@@ -42,6 +42,8 @@ impl fmt::Display for LogHash {
 pub enum EntryKind {
     ManifestPublished,
     DeviceEnrolled,
+    DeviceApproved,
+    DeviceRevoked,
 }
 
 impl EntryKind {
@@ -49,6 +51,8 @@ impl EntryKind {
         match self {
             EntryKind::ManifestPublished => "manifest_published",
             EntryKind::DeviceEnrolled => "device_enrolled",
+            EntryKind::DeviceApproved => "device_approved",
+            EntryKind::DeviceRevoked => "device_revoked",
         }
     }
 }
