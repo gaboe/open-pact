@@ -4,7 +4,9 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{Error, ManifestHash, Os, Pseudonym, PublicKey, Signature, SigningKey, TrustLevel};
+use crate::{
+    Error, LogHash, ManifestHash, Os, Pseudonym, PublicKey, Signature, SigningKey, TrustLevel,
+};
 
 const HEADER: &str = r#"{"alg":"ES256","typ":"open-pact-claim+jws"}"#;
 
@@ -30,6 +32,16 @@ pub struct Claim {
     pub results: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub csr_pem: Option<String>,
+    /// The last log checkpoint this client verified, so each claim commits to the rules history it saw.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_checkpoint: Option<LogCheckpoint>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LogCheckpoint {
+    pub size: u64,
+    pub root: LogHash,
 }
 
 impl Claim {
@@ -136,6 +148,7 @@ mod tests {
                 ("disk_encryption".into(), "full".into()),
             ]),
             csr_pem: None,
+            log_checkpoint: None,
         }
     }
 
@@ -151,6 +164,23 @@ mod tests {
                 r#""results":{"disk_encryption":"full","firewall":"on"},"time":"2026-11-03T08:12:44Z","trust_level":"L0","virtualized":"no"}"#
             )
         );
+    }
+
+    #[test]
+    fn log_checkpoint_is_signed_with_the_claim() {
+        let key = fixed_key();
+        let mut claim = claim_for(&key);
+        claim.log_checkpoint = Some(LogCheckpoint {
+            size: 3,
+            root: LogHash([0xab; 32]),
+        });
+        let json = String::from_utf8(claim.canonical_json()).unwrap();
+        assert!(json.contains(&format!(
+            r#""log_checkpoint":{{"root":"{}","size":3}}"#,
+            "ab".repeat(32)
+        )));
+        let jws = sign_claim(&claim, &key).unwrap();
+        assert_eq!(verify_claim(&jws).unwrap().claim(), &claim);
     }
 
     #[test]

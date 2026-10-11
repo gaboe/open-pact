@@ -181,6 +181,7 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect::<BTreeMap<_, _>>(),
             csr_pem: None,
+            log_checkpoint: None,
         }
     }
 

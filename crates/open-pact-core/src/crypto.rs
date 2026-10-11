@@ -5,6 +5,7 @@ use p256::ecdsa::{
     SigningKey, VerifyingKey,
     signature::{Signer, Verifier},
 };
+use p256::pkcs8::{DecodePublicKey, EncodePublicKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -99,6 +100,29 @@ impl PublicKey {
     pub(crate) fn verify(&self, message: &[u8], sig: &Signature) -> bool {
         self.0.verify(message, &sig.0).is_ok()
     }
+
+    pub(crate) fn spki_der(&self) -> Vec<u8> {
+        self.0
+            .to_public_key_der()
+            .expect("P-256 keys always encode")
+            .into_vec()
+    }
+
+    pub(crate) fn from_spki_der(der: &[u8]) -> Result<Self, Error> {
+        VerifyingKey::from_public_key_der(der)
+            .map(Self)
+            .map_err(|_| Error::InvalidKey)
+    }
+
+    /// ASN.1 DER ECDSA signature over SHA-256 of `message`, as C2SP signed-note type 0x02 uses.
+    pub(crate) fn verify_der(&self, message: &[u8], der: &[u8]) -> bool {
+        p256::ecdsa::Signature::from_der(der).is_ok_and(|sig| self.0.verify(message, &sig).is_ok())
+    }
+}
+
+pub(crate) fn sign_der(key: &SigningKey, message: &[u8]) -> Vec<u8> {
+    let sig: p256::ecdsa::Signature = key.sign(message);
+    sig.to_der().as_bytes().to_vec()
 }
 
 impl From<&SigningKey> for PublicKey {

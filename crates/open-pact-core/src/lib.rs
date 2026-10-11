@@ -5,13 +5,18 @@ mod evaluate;
 mod log;
 mod manifest;
 mod narrowing;
+mod note;
 
-pub use claim::{Claim, VerifiedClaim, Virtualized, sign_claim, verify_claim};
+pub use claim::{Claim, LogCheckpoint, VerifiedClaim, Virtualized, sign_claim, verify_claim};
 pub use crypto::{Endorsement, ManifestHash, Pseudonym, PublicKey, Signature, SignedManifest};
 pub use evaluate::{Decision, Reason, evaluate};
-pub use log::{Entry, EntryKind, Head, LogHash, verify_chain};
+pub use log::{
+    Entry, EntryKind, LogHash, consistency_proof, inclusion_proof, leaf_hash, root,
+    verify_consistency, verify_inclusion,
+};
 pub use manifest::{Accepted, Control, Manifest, ManifestBody, Os, Source, Span, TrustLevel};
 pub use narrowing::{Violation, is_narrowing};
+pub use note::{Checkpoint, LogKey, Note, NoteSignature, WitnessKey};
 pub use p256::ecdsa::SigningKey;
 
 #[derive(Debug, thiserror::Error)]

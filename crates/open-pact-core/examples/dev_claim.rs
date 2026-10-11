@@ -43,6 +43,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         virtualized: Virtualized::No,
         results,
         csr_pem: None,
+        log_checkpoint: None,
     };
     println!("{}", sign_claim(&claim, &key)?);
     Ok(())
