@@ -2,7 +2,7 @@
 
 Verifiable security checks on personally owned devices, without blanket monitoring. The owner signs the company's manifest once. Each time the device connects, the client sends one small signed claim to the company gateway, and a compliant device gets a short-lived VPN client certificate. Read [PAPER.md](PAPER.md) for the design.
 
-Status: proof of concept, not for production. All keys are development software keys (trust level L0). The gateway enforces [examples/manifest.toml](examples/manifest.toml), or the file in `MANIFEST_PATH`.
+Status: proof of concept, not for production. On a Mac, `join` creates the device key in the Secure Enclave (trust level L1); elsewhere, or with `join --software-key`, all keys are development software keys (trust level L0). The gateway enforces [examples/manifest.toml](examples/manifest.toml), or the file in `MANIFEST_PATH`.
 
 ## Layout
 
@@ -40,7 +40,8 @@ The client keeps its files in `~/.config/open-pact/`, or in the directory given 
 | File | Content |
 | --- | --- |
 | `owner-dev.pem` | owner key; signs the manifest hash |
-| `device-dev.pem` | device key; signs claims, its hash is the pseudonym |
+| `device-se.key` | device key on a Mac: a Secure Enclave key wrapped for this Mac only; signs the enrolment statement and claims, its public key's hash is the pseudonym |
+| `device-dev.pem` | device key as a software file, instead of `device-se.key` |
 | `vpn-key.pem` | VPN certificate key; only its certificate request leaves the device |
 | `manifest.toml`, `enrolment.json` | the signed manifest, gateway URL and the salt that opens the enrolment commitment |
 | `vpn-cert.pem`, `ca.pem` | the last VPN client certificate and the gateway CA |
@@ -135,7 +136,7 @@ On first start the gateway generates its company manifest-signing key, its log-s
 
 ## Tests
 
-`scripts/smoke.sh` runs the full flow against a running gateway: an invitation with a wrong company key fingerprint (refused, nothing pinned), a remote `http://` gateway (refused), `join --yes` with the right invitation, `check` denied while pending, a repeated `join`, reuse of the invitation by another device, three devices racing for one invitation, `devices approve` and `devices list`, `check`, `openssl verify` of the certificate, a replay of the client's own claim, a claim from an unenrolled device, chosen-result claims (failed check, undisclosed result, wrong manifest, tampered signature), `log show`, `log prove`, a witness cosignature, and the log alarm for a different root (split view), for a rollback, and the upgrade message for a v0.1.0 log head, a changed company key, and `devices revoke`. On a device that fails a 0-day-grace check, such as disk encryption off, `check` is denied and the smoke script stops there.
+`scripts/smoke.sh` runs the full flow against a running gateway: an invitation with a wrong company key fingerprint (refused, nothing pinned), a remote `http://` gateway (refused), `join --yes --software-key` with the right invitation (it signs crafted claims with `device-dev.pem`), `check` denied while pending, a repeated `join`, reuse of the invitation by another device, three devices racing for one invitation, `devices approve` and `devices list`, `check`, `openssl verify` of the certificate, a replay of the client's own claim, a claim from an unenrolled device, chosen-result claims (failed check, undisclosed result, wrong manifest, tampered signature), `log show`, `log prove`, a witness cosignature, and the log alarm for a different root (split view), for a rollback, and the upgrade message for a v0.1.0 log head, a changed company key, and `devices revoke`. On a device that fails a 0-day-grace check, such as disk encryption off, `check` is denied and the smoke script stops there.
 
 ## Known gaps
 
@@ -144,4 +145,6 @@ On first start the gateway generates its company manifest-signing key, its log-s
 - Approval belongs to one manifest hash. When the gateway enforces a new manifest, the owner needs a new invitation and IT approves again.
 - The client prints witness cosignatures with the checkpoint but does not verify them, because it has no list of witness keys yet. The demo witness signs any checkpoint it is given; a real witness first checks a consistency proof from the last checkpoint it cosigned.
 - The summary page counts stored claims only. Replays, bad signatures, unenrolled devices and oversharing claims are refused without being stored.
+- The Secure Enclave device key proves that claims come from this Mac, but it is not bound to the client's code signature as PAPER.md section 5 describes. The client keeps the wrapped key in `device-se.key`, not in the keychain, so it needs no keychain entitlement, and any program on the same Mac that can read the file can sign with it. A Developer ID signed client with a keychain access group closes this. The trust level is what the client reports; the gateway cannot check it without attestation.
+- The VPN certificate key and the owner key are still software keys.
 - The CN is the pseudonym's hex digest without the `pseudonym:` prefix, because X.509 limits a CN to 64 characters.
