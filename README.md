@@ -53,7 +53,7 @@ Nothing runs in the background. To uninstall, delete the binary and the director
 
 ## Verify a release
 
-The gateway image is reproducible: a pinned toolchain and builder, a static musl binary, `FROM scratch`, and timestamps fixed to the commit time. CI builds each release twice on separate runners and fails when the digests differ. To check a release yourself, run `scripts/verify-release.sh v0.0.1 ghcr.io/<owner>/open-pact-gateway@sha256:<digest>`. It rebuilds the tag from the public source, prints the digest, and exits nonzero on a mismatch. It needs Docker with buildx and takes several minutes. The gateway makes no outbound TLS calls, so the image carries no CA bundle (do not use `sslmode=verify-full` for PostgreSQL).
+The gateway image is reproducible: a pinned toolchain and builder, a static musl binary, `FROM scratch`, and timestamps fixed to the commit time. CI builds each release twice on separate runners and fails when the digests differ. The witness image (`ghcr.io/<owner>/open-pact-witness`, the Dockerfile `witness` target) is built and checked the same way. To check a release yourself, run `scripts/verify-release.sh v0.0.1 ghcr.io/<owner>/open-pact-gateway@sha256:<digest>`, or add `--target witness` and the witness image reference. It rebuilds the tag from the public source, prints the digest, and exits nonzero on a mismatch. It needs Docker with buildx and takes several minutes. The gateway makes no outbound TLS calls, so the image carries no CA bundle (do not use `sslmode=verify-full` for PostgreSQL).
 
 ## Gateway API
 
@@ -173,11 +173,13 @@ helm upgrade --install pact deploy/helm/open-pact \
 
 The chart fails to render without `gateway.kekSecret.name`, and, for the bundled PostgreSQL, without `postgres.password` or `postgres.existingSecret`.
 
+The manifest lives in the company's deployment config, not in the image. The image carries only the example manifest. To enforce your own signed manifest, pass its TOML text with `--set-file manifest=company-manifest.toml`. The chart renders it into a ConfigMap, mounts it at `/etc/open-pact/custom/manifest.toml`, sets `MANIFEST_PATH`, and restarts the gateway when the text changes. Run the witness as a separate release (`witness.enabled=true`, with its own key Secret and `witness.logKeys`) and list its URL in the gateway's `log.witnessUrls`. Both images are published from this repository; you rebuild neither. The chart sets non-root users, a read-only root filesystem and default `resources` for both; override `gateway.resources`, `gateway.securityContext` and the `witness.*` equivalents as needed.
+
 ## Tests
 
 `scripts/smoke.sh` runs the full flow against a running gateway: an invitation with a wrong company key fingerprint (refused, nothing pinned), a remote `http://` gateway (refused), `join --yes --software-key` with the right invitation (it signs crafted claims with `device-dev.pem`), `check` denied while pending, a repeated `join`, reuse of the invitation by another device, three devices racing for one invitation, `devices approve` and `devices list`, `check`, `openssl verify` of the certificate, a replay of the client's own claim, a claim from an unenrolled device, chosen-result claims (failed check, a grace period that starts, ends after a day with the stored start moved back, and clears on a pass, undisclosed result, wrong manifest, tampered signature), `log show`, `log prove`, a claim with a foreign log checkpoint, the witness cosignature, a fork the witness refuses, the log alarm for a checkpoint without a cosignature and for one cosigned two hours ago, and the log alarm for a different root (split view), for a rollback, and the upgrade message for a v0.1.0 log head, a changed company key, and `devices revoke`. On a device that fails a 0-day-grace check, such as disk encryption off, `check` is denied and the smoke script stops there.
 
-`scripts/check-helm.sh` checks that the chart refuses to render without `gateway.kekSecret.name` and without a database password or secret. The gateway tests that need PostgreSQL are `#[ignore]`d in a plain `cargo test`. Run them against a throwaway database:
+`scripts/check-helm.sh` checks that the chart refuses to render without `gateway.kekSecret.name` and without a database password or secret, and that `manifest` renders its ConfigMap, mount and checksum. The gateway tests that need PostgreSQL are `#[ignore]`d in a plain `cargo test`. Run them against a throwaway database:
 
 ```sh
 docker run -d --rm --name pact-testdb -e POSTGRES_PASSWORD=test -p 55432:5432 postgres:17
