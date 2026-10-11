@@ -6,6 +6,8 @@ image:
 imagePullSecrets: []
 
 gateway:
+  # Set false for a witness-only release in the witness operator's cluster.
+  enabled: true
   # Required. An existing Secret holding the key-encryption key: 32 random bytes, base64.
   # It encrypts the gateway keys and claims in PostgreSQL. Keep a copy outside the cluster:
   # without it the database cannot be read.

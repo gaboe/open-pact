@@ -1,4 +1,4 @@
-{{- if and .Values.postgres.enabled (not .Values.database.externalUrl) }}
+{{- if and .Values.gateway.enabled .Values.postgres.enabled (not .Values.database.externalUrl) }}
 {{- if not .Values.postgres.existingSecret }}
 apiVersion: v1
 kind: Secret
