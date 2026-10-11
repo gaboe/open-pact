@@ -307,7 +307,7 @@ fn print_summary(manifest: &Manifest, company: &PublicKey, os: Os) {
     };
     println!("Manifest     {}", manifest.hash());
     println!(
-        "Company key  {}  (compare with the fingerprint IT gave you)",
+        "Company key  {}  (matches your invitation)",
         company.fingerprint()
     );
     println!("Issuer       {}, valid from {}", b.issuer, b.valid_from);

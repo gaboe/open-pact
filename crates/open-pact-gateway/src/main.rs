@@ -740,7 +740,8 @@ async fn invite(db: &PgPool, url: &str, ttl: &str, note: &str) -> anyhow::Result
         code,
     );
     eprint!(
-        "One-time invitation, valid until {expires}{}\n{}",
+        "One-time invitation, valid until {}{}\n{}",
+        expires.format("%Y-%m-%dT%H:%M:%SZ"),
         if note.is_empty() {
             String::new()
         } else {

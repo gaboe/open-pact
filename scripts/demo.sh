@@ -13,6 +13,13 @@ cargo build -q --manifest-path "$root/Cargo.toml" -p open-pact-core --example de
 client=("$root/target/debug/open-pact-client" --home "$home")
 dev_claim="$root/target/debug/examples/dev_claim"
 dev_witness="$root/target/debug/examples/dev_witness"
+# OPEN_PACT_ADMIN runs the gateway admin CLI elsewhere, e.g. "kubectl exec -i deploy/pact-gateway -- open-pact-gateway".
+if [ -n "${OPEN_PACT_ADMIN:-}" ]; then
+  read -ra admin_cmd <<< "$OPEN_PACT_ADMIN"
+else
+  admin_cmd=(docker compose -f "$root/compose.yaml" exec -T gateway open-pact-gateway)
+fi
+admin() { "${admin_cmd[@]}" "$@"; }
 
 n=0
 step() {
@@ -28,8 +35,18 @@ curl -fsS "$url/healthz" > /dev/null
 sed -n 's/.*<dt>\(.*\)<\/dt><dd><code>\(.*\)<\/code><\/dd>.*/\1: \2/p' < <(curl -fsS "$url/")
 echo "Summary page: $url/"
 
-step "The owner reads the manifest and signs its hash; the device enrols"
-"${client[@]}" join --gateway "$url" --yes
+step "IT creates a one-time invitation: gateway, company key and log key fingerprints, a 256-bit code"
+invitation="$(admin invite --url "$url" --ttl 1h --note "demo owner")"
+echo "$invitation"
+
+step "The owner joins: the client checks the gateway's keys against the invitation, then shows the manifest"
+"${client[@]}" join "$invitation" --yes | tee "$tmp/join"
+
+step "Until IT approves, the gateway refuses the device"
+"${client[@]}" check || echo "(check exited with status $?)"
+
+step "IT approves the device by the code the owner reads out"
+admin devices approve "$(sed -nE 's/^Waiting for IT approval. Read this device code to IT: ([0-9a-f]{12})$/\1/p' "$tmp/join")"
 
 step "The device runs the checks and sends one signed claim"
 "${client[@]}" check

@@ -17,17 +17,96 @@ client=("$root/target/debug/open-pact-client" --home "$home")
 dev_claim="$root/target/debug/examples/dev_claim"
 dev_witness="$root/target/debug/examples/dev_witness"
 
-"${client[@]}" join --gateway "$url" --yes > "$tmp/join"
+# OPEN_PACT_ADMIN runs the gateway admin CLI elsewhere, e.g. "kubectl exec -i deploy/pact-gateway -- open-pact-gateway".
+if [ -n "${OPEN_PACT_ADMIN:-}" ]; then
+  read -ra admin_cmd <<< "$OPEN_PACT_ADMIN"
+else
+  admin_cmd=(docker compose -f "$root/compose.yaml" exec -T gateway open-pact-gateway)
+fi
+admin() { "${admin_cmd[@]}" "$@"; }
+invite() { admin invite --url "$url" --ttl 1h --note "$1" 2> /dev/null; }
+# Rewrites one field of an invitation; "flip" changes the last character of the current value.
+tamper() {
+  python3 - "$@" <<'PY'
+import base64, json, sys
+inv, field, value = sys.argv[1:]
+body = inv.removeprefix("opi1:")
+j = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
+if value == "flip":
+    value = j[field][:-1] + ("0" if j[field][-1] != "0" else "1")
+j[field] = value
+print("opi1:" + base64.urlsafe_b64encode(json.dumps(j).encode()).decode().rstrip("="))
+PY
+}
+run_status() {
+  set +e
+  "$@" > "$tmp/out" 2>&1
+  local got=$?
+  set -e
+  echo "$got"
+}
+
+inv="$(invite "smoke owner")"
+[[ "$inv" == opi1:* ]]
+echo "invitation created: ${inv:0:24}..."
+
+got="$(run_status "${client[@]}" join "$(tamper "$inv" company flip)" --yes)"
+[ "$got" = 1 ] || { cat "$tmp/out"; exit 1; }
+grep -q 'is not the gateway in your invitation: the company key differs' "$tmp/out"
+[ ! -e "$home/company-key.txt" ]
+[ ! -e "$home/log-key.txt" ]
+[ ! -e "$home/enrolment.json" ]
+echo "an invitation with another company key fingerprint is refused before anything is sent or pinned"
+
+got="$(run_status "${client[@]}" join "$(tamper "$inv" gateway http://pact.example.com)" --yes)"
+[ "$got" = 1 ]
+grep -q 'refusing plain http://' "$tmp/out"
+echo "plain http to a remote gateway is refused"
+
+"${client[@]}" join "$inv" --yes > "$tmp/join"
+grep -q '^Gateway keys match the invitation' "$tmp/join"
 grep -q '^Enrolled as pseudonym:' "$tmp/join"
 grep -q '^Transparency log verified' "$tmp/join"
 grep -q '^Inclusion proofs verified: the manifest you signed (#0) and your enrolment' "$tmp/join"
-echo "join: $(grep '^Enrolled' "$tmp/join")"
+code="$(sed -nE 's/^Waiting for IT approval. Read this device code to IT: ([0-9a-f]{12})$/\1/p' "$tmp/join")"
+[ -n "$code" ]
+echo "join with the untouched invitation: $(grep '^Enrolled' "$tmp/join"), pending, device code $code"
+
+got="$(run_status "${client[@]}" check)"
+[ "$got" = 1 ]
+grep -qx DENIED "$tmp/out"
+grep -q 'device awaiting IT approval' "$tmp/out"
+echo "check before approval: denied, device awaiting IT approval"
 
 head_before="$("${client[@]}" log head)"
-"${client[@]}" join --gateway "$url" --yes > "$tmp/rejoin"
+"${client[@]}" join "$inv" --yes > "$tmp/rejoin"
 diff <(grep '^Enrolled' "$tmp/join") <(grep '^Enrolled' "$tmp/rejoin")
 [ "$head_before" = "$("${client[@]}" log head)" ]
-echo "re-join is idempotent: same pseudonym, no new log entry"
+echo "re-join with the same invitation is idempotent: same pseudonym, no new log entry"
+
+got="$(run_status "$root/target/debug/open-pact-client" --home "$tmp/other" join "$inv" --yes)"
+[ "$got" = 1 ]
+grep -q 'invalid or used invitation' "$tmp/out"
+echo "another device cannot reuse the invitation: $(grep -o '"reasons":\[[^]]*\]' "$tmp/out")"
+
+race="$(invite "smoke race")"
+for i in 1 2 3; do
+  ( "$root/target/debug/open-pact-client" --home "$tmp/race$i" join "$race" --yes > "$tmp/race$i.out" 2>&1; echo $? > "$tmp/race$i.code" ) &
+done
+wait
+winners="$(grep -lx 0 "$tmp"/race?.code | wc -l | tr -d ' ')"
+[ "$winners" = 1 ] || { cat "$tmp"/race?.out; exit 1; }
+[ "$(grep -l 'invalid or used invitation' "$tmp"/race?.out | wc -l | tr -d ' ')" = 2 ]
+echo "three devices racing for one invitation: exactly one enrolled"
+
+got="$(run_status admin devices approve 1234567)"
+[ "$got" != 0 ]
+grep -q 'at least 8' "$tmp/out"
+admin devices approve "$code" | tee "$tmp/approved"
+grep -q '^approved pseudonym:'"$code" "$tmp/approved"
+admin devices list > "$tmp/devices"
+grep -q "^approved  *pseudonym:$code.*smoke owner" "$tmp/devices"
+echo "IT approved the device by its code; devices list shows it with the invitation note"
 
 "${client[@]}" log prove > "$tmp/prove"
 cat "$tmp/prove"
@@ -163,9 +242,26 @@ echo "without stored indexes the client finds its entries, proves them and store
 rm "$home/log-checkpoint.txt"
 echo '{"index": 3, "hash": "00"}' > "$home/log-head.json"
 expect_status "a v0.1.0 log head asks for re-join instead of an alarm" 1 'log format was upgraded'
-"${client[@]}" join --gateway "$url" --yes > "$tmp/rejoin2"
+"${client[@]}" join "$inv" --yes > "$tmp/rejoin2"
 grep -q '^Transparency log verified' "$tmp/rejoin2"
 [ ! -e "$home/log-head.json" ]
 echo "join replaces the old head with a checkpoint"
+
+cp "$home/company-key.txt" "$tmp/good-company-key"
+echo "sha256:$(printf '0%.0s' {1..64})" > "$home/company-key.txt"
+expect_status "a different company key than the pinned one raises the alarm" 2 'the company key changed'
+cp "$tmp/good-company-key" "$home/company-key.txt"
+
+pseudonym="$(sed -n 's/^Enrolled as //p' "$tmp/join")"
+admin devices revoke "$pseudonym" | grep -q '^revoked '
+got="$(run_status "${client[@]}" check)"
+[ "$got" = 1 ]
+grep -q 'device revoked' "$tmp/out"
+expect "revoked device" 403 'device revoked' \
+  "$("$dev_claim" "$device" "$manifest" "$(nonce)" linux "${passing[@]}")"
+got="$(run_status admin devices approve "$code")"
+[ "$got" != 0 ]
+[ "$(curl -fsS "$url/v1/log/entries" | grep -o '"kind":"device_revoked"' | wc -l | tr -d ' ')" -ge 1 ]
+echo "IT revoked the device: check denied, approval refused, revocation logged"
 
 echo "smoke passed"
