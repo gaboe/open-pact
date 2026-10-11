@@ -1,5 +1,7 @@
 mod checks;
 mod device_key;
+#[cfg(test)]
+mod fake_gateway;
 mod locallog;
 #[cfg(target_os = "macos")]
 mod secure_enclave;
@@ -851,10 +853,14 @@ async fn check(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
     }
     let device = DeviceKey::load(&home.0)?;
     let os = current_os()?;
-    let results = collect_results(&manifest, os);
 
     let http = http_client()?;
     let sync = sync_log(&http, home, &mut enrolment).await?;
+    if let LogSync::Alarm(_) = sync {
+        report_log(sync, home);
+        return Ok(ExitCode::from(2));
+    }
+    let results = collect_results(&manifest, os);
     let gateway = base(&enrolment.gateway);
     let log_checkpoint = disclosable_checkpoint(&manifest, home.checkpoint()?);
     let nonce: Nonce = http
@@ -932,11 +938,11 @@ async fn check(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
             false
         }
     };
-    let log_ok = report_log(sync, home);
-    Ok(match (log_ok, accepted) {
-        (false, _) => ExitCode::from(2),
-        (true, true) => ExitCode::SUCCESS,
-        (true, false) => ExitCode::FAILURE,
+    report_log(sync, home);
+    Ok(if accepted {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     })
 }
 
@@ -1168,5 +1174,66 @@ mod tests {
         assert_ne!(unlisted, toml);
         let unlisted = Manifest::parse(unlisted.as_bytes()).unwrap();
         assert_eq!(disclosable_checkpoint(&unlisted, Some(cp)), None);
+    }
+
+    use fake_gateway::{Company, DEMO_MANIFEST, FakeGateway, not_found, snapshot};
+
+    /// A device enrolled at `gateway` under the demo manifest, with a certificate from an earlier check.
+    fn enrolled_home(dir: &Path, gateway: &str, company: &Company) -> Home {
+        let home = Home(dir.to_path_buf());
+        let manifest = Manifest::parse(DEMO_MANIFEST.as_bytes()).unwrap();
+        let device = DeviceKey::load_or_create(dir, true).unwrap();
+        let enrolment = Enrolment {
+            gateway: gateway.into(),
+            manifest: manifest.hash().clone(),
+            device: Pseudonym::of(&device.public_key()),
+            salt: "00".repeat(32),
+            log_entries: None,
+        };
+        home.write("enrolment.json", &serde_json::to_vec(&enrolment).unwrap())
+            .unwrap();
+        home.write("manifest.toml", DEMO_MANIFEST.as_bytes())
+            .unwrap();
+        Pins {
+            company: company.fingerprint(),
+            log: company.log.clone(),
+        }
+        .save(&home)
+        .unwrap();
+        home.write("ca.pem", b"earlier CA").unwrap();
+        home.write("vpn-cert.pem", b"earlier certificate").unwrap();
+        home
+    }
+
+    #[tokio::test]
+    async fn check_after_a_log_alarm_sends_nothing_and_writes_no_file() {
+        let company = Company::new();
+        let attacker = dev_key::generate();
+        let log = company.log.vkey();
+        let gateway = FakeGateway::start(move |line, _| match line {
+            "GET /v1/manifest" => (200, Company::published(DEMO_MANIFEST, &attacker)),
+            "GET /v1/log/key" => (200, format!("{log}\n")),
+            "POST /v1/nonce" => (200, r#"{"nonce":"n"}"#.into()),
+            "POST /v1/claim" => (
+                200,
+                r#"{"status":"accepted","warnings":[],"certificate_pem":null,"ca_pem":"attacker CA"}"#
+                    .into(),
+            ),
+            _ => not_found(),
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let home = enrolled_home(dir.path(), &gateway.url, &company);
+        let before = snapshot(dir.path());
+
+        let code = check(&home, false).await;
+
+        assert_eq!(gateway.posts(), Vec::<String>::new(), "no nonce, no claim");
+        assert_eq!(
+            snapshot(dir.path()),
+            before,
+            "no CA, certificate, key or log written"
+        );
+        assert_eq!(code.unwrap(), ExitCode::from(2));
     }
 }
