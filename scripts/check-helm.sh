@@ -18,7 +18,7 @@ refuses "postgres.password or postgres.existingSecret" "${kek[@]}"
 
 out="$(helm template t "$chart" "${kek[@]}" --set postgres.password=example-only)"
 grep -q 'name: pact-gateway-kek' <<< "$out"
-! grep -q 'change-me' <<< "$out"
+if grep -q 'change-me' <<< "$out"; then echo "FAIL: rendered a placeholder password"; exit 1; fi
 helm template t "$chart" "${kek[@]}" --set postgres.existingSecret=pact-postgres > /dev/null
 helm template t "$chart" "${kek[@]}" --set database.externalUrl=postgres://db.example.com/pact > /dev/null
 base=("${kek[@]}" --set postgres.password=example-only --set witness.enabled=true)
@@ -36,7 +36,7 @@ kinds="$(grep '^kind:' <<< "$witness_only" | sort | tr '\n' ' ')"
 echo "a witness-only release needs no gateway or database secret and renders only the witness"
 
 plain="$(helm template t "$chart" "${kek[@]}" --set postgres.password=example-only)"
-! grep -q -E 'MANIFEST_PATH|kind: ConfigMap|checksum/manifest' <<< "$plain"
+if grep -q -E 'MANIFEST_PATH|kind: ConfigMap|checksum/manifest' <<< "$plain"; then echo "FAIL: rendered a custom manifest without one"; exit 1; fi
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 printf 'name = "Example Co"\n' > "$tmp/a.toml"
 printf 'name = "Example Co 2"\n' > "$tmp/b.toml"
