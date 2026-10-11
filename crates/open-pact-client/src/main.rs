@@ -9,9 +9,9 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use open_pact_core::{
-    Checkpoint, Claim, Endorsement, Entry, EntryKind, LogCheckpoint, LogHash, LogKey, Manifest,
-    ManifestHash, Note, Os, Pseudonym, PublicKey, SignedManifest, TrustLevel, Virtualized, dev_key,
-    root, sign_claim, verify_claim, verify_consistency, verify_inclusion,
+    Checkpoint, Claim, Endorsement, Entry, EntryKind, Invitation, LogCheckpoint, LogHash, LogKey,
+    Manifest, ManifestHash, Note, Os, Pseudonym, PublicKey, SignedManifest, TrustLevel,
+    Virtualized, dev_key, root, sign_claim, verify_claim, verify_consistency, verify_inclusion,
 };
 use rcgen::{CertificateParams, DistinguishedName, KeyPair};
 use serde::{Deserialize, Serialize};
@@ -33,10 +33,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Show the company's manifest, sign it as the device owner and enrol this device
+    /// Check the gateway against the invitation from IT, show the manifest, sign it and enrol
     Join {
-        #[arg(long)]
-        gateway: String,
+        /// The opi1: invitation string from IT
+        invitation: String,
         /// Sign without asking
         #[arg(long)]
         yes: bool,
@@ -96,6 +96,7 @@ struct Proof {
 }
 
 const LOG_KEY: &str = "log-key.txt";
+const COMPANY_KEY: &str = "company-key.txt";
 const LOG_CHECKPOINT: &str = "log-checkpoint.txt";
 const LEGACY_LOG_HEAD: &str = "log-head.json";
 
@@ -179,7 +180,7 @@ impl Home {
 
     fn enrolment(&self) -> Result<Enrolment> {
         self.read_json("enrolment.json")?
-            .context("not enrolled; run `open-pact-client join --gateway <url>` first")
+            .context("not enrolled; run `open-pact-client join <invitation from IT>` first")
     }
 }
 
@@ -246,6 +247,13 @@ fn disclosable_checkpoint(manifest: &Manifest, cp: Option<Checkpoint>) -> Option
 
 fn base(gateway: &str) -> &str {
     gateway.trim_end_matches('/')
+}
+
+/// The API never redirects, so a redirect cannot move the client from https to http.
+fn http_client() -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?)
 }
 
 async fn get_text(http: &reqwest::Client, url: String) -> Result<String> {
@@ -347,15 +355,55 @@ async fn fetch_entries(
     Ok(entries)
 }
 
-async fn pinned_log_key(http: &reqwest::Client, home: &Home, gateway: &str) -> Result<LogKey> {
-    if let Some(vkey) = home.read_text(LOG_KEY)? {
-        return Ok(LogKey::parse(&vkey)?);
+struct Pins {
+    company: String,
+    log: LogKey,
+}
+
+impl Pins {
+    fn load(home: &Home) -> Result<Pins> {
+        let (Some(company), Some(log)) = (home.read_text(COMPANY_KEY)?, home.read_text(LOG_KEY)?)
+        else {
+            bail!(
+                "this device has no pinned company key and log key; run `open-pact-client join <invitation from IT>`"
+            );
+        };
+        Ok(Pins {
+            company: company.trim().to_string(),
+            log: LogKey::parse(log.trim())?,
+        })
     }
-    let vkey = get_text(http, format!("{}/v1/log/key", base(gateway))).await?;
-    let key = LogKey::parse(&vkey)?;
-    home.write(LOG_KEY, format!("{}\n", key.vkey()).as_bytes())?;
-    println!("Pinned log key {}", key.vkey());
-    Ok(key)
+
+    fn save(&self, home: &Home) -> Result<()> {
+        home.write(COMPANY_KEY, format!("{}\n", self.company).as_bytes())?;
+        home.write(LOG_KEY, format!("{}\n", self.log.vkey()).as_bytes())?;
+        Ok(())
+    }
+
+    /// What differs between the pinned keys and the ones a gateway serves, if anything.
+    fn differs(&self, company: &str, log: &str) -> Option<String> {
+        if company != self.company {
+            return Some(format!(
+                "the company key changed: pinned {}, gateway now shows {company}",
+                self.company
+            ));
+        }
+        if log.trim() != self.log.vkey() {
+            return Some(format!(
+                "the log key changed: pinned {}, gateway now shows {}",
+                self.log.vkey(),
+                log.trim()
+            ));
+        }
+        None
+    }
+
+    async fn compare(&self, http: &reqwest::Client, gateway: &str) -> Result<Option<String>> {
+        let published: PublishedManifest =
+            get_json(http, format!("{}/v1/manifest", base(gateway))).await?;
+        let log = get_text(http, format!("{}/v1/log/key", base(gateway))).await?;
+        Ok(self.differs(&published.company.key.fingerprint(), &log))
+    }
 }
 
 /// Fetches the gateway's checkpoint and checks that it extends the one stored on this device.
@@ -365,7 +413,11 @@ async fn sync_checkpoint(
     home: &Home,
     gateway: &str,
 ) -> Result<Result<Checkpoint, String>> {
-    let key = pinned_log_key(http, home, gateway).await?;
+    let pins = Pins::load(home)?;
+    if let Some(changed) = pins.compare(http, gateway).await? {
+        return Ok(Err(changed));
+    }
+    let key = pins.log;
     let prev = home.checkpoint()?;
     let text = get_text(http, format!("{}/v1/log/checkpoint", base(gateway))).await?;
     let new = match Note::parse(&text).and_then(|note| key.verify(&note)) {
@@ -558,7 +610,7 @@ fn report_log(sync: LogSync, home: &Home) -> bool {
         LogSync::Alarm(e) => {
             let bar = "!".repeat(72);
             eprintln!(
-                "\n{bar}\n!! TRANSPARENCY LOG ALARM\n!! The gateway's history does not match the copy on this device.\n!! {e}"
+                "\n{bar}\n!! TRANSPARENCY LOG ALARM\n!! The gateway's keys or history do not match the copy on this device.\n!! {e}"
             );
             eprintln!(
                 "!! Keep {}: it is the last checkpoint the gateway signed for you.\n!! Compare it with colleagues: open-pact-client log head\n{bar}\n",
@@ -573,25 +625,61 @@ fn print_log_upgrade(home: &Home) {
     eprintln!(
         "The transparency log format was upgraded: it is now a Merkle tree with signed checkpoints.\n\
          {} holds a head in the old hash-chain format, which cannot be compared with a checkpoint.\n\
-         This is not a log alarm. Run `open-pact-client join --gateway <url>` again to review the\n\
+         This is not a log alarm. Run `open-pact-client join <invitation>` again to review the\n\
          manifest and pin the new log.",
         home.file(LEGACY_LOG_HEAD).display()
     );
 }
 
-async fn join(home: &Home, gateway: &str, yes: bool) -> Result<bool> {
-    let http = reqwest::Client::new();
+async fn join(home: &Home, invitation: &str, yes: bool) -> Result<ExitCode> {
+    let invitation = Invitation::decode(invitation)?;
+    let gateway = invitation.gateway.as_str();
+    let wanted = Pins {
+        company: invitation.company.clone(),
+        log: invitation.log_key(),
+    };
+    if let Ok(pinned) = Pins::load(home)
+        && let Some(changed) = pinned.differs(&wanted.company, &wanted.log.vkey())
+    {
+        report_log(
+            alarm(format!(
+                "{changed} (the new invitation). Use a separate --home for another company"
+            )),
+            home,
+        );
+        return Ok(ExitCode::from(2));
+    }
+    let http = http_client()?;
     let published: PublishedManifest =
         get_json(&http, format!("{}/v1/manifest", base(gateway))).await?;
     let manifest = Manifest::parse(published.toml.as_bytes())?;
     if !published.company.verify(manifest.hash()) {
         bail!("the company signature does not match this manifest; refusing to show it");
     }
+    if let Some(mismatch) = wanted.compare(&http, gateway).await? {
+        bail!(
+            "{gateway} is not the gateway in your invitation: {}. Nothing was sent. \
+             Ask IT for a new invitation and report this",
+            mismatch.replace(" changed: pinned ", " differs: the invitation names ")
+        );
+    }
+    wanted.save(home)?;
+    println!("Gateway keys match the invitation:");
+    print!("{}", invitation.describe());
+    if home.has_legacy_log_head() {
+        std::fs::remove_file(home.file(LEGACY_LOG_HEAD))?;
+        println!("Removed the old hash-chain log head; this device now pins the Merkle log.");
+    }
+    if let Err(e) = sync_checkpoint(&http, home, gateway).await? {
+        report_log(alarm(e), home);
+        return Ok(ExitCode::from(2));
+    }
+    println!();
     let os = current_os()?;
     print_summary(&manifest, &published.company.key, os);
     if !yes && !confirm("Sign this manifest as the device owner?")? {
         println!("Not signed. Nothing was sent.");
-        return Ok(false);
+        return Ok(ExitCode::FAILURE);
     }
     let owner = dev_key::load_or_create(&home.file("owner-dev.pem"))?;
     let device = dev_key::load_or_create(&home.file("device-dev.pem"))?;
@@ -602,14 +690,18 @@ async fn join(home: &Home, gateway: &str, yes: bool) -> Result<bool> {
     };
     let resp = http
         .post(format!("{}/v1/enroll", base(gateway)))
-        .json(&json!({"signed_manifest": signed, "device_key": PublicKey::from(&device)}))
+        .json(&json!({
+            "signed_manifest": signed,
+            "device_key": PublicKey::from(&device),
+            "invitation_code": invitation.code,
+        }))
         .send()
         .await?;
     let status = resp.status();
     let body: Value = resp.json().await?;
     if !status.is_success() {
         println!("Enrolment refused ({status}): {body}");
-        return Ok(false);
+        return Ok(ExitCode::FAILURE);
     }
     home.write("manifest.toml", published.toml.as_bytes())?;
     let log_entries = match (
@@ -638,14 +730,24 @@ async fn join(home: &Home, gateway: &str, yes: bool) -> Result<bool> {
     println!(
         "The public log records only sha256(salt || pseudonym); the salt stays in enrolment.json."
     );
-    if home.has_legacy_log_head() {
-        std::fs::remove_file(home.file(LEGACY_LOG_HEAD))?;
-        println!("Removed the old hash-chain log head; this device now pins the Merkle log.");
+    match body["state"].as_str() {
+        Some("pending") => {
+            let hex = enrolment.device.as_str().trim_start_matches("pseudonym:");
+            println!(
+                "Waiting for IT approval. Read this device code to IT: {}",
+                &hex[..12]
+            );
+        }
+        Some("revoked") => println!("This device key is revoked."),
+        _ => {}
     }
-    Ok(report_log(
-        sync_log(&http, home, &mut enrolment).await?,
-        home,
-    ))
+    Ok(
+        if report_log(sync_log(&http, home, &mut enrolment).await?, home) {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(2)
+        },
+    )
 }
 
 fn vpn_csr(home: &Home) -> Result<String> {
@@ -707,7 +809,7 @@ async fn check(home: &Home) -> Result<ExitCode> {
     let os = current_os()?;
     let results = collect_results(&manifest, os);
 
-    let http = reqwest::Client::new();
+    let http = http_client()?;
     let sync = sync_log(&http, home, &mut enrolment).await?;
     let gateway = base(&enrolment.gateway);
     let log_checkpoint = disclosable_checkpoint(&manifest, home.checkpoint()?);
@@ -802,8 +904,9 @@ fn log_head(home: &Home) -> Result<()> {
         .read_text(LOG_CHECKPOINT)?
         .context("no log checkpoint yet; run join or check")?;
     print!("{text}");
-    if let Some(vkey) = home.read_text(LOG_KEY)? {
-        println!("\npinned log key {}", vkey.trim_end());
+    if let Ok(pins) = Pins::load(home) {
+        println!("\npinned company key {}", pins.company);
+        println!("pinned log key {}", pins.log.vkey());
     }
     Ok(())
 }
@@ -821,7 +924,7 @@ async fn log_prove(home: &Home, index: Option<u64>) -> Result<ExitCode> {
         print_log_upgrade(home);
         return Ok(ExitCode::FAILURE);
     }
-    let http = reqwest::Client::new();
+    let http = http_client()?;
     let sync = sync_log(&http, home, &mut enrolment).await?;
     let LogSync::Verified(cp, own) = sync else {
         report_log(sync, home);
@@ -879,15 +982,8 @@ fn log_show(path: &Path) -> Result<()> {
 
 async fn run(cli: Cli) -> Result<ExitCode> {
     let home = Home::new(cli.home)?;
-    let ok = |b: bool| {
-        if b {
-            ExitCode::SUCCESS
-        } else {
-            ExitCode::FAILURE
-        }
-    };
     match cli.command {
-        Command::Join { gateway, yes } => Ok(ok(join(&home, &gateway, yes).await?)),
+        Command::Join { invitation, yes } => join(&home, &invitation, yes).await,
         Command::Check => check(&home).await,
         Command::Log {
             command: LogCommand::Head,
@@ -920,6 +1016,33 @@ async fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_changed_company_key_or_log_key_is_reported() {
+        let fingerprint = || PublicKey::from(&dev_key::generate()).fingerprint();
+        let log = |k: &PublicKey| LogKey::new("pact.example.com/log", k);
+        let (log_a, log_b) = (
+            log(&PublicKey::from(&dev_key::generate())),
+            log(&PublicKey::from(&dev_key::generate())),
+        );
+        let company = fingerprint();
+        let pins = Pins {
+            company: company.clone(),
+            log: log_a.clone(),
+        };
+        assert_eq!(pins.differs(&company, &format!("{}\n", log_a.vkey())), None);
+        let other = fingerprint();
+        assert!(
+            pins.differs(&other, &log_a.vkey())
+                .unwrap()
+                .starts_with("the company key changed")
+        );
+        assert!(
+            pins.differs(&company, &log_b.vkey())
+                .unwrap()
+                .starts_with("the log key changed")
+        );
+    }
 
     #[test]
     fn sends_only_results_the_manifest_requires_on_this_os() {
