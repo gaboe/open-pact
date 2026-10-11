@@ -1604,6 +1604,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "open-pact-witness"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "axum",
+ "ed25519-dalek",
+ "hex",
+ "open-pact-core",
+ "rand 0.9.5",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "p256"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
