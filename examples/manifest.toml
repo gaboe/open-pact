@@ -1,0 +1,45 @@
+manifest_version = 1
+issuer = "company.example"
+valid_from = "2026-10-01"
+claim_max_age = "24h"
+claim_retention = "12mo"
+claim_recipients = ["Company IT security", "auditor on request"]
+disclosed_metadata = ["time", "device_pseudonym", "client_hash", "manifest_hash", "trust_level", "virtualized", "os"]
+data_controller = "Company Ltd., dpo@company.example"
+min_trust_level = "L0"               # demo only: software device keys are L0
+unknown_grace = "7d"
+
+[[control]]
+id = "disk_encryption"
+source = "customer_contract"
+source_ref = "Client contract, security annex, 4.2"
+rationale = "A lost laptop must not expose client data."
+check = "builtin:disk_encryption@1"
+output = ["full", "partial", "none", "unknown"]
+required = { macos = "full", windows = "full", linux = "full" }
+grace = "0d"
+
+[[control]]
+id = "firewall"
+source = "company_policy"
+check = "builtin:firewall@1"
+output = ["on", "off", "unknown"]
+required = { macos = "on", windows = "on", linux = "on" }
+grace = "1d"
+
+[[control]]
+id = "screen_lock"
+source = "customer_contract"
+source_ref = "Flow-down of RTS 2024/1774 Art. 13(l)"
+check = "builtin:screen_lock@1"
+output = ["le_5min", "le_15min", "gt_15min", "off", "unknown"]
+required = { macos = "le_5min", windows = "le_5min", linux = "le_5min" }
+grace = "1d"
+
+[[control]]
+id = "os_supported"
+source = "standard"
+check = "builtin:os_supported@1"
+output = ["yes", "no"]
+required = { macos = "yes", windows = "yes", linux = "yes" }
+grace = "14d"

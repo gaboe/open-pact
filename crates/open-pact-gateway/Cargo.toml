@@ -13,3 +13,4 @@ axum = "0.8"
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls", "migrate", "json", "macros"] }
 rand = "0.9"
 anyhow = "1"
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }

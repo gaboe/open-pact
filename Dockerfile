@@ -10,6 +10,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 gateway
 COPY --from=build /src/target/release/open-pact-gateway /usr/local/bin/open-pact-gateway
+COPY examples/manifest.toml /etc/open-pact/manifest.toml
+ENV MANIFEST_PATH=/etc/open-pact/manifest.toml
 USER 10001
 EXPOSE 8080
 ENTRYPOINT ["open-pact-gateway"]
