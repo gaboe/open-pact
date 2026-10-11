@@ -9,9 +9,10 @@ ENV CARGO_INCREMENTAL=0 \
 RUN cargo build --locked --release --target x86_64-unknown-linux-musl -p open-pact-gateway
 
 FROM --platform=linux/amd64 scratch
-COPY --from=build --chmod=0555 /src/target/x86_64-unknown-linux-musl/release/open-pact-gateway /open-pact-gateway
+COPY --from=build --chmod=0555 /src/target/x86_64-unknown-linux-musl/release/open-pact-gateway /usr/local/bin/open-pact-gateway
 COPY examples/manifest.toml /etc/open-pact/manifest.toml
-ENV MANIFEST_PATH=/etc/open-pact/manifest.toml
+ENV PATH=/usr/local/bin \
+    MANIFEST_PATH=/etc/open-pact/manifest.toml
 USER 10001:10001
 EXPOSE 8080
-ENTRYPOINT ["/open-pact-gateway"]
+ENTRYPOINT ["/usr/local/bin/open-pact-gateway"]
