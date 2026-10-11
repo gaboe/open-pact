@@ -70,7 +70,7 @@ impl Memory {
         })
     }
 
-    /// Writes a temporary file, syncs it and renames it over the state file.
+    /// Writes a new temporary file, syncs it and renames it over the state file.
     fn save(&self, path: &Path) -> anyhow::Result<()> {
         let stored = Stored {
             pinned_log_keys: self.pinned.iter().map(LogKey::vkey).collect(),
@@ -80,14 +80,27 @@ impl Memory {
                 .map(|(o, c)| (o.clone(), c.body()))
                 .collect(),
         };
-        let tmp = path.with_extension("tmp");
-        let file = std::fs::File::create(&tmp)?;
-        serde_json::to_writer_pretty(&file, &stored)?;
-        file.sync_all()?;
-        std::fs::rename(&tmp, path)?;
-        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-            std::fs::File::open(dir)?.sync_all()?;
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(format!(
+            ".{}.{}.tmp",
+            std::process::id(),
+            hex::encode(rand::random::<[u8; 8]>())
+        ));
+        let tmp = PathBuf::from(tmp);
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        let written = serde_json::to_writer_pretty(&file, &stored)
+            .map_err(anyhow::Error::from)
+            .and_then(|()| Ok(file.sync_all()?))
+            .and_then(|()| Ok(std::fs::rename(&tmp, path)?));
+        if written.is_err() {
+            let _ = std::fs::remove_file(&tmp);
         }
+        written?;
+        let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
+        std::fs::File::open(dir.unwrap_or(Path::new(".")))?.sync_all()?;
         Ok(())
     }
 }
@@ -388,6 +401,28 @@ mod tests {
             .await
             .unwrap();
         (resp.status().as_u16(), resp.text().await.unwrap())
+    }
+
+    #[test]
+    fn saving_leaves_other_files_in_the_directory_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let neighbour = dir.path().join("state.tmp");
+        std::fs::write(&neighbour, "another witness's state").unwrap();
+        let path = dir.path().join("state.json");
+        let memory = Memory::load(&path).unwrap();
+        memory.save(&path).unwrap();
+        memory.save(&path).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&neighbour).unwrap(),
+            "another witness's state"
+        );
+        let mut names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| !n.ends_with(".lock"))
+            .collect();
+        names.sort();
+        assert_eq!(names, ["state.json", "state.tmp"]);
     }
 
     #[tokio::test]
