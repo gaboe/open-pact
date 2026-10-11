@@ -1,0 +1,18 @@
+FROM rust:1-slim-bookworm AS build
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates crates
+COPY examples examples
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    (cargo test -p open-pact-client --no-run >/tmp/build.log 2>&1 || { cat /tmp/build.log; exit 1; }) \
+    && bin=$(grep -o 'target/debug/deps/open_pact_client-[0-9a-f]*' /tmp/build.log | head -1) \
+    && cp "$bin" /open-pact-checks
+
+FROM fedora:43
+RUN dnf -y upgrade --refresh \
+    && dnf -y install util-linux glib2 gsettings-desktop-schemas dconf firewalld \
+    && dnf clean all
+COPY --from=build /open-pact-checks /usr/local/bin/open-pact-checks
+COPY tests/linux/entrypoint.sh /usr/local/bin/entrypoint.sh
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

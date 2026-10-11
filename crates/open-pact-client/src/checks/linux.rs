@@ -10,21 +10,24 @@ const SECURE_BOOT_EFIVAR: &str =
     "/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c";
 const AUTOLOGIN_FILES: &[&str] = &[
     "/etc/gdm3/custom.conf",
+    "/etc/gdm3/daemon.conf",
     "/etc/gdm/custom.conf",
     "/etc/sddm.conf",
+    "/etc/lightdm/lightdm.conf",
 ];
-const AUTOLOGIN_DIR: &str = "/etc/sddm.conf.d";
+const AUTOLOGIN_DIRS: &[&str] = &["/etc/sddm.conf.d", "/etc/lightdm/lightdm.conf.d"];
+const APT_ROTATED_LOGS: u32 = 3;
 
 const UBUNTU_EOL: &[(&str, &str)] = &[
-    ("22.04", "2027-04-30"),
-    ("24.04", "2029-04-30"),
-    ("25.10", "2026-07-31"),
-    ("26.04", "2031-04-30"),
+    ("22.04", "2027-06-01"),
+    ("24.04", "2029-05-31"),
+    ("25.10", "2026-07-01"),
+    ("26.04", "2031-05-29"),
 ];
 const FEDORA_EOL: &[(&str, &str)] = &[
-    ("42", "2026-05-13"),
-    ("43", "2026-12-02"),
-    ("44", "2027-05-19"),
+    ("42", "2026-05-27"),
+    ("43", "2026-12-09"),
+    ("44", "2027-06-02"),
 ];
 
 pub fn disk_encryption() -> &'static str {
@@ -78,7 +81,9 @@ pub fn os_supported() -> &'static str {
 
 pub fn os_patch_age() -> &'static str {
     let last = match fs::read_to_string(APT_HISTORY) {
-        Ok(text) => parse_apt_history(&text),
+        Ok(text) => first_upgrade_date(
+            std::iter::once(text).chain((1..=APT_ROTATED_LOGS).filter_map(read_rotated_apt_log)),
+        ),
         Err(_) => run("dnf", &["history", "list"]).and_then(|t| parse_dnf_history(&t)),
     };
     last.map_or("unknown", |d| {
@@ -86,10 +91,19 @@ pub fn os_patch_age() -> &'static str {
     })
 }
 
+fn read_rotated_apt_log(n: u32) -> Option<String> {
+    let path = format!("{APT_HISTORY}.{n}");
+    fs::read_to_string(&path)
+        .ok()
+        .or_else(|| run("gzip", &["-dc", &format!("{path}.gz")]))
+}
+
 pub fn auto_login() -> &'static str {
     let mut paths: Vec<std::path::PathBuf> = AUTOLOGIN_FILES.iter().map(Into::into).collect();
-    if let Ok(dir) = fs::read_dir(AUTOLOGIN_DIR) {
-        paths.extend(dir.flatten().map(|e| e.path()));
+    for dir in AUTOLOGIN_DIRS {
+        if let Ok(dir) = fs::read_dir(dir) {
+            paths.extend(dir.flatten().map(|e| e.path()));
+        }
     }
     let texts: Vec<String> = paths
         .iter()
@@ -209,9 +223,11 @@ pub fn parse_kscreenlocker(ini: &str) -> &'static str {
         if let Some(section) = line.strip_prefix('[') {
             in_daemon = section.trim_end_matches(']') == "Daemon";
         } else if in_daemon {
-            match line.split_once('=') {
-                Some(("Autolock", v)) => autolock = v.trim() != "false",
-                Some(("Timeout", v)) => timeout_min = v.trim().parse().unwrap_or(timeout_min),
+            match line.split_once('=').map(|(k, v)| (k.trim(), v.trim())) {
+                Some(("Autolock", v)) => {
+                    autolock = !matches!(v.to_lowercase().as_str(), "false" | "no" | "off" | "0");
+                }
+                Some(("Timeout", v)) => timeout_min = v.parse().unwrap_or(timeout_min),
                 _ => {}
             }
         }
@@ -282,13 +298,46 @@ pub fn parse_apt_history(text: &str) -> Option<NaiveDate> {
     latest
 }
 
+pub fn first_upgrade_date(logs: impl Iterator<Item = String>) -> Option<NaiveDate> {
+    logs.into_iter().find_map(|log| parse_apt_history(&log))
+}
+
+const DNF_UPGRADE_COMMANDS: &[&str] = &[
+    "upgrade",
+    "update",
+    "up",
+    "upgrade-minimal",
+    "distro-sync",
+    "dsync",
+    "system-upgrade",
+    "offline",
+];
+
+fn is_dnf_upgrade(command: &str) -> bool {
+    let mut tokens = command
+        .split(|c: char| c.is_whitespace() || c == '|')
+        .filter(|t| !t.is_empty())
+        .skip_while(|t| t.chars().all(|c| c.is_ascii_digit()));
+    tokens
+        .find(|t| !t.starts_with('-') && !t.rsplit('/').next().is_some_and(is_dnf_program))
+        .is_some_and(|t| DNF_UPGRADE_COMMANDS.contains(&t))
+}
+
+fn is_dnf_program(name: &str) -> bool {
+    matches!(name, "dnf" | "dnf5" | "yum" | "microdnf")
+}
+
 pub fn parse_dnf_history(text: &str) -> Option<NaiveDate> {
     text.lines()
-        .filter(|l| {
-            let l = l.to_lowercase();
-            l.contains("upgrade") || l.contains("update")
+        .filter_map(|line| {
+            let (at, date) = line.split_whitespace().find_map(|t| {
+                Some((
+                    line.find(t)?,
+                    NaiveDate::parse_from_str(t, "%Y-%m-%d").ok()?,
+                ))
+            })?;
+            is_dnf_upgrade(&line[..at]).then_some(date)
         })
-        .filter_map(first_date)
         .max()
 }
 
@@ -299,13 +348,15 @@ pub fn parse_autologin(conf: &str) -> bool {
             section = name.trim_end_matches(']');
             continue;
         }
-        match line.split_once('=') {
-            Some(("AutomaticLoginEnable", v))
-                if matches!(v.trim().to_lowercase().as_str(), "true" | "1") =>
-            {
+        let Some((key, value)) = line.split_once('=').map(|(k, v)| (k.trim(), v.trim())) else {
+            continue;
+        };
+        match key {
+            "AutomaticLoginEnable" if matches!(value.to_lowercase().as_str(), "true" | "1") => {
                 return true;
             }
-            Some(("User", v)) if section == "Autologin" && !v.trim().is_empty() => return true,
+            "User" if section == "Autologin" && !value.is_empty() => return true,
+            "autologin-user" if !value.is_empty() => return true,
             _ => {}
         }
     }
@@ -467,7 +518,7 @@ luks-data crypt /home
         assert_eq!(parse_os_supported(&ubuntu("20.04"), today), "no");
         assert_eq!(parse_os_supported(&ubuntu("25.04"), today), "no");
         assert_eq!(parse_os_supported(&ubuntu("26.10"), today), "yes");
-        assert_eq!(parse_os_supported(&ubuntu("22.04"), d(2027, 5, 1)), "no");
+        assert_eq!(parse_os_supported(&ubuntu("22.04"), d(2027, 6, 2)), "no");
         assert_eq!(
             parse_os_supported("ID=fedora\nVERSION_ID=43\n", today),
             "yes"
@@ -551,5 +602,84 @@ ID     | Command line             | Date and time    | Action(s)      | Altered
         assert_eq!(parse_antimalware_units("active\ninactive\n"), "yes");
         assert_eq!(parse_antimalware_units("inactive\ninactive\n"), "no");
         assert_eq!(parse_antimalware_units(""), "unknown");
+    }
+
+    #[test]
+    fn dnf5_history_ignores_package_names_and_reads_plain_columns() {
+        let out = "\
+ID Command line                          Date and time       Action(s) Altered
+ 9 dnf install python3-update-notifier  2026-10-09 09:00:00                 4
+ 8 dnf -y upgrade --refresh             2026-09-30 05:47:37                46
+ 7 dnf5 --config /example.config -y --  2026-10-01 05:47:41               142
+";
+        assert_eq!(parse_dnf_history(out), Some(d(2026, 9, 30)));
+        let only_install = " 9 dnf install foo-update-tools  2026-10-09 09:00:00  4\n";
+        assert_eq!(parse_dnf_history(only_install), None);
+    }
+
+    #[test]
+    fn apt_upgrade_falls_back_to_rotated_logs() {
+        let current = "Start-Date: 2026-10-02  06:00:00\nCommandline: apt install foo\nInstall: foo:amd64 (1.0)\nEnd-Date: 2026-10-02  06:00:10\n";
+        let rotated = "Start-Date: 2026-09-20  06:25:01\nUpgrade: libc6:amd64 (2.39-1, 2.39-2)\nEnd-Date: 2026-09-20  06:25:30\n";
+        let logs = [current.to_string(), String::new(), rotated.to_string()];
+        assert_eq!(first_upgrade_date(logs.into_iter()), Some(d(2026, 9, 20)));
+        assert_eq!(first_upgrade_date(std::iter::empty()), None);
+    }
+
+    #[test]
+    fn autologin_keys_may_have_spaces_around_equals() {
+        assert!(parse_autologin("[daemon]\nAutomaticLoginEnable = true\n"));
+        assert!(parse_autologin("[Autologin]\nUser = alice\n"));
+        assert!(!parse_autologin(
+            "[daemon]\n#  AutomaticLoginEnable = true\n"
+        ));
+    }
+
+    #[test]
+    fn lightdm_autologin_user() {
+        assert!(parse_autologin("[Seat:*]\nautologin-user=alice\n"));
+        assert!(!parse_autologin(
+            "[Seat:*]\nautologin-user=\n#autologin-user=alice\n"
+        ));
+    }
+
+    #[test]
+    fn kde_lock_keys_tolerate_spaces_and_case() {
+        assert_eq!(parse_kscreenlocker("[Daemon]\nAutolock = false\n"), "off");
+        assert_eq!(parse_kscreenlocker("[Daemon]\nAutolock=False\n"), "off");
+        assert_eq!(parse_kscreenlocker("[Daemon]\nTimeout = 20\n"), "gt_15min");
+    }
+
+    #[test]
+    fn eol_dates_match_published_tables() {
+        assert_eq!(
+            parse_os_supported("ID=ubuntu\nVERSION_ID=\"22.04\"\n", d(2027, 6, 1)),
+            "yes"
+        );
+        assert_eq!(
+            parse_os_supported("ID=ubuntu\nVERSION_ID=\"22.04\"\n", d(2027, 6, 2)),
+            "no"
+        );
+        assert_eq!(
+            parse_os_supported("ID=fedora\nVERSION_ID=43\n", d(2026, 12, 9)),
+            "yes"
+        );
+        assert_eq!(
+            parse_os_supported("ID=fedora\nVERSION_ID=43\n", d(2026, 12, 10)),
+            "no"
+        );
+    }
+
+    #[test]
+    fn lsblk_ascii_tree_in_non_utf8_locale() {
+        let out = "\
+vg--root-lv  lvm   /
+`-luks-0     crypt
+  `-vda3     part
+    `-vda    disk
+vda2         part  /boot
+`-vda        disk
+";
+        assert_eq!(parse_lsblk_inverse(out), "full");
     }
 }

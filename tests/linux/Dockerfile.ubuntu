@@ -1,0 +1,22 @@
+FROM rust:1-slim-bookworm AS build
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates crates
+COPY examples examples
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    (cargo test -p open-pact-client --no-run >/tmp/build.log 2>&1 || { cat /tmp/build.log; exit 1; }) \
+    && bin=$(grep -o 'target/debug/deps/open_pact_client-[0-9a-f]*' /tmp/build.log | head -1) \
+    && cp "$bin" /open-pact-checks
+
+FROM ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get upgrade -y \
+    && apt-get install -y --no-install-recommends \
+        util-linux libglib2.0-bin gsettings-desktop-schemas dconf-gsettings-backend \
+        ufw firewalld \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /open-pact-checks /usr/local/bin/open-pact-checks
+COPY tests/linux/entrypoint.sh /usr/local/bin/entrypoint.sh
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
