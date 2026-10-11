@@ -641,11 +641,11 @@ async fn claim(
         None => None,
     };
     let manifest_hash = app.manifest.hash().as_str();
-    let now = chrono::Utc::now();
     let mut tx = app.db.begin().await.map_err(internal)?;
-    let state = devices::state(&mut tx, &claim.device, manifest_hash)
+    let state = devices::lock(&mut tx, &claim.device, manifest_hash)
         .await
         .map_err(internal)?;
+    let now = chrono::Utc::now();
     let enrolled = state.is_some();
     let first_failures = if enrolled {
         grace::load(&mut tx, &claim.device, manifest_hash)

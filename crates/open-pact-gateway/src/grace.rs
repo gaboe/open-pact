@@ -82,4 +82,63 @@ mod tests {
             .unwrap();
         assert!(load(&mut conn, &device, "m").await.unwrap().is_empty());
     }
+
+    /// R2-M4: claim A reads the empty state and saves it unchanged (an invalid envelope). Claim
+    /// B of the same device starts a failure meanwhile. A's stale save must not erase B's clock.
+    #[tokio::test]
+    #[ignore = "needs TEST_DATABASE_URL"]
+    async fn a_stale_concurrent_claim_cannot_erase_a_committed_failure() {
+        let db = testdb::fresh().await;
+        let device = Pseudonym::of(&PublicKey::from(&dev_key::generate()));
+        testdb::enrolled_device(&db, device.as_str(), "m").await;
+        let t0: DateTime<Utc> = "2026-10-12T09:00:00Z".parse().unwrap();
+
+        let mut a = db.begin().await.unwrap();
+        crate::devices::lock(&mut a, &device, "m").await.unwrap();
+        let stale = load(&mut a, &device, "m").await.unwrap();
+        assert!(stale.is_empty());
+
+        let mut b_conn = db.acquire().await.unwrap();
+        let b_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *b_conn)
+            .await
+            .unwrap();
+        let b_device = device.clone();
+        let b = tokio::spawn(async move {
+            let mut b = sqlx::Connection::begin(&mut *b_conn).await.unwrap();
+            crate::devices::lock(&mut b, &b_device, "m").await.unwrap();
+            let mut failures = load(&mut b, &b_device, "m").await.unwrap();
+            failures.entry("firewall".into()).or_insert(t0);
+            save(&mut b, &b_device, "m", &failures).await.unwrap();
+            b.commit().await.unwrap();
+        });
+        let waits_or_done = async {
+            loop {
+                let waiting: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1 AND wait_event_type = 'Lock')",
+                )
+                .bind(b_pid)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+                if waiting || b.is_finished() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), waits_or_done)
+            .await
+            .expect("claim B neither waits nor finishes");
+
+        save(&mut a, &device, "m", &stale).await.unwrap();
+        a.commit().await.unwrap();
+        b.await.unwrap();
+        let mut conn = db.acquire().await.unwrap();
+        assert_eq!(
+            load(&mut conn, &device, "m").await.unwrap(),
+            FirstFailures::from([("firewall".into(), t0)]),
+            "the failure clock B started survives A's stale save"
+        );
+    }
 }

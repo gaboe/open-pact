@@ -77,17 +77,20 @@ pub fn commitment(salt_hex: &str, device: &str) -> anyhow::Result<String> {
     Ok(format!("sha256:{}", hex::encode(h.finalize())))
 }
 
-pub async fn state(
+/// The state of `device` under `manifest`, with its row locked until the transaction ends. Claims
+/// of one device then load, evaluate and save their grace state one after another (R2-M4).
+pub async fn lock(
     conn: &mut PgConnection,
     device: &Pseudonym,
     manifest: &str,
 ) -> anyhow::Result<Option<State>> {
-    let state: Option<String> =
-        sqlx::query_scalar("SELECT state FROM devices WHERE pseudonym = $1 AND manifest_hash = $2")
-            .bind(device.as_str())
-            .bind(manifest)
-            .fetch_optional(conn)
-            .await?;
+    let state: Option<String> = sqlx::query_scalar(
+        "SELECT state FROM devices WHERE pseudonym = $1 AND manifest_hash = $2 FOR UPDATE",
+    )
+    .bind(device.as_str())
+    .bind(manifest)
+    .fetch_optional(conn)
+    .await?;
     state.as_deref().map(State::parse).transpose()
 }
 
