@@ -221,6 +221,20 @@ fn disclosable(
         .collect()
 }
 
+/// The checkpoint goes into the claim only if the signed manifest discloses it.
+fn disclosable_checkpoint(manifest: &Manifest, cp: Option<Checkpoint>) -> Option<LogCheckpoint> {
+    cp.filter(|_| {
+        manifest
+            .body()
+            .disclosed_metadata
+            .contains("log_checkpoint")
+    })
+    .map(|cp| LogCheckpoint {
+        size: cp.size,
+        root: cp.root,
+    })
+}
+
 fn base(gateway: &str) -> &str {
     gateway.trim_end_matches('/')
 }
@@ -524,10 +538,7 @@ async fn check(home: &Home) -> Result<ExitCode> {
     let http = reqwest::Client::new();
     let gateway = base(&enrolment.gateway);
     let sync = sync_log(&http, home, gateway).await?;
-    let log_checkpoint = home.checkpoint()?.map(|cp| LogCheckpoint {
-        size: cp.size,
-        root: cp.root,
-    });
+    let log_checkpoint = disclosable_checkpoint(&manifest, home.checkpoint()?);
     let nonce: Nonce = http
         .post(format!("{gateway}/v1/nonce"))
         .send()
@@ -784,5 +795,27 @@ mod tests {
             ["disk_encryption", "firewall", "screen_lock"]
         );
         assert_eq!(ids(Os::Linux), ["disk_encryption", "screen_lock"]);
+    }
+
+    #[test]
+    fn sends_log_checkpoint_only_if_the_manifest_discloses_it() {
+        let toml = include_str!("../../../examples/manifest.toml");
+        let cp = Checkpoint {
+            origin: "pact.example.com/log".into(),
+            size: 3,
+            root: LogHash([1; 32]),
+        };
+        let listed = Manifest::parse(toml.as_bytes()).unwrap();
+        assert_eq!(
+            disclosable_checkpoint(&listed, Some(cp.clone())),
+            Some(LogCheckpoint {
+                size: 3,
+                root: LogHash([1; 32])
+            })
+        );
+        let unlisted = toml.replace(r#", "log_checkpoint"]"#, "]");
+        assert_ne!(unlisted, toml);
+        let unlisted = Manifest::parse(unlisted.as_bytes()).unwrap();
+        assert_eq!(disclosable_checkpoint(&unlisted, Some(cp)), None);
     }
 }
