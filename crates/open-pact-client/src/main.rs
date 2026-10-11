@@ -1,5 +1,8 @@
 mod checks;
+mod device_key;
 mod locallog;
+#[cfg(target_os = "macos")]
+mod secure_enclave;
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
@@ -8,11 +11,11 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use device_key::DeviceKey;
 use open_pact_core::{
     Checkpoint, Claim, Endorsement, EnrolRequest, Entry, EntryKind, Invitation, LogCheckpoint,
     LogHash, LogKey, Manifest, ManifestHash, Note, Os, Pseudonym, PublicKey, SignedManifest,
-    TrustLevel, Virtualized, dev_key, root, sign_claim, verify_claim, verify_consistency,
-    verify_inclusion,
+    Virtualized, dev_key, root, verify_claim, verify_consistency, verify_inclusion,
 };
 use rcgen::{CertificateParams, DistinguishedName, KeyPair};
 use serde::{Deserialize, Serialize};
@@ -44,6 +47,9 @@ enum Command {
         /// Sign without asking
         #[arg(long)]
         yes: bool,
+        /// Keep a new device key in a file (trust level L0) even when a Secure Enclave is available
+        #[arg(long)]
+        software_key: bool,
     },
     /// Run the manifest's checks, send a signed claim and fetch a VPN certificate
     Check,
@@ -653,7 +659,13 @@ fn print_log_upgrade(home: &Home) {
     );
 }
 
-async fn join(home: &Home, invitation: &str, yes: bool, insecure_dev: bool) -> Result<ExitCode> {
+async fn join(
+    home: &Home,
+    invitation: &str,
+    yes: bool,
+    software_key: bool,
+    insecure_dev: bool,
+) -> Result<ExitCode> {
     let invitation = Invitation::decode(invitation)?;
     let gateway = invitation.gateway.as_str();
     check_scheme(gateway, insecure_dev)?;
@@ -705,13 +717,19 @@ async fn join(home: &Home, invitation: &str, yes: bool, insecure_dev: bool) -> R
         return Ok(ExitCode::FAILURE);
     }
     let owner = dev_key::load_or_create(&home.file("owner-dev.pem"))?;
-    let device = dev_key::load_or_create(&home.file("device-dev.pem"))?;
+    let device = DeviceKey::load_or_create(&home.0, software_key)?;
     let signed = SignedManifest {
         toml: published.toml.clone(),
         company: published.company,
         owner: Endorsement::sign(&owner, manifest.hash()),
     };
-    let request = EnrolRequest::sign(signed, invitation.code.clone(), &owner, &device)?;
+    let request = EnrolRequest::sign_with(
+        signed,
+        invitation.code.clone(),
+        &owner,
+        &device.public_key(),
+        |statement| device.sign(statement),
+    )?;
     let resp = http
         .post(format!("{}/v1/enroll", base(gateway)))
         .json(&request)
@@ -737,13 +755,18 @@ async fn join(home: &Home, invitation: &str, yes: bool, insecure_dev: bool) -> R
     let mut enrolment = Enrolment {
         gateway: gateway.to_string(),
         manifest: manifest.hash().clone(),
-        device: Pseudonym::of(&PublicKey::from(&device)),
+        device: Pseudonym::of(&device.public_key()),
         salt: body["salt"].as_str().context("salt")?.to_string(),
         log_entries,
     };
     home.write("enrolment.json", &serde_json::to_vec_pretty(&enrolment)?)?;
     println!("Owner signed {}", manifest.hash());
     println!("Enrolled as {}", enrolment.device);
+    println!(
+        "Device key: {}, trust level {:?}",
+        device.describe(),
+        device.trust_level()
+    );
     if let Some(index) = body["log_index"].as_u64() {
         println!("Enrolment is log entry #{index}; prove it with: open-pact-client log prove");
     }
@@ -826,7 +849,7 @@ async fn check(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
     if manifest.hash() != &enrolment.manifest {
         bail!("manifest.toml no longer matches the hash you signed");
     }
-    let device = dev_key::load(&home.file("device-dev.pem"))?;
+    let device = DeviceKey::load(&home.0)?;
     let os = current_os()?;
     let results = collect_results(&manifest, os);
 
@@ -841,7 +864,7 @@ async fn check(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
         .error_for_status()?
         .json()
         .await?;
-    let device_key = PublicKey::from(&device);
+    let device_key = device.public_key();
     let claim = Claim {
         manifest: manifest.hash().clone(),
         device: Pseudonym::of(&device_key),
@@ -851,13 +874,13 @@ async fn check(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
             .context("clock")?,
         client: concat!("open-pact-client ", env!("CARGO_PKG_VERSION")).into(),
         os,
-        trust_level: TrustLevel::L0,
+        trust_level: device.trust_level(),
         virtualized: virtualized(),
         results,
         csr_pem: Some(vpn_csr(home)?),
         log_checkpoint,
     };
-    let sent = serde_json::to_vec(&json!({ "jws": sign_claim(&claim, &device)? }))?;
+    let sent = serde_json::to_vec(&json!({ "jws": device.sign_claim(&claim)? }))?;
     let resp = http
         .post(format!("{gateway}/v1/claim"))
         .header("content-type", "application/json")
@@ -1005,7 +1028,11 @@ fn log_show(path: &Path) -> Result<()> {
 async fn run(cli: Cli) -> Result<ExitCode> {
     let home = Home::new(cli.home)?;
     match cli.command {
-        Command::Join { invitation, yes } => join(&home, &invitation, yes, cli.insecure_dev).await,
+        Command::Join {
+            invitation,
+            yes,
+            software_key,
+        } => join(&home, &invitation, yes, software_key, cli.insecure_dev).await,
         Command::Check => check(&home, cli.insecure_dev).await,
         Command::Log {
             command: LogCommand::Head,

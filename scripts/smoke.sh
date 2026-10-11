@@ -50,7 +50,7 @@ inv="$(invite "smoke owner")"
 [[ "$inv" == opi1:* ]]
 echo "invitation created: ${inv:0:24}..."
 
-got="$(run_status "${client[@]}" join "$(tamper "$inv" company flip)" --yes)"
+got="$(run_status "${client[@]}" join "$(tamper "$inv" company flip)" --yes --software-key)"
 [ "$got" = 1 ] || { cat "$tmp/out"; exit 1; }
 grep -q 'is not the gateway in your invitation: the company key differs' "$tmp/out"
 [ ! -e "$home/company-key.txt" ]
@@ -58,12 +58,12 @@ grep -q 'is not the gateway in your invitation: the company key differs' "$tmp/o
 [ ! -e "$home/enrolment.json" ]
 echo "an invitation with another company key fingerprint is refused before anything is sent or pinned"
 
-got="$(run_status "${client[@]}" join "$(tamper "$inv" gateway http://pact.example.com)" --yes)"
+got="$(run_status "${client[@]}" join "$(tamper "$inv" gateway http://pact.example.com)" --yes --software-key)"
 [ "$got" = 1 ]
 grep -q 'refusing plain http://' "$tmp/out"
 echo "plain http to a remote gateway is refused"
 
-"${client[@]}" join "$inv" --yes > "$tmp/join"
+"${client[@]}" join "$inv" --yes --software-key > "$tmp/join"
 grep -q '^Gateway keys match the invitation' "$tmp/join"
 grep -q '^Enrolled as pseudonym:' "$tmp/join"
 grep -q '^Transparency log verified' "$tmp/join"
@@ -79,19 +79,19 @@ grep -q 'device awaiting IT approval' "$tmp/out"
 echo "check before approval: denied, device awaiting IT approval"
 
 head_before="$("${client[@]}" log head)"
-"${client[@]}" join "$inv" --yes > "$tmp/rejoin"
+"${client[@]}" join "$inv" --yes --software-key > "$tmp/rejoin"
 diff <(grep '^Enrolled' "$tmp/join") <(grep '^Enrolled' "$tmp/rejoin")
 [ "$head_before" = "$("${client[@]}" log head)" ]
 echo "re-join with the same invitation is idempotent: same pseudonym, no new log entry"
 
-got="$(run_status "$root/target/debug/open-pact-client" --home "$tmp/other" join "$inv" --yes)"
+got="$(run_status "$root/target/debug/open-pact-client" --home "$tmp/other" join "$inv" --yes --software-key)"
 [ "$got" = 1 ]
 grep -q 'invalid or used invitation' "$tmp/out"
 echo "another device cannot reuse the invitation: $(grep -o '"reasons":\[[^]]*\]' "$tmp/out")"
 
 race="$(invite "smoke race")"
 for i in 1 2 3; do
-  ( "$root/target/debug/open-pact-client" --home "$tmp/race$i" join "$race" --yes > "$tmp/race$i.out" 2>&1; echo $? > "$tmp/race$i.code" ) &
+  ( "$root/target/debug/open-pact-client" --home "$tmp/race$i" join "$race" --yes --software-key > "$tmp/race$i.out" 2>&1; echo $? > "$tmp/race$i.code" ) &
 done
 wait
 winners="$(grep -lx 0 "$tmp"/race?.code | wc -l | tr -d ' ')"
@@ -242,7 +242,7 @@ echo "without stored indexes the client finds its entries, proves them and store
 rm "$home/log-checkpoint.txt"
 echo '{"index": 3, "hash": "00"}' > "$home/log-head.json"
 expect_status "a v0.1.0 log head asks for re-join instead of an alarm" 1 'log format was upgraded'
-"${client[@]}" join "$inv" --yes > "$tmp/rejoin2"
+"${client[@]}" join "$inv" --yes --software-key > "$tmp/rejoin2"
 grep -q '^Transparency log verified' "$tmp/rejoin2"
 [ ! -e "$home/log-head.json" ]
 echo "join replaces the old head with a checkpoint"

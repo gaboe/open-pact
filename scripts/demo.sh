@@ -50,6 +50,8 @@ admin devices approve "$(sed -nE 's/^Waiting for IT approval. Read this device c
 
 step "The device runs the checks and sends one signed claim"
 "${client[@]}" check
+"${client[@]}" log show > "$tmp/sent"
+grep -m 1 '"trust_level"' "$tmp/sent" | sed -E 's/.*: "(L[0-9])".*/Trust level in the signed claim: \1/'
 
 step "Any VPN that trusts the gateway CA accepts this short-lived certificate"
 openssl x509 -in "$home/vpn-cert.pem" -noout -subject -issuer -enddate -ext extendedKeyUsage

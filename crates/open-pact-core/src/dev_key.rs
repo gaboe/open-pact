@@ -29,7 +29,11 @@ pub fn from_pem(pem: &str) -> Result<SigningKey, p256::pkcs8::Error> {
 }
 
 pub fn save(path: &Path, key: &SigningKey) -> Result<(), Error> {
-    let pem = to_pem(key);
+    write_new(path, to_pem(key).as_bytes())
+}
+
+/// Writes a new owner-only (0600) key file; never overwrites one.
+pub fn write_new(path: &Path, bytes: &[u8]) -> Result<(), Error> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| key_error(path, e))?;
     }
@@ -38,7 +42,7 @@ pub fn save(path: &Path, key: &SigningKey) -> Result<(), Error> {
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
     let mut file = options.open(path).map_err(|e| key_error(path, e))?;
-    std::io::Write::write_all(&mut file, pem.as_bytes()).map_err(|e| key_error(path, e))
+    std::io::Write::write_all(&mut file, bytes).map_err(|e| key_error(path, e))
 }
 
 pub fn load(path: &Path) -> Result<SigningKey, Error> {
