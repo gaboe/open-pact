@@ -20,6 +20,7 @@ dev_witness="$root/target/debug/examples/dev_witness"
 "${client[@]}" join --gateway "$url" --yes > "$tmp/join"
 grep -q '^Enrolled as pseudonym:' "$tmp/join"
 grep -q '^Transparency log verified' "$tmp/join"
+grep -q '^Inclusion proofs verified: the manifest you signed (#0) and your enrolment' "$tmp/join"
 echo "join: $(grep '^Enrolled' "$tmp/join")"
 
 head_before="$("${client[@]}" log head)"
@@ -129,6 +130,35 @@ expect_status "a gateway behind the stored checkpoint (rollback) raises the alar
 cp "$tmp/good-checkpoint" "$home/log-checkpoint.txt"
 "${client[@]}" check > /dev/null
 echo "the restored checkpoint verifies again"
+
+cp "$home/enrolment.json" "$tmp/good-enrolment"
+python3 - "$home/enrolment.json" <<'PY'
+import json, sys
+e = json.load(open(sys.argv[1]))
+e["salt"] = ("1" if e["salt"][0] != "1" else "2") + e["salt"][1:]
+json.dump(e, open(sys.argv[1], "w"))
+PY
+expect_status "a log without this device's enrolment raises the alarm" 2 "is not this device's enrolment"
+
+cp "$tmp/good-enrolment" "$home/enrolment.json"
+python3 - "$home/enrolment.json" <<'PY'
+import json, sys
+e = json.load(open(sys.argv[1]))
+e["log_entries"]["manifest"] = e["log_entries"]["enrolment"]
+json.dump(e, open(sys.argv[1], "w"))
+PY
+expect_status "a log without the signed manifest at its index raises the alarm" 2 "is not the manifest you signed"
+
+python3 - "$home/enrolment.json" <<'PY'
+import json, sys
+e = json.load(open(sys.argv[1]))
+del e["log_entries"]
+json.dump(e, open(sys.argv[1], "w"))
+PY
+"${client[@]}" check > "$tmp/found" 2>&1
+grep -q '^Inclusion proofs verified' "$tmp/found"
+grep -q '"log_entries"' "$home/enrolment.json"
+echo "without stored indexes the client finds its entries, proves them and stores the indexes"
 
 rm "$home/log-checkpoint.txt"
 echo '{"index": 3, "hash": "00"}' > "$home/log-head.json"

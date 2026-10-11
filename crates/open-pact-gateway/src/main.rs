@@ -423,12 +423,20 @@ async fn enroll(
         }
     };
     tx.commit().await.map_err(internal)?;
+    let manifest_index: i64 = sqlx::query_scalar(
+        "SELECT idx FROM log_entries WHERE kind = 'manifest_published' AND data->>'manifest' = $1",
+    )
+    .bind(app.manifest.hash().as_str())
+    .fetch_one(&app.db)
+    .await
+    .map_err(internal)?;
     let checkpoint = app.checkpoint().await?;
     Ok(Json(json!({
         "status": "enrolled",
         "device": device,
         "salt": salt,
         "log_index": log_index,
+        "manifest_log_index": manifest_index,
         "log_checkpoint": checkpoint.to_string(),
     })))
 }

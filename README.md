@@ -49,12 +49,12 @@ Nothing runs in the background. To uninstall, delete the binary and the director
 | Request | Response |
 | --- | --- |
 | `GET /v1/manifest` | `{toml, company}`: the enforced manifest and the company's signature over its hash |
-| `POST /v1/enroll {signed_manifest, device_key}` | `{status: "enrolled", device, salt, log_index, log_checkpoint}`. The gateway checks both signatures, that `company.key` is its own key and that the hash is the enforced manifest. Enrolling the same device key again changes nothing; a different owner key gets 409. |
+| `POST /v1/enroll {signed_manifest, device_key}` | `{status: "enrolled", device, salt, log_index, manifest_log_index, log_checkpoint}`. The gateway checks both signatures, that `company.key` is its own key and that the hash is the enforced manifest. Enrolling the same device key again changes nothing; a different owner key gets 409. |
 | `POST /v1/nonce` | `{nonce}`, single use, valid 5 minutes |
 | `POST /v1/claim {jws}` | `{status: "accepted", warnings, certificate_pem, ca_pem, log_checkpoint}`, or 403 `{status: "denied", reasons}` |
 | `GET /v1/log/key` | the log verifier key, `<origin>+<key id>+<base64 key>` |
 | `GET /v1/log/checkpoint` | the signed checkpoint note, with stored witness cosignatures |
-| `GET /v1/log/entries?from=&to=` | `{entries}`, `from` inclusive, `to` exclusive, default the whole log |
+| `GET /v1/log/entries?from=&to=` | `{entries}`, `from` inclusive, `to` exclusive, at most 256 entries; without `to`, one page |
 | `GET /v1/log/proof/inclusion?index=&size=` | `{index, size, proof}`, hashes in lowercase hex |
 | `GET /v1/log/proof/consistency?from=&to=` | `{from, to, proof}` |
 | `POST /v1/log/witness` | body: a checkpoint note with witness cosignature lines; stores the valid ones |
@@ -79,9 +79,9 @@ curl -s localhost:8080/v1/log/checkpoint | cargo run -q -p open-pact-core --exam
   | curl -s --data-binary @- localhost:8080/v1/log/witness
 ```
 
-**Client.** The client pins the log key at the first `join`. On every `join` and `check` it fetches the checkpoint, verifies the signature and verifies a consistency proof from the checkpoint it stored. On first contact it downloads all entries and recomputes the root instead. If a check fails, the client prints an alarm and exits with status 2. `log prove [index]` verifies the inclusion proof of one entry. Without an index, it proves the entry of this device's enrolment. Each claim carries `log_checkpoint`, the size and root that the client verified last.
+**Client.** The client pins the log key at the first `join`. On every `join` and `check` it fetches the checkpoint, verifies the signature and verifies a consistency proof from the checkpoint it stored. On first contact it downloads all entries and recomputes the root instead. It then fetches the entry for the manifest hash the owner signed and the entry with this device's commitment `sha256(salt || pseudonym)`, and verifies an inclusion proof for each. `enrolment.json` keeps their indexes; the gateway returns them at enrolment. If a check fails or an entry is missing, the client prints an alarm and exits with status 2. `log prove [index]` verifies the inclusion proof of one entry. Without an index, it proves the entry of this device's enrolment. Each claim carries `log_checkpoint`, the size and root that the client verified last.
 
-The checkpoint, the cosignatures and the proofs also verify with the Go packages `golang.org/x/mod/sumdb/note`, `github.com/transparency-dev/formats/note` and `github.com/transparency-dev/merkle/proof`. `log_entries` rejects `UPDATE`, `DELETE` and `TRUNCATE` with a trigger.
+The gateway reads each log row from the database once and signs the checkpoint once per tree size. The checkpoint, the cosignatures and the proofs also verify with the Go packages `golang.org/x/mod/sumdb/note`, `github.com/transparency-dev/formats/note` and `github.com/transparency-dev/merkle/proof`. `log_entries` rejects `UPDATE`, `DELETE` and `TRUNCATE` with a trigger.
 
 **Upgrade from v0.1.0.** Migration 0004 drops the hash-chain columns. The entries keep their order and become the leaves, and the log key stays. A client that holds a v0.1.0 `log-head.json` tells the owner to run `join` again, exits with status 1 and raises no alarm. `join` removes the old file and pins the checkpoint. `GET /v1/log` answers 410. The example manifest now lists `log_checkpoint` in `disclosed_metadata`, so its hash changes and owners sign it again at that `join`.
 
