@@ -391,15 +391,65 @@ fn first_date(line: &str) -> Option<NaiveDate> {
         .find_map(|t| NaiveDate::parse_from_str(t, "%Y-%m-%d").ok())
 }
 
+/// Patch-age heuristic. Package history records neither the archive pocket nor
+/// advisories, so a transaction counts as an OS update only when it upgraded
+/// something and either (a) was a whole-system upgrade (`apt upgrade`,
+/// `dist-upgrade`, `full-upgrade`, `unattended-upgrade`, with no package
+/// names) or (b) upgraded a kernel or base OS package. One application
+/// upgrade or install never resets the age. Without a qualifying entry the
+/// age is unknown.
+const APT_FULL_UPGRADE_VERBS: &[&str] =
+    &["upgrade", "dist-upgrade", "full-upgrade", "safe-upgrade"];
+const BASE_OS_PACKAGES: &[&str] = &[
+    "libc6",
+    "systemd",
+    "openssl",
+    "base-files",
+    "dpkg",
+    "apt",
+    "ubuntu-minimal",
+];
+const BASE_OS_PREFIXES: &[&str] = &["linux-image", "linux-generic", "linux-modules", "libssl"];
+
+fn is_apt_full_upgrade(commandline: &str) -> bool {
+    let mut tokens = commandline.split_whitespace();
+    let Some(program) = tokens.next().and_then(|t| t.rsplit('/').next()) else {
+        return false;
+    };
+    if program.starts_with("unattended-upgrade") {
+        return true;
+    }
+    if !matches!(program, "apt" | "apt-get" | "aptitude") {
+        return false;
+    }
+    let args: Vec<&str> = tokens.filter(|t| !t.starts_with('-')).collect();
+    matches!(args.as_slice(), [verb] if APT_FULL_UPGRADE_VERBS.contains(verb))
+}
+
+fn upgrades_base_os(upgrade_line: &str) -> bool {
+    upgrade_line
+        .split("), ")
+        .filter_map(|entry| entry.split_whitespace().next())
+        .map(|name| name.split(':').next().unwrap_or(name))
+        .any(|name| {
+            BASE_OS_PACKAGES.contains(&name) || BASE_OS_PREFIXES.iter().any(|p| name.starts_with(p))
+        })
+}
+
 pub fn parse_apt_history(text: &str) -> Option<NaiveDate> {
+    let mut full_upgrade = false;
     let mut upgraded = false;
+    let mut base_os = false;
     let mut latest = None;
     for line in text.lines() {
         if line.starts_with("Start-Date:") {
-            upgraded = false;
-        } else if line.starts_with("Upgrade:") {
+            (full_upgrade, upgraded, base_os) = (false, false, false);
+        } else if let Some(cmd) = line.strip_prefix("Commandline:") {
+            full_upgrade = is_apt_full_upgrade(cmd);
+        } else if let Some(pkgs) = line.strip_prefix("Upgrade:") {
             upgraded = true;
-        } else if line.starts_with("End-Date:") && upgraded {
+            base_os |= upgrades_base_os(pkgs);
+        } else if line.starts_with("End-Date:") && upgraded && (full_upgrade || base_os) {
             latest = latest.max(first_date(line));
         }
     }
@@ -421,14 +471,33 @@ const DNF_UPGRADE_COMMANDS: &[&str] = &[
     "offline",
 ];
 
+/// A dnf transaction counts only when it upgrades the whole system: an upgrade
+/// verb with no package-name filter, or one limited by a security advisory
+/// flag. Offline upgrades take a subcommand instead of packages. The history
+/// column truncates long command lines, so a cut-off filter is not seen.
+const DNF_SYSTEM_UPGRADE_COMMANDS: &[&str] = &["system-upgrade", "offline"];
+const DNF_ADVISORY_FLAGS: &[&str] = &["--security", "--advisor", "--sec-severity", "--cve", "--bz"];
+
 fn is_dnf_upgrade(command: &str) -> bool {
     let mut tokens = command
         .split(|c: char| c.is_whitespace() || c == '|')
         .filter(|t| !t.is_empty())
-        .skip_while(|t| t.chars().all(|c| c.is_ascii_digit()));
-    tokens
-        .find(|t| !t.starts_with('-') && !t.rsplit('/').next().is_some_and(is_dnf_program))
-        .is_some_and(|t| DNF_UPGRADE_COMMANDS.contains(&t))
+        .skip_while(|t| t.chars().all(|c| c.is_ascii_digit()))
+        .filter(|t| !t.rsplit('/').next().is_some_and(is_dnf_program))
+        .skip_while(|t| t.starts_with('-'));
+    let Some(verb) = tokens.next() else {
+        return false;
+    };
+    if !DNF_UPGRADE_COMMANDS.contains(&verb) {
+        return false;
+    }
+    if DNF_SYSTEM_UPGRADE_COMMANDS.contains(&verb) {
+        return true;
+    }
+    let rest: Vec<&str> = tokens.collect();
+    rest.iter()
+        .any(|t| DNF_ADVISORY_FLAGS.iter().any(|f| t.starts_with(f)))
+        || rest.iter().all(|t| t.starts_with('-'))
 }
 
 fn is_dnf_program(name: &str) -> bool {
@@ -783,6 +852,76 @@ End-Date: 2026-10-05  09:00:05
         assert_eq!(parse_apt_history(""), None);
     }
 
+    fn apt_entry(date: &str, cmd: &str, upgrade: &str) -> String {
+        format!(
+            "Start-Date: {date}  06:00:00\nCommandline: {cmd}\nUpgrade: {upgrade}\nEnd-Date: {date}  06:00:30\n\n"
+        )
+    }
+
+    #[test]
+    fn apt_single_application_upgrade_does_not_reset_patch_age() {
+        let log = apt_entry("2026-09-01", "apt upgrade", "libc6:amd64 (2.39-1, 2.39-2)")
+            + &apt_entry(
+                "2026-10-11",
+                "apt install --only-upgrade fictional-editor",
+                "fictional-editor:amd64 (1.0, 1.1)",
+            );
+        assert_eq!(parse_apt_history(&log), Some(d(2026, 9, 1)));
+        let only_app = apt_entry(
+            "2026-10-11",
+            "apt install fictional-editor",
+            "fictional-editor:amd64 (1.0, 1.1)",
+        );
+        assert_eq!(parse_apt_history(&only_app), None);
+        let named_upgrade = apt_entry(
+            "2026-10-11",
+            "apt upgrade fictional-editor",
+            "fictional-editor:amd64 (1.0, 1.1)",
+        );
+        assert_eq!(parse_apt_history(&named_upgrade), None);
+    }
+
+    #[test]
+    fn apt_full_upgrades_and_base_os_packages_count() {
+        let pkg = "fictional-lib:amd64 (1.0, 1.1)";
+        for cmd in [
+            "apt upgrade",
+            "apt-get -y dist-upgrade",
+            "/usr/bin/apt full-upgrade",
+            "/usr/bin/unattended-upgrade",
+        ] {
+            let log = apt_entry("2026-10-01", cmd, pkg);
+            assert_eq!(parse_apt_history(&log), Some(d(2026, 10, 1)), "{cmd}");
+        }
+        let kernel = apt_entry(
+            "2026-10-02",
+            "aptdaemon role='role-commit-packages'",
+            "fictional-editor:amd64 (1, 2), linux-image-6.8.0-1-generic:amd64 (6.8.0-1, 6.8.0-2)",
+        );
+        assert_eq!(parse_apt_history(&kernel), Some(d(2026, 10, 2)));
+    }
+
+    #[test]
+    fn apt_held_upgrade_with_no_upgraded_packages_is_ignored() {
+        let held = "Start-Date: 2026-10-11  06:00:00\nCommandline: apt upgrade\nEnd-Date: 2026-10-11  06:00:30\n";
+        assert_eq!(parse_apt_history(held), None);
+    }
+
+    #[test]
+    fn dnf_package_filtered_upgrade_does_not_reset_patch_age() {
+        let out = "\
+ID Command line                         Date and time       Action(s) Altered
+ 9 dnf upgrade fictional-editor         2026-10-11 09:00:00                 1
+ 8 dnf update -y fictional-editor       2026-10-10 09:00:00                 1
+ 7 dnf -y upgrade --refresh             2026-09-01 05:47:37                46
+";
+        assert_eq!(parse_dnf_history(out), Some(d(2026, 9, 1)));
+        let security = " 9 dnf upgrade --security fictional-editor 2026-10-11 09:00:00 1\n";
+        assert_eq!(parse_dnf_history(security), Some(d(2026, 10, 11)));
+        let only_filtered = " 9 dnf upgrade fictional-editor 2026-10-11 09:00:00 1\n";
+        assert_eq!(parse_dnf_history(only_filtered), None);
+    }
+
     #[test]
     fn dnf_history_last_upgrade() {
         let out = "\
@@ -850,7 +989,7 @@ ID Command line                          Date and time       Action(s) Altered
     #[test]
     fn apt_upgrade_falls_back_to_rotated_logs() {
         let current = "Start-Date: 2026-10-02  06:00:00\nCommandline: apt install foo\nInstall: foo:amd64 (1.0)\nEnd-Date: 2026-10-02  06:00:10\n";
-        let rotated = "Start-Date: 2026-09-20  06:25:01\nUpgrade: libc6:amd64 (2.39-1, 2.39-2)\nEnd-Date: 2026-09-20  06:25:30\n";
+        let rotated = "Start-Date: 2026-09-20  06:25:01\nCommandline: apt upgrade\nUpgrade: libc6:amd64 (2.39-1, 2.39-2)\nEnd-Date: 2026-09-20  06:25:30\n";
         let logs = [current.to_string(), String::new(), rotated.to_string()];
         assert_eq!(first_upgrade_date(logs.into_iter()), Some(d(2026, 9, 20)));
         assert_eq!(first_upgrade_date(std::iter::empty()), None);

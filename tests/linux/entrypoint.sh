@@ -73,7 +73,7 @@ case $variant in
         else
             mkdir -p /var/log/apt
             printf 'Start-Date: 2026-10-02  06:00:00\nCommandline: apt install example-tool\nInstall: example-tool:amd64 (1.0)\nEnd-Date: 2026-10-02  06:00:10\n' >/var/log/apt/history.log
-            printf 'Start-Date: 2024-01-09  08:14:00\nUpgrade: example-lib:amd64 (1.0, 1.1)\nEnd-Date: 2024-01-09  08:15:02\n' | gzip >/var/log/apt/history.log.1.gz
+            printf 'Start-Date: 2024-01-09  08:14:00\nCommandline: apt upgrade\nUpgrade: example-lib:amd64 (1.0, 1.1)\nEnd-Date: 2024-01-09  08:15:02\n' | gzip >/var/log/apt/history.log.1.gz
         fi ;;
     eol)
         if [ "$distro" = fedora ]; then
