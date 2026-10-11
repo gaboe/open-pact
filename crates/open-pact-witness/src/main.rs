@@ -112,8 +112,32 @@ struct Witness {
     /// WITNESS_LOG_KEY_URL is set: not ready until that key is pinned.
     pins_log_key: bool,
     path: PathBuf,
+    /// Keeps other processes off this state for as long as the witness runs.
+    _state_lock: std::fs::File,
     /// Held from the old-size check until the new checkpoint is on disk.
     memory: Mutex<Memory>,
+}
+
+/// Locks `<state>.lock` exclusively. Two processes with one state could each cosign a different
+/// history. The lock is on a separate file because each save renames a new file over the state.
+fn lock_state(path: &Path) -> anyhow::Result<std::fs::File> {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".lock");
+    let name = PathBuf::from(name);
+    let lock = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&name)
+        .with_context(|| name.display().to_string())?;
+    match lock.try_lock() {
+        Ok(()) => Ok(lock),
+        Err(std::fs::TryLockError::WouldBlock) => bail!(
+            "another witness process holds {}; run one process per state file",
+            name.display()
+        ),
+        Err(std::fs::TryLockError::Error(e)) => Err(e).context(name.display().to_string()),
+    }
 }
 
 fn now() -> u64 {
@@ -264,6 +288,7 @@ async fn serve() -> anyhow::Result<()> {
     let name = key_name()?;
     let signer = load_key(&key_file()?)?;
     let path = PathBuf::from(env("WITNESS_STATE").unwrap_or_else(|| "witness-state.json".into()));
+    let state_lock = lock_state(&path)?;
     let memory = Memory::load(&path).with_context(|| path.display().to_string())?;
     let pin_url = env("WITNESS_LOG_KEY_URL").filter(|_| memory.pinned.is_empty());
     let witness = Arc::new(Witness {
@@ -272,6 +297,7 @@ async fn serve() -> anyhow::Result<()> {
         signer,
         logs: log_keys()?,
         path,
+        _state_lock: state_lock,
         memory: Mutex::new(memory),
     });
     eprintln!("witness key {}", witness.key.vkey());
@@ -377,20 +403,43 @@ mod tests {
         }
     }
 
-    async fn start(log: &Log, path: &Path) -> String {
+    struct Running {
+        url: String,
+        stop: tokio::sync::oneshot::Sender<()>,
+        served: tokio::task::JoinHandle<()>,
+    }
+
+    impl Running {
+        async fn stop(self) {
+            self.stop.send(()).unwrap();
+            self.served.await.unwrap();
+        }
+    }
+
+    async fn start(log: &Log, path: &Path) -> anyhow::Result<Running> {
         let signer = ed25519_dalek::SigningKey::from_bytes(&[5; 32]);
+        let state_lock = lock_state(path)?;
         let witness = Arc::new(Witness {
             key: WitnessKey::new("witness.example.org/test", signer.verifying_key()),
             signer,
             logs: vec![log.key.clone()],
             pins_log_key: false,
             path: path.to_path_buf(),
-            memory: Mutex::new(Memory::load(path).unwrap()),
+            _state_lock: state_lock,
+            memory: Mutex::new(Memory::load(path)?),
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, router(witness)).await });
-        url
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("http://{}", listener.local_addr()?);
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let served = tokio::spawn(async move {
+            axum::serve(listener, router(witness))
+                .with_graceful_shutdown(async {
+                    stopped.await.ok();
+                })
+                .await
+                .unwrap();
+        });
+        Ok(Running { url, stop, served })
     }
 
     async fn post(url: &str, body: String) -> (u16, String) {
@@ -430,7 +479,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
         let log = Log::new();
-        let url = start(&log, &path).await;
+        let first = start(&log, &path).await.unwrap();
+        let url = first.url.clone();
 
         let (status, body) = post(&url, log.body(0, 3, false)).await;
         assert_eq!(status, 200, "{body}");
@@ -462,7 +512,14 @@ mod tests {
         assert_eq!(post(&url, log.body(3, 7, false)).await, (409, "6\n".into()));
         assert_eq!(post(&url, "old 0\n\nnot a note".into()).await.0, 400);
 
-        let restarted = start(&log, &path).await;
+        let err = start(&log, &path)
+            .await
+            .err()
+            .expect("a second witness on one state");
+        assert!(err.to_string().contains("another witness process"), "{err}");
+        first.stop().await;
+        let second = start(&log, &path).await.unwrap();
+        let restarted = second.url.clone();
         assert_eq!(
             post(&restarted, log.body(0, 3, false)).await,
             (409, "6\n".into())
@@ -474,5 +531,6 @@ mod tests {
             Checkpoint::parse(&stored.checkpoints[ORIGIN]).unwrap().size,
             8
         );
+        second.stop().await;
     }
 }
