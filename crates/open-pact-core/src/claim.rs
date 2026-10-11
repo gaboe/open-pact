@@ -37,11 +37,34 @@ pub struct Claim {
     pub log_checkpoint: Option<LogCheckpoint>,
 }
 
+/// Size and root as the checkpoint text writes them; the root is standard base64.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LogCheckpoint {
     pub size: u64,
+    #[serde(with = "base64_root")]
     pub root: LogHash,
+}
+
+mod base64_root {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use serde::{Deserialize, Deserializer, Serializer, de::Error};
+
+    use crate::LogHash;
+
+    pub fn serialize<S: Serializer>(root: &LogHash, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&STANDARD.encode(root.0))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<LogHash, D::Error> {
+        let text = String::deserialize(d)?;
+        STANDARD
+            .decode(&text)
+            .ok()
+            .and_then(|b| <[u8; 32]>::try_from(b).ok())
+            .map(LogHash)
+            .ok_or_else(|| D::Error::custom(format!("expected base64 of 32 bytes, got {text:?}")))
+    }
 }
 
 impl Claim {
@@ -175,10 +198,9 @@ mod tests {
             root: LogHash([0xab; 32]),
         });
         let json = String::from_utf8(claim.canonical_json()).unwrap();
-        assert!(json.contains(&format!(
-            r#""log_checkpoint":{{"root":"{}","size":3}}"#,
-            "ab".repeat(32)
-        )));
+        assert!(json.contains(
+            r#""log_checkpoint":{"root":"q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s=","size":3}"#
+        ));
         let jws = sign_claim(&claim, &key).unwrap();
         assert_eq!(verify_claim(&jws).unwrap().claim(), &claim);
     }

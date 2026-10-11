@@ -153,7 +153,7 @@ When the device connects, the client produces a claim and signs it with the devi
     "os_patch_age": "le_14d",
     "firewall": "on"
   },
-  "log_checkpoint": { "size": 42, "root": "9b1d..." }
+  "log_checkpoint": { "size": 42, "root": "m1Rw..." }
 }
 ```
 
