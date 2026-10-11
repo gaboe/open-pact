@@ -222,7 +222,7 @@ The owner can stop the client (`open-pact-client stop`) or uninstall it at any t
 
 ### 4.8 Agreed deletion
 
-- **Automatic** when `claim_retention` ends.
+- **Automatic** when `claim_retention` ends. Each claim keeps the retention of the manifest that accepted it: a later manifest can shorten it but cannot extend it.
 - **On request.** Owner and company both sign a deletion request with a scope (device, period). The gateway deletes the data and issues a signed deletion confirmation. The event (hashes of request and confirmation, not the data) goes into the transparency log.
 - **Backups.** Claims are encrypted per period on disk. The period keys are encrypted under the KEK and stored next to the claims, so a database backup holds both. When a claim's period key is deleted, backups made later cannot decrypt the claim. Backups made earlier can, for anyone who also holds the KEK, until they expire. A claim is therefore gone from every backup when its period key is deleted (at the latest when the month of its deadline ends) plus the longest time the company keeps database backups. The company states that backup retention to the owner; open-pact cannot enforce it.
 - **Exception.** Deletion is postponed while an audit, an incident or a legal retention duty is running. The owner gets the reason and the expected date in writing.
