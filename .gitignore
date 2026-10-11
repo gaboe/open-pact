@@ -1,0 +1,6 @@
+internal/
+.agents/
+.claude/
+skills-lock.json
+target/
+DECISIONS.md
