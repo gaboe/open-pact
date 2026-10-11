@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>open-pact gateway</title>
+<style>
+  :root {{ color-scheme: light dark; --fg: #1a1a1a; --muted: #666; --bg: #fafafa; --card: #fff; --line: #e3e3e3; --ok: #1b7f3b; --bad: #b42318; }}
+  @media (prefers-color-scheme: dark) {{ :root {{ --fg: #eee; --muted: #9a9a9a; --bg: #141414; --card: #1d1d1d; --line: #333; --ok: #4cc276; --bad: #ff7a6e; }} }}
+  body {{ margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.5 system-ui, sans-serif; }}
+  main {{ max-width: 46rem; margin: 0 auto; padding: 2.5rem 1rem; }}
+  h1 {{ font-size: 1.4rem; margin: 0 0 .25rem; }}
+  p.lead {{ color: var(--muted); margin: 0 0 2rem; }}
+  .stats {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr)); gap: .75rem; margin-bottom: 2rem; }}
+  .stat {{ background: var(--card); border: 1px solid var(--line); border-radius: .5rem; padding: 1rem; }}
+  .stat b {{ display: block; font-size: 2rem; font-variant-numeric: tabular-nums; }}
+  .stat span {{ color: var(--muted); font-size: .9rem; }}
+  .ok b {{ color: var(--ok); }}
+  .bad b {{ color: var(--bad); }}
+  dl {{ background: var(--card); border: 1px solid var(--line); border-radius: .5rem; padding: 1rem; margin: 0 0 1.5rem; }}
+  dt {{ color: var(--muted); font-size: .9rem; }}
+  dd {{ margin: 0 0 .75rem; }}
+  dd:last-child {{ margin-bottom: 0; }}
+  code {{ font: .85rem/1.4 ui-monospace, monospace; word-break: break-all; }}
+  footer {{ color: var(--muted); font-size: .9rem; }}
+</style>
+<main>
+  <h1>open-pact gateway</h1>
+  <p class="lead">Aggregate view only. The gateway shows no per-device detail.</p>
+  <section class="stats">
+    <div class="stat"><b>{devices}</b><span>devices enrolled</span></div>
+    <div class="stat ok"><b>{allowed}</b><span>claims allowed, last 24 h</span></div>
+    <div class="stat bad"><b>{denied}</b><span>claims denied, last 24 h</span></div>
+  </section>
+  <dl>
+    <dt>Enforced manifest</dt><dd><code>{manifest}</code></dd>
+    <dt>Company manifest-signing key</dt><dd><code>{company}</code></dd>
+    <dt>Transparency log head</dt><dd><code>#{log_index} {log_hash}</code></dd>
+    <dt>VPN client CA (SHA-256)</dt><dd><code>{ca}</code></dd>
+  </dl>
+  <footer>Signed log: <code>GET /v1/log</code>. Manifest: <code>GET /v1/manifest</code>.</footer>
+</main>
+</html>

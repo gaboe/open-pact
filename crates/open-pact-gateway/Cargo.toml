@@ -14,3 +14,8 @@ sqlx = { version = "0.8", default-features = false, features = ["postgres", "run
 rand = "0.9"
 anyhow = "1"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring", "pem", "x509-parser"] }
+hex = "0.4.3"
+sha2 = "0.11"
+time = "0.3"
+x509-parser = "0.18"

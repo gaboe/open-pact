@@ -92,6 +92,10 @@ impl PublicKey {
         self.0.to_sec1_point(false).as_bytes().to_vec()
     }
 
+    pub fn fingerprint(&self) -> String {
+        format!("sha256:{}", sha256_hex(&self.sec1_uncompressed()))
+    }
+
     pub(crate) fn verify(&self, message: &[u8], sig: &Signature) -> bool {
         self.0.verify(message, &sig.0).is_ok()
     }

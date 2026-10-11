@@ -286,7 +286,11 @@ mod tests {
         let f2 = f1.next(EntryKind::DeviceEnrolled, json!({}));
         let extra = f2.next(EntryKind::DeviceEnrolled, json!({}));
         assert_eq!(
-            fails(Some(&known), &[extra.clone()], &Head::sign(&key, &extra)),
+            fails(
+                Some(&known),
+                std::slice::from_ref(&extra),
+                &Head::sign(&key, &extra)
+            ),
             "transparency log: entry 3 does not extend the history this client holds"
         );
     }
