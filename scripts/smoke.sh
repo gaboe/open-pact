@@ -5,17 +5,32 @@ url="${1:?usage: smoke.sh <gateway-url>}"
 url="${url%/}"
 root="$(cd "$(dirname "$0")/.." && pwd)"
 tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
+proxy_pid=""
+trap '[ -z "$proxy_pid" ] || kill "$proxy_pid" 2> /dev/null; rm -rf "$tmp"' EXIT
 home="$tmp/home"
 
-curl -fsS "$url/healthz" | grep -qx ok
+# Waits up to a minute for a service that `docker compose up -d` has just started.
+ready() {
+  for _ in $(seq 60); do
+    curl -fsS "$1/healthz" 2> /dev/null | grep -qx ok && return
+    sleep 1
+  done
+  curl -fsS "$1/healthz" | grep -qx ok
+}
+ready "$url"
 echo "healthz ok"
 
 cargo build -q --manifest-path "$root/Cargo.toml" -p open-pact-client
-cargo build -q --manifest-path "$root/Cargo.toml" -p open-pact-core --example dev_claim --example dev_witness
+cargo build -q --manifest-path "$root/Cargo.toml" -p open-pact-core --example dev_claim --example dev_attacks
 client=("$root/target/debug/open-pact-client" --home "$home")
 dev_claim="$root/target/debug/examples/dev_claim"
-dev_witness="$root/target/debug/examples/dev_witness"
+attacks="$root/target/debug/examples/dev_attacks"
+
+# OPEN_PACT_WITNESS_URL points at the witness elsewhere; by default the compose witness.
+witness="${OPEN_PACT_WITNESS_URL:-http://$(docker compose -f "$root/compose.yaml" port witness 8080)}"
+witness="${witness%/}"
+ready "$witness"
+echo "witness ready at $witness"
 
 # OPEN_PACT_ADMIN runs the gateway admin CLI elsewhere, e.g. "kubectl exec -i deploy/pact-gateway -- open-pact-gateway".
 if [ -n "${OPEN_PACT_ADMIN:-}" ]; then
@@ -116,12 +131,59 @@ grep -q '^This entry is your enrolment' "$tmp/prove"
 grep -q '"kind":"manifest_published"' "$tmp/prove0"
 echo "inclusion proofs verify for this device's enrolment and for entry 0"
 
-curl -fsS "$url/v1/log/checkpoint" | "$dev_witness" cosign > "$tmp/cosigned"
-curl -fsS -X POST --data-binary "@$tmp/cosigned" "$url/v1/log/witness" | grep -q '"stored"'
-curl -fsS "$url/v1/log/checkpoint" | grep -q '^— witness.example.org/demo '
-code="$(curl -sS -o "$tmp/body" -w '%{http_code}' -X POST --data-binary @<(curl -fsS "$url/v1/log/checkpoint" | grep -v witness.example.org) "$url/v1/log/witness")"
-[ "$code" = 403 ]
-echo "witness cosignature stored and served; a checkpoint without one is refused ($code)"
+curl -fsS "$url/v1/log/checkpoint" > "$tmp/cosigned"
+grep -q '^— witness.example.org/demo ' "$tmp/cosigned"
+echo "the gateway serves its checkpoint with the witness cosignature"
+
+add_checkpoint() { curl -sS -o "$tmp/witnessed" -w '%{http_code}' --data-binary @- "$witness/add-checkpoint"; }
+got="$("$attacks" add 0 1 | add_checkpoint)"
+case "$got" in
+  200) size=1 ;;
+  409) size="$(cat "$tmp/witnessed")" ;;
+  *) echo "witness: $got $(cat "$tmp/witnessed")"; exit 1 ;;
+esac
+[ "$size" -lt 64 ] || { echo "the witness test log is full; run docker compose down -v"; exit 1; }
+next=$((size + 1))
+[ "$("$attacks" add "$size" "$next" | add_checkpoint)" = 200 ]
+grep -q '^— witness.example.org/demo ' "$tmp/witnessed"
+got="$("$attacks" fork "$next" | add_checkpoint)"
+[ "$got" = 422 ] || { echo "fork: $got $(cat "$tmp/witnessed")"; exit 1; }
+echo "the witness refuses a log-signed fork at size $next: $got $(cat "$tmp/witnessed")"
+[ "$("$attacks" add 0 "$next" | add_checkpoint)" = 409 ]
+[ "$(cat "$tmp/witnessed")" = "$next" ]
+echo "the witness answers a stale old size with 409 and the size it holds"
+
+python3 "$root/scripts/checkpoint-proxy.py" "$tmp/proxy-port" "$url" "$tmp/served" &
+proxy_pid=$!
+for _ in $(seq 50); do [ -s "$tmp/proxy-port" ] && break; sleep 0.1; done
+cp "$home/enrolment.json" "$tmp/real-enrolment"
+python3 - "$home/enrolment.json" "http://127.0.0.1:$(cat "$tmp/proxy-port")" <<'PY2'
+import json, sys
+e = json.load(open(sys.argv[1]))
+e["gateway"] = sys.argv[2]
+json.dump(e, open(sys.argv[1], "w"))
+PY2
+grep -v '^— witness.example.org/' "$tmp/cosigned" > "$tmp/served"
+expect_alarm() {
+  local name="$1" pattern="$2" got
+  set +e
+  "${client[@]}" check > /dev/null 2> "$tmp/err"
+  got=$?
+  set -e
+  [ "$got" = 2 ] || { cat "$tmp/err"; return 1; }
+  grep -q 'TRANSPARENCY LOG ALARM' "$tmp/err"
+  grep -q "$pattern" "$tmp/err"
+  echo "$name (exit $got): $(grep -o "$pattern.*" "$tmp/err" | head -n 1)"
+}
+expect_alarm "a checkpoint without the witness cosignature (what a forking gateway can show) raises the alarm" \
+  'has 0 of the 1 witness cosignatures'
+"$attacks" stale "$(( $(date +%s) - 7200 ))" < "$tmp/cosigned" > "$tmp/served"
+expect_alarm "a replayed checkpoint whose cosignature is two hours old raises the alarm" \
+  'more than checkpoint_max_age 1h'
+cp "$tmp/real-enrolment" "$home/enrolment.json"
+kill "$proxy_pid"
+wait "$proxy_pid" 2> /dev/null || true
+proxy_pid=""
 
 for q in "entries?from=0&to=99999" "entries?from=3&to=2" "proof/inclusion?index=99999" \
   "proof/inclusion?index=0&size=99999" "proof/consistency?from=0" "proof/consistency?from=2&to=1" \
@@ -195,6 +257,9 @@ expect "wrong manifest" 403 'claim is for manifest' \
 
 tampered="$("$dev_claim" "$device" "$manifest" "$(nonce)" linux "${passing[@]}" | awk -F. '{print $1"."$2"."substr($3,1,10)"AAAA"substr($3,15)}')"
 expect "tampered signature" 403 'signature does not verify' "$tampered"
+
+expect "log checkpoint the gateway never had" 403 "is not a state of this gateway's log" \
+  "$(DEV_CLAIM_LOG_CHECKPOINT="999999 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" "$dev_claim" "$device" "$manifest" "$(nonce)" linux "${passing[@]}")"
 
 "${client[@]}" log show > "$tmp/show"
 grep -q '"results"' "$tmp/show"

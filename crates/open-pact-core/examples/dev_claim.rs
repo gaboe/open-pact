@@ -1,12 +1,28 @@
 //! Prints a claim JWS with chosen results, for smoke tests. The key file is created if missing.
 //! Usage: dev_claim <key.pem> <manifest.toml|sha256:...> <nonce> <os> [check=value ...]
+//! DEV_CLAIM_LOG_CHECKPOINT="<size> <base64 root>" adds a log checkpoint to the claim.
 
 use std::collections::BTreeMap;
 
 use open_pact_core::{
-    Claim, Manifest, ManifestHash, Os, Pseudonym, PublicKey, TrustLevel, Virtualized, dev_key,
-    sign_claim,
+    Claim, LogCheckpoint, LogHash, Manifest, ManifestHash, Os, Pseudonym, PublicKey, TrustLevel,
+    Virtualized, dev_key, sign_claim,
 };
+
+fn log_checkpoint() -> Result<Option<LogCheckpoint>, Box<dyn std::error::Error>> {
+    use base64::Engine;
+    let Ok(value) = std::env::var("DEV_CLAIM_LOG_CHECKPOINT") else {
+        return Ok(None);
+    };
+    let (size, root) = value
+        .split_once(' ')
+        .ok_or("expected <size> <base64 root>")?;
+    let root = base64::engine::general_purpose::STANDARD.decode(root)?;
+    Ok(Some(LogCheckpoint {
+        size: size.parse()?,
+        root: LogHash(root.try_into().map_err(|_| "root must be 32 bytes")?),
+    }))
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -43,7 +59,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         virtualized: Some(Virtualized::No),
         results,
         csr_sha256: None,
-        log_checkpoint: None,
+        log_checkpoint: log_checkpoint()?,
     };
     println!("{}", sign_claim(&claim, &key)?);
     Ok(())

@@ -5,14 +5,18 @@ url="${1:?usage: demo.sh <gateway-url>   (PAUSE=1 waits for Enter between steps)
 url="${url%/}"
 root="$(cd "$(dirname "$0")/.." && pwd)"
 tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
+proxy_pid=""
+trap '[ -z "$proxy_pid" ] || kill "$proxy_pid" 2> /dev/null; rm -rf "$tmp"' EXIT
 home="$tmp/open-pact"
 
 cargo build -q --manifest-path "$root/Cargo.toml" -p open-pact-client
-cargo build -q --manifest-path "$root/Cargo.toml" -p open-pact-core --example dev_claim --example dev_witness
+cargo build -q --manifest-path "$root/Cargo.toml" -p open-pact-core --example dev_claim --example dev_attacks
 client=("$root/target/debug/open-pact-client" --home "$home")
 dev_claim="$root/target/debug/examples/dev_claim"
-dev_witness="$root/target/debug/examples/dev_witness"
+attacks="$root/target/debug/examples/dev_attacks"
+# OPEN_PACT_WITNESS_URL points at the witness elsewhere; by default the compose witness.
+witness="${OPEN_PACT_WITNESS_URL:-http://$(docker compose -f "$root/compose.yaml" port witness 8080)}"
+witness="${witness%/}"
 # OPEN_PACT_ADMIN runs the gateway admin CLI elsewhere, e.g. "kubectl exec -i deploy/pact-gateway -- open-pact-gateway".
 if [ -n "${OPEN_PACT_ADMIN:-}" ]; then
   read -ra admin_cmd <<< "$OPEN_PACT_ADMIN"
@@ -31,9 +35,19 @@ step() {
 }
 
 step "The company gateway at $url"
+for _ in $(seq 60); do
+  curl -fsS "$url/healthz" > /dev/null 2>&1 && break
+  sleep 1
+done
 curl -fsS "$url/healthz" > /dev/null
 sed -n 's/.*<dt>\(.*\)<\/dt><dd><code>\(.*\)<\/code><\/dd>.*/\1: \2/p' < <(curl -fsS "$url/")
 echo "Summary page: $url/"
+
+for _ in $(seq 60); do
+  curl -fsS "$witness/healthz" > /dev/null 2>&1 && break
+  sleep 1
+done
+echo "Witness at $witness: $(curl -fsS "$witness/healthz")"
 
 step "IT creates a one-time invitation: gateway, company key and log key fingerprints, a 256-bit code"
 invitation="$(admin invite --url "$url" --ttl 1h --note "demo owner")"
@@ -71,14 +85,42 @@ echo
 step "Everything that left the device, kept locally byte for byte"
 "${client[@]}" log show | sed -n '1,/^-- response/p'
 
-step "The transparency log checkpoint (Merkle tree size and root), signed by the gateway"
+step "The transparency log checkpoint (Merkle tree size and root), signed by the gateway and cosigned by the witness"
 "${client[@]}" log head
+curl -fsS "$url/v1/log/checkpoint" > "$tmp/cosigned"
 
-step "An independent witness cosigns the checkpoint; the gateway serves it with the cosignature"
-curl -fsS "$url/v1/log/checkpoint" | "$dev_witness" cosign > "$tmp/cosigned"
-curl -fsS -X POST --data-binary "@$tmp/cosigned" "$url/v1/log/witness"
-echo
-curl -fsS "$url/v1/log/checkpoint"
+step "A log signs a fork (another root for a size the witness already cosigned): the witness refuses it"
+echo "(a test log whose key this script holds plays the gateway)"
+add_checkpoint() { curl -sS -o "$tmp/witnessed" -w '%{http_code}' --data-binary @- "$witness/add-checkpoint"; }
+size=1
+[ "$("$attacks" add 0 1 | add_checkpoint)" = 409 ] && size="$(cat "$tmp/witnessed")"
+next=$((size + 1))
+echo "honest checkpoint of size $next: $("$attacks" add "$size" "$next" | add_checkpoint)"
+cat "$tmp/witnessed"
+echo "forked checkpoint of size $next: $("$attacks" fork "$next" | add_checkpoint)"
+cat "$tmp/witnessed"
+
+step "So a forking gateway can show its victims only checkpoints without the cosignature: the client raises the alarm"
+python3 "$root/scripts/checkpoint-proxy.py" "$tmp/proxy-port" "$url" "$tmp/served" &
+proxy_pid=$!
+for _ in $(seq 50); do [ -s "$tmp/proxy-port" ] && break; sleep 0.1; done
+cp "$home/enrolment.json" "$tmp/real-enrolment"
+python3 - "$home/enrolment.json" "http://127.0.0.1:$(cat "$tmp/proxy-port")" <<'PY2'
+import json, sys
+e = json.load(open(sys.argv[1]))
+e["gateway"] = sys.argv[2]
+json.dump(e, open(sys.argv[1], "w"))
+PY2
+grep -v '^— witness.example.org/' "$tmp/cosigned" > "$tmp/served"
+"${client[@]}" check > /dev/null || echo "(check exited with status $?)"
+
+step "A frozen checkpoint, replayed with a cosignature from two hours ago, raises the alarm too"
+"$attacks" stale "$(( $(date +%s) - 7200 ))" < "$tmp/cosigned" > "$tmp/served"
+"${client[@]}" check > /dev/null || echo "(check exited with status $?)"
+cp "$tmp/real-enrolment" "$home/enrolment.json"
+kill "$proxy_pid"
+wait "$proxy_pid" 2> /dev/null || true
+proxy_pid=""
 
 step "The record of my enrolment is provably in the log"
 "${client[@]}" log prove

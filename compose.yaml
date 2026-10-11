@@ -23,10 +23,36 @@ services:
       PUBLIC_URL: http://localhost:${GATEWAY_PORT:-8080}
       # true approves every enrolled device without IT. Smoke and demo need the pending state.
       AUTO_APPROVE: "false"
-      # Demo witness key from `cargo run -p open-pact-core --example dev_witness -- vkey`.
-      WITNESS_KEYS: witness.example.org/demo+10c00e9a+BDnDJtIcX1p95tKTK+ggaN1dSvTB9a0EYGVntufeUB5t
+      # Every new checkpoint goes here; the manifest's [log] section names the witness keys.
+      WITNESS_URLS: http://witness:8080
     ports:
       - "${GATEWAY_PORT:-8080}:8080"
     depends_on:
       db:
         condition: service_healthy
+  # INSECURE demo witness. Its key comes from a public seed, and it trusts the first log key the
+  # gateway serves. A real witness runs under another operator with WITNESS_LOG_KEYS only.
+  witness:
+    build:
+      context: .
+      target: witness
+    environment:
+      WITNESS_NAME: witness.example.org/demo
+      WITNESS_KEY_FILE: /run/secrets/demo_witness_key
+      WITNESS_LOG_KEY_URL: http://gateway:8080/v1/log/key
+      # The test log smoke.sh and demo.sh try to fork: `cargo run -p open-pact-core --example dev_attacks -- test-log-key`.
+      WITNESS_LOG_KEYS: log.example.org/witness-test+7e6c623a+AjBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABDv2YtBxbEJe1L73o+h+UYoRuUHXrLAj2lInGJ2abeQ+7p6VZlu57wOlw5PEswDLqKs2NpO1jQUPKcWSu1xTtl0=
+    secrets:
+      - demo_witness_key
+    volumes:
+      - witness-state:/var/lib/open-pact-witness
+    # A free localhost port; scripts find it with `docker compose port witness 8080`.
+    ports:
+      - "127.0.0.1::8080"
+
+secrets:
+  demo_witness_key:
+    file: ./deploy/compose/demo-witness.key
+
+volumes:
+  witness-state:
