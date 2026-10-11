@@ -227,7 +227,7 @@ mod tests {
 
     #[test]
     fn auto_login() {
-        let absent = "2026-10-11 16:49:08.719 defaults[8175:1] \nThe domain/default pair of (/Library/Preferences/com.apple.loginwindow, autoLoginUser) does not exist\n";
+        let absent = "2026-01-01 09:00:00.000 defaults[1234:1] \nThe domain/default pair of (/Library/Preferences/com.apple.loginwindow, autoLoginUser) does not exist\n";
         assert_eq!(parse_auto_login(absent), "off");
         assert_eq!(parse_auto_login("alice\n"), "on");
         assert_eq!(parse_auto_login(""), "unknown");
