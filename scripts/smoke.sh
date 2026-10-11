@@ -174,6 +174,19 @@ expect "unenrolled device" 403 'device not enrolled' \
 expect "failing check" 403 'disk_encryption = none, full required' \
   "$("$dev_claim" "$device" "$manifest" "$(nonce)" linux "${passing[@]}" disk_encryption=none)"
 
+expect "grace starts at the first failure" 200 'firewall = off, on required, access ends in 2[34]h' \
+  "$("$dev_claim" "$device" "$manifest" "$(nonce)" linux "${passing[@]}" firewall=off)"
+
+if [ -z "${OPEN_PACT_ADMIN:-}" ]; then
+  docker compose -f "$root/compose.yaml" exec -T db psql -U pact -d pact -qc \
+    "UPDATE control_failures SET first_failed_at = now() - interval '25 hours' WHERE control = 'firewall'"
+  expect "grace ended a day after the first failure" 403 'firewall = off, on required, grace 1d ended' \
+    "$("$dev_claim" "$device" "$manifest" "$(nonce)" linux "${passing[@]}" firewall=off)"
+fi
+
+expect "a passing claim clears the failure" 200 '"warnings":\[\]' \
+  "$("$dev_claim" "$device" "$manifest" "$(nonce)" linux "${passing[@]}")"
+
 expect "undisclosed key" 403 'installed_apps is not in the manifest' \
   "$("$dev_claim" "$device" "$manifest" "$(nonce)" linux "${passing[@]}" installed_apps=slack)"
 

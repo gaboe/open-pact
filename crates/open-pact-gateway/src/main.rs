@@ -1,7 +1,10 @@
 mod devices;
+mod grace;
 mod invitations;
 mod keys;
 mod ratelimit;
+#[cfg(test)]
+mod testdb;
 mod translog;
 
 use std::fmt::Display;
@@ -18,9 +21,9 @@ use axum::{
 };
 use clap::{Parser, Subcommand};
 use open_pact_core::{
-    Checkpoint, Decision, Endorsement, EnrolRequest, Entry, EntryKind, Invitation, LogHash, LogKey,
-    Manifest, Note, Pseudonym, PublicKey, Reason, SigningKey, WitnessKey, consistency_proof,
-    evaluate, inclusion_proof, root, verify_claim,
+    Checkpoint, Decision, Endorsement, EnrolRequest, Entry, EntryKind, Evaluation, FirstFailures,
+    Invitation, LogHash, LogKey, Manifest, Note, Pseudonym, PublicKey, Reason, SigningKey,
+    WitnessKey, consistency_proof, evaluate, inclusion_proof, root, verify_claim,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -584,16 +587,24 @@ async fn claim(
         Some(false) => return Err(denied(vec!["expired nonce".into()])),
         Some(true) => {}
     }
-    let state = devices::state(
-        &mut *app.conn().await?,
-        &claim.device,
-        app.manifest.hash().as_str(),
-    )
-    .await
-    .map_err(internal)?;
+    let manifest_hash = app.manifest.hash().as_str();
+    let mut tx = app.db.begin().await.map_err(internal)?;
+    let state = devices::state(&mut tx, &claim.device, manifest_hash)
+        .await
+        .map_err(internal)?;
     let enrolled = state.is_some();
+    let first_failures = if enrolled {
+        grace::load(&mut tx, &claim.device, manifest_hash)
+            .await
+            .map_err(internal)?
+    } else {
+        FirstFailures::new()
+    };
 
-    let decision = evaluate(&app.manifest, claim, chrono::Utc::now());
+    let Evaluation {
+        decision,
+        first_failures,
+    } = evaluate(&app.manifest, claim, chrono::Utc::now(), &first_failures);
     let oversharing = matches!(&decision, Decision::Deny { reasons } if reasons.iter().any(Reason::breaks_disclosure_contract));
     let strings = |rs: &[Reason]| rs.iter().map(ToString::to_string).collect::<Vec<_>>();
     let (warnings, mut reasons) = match &decision {
@@ -622,6 +633,11 @@ async fn claim(
         }
     }
 
+    if enrolled {
+        grace::save(&mut tx, &claim.device, manifest_hash, &first_failures)
+            .await
+            .map_err(internal)?;
+    }
     if enrolled && !oversharing {
         let payload = serde_json::to_value(claim).map_err(internal)?;
         sqlx::query("INSERT INTO claims (device, claim, jws, allowed) VALUES ($1, $2, $3, $4)")
@@ -629,10 +645,11 @@ async fn claim(
             .bind(&payload)
             .bind(verified.jws())
             .bind(reasons.is_empty())
-            .execute(&app.db)
+            .execute(&mut *tx)
             .await
             .map_err(internal)?;
     }
+    tx.commit().await.map_err(internal)?;
     if !reasons.is_empty() {
         return Err(denied(reasons));
     }

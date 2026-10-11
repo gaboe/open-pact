@@ -14,7 +14,7 @@ pub use claim::{
 };
 pub use crypto::{Endorsement, ManifestHash, Pseudonym, PublicKey, Signature, SignedManifest};
 pub use enrol::{EnrolRequest, enrol_statement};
-pub use evaluate::{Decision, Reason, evaluate};
+pub use evaluate::{Decision, Evaluation, FirstFailures, Grace, Reason, evaluate};
 pub use invitation::{InvalidInvitation, Invitation, InvitationCode, InvitationHash};
 pub use log::{
     Entry, EntryKind, LogHash, consistency_proof, inclusion_proof, leaf_hash, root,
