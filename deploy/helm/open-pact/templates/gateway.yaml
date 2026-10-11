@@ -28,6 +28,10 @@ spec:
               value: 0.0.0.0:8080
             - name: LOG_ORIGIN
               value: {{ .Values.log.origin | quote }}
+            - name: PUBLIC_URL
+              value: {{ .Values.publicUrl | default (printf "https://%s" .Values.ingress.host) | quote }}
+            - name: AUTO_APPROVE
+              value: {{ .Values.autoApprove | quote }}
             - name: WITNESS_KEYS
               value: {{ join "," .Values.log.witnessKeys | quote }}
             {{- if .Values.database.externalUrl }}
@@ -75,11 +79,11 @@ metadata:
   {{- end }}
 spec:
   ingressClassName: {{ .Values.ingress.ingressClassName }}
-  {{- if .Values.ingress.tlsSecretName }}
+  {{- if .Values.ingress.tls }}
   tls:
     - hosts:
         - {{ .Values.ingress.host }}
-      secretName: {{ .Values.ingress.tlsSecretName }}
+      secretName: {{ .Values.ingress.tlsSecretName | default (printf "%s-tls" .Release.Name) }}
   {{- end }}
   rules:
     - host: {{ .Values.ingress.host }}

@@ -10,6 +10,9 @@ ingress:
   host: pact.example.com
   ingressClassName: nginx
   annotations: {}
+  # TLS is on by default: the invitation code and the claims must not cross the network in clear.
+  tls: true
+  # Defaults to <release>-tls, for example from cert-manager.
   tlsSecretName: ""
 
 postgres:
@@ -25,6 +28,12 @@ postgres:
 
 database:
   externalUrl: ""
+
+# URL the clients use, written into invitations. Defaults to https://<ingress.host>.
+publicUrl: ""
+
+# Approve enrolled devices without IT. Off: IT runs `open-pact-gateway devices approve`.
+autoApprove: false
 
 log:
   # Checkpoint origin and log key name (c2sp.org/tlog-checkpoint).

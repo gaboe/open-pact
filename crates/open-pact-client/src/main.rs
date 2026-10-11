@@ -28,6 +28,9 @@ struct Cli {
     /// Directory for keys, the signed manifest and logs [default: ~/.config/open-pact]
     #[arg(long, global = true)]
     home: Option<PathBuf>,
+    /// Allow a plain http:// gateway other than localhost. For development only
+    #[arg(long, global = true)]
+    insecure_dev: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -248,6 +251,24 @@ fn disclosable_checkpoint(manifest: &Manifest, cp: Option<Checkpoint>) -> Option
 
 fn base(gateway: &str) -> &str {
     gateway.trim_end_matches('/')
+}
+
+fn check_scheme(gateway: &str, insecure_dev: bool) -> Result<()> {
+    let url = reqwest::Url::parse(gateway).with_context(|| format!("gateway URL {gateway:?}"))?;
+    let host = url.host_str().unwrap_or_default().trim_matches(['[', ']']);
+    let local = host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    match url.scheme() {
+        "https" => Ok(()),
+        "http" if local || insecure_dev => Ok(()),
+        "http" => bail!(
+            "refusing plain http:// to {gateway}: the invitation code and claims would travel unencrypted. \
+             Use https://, or --insecure-dev for a development gateway"
+        ),
+        other => bail!("unsupported gateway URL scheme {other:?}"),
+    }
 }
 
 /// The API never redirects, so a redirect cannot move the client from https to http.
@@ -632,9 +653,10 @@ fn print_log_upgrade(home: &Home) {
     );
 }
 
-async fn join(home: &Home, invitation: &str, yes: bool) -> Result<ExitCode> {
+async fn join(home: &Home, invitation: &str, yes: bool, insecure_dev: bool) -> Result<ExitCode> {
     let invitation = Invitation::decode(invitation)?;
     let gateway = invitation.gateway.as_str();
+    check_scheme(gateway, insecure_dev)?;
     let wanted = Pins {
         company: invitation.company.clone(),
         log: invitation.log_key(),
@@ -793,8 +815,9 @@ fn print_hints(manifest: &Manifest, results: &BTreeMap<String, String>, os: Os) 
     }
 }
 
-async fn check(home: &Home) -> Result<ExitCode> {
+async fn check(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
     let mut enrolment = home.enrolment()?;
+    check_scheme(&enrolment.gateway, insecure_dev)?;
     if home.has_legacy_log_head() {
         print_log_upgrade(home);
         return Ok(ExitCode::FAILURE);
@@ -916,8 +939,9 @@ fn commitment(enrolment: &Enrolment) -> Result<String> {
     Ok(format!("sha256:{}", hex::encode(h.finalize())))
 }
 
-async fn log_prove(home: &Home, index: Option<u64>) -> Result<ExitCode> {
+async fn log_prove(home: &Home, index: Option<u64>, insecure_dev: bool) -> Result<ExitCode> {
     let mut enrolment = home.enrolment()?;
+    check_scheme(&enrolment.gateway, insecure_dev)?;
     if home.has_legacy_log_head() {
         print_log_upgrade(home);
         return Ok(ExitCode::FAILURE);
@@ -981,14 +1005,14 @@ fn log_show(path: &Path) -> Result<()> {
 async fn run(cli: Cli) -> Result<ExitCode> {
     let home = Home::new(cli.home)?;
     match cli.command {
-        Command::Join { invitation, yes } => join(&home, &invitation, yes).await,
-        Command::Check => check(&home).await,
+        Command::Join { invitation, yes } => join(&home, &invitation, yes, cli.insecure_dev).await,
+        Command::Check => check(&home, cli.insecure_dev).await,
         Command::Log {
             command: LogCommand::Head,
         } => log_head(&home).map(|()| ExitCode::SUCCESS),
         Command::Log {
             command: LogCommand::Prove { index },
-        } => log_prove(&home, index).await,
+        } => log_prove(&home, index, cli.insecure_dev).await,
         Command::Log {
             command: LogCommand::Show,
         } => log_show(&home.file("claims.jsonl")).map(|()| ExitCode::SUCCESS),
@@ -1014,6 +1038,27 @@ async fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plain_http_only_to_this_machine_unless_insecure_dev() {
+        for ok in [
+            "https://pact.example.com",
+            "http://localhost:8080",
+            "http://127.0.0.1:8080/",
+            "http://[::1]:8080",
+        ] {
+            assert!(check_scheme(ok, false).is_ok(), "{ok}");
+        }
+        for bad in [
+            "http://pact.example.com",
+            "http://localhost.pact.example.com",
+            "http://10.0.0.1",
+        ] {
+            assert!(check_scheme(bad, false).is_err(), "{bad}");
+            assert!(check_scheme(bad, true).is_ok(), "{bad}");
+        }
+        assert!(check_scheme("ftp://pact.example.com", true).is_err());
+    }
 
     #[test]
     fn a_changed_company_key_or_log_key_is_reported() {
