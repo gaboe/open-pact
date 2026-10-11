@@ -31,8 +31,11 @@ const FEDORA_EOL: &[(&str, &str)] = &[
 ];
 
 pub fn disk_encryption() -> &'static str {
-    run("lsblk", &["-s", "-n", "-o", "NAME,TYPE,MOUNTPOINT"])
-        .map_or("unknown", |t| parse_lsblk_inverse(&t))
+    run(
+        "lsblk",
+        &["-s", "-n", "-o", "NAME,TYPE,RO,RM,FSTYPE,MOUNTPOINT"],
+    )
+    .map_or("unknown", |t| parse_lsblk_inverse(&t))
 }
 
 pub fn firewall() -> &'static str {
@@ -124,35 +127,113 @@ pub fn antimalware_active() -> &'static str {
         .map_or("unknown", |t| parse_antimalware_units(&t))
 }
 
-pub fn parse_lsblk_inverse(out: &str) -> &'static str {
-    let mut groups: Vec<(bool, bool)> = Vec::new();
-    for line in out.lines() {
-        let Some(first) = line.chars().next() else {
-            continue;
-        };
-        let root_level = first.is_alphanumeric();
-        let mut fields = line
-            .trim_start_matches(|c: char| c.is_whitespace() || "│├└─".contains(c))
-            .split_whitespace();
-        let (Some(_name), Some(kind)) = (fields.next(), fields.next()) else {
-            continue;
-        };
-        let mount = fields.next();
-        if root_level {
-            groups.push((mount == Some("/"), false));
+/// One block device that nothing else is stacked on, with the facts the
+/// encryption check needs. `lsblk -s` lists each such device first, then its
+/// ancestors, so a crypt ancestor anywhere in the group encrypts the device.
+struct StorageGroup {
+    name: String,
+    kind: String,
+    read_only: bool,
+    removable: bool,
+    fstype: String,
+    mount: String,
+    encrypted: bool,
+}
+
+/// Mounts that hold no user data and stay plaintext on a standard encrypted
+/// install, so they do not count against `disk_encryption`.
+const BOOT_MOUNTS: &[&str] = &["/boot", "/boot/efi", "/efi"];
+const NON_PERSISTENT_FSTYPES: &[&str] =
+    &["squashfs", "iso9660", "udf", "tmpfs", "overlay", "ramfs"];
+
+impl StorageGroup {
+    fn is_swap(&self) -> bool {
+        self.fstype == "swap" || self.mount == "[SWAP]"
+    }
+
+    /// In scope: a writable, non-removable, persistent local block device that
+    /// is mounted or used as swap. Excluded on purpose: read-only and
+    /// removable media, loop and optical devices, squashfs/iso/tmpfs/overlay,
+    /// zram (RAM-backed), boot partitions, and unmounted devices.
+    fn in_scope(&self) -> bool {
+        if self.read_only || self.removable {
+            return false;
         }
-        if let Some(group) = groups.last_mut() {
-            if kind == "crypt" {
-                group.1 = true;
-            }
+        if matches!(self.kind.as_str(), "loop" | "rom") || self.name.starts_with("zram") {
+            return false;
+        }
+        if NON_PERSISTENT_FSTYPES.contains(&self.fstype.as_str()) {
+            return false;
+        }
+        if self.is_swap() {
+            return true;
+        }
+        !self.mount.is_empty() && !BOOT_MOUNTS.contains(&self.mount.as_str())
+    }
+}
+
+fn parse_lsblk_row<'a>(
+    mut fields: impl Iterator<Item = &'a str>,
+) -> Option<(bool, bool, String, String)> {
+    let read_only = flag(fields.next()?)?;
+    let removable = flag(fields.next()?)?;
+    let tail: Vec<&str> = fields.collect();
+    let (fstype, mount) = match tail.as_slice() {
+        [] => ("", String::new()),
+        [one] if one.starts_with('/') || one.starts_with('[') => ("", (*one).to_string()),
+        [one] => (*one, String::new()),
+        [fs, mount @ ..] => (*fs, mount.join(" ")),
+    };
+    Some((read_only, removable, fstype.to_string(), mount))
+}
+
+fn flag(s: &str) -> Option<bool> {
+    match s {
+        "0" => Some(false),
+        "1" => Some(true),
+        _ => None,
+    }
+}
+
+/// Input is `lsblk -s -n -o NAME,TYPE,RO,RM,FSTYPE,MOUNTPOINT`.
+///
+/// `full` when every in-scope filesystem has a crypt ancestor, `partial` when
+/// some do, `none` when none do, `unknown` when the root filesystem is not
+/// listed or a row cannot be read.
+pub fn parse_lsblk_inverse(out: &str) -> &'static str {
+    let mut groups: Vec<StorageGroup> = Vec::new();
+    for line in out.lines().filter(|l| !l.trim().is_empty()) {
+        let root_level = line.chars().next().is_some_and(char::is_alphanumeric);
+        let body = line.trim_start_matches(|c: char| c.is_whitespace() || "│├└─|`-".contains(c));
+        let mut parts = body.split_whitespace();
+        let (Some(name), Some(kind)) = (parts.next(), parts.next()) else {
+            return "unknown";
+        };
+        if root_level {
+            let Some((read_only, removable, fstype, mount)) = parse_lsblk_row(parts) else {
+                return "unknown";
+            };
+            groups.push(StorageGroup {
+                name: name.to_string(),
+                kind: kind.to_string(),
+                read_only,
+                removable,
+                fstype,
+                mount,
+                encrypted: kind == "crypt",
+            });
+        } else if let Some(group) = groups.last_mut() {
+            group.encrypted |= kind == "crypt";
         }
     }
-    let Some(root) = groups.iter().find(|g| g.0) else {
+    let scoped: Vec<&StorageGroup> = groups.iter().filter(|g| g.in_scope()).collect();
+    if !scoped.iter().any(|g| g.mount == "/") {
         return "unknown";
-    };
-    if root.1 {
+    }
+    let encrypted = scoped.iter().filter(|g| g.encrypted).count();
+    if encrypted == scoped.len() {
         "full"
-    } else if groups.iter().any(|g| g.1) {
+    } else if encrypted > 0 {
         "partial"
     } else {
         "none"
@@ -413,12 +494,39 @@ mod tests {
     #[test]
     fn lsblk_luks_under_lvm_root() {
         let out = "\
-ubuntu--vg-ubuntu--lv lvm  /
-└─dm_crypt-0          crypt
-  └─nvme0n1p3         part
-    └─nvme0n1         disk
-nvme0n1p2             part /boot
-└─nvme0n1             disk
+ubuntu--vg-ubuntu--lv lvm  0 0 ext4  /
+└─dm_crypt-0          crypt 0 0 crypto_LUKS
+  └─nvme0n1p3         part 0 0
+    └─nvme0n1         disk 0 0
+nvme0n1p2             part 0 0 ext4 /boot
+└─nvme0n1             disk 0 0
+";
+        assert_eq!(parse_lsblk_inverse(out), "full");
+    }
+
+    #[test]
+    fn lsblk_encrypted_root_but_plain_home_is_partial() {
+        let out = "\
+vg-root     lvm  0 0 ext4 /
+└─luks-root crypt 0 0
+  └─sda2    part 0 0
+    └─sda   disk 0 0
+sdb1        part 0 0 ext4 /home
+└─sdb       disk 0 0
+";
+        assert_eq!(parse_lsblk_inverse(out), "partial");
+    }
+
+    #[test]
+    fn lsblk_encrypted_root_and_home_is_full() {
+        let out = "\
+vg-root     lvm  0 0 ext4 /
+└─luks-root crypt 0 0
+  └─sda2    part 0 0
+    └─sda   disk 0 0
+luks-home   crypt 0 0 ext4 /home
+└─sdb1      part 0 0
+  └─sdb     disk 0 0
 ";
         assert_eq!(parse_lsblk_inverse(out), "full");
     }
@@ -426,10 +534,10 @@ nvme0n1p2             part /boot
     #[test]
     fn lsblk_plain_root() {
         let out = "\
-nvme0n1p2 part /
-└─nvme0n1 disk
-nvme0n1p1 part /boot/efi
-└─nvme0n1 disk
+nvme0n1p2 part 0 0 ext4 /
+└─nvme0n1 disk 0 0
+nvme0n1p1 part 0 0 vfat /boot/efi
+└─nvme0n1 disk 0 0
 ";
         assert_eq!(parse_lsblk_inverse(out), "none");
     }
@@ -437,20 +545,81 @@ nvme0n1p1 part /boot/efi
     #[test]
     fn lsblk_encrypted_data_but_plain_root() {
         let out = "\
-nvme0n1p2 part /
-└─nvme0n1 disk
-luks-data crypt /home
-└─sda1    part
-  └─sda   disk
+nvme0n1p2 part 0 0 ext4 /
+└─nvme0n1 disk 0 0
+luks-data crypt 0 0 ext4 /home
+└─sda1    part 0 0
+  └─sda   disk 0 0
 ";
         assert_eq!(parse_lsblk_inverse(out), "partial");
+    }
+
+    #[test]
+    fn lsblk_other_mounted_data_disk_counts() {
+        let out = "\
+luks-root crypt 0 0 ext4 /
+└─sda2    part 0 0
+  └─sda   disk 0 0
+sdb1      part 0 0 xfs /srv/data
+└─sdb     disk 0 0
+";
+        assert_eq!(parse_lsblk_inverse(out), "partial");
+    }
+
+    #[test]
+    fn lsblk_plain_swap_partition_makes_encrypted_root_partial() {
+        let out = "\
+luks-root crypt 0 0 ext4 /
+└─sda2    part 0 0
+  └─sda   disk 0 0
+sda3      part 0 0 swap [SWAP]
+└─sda     disk 0 0
+";
+        assert_eq!(parse_lsblk_inverse(out), "partial");
+    }
+
+    #[test]
+    fn lsblk_encrypted_swap_and_zram_swap_stay_full() {
+        let out = "\
+luks-root crypt 0 0 ext4 /
+└─sda2    part 0 0
+  └─sda   disk 0 0
+cryptswap crypt 0 0 swap [SWAP]
+└─sda3    part 0 0
+  └─sda   disk 0 0
+zram0     disk 0 0 swap [SWAP]
+";
+        assert_eq!(parse_lsblk_inverse(out), "full");
+    }
+
+    #[test]
+    fn lsblk_ignores_removable_read_only_loop_and_unmounted_devices() {
+        let out = "\
+luks-root crypt 0 0 ext4 /
+└─sda2    part 0 0
+  └─sda   disk 0 0
+sdc1      part 0 1 vfat /media/user/stick
+└─sdc     disk 0 1
+sr0       rom  0 0 iso9660 /media/user/disc
+loop3     loop 1 0 squashfs /snap/example/1
+sdd1      part 0 0 ext4
+└─sdd     disk 0 0
+sde1      part 1 0 ext4 /mnt/archive
+└─sde     disk 1 0
+";
+        assert_eq!(parse_lsblk_inverse(out), "full");
+    }
+
+    #[test]
+    fn lsblk_unreadable_row_is_unknown() {
+        assert_eq!(parse_lsblk_inverse("sda1 part ? ? ext4 /\n"), "unknown");
     }
 
     #[test]
     fn lsblk_without_root_is_unknown() {
         assert_eq!(parse_lsblk_inverse(""), "unknown");
         assert_eq!(
-            parse_lsblk_inverse("sda1 part /data\n└─sda disk\n"),
+            parse_lsblk_inverse("sda1 part 0 0 ext4 /data\n└─sda disk 0 0\n"),
             "unknown"
         );
     }
@@ -673,12 +842,12 @@ ID Command line                          Date and time       Action(s) Altered
     #[test]
     fn lsblk_ascii_tree_in_non_utf8_locale() {
         let out = "\
-vg--root-lv  lvm   /
-`-luks-0     crypt
-  `-vda3     part
-    `-vda    disk
-vda2         part  /boot
-`-vda        disk
+vg--root-lv  lvm   0 0 ext4 /
+`-luks-0     crypt 0 0
+  `-vda3     part  0 0
+    `-vda    disk  0 0
+vda2         part  0 0 ext4 /boot
+`-vda        disk  0 0
 ";
         assert_eq!(parse_lsblk_inverse(out), "full");
     }
