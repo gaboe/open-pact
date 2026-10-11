@@ -144,6 +144,7 @@ When the device connects, the client produces a claim and signs it with the devi
   "nonce": "from the gateway, single use",
   "time": "2026-11-03T08:12:44Z",
   "client": "open-pact-client 0.4.1 sha256:77ac...",
+  "os": "macos",
   "trust_level": "L1",
   "virtualized": "no",
   "results": {
@@ -151,14 +152,15 @@ When the device connects, the client produces a claim and signs it with the devi
     "secure_boot": "on",
     "os_patch_age": "le_14d",
     "firewall": "on"
-  }
+  },
+  "log_checkpoint": { "size": 42, "root": "9b1d..." }
 }
 ```
 
 - **Format.** JSON with canonical serialisation (RFC 8785), signed as JWS with ES256 (P-256). P-256 is the curve the Secure Enclave supports and TPM 2.0 supports widely, so the device key can stay in hardware. CBOR/COSE may follow when hardware attestation arrives.
 - **Device key.** Generated in TPM 2.0 or the Secure Enclave (vTPM inside a VM) and not exportable. A device without hardware key storage is refused. `trust_level` states what backs the claim (section 5) and the manifest sets the minimum.
 - **One key per company.** At `join` the client creates a separate device key and a separate VPN certificate key for each company. A public key is itself a stable identifier, so sharing one key would let companies link the device. The pseudonym is the hash of that company-specific key.
-- **Everything that leaves.** Besides `results`: manifest hash, device pseudonym, nonce, time, client version and hash, `trust_level`, `virtualized`, the signature and public key, and a certificate request for the VPN key. The gateway also sees the source IP address, as any server does. At enrolment the device sends its public keys; incident reports leave only when the owner starts them. With L2 attestation, boot measurements will be added, which reveal bootloader and kernel versions, and must then be listed in `disclosed_metadata`.
+- **Everything that leaves.** Besides `results`: manifest hash, device pseudonym, nonce, time, client version and hash, `os`, `trust_level`, `virtualized`, `log_checkpoint` (size and root of the last transparency log checkpoint the client verified), the signature and public key, and a certificate request for the VPN key. The gateway also sees the source IP address, as any server does. At enrolment the device sends its public keys; incident reports leave only when the owner starts them. With L2 attestation, boot measurements will be added, which reveal bootloader and kernel versions, and must then be listed in `disclosed_metadata`.
 - **Optional `in_eea`.** If a client contract requires it, the gateway derives yes or no from the source IP it already sees and stores only that result, not the IP. The client sends nothing new. It is off by default and must be listed in `disclosed_metadata`.
 - **Metadata.** Time, pseudonym and hashes form a record of when a device connected. That is personal data, so the manifest lists it in `disclosed_metadata` and `claim_retention` applies. The company already holds the same record in its VPN logs; open-pact does not add to it.
 - **Pull only.** The client does not run as a service and opens no port. The VPN connect script or the owner starts it, and its only connection is outbound to the gateway. When the owner is not connected to the company, the client does nothing.
@@ -197,9 +199,9 @@ The log is a list of events about the rules. Nothing can be removed from it or q
 
 The log is copied to every contractor, so entries about one person (incidents, admin views, deletions) carry only a commitment: a salted hash that reveals nothing to colleagues. The affected owner is notified and receives the opening, so they can prove the entry is about them.
 
-Each entry contains the hash of the previous one, so changing an old entry changes every entry after it. The gateway keeps the log. On every connection the client downloads new entries, verifies the chain and keeps its own copy. While connected, it holds an outbound connection and receives new entries immediately. It opens no port. If the gateway's history no longer matches the client's copy, the client raises an alarm.
+The log is a Merkle tree, hashed as in Certificate Transparency (RFC 9162). Changing or removing any past entry changes the root. The gateway keeps the log and signs checkpoints. A checkpoint states the log's name, the number of entries and the root, in the C2SP checkpoint and signed-note formats. On every connection the client fetches the latest checkpoint and a consistency proof. The proof is a few hashes that show that the new tree contains the tree the client verified before, unchanged. The client keeps the new checkpoint and puts its size and root into each claim, so every signed claim also states which history of the rules the device saw. While connected, the client holds an outbound connection and receives new checkpoints immediately. It opens no port. If a proof fails, the client raises an alarm.
 
-To stop the gateway from showing different histories to different people, the gateway signs the current log head in every response. Contractors can compare heads among themselves (`open-pact-client log head`). A mismatch is signed proof of tampering. Unlike a wiki page whose history can be deleted, every change here shows.
+The gateway could still show different histories to different people. Witnesses close this gap. A witness is an independent party, for example the bank's auditor, that cosigns a checkpoint only if it extends the last checkpoint the witness cosigned (C2SP tlog-witness). The gateway serves the cosignatures with the checkpoint. Two checkpoints of the same size with different roots, both signed by the gateway, are signed proof of tampering. Contractors can also compare checkpoints among themselves (`open-pact-client log head`). An owner can show one entry about them to a third party with an inclusion proof against a cosigned checkpoint (`open-pact-client log prove`), without handing over the whole log. Unlike a wiki page whose history can be deleted, every change here shows.
 
 ### 4.6 Enrolment, device changes, incidents and leaving
 
@@ -280,7 +282,7 @@ Lean is used for what it does best: an executable model of the protocol rules, w
 
 1. **Narrowing.** A manifest change passes without the owner's signature only if it is a true narrowing (section 4.2). No new check, wider output, stricter value, shorter grace or longer retention gets through unsigned.
 2. **Disclosure contract.** A claim contains only fields the manifest lists, and every value belongs to its declared enumeration, so `results` carries at most Σ log₂|enumeration| bits. The metadata in `disclosed_metadata` is counted separately.
-3. **Transparency log.** Changing any past entry changes every later head.
+3. **Transparency log.** A verified consistency proof means that the old tree is an unchanged prefix of the new one, and a verified inclusion proof means that the entry is in the tree with that root.
 4. **Grace periods.** `unknown` never denies access immediately, and `grace` behaves as the manifest says.
 
 The OS checks themselves cannot be proven; they are tested on real systems (section 5).
@@ -321,7 +323,7 @@ The repository holds both parts: the client and the gateway. A company deploys t
 3. **Pilot.** The first manifest (Appendix A) on macOS, Windows and Linux. VPN access through short-lived certificates. Transparency log in the gateway. Device key in TPM 2.0 or Secure Enclave, required. CLI only.
 4. **Hardware proof (planned).** Measured boot attestation through the TPM (L2). On Windows, BitLocker and Secure Boot proven cryptographically rather than reported. On Linux, the same plus proof of the running client through IMA. On macOS, Apple offers no attestation without MDM; the client relies on a Secure Enclave key bound to its code signature and a SIP status check.
 5. **open-pact Foundation.** A neutral legal entity that maintains the public project (releases, review of new checks). It holds no keys and no data.
-6. **Lean model and differential testing** from the proof of concept onward: narrowing rule, disclosure contract, log chain and grace periods, checked against the Rust code in CI.
+6. **Lean model and differential testing** from the proof of concept onward: narrowing rule, disclosure contract, log proofs and grace periods, checked against the Rust code in CI.
 7. **Optional.** A tray icon, the Decree 409 logging module.
 
 Out of scope on purpose: remote execution, log collection, wiping personal devices, location, and any check whose output is not a small enumeration. Work rules such as daily pushes to a repository, approved AI tools or approved storage are contractual duties checked on the server or by audit, not device state.
@@ -335,7 +337,7 @@ valid_from = "2026-11-01"
 claim_max_age = "24h"
 claim_retention = "12mo"
 claim_recipients = ["Company IT security", "auditor on request"]
-disclosed_metadata = ["time", "device_pseudonym", "client_hash", "manifest_hash", "trust_level", "virtualized"]
+disclosed_metadata = ["time", "device_pseudonym", "client_hash", "manifest_hash", "os", "trust_level", "virtualized", "log_checkpoint"]
 data_controller = "Company Ltd., dpo@company.example"
 min_trust_level = "L1"
 unknown_grace = "7d"                 # default for all checks, never zero
@@ -484,6 +486,8 @@ grace = "0d"
 - Microsoft Intune Retire and Wipe actions. https://learn.microsoft.com/en-us/intune/device-management/actions/retire ; https://learn.microsoft.com/en-us/intune/device-management/actions/wipe
 - BitLocker countermeasures (TPM-only vs TPM+PIN). https://learn.microsoft.com/en-us/windows/security/operating-system-security/data-protection/bitlocker/countermeasures
 - NIST SP 800-46 Rev. 2 (telework and BYOD). https://csrc.nist.gov/pubs/sp/800/46/r2/final
+- RFC 9162, Certificate Transparency Version 2.0, section 2.1 (Merkle tree, inclusion and consistency proofs). https://www.rfc-editor.org/rfc/rfc9162.html
+- C2SP tlog-checkpoint, signed-note, tlog-cosignature and tlog-witness. https://c2sp.org/tlog-checkpoint ; https://c2sp.org/signed-note ; https://c2sp.org/tlog-cosignature ; https://c2sp.org/tlog-witness
 - Evolu, local-first library. https://www.evolu.dev
 - Kolide, Honest Security. https://honest.security
 - AWS Cedar: verification-guided development with a Lean model and differential testing against Rust. https://lean-lang.org/use-cases/cedar/ ; https://arxiv.org/pdf/2407.01688
