@@ -128,7 +128,7 @@ impl Reason {
     }
 }
 
-/// `open-pact-client 1.2.3` and nothing else, so the field cannot carry free text off the device.
+/// `open-pact-client 1.2.3` with canonical `u32` components and nothing else, so the field cannot carry free text off the device.
 fn is_client_version(client: &str) -> bool {
     let Some(version) = client.strip_prefix("open-pact-client ") else {
         return false;
@@ -137,7 +137,7 @@ fn is_client_version(client: &str) -> bool {
     parts.len() == 3
         && parts
             .iter()
-            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+            .all(|p| p.parse::<u32>().is_ok_and(|n| n.to_string() == *p))
 }
 
 /// Grace is measured from the first failure the gateway saw, in `first_failures`. A failure keeps
@@ -294,7 +294,7 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect::<BTreeMap<_, _>>(),
-            csr_pem: None,
+            csr_sha256: None,
             log_checkpoint: None,
         }
     }
@@ -349,6 +349,9 @@ mod tests {
             "open-pact-client 1..2",
             "my-client 1.2.3",
             "open-pact-client 1.2.3 hello from the owner",
+            &format!("open-pact-client {}.2.3", "7".repeat(65_536)),
+            "open-pact-client 0001.2.3",
+            "open-pact-client 4294967296.0.0",
         ] {
             let mut c = claim(&[]);
             c.client = bad.into();

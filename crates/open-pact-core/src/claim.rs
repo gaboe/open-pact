@@ -5,7 +5,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Error, LogHash, ManifestHash, Os, Pseudonym, PublicKey, Signature, SigningKey, TrustLevel,
+    CsrHash, Error, LogHash, ManifestHash, Os, Pseudonym, PublicKey, Signature, SigningKey,
+    TrustLevel,
 };
 
 const HEADER: &str = r#"{"alg":"ES256","typ":"open-pact-claim+jws"}"#;
@@ -30,8 +31,10 @@ pub struct Claim {
     pub trust_level: TrustLevel,
     pub virtualized: Virtualized,
     pub results: BTreeMap<String, String>,
+    /// The SHA-256 of the VPN key's certificate request. The request travels next to the JWS, so
+    /// the signed claim, which the company keeps, holds only this hash.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub csr_pem: Option<String>,
+    pub csr_sha256: Option<CsrHash>,
     /// The last log checkpoint this client verified, so each claim commits to the rules history it saw.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_checkpoint: Option<LogCheckpoint>,
@@ -181,7 +184,7 @@ mod tests {
                 ("firewall".into(), "on".into()),
                 ("disk_encryption".into(), "full".into()),
             ]),
-            csr_pem: None,
+            csr_sha256: None,
             log_checkpoint: None,
         }
     }
@@ -297,6 +300,15 @@ mod tests {
             verify_claim(&resign(&key, &pretty)),
             Err(Error::MalformedJws(_))
         ));
+    }
+
+    #[test]
+    fn a_claim_cannot_carry_a_certificate_request() {
+        let key = dev_key::generate();
+        let mut payload = serde_json::to_value(claim_for(&key)).unwrap();
+        payload["csr_pem"] = "-----BEGIN CERTIFICATE REQUEST-----\nFICTIONAL private note\n".into();
+        let jws = resign(&key, &serde_jcs::to_vec(&payload).unwrap());
+        assert!(matches!(verify_claim(&jws), Err(Error::MalformedJws(_))));
     }
 
     #[test]

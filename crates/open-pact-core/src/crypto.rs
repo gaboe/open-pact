@@ -59,10 +59,18 @@ macro_rules! prefixed_hash {
 
 prefixed_hash!(ManifestHash, "sha256:");
 prefixed_hash!(Pseudonym, "pseudonym:");
+prefixed_hash!(CsrHash, "sha256:");
 
 impl ManifestHash {
     pub fn of(manifest_bytes: &[u8]) -> Self {
         Self(format!("sha256:{}", sha256_hex(manifest_bytes)))
+    }
+}
+
+impl CsrHash {
+    /// The hash of a certificate request's DER, which the claim signs instead of the request itself.
+    pub fn of(csr_der: &[u8]) -> Self {
+        Self(format!("sha256:{}", sha256_hex(csr_der)))
     }
 }
 

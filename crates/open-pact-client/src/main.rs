@@ -15,9 +15,9 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use device_key::DeviceKey;
 use open_pact_core::{
-    Checkpoint, Claim, Endorsement, EnrolRequest, Entry, EntryKind, Invitation, LogCheckpoint,
-    LogHash, LogKey, Manifest, ManifestHash, Note, Os, Pseudonym, PublicKey, SignedManifest,
-    Virtualized, dev_key, root, verify_claim, verify_consistency, verify_inclusion,
+    Checkpoint, Claim, CsrHash, Endorsement, EnrolRequest, Entry, EntryKind, Invitation,
+    LogCheckpoint, LogHash, LogKey, Manifest, ManifestHash, Note, Os, Pseudonym, PublicKey,
+    SignedManifest, Virtualized, dev_key, root, verify_claim, verify_consistency, verify_inclusion,
 };
 use rcgen::{CertificateParams, DistinguishedName, KeyPair};
 use serde::{Deserialize, Serialize};
@@ -806,7 +806,9 @@ async fn join(
     )
 }
 
-fn vpn_csr(home: &Home) -> Result<String> {
+/// A certificate request for the VPN key with an empty subject and no attributes: it carries the
+/// public key and nothing else. Returns the PEM and the DER.
+fn vpn_csr(home: &Home) -> Result<(String, Vec<u8>)> {
     let path = home.file("vpn-key.pem");
     let key = if path.exists() {
         KeyPair::from_pem(&std::fs::read_to_string(&path)?)?
@@ -824,7 +826,8 @@ fn vpn_csr(home: &Home) -> Result<String> {
     };
     let mut params = CertificateParams::default();
     params.distinguished_name = DistinguishedName::new();
-    Ok(params.serialize_request(&key)?.pem()?)
+    let csr = params.serialize_request(&key)?;
+    Ok((csr.pem()?, csr.der().to_vec()))
 }
 
 fn describe_cert(pem: &str) -> Result<String> {
@@ -884,6 +887,7 @@ async fn check(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
         .json()
         .await?;
     let device_key = device.public_key();
+    let (csr_pem, csr_der) = vpn_csr(home)?;
     let claim = Claim {
         manifest: manifest.hash().clone(),
         device: Pseudonym::of(&device_key),
@@ -896,10 +900,11 @@ async fn check(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
         trust_level: device.trust_level(),
         virtualized: virtualized(),
         results,
-        csr_pem: Some(vpn_csr(home)?),
+        csr_sha256: Some(CsrHash::of(&csr_der)),
         log_checkpoint,
     };
-    let sent = serde_json::to_vec(&json!({ "jws": device.sign_claim(&claim)? }))?;
+    let sent =
+        serde_json::to_vec(&json!({ "jws": device.sign_claim(&claim)?, "csr_pem": csr_pem }))?;
     let resp = http
         .post(format!("{gateway}/v1/claim"))
         .header("content-type", "application/json")
@@ -1340,5 +1345,20 @@ mod tests {
             let error = format!("{:#}", joined.expect_err(to));
             assert!(error.contains("does not implement"), "{error}");
         }
+    }
+
+    #[test]
+    fn the_vpn_certificate_request_carries_only_the_public_key() {
+        use x509_parser::certification_request::X509CertificationRequest;
+        use x509_parser::prelude::FromDer;
+        let dir = tempfile::tempdir().unwrap();
+        let (pem, der) = vpn_csr(&Home(dir.path().to_path_buf())).unwrap();
+        let (_, parsed) = x509_parser::pem::parse_x509_pem(pem.as_bytes()).unwrap();
+        assert_eq!(parsed.contents, der);
+        let (rest, csr) = X509CertificationRequest::from_der(&der).unwrap();
+        assert!(rest.is_empty());
+        let info = &csr.certification_request_info;
+        assert_eq!(info.subject.iter().count(), 0, "empty subject");
+        assert!(info.attributes().is_empty(), "no attributes or extensions");
     }
 }

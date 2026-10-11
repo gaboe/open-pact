@@ -279,11 +279,7 @@ pub fn ufw_enabled(conf: Option<&str>, service: Option<bool>) -> Option<bool> {
         .filter_map(|l| l.split_once('='))
         .rfind(|(k, _)| k.trim() == "ENABLED")
         .is_some_and(|(_, v)| v.trim().trim_matches('"').eq_ignore_ascii_case("yes"));
-    if enabled {
-        service
-    } else {
-        Some(false)
-    }
+    if enabled { service } else { Some(false) }
 }
 
 pub fn merge_firewall(firewalld: Option<bool>, ufw: Option<bool>) -> &'static str {

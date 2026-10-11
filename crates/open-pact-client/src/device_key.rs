@@ -120,7 +120,7 @@ mod tests {
             trust_level: key.trust_level(),
             virtualized: Virtualized::No,
             results: BTreeMap::from([("firewall".into(), "on".into())]),
-            csr_pem: None,
+            csr_sha256: None,
             log_checkpoint: None,
         }
     }

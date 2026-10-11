@@ -42,7 +42,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         trust_level: TrustLevel::L0,
         virtualized: Virtualized::No,
         results,
-        csr_pem: None,
+        csr_sha256: None,
         log_checkpoint: None,
     };
     println!("{}", sign_claim(&claim, &key)?);

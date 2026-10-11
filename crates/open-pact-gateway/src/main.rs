@@ -24,9 +24,9 @@ use axum::{
 };
 use clap::{Parser, Subcommand};
 use open_pact_core::{
-    Checkpoint, Decision, Endorsement, EnrolRequest, Entry, EntryKind, Evaluation, FirstFailures,
-    Invitation, LogHash, LogKey, Manifest, Note, Pseudonym, PublicKey, Reason, SigningKey, Span,
-    WitnessKey, consistency_proof, evaluate, inclusion_proof, root, verify_claim,
+    Checkpoint, Claim, CsrHash, Decision, Endorsement, EnrolRequest, Entry, EntryKind, Evaluation,
+    FirstFailures, Invitation, LogHash, LogKey, Manifest, Note, Pseudonym, PublicKey, Reason,
+    SigningKey, Span, WitnessKey, consistency_proof, evaluate, inclusion_proof, root, verify_claim,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -133,6 +133,9 @@ impl Tree {
 #[serde(deny_unknown_fields)]
 struct ClaimRequest {
     jws: String,
+    /// Travels outside the JWS so the stored claim holds only its hash, `csr_sha256`.
+    #[serde(default)]
+    csr_pem: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -631,9 +634,10 @@ async fn claim(
     State(app): State<App>,
     body: Result<Json<ClaimRequest>, JsonRejection>,
 ) -> Result<Json<Value>, Reply> {
-    let Ok(Json(ClaimRequest { jws })) = body else {
+    let Ok(Json(ClaimRequest { jws, csr_pem })) = body else {
         return Err(denied(vec![
-            "body must be {\"jws\": \"<compact JWS>\"}".into(),
+            "body must be {\"jws\": \"<compact JWS>\", \"csr_pem\": \"<PEM>\"}, csr_pem optional"
+                .into(),
         ]));
     };
     let verified = verify_claim(&jws).map_err(|e| denied(vec![e.to_string()]))?;
@@ -679,8 +683,30 @@ async fn claim(
         Some(Some(why)) => reasons.insert(0, why.into()),
         Some(None) => {}
     }
+    let csr = match (&claim.csr_sha256, &csr_pem) {
+        (None, None) => None,
+        (Some(hash), Some(pem)) => match keys::bare_csr_der(pem) {
+            Ok(der) if CsrHash::of(&der) == *hash => Some(pem),
+            Ok(_) => {
+                reasons.push("csr_pem does not match the claim's csr_sha256".into());
+                None
+            }
+            Err(e) => {
+                reasons.push(e);
+                None
+            }
+        },
+        (Some(_), None) => {
+            reasons.push("the claim signs csr_sha256 but the request has no csr_pem".into());
+            None
+        }
+        (None, Some(_)) => {
+            reasons.push("csr_pem needs its csr_sha256 in the signed claim".into());
+            None
+        }
+    };
     let mut certificate_pem = None;
-    if let (true, Some(csr)) = (reasons.is_empty(), &claim.csr_pem) {
+    if let (true, Some(csr)) = (reasons.is_empty(), csr) {
         let validity = app
             .manifest
             .body()
@@ -702,7 +728,7 @@ async fn claim(
             .map_err(internal)?;
     }
     if enrolled && !oversharing {
-        let payload = serde_json::to_value(claim).map_err(internal)?;
+        let payload = stored_claim(claim, certificate_pem.as_deref()).map_err(internal)?;
         claims::store(
             &mut tx,
             &app.kek,
@@ -727,6 +753,15 @@ async fn claim(
         "ca_pem": app.keys.ca.cert_pem,
         "log_checkpoint": checkpoint.to_string(),
     })))
+}
+
+/// The claim as the company keeps it, with the fingerprint of the certificate issued for it.
+fn stored_claim(claim: &Claim, certificate_pem: Option<&str>) -> anyhow::Result<Value> {
+    let mut payload = serde_json::to_value(claim)?;
+    if let Some(pem) = certificate_pem {
+        payload["certificate_sha256"] = keys::certificate_sha256(pem)?.into();
+    }
+    Ok(payload)
 }
 
 async fn index(State(app): State<App>) -> Result<Html<String>, Reply> {
@@ -1009,11 +1044,17 @@ mod tests {
 
     use super::*;
 
+    const DEMO: &str = include_str!("../../../examples/manifest.toml");
+    const TEST_KEK: [u8; 32] = [5; 32];
+
     async fn test_app(enrol_limit: u32, nonce_limit: u32) -> Router {
+        test_app_with(DEMO, enrol_limit, nonce_limit).await.0
+    }
+
+    async fn test_app_with(toml: &str, enrol_limit: u32, nonce_limit: u32) -> (Router, PgPool) {
         let db = testdb::fresh().await;
-        let kek = SealingKey::new(&[5; 32]);
+        let kek = SealingKey::new(&TEST_KEK);
         let keys = Keys::load_or_create(&db, &kek).await.unwrap();
-        let toml = include_str!("../../../examples/manifest.toml");
         let manifest = Manifest::parse(toml.as_bytes()).unwrap();
         let log = Log {
             key: LogKey::new("log.example.org/test", &PublicKey::from(&keys.log)),
@@ -1022,8 +1063,8 @@ mod tests {
             cache: Mutex::default(),
         };
         let minute = Duration::from_secs(60);
-        router(App {
-            db,
+        let app = router(App {
+            db: db.clone(),
             company: Endorsement::sign(&keys.manifest, manifest.hash()),
             manifest: Arc::new(manifest),
             toml: toml.into(),
@@ -1034,7 +1075,141 @@ mod tests {
             nonce_limiter: Arc::new(Limiter::new(nonce_limit, minute, 100)),
             max_nonces: 10_000,
             kek: Arc::new(kek),
-        })
+        });
+        (app, db)
+    }
+
+    async fn post_json(app: &Router, path: &str, body: &Value) -> (StatusCode, Value) {
+        let mut req = Request::post(path)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([192, 0, 2, 7], 40000))));
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    /// An approved device under `toml` and a compliant claim from it with a fresh nonce.
+    async fn enrolled_claim(app: &Router, db: &PgPool, toml: &str) -> (SigningKey, Claim) {
+        let manifest = Manifest::parse(toml.as_bytes()).unwrap();
+        let key = open_pact_core::dev_key::generate();
+        let device_key = PublicKey::from(&key);
+        let device = Pseudonym::of(&device_key);
+        testdb::enrolled_device(db, device.as_str(), manifest.hash().as_str()).await;
+        let (_, nonce) = post_json(app, "/v1/nonce", &Value::Null).await;
+        let claim = Claim {
+            manifest: manifest.hash().clone(),
+            device,
+            device_key,
+            nonce: nonce["nonce"].as_str().unwrap().into(),
+            time: chrono::DateTime::from_timestamp(chrono::Utc::now().timestamp(), 0).unwrap(),
+            client: "open-pact-client 0.0.1".into(),
+            os: open_pact_core::Os::Linux,
+            trust_level: open_pact_core::TrustLevel::L0,
+            virtualized: open_pact_core::Virtualized::No,
+            results: [
+                ("disk_encryption", "full"),
+                ("firewall", "on"),
+                ("screen_lock", "le_5min"),
+                ("os_supported", "yes"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+            csr_sha256: None,
+            log_checkpoint: None,
+        };
+        (key, claim)
+    }
+
+    fn bare_csr() -> (String, Vec<u8>) {
+        let mut params = rcgen::CertificateParams::default();
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        let csr = params
+            .serialize_request(&rcgen::KeyPair::generate().unwrap())
+            .unwrap();
+        (csr.pem().unwrap(), csr.der().to_vec())
+    }
+
+    /// Every stored record, and the JSON payload of its JWS, as text.
+    async fn stored_text(db: &PgPool) -> Vec<String> {
+        let kek = SealingKey::new(&TEST_KEK);
+        claims::open_all(db, &kek)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|record| {
+                use base64::Engine;
+                let payload = record["jws"].as_str().unwrap().split('.').nth(1).unwrap();
+                let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(payload)
+                    .unwrap();
+                format!("{record} {}", String::from_utf8(payload).unwrap())
+            })
+            .collect()
+    }
+
+    /// M3: the request travels beside the JWS; the company keeps its hash and the certificate's.
+    #[tokio::test]
+    #[ignore = "needs TEST_DATABASE_URL"]
+    async fn issues_a_certificate_without_storing_the_certificate_request() {
+        let (app, db) = test_app_with(DEMO, 10, 100).await;
+        let (key, mut claim) = enrolled_claim(&app, &db, DEMO).await;
+        let (pem, der) = bare_csr();
+        claim.csr_sha256 = Some(CsrHash::of(&der));
+        let jws = open_pact_core::sign_claim(&claim, &key).unwrap();
+        let (status, body) =
+            post_json(&app, "/v1/claim", &json!({"jws": jws, "csr_pem": pem})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let certificate = body["certificate_pem"].as_str().unwrap();
+
+        let stored = stored_text(&db).await;
+        assert_eq!(stored.len(), 1);
+        let pem_body = pem.lines().nth(1).unwrap();
+        assert!(!stored[0].contains("CERTIFICATE REQUEST") && !stored[0].contains(pem_body));
+        assert!(stored[0].contains(&keys::certificate_sha256(certificate).unwrap()));
+    }
+
+    /// M3: a request with anything besides its key, or another request than the claim signs, gets no certificate.
+    #[tokio::test]
+    #[ignore = "needs TEST_DATABASE_URL"]
+    async fn refuses_a_certificate_request_the_claim_does_not_sign_or_that_carries_text() {
+        let (app, db) = test_app_with(DEMO, 10, 100).await;
+        let mut subject = rcgen::CertificateParams::default();
+        subject.distinguished_name = rcgen::DistinguishedName::new();
+        subject
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "FICTIONAL private note");
+        let texty = subject
+            .serialize_request(&rcgen::KeyPair::generate().unwrap())
+            .unwrap();
+        let (other_pem, _) = bare_csr();
+        for (signed, sent) in [
+            (CsrHash::of(texty.der()), texty.pem().unwrap()),
+            (CsrHash::of(&bare_csr().1), other_pem),
+        ] {
+            let (key, mut claim) = enrolled_claim(&app, &db, DEMO).await;
+            claim.csr_sha256 = Some(signed);
+            let jws = open_pact_core::sign_claim(&claim, &key).unwrap();
+            let (status, body) =
+                post_json(&app, "/v1/claim", &json!({"jws": jws, "csr_pem": sent})).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            assert!(body["reasons"].to_string().contains("csr"), "{body}");
+        }
+        assert!(
+            stored_text(&db)
+                .await
+                .iter()
+                .all(|r| !r.contains("FICTIONAL"))
+        );
     }
 
     async fn post_from(app: &Router, path: &str, body: &str) -> StatusCode {

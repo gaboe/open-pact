@@ -126,6 +126,7 @@ impl Ca {
     }
 
     pub fn issue(&self, csr_pem: &str, cn: &str, validity: Duration) -> Result<String, String> {
+        bare_csr_der(csr_pem)?;
         let csr = CertificateSigningRequestParams::from_pem(csr_pem)
             .map_err(|e| format!("csr_pem is not a valid signed certificate request: {e}"))?;
         let mut params = CertificateParams::default();
@@ -142,6 +143,63 @@ impl Ca {
             .map_err(|e| format!("cannot issue certificate: {e}"))?;
         Ok(cert.pem())
     }
+}
+
+/// The DER of a certificate request that carries a P-256 public key and nothing else: canonical PEM
+/// with no text around it, an empty subject, no attributes and so no extensions. Any other field
+/// could carry text off the device. The signature is checked when the certificate is issued.
+pub fn bare_csr_der(csr_pem: &str) -> Result<Vec<u8>, String> {
+    use x509_parser::certification_request::X509CertificationRequest;
+    use x509_parser::oid_registry::{OID_EC_P256, OID_KEY_TYPE_EC_PUBLIC_KEY};
+    use x509_parser::prelude::FromDer;
+
+    let bad = |why: &str| format!("csr_pem must be a bare certificate request: {why}");
+    let (_, pem) =
+        x509_parser::pem::parse_x509_pem(csr_pem.as_bytes()).map_err(|_| bad("not PEM"))?;
+    if pem.label != "CERTIFICATE REQUEST"
+        || csr_pem.replace("\r\n", "\n") != canonical_pem(&pem.contents)
+    {
+        return Err(bad("only the PEM block, nothing around it"));
+    }
+    let (rest, csr) =
+        X509CertificationRequest::from_der(&pem.contents).map_err(|_| bad("not PKCS #10"))?;
+    let info = &csr.certification_request_info;
+    if !rest.is_empty() {
+        return Err(bad("trailing bytes"));
+    }
+    if info.subject.iter().next().is_some() {
+        return Err(bad("the subject must be empty"));
+    }
+    if !info.attributes().is_empty() {
+        return Err(bad("no attributes or extensions"));
+    }
+    let algorithm = &info.subject_pki.algorithm;
+    let curve = algorithm.parameters.as_ref().and_then(|p| p.as_oid().ok());
+    if algorithm.algorithm != OID_KEY_TYPE_EC_PUBLIC_KEY || curve != Some(OID_EC_P256) {
+        return Err(bad("the key must be P-256"));
+    }
+    Ok(pem.contents)
+}
+
+/// `sha256:<hex>` of a certificate's DER.
+pub fn certificate_sha256(cert_pem: &str) -> anyhow::Result<String> {
+    let (_, pem) = x509_parser::pem::parse_x509_pem(cert_pem.as_bytes())?;
+    Ok(format!(
+        "sha256:{}",
+        hex::encode(Sha256::digest(&pem.contents))
+    ))
+}
+
+fn canonical_pem(der: &[u8]) -> String {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(der);
+    let mut pem = String::from("-----BEGIN CERTIFICATE REQUEST-----\n");
+    for line in b64.as_bytes().chunks(64) {
+        pem.push_str(std::str::from_utf8(line).expect("base64 is ASCII"));
+        pem.push('\n');
+    }
+    pem.push_str("-----END CERTIFICATE REQUEST-----\n");
+    pem
 }
 
 fn random_serial() -> SerialNumber {
@@ -163,10 +221,7 @@ mod tests {
     }
 
     fn csr(key: &KeyPair) -> String {
-        let mut params = CertificateParams::default();
-        params.distinguished_name = common_name("requested-name");
-        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-        params.serialize_request(key).unwrap().pem().unwrap()
+        bare_params().serialize_request(key).unwrap().pem().unwrap()
     }
 
     fn der(pem: &str) -> Vec<u8> {
@@ -251,22 +306,8 @@ mod tests {
     }
 
     #[test]
-    fn takes_only_the_public_key_from_the_csr() {
-        let vpn_key = KeyPair::generate().unwrap();
-        let mut params = CertificateParams::new(vec!["vpn.example.com".to_string()]).unwrap();
-        params.distinguished_name = common_name("admin");
-        params
-            .distinguished_name
-            .push(DnType::OrganizationName, "Example Corp");
-        params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
-        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-        let csr = params.serialize_request(&vpn_key).unwrap().pem().unwrap();
-        params.custom_extensions = vec![rcgen::CustomExtension::from_oid_content(
-            &[1, 3, 6, 1, 4, 1, 32473, 1],
-            vec![0x05, 0x00],
-        )];
-        let unknown = params.serialize_request(&vpn_key).unwrap().pem().unwrap();
-        assert!(ca().issue(&unknown, "abc", Duration::hours(1)).is_err());
+    fn issues_only_its_own_subject_and_extensions() {
+        let csr = csr(&KeyPair::generate().unwrap());
         let issued = ca().issue(&csr, "abc", Duration::hours(1)).unwrap();
         let der = der(&issued);
         let (_, cert) = X509Certificate::from_der(&der).unwrap();
@@ -290,6 +331,58 @@ mod tests {
         assert!(ku.digital_signature() && !ku.key_cert_sign());
     }
 
+    fn bare_params() -> CertificateParams {
+        let mut params = CertificateParams::default();
+        params.distinguished_name = DistinguishedName::new();
+        params
+    }
+
+    #[test]
+    fn rejects_a_csr_that_carries_more_than_its_key() {
+        let key = KeyPair::generate().unwrap();
+        let bare = bare_params()
+            .serialize_request(&key)
+            .unwrap()
+            .pem()
+            .unwrap();
+        assert!(ca().issue(&bare, "abc", Duration::hours(1)).is_ok());
+
+        let mut subject = bare_params();
+        subject.distinguished_name = common_name("FICTIONAL private note");
+        let mut san = CertificateParams::new(vec!["fictional.example.com".to_string()]).unwrap();
+        san.distinguished_name = DistinguishedName::new();
+        let challenge = rcgen::Attribute {
+            oid: &[1, 2, 840, 113549, 1, 9, 7],
+            values: vec![
+                0x0c, 0x09, b'F', b'I', b'C', b'T', b'I', b'O', b'N', b'A', b'L',
+            ],
+        };
+        let with_attribute = bare_params()
+            .serialize_request_with_attributes(&key, vec![challenge])
+            .unwrap()
+            .pem()
+            .unwrap();
+        for (what, pem) in [
+            (
+                "subject",
+                subject.serialize_request(&key).unwrap().pem().unwrap(),
+            ),
+            (
+                "extension",
+                san.serialize_request(&key).unwrap().pem().unwrap(),
+            ),
+            ("attribute", with_attribute),
+            ("leading text", format!("FICTIONAL private note\n{bare}")),
+            ("trailing text", format!("{bare}FICTIONAL private note\n")),
+            ("not a CSR", "FICTIONAL_PRIVATE_NOT_A_CSR".to_string()),
+        ] {
+            assert!(
+                ca().issue(&pem, "abc", Duration::hours(1)).is_err(),
+                "{what} accepted"
+            );
+        }
+    }
+
     #[test]
     fn rejects_csr_with_a_broken_signature() {
         let pem = csr(&KeyPair::generate().unwrap());
@@ -301,7 +394,7 @@ mod tests {
             "A"
         };
         lines[last_body].replace_range(0..1, flipped);
-        let tampered = lines.join("\n");
+        let tampered = lines.join("\n") + "\n";
         assert_ne!(tampered.trim(), pem.trim());
         assert_eq!(
             ca().issue(&tampered, "abc", Duration::hours(1))
