@@ -17,6 +17,8 @@ pub enum Reason {
     },
     #[error("claim time {time} is older than claim_max_age {max_age}")]
     Stale { time: DateTime<Utc>, max_age: Span },
+    #[error("client must be \"open-pact-client <major>.<minor>.<patch>\"")]
+    BadClient,
     #[error("claim time {0} is more than 5 minutes in the future")]
     FromFuture(DateTime<Utc>),
     #[error("manifest is valid from {0}")]
@@ -52,9 +54,21 @@ impl Reason {
     pub fn breaks_disclosure_contract(&self) -> bool {
         matches!(
             self,
-            Reason::UnknownControl { .. } | Reason::UndisclosedValue { .. }
+            Reason::UnknownControl { .. } | Reason::UndisclosedValue { .. } | Reason::BadClient
         )
     }
+}
+
+/// `open-pact-client 1.2.3` and nothing else, so the field cannot carry free text off the device.
+fn is_client_version(client: &str) -> bool {
+    let Some(version) = client.strip_prefix("open-pact-client ") else {
+        return false;
+    };
+    let parts: Vec<&str> = version.split('.').collect();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
 }
 
 fn grace_note(grace: &Span) -> String {
@@ -72,6 +86,9 @@ pub fn evaluate(manifest: &Manifest, claim: &Claim, now: DateTime<Utc>) -> Decis
     let mut deny = Vec::new();
     let mut warn = Vec::new();
 
+    if !is_client_version(&claim.client) {
+        deny.push(Reason::BadClient);
+    }
     if &claim.manifest != manifest.hash() {
         deny.push(Reason::WrongManifest {
             claimed: claim.manifest.clone(),
@@ -172,7 +189,7 @@ mod tests {
             device_key,
             nonce: "n".into(),
             time: now(),
-            client: "test".into(),
+            client: "open-pact-client 0.0.1".into(),
             os: Os::Macos,
             trust_level: TrustLevel::L0,
             virtualized: Virtualized::No,
@@ -204,6 +221,31 @@ mod tests {
         match decision {
             Decision::Deny { reasons } => reasons.iter().map(ToString::to_string).collect(),
             Decision::Allow { warnings } => panic!("expected deny, got allow with {warnings:?}"),
+        }
+    }
+
+    #[test]
+    fn client_must_be_a_bare_version_and_is_not_stored_otherwise() {
+        let m = manifest();
+        for ok in ["open-pact-client 0.0.1", "open-pact-client 10.20.30"] {
+            assert!(is_client_version(ok), "{ok}");
+        }
+        for bad in [
+            "open-pact-client 0.4.1 sha256:77ac",
+            "open-pact-client 1.2",
+            "open-pact-client 1.2.x",
+            "open-pact-client 1..2",
+            "my-client 1.2.3",
+            "open-pact-client 1.2.3 hello from the owner",
+        ] {
+            let mut c = claim(&[]);
+            c.client = bad.into();
+            let Decision::Deny { reasons } = evaluate(&m, &c, Utc::now()) else {
+                panic!("{bad} was allowed");
+            };
+            assert!(reasons.contains(&Reason::BadClient), "{bad}");
+            assert!(reasons.iter().any(Reason::breaks_disclosure_contract));
+            assert!(Reason::BadClient.to_string().starts_with("client must be"));
         }
     }
 

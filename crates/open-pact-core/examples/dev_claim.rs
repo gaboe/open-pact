@@ -37,7 +37,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         device_key,
         nonce: nonce.clone(),
         time: chrono::DateTime::from_timestamp(chrono::Utc::now().timestamp(), 0).ok_or("clock")?,
-        client: "dev_claim".into(),
+        client: concat!("open-pact-client ", env!("CARGO_PKG_VERSION")).into(),
         os,
         trust_level: TrustLevel::L0,
         virtualized: Virtualized::No,
