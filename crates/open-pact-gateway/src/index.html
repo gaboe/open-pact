@@ -28,8 +28,8 @@
   <p class="lead">Aggregate view only. The gateway shows no per-device detail.</p>
   <section class="stats">
     <div class="stat"><b>{devices}</b><span>devices enrolled</span></div>
-    <div class="stat ok"><b>{allowed}</b><span>claims allowed, last 24 h</span></div>
-    <div class="stat bad"><b>{denied}</b><span>claims denied, last 24 h</span></div>
+    <div class="stat ok"><b>{allowed}</b><span>stored claims allowed, last 24 h</span></div>
+    <div class="stat bad"><b>{denied}</b><span>stored claims denied, last 24 h</span></div>
   </section>
   <dl>
     <dt>Enforced manifest</dt><dd><code>{manifest}</code></dd>
@@ -37,6 +37,6 @@
     <dt>Transparency log head</dt><dd><code>#{log_index} {log_hash}</code></dd>
     <dt>VPN client CA (SHA-256)</dt><dd><code>{ca}</code></dd>
   </dl>
-  <footer>Signed log: <code>GET /v1/log</code>. Manifest: <code>GET /v1/manifest</code>.</footer>
+  <footer>Replays, bad signatures, unenrolled devices and claims that overshare are refused without being stored.<br>Signed log: <code>GET /v1/log</code>. Manifest: <code>GET /v1/manifest</code>.</footer>
 </main>
 </html>

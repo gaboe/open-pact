@@ -76,4 +76,6 @@ On first start the gateway generates its company manifest-signing key, its log-s
 ## Known gaps
 
 - Anyone who can reach the gateway and holds the company-signed manifest can enrol a device. PAPER.md section 4.6 adds a one-time invitation code and IT approval; neither exists yet.
+- `join` prints the company key fingerprint but compares it with nothing, and the client trusts the log key it sees first. A fake gateway at join time wins both. The invitation fingerprint from PAPER.md section 4.6 closes this.
+- The summary page counts stored claims only. Replays, bad signatures, unenrolled devices and oversharing claims are refused without being stored.
 - The CN is the pseudonym's hex digest without the `pseudonym:` prefix, because X.509 limits a CN to 64 characters.
