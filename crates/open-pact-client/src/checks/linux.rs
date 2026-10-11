@@ -93,8 +93,42 @@ pub fn os_patch_age() -> &'static str {
         ),
         Err(_) => run("dnf", &["history", "list"]).and_then(|t| parse_dnf_history(&t)),
     };
+    if security_updates_pending() {
+        return "unknown";
+    }
     last.map_or("unknown", |d| {
         buckets::patch_age(d, Utc::now().date_naive())
+    })
+}
+
+fn security_updates_pending() -> bool {
+    if fs::metadata(APT_HISTORY).is_ok() {
+        return run("apt-get", &["-s", "-o", "Debug::NoLocking=1", "upgrade"])
+            .is_some_and(|t| apt_security_pending(&t));
+    }
+    run("dnf", &["-C", "-q", "updateinfo", "list", "--security"])
+        .is_some_and(|t| dnf_security_pending(&t))
+}
+
+/// Reads `apt-get -s upgrade`. A package in the security pocket with an
+/// `Inst` line, or any kept-back package, is an outstanding update.
+pub fn apt_security_pending(out: &str) -> bool {
+    out.lines().any(|l| {
+        (l.starts_with("Inst ") && l.to_lowercase().contains("security"))
+            || l.contains("have been kept back")
+    })
+}
+
+/// Reads `dnf updateinfo list --security`. Each advisory is one line that
+/// starts with an id such as `FICTIONAL-2026-0001`.
+pub fn dnf_security_pending(out: &str) -> bool {
+    out.lines().any(|l| {
+        let mut t = l.split_whitespace();
+        let id = t.next().unwrap_or("");
+        t.count() >= 2
+            && id.contains('-')
+            && id.chars().any(|c| c.is_ascii_digit())
+            && id.chars().next().is_some_and(|c| c.is_ascii_uppercase())
     })
 }
 
@@ -133,7 +167,8 @@ pub fn antimalware_active() -> &'static str {
 
 /// One block device that nothing else is stacked on, with the facts the
 /// encryption check needs. `lsblk -s` lists each such device first, then its
-/// ancestors, so a crypt ancestor anywhere in the group encrypts the device.
+/// ancestors. A filesystem backed by several devices (RAID, multi-PV LVM,
+/// multi-device btrfs) has several leaf paths, and each needs a crypt device.
 struct StorageGroup {
     name: String,
     kind: String,
@@ -141,7 +176,9 @@ struct StorageGroup {
     removable: bool,
     fstype: String,
     mount: String,
-    encrypted: bool,
+    /// The device itself and its ancestors as (tree depth, is crypt), in
+    /// `lsblk -s` order.
+    tree: Vec<(usize, bool)>,
 }
 
 /// Mounts that hold no user data and stay plaintext on a standard encrypted
@@ -150,7 +187,38 @@ const BOOT_MOUNTS: &[&str] = &["/boot", "/boot/efi", "/efi"];
 const NON_PERSISTENT_FSTYPES: &[&str] =
     &["squashfs", "iso9660", "udf", "tmpfs", "overlay", "ramfs"];
 
+#[derive(PartialEq)]
+enum Coverage {
+    All,
+    Some,
+    NoneCovered,
+}
+
 impl StorageGroup {
+    /// Encryption coverage of the backing leaf paths, or None when the tree
+    /// skips a depth level and cannot be trusted.
+    fn coverage(&self) -> Option<Coverage> {
+        let mut on_path: Vec<bool> = Vec::new();
+        let mut leaves: Vec<bool> = Vec::new();
+        for (i, &(depth, crypt)) in self.tree.iter().enumerate() {
+            if depth > on_path.len() {
+                return None;
+            }
+            on_path.truncate(depth);
+            on_path.push(crypt || on_path.last().copied().unwrap_or(false));
+            if self.tree.get(i + 1).is_none_or(|&(next, _)| next <= depth) {
+                leaves.push(on_path[depth]);
+            }
+        }
+        Some(if leaves.iter().all(|&c| c) {
+            Coverage::All
+        } else if leaves.iter().any(|&c| c) {
+            Coverage::Some
+        } else {
+            Coverage::NoneCovered
+        })
+    }
+
     fn is_swap(&self) -> bool {
         self.fstype == "swap" || self.mount == "[SWAP]"
     }
@@ -201,19 +269,24 @@ fn flag(s: &str) -> Option<bool> {
 
 /// Input is `lsblk -s -n -o NAME,TYPE,RO,RM,FSTYPE,MOUNTPOINT`.
 ///
-/// `full` when every in-scope filesystem has a crypt ancestor, `partial` when
-/// some do, `none` when none do, `unknown` when the root filesystem is not
-/// listed or a row cannot be read.
+/// `full` when every backing leaf path of every in-scope filesystem has a
+/// crypt device, `none` when no leaf path has one, `partial` otherwise (also
+/// for one filesystem whose branches are only partly encrypted), `unknown`
+/// when the root filesystem is not listed or the tree cannot be read.
 pub fn parse_lsblk_inverse(out: &str) -> &'static str {
     let mut groups: Vec<StorageGroup> = Vec::new();
     for line in out.lines().filter(|l| !l.trim().is_empty()) {
-        let root_level = line.chars().next().is_some_and(char::is_alphanumeric);
+        let depth = line
+            .chars()
+            .take_while(|c| !c.is_alphanumeric())
+            .count()
+            .div_ceil(2);
         let body = line.trim_start_matches(|c: char| c.is_whitespace() || "│├└─|`-".contains(c));
         let mut parts = body.split_whitespace();
         let (Some(name), Some(kind)) = (parts.next(), parts.next()) else {
             return "unknown";
         };
-        if root_level {
+        if depth == 0 {
             let Some((read_only, removable, fstype, mount)) = parse_lsblk_row(parts) else {
                 return "unknown";
             };
@@ -224,23 +297,31 @@ pub fn parse_lsblk_inverse(out: &str) -> &'static str {
                 removable,
                 fstype,
                 mount,
-                encrypted: kind == "crypt",
+                tree: vec![(0, kind == "crypt")],
             });
         } else if let Some(group) = groups.last_mut() {
-            group.encrypted |= kind == "crypt";
+            group.tree.push((depth, kind == "crypt"));
+        } else {
+            return "unknown";
         }
     }
     let scoped: Vec<&StorageGroup> = groups.iter().filter(|g| g.in_scope()).collect();
     if !scoped.iter().any(|g| g.mount == "/") {
         return "unknown";
     }
-    let encrypted = scoped.iter().filter(|g| g.encrypted).count();
-    if encrypted == scoped.len() {
+    let mut coverage = Vec::new();
+    for group in scoped {
+        match group.coverage() {
+            Some(c) => coverage.push(c),
+            None => return "unknown",
+        }
+    }
+    if coverage.iter().all(|c| *c == Coverage::All) {
         "full"
-    } else if encrypted > 0 {
-        "partial"
-    } else {
+    } else if coverage.iter().all(|c| *c == Coverage::NoneCovered) {
         "none"
+    } else {
+        "partial"
     }
 }
 
@@ -388,24 +469,16 @@ fn first_date(line: &str) -> Option<NaiveDate> {
 }
 
 /// Patch-age heuristic. Package history records neither the archive pocket nor
-/// advisories, so a transaction counts as an OS update only when it upgraded
-/// something and either (a) was a whole-system upgrade (`apt upgrade`,
-/// `dist-upgrade`, `full-upgrade`, `unattended-upgrade`, with no package
-/// names) or (b) upgraded a kernel or base OS package. One application
-/// upgrade or install never resets the age. Without a qualifying entry the
-/// age is unknown.
+/// advisories, so a transaction counts as an OS update only when it was a
+/// whole-system upgrade (`apt upgrade`, `dist-upgrade`, `full-upgrade`,
+/// `unattended-upgrade`, with no package names) that upgraded something and
+/// finished without an error. An application upgrade, a base package alone,
+/// or an interrupted transaction never resets the age. Held-back and skipped
+/// packages leave no trace in history, so `os_patch_age` also asks the package
+/// manager for outstanding security updates and reports `unknown` when any
+/// remain. Without a qualifying entry the age is unknown.
 const APT_FULL_UPGRADE_VERBS: &[&str] =
     &["upgrade", "dist-upgrade", "full-upgrade", "safe-upgrade"];
-const BASE_OS_PACKAGES: &[&str] = &[
-    "libc6",
-    "systemd",
-    "openssl",
-    "base-files",
-    "dpkg",
-    "apt",
-    "ubuntu-minimal",
-];
-const BASE_OS_PREFIXES: &[&str] = &["linux-image", "linux-generic", "linux-modules", "libssl"];
 
 fn is_apt_full_upgrade(commandline: &str) -> bool {
     let mut tokens = commandline.split_whitespace();
@@ -422,30 +495,21 @@ fn is_apt_full_upgrade(commandline: &str) -> bool {
     matches!(args.as_slice(), [verb] if APT_FULL_UPGRADE_VERBS.contains(verb))
 }
 
-fn upgrades_base_os(upgrade_line: &str) -> bool {
-    upgrade_line
-        .split("), ")
-        .filter_map(|entry| entry.split_whitespace().next())
-        .map(|name| name.split(':').next().unwrap_or(name))
-        .any(|name| {
-            BASE_OS_PACKAGES.contains(&name) || BASE_OS_PREFIXES.iter().any(|p| name.starts_with(p))
-        })
-}
-
 pub fn parse_apt_history(text: &str) -> Option<NaiveDate> {
     let mut full_upgrade = false;
     let mut upgraded = false;
-    let mut base_os = false;
+    let mut failed = false;
     let mut latest = None;
     for line in text.lines() {
         if line.starts_with("Start-Date:") {
-            (full_upgrade, upgraded, base_os) = (false, false, false);
+            (full_upgrade, upgraded, failed) = (false, false, false);
         } else if let Some(cmd) = line.strip_prefix("Commandline:") {
             full_upgrade = is_apt_full_upgrade(cmd);
-        } else if let Some(pkgs) = line.strip_prefix("Upgrade:") {
+        } else if line.starts_with("Upgrade:") {
             upgraded = true;
-            base_os |= upgrades_base_os(pkgs);
-        } else if line.starts_with("End-Date:") && upgraded && (full_upgrade || base_os) {
+        } else if line.starts_with("Error:") {
+            failed = true;
+        } else if line.starts_with("End-Date:") && upgraded && full_upgrade && !failed {
             latest = latest.max(first_date(line));
         }
     }
@@ -468,11 +532,22 @@ const DNF_UPGRADE_COMMANDS: &[&str] = &[
 ];
 
 /// A dnf transaction counts only when it upgrades the whole system: an upgrade
-/// verb with no package-name filter, or one limited by a security advisory
-/// flag. Offline upgrades take a subcommand instead of packages. The history
+/// verb with no package-name filter and no flag that narrows the set, except
+/// `--security`, which still covers every outstanding security update. Offline upgrades take a subcommand instead of packages. The history
 /// column truncates long command lines, so a cut-off filter is not seen.
 const DNF_SYSTEM_UPGRADE_COMMANDS: &[&str] = &["system-upgrade", "offline"];
-const DNF_ADVISORY_FLAGS: &[&str] = &["--security", "--advisor", "--sec-severity", "--cve", "--bz"];
+const DNF_SUBSET_FLAGS: &[&str] = &[
+    "--advisor",
+    "--sec-severity",
+    "--cve",
+    "--bz",
+    "--bugfix",
+    "--enhancement",
+    "--newpackage",
+    "--exclude",
+    "-x",
+    "--skip-broken",
+];
 
 fn is_dnf_upgrade(command: &str) -> bool {
     let mut tokens = command
@@ -492,8 +567,7 @@ fn is_dnf_upgrade(command: &str) -> bool {
     }
     let rest: Vec<&str> = tokens.collect();
     rest.iter()
-        .any(|t| DNF_ADVISORY_FLAGS.iter().any(|f| t.starts_with(f)))
-        || rest.iter().all(|t| t.starts_with('-'))
+        .all(|t| t.starts_with('-') && !DNF_SUBSET_FLAGS.iter().any(|f| t.starts_with(f)))
 }
 
 fn is_dnf_program(name: &str) -> bool {
@@ -594,6 +668,72 @@ nvme0n1p2             part 0 0 ext4 /boot
 └─nvme0n1             disk 0 0
 ";
         assert_eq!(parse_lsblk_inverse(out), "full");
+    }
+
+    #[test]
+    fn lsblk_raid1_with_one_encrypted_leg_is_partial() {
+        let out = "\
+md0 raid1 0 0 ext4 /
+├─crypt-leg crypt 0 0
+│ └─sda1 part 0 0
+│   └─sda disk 0 0
+└─sdb1 part 0 0
+  └─sdb disk 0 0
+";
+        assert_eq!(parse_lsblk_inverse(out), "partial");
+    }
+
+    #[test]
+    fn lsblk_raid1_encrypted_above_or_on_every_leg() {
+        let above = "\
+crypt-md crypt 0 0 ext4 /
+└─md0 raid1 0 0
+  ├─sda1 part 0 0
+  │ └─sda disk 0 0
+  └─sdb1 part 0 0
+    └─sdb disk 0 0
+";
+        assert_eq!(parse_lsblk_inverse(above), "full");
+        let legs = "\
+md0 raid1 0 0 ext4 /
+├─crypt-a crypt 0 0
+│ └─sda1 part 0 0
+│   └─sda disk 0 0
+└─crypt-b crypt 0 0
+  └─sdb1 part 0 0
+    └─sdb disk 0 0
+";
+        assert_eq!(parse_lsblk_inverse(legs), "full");
+    }
+
+    #[test]
+    fn lsblk_lvm_spanning_encrypted_and_plain_pv_is_partial() {
+        let out = "\
+vg-root lvm 0 0 ext4 /
+├─crypt-pv1 crypt 0 0
+│ └─sda2 part 0 0
+│   └─sda disk 0 0
+└─sdb2 part 0 0
+  └─sdb disk 0 0
+";
+        assert_eq!(parse_lsblk_inverse(out), "partial");
+    }
+
+    #[test]
+    fn lsblk_raid1_with_two_plain_legs_is_none_and_skipped_depth_is_unknown() {
+        let plain = "\
+md0 raid1 0 0 ext4 /
+├─sda1 part 0 0
+│ └─sda disk 0 0
+└─sdb1 part 0 0
+  └─sdb disk 0 0
+";
+        assert_eq!(parse_lsblk_inverse(plain), "none");
+        let skipped = "\
+md0 raid1 0 0 ext4 /
+    └─sda1 part 0 0
+";
+        assert_eq!(parse_lsblk_inverse(skipped), "unknown");
     }
 
     #[test]
@@ -878,7 +1018,7 @@ End-Date: 2026-10-05  09:00:05
     }
 
     #[test]
-    fn apt_full_upgrades_and_base_os_packages_count() {
+    fn apt_whole_system_upgrades_count() {
         let pkg = "fictional-lib:amd64 (1.0, 1.1)";
         for cmd in [
             "apt upgrade",
@@ -889,12 +1029,46 @@ End-Date: 2026-10-05  09:00:05
             let log = apt_entry("2026-10-01", cmd, pkg);
             assert_eq!(parse_apt_history(&log), Some(d(2026, 10, 1)), "{cmd}");
         }
+    }
+
+    #[test]
+    fn apt_base_package_alone_or_failed_transaction_is_not_an_os_update() {
+        let base = apt_entry(
+            "2026-10-02",
+            "apt install --only-upgrade base-files",
+            "base-files:amd64 (1, 2)",
+        );
+        assert_eq!(parse_apt_history(&base), None);
         let kernel = apt_entry(
             "2026-10-02",
             "aptdaemon role='role-commit-packages'",
-            "fictional-editor:amd64 (1, 2), linux-image-6.8.0-1-generic:amd64 (6.8.0-1, 6.8.0-2)",
+            "linux-image-6.8.0-1-generic:amd64 (6.8.0-1, 6.8.0-2)",
         );
-        assert_eq!(parse_apt_history(&kernel), Some(d(2026, 10, 2)));
+        assert_eq!(parse_apt_history(&kernel), None);
+        let failed = apt_entry("2026-10-03", "apt upgrade", "fictional-lib:amd64 (1, 2)")
+            .replace("End-Date", "Error: dpkg interrupted\nEnd-Date");
+        assert_eq!(parse_apt_history(&failed), None);
+    }
+
+    #[test]
+    fn apt_kept_back_or_pending_security_updates_are_detected() {
+        let kept = "The following packages have been kept back:\n  fictional-lib\n";
+        assert!(apt_security_pending(kept));
+        let inst = "Inst fictional-lib [1.0] (1.1 Fictional:1/stable-security [amd64])\n";
+        assert!(apt_security_pending(inst));
+        let plain = "Inst fictional-editor [1] (2 Fictional:1/stable [amd64])\n0 upgraded\n";
+        assert!(!apt_security_pending(plain));
+        assert!(!apt_security_pending(""));
+    }
+
+    #[test]
+    fn dnf_pending_security_advisories_are_detected() {
+        let out = "FICTIONAL-2026-0001 Important/Sec. fictional-lib-1.1.x86_64\n";
+        assert!(dnf_security_pending(out));
+        assert!(!dnf_security_pending(""));
+        assert!(!dnf_security_pending(
+            "Last metadata expiration check: 1 day, 0:00:00 ago.\n"
+        ));
     }
 
     #[test]
@@ -913,7 +1087,13 @@ ID Command line                         Date and time       Action(s) Altered
 ";
         assert_eq!(parse_dnf_history(out), Some(d(2026, 9, 1)));
         let security = " 9 dnf upgrade --security fictional-editor 2026-10-11 09:00:00 1\n";
-        assert_eq!(parse_dnf_history(security), Some(d(2026, 10, 11)));
+        assert_eq!(parse_dnf_history(security), None);
+        let bare_security = " 9 dnf upgrade --security 2026-10-11 09:00:00 1\n";
+        assert_eq!(parse_dnf_history(bare_security), Some(d(2026, 10, 11)));
+        let severity = " 9 dnf upgrade --sec-severity=Critical 2026-10-11 09:00:00 1\n";
+        assert_eq!(parse_dnf_history(severity), None);
+        let excluded = " 9 dnf upgrade --exclude=fictional-lib 2026-10-11 09:00:00 1\n";
+        assert_eq!(parse_dnf_history(excluded), None);
         let only_filtered = " 9 dnf upgrade fictional-editor 2026-10-11 09:00:00 1\n";
         assert_eq!(parse_dnf_history(only_filtered), None);
     }
