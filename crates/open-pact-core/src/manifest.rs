@@ -150,6 +150,16 @@ impl Span {
         }
     }
 
+    /// The instant this span after `t`, in calendar months for `mo`. `None` past the calendar.
+    pub fn after(&self, t: chrono::DateTime<chrono::Utc>) -> Option<chrono::DateTime<chrono::Utc>> {
+        match self.unit {
+            Unit::Month => {
+                t.checked_add_months(chrono::Months::new(u32::try_from(self.amount).ok()?))
+            }
+            _ => t.checked_add_signed(self.min_duration()?),
+        }
+    }
+
     pub fn is_zero(&self) -> bool {
         self.amount == 0
     }
@@ -615,5 +625,14 @@ mod tests {
             "2026-03-17T10:00:00+00:00"
         );
         assert_eq!(span("300000000mo").before(t), None);
+        assert_eq!(
+            span("1mo").after(t).unwrap().to_rfc3339(),
+            "2026-04-30T10:00:00+00:00"
+        );
+        assert_eq!(
+            span("1h").after(t).unwrap().to_rfc3339(),
+            "2026-03-31T11:00:00+00:00"
+        );
+        assert_eq!(span("300000000mo").after(t), None);
     }
 }

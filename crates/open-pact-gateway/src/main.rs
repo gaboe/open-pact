@@ -720,6 +720,7 @@ async fn claim(
         claims::store(
             &mut tx,
             &app.kek,
+            &app.manifest.body().claim_retention,
             now,
             &claim.device,
             &payload,
@@ -1030,9 +1031,16 @@ async fn serve(db: PgPool) -> anyhow::Result<()> {
     if auto_approve {
         eprintln!("AUTO_APPROVE=true: enrolled devices are approved without IT");
     }
-    let sealed = claims::seal_plaintext(&db, &kek).await?;
+    let retention = &manifest.body().claim_retention;
+    let sealed = claims::seal_plaintext(&db, &kek, retention).await?;
     if sealed > 0 {
         eprintln!("sealed {sealed} plaintext claims from an earlier version");
+    }
+    let dated = claims::set_missing_deadlines(&db, retention).await?;
+    if dated > 0 {
+        eprintln!(
+            "gave {dated} claims from an earlier version a deadline of {retention} after receipt"
+        );
     }
     tokio::spawn(delete_expired_nonces(db.clone()));
     tokio::spawn(enforce_retention(
