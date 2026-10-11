@@ -2,7 +2,7 @@
 
 Verifiable security checks on personally owned devices, without blanket monitoring. The owner signs the company's manifest once. Each time the device connects, the client sends one small signed claim to the company gateway, and a compliant device gets a short-lived VPN client certificate. Read [PAPER.md](PAPER.md) for the design.
 
-Status: proof of concept, not for production. On a Mac, `join` creates the device key in the Secure Enclave (trust level L1); elsewhere, or with `join --software-key`, all keys are development software keys (trust level L0). The gateway enforces [examples/manifest.toml](examples/manifest.toml), or the file in `MANIFEST_PATH`.
+Status: proof of concept, not for production. On a Mac, `join` creates the device key in the Secure Enclave, and the client reports trust level L1; elsewhere, or with `join --software-key`, all keys are development software keys (trust level L0). The gateway has no attestation, so it counts every claim as L0 whatever the client reports. The gateway enforces [examples/manifest.toml](examples/manifest.toml), or the file in `MANIFEST_PATH`.
 
 ## Layout
 
@@ -176,6 +176,6 @@ TEST_DATABASE_URL=postgres://postgres:test@localhost:55432/postgres cargo test -
 - Approval belongs to one manifest hash. When the gateway enforces a new manifest, the owner needs a new invitation and IT approves again.
 - The client prints witness cosignatures with the checkpoint but does not verify them, because it has no list of witness keys yet. The demo witness signs any checkpoint it is given; a real witness first checks a consistency proof from the last checkpoint it cosigned.
 - The summary page counts stored claims only. Replays, bad signatures, unenrolled devices and oversharing claims are refused without being stored.
-- The Secure Enclave device key proves that claims come from this Mac, but it is not bound to the client's code signature as PAPER.md section 5 describes. The client keeps the wrapped key in `device-se.key`, not in the keychain, so it needs no keychain entitlement, and any program on the same Mac that can read the file can sign with it. A Developer ID signed client with a keychain access group closes this. The trust level is what the client reports; the gateway cannot check it without attestation.
+- The Secure Enclave device key proves that claims come from this Mac, but it is not bound to the client's code signature as PAPER.md section 5 describes. The client keeps the wrapped key in `device-se.key`, not in the keychain, so it needs no keychain entitlement, and any program on the same Mac that can read the file can sign with it. A Developer ID signed client with a keychain access group closes this. The Secure Enclave key protects against key theft: its private key cannot be copied off the Mac. It does not prove anything to the gateway, because the trust level in a claim is what the client asserts. Without attestation the gateway records that assertion as `asserted_trust_level`, counts every claim as `verified_trust_level` L0, and denies every claim when `min_trust_level` is L1 or L2, with the reason that the level needs attestation, which is not available.
 - The VPN certificate key and the owner key are still software keys.
 - The CN is the pseudonym's hex digest without the `pseudonym:` prefix, because X.509 limits a CN to 64 characters.

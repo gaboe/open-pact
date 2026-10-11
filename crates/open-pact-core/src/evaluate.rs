@@ -92,9 +92,13 @@ pub enum Reason {
     FromFuture(DateTime<Utc>),
     #[error("manifest is valid from {0}")]
     NotYetValid(NaiveDate),
-    #[error("trust_level = {claimed:?}, {min:?} required")]
+    #[error(
+        "min_trust_level {min:?} needs attestation, which is not available: \
+         every claim counts as {verified:?} (this one asserts {asserted:?})"
+    )]
     TrustLevelTooLow {
-        claimed: TrustLevel,
+        asserted: TrustLevel,
+        verified: TrustLevel,
         min: TrustLevel,
     },
     #[error("{0} is not in disclosed_metadata")]
@@ -131,6 +135,13 @@ impl Reason {
                 | Reason::BadClient
         )
     }
+}
+
+/// The trust level the gateway can verify. A claim's `trust_level` is the client's own assertion: a
+/// Secure Enclave key protects against key theft, but nothing proves to the gateway that the key is
+/// in hardware. Until attestation exists, every claim counts as L0.
+pub fn verified_trust_level(_claim: &Claim) -> TrustLevel {
+    TrustLevel::L0
 }
 
 /// `open-pact-client 1.2.3` with canonical `u32` components and nothing else, so the field cannot carry free text off the device.
@@ -192,9 +203,11 @@ pub fn evaluate(
     if now.date_naive() < body.valid_from {
         deny.push(Reason::NotYetValid(body.valid_from));
     }
-    if claim.trust_level < body.min_trust_level {
+    let verified = verified_trust_level(claim);
+    if verified < body.min_trust_level {
         deny.push(Reason::TrustLevelTooLow {
-            claimed: claim.trust_level,
+            asserted: claim.trust_level,
+            verified,
             min: body.min_trust_level,
         });
     }
@@ -659,8 +672,35 @@ mod tests {
         c.manifest = m.hash().clone();
         assert_eq!(
             reasons(decide(&m, &c, now())),
-            ["trust_level = L0, L1 required"]
+            [
+                "min_trust_level L1 needs attestation, which is not available: \
+              every claim counts as L0 (this one asserts L0)"
+            ]
         );
+    }
+
+    #[test]
+    fn an_asserted_trust_level_without_attestation_counts_as_l0() {
+        for min in ["L1", "L2"] {
+            let toml = DEMO.replace(
+                r#"min_trust_level = "L0""#,
+                &format!("min_trust_level = \"{min}\""),
+            );
+            let m = Manifest::parse(toml.as_bytes()).unwrap();
+            let mut c = claim(&PASSING);
+            c.manifest = m.hash().clone();
+            c.trust_level = TrustLevel::L2;
+            let Decision::Deny { reasons } = decide(&m, &c, now()) else {
+                panic!("an asserted L2 met min_trust_level {min}");
+            };
+            assert_eq!(
+                texts(&reasons),
+                [format!(
+                    "min_trust_level {min} needs attestation, which is not available: \
+                     every claim counts as L0 (this one asserts L2)"
+                )]
+            );
+        }
     }
 
     #[test]

@@ -255,6 +255,8 @@ Cryptography proves who signed a claim and that nobody changed it. It does not p
 | L1 | Key in TPM or Secure Enclave: the claim came from this physical device | The key no, the content yes |
 | L2 | Measured boot attestation (TPM quote): what booted, including Secure Boot and, on Windows, BitLocker state | No, short of a hardware attack |
 
+A level is only worth what the gateway can verify. A Secure Enclave or TPM key protects against key theft, but a claim's `trust_level` is the client's own assertion until attestation binds it to the enrolled key and a fresh challenge. Until then the gateway counts every claim as L0, keeps the asserted level apart from the verified one, and denies a claim when the manifest's minimum is higher.
+
 Runtime settings (screen lock, firewall, updates) cannot be proven cryptographically on a device its owner controls. The same holds for Intune and Wazuh. These checks are reported and the owner stays responsible for the real state of the device. A claim is evidence, not a transfer of responsibility. The project is open source and comes without warranty.
 
 **Making a modified client harder to use and easier to catch.** On a device the owner controls, modifying a program cannot be prevented completely. It can be made so that a modified client cannot produce valid proof, or so that the change comes to light:

@@ -26,7 +26,8 @@ use clap::{Parser, Subcommand};
 use open_pact_core::{
     Checkpoint, Claim, CsrHash, Decision, Endorsement, EnrolRequest, Entry, EntryKind, Evaluation,
     FirstFailures, Invitation, LogHash, LogKey, Manifest, Note, Pseudonym, PublicKey, Reason,
-    SigningKey, Span, WitnessKey, consistency_proof, evaluate, inclusion_proof, root, verify_claim,
+    SigningKey, Span, WitnessKey, consistency_proof, evaluate, inclusion_proof, root,
+    verified_trust_level, verify_claim,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -755,9 +756,17 @@ async fn claim(
     })))
 }
 
-/// The claim as the company keeps it, with the fingerprint of the certificate issued for it.
+/// The claim as the company keeps it, with the fingerprint of the certificate issued for it. The
+/// client's `trust_level` is kept as `asserted_trust_level`, next to the level the gateway verified.
 fn stored_claim(claim: &Claim, certificate_pem: Option<&str>) -> anyhow::Result<Value> {
     let mut payload = serde_json::to_value(claim)?;
+    let fields = payload.as_object_mut().expect("a claim is a JSON object");
+    let asserted = fields.remove("trust_level");
+    fields.insert("asserted_trust_level".into(), asserted.into());
+    fields.insert(
+        "verified_trust_level".into(),
+        serde_json::to_value(verified_trust_level(claim))?,
+    );
     if let Some(pem) = certificate_pem {
         payload["certificate_sha256"] = keys::certificate_sha256(pem)?.into();
     }
@@ -952,6 +961,12 @@ async fn serve(db: PgPool) -> anyhow::Result<()> {
     let toml = std::fs::read_to_string(&manifest_path)?;
     let manifest = Manifest::parse(toml.as_bytes())?;
     eprintln!("enforcing {manifest_path} {}", manifest.hash());
+    if manifest.body().min_trust_level > open_pact_core::TrustLevel::L0 {
+        eprintln!(
+            "min_trust_level {:?} needs attestation, which is not available: every claim will be denied",
+            manifest.body().min_trust_level
+        );
+    }
     let auto_approve = env_flag("AUTO_APPROVE")?;
     let limiter = Limiter::new(
         env_number("ENROL_MAX_FAILURES", 10)?,
@@ -1279,6 +1294,36 @@ mod tests {
                 .contains("log_checkpoint is not in disclosed_metadata")
         );
         assert_eq!(stored_text(&db).await, Vec::<String>::new());
+    }
+
+    /// H7: an asserted level cannot meet a policy, and the company keeps it apart from the verified one.
+    #[tokio::test]
+    #[ignore = "needs TEST_DATABASE_URL"]
+    async fn an_asserted_trust_level_counts_as_l0() {
+        let l2 = DEMO.replace(r#"min_trust_level = "L0""#, r#"min_trust_level = "L2""#);
+        let (app, db) = test_app_with(&l2, 10, 100).await;
+        let (key, mut claim) = enrolled_claim(&app, &db, &l2).await;
+        claim.trust_level = open_pact_core::TrustLevel::L2;
+        let jws = open_pact_core::sign_claim(&claim, &key).unwrap();
+        let (status, body) = post_json(&app, "/v1/claim", &json!({ "jws": jws })).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(
+            body["reasons"].to_string().contains("needs attestation"),
+            "{body}"
+        );
+
+        let (app, db) = test_app_with(DEMO, 10, 100).await;
+        let (key, mut claim) = enrolled_claim(&app, &db, DEMO).await;
+        claim.trust_level = open_pact_core::TrustLevel::L1;
+        let jws = open_pact_core::sign_claim(&claim, &key).unwrap();
+        let (status, body) = post_json(&app, "/v1/claim", &json!({ "jws": jws })).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let stored = claims::open_all(&db, &SealingKey::new(&TEST_KEK))
+            .await
+            .unwrap();
+        assert_eq!(stored[0]["claim"]["asserted_trust_level"], "L1");
+        assert_eq!(stored[0]["claim"]["verified_trust_level"], "L0");
+        assert_eq!(stored[0]["claim"]["trust_level"], Value::Null);
     }
 
     #[test]

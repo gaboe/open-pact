@@ -784,7 +784,7 @@ async fn join(
     println!("Owner signed {}", manifest.hash());
     println!("Enrolled as {}", enrolment.device);
     println!(
-        "Device key: {}, trust level {:?}",
+        "Device key: {}, trust level {:?} (asserted by this client; without attestation the gateway counts it as L0)",
         device.describe(),
         device.trust_level()
     );
