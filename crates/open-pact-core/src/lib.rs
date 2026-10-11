@@ -8,6 +8,7 @@ mod log;
 mod manifest;
 mod narrowing;
 mod note;
+mod witness;
 
 pub use claim::{
     Claim, LogCheckpoint, VerifiedClaim, Virtualized, sign_claim, sign_claim_with, verify_claim,
@@ -25,11 +26,13 @@ pub use log::{
     verify_consistency, verify_inclusion,
 };
 pub use manifest::{
-    Accepted, Control, Manifest, ManifestBody, Metadata, Os, Source, Span, TrustLevel,
+    Accepted, Control, LogPolicy, Manifest, ManifestBody, Metadata, Os, Source, Span, TrustLevel,
+    Witness,
 };
 pub use narrowing::{Violation, is_narrowing};
 pub use note::{Checkpoint, LogKey, Note, NoteSignature, WitnessKey};
 pub use p256::ecdsa::SigningKey;
+pub use witness::{AddCheckpoint, CLOCK_SKEW_SECS, Refusal, add_checkpoint, verify_cosignatures};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

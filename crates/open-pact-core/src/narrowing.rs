@@ -32,6 +32,8 @@ pub enum Violation {
     MaxAgeShorter,
     #[error("min_trust_level is higher")]
     TrustLevelHigher,
+    #[error("the [log] witness policy changed")]
+    WitnessPolicyChanged,
 }
 
 fn added<T: Ord + Clone>(old: &BTreeSet<T>, new: &BTreeSet<T>) -> Vec<T> {
@@ -116,6 +118,9 @@ pub fn is_narrowing(old: &Manifest, new: &Manifest) -> Result<(), Vec<Violation>
     if new.min_trust_level > old.min_trust_level {
         v.push(Violation::TrustLevelHigher);
     }
+    if new.log != old.log {
+        v.push(Violation::WitnessPolicyChanged);
+    }
 
     if v.is_empty() { Ok(()) } else { Err(v) }
 }
@@ -141,6 +146,21 @@ mod tests {
     }
 
     const FIREWALL: &str = "[[control]]\nid = \"firewall\"\nsource = \"company_policy\"\ncheck = \"builtin:firewall@1\"\noutput = [\"on\", \"off\", \"unknown\"]\nrequired = { macos = \"on\", windows = \"on\", linux = \"on\" }\ngrace = \"1d\"\n\n";
+
+    #[test]
+    fn any_witness_policy_change_needs_the_owner() {
+        rejected(
+            &[("witness_quorum = 1", "witness_quorum = 0")],
+            Violation::WitnessPolicyChanged,
+        );
+        rejected(
+            &[(
+                r#"checkpoint_max_age = "1h""#,
+                r#"checkpoint_max_age = "2h""#,
+            )],
+            Violation::WitnessPolicyChanged,
+        );
+    }
 
     #[test]
     fn accepts_identical_manifest() {

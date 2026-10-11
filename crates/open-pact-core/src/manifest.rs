@@ -4,7 +4,7 @@ use std::fmt;
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 
-use crate::{Error, ManifestHash};
+use crate::{Error, ManifestHash, WitnessKey};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -263,6 +263,56 @@ pub struct ManifestBody {
     pub unknown_grace: Span,
     #[serde(rename = "control")]
     pub controls: Vec<Control>,
+    /// Without it no witness is required and split views go undetected.
+    #[serde(default)]
+    pub log: Option<LogPolicy>,
+}
+
+/// Which witnesses must cosign a log checkpoint before a client trusts it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LogPolicy {
+    #[serde(default)]
+    pub witnesses: Vec<Witness>,
+    pub witness_quorum: usize,
+    /// The oldest witness cosignature a client accepts, so a frozen checkpoint stops verifying.
+    pub checkpoint_max_age: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Witness {
+    pub name: String,
+    pub key: WitnessKey,
+}
+
+impl LogPolicy {
+    fn validate(&self) -> Result<(), String> {
+        let mut names = BTreeSet::new();
+        for w in &self.witnesses {
+            if w.key.name() != w.name {
+                return Err(format!(
+                    "log.witnesses: key {} is not named {:?}",
+                    w.key.vkey(),
+                    w.name
+                ));
+            }
+            if !names.insert(&w.name) {
+                return Err(format!("log.witnesses: duplicate witness {:?}", w.name));
+            }
+        }
+        if self.witness_quorum > self.witnesses.len() {
+            return Err(format!(
+                "log.witness_quorum {} is more than the {} witnesses listed",
+                self.witness_quorum,
+                self.witnesses.len()
+            ));
+        }
+        if self.checkpoint_max_age.is_zero() {
+            return Err("log.checkpoint_max_age must not be zero".into());
+        }
+        Ok(())
+    }
 }
 
 impl ManifestBody {
@@ -288,6 +338,9 @@ impl ManifestBody {
         }
         if self.unknown_grace.is_zero() {
             return Err("unknown_grace must not be zero".into());
+        }
+        if let Some(log) = &self.log {
+            log.validate()?;
         }
         let mut ids = BTreeSet::new();
         for c in &self.controls {
@@ -428,6 +481,41 @@ mod tests {
             let toml = DEMO.replace(line, to);
             assert!(Manifest::parse(toml.as_bytes()).is_err(), "accepted {to}");
         }
+    }
+
+    #[test]
+    fn witness_policy_parses_and_rejects_inconsistent_witnesses() {
+        let log = Manifest::parse(DEMO.as_bytes())
+            .unwrap()
+            .body()
+            .log
+            .clone()
+            .unwrap();
+        assert_eq!(log.witness_quorum, 1);
+        assert_eq!(log.witnesses[0].name, "witness.example.org/demo");
+        assert_eq!(log.checkpoint_max_age.to_string(), "1h");
+
+        rejects("witness_quorum = 1", "witness_quorum = 2");
+        rejects(
+            r#"checkpoint_max_age = "1h""#,
+            r#"checkpoint_max_age = "0h""#,
+        );
+        rejects(
+            r#"name = "witness.example.org/demo""#,
+            r#"name = "witness.example.org/other""#,
+        );
+        rejects("+BDnDJtIcX1p95tKTK", "+BDnDJtIcX1p95tKTX");
+        rejects("witness_quorum = 1", "witness_quorum = 1\nextra = true");
+        let twice = DEMO.replace(
+            "witnesses = [{",
+            r#"witnesses = [{ name = "witness.example.org/demo", key = "witness.example.org/demo+10c00e9a+BDnDJtIcX1p95tKTK+ggaN1dSvTB9a0EYGVntufeUB5t" }, {"#,
+        );
+        assert!(Manifest::parse(twice.as_bytes()).is_err());
+        let without = &DEMO[..DEMO.find("[log]").unwrap()];
+        assert_eq!(
+            Manifest::parse(without.as_bytes()).unwrap().body().log,
+            None
+        );
     }
 
     #[test]

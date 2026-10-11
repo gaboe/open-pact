@@ -279,10 +279,24 @@ fn cosigned_message(checkpoint: &Checkpoint, timestamp: u64) -> String {
 }
 
 /// A witness verifier key, c2sp.org/tlog-cosignature `cosignature/v1` (Ed25519).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "String", into = "String")]
 pub struct WitnessKey {
     name: String,
     key: ed25519_dalek::VerifyingKey,
+}
+
+impl TryFrom<String> for WitnessKey {
+    type Error = Error;
+    fn try_from(vkey: String) -> Result<Self, Error> {
+        WitnessKey::parse(&vkey)
+    }
+}
+
+impl From<WitnessKey> for String {
+    fn from(key: WitnessKey) -> String {
+        key.vkey()
+    }
 }
 
 impl WitnessKey {
