@@ -27,6 +27,10 @@ metadata:
 spec:
   serviceName: {{ .Release.Name }}-postgres
   replicas: 1
+  podManagementPolicy: OrderedReady
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
   selector:
     matchLabels:
       app: {{ .Release.Name }}-postgres
@@ -59,10 +63,13 @@ spec:
             - name: data
               mountPath: /var/lib/postgresql/data
   volumeClaimTemplates:
-    - metadata:
+    - apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
         name: data
       spec:
         accessModes: ["ReadWriteOnce"]
+        volumeMode: Filesystem
         {{- if .Values.postgres.storageClass }}
         storageClassName: {{ .Values.postgres.storageClass }}
         {{- end }}
