@@ -11,7 +11,15 @@ spec:
     metadata:
       labels:
         app: {{ .Release.Name }}-gateway
+      {{- if .Values.manifest }}
+      annotations:
+        checksum/manifest: {{ .Values.manifest | sha256sum }}
+      {{- end }}
     spec:
+      {{- with .Values.gateway.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -20,10 +28,22 @@ spec:
         - name: gateway
           image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.gateway.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.gateway.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           ports:
             - name: http
               containerPort: 8080
           env:
+            {{- if .Values.manifest }}
+            - name: MANIFEST_PATH
+              value: /etc/open-pact/custom/manifest.toml
+            {{- end }}
             - name: GATEWAY_KEK
               valueFrom:
                 secretKeyRef:
@@ -66,6 +86,18 @@ spec:
               path: /healthz
               port: http
             initialDelaySeconds: 10
+          {{- if .Values.manifest }}
+          volumeMounts:
+            - name: manifest
+              mountPath: /etc/open-pact/custom
+              readOnly: true
+          {{- end }}
+      {{- if .Values.manifest }}
+      volumes:
+        - name: manifest
+          configMap:
+            name: {{ .Release.Name }}-manifest
+      {{- end }}
 ---
 apiVersion: v1
 kind: Service

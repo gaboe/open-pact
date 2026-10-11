@@ -1,0 +1,9 @@
+{{- if .Values.manifest }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-manifest
+data:
+  manifest.toml: |
+    {{- .Values.manifest | nindent 4 }}
+{{- end }}

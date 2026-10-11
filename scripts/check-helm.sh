@@ -26,5 +26,19 @@ refuses "witness.keySecret.name" "${base[@]}" --set 'witness.logKeys[0]=pact.exa
 refuses "witness.logKeys" "${base[@]}" --set witness.keySecret.name=pact-witness-key
 helm template t "$chart" "${base[@]}" --set witness.keySecret.name=pact-witness-key \
   --set 'witness.logKeys[0]=pact.example.com/log+00000000+AA' | grep -q 'name: WITNESS_LOG_KEYS'
+
+plain="$(helm template t "$chart" "${kek[@]}" --set postgres.password=example-only)"
+! grep -q -E 'MANIFEST_PATH|kind: ConfigMap|checksum/manifest' <<< "$plain"
+tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+printf 'name = "Example Co"\n' > "$tmp/a.toml"
+printf 'name = "Example Co 2"\n' > "$tmp/b.toml"
+with_a="$(helm template t "$chart" "${kek[@]}" --set postgres.password=example-only --set-file manifest="$tmp/a.toml")"
+with_b="$(helm template t "$chart" "${kek[@]}" --set postgres.password=example-only --set-file manifest="$tmp/b.toml")"
+grep -q 'kind: ConfigMap' <<< "$with_a"
+grep -q 'name = "Example Co"' <<< "$with_a"
+grep -q 'value: /etc/open-pact/custom/manifest.toml' <<< "$with_a"
+grep -q 'mountPath: /etc/open-pact/custom' <<< "$with_a"
+[ "$(grep checksum/manifest <<< "$with_a")" != "$(grep checksum/manifest <<< "$with_b")" ]
+echo "a custom manifest renders a ConfigMap, the mount, MANIFEST_PATH, and a checksum that changes with the text; without one, none of them"
 echo "the witness needs its own key secret and the log keys it witnesses"
 echo "renders with the KEK secret and a chosen database password, existing secret or external database"

@@ -33,12 +33,22 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- with .Values.witness.podSecurityContext }}
       securityContext:
-        fsGroup: 10001
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: witness
           image: {{ .Values.witness.image.repository }}:{{ .Values.witness.image.tag }}
           imagePullPolicy: {{ .Values.witness.image.pullPolicy }}
+          {{- with .Values.witness.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.witness.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           ports:
             - name: http
               containerPort: 8080

@@ -13,6 +13,29 @@ gateway:
   kekSecret:
     name: ""
     key: kek
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10001
+    seccompProfile:
+      type: RuntimeDefault
+  securityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop: [ALL]
+
+# The signed manifest as TOML text. Empty: the gateway enforces the example manifest built into the
+# image. Set it to run your own: the chart mounts it at /etc/open-pact/custom/manifest.toml, sets
+# MANIFEST_PATH, and restarts the pod when the text changes. Keep the manifest in your deployment
+# config, for example `--set-file manifest=company-manifest.toml`; no image rebuild is needed.
+manifest: ""
 
 ingress:
   enabled: true
@@ -79,3 +102,22 @@ witness:
   # The state is the latest cosigned checkpoint per log. Losing it lets the gateway roll back.
   storageClass: ""
   size: 100Mi
+  resources:
+    requests:
+      cpu: 50m
+      memory: 32Mi
+    limits:
+      memory: 128Mi
+  # fsGroup lets the non-root user write the state volume.
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10001
+    fsGroup: 10001
+    seccompProfile:
+      type: RuntimeDefault
+  securityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop: [ALL]
