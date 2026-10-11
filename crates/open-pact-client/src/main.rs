@@ -164,11 +164,19 @@ fn virtualized() -> Virtualized {
 }
 
 fn collect_results(manifest: &Manifest, os: Os) -> BTreeMap<String, String> {
-    let mut all = checks::run_all(os);
+    disclosable(manifest, os, checks::run_all(os))
+}
+
+fn disclosable(
+    manifest: &Manifest,
+    os: Os,
+    mut all: BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
     manifest
         .body()
         .controls
         .iter()
+        .filter(|c| c.required.contains_key(&os))
         .filter_map(|c| {
             let value = all.remove(&c.id)?;
             c.output.contains(&value).then(|| (c.id.clone(), value))
@@ -523,5 +531,39 @@ async fn main() -> ExitCode {
             eprintln!("error: {e:#}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sends_only_results_the_manifest_requires_on_this_os() {
+        let toml = include_str!("../../../examples/manifest.toml").replace(
+            r#"required = { macos = "on", windows = "on", linux = "on" }"#,
+            r#"required = { macos = "on" }"#,
+        );
+        let manifest = Manifest::parse(toml.as_bytes()).unwrap();
+        let all = BTreeMap::from(
+            [
+                ("disk_encryption", "full"),
+                ("firewall", "on"),
+                ("screen_lock", "le_5min"),
+                ("os_supported", "unknown"),
+                ("antimalware_active", "yes"),
+            ]
+            .map(|(k, v)| (k.to_string(), v.to_string())),
+        );
+        let ids = |os| -> Vec<String> {
+            disclosable(&manifest, os, all.clone())
+                .into_keys()
+                .collect()
+        };
+        assert_eq!(
+            ids(Os::Macos),
+            ["disk_encryption", "firewall", "screen_lock"]
+        );
+        assert_eq!(ids(Os::Linux), ["disk_encryption", "screen_lock"]);
     }
 }
