@@ -18,7 +18,7 @@ manager.
 | Check | Baseline value | Reason |
 | --- | --- | --- |
 | `disk_encryption` | `unknown` | The container root is an overlay mount. `lsblk` lists no device mounted at `/`, so the root cannot be classified. |
-| `firewall` | `unknown` | `firewall-cmd` cannot reach firewalld (no D-Bus, no daemon). `systemctl is-active ufw` fails without systemd as init. |
+| `firewall` | `unknown` | `firewall-cmd` cannot reach firewalld (no D-Bus, no daemon). `systemctl is-active ufw` fails without systemd as init, and no `/etc/ufw/ufw.conf` says `ENABLED=yes`. |
 | `screen_lock` | `unknown` | `XDG_CURRENT_DESKTOP` is unset. No desktop session runs. |
 | `auto_login` | `unknown` | No display manager config file exists. |
 | `secure_boot` | `unknown` | No `mokutil` and no EFI variables in the container. |

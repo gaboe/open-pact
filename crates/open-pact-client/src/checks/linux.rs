@@ -5,6 +5,7 @@ use chrono::{NaiveDate, Utc};
 use super::buckets;
 use super::exec::run;
 
+const UFW_CONF: &str = "/etc/ufw/ufw.conf";
 const APT_HISTORY: &str = "/var/log/apt/history.log";
 const SECURE_BOOT_EFIVAR: &str =
     "/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c";
@@ -40,10 +41,13 @@ pub fn disk_encryption() -> &'static str {
 
 pub fn firewall() -> &'static str {
     let firewalld = run("firewall-cmd", &["--state"]);
-    let units = run("systemctl", &["is-active", "ufw"]);
+    let service = run("systemctl", &["is-active", "ufw"])
+        .as_deref()
+        .and_then(parse_systemctl_unit);
+    let conf = fs::read_to_string(UFW_CONF).ok();
     merge_firewall(
         firewalld.as_deref().and_then(parse_firewall_cmd),
-        units.as_deref().and_then(parse_systemctl_unit),
+        ufw_enabled(conf.as_deref(), service),
     )
 }
 
@@ -256,6 +260,29 @@ pub fn parse_systemctl_unit(out: &str) -> Option<bool> {
         "active" => Some(true),
         "inactive" | "failed" => Some(false),
         _ => None,
+    }
+}
+
+/// The ufw service is a oneshot unit that stays `active` after it exits, even
+/// when `ENABLED=no` makes it load no rules. UFW protects the device only when
+/// `/etc/ufw/ufw.conf` says `ENABLED=yes` (world-readable, no root needed) and
+/// the service is active. Without the file the config cannot confirm anything,
+/// so an active service alone is `None`.
+pub fn ufw_enabled(conf: Option<&str>, service: Option<bool>) -> Option<bool> {
+    let Some(conf) = conf else {
+        return service.filter(|active| !active);
+    };
+    let enabled = conf
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with('#'))
+        .filter_map(|l| l.split_once('='))
+        .rfind(|(k, _)| k.trim() == "ENABLED")
+        .is_some_and(|(_, v)| v.trim().trim_matches('"').eq_ignore_ascii_case("yes"));
+    if enabled {
+        service
+    } else {
+        Some(false)
     }
 }
 
@@ -635,6 +662,40 @@ sde1      part 1 0 ext4 /mnt/archive
         assert_eq!(merge_firewall(Some(false), Some(true)), "on");
         assert_eq!(merge_firewall(None, Some(false)), "off");
         assert_eq!(merge_firewall(None, None), "unknown");
+    }
+
+    #[test]
+    fn ufw_active_service_with_disabled_config_is_off() {
+        let disabled = "# comment\nENABLED=no\nLOGLEVEL=low\n";
+        assert_eq!(ufw_enabled(Some(disabled), Some(true)), Some(false));
+        assert_eq!(
+            merge_firewall(None, ufw_enabled(Some(disabled), Some(true))),
+            "off"
+        );
+    }
+
+    #[test]
+    fn ufw_needs_enabled_config_and_active_service() {
+        let enabled = "ENABLED=yes\n";
+        assert_eq!(ufw_enabled(Some(enabled), Some(true)), Some(true));
+        assert_eq!(ufw_enabled(Some("ENABLED=Yes"), Some(true)), Some(true));
+        assert_eq!(ufw_enabled(Some(enabled), Some(false)), Some(false));
+        assert_eq!(ufw_enabled(Some(enabled), None), None);
+        assert_eq!(ufw_enabled(Some("#ENABLED=yes\n"), Some(true)), Some(false));
+        assert_eq!(ufw_enabled(Some(""), Some(true)), Some(false));
+        assert_eq!(ufw_enabled(None, Some(true)), None);
+        assert_eq!(ufw_enabled(None, Some(false)), Some(false));
+        assert_eq!(ufw_enabled(None, None), None);
+    }
+
+    #[test]
+    fn firewalld_running_state_wins_over_disabled_ufw() {
+        let ufw = ufw_enabled(Some("ENABLED=no\n"), Some(true));
+        assert_eq!(merge_firewall(parse_firewall_cmd("running\n"), ufw), "on");
+        assert_eq!(
+            merge_firewall(parse_firewall_cmd("not running\n"), None),
+            "off"
+        );
     }
 
     #[test]

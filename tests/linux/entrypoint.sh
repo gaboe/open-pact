@@ -29,6 +29,11 @@ set_gsettings() { # lock-enabled idle-delay lock-delay
     gsettings set org.gnome.desktop.screensaver lock-delay "$3"
 }
 
+ufw_conf() { # yes|no
+    mkdir -p /etc/ufw
+    printf '# fictional ufw.conf\nENABLED=%s\nLOGLEVEL=low\n' "$1" >/etc/ufw/ufw.conf
+}
+
 stale_history() {
     if [ "$distro" = fedora ]; then
         shim dnf 'cat <<DNF
@@ -45,7 +50,10 @@ DNF'
 case $variant in
     baseline) ;;
     firewalld-installed) ;;
-    ufw-active) shim systemctl '[ "$1 $2" = "is-active ufw" ] && echo active || echo inactive' ;;
+    ufw-active) ufw_conf yes
+        shim systemctl '[ "$1 $2" = "is-active ufw" ] && echo active || echo inactive' ;;
+    ufw-active-disabled) ufw_conf no
+        shim systemctl '[ "$1 $2" = "is-active ufw" ] && echo active || echo inactive' ;;
     ufw-inactive) shim systemctl 'echo inactive; exit 3' ;;
     gnome-default) export GSETTINGS_BACKEND=keyfile XDG_CURRENT_DESKTOP=GNOME ;;
     gnome-lock-5min) set_gsettings true 300 0 ;;
