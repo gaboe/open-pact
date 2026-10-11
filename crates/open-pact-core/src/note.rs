@@ -36,7 +36,8 @@ impl Checkpoint {
         )
     }
 
-    fn parse(text: &str) -> Result<Self, Error> {
+    /// Parses a checkpoint body without checking any signature.
+    pub fn parse(text: &str) -> Result<Self, Error> {
         let lines: Vec<&str> = text
             .strip_suffix('\n')
             .ok_or_else(|| bad("checkpoint must end with a newline"))?

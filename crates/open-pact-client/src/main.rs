@@ -9,12 +9,14 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use open_pact_core::{
-    Claim, Endorsement, Entry, Head, Manifest, ManifestHash, Os, Pseudonym, PublicKey,
-    SignedManifest, TrustLevel, Virtualized, dev_key, sign_claim, verify_chain, verify_claim,
+    Checkpoint, Claim, Endorsement, Entry, EntryKind, LogCheckpoint, LogHash, LogKey, Manifest,
+    ManifestHash, Note, Os, Pseudonym, PublicKey, SignedManifest, TrustLevel, Virtualized, dev_key,
+    root, sign_claim, verify_claim, verify_consistency, verify_inclusion,
 };
 use rcgen::{CertificateParams, DistinguishedName, KeyPair};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 #[derive(Parser)]
 #[command(
@@ -52,8 +54,10 @@ enum Command {
 
 #[derive(Subcommand)]
 enum LogCommand {
-    /// Print the verified, gateway-signed log head held on this device
+    /// Print the last verified, gateway-signed log checkpoint held on this device
     Head,
+    /// Fetch and verify the inclusion proof of one log entry [default: this device's enrolment]
+    Prove { index: Option<u64> },
     /// Print every claim this device sent and the gateway's response
     Show,
 }
@@ -73,10 +77,18 @@ struct PublishedManifest {
 }
 
 #[derive(Deserialize)]
-struct LogPage {
+struct Entries {
     entries: Vec<Entry>,
-    head: Head,
 }
+
+#[derive(Deserialize)]
+struct Proof {
+    proof: Vec<LogHash>,
+}
+
+const LOG_KEY: &str = "log-key.txt";
+const LOG_CHECKPOINT: &str = "log-checkpoint.txt";
+const LEGACY_LOG_HEAD: &str = "log-head.json";
 
 #[derive(Deserialize)]
 struct Nonce {
@@ -129,6 +141,31 @@ impl Home {
         let path = self.file(name);
         std::fs::write(&path, bytes).with_context(|| format!("{}", path.display()))?;
         Ok(path)
+    }
+
+    fn read_text(&self, name: &str) -> Result<Option<String>> {
+        let path = self.file(name);
+        match std::fs::read_to_string(&path) {
+            Ok(text) => Ok(Some(text)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).with_context(|| format!("{}", path.display())),
+        }
+    }
+
+    /// The last checkpoint this device verified. It was verified when stored, so it is trusted as is.
+    fn checkpoint(&self) -> Result<Option<Checkpoint>> {
+        self.read_text(LOG_CHECKPOINT)?
+            .map(|text| -> Result<Checkpoint> {
+                let note = Note::parse(&text)?;
+                Ok(Checkpoint::parse(&note.text)?)
+            })
+            .transpose()
+            .with_context(|| format!("{}", self.file(LOG_CHECKPOINT).display()))
+    }
+
+    /// A v0.1.0 hash-chain head with no Merkle checkpoint next to it.
+    fn has_legacy_log_head(&self) -> bool {
+        self.file(LEGACY_LOG_HEAD).exists() && !self.file(LOG_CHECKPOINT).exists()
     }
 
     fn enrolment(&self) -> Result<Enrolment> {
@@ -188,6 +225,17 @@ fn base(gateway: &str) -> &str {
     gateway.trim_end_matches('/')
 }
 
+async fn get_text(http: &reqwest::Client, url: String) -> Result<String> {
+    http.get(&url)
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?
+        .error_for_status()?
+        .text()
+        .await
+        .with_context(|| format!("GET {url}"))
+}
+
 async fn get_json<T: for<'de> Deserialize<'de>>(http: &reqwest::Client, url: String) -> Result<T> {
     http.get(&url)
         .send()
@@ -243,29 +291,95 @@ fn confirm(question: &str) -> Result<bool> {
 }
 
 enum LogSync {
-    Verified(Head),
-    Alarm(open_pact_core::Error),
+    Verified(Checkpoint),
+    Alarm(String),
 }
 
-async fn sync_log(http: &reqwest::Client, home: &Home, gateway: &str) -> Result<LogSync> {
-    let prev: Option<Head> = home.read_json("log-head.json")?;
-    let from = prev.as_ref().map_or(0, |h| h.index + 1);
-    let page: LogPage = get_json(http, format!("{}/v1/log?from={from}", base(gateway))).await?;
-    match verify_chain(prev.as_ref(), &page.entries, &page.head) {
-        Ok(head) => {
-            home.write("log-head.json", &serde_json::to_vec_pretty(&head)?)?;
-            Ok(LogSync::Verified(head))
-        }
-        Err(e) => Ok(LogSync::Alarm(e)),
+fn alarm(e: impl std::fmt::Display) -> LogSync {
+    LogSync::Alarm(e.to_string())
+}
+
+async fn pinned_log_key(http: &reqwest::Client, home: &Home, gateway: &str) -> Result<LogKey> {
+    if let Some(vkey) = home.read_text(LOG_KEY)? {
+        return Ok(LogKey::parse(&vkey)?);
     }
+    let vkey = get_text(http, format!("{}/v1/log/key", base(gateway))).await?;
+    let key = LogKey::parse(&vkey)?;
+    home.write(LOG_KEY, format!("{}\n", key.vkey()).as_bytes())?;
+    println!("Pinned log key {}", key.vkey());
+    Ok(key)
+}
+
+/// Fetches the gateway's checkpoint and checks that it extends the one stored on this device.
+/// On first contact it downloads every entry and recomputes the root instead.
+async fn sync_log(http: &reqwest::Client, home: &Home, gateway: &str) -> Result<LogSync> {
+    let key = pinned_log_key(http, home, gateway).await?;
+    let prev = home.checkpoint()?;
+    let text = get_text(http, format!("{}/v1/log/checkpoint", base(gateway))).await?;
+    let new = match Note::parse(&text).and_then(|note| key.verify(&note)) {
+        Ok(checkpoint) => checkpoint,
+        Err(e) => return Ok(alarm(e)),
+    };
+    let checked = match &prev {
+        None => {
+            let page: Entries = get_json(
+                http,
+                format!("{}/v1/log/entries?from=0&to={}", base(gateway), new.size),
+            )
+            .await?;
+            let leaves: Vec<LogHash> = page.entries.iter().map(Entry::leaf_hash).collect();
+            let indexes_ok = page
+                .entries
+                .iter()
+                .enumerate()
+                .all(|(i, e)| e.index == i as u64);
+            if indexes_ok && leaves.len() as u64 == new.size && root(&leaves) == new.root {
+                Ok(())
+            } else {
+                Err(format!(
+                    "the entries the gateway served do not hash to its signed root {}",
+                    new.root
+                ))
+            }
+        }
+        Some(old) if old.size == new.size => {
+            verify_consistency(old.size, new.size, &old.root, &new.root, &[])
+                .map_err(|e| e.to_string())
+        }
+        Some(old) => {
+            let url = format!(
+                "{}/v1/log/proof/consistency?from={}&to={}",
+                base(gateway),
+                old.size,
+                new.size
+            );
+            match get_json::<Proof>(http, url).await {
+                Ok(p) => verify_consistency(old.size, new.size, &old.root, &new.root, &p.proof)
+                    .map_err(|e| e.to_string()),
+                Err(e) => Err(format!("no consistency proof from the gateway: {e:#}")),
+            }
+        }
+    };
+    if let Err(e) = checked {
+        return Ok(alarm(e));
+    }
+    home.write(LOG_CHECKPOINT, text.as_bytes())?;
+    Ok(LogSync::Verified(new))
+}
+
+/// A root as the checkpoint text shows it.
+fn b64(root: &LogHash) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(root.0)
 }
 
 fn report_log(sync: LogSync, home: &Home) -> bool {
     match sync {
-        LogSync::Verified(head) => {
+        LogSync::Verified(cp) => {
             println!(
-                "Transparency log verified: head #{} {}",
-                head.index, head.hash
+                "Transparency log verified: checkpoint size {} root {}",
+                cp.size,
+                b64(&cp.root)
             );
             true
         }
@@ -275,12 +389,22 @@ fn report_log(sync: LogSync, home: &Home) -> bool {
                 "\n{bar}\n!! TRANSPARENCY LOG ALARM\n!! The gateway's history does not match the copy on this device.\n!! {e}"
             );
             eprintln!(
-                "!! Keep {}: it is the last head the gateway signed for you.\n!! Compare it with colleagues: open-pact-client log head\n{bar}\n",
-                home.file("log-head.json").display()
+                "!! Keep {}: it is the last checkpoint the gateway signed for you.\n!! Compare it with colleagues: open-pact-client log head\n{bar}\n",
+                home.file(LOG_CHECKPOINT).display()
             );
             false
         }
     }
+}
+
+fn print_log_upgrade(home: &Home) {
+    eprintln!(
+        "The transparency log format was upgraded: it is now a Merkle tree with signed checkpoints.\n\
+         {} holds a head in the old hash-chain format, which cannot be compared with a checkpoint.\n\
+         This is not a log alarm. Run `open-pact-client join --gateway <url>` again to review the\n\
+         manifest and pin the new log.",
+        home.file(LEGACY_LOG_HEAD).display()
+    );
 }
 
 async fn join(home: &Home, gateway: &str, yes: bool) -> Result<bool> {
@@ -325,9 +449,16 @@ async fn join(home: &Home, gateway: &str, yes: bool) -> Result<bool> {
     home.write("enrolment.json", &serde_json::to_vec_pretty(&enrolment)?)?;
     println!("Owner signed {}", manifest.hash());
     println!("Enrolled as {}", enrolment.device);
+    if let Some(index) = body["log_index"].as_u64() {
+        println!("Enrolment is log entry #{index}; prove it with: open-pact-client log prove");
+    }
     println!(
         "The public log records only sha256(salt || pseudonym); the salt stays in enrolment.json."
     );
+    if home.has_legacy_log_head() {
+        std::fs::remove_file(home.file(LEGACY_LOG_HEAD))?;
+        println!("Removed the old hash-chain log head; this device now pins the Merkle log.");
+    }
     Ok(report_log(sync_log(&http, home, gateway).await?, home))
 }
 
@@ -378,6 +509,10 @@ fn print_hints(manifest: &Manifest, results: &BTreeMap<String, String>, os: Os) 
 
 async fn check(home: &Home) -> Result<ExitCode> {
     let enrolment = home.enrolment()?;
+    if home.has_legacy_log_head() {
+        print_log_upgrade(home);
+        return Ok(ExitCode::FAILURE);
+    }
     let manifest = Manifest::parse(&std::fs::read(home.file("manifest.toml"))?)?;
     if manifest.hash() != &enrolment.manifest {
         bail!("manifest.toml no longer matches the hash you signed");
@@ -388,6 +523,11 @@ async fn check(home: &Home) -> Result<ExitCode> {
 
     let http = reqwest::Client::new();
     let gateway = base(&enrolment.gateway);
+    let sync = sync_log(&http, home, gateway).await?;
+    let log_checkpoint = home.checkpoint()?.map(|cp| LogCheckpoint {
+        size: cp.size,
+        root: cp.root,
+    });
     let nonce: Nonce = http
         .post(format!("{gateway}/v1/nonce"))
         .send()
@@ -409,6 +549,7 @@ async fn check(home: &Home) -> Result<ExitCode> {
         virtualized: virtualized(),
         results,
         csr_pem: Some(vpn_csr(home)?),
+        log_checkpoint,
     };
     let sent = serde_json::to_vec(&json!({ "jws": sign_claim(&claim, &device)? }))?;
     let resp = http
@@ -462,7 +603,7 @@ async fn check(home: &Home) -> Result<ExitCode> {
             false
         }
     };
-    let log_ok = report_log(sync_log(&http, home, &enrolment.gateway).await?, home);
+    let log_ok = report_log(sync, home);
     Ok(match (log_ok, accepted) {
         (false, _) => ExitCode::from(2),
         (true, true) => ExitCode::SUCCESS,
@@ -471,12 +612,87 @@ async fn check(home: &Home) -> Result<ExitCode> {
 }
 
 fn log_head(home: &Home) -> Result<()> {
-    let head: Head = home
-        .read_json("log-head.json")?
-        .context("no log head yet; run join or check")?;
-    println!("{}", serde_json::to_string_pretty(&head)?);
-    println!("key fingerprint {}", head.key.fingerprint());
+    if home.has_legacy_log_head() {
+        print_log_upgrade(home);
+    }
+    let text = home
+        .read_text(LOG_CHECKPOINT)?
+        .context("no log checkpoint yet; run join or check")?;
+    print!("{text}");
+    if let Some(vkey) = home.read_text(LOG_KEY)? {
+        println!("\npinned log key {}", vkey.trim_end());
+    }
     Ok(())
+}
+
+fn commitment(enrolment: &Enrolment) -> Result<String> {
+    let mut h = Sha256::new();
+    h.update(hex::decode(&enrolment.salt).context("salt in enrolment.json")?);
+    h.update(enrolment.device.as_str());
+    Ok(format!("sha256:{}", hex::encode(h.finalize())))
+}
+
+async fn log_prove(home: &Home, index: Option<u64>) -> Result<ExitCode> {
+    let enrolment = home.enrolment()?;
+    if home.has_legacy_log_head() {
+        print_log_upgrade(home);
+        return Ok(ExitCode::FAILURE);
+    }
+    let http = reqwest::Client::new();
+    let gateway = base(&enrolment.gateway);
+    let sync = sync_log(&http, home, gateway).await?;
+    let LogSync::Verified(cp) = sync else {
+        report_log(sync, home);
+        return Ok(ExitCode::from(2));
+    };
+    let mine = commitment(&enrolment)?;
+    let is_mine =
+        |e: &Entry| e.kind == EntryKind::DeviceEnrolled && e.data["commitment"] == mine.as_str();
+    let entry = match index {
+        Some(i) => {
+            let url = format!("{gateway}/v1/log/entries?from={i}&to={}", i + 1);
+            let page: Entries = get_json(&http, url).await?;
+            page.entries
+                .into_iter()
+                .find(|e| e.index == i)
+                .with_context(|| format!("the gateway did not serve entry #{i}"))?
+        }
+        None => {
+            let url = format!("{gateway}/v1/log/entries?from=0&to={}", cp.size);
+            let page: Entries = get_json(&http, url).await?;
+            page.entries
+                .into_iter()
+                .find(is_mine)
+                .context("no enrolment entry for this device in the log")?
+        }
+    };
+    let leaf = entry.leaf_hash();
+    let url = format!(
+        "{gateway}/v1/log/proof/inclusion?index={}&size={}",
+        entry.index, cp.size
+    );
+    let proof: Proof = get_json(&http, url).await?;
+    println!("Entry #{} {}", entry.index, serde_json::to_string(&entry)?);
+    println!("Leaf hash  {leaf}  (sha256 of 0x00 || JCS({{kind, data}}))");
+    println!("Proof      {} hashes", proof.proof.len());
+    for h in &proof.proof {
+        println!("           {h}");
+    }
+    if let Err(e) = verify_inclusion(&leaf, entry.index, cp.size, &proof.proof, &cp.root) {
+        report_log(alarm(e), home);
+        return Ok(ExitCode::from(2));
+    }
+    println!(
+        "INCLUDED in the checkpoint this device verified: size {} root {}",
+        cp.size,
+        b64(&cp.root)
+    );
+    if is_mine(&entry) {
+        println!(
+            "This entry is your enrolment: sha256(salt || pseudonym) from enrolment.json matches."
+        );
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn log_show(path: &Path) -> Result<()> {
@@ -512,6 +728,9 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Command::Log {
             command: LogCommand::Head,
         } => log_head(&home).map(|()| ExitCode::SUCCESS),
+        Command::Log {
+            command: LogCommand::Prove { index },
+        } => log_prove(&home, index).await,
         Command::Log {
             command: LogCommand::Show,
         } => log_show(&home.file("claims.jsonl")).map(|()| ExitCode::SUCCESS),

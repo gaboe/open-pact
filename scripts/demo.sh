@@ -9,9 +9,10 @@ trap 'rm -rf "$tmp"' EXIT
 home="$tmp/open-pact"
 
 cargo build -q --manifest-path "$root/Cargo.toml" -p open-pact-client
-cargo build -q --manifest-path "$root/Cargo.toml" -p open-pact-core --example dev_claim
+cargo build -q --manifest-path "$root/Cargo.toml" -p open-pact-core --example dev_claim --example dev_witness
 client=("$root/target/debug/open-pact-client" --home "$home")
 dev_claim="$root/target/debug/examples/dev_claim"
+dev_witness="$root/target/debug/examples/dev_witness"
 
 n=0
 step() {
@@ -51,11 +52,20 @@ echo
 step "Everything that left the device, kept locally byte for byte"
 "${client[@]}" log show | sed -n '1,/^-- response/p'
 
-step "The transparency log head, signed by the gateway, to compare with colleagues"
+step "The transparency log checkpoint (Merkle tree size and root), signed by the gateway"
 "${client[@]}" log head
 
-step "Simulated split view: the local head no longer matches the gateway history"
-sed -i.bak -E 's/"hash": "[0-9a-f]{8}/"hash": "00000000/' "$home/log-head.json"
+step "An independent witness cosigns the checkpoint; the gateway serves it with the cosignature"
+curl -fsS "$url/v1/log/checkpoint" | "$dev_witness" cosign > "$tmp/cosigned"
+curl -fsS -X POST --data-binary "@$tmp/cosigned" "$url/v1/log/witness"
+echo
+curl -fsS "$url/v1/log/checkpoint"
+
+step "The record of my enrolment is provably in the log"
+"${client[@]}" log prove
+
+step "Simulated split view: this device holds a different root than the gateway now proves"
+sed -i.bak '3s/.*/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=/' "$home/log-checkpoint.txt"
 "${client[@]}" check > /dev/null || echo "(check exited with status $?)"
 
 step "Stopping"

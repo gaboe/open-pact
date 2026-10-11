@@ -161,7 +161,10 @@ mod tests {
                     r#"["Company IT security", "auditor on request"]"#,
                     r#"["Company IT security"]"#
                 ),
-                (r#", "virtualized", "os"]"#, r#", "os"]"#),
+                (
+                    r#", "virtualized", "os", "log_checkpoint"]"#,
+                    r#", "os", "log_checkpoint"]"#
+                ),
                 (
                     r#"required = { macos = "le_5min", windows = "le_5min", linux = "le_5min" }"#,
                     r#"required = { macos = ["le_5min", "le_15min"], windows = "le_5min" }"#
@@ -241,7 +244,7 @@ mod tests {
     #[test]
     fn rejects_added_metadata() {
         rejected(
-            &[(r#", "os"]"#, r#", "os", "in_eea"]"#)],
+            &[(r#", "log_checkpoint"]"#, r#", "log_checkpoint", "in_eea"]"#)],
             Violation::MetadataAdded(vec!["in_eea".into()]),
         );
     }
