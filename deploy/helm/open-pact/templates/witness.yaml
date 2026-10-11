@@ -1,0 +1,90 @@
+{{- if .Values.witness.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ .Release.Name }}-witness
+spec:
+  accessModes: ["ReadWriteOnce"]
+  {{- with .Values.witness.storageClass }}
+  storageClassName: {{ . }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.witness.size }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-witness
+spec:
+  # One writer for the state file.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: {{ .Release.Name }}-witness
+  template:
+    metadata:
+      labels:
+        app: {{ .Release.Name }}-witness
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        fsGroup: 10001
+      containers:
+        - name: witness
+          image: {{ .Values.witness.image.repository }}:{{ .Values.witness.image.tag }}
+          imagePullPolicy: {{ .Values.witness.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: LISTEN_ADDR
+              value: 0.0.0.0:8080
+            - name: WITNESS_NAME
+              value: {{ .Values.witness.name | quote }}
+            - name: WITNESS_KEY_FILE
+              value: /etc/open-pact-witness/{{ .Values.witness.keySecret.key }}
+            - name: WITNESS_STATE
+              value: /var/lib/open-pact-witness/state.json
+            - name: WITNESS_LOG_KEYS
+              value: {{ required "witness.logKeys: list the gateway log keys to witness" (join "," .Values.witness.logKeys) | quote }}
+          volumeMounts:
+            - name: key
+              mountPath: /etc/open-pact-witness
+              readOnly: true
+            - name: state
+              mountPath: /var/lib/open-pact-witness
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+      volumes:
+        - name: key
+          secret:
+            secretName: {{ required "witness.keySecret.name: create a Secret with the witness seed and name it here" .Values.witness.keySecret.name }}
+        - name: state
+          persistentVolumeClaim:
+            claimName: {{ .Release.Name }}-witness
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-witness
+spec:
+  selector:
+    app: {{ .Release.Name }}-witness
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+{{- end }}

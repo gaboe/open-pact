@@ -21,4 +21,10 @@ grep -q 'name: pact-gateway-kek' <<< "$out"
 ! grep -q 'change-me' <<< "$out"
 helm template t "$chart" "${kek[@]}" --set postgres.existingSecret=pact-postgres > /dev/null
 helm template t "$chart" "${kek[@]}" --set database.externalUrl=postgres://db.example.com/pact > /dev/null
+base=("${kek[@]}" --set postgres.password=example-only --set witness.enabled=true)
+refuses "witness.keySecret.name" "${base[@]}" --set 'witness.logKeys[0]=pact.example.com/log+00000000+AA'
+refuses "witness.logKeys" "${base[@]}" --set witness.keySecret.name=pact-witness-key
+helm template t "$chart" "${base[@]}" --set witness.keySecret.name=pact-witness-key \
+  --set 'witness.logKeys[0]=pact.example.com/log+00000000+AA' | grep -q 'name: WITNESS_LOG_KEYS'
+echo "the witness needs its own key secret and the log keys it witnesses"
 echo "renders with the KEK secret and a chosen database password, existing secret or external database"

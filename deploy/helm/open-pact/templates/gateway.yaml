@@ -37,8 +37,8 @@ spec:
               value: {{ .Values.publicUrl | default (printf "https://%s" .Values.ingress.host) | quote }}
             - name: AUTO_APPROVE
               value: {{ .Values.autoApprove | quote }}
-            - name: WITNESS_KEYS
-              value: {{ join "," .Values.log.witnessKeys | quote }}
+            - name: WITNESS_URLS
+              value: {{ join "," .Values.log.witnessUrls | quote }}
             - name: NONCE_MAX_PER_WINDOW
               value: {{ .Values.nonces.maxPerWindow | quote }}
             - name: NONCE_WINDOW_SECS

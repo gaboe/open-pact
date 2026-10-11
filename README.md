@@ -68,7 +68,6 @@ The gateway image is reproducible: a pinned toolchain and builder, a static musl
 | `GET /v1/log/entries?from=&to=` | `{entries}`, `from` inclusive, `to` exclusive, at most 256 entries; without `to`, one page |
 | `GET /v1/log/proof/inclusion?index=&size=` | `{index, size, proof}`, hashes in lowercase hex |
 | `GET /v1/log/proof/consistency?from=&to=` | `{from, to, proof}` |
-| `POST /v1/log/witness` | body: a checkpoint note with witness cosignature lines; stores the valid ones |
 | `GET /v1/log` | 410: the v0.1.0 hash-chain endpoint is gone |
 | `GET /` | aggregate summary page, no per-device detail |
 
@@ -124,14 +123,30 @@ The log is a Merkle tree with RFC 9162 (Certificate Transparency 2.0) hashing. A
 
 **Checkpoints.** The gateway signs a checkpoint, the C2SP [tlog-checkpoint](https://c2sp.org/tlog-checkpoint) body `<origin>\n<size>\n<base64 root>\n`, in C2SP [signed-note](https://c2sp.org/signed-note) format. The key name is the origin, set by `LOG_ORIGIN` (default `pact.example.com/log`). The log key is ECDSA P-256, signed-note type `0x02` as transparency-dev/formats implements it: a DER signature over SHA-256, and a key ID from the DER public key. Most C2SP tools use Ed25519. P-256 keeps the log key in the same hardware as the other keys.
 
-**Witnesses.** A witness checks that a new checkpoint extends the last one it saw, then cosigns it with Ed25519 `cosignature/v1` (C2SP [tlog-cosignature](https://c2sp.org/tlog-cosignature)). `POST /v1/log/witness` takes the checkpoint note with the witness's cosignature lines appended, as a C2SP [tlog-witness](https://c2sp.org/tlog-witness) response carries them. The gateway keeps cosignatures from the keys in `WITNESS_KEYS` (comma-separated verifier keys) and serves them with the checkpoint of the same size and root. The `dev_witness` example is a demo witness with a fixed, public key, and `compose.yaml` trusts it:
+**Witnesses.** A witness is a separate service, `open-pact-witness`, with its own Ed25519 key and its own state file. It implements the C2SP [tlog-witness](https://c2sp.org/tlog-witness) `add-checkpoint` call. It keeps the latest checkpoint it cosigned for each log. It cosigns a new checkpoint only with a valid consistency proof from that size, and it refuses forks and rollbacks (422 and 400) and a stale old size (409 with the size it holds). The cosignature is Ed25519 `cosignature/v1` with a timestamp (C2SP [tlog-cosignature](https://c2sp.org/tlog-cosignature)).
 
-```sh
-curl -s localhost:8080/v1/log/checkpoint | cargo run -q -p open-pact-core --example dev_witness -- cosign \
-  | curl -s --data-binary @- localhost:8080/v1/log/witness
+The manifest names the witnesses, so the owner signs the witness set and no one can change it without them:
+
+```toml
+[log]
+witnesses = [{ name = "witness.example.org/w1", key = "witness.example.org/w1+<id>+<key>" }]
+witness_quorum = 1          # cosignatures a client requires
+checkpoint_max_age = "1h"   # oldest cosignature a client accepts
 ```
 
-**Client.** The client pins the log key from the invitation at `join`. On every `join` and `check` it fetches the checkpoint, verifies the signature and verifies a consistency proof from the checkpoint it stored. On first contact it downloads all entries and recomputes the root instead. It then fetches the entry for the manifest hash the owner signed and the entry with this device's commitment `sha256(salt || pseudonym)`, and verifies an inclusion proof for each. `enrolment.json` keeps their indexes; the gateway returns them at enrolment. If a check fails or an entry is missing, the client prints an alarm and exits with status 2. `log prove [index]` verifies the inclusion proof of one entry. Without an index, it proves the entry of this device's enrolment. Each claim carries `log_checkpoint`, the size and root that the client verified last.
+The gateway sends every new checkpoint to the witnesses in `WITNESS_URLS` before it serves it, keeps the cosignatures that a manifest witness key verifies, and serves them with the checkpoint. It sends the current checkpoint again every `WITNESS_REFRESH_SECS` (default a quarter of `checkpoint_max_age`, at most 600), so the cosignatures stay fresh while the log does not grow.
+
+A witness detects a forking gateway only if someone other than the gateway operator runs it, for example the contractor or an auditor. To run one:
+
+```sh
+WITNESS_NAME=witness.example.org/w1 WITNESS_KEY_FILE=witness.key open-pact-witness keygen   # prints the verifier key for the manifest
+WITNESS_NAME=witness.example.org/w1 WITNESS_KEY_FILE=witness.key WITNESS_STATE=state.json \
+  WITNESS_LOG_KEYS="$(curl -s https://pact.example.com/v1/log/key)" open-pact-witness
+```
+
+Confirm the log key out of band, as with the invitation. `WITNESS_LOG_KEY_URL` pins the first key a URL serves; it exists for `compose.yaml` only. Losing the state file lets the gateway roll the log back, so back it up. The `compose.yaml` witness uses a key from a public seed (`deploy/compose/demo-witness.key`), and `examples/manifest.toml` lists it: anyone can forge its cosignatures.
+
+**Client.** The client pins the log key from the invitation at `join`. On every `join` and `check` it fetches the checkpoint, verifies the signature and verifies a consistency proof from the checkpoint it stored. On first contact it downloads all entries and recomputes the root instead. It then fetches the entry for the manifest hash the owner signed and the entry with this device's commitment `sha256(salt || pseudonym)`, and verifies an inclusion proof for each. `enrolment.json` keeps their indexes; the gateway returns them at enrolment. Before that it requires `witness_quorum` valid cosignatures from the manifest's witnesses, each no older than `checkpoint_max_age`, so a checkpoint the witnesses did not see, or an old one replayed, raises the alarm. Without a witness policy it warns that split views go undetected. If a check fails or an entry is missing, the client prints an alarm and exits with status 2. `log prove [index]` verifies the inclusion proof of one entry. Without an index, it proves the entry of this device's enrolment. Each claim carries `log_checkpoint`, the size and root that the client verified last. The gateway denies a claim whose checkpoint is not a state of its log.
 
 The gateway reads each log row from the database once and signs the checkpoint once per tree size. The checkpoint, the cosignatures and the proofs also verify with the Go packages `golang.org/x/mod/sumdb/note`, `github.com/transparency-dev/formats/note` and `github.com/transparency-dev/merkle/proof`. `log_entries` rejects `UPDATE`, `DELETE` and `TRUNCATE` with a trigger.
 
@@ -160,7 +175,7 @@ The chart fails to render without `gateway.kekSecret.name`, and, for the bundled
 
 ## Tests
 
-`scripts/smoke.sh` runs the full flow against a running gateway: an invitation with a wrong company key fingerprint (refused, nothing pinned), a remote `http://` gateway (refused), `join --yes --software-key` with the right invitation (it signs crafted claims with `device-dev.pem`), `check` denied while pending, a repeated `join`, reuse of the invitation by another device, three devices racing for one invitation, `devices approve` and `devices list`, `check`, `openssl verify` of the certificate, a replay of the client's own claim, a claim from an unenrolled device, chosen-result claims (failed check, a grace period that starts, ends after a day with the stored start moved back, and clears on a pass, undisclosed result, wrong manifest, tampered signature), `log show`, `log prove`, a witness cosignature, and the log alarm for a different root (split view), for a rollback, and the upgrade message for a v0.1.0 log head, a changed company key, and `devices revoke`. On a device that fails a 0-day-grace check, such as disk encryption off, `check` is denied and the smoke script stops there.
+`scripts/smoke.sh` runs the full flow against a running gateway: an invitation with a wrong company key fingerprint (refused, nothing pinned), a remote `http://` gateway (refused), `join --yes --software-key` with the right invitation (it signs crafted claims with `device-dev.pem`), `check` denied while pending, a repeated `join`, reuse of the invitation by another device, three devices racing for one invitation, `devices approve` and `devices list`, `check`, `openssl verify` of the certificate, a replay of the client's own claim, a claim from an unenrolled device, chosen-result claims (failed check, a grace period that starts, ends after a day with the stored start moved back, and clears on a pass, undisclosed result, wrong manifest, tampered signature), `log show`, `log prove`, a claim with a foreign log checkpoint, the witness cosignature, a fork the witness refuses, the log alarm for a checkpoint without a cosignature and for one cosigned two hours ago, and the log alarm for a different root (split view), for a rollback, and the upgrade message for a v0.1.0 log head, a changed company key, and `devices revoke`. On a device that fails a 0-day-grace check, such as disk encryption off, `check` is denied and the smoke script stops there.
 
 `scripts/check-helm.sh` checks that the chart refuses to render without `gateway.kekSecret.name` and without a database password or secret. The gateway tests that need PostgreSQL are `#[ignore]`d in a plain `cargo test`. Run them against a throwaway database:
 
@@ -174,7 +189,7 @@ TEST_DATABASE_URL=postgres://postgres:test@localhost:55432/postgres cargo test -
 - The invitation is a bearer secret, and its fingerprints are only as authentic as the channel that carried it. A relay that forwards the public endpoints passes the fingerprint check and can use a code it intercepts. TLS and IT approval of the device code are the defences; confirm the company key fingerprint over a second channel.
 - Behind an ingress the gateway sees the ingress address, so the enrolment failure limit applies to all enrolments together and the nonce limit to all devices together. Size `NONCE_MAX_PER_WINDOW` for the whole fleet in that case. The gateway does not read `X-Forwarded-For`. The limits are in memory and per replica.
 - Approval belongs to one manifest hash. When the gateway enforces a new manifest, the owner needs a new invitation and IT approves again.
-- The client prints witness cosignatures with the checkpoint but does not verify them, because it has no list of witness keys yet. The demo witness signs any checkpoint it is given; a real witness first checks a consistency proof from the last checkpoint it cosigned.
+- The witness has no monitoring endpoint yet, so a client cannot fetch cosignatures from it directly; it gets them through the gateway.
 - The summary page counts stored claims only. Replays, bad signatures, unenrolled devices and oversharing claims are refused without being stored.
 - The Secure Enclave device key proves that claims come from this Mac, but it is not bound to the client's code signature as PAPER.md section 5 describes. The client keeps the wrapped key in `device-se.key`, not in the keychain, so it needs no keychain entitlement, and any program on the same Mac that can read the file can sign with it. A Developer ID signed client with a keychain access group closes this. The Secure Enclave key protects against key theft: its private key cannot be copied off the Mac. It does not prove anything to the gateway, because the trust level in a claim is what the client asserts. Without attestation the gateway records that assertion as `asserted_trust_level`, counts every claim as `verified_trust_level` L0, and denies every claim when `min_trust_level` is L1 or L2, with the reason that the level needs attestation, which is not available.
 - The VPN certificate key and the owner key are still software keys.

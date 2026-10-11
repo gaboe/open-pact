@@ -55,5 +55,27 @@ autoApprove: false
 log:
   # Checkpoint origin and log key name (c2sp.org/tlog-checkpoint).
   origin: pact.example.com/log
-  # Witness verifier keys (Ed25519 cosignature/v1) whose cosignatures POST /v1/log/witness accepts.
-  witnessKeys: []
+  # add-checkpoint URL prefixes of the witnesses (c2sp.org/tlog-witness). The gateway sends each new
+  # checkpoint there and keeps the cosignatures that the manifest's [log] witness keys verify.
+  witnessUrls: []
+
+# Optional witness (c2sp.org/tlog-witness) with its own key and state. A witness detects a forking
+# gateway only if someone other than the gateway operator runs it, for example the contractor or
+# an auditor. Install it in their cluster with only this section enabled, not next to the gateway.
+witness:
+  enabled: false
+  image:
+    repository: registry.example.com/open-pact-witness
+    tag: latest
+    pullPolicy: IfNotPresent
+  # Key name; the manifest's [log] witnesses list it with the key `open-pact-witness vkey` prints.
+  name: witness.example.org/w1
+  # Secret holding the Ed25519 seed as 64 hex digits, created with `open-pact-witness keygen`.
+  keySecret:
+    name: ""
+    key: witness.key
+  # Verifier keys of the logs to witness (the gateway's GET /v1/log/key), confirmed out of band.
+  logKeys: []
+  # The state is the latest cosigned checkpoint per log. Losing it lets the gateway roll back.
+  storageClass: ""
+  size: 100Mi
