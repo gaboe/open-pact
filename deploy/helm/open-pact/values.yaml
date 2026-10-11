@@ -86,7 +86,9 @@ log:
 
 # Optional witness (c2sp.org/tlog-witness) with its own key and state. A witness detects a forking
 # gateway only if someone other than the gateway operator runs it, for example the contractor or
-# an auditor. Install it in their cluster with only this section enabled, not next to the gateway.
+# an auditor. Install it in their cluster, not next to the gateway, with gateway.enabled=false and
+# witness.enabled=true: that release needs no gateway or database secret and renders only the witness.
+# Run one replica per witness key: a second process on the same state refuses to start.
 witness:
   enabled: false
   image:

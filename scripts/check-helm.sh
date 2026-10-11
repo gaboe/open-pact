@@ -27,6 +27,14 @@ refuses "witness.logKeys" "${base[@]}" --set witness.keySecret.name=pact-witness
 helm template t "$chart" "${base[@]}" --set witness.keySecret.name=pact-witness-key \
   --set 'witness.logKeys[0]=pact.example.com/log+00000000+AA' | grep -q 'name: WITNESS_LOG_KEYS'
 
+witness_only="$(helm template t "$chart" --set gateway.enabled=false --set witness.enabled=true \
+  --set witness.keySecret.name=pact-witness-key --set 'witness.logKeys[0]=pact.example.com/log+00000000+AA' \
+  --set-file manifest=<(printf 'name = "Example Co"\n') --set ingress.enabled=true)"
+kinds="$(grep '^kind:' <<< "$witness_only" | sort | tr '\n' ' ')"
+[ "$kinds" = "kind: Deployment kind: PersistentVolumeClaim kind: Service " ] || { echo "FAIL: witness-only release renders $kinds"; exit 1; }
+! grep -q -E 'open-pact-gateway|postgres|kek|t-manifest' <<< "$witness_only" || { echo "FAIL: witness-only release references the gateway"; exit 1; }
+echo "a witness-only release needs no gateway or database secret and renders only the witness"
+
 plain="$(helm template t "$chart" "${kek[@]}" --set postgres.password=example-only)"
 ! grep -q -E 'MANIFEST_PATH|kind: ConfigMap|checksum/manifest' <<< "$plain"
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
