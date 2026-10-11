@@ -167,7 +167,7 @@ mod tests {
 
     #[test]
     fn screen_lock() {
-        let line = |s: &str| format!("2026-10-11 16:49:08.713 sysadminctl[8174:1] screenLock {s}");
+        let line = |s: &str| format!("2026-01-01 09:00:00.000 sysadminctl[1234:1] screenLock {s}");
         assert_eq!(parse_screen_lock(&line("delay is immediate")), "le_5min");
         assert_eq!(parse_screen_lock(&line("delay is 300 seconds")), "le_5min");
         assert_eq!(parse_screen_lock(&line("delay is 600 seconds")), "le_15min");
