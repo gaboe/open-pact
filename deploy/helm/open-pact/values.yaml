@@ -1,0 +1,27 @@
+image:
+  repository: registry.example.com/open-pact-gateway
+  tag: latest
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+ingress:
+  enabled: true
+  host: pact.example.com
+  ingressClassName: nginx
+  annotations: {}
+  tlsSecretName: ""
+
+postgres:
+  enabled: true
+  image: postgres:17
+  database: pact
+  user: pact
+  password: change-me
+  existingSecret: ""
+  existingSecretKey: password
+  storageClass: ""
+  size: 5Gi
+
+database:
+  externalUrl: ""
