@@ -16,9 +16,9 @@ use clap::{Parser, Subcommand};
 use device_key::DeviceKey;
 use open_pact_core::{
     Checkpoint, Claim, CsrHash, Endorsement, EnrolRequest, Entry, EntryKind, Invitation,
-    LogCheckpoint, LogHash, LogKey, Manifest, ManifestHash, Metadata, Note, Os, Pseudonym,
-    PublicKey, SignedManifest, Virtualized, dev_key, root, verify_claim, verify_consistency,
-    verify_inclusion,
+    LogCheckpoint, LogHash, LogKey, LogPolicy, Manifest, ManifestHash, Metadata, Note, Os,
+    Pseudonym, PublicKey, SignedManifest, Virtualized, dev_key, root, verify_claim,
+    verify_consistency, verify_cosignatures, verify_inclusion,
 };
 use rcgen::{CertificateParams, DistinguishedName, KeyPair};
 use serde::{Deserialize, Serialize};
@@ -451,12 +451,14 @@ impl Pins {
     }
 }
 
-/// Fetches the gateway's checkpoint and checks that it extends the one stored on this device.
-/// On first contact it downloads every entry and recomputes the root instead.
+/// Fetches the gateway's checkpoint, checks the manifest's witness policy on it, and checks that
+/// it extends the one stored on this device. On first contact it downloads every entry and
+/// recomputes the root instead.
 async fn sync_checkpoint(
     http: &reqwest::Client,
     home: &Home,
     gateway: &str,
+    policy: Option<&LogPolicy>,
 ) -> Result<Result<Checkpoint, String>> {
     let pins = Pins::load(home)?;
     if let Some(changed) = pins.compare(http, gateway).await? {
@@ -465,10 +467,21 @@ async fn sync_checkpoint(
     let key = pins.log;
     let prev = home.checkpoint()?;
     let text = get_text(http, format!("{}/v1/log/checkpoint", base(gateway))).await?;
-    let new = match Note::parse(&text).and_then(|note| key.verify(&note)) {
+    let now = u64::try_from(chrono::Utc::now().timestamp()).context("clock")?;
+    let new = match Note::parse(&text).and_then(|note| {
+        let checkpoint = key.verify(&note)?;
+        verify_cosignatures(policy, &checkpoint, &note, now)?;
+        Ok(checkpoint)
+    }) {
         Ok(checkpoint) => checkpoint,
         Err(e) => return Ok(Err(e.to_string())),
     };
+    if policy.is_none_or(|p| p.witness_quorum == 0) {
+        eprintln!(
+            "WARNING: the manifest requires no witness cosignatures. The gateway could show this \
+             device another log history than other devices (a split view) and nothing here would notice."
+        );
+    }
     let checked = match &prev {
         None => {
             let entries = fetch_entries(http, gateway, 0, new.size).await?;
@@ -619,10 +632,12 @@ async fn check_own_entries(
 async fn sync_log(
     http: &reqwest::Client,
     home: &Home,
+    manifest: &Manifest,
     enrolment: &mut Enrolment,
 ) -> Result<LogSync> {
     let gateway = enrolment.gateway.clone();
-    let cp = match sync_checkpoint(http, home, &gateway).await? {
+    let policy = manifest.body().log.as_ref();
+    let cp = match sync_checkpoint(http, home, &gateway, policy).await? {
         Ok(cp) => cp,
         Err(e) => return Ok(alarm(e)),
     };
@@ -726,7 +741,7 @@ async fn join(
         std::fs::remove_file(home.file(LEGACY_LOG_HEAD))?;
         println!("Removed the old hash-chain log head; this device now pins the Merkle log.");
     }
-    if let Err(e) = sync_checkpoint(&http, home, gateway).await? {
+    if let Err(e) = sync_checkpoint(&http, home, gateway, manifest.body().log.as_ref()).await? {
         report_log(alarm(e), home);
         return Ok(ExitCode::from(2));
     }
@@ -806,7 +821,10 @@ async fn join(
         _ => {}
     }
     Ok(
-        if report_log(sync_log(&http, home, &mut enrolment).await?, home) {
+        if report_log(
+            sync_log(&http, home, &manifest, &mut enrolment).await?,
+            home,
+        ) {
             ExitCode::SUCCESS
         } else {
             ExitCode::from(2)
@@ -879,7 +897,7 @@ async fn check(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
     let os = current_os()?;
 
     let http = http_client()?;
-    let sync = sync_log(&http, home, &mut enrolment).await?;
+    let sync = sync_log(&http, home, &manifest, &mut enrolment).await?;
     if let LogSync::Alarm(_) = sync {
         report_log(sync, home);
         return Ok(ExitCode::from(2));
@@ -1001,8 +1019,12 @@ async fn log_prove(home: &Home, index: Option<u64>, insecure_dev: bool) -> Resul
         print_log_upgrade(home);
         return Ok(ExitCode::FAILURE);
     }
+    let manifest = Manifest::parse(&std::fs::read(home.file("manifest.toml"))?)?;
+    if manifest.hash() != &enrolment.manifest {
+        bail!("manifest.toml no longer matches the hash you signed");
+    }
     let http = http_client()?;
-    let sync = sync_log(&http, home, &mut enrolment).await?;
+    let sync = sync_log(&http, home, &manifest, &mut enrolment).await?;
     let LogSync::Verified(cp, own) = sync else {
         report_log(sync, home);
         return Ok(ExitCode::from(2));
