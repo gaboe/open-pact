@@ -9,6 +9,7 @@ mod seal;
 #[cfg(test)]
 mod testdb;
 mod translog;
+mod witness;
 
 use std::fmt::Display;
 use std::net::SocketAddr;
@@ -25,9 +26,9 @@ use axum::{
 use clap::{Parser, Subcommand};
 use open_pact_core::{
     Checkpoint, Claim, CsrHash, Decision, Endorsement, EnrolRequest, Entry, EntryKind, Evaluation,
-    FirstFailures, Invitation, LogHash, LogKey, Manifest, Note, Pseudonym, PublicKey, Reason,
-    SigningKey, Span, WitnessKey, consistency_proof, evaluate, inclusion_proof, root,
-    verified_trust_level, verify_claim,
+    FirstFailures, Invitation, LogCheckpoint, LogHash, LogKey, Manifest, Note, NoteSignature,
+    Pseudonym, PublicKey, Reason, SigningKey, Span, consistency_proof, evaluate, inclusion_proof,
+    root, verified_trust_level, verify_claim,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -37,6 +38,7 @@ use devices::{Action, State as DeviceState, commitment};
 use keys::Keys;
 use ratelimit::Limiter;
 use seal::SealingKey;
+use witness::Witnesses;
 
 #[derive(Parser)]
 #[command(
@@ -101,7 +103,7 @@ struct App {
 struct Log {
     signer: SigningKey,
     key: LogKey,
-    witnesses: Vec<WitnessKey>,
+    witnesses: Witnesses,
     cache: Mutex<LogCache>,
 }
 
@@ -217,32 +219,47 @@ impl App {
         })
     }
 
-    /// The current checkpoint signed by the log key, with the witness cosignatures stored for it.
-    async fn checkpoint(&self) -> Result<Note, Reply> {
-        let tree = self.tree().await?;
-        let cached = self
-            .log
-            .cache
-            .lock()
-            .expect("log cache")
+    /// The checkpoint of `tree` signed by the log key, and whether it was signed just now.
+    fn signed(&self, tree: &Tree) -> (Checkpoint, Note, bool) {
+        let mut cache = self.log.cache.lock().expect("log cache");
+        if let Some((cp, note)) = cache
             .signed
             .clone()
-            .filter(|(cp, _)| cp.size == tree.size());
-        let (checkpoint, mut note) = match cached {
-            Some(signed) => signed,
-            None => {
-                let checkpoint = Checkpoint {
-                    origin: self.log.key.origin().to_string(),
-                    size: tree.size(),
-                    root: root(&tree.leaves),
-                };
-                let note = self.log.key.sign(&self.log.signer, &checkpoint);
-                let signed = (checkpoint, note);
-                self.log.cache.lock().expect("log cache").signed = Some(signed.clone());
-                signed
-            }
+            .filter(|(cp, _)| cp.size == tree.size())
+        {
+            return (cp, note, false);
+        }
+        let checkpoint = Checkpoint {
+            origin: self.log.key.origin().to_string(),
+            size: tree.size(),
+            root: root(&tree.leaves),
         };
-        let cosignatures: Vec<String> = sqlx::query_scalar(
+        let note = self.log.key.sign(&self.log.signer, &checkpoint);
+        cache.signed = Some((checkpoint.clone(), note.clone()));
+        (checkpoint, note, true)
+    }
+
+    /// The current checkpoint signed by the log key, with the witness cosignatures stored for it.
+    /// A new checkpoint goes to the witnesses before any client sees it.
+    async fn checkpoint(&self) -> Result<Note, Reply> {
+        let tree = self.tree().await?;
+        let (checkpoint, mut note, fresh) = self.signed(&tree);
+        let mut cosignatures = self.cosignatures(&checkpoint).await?;
+        let short = cosignatures.len() < self.log.witnesses.quorum;
+        if fresh || (short && self.log.witnesses.retry_due()) {
+            self.witness(&checkpoint, &note, &tree).await?;
+            cosignatures = self.cosignatures(&checkpoint).await?;
+        } else if short {
+            // Another request may be pushing this checkpoint right now.
+            self.log.witnesses.settled().await;
+            cosignatures = self.cosignatures(&checkpoint).await?;
+        }
+        note.signatures.extend(cosignatures);
+        Ok(note)
+    }
+
+    async fn cosignatures(&self, checkpoint: &Checkpoint) -> Result<Vec<NoteSignature>, Reply> {
+        let lines: Vec<String> = sqlx::query_scalar(
             "SELECT signature FROM log_cosignatures WHERE size = $1 AND root = $2 ORDER BY witness",
         )
         .bind(i64::try_from(checkpoint.size).map_err(internal)?)
@@ -250,11 +267,38 @@ impl App {
         .fetch_all(&self.db)
         .await
         .map_err(internal)?;
-        for line in cosignatures {
-            note.signatures
-                .push(open_pact_core::NoteSignature::parse(&line).map_err(internal)?);
+        lines
+            .iter()
+            .map(|l| NoteSignature::parse(l).map_err(internal))
+            .collect()
+    }
+
+    /// Asks the witnesses to cosign and stores what they return, newest per witness.
+    async fn witness(
+        &self,
+        checkpoint: &Checkpoint,
+        note: &Note,
+        tree: &Tree,
+    ) -> Result<(), Reply> {
+        let cosigned = self
+            .log
+            .witnesses
+            .cosign(note, checkpoint, tree.prefix(checkpoint.size))
+            .await;
+        for (name, sig) in cosigned {
+            sqlx::query(
+                "INSERT INTO log_cosignatures (size, root, witness, signature) VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (size, root, witness) DO UPDATE SET signature = EXCLUDED.signature, received_at = now()",
+            )
+            .bind(i64::try_from(checkpoint.size).map_err(internal)?)
+            .bind(checkpoint.root.to_string())
+            .bind(name)
+            .bind(sig.to_string().trim_end())
+            .execute(&self.db)
+            .await
+            .map_err(internal)?;
         }
-        Ok(note)
+        Ok(())
     }
 
     async fn conn(&self) -> Result<sqlx::pool::PoolConnection<sqlx::Postgres>, Reply> {
@@ -350,68 +394,6 @@ async fn consistency(
     }
     let proof = consistency_proof(tree.prefix(to), from).map_err(bad_request)?;
     Ok(Json(json!({"from": from, "to": to, "proof": proof})))
-}
-
-/// Takes a checkpoint signed by this log with witness cosignature lines appended, as a
-/// c2sp.org/tlog-witness add-checkpoint response would carry them, and stores the valid ones.
-async fn witness(State(app): State<App>, body: String) -> Result<Json<Value>, Reply> {
-    let reject =
-        |code, reason: String| (code, Json(json!({"status": "denied", "reasons": [reason]})));
-    let note = Note::parse(&body).map_err(bad_request)?;
-    let checkpoint = app
-        .log
-        .key
-        .verify(&note)
-        .map_err(|e| reject(StatusCode::FORBIDDEN, e.to_string()))?;
-    let tree = app.tree().await?;
-    let mut conn = app.conn().await?;
-    if checkpoint.size == 0
-        || checkpoint.size > tree.size()
-        || root(tree.prefix(checkpoint.size)) != checkpoint.root
-    {
-        return Err(reject(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            format!(
-                "checkpoint of size {} does not match this log",
-                checkpoint.size
-            ),
-        ));
-    }
-    let mut accepted = vec![];
-    for sig in &note.signatures {
-        for w in &app.log.witnesses {
-            match w.verify(&checkpoint, sig) {
-                None => {}
-                Some(Err(e)) => {
-                    return Err(reject(StatusCode::FORBIDDEN, format!("{}: {e}", w.name())));
-                }
-                Some(Ok(_)) => accepted.push((w.name(), sig.to_string())),
-            }
-        }
-    }
-    if accepted.is_empty() {
-        return Err(reject(
-            StatusCode::FORBIDDEN,
-            "no cosignature from a key in WITNESS_KEYS".into(),
-        ));
-    }
-    for (name, line) in &accepted {
-        sqlx::query(
-            "INSERT INTO log_cosignatures (size, root, witness, signature) VALUES ($1, $2, $3, $4) \
-             ON CONFLICT (size, root, witness) DO UPDATE SET signature = EXCLUDED.signature, received_at = now()",
-        )
-        .bind(i64::try_from(checkpoint.size).map_err(internal)?)
-        .bind(checkpoint.root.to_string())
-        .bind(name)
-        .bind(line.trim_end())
-        .execute(&mut *conn)
-        .await
-        .map_err(internal)?;
-    }
-    let names: Vec<&str> = accepted.iter().map(|(n, _)| *n).collect();
-    Ok(Json(
-        json!({"status": "stored", "size": checkpoint.size, "witnesses": names}),
-    ))
 }
 
 fn too_many(reason: &str) -> Reply {
@@ -654,6 +636,10 @@ async fn claim(
         Some(false) => return Err(denied(vec!["expired nonce".into()])),
         Some(true) => {}
     }
+    let foreign = match &claim.log_checkpoint {
+        Some(cp) => foreign_checkpoint(&app.tree().await?, cp),
+        None => None,
+    };
     let manifest_hash = app.manifest.hash().as_str();
     let now = chrono::Utc::now();
     let mut tx = app.db.begin().await.map_err(internal)?;
@@ -684,6 +670,7 @@ async fn claim(
         Some(Some(why)) => reasons.insert(0, why.into()),
         Some(None) => {}
     }
+    reasons.extend(foreign);
     let csr = match (&claim.csr_sha256, &csr_pem) {
         (None, None) => None,
         (Some(hash), Some(pem)) => match keys::bare_csr_der(pem) {
@@ -801,7 +788,7 @@ async fn index(State(app): State<App>) -> Result<Html<String>, Reply> {
             use base64::Engine;
             base64::engine::general_purpose::STANDARD.encode(root(&tree.leaves).0)
         },
-        log_witnesses = app.log.witnesses.len(),
+        log_witnesses = app.log.witnesses.keys().len(),
         ca = app.keys.ca.fingerprint,
     )))
 }
@@ -846,13 +833,38 @@ async fn connect(url: &str) -> anyhow::Result<PgPool> {
     }
 }
 
-fn witness_keys() -> anyhow::Result<Vec<WitnessKey>> {
-    std::env::var("WITNESS_KEYS")
+fn witness_urls() -> Vec<String> {
+    std::env::var("WITNESS_URLS")
         .unwrap_or_default()
         .split([',', ' ', '\n'])
-        .filter(|k| !k.is_empty())
-        .map(|k| WitnessKey::parse(k).map_err(|e| anyhow::anyhow!("WITNESS_KEYS: {e}")))
+        .filter(|u| !u.is_empty())
+        .map(String::from)
         .collect()
+}
+
+/// Re-sends the current checkpoint so the cosignatures stay younger than checkpoint_max_age
+/// while the log does not grow.
+async fn refresh_cosignatures(app: App, every: Duration) {
+    loop {
+        tokio::time::sleep(every).await;
+        let Ok(tree) = app.tree().await else {
+            continue;
+        };
+        let (checkpoint, note, _) = app.signed(&tree);
+        let _ = app.witness(&checkpoint, &note, &tree).await;
+    }
+}
+
+/// Denies a claim whose checkpoint is not a state of this gateway's log.
+fn foreign_checkpoint(tree: &Tree, cp: &LogCheckpoint) -> Option<String> {
+    let known = cp.size > 0 && cp.size <= tree.size() && root(tree.prefix(cp.size)) == cp.root;
+    (!known).then(|| {
+        format!(
+            "the claim's log checkpoint (size {}) is not a state of this gateway's log (size {})",
+            cp.size,
+            tree.size()
+        )
+    })
 }
 
 fn log_origin() -> anyhow::Result<String> {
@@ -948,7 +960,6 @@ fn router(app: App) -> Router {
         .route("/v1/log/entries", get(log_entries))
         .route("/v1/log/proof/inclusion", get(inclusion))
         .route("/v1/log/proof/consistency", get(consistency))
-        .route("/v1/log/witness", post(witness))
         .route("/v1/nonce", post(nonce))
         .route("/v1/claim", post(claim))
         .with_state(app)
@@ -981,16 +992,37 @@ async fn serve(db: PgPool) -> anyhow::Result<()> {
     let max_nonces = env_number("NONCE_MAX_OUTSTANDING", 10_000)?;
     let kek = SealingKey::kek_from_env()?;
     let keys = Keys::load_or_create(&db, &kek).await?;
+    let policy = manifest.body().log.as_ref();
     let log = Log {
         key: log_key(&keys)?,
         signer: keys.log.clone(),
-        witnesses: witness_keys()?,
+        witnesses: Witnesses::new(witness_urls(), policy)?,
         cache: Mutex::default(),
     };
     eprintln!("log key {}", log.key.vkey());
-    for w in &log.witnesses {
-        eprintln!("witness {}", w.vkey());
+    for w in log.witnesses.keys() {
+        eprintln!("manifest witness {}", w.vkey());
     }
+    for url in log.witnesses.urls() {
+        eprintln!("pushing checkpoints to {url}");
+    }
+    if log.witnesses.urls().len() < log.witnesses.quorum {
+        eprintln!(
+            "WARNING: the manifest requires {} witness cosignatures but WITNESS_URLS lists {} witnesses; clients will raise a log alarm",
+            log.witnesses.quorum,
+            log.witnesses.urls().len()
+        );
+    }
+    let refresh = match policy.and_then(|p| p.checkpoint_max_age.min_duration()) {
+        Some(age) if !log.witnesses.urls().is_empty() => {
+            let quarter = u64::try_from(age.num_seconds() / 4).unwrap_or(600);
+            Some(Duration::from_secs(env_number(
+                "WITNESS_REFRESH_SECS",
+                quarter.clamp(10, 600),
+            )?))
+        }
+        _ => None,
+    };
     publish_manifest(&db, &manifest).await?;
     let company = Endorsement::sign(&keys.manifest, manifest.hash());
     eprintln!("company key {}", company.key.fingerprint());
@@ -1007,7 +1039,7 @@ async fn serve(db: PgPool) -> anyhow::Result<()> {
         db.clone(),
         manifest.body().claim_retention.clone(),
     ));
-    let app = router(App {
+    let app = App {
         db,
         manifest: Arc::new(manifest),
         toml: toml.into(),
@@ -1019,7 +1051,11 @@ async fn serve(db: PgPool) -> anyhow::Result<()> {
         nonce_limiter: Arc::new(nonce_limiter),
         max_nonces,
         kek: Arc::new(kek),
-    });
+    };
+    if let Some(every) = refresh {
+        tokio::spawn(refresh_cosignatures(app.clone(), every));
+    }
+    let app = router(app);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(
         listener,
@@ -1074,7 +1110,7 @@ mod tests {
         let log = Log {
             key: LogKey::new("log.example.org/test", &PublicKey::from(&keys.log)),
             signer: keys.log.clone(),
-            witnesses: vec![],
+            witnesses: Witnesses::new(vec![], manifest.body().log.as_ref()).unwrap(),
             cache: Mutex::default(),
         };
         let minute = Duration::from_secs(60);
@@ -1324,6 +1360,30 @@ mod tests {
         assert_eq!(stored[0]["claim"]["asserted_trust_level"], "L1");
         assert_eq!(stored[0]["claim"]["verified_trust_level"], "L0");
         assert_eq!(stored[0]["claim"]["trust_level"], Value::Null);
+    }
+
+    #[test]
+    fn a_claim_checkpoint_must_be_a_state_of_this_log() {
+        let tree = Tree {
+            leaves: (0u8..5).map(|i| open_pact_core::leaf_hash(&[i])).collect(),
+        };
+        let at = |size: u64| LogCheckpoint {
+            size,
+            root: root(tree.prefix(size)),
+        };
+        assert_eq!(foreign_checkpoint(&tree, &at(3)), None);
+        assert_eq!(foreign_checkpoint(&tree, &at(5)), None);
+        let wrong_root = LogCheckpoint {
+            root: at(2).root,
+            ..at(3)
+        };
+        assert!(foreign_checkpoint(&tree, &wrong_root).is_some());
+        let beyond = LogCheckpoint {
+            size: 999_999,
+            root: LogHash([0; 32]),
+        };
+        assert!(foreign_checkpoint(&tree, &beyond).is_some());
+        assert!(foreign_checkpoint(&tree, &at(0)).is_some());
     }
 
     #[test]

@@ -12,6 +12,7 @@ tokio.workspace = true
 axum = "0.8"
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls", "migrate", "json", "macros", "chrono"] }
 rand = "0.9"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 anyhow = "1"
 base64 = "0.23.1"
 clap = { version = "4", features = ["derive", "env"] }
