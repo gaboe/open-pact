@@ -101,7 +101,7 @@ open-pact-gateway devices revoke pseudonym:0a1b2c3d4e5f...   # the full pseudony
 | Attack | Defence |
 | --- | --- |
 | Enrolling a device with only the public manifest | a valid invitation is required, and IT approves each device |
-| Guessing or enumerating codes | 256-bit codes; unknown, expired, used and someone else's codes get the same 403 "invalid or used invitation"; after `ENROL_MAX_FAILURES` (default 10) failures in `ENROL_FAILURE_WINDOW_SECS` (default 600) from one address, IPv6 per /64, the gateway answers 429 |
+| Guessing or enumerating codes | 256-bit codes; unknown, expired, used and someone else's codes get the same 403 "invalid or used invitation"; after `ENROL_MAX_FAILURES` (default 10) refused enrolments of any kind (malformed body, bad signature, wrong manifest, invalid invitation) in `ENROL_FAILURE_WINDOW_SECS` (default 600) from one address, IPv6 per /64, the gateway answers 429 |
 | Using one invitation twice, also concurrently | one `UPDATE ... WHERE used_at IS NULL AND expires_at > now()` inside the enrolment transaction; smoke races three devices for one code |
 | Reading codes from a database dump | only SHA-256 hashes are stored |
 | A fake gateway at first contact | the client compares the company key fingerprint and the log key with the invitation before it shows or sends anything |

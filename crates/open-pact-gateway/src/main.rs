@@ -469,6 +469,8 @@ async fn delete_expired_nonces(db: PgPool) {
     }
 }
 
+/// Every refused enrolment counts against the address, whether the body, a signature, the
+/// manifest or the invitation was wrong. Server errors do not count.
 async fn enroll(
     State(app): State<App>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -479,6 +481,17 @@ async fn enroll(
             "too many failed enrolments from this address; try again later",
         ));
     }
+    let result = try_enroll(&app, body).await;
+    if matches!(&result, Err((status, _)) if status.is_client_error()) {
+        app.limiter.record(peer.ip(), Instant::now());
+    }
+    result
+}
+
+async fn try_enroll(
+    app: &App,
+    body: Result<Json<EnrolRequest>, JsonRejection>,
+) -> Result<Json<Value>, Reply> {
     let Json(req) = body.map_err(|e| denied(vec![e.body_text()]))?;
     let signed = &req.signed_manifest;
     let manifest = req.verify().map_err(|e| denied(vec![e.to_string()]))?;
@@ -497,10 +510,6 @@ async fn enroll(
     let device = Pseudonym::of(&req.device_key);
     let invitation = req.invitation_code.hash();
     let owner_key = serde_json::to_value(&signed.owner.key).map_err(internal)?;
-    let invalid = || {
-        app.limiter.record(peer.ip(), Instant::now());
-        invalid_invitation()
-    };
 
     let mut tx = app.db.begin().await.map_err(internal)?;
     translog::lock(&mut tx).await.map_err(internal)?;
@@ -538,7 +547,7 @@ async fn enroll(
                 }
             };
             if !accepted {
-                return Err(invalid());
+                return Err(invalid_invitation());
             }
             let index: i64 = sqlx::query_scalar(
                 "SELECT idx FROM log_entries WHERE kind = 'device_enrolled' AND data->>'commitment' = $1",
@@ -561,7 +570,7 @@ async fn enroll(
                 .await
                 .map_err(internal)?
             {
-                return Err(invalid());
+                return Err(invalid_invitation());
             }
             let salt = hex::encode(rand::random::<[u8; 32]>());
             let state = if app.auto_approve {
@@ -883,6 +892,24 @@ async fn admin_devices(db: &PgPool, command: DevicesCommand) -> anyhow::Result<(
     Ok(())
 }
 
+fn router(app: App) -> Router {
+    Router::new()
+        .route("/", get(index))
+        .route("/healthz", get(healthz))
+        .route("/v1/manifest", get(self::manifest))
+        .route("/v1/enroll", post(enroll))
+        .route("/v1/log", get(legacy_log))
+        .route("/v1/log/key", get(self::log_key_text))
+        .route("/v1/log/checkpoint", get(log_checkpoint))
+        .route("/v1/log/entries", get(log_entries))
+        .route("/v1/log/proof/inclusion", get(inclusion))
+        .route("/v1/log/proof/consistency", get(consistency))
+        .route("/v1/log/witness", post(witness))
+        .route("/v1/nonce", post(nonce))
+        .route("/v1/claim", post(claim))
+        .with_state(app)
+}
+
 async fn serve(db: PgPool) -> anyhow::Result<()> {
     let addr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
     let manifest_path =
@@ -930,33 +957,19 @@ async fn serve(db: PgPool) -> anyhow::Result<()> {
         db.clone(),
         manifest.body().claim_retention.clone(),
     ));
-    let app = Router::new()
-        .route("/", get(index))
-        .route("/healthz", get(healthz))
-        .route("/v1/manifest", get(self::manifest))
-        .route("/v1/enroll", post(enroll))
-        .route("/v1/log", get(legacy_log))
-        .route("/v1/log/key", get(self::log_key_text))
-        .route("/v1/log/checkpoint", get(log_checkpoint))
-        .route("/v1/log/entries", get(log_entries))
-        .route("/v1/log/proof/inclusion", get(inclusion))
-        .route("/v1/log/proof/consistency", get(consistency))
-        .route("/v1/log/witness", post(witness))
-        .route("/v1/nonce", post(nonce))
-        .route("/v1/claim", post(claim))
-        .with_state(App {
-            db,
-            manifest: Arc::new(manifest),
-            toml: toml.into(),
-            company,
-            keys: Arc::new(keys),
-            log: Arc::new(log),
-            auto_approve,
-            limiter: Arc::new(limiter),
-            nonce_limiter: Arc::new(nonce_limiter),
-            max_nonces,
-            kek: Arc::new(kek),
-        });
+    let app = router(App {
+        db,
+        manifest: Arc::new(manifest),
+        toml: toml.into(),
+        company,
+        keys: Arc::new(keys),
+        log: Arc::new(log),
+        auto_approve,
+        limiter: Arc::new(limiter),
+        nonce_limiter: Arc::new(nonce_limiter),
+        max_nonces,
+        kek: Arc::new(kek),
+    });
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(
         listener,
@@ -990,7 +1003,80 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
     use super::*;
+
+    async fn test_app(enrol_limit: u32, nonce_limit: u32) -> Router {
+        let db = testdb::fresh().await;
+        let kek = SealingKey::new(&[5; 32]);
+        let keys = Keys::load_or_create(&db, &kek).await.unwrap();
+        let toml = include_str!("../../../examples/manifest.toml");
+        let manifest = Manifest::parse(toml.as_bytes()).unwrap();
+        let log = Log {
+            key: LogKey::new("log.example.org/test", &PublicKey::from(&keys.log)),
+            signer: keys.log.clone(),
+            witnesses: vec![],
+            cache: Mutex::default(),
+        };
+        let minute = Duration::from_secs(60);
+        router(App {
+            db,
+            company: Endorsement::sign(&keys.manifest, manifest.hash()),
+            manifest: Arc::new(manifest),
+            toml: toml.into(),
+            keys: Arc::new(keys),
+            log: Arc::new(log),
+            auto_approve: false,
+            limiter: Arc::new(Limiter::new(enrol_limit, minute, 100)),
+            nonce_limiter: Arc::new(Limiter::new(nonce_limit, minute, 100)),
+            max_nonces: 10_000,
+            kek: Arc::new(kek),
+        })
+    }
+
+    async fn post_from(app: &Router, path: &str, body: &str) -> StatusCode {
+        let mut req = Request::post(path)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([192, 0, 2, 7], 40000))));
+        app.clone().oneshot(req).await.unwrap().status()
+    }
+
+    /// M7: refusals before the invitation check (a broken body or signature) also count.
+    #[tokio::test]
+    #[ignore = "needs TEST_DATABASE_URL"]
+    async fn every_refused_enrolment_counts_towards_the_limit() {
+        let app = test_app(3, 100).await;
+        for _ in 0..3 {
+            assert_eq!(
+                post_from(&app, "/v1/enroll", "{}").await,
+                StatusCode::FORBIDDEN
+            );
+        }
+        assert_eq!(
+            post_from(&app, "/v1/enroll", "{}").await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    /// M2: one address cannot fill the nonce table.
+    #[tokio::test]
+    #[ignore = "needs TEST_DATABASE_URL"]
+    async fn nonces_are_limited_per_address() {
+        let app = test_app(10, 2).await;
+        for _ in 0..2 {
+            assert_eq!(post_from(&app, "/v1/nonce", "").await, StatusCode::OK);
+        }
+        assert_eq!(
+            post_from(&app, "/v1/nonce", "").await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
 
     #[test]
     fn entries_are_served_in_pages_of_at_most_256() {
