@@ -43,6 +43,14 @@ code="$(curl -sS -o "$tmp/body" -w '%{http_code}' -X POST --data-binary @<(curl 
 [ "$code" = 403 ]
 echo "witness cosignature stored and served; a checkpoint without one is refused ($code)"
 
+for q in "entries?from=0&to=99999" "entries?from=3&to=2" "proof/inclusion?index=99999" \
+  "proof/inclusion?index=0&size=99999" "proof/consistency?from=0" "proof/consistency?from=2&to=1" \
+  "proof/consistency?from=1&to=99999"; do
+  code="$(curl -sS -o "$tmp/body" -w '%{http_code}' "$url/v1/log/$q")"
+  [ "$code" = 400 ] || { echo "$q: $code $(cat "$tmp/body")"; exit 1; }
+done
+echo "out-of-range log requests answer 400"
+
 code="$(curl -sS -o "$tmp/body" -w '%{http_code}' "$url/v1/log")"
 [ "$code" = 410 ]
 echo "old hash-chain endpoint answers 410: $(cat "$tmp/body")"

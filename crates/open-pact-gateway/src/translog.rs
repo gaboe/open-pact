@@ -1,5 +1,5 @@
 use anyhow::Context;
-use open_pact_core::{Entry, EntryKind, LogHash};
+use open_pact_core::{Entry, EntryKind};
 use serde_json::Value;
 use sqlx::PgConnection;
 
@@ -20,26 +20,35 @@ pub async fn lock(conn: &mut PgConnection) -> sqlx::Result<()> {
         .map(drop)
 }
 
-/// Every entry in index order. The log is small, so proofs are computed from all leaves.
-pub async fn all(conn: &mut PgConnection) -> anyhow::Result<Vec<Entry>> {
-    let entries = sqlx::query_as::<_, Row>("SELECT idx, kind, data FROM log_entries ORDER BY idx")
-        .fetch_all(conn)
-        .await?
-        .into_iter()
-        .map(entry)
-        .collect::<anyhow::Result<Vec<_>>>()?;
+/// Entries `from..to` in index order; fails if the table has a gap there.
+pub async fn range(conn: &mut PgConnection, from: u64, to: u64) -> anyhow::Result<Vec<Entry>> {
+    let entries = sqlx::query_as::<_, Row>(
+        "SELECT idx, kind, data FROM log_entries WHERE idx >= $1 AND idx < $2 ORDER BY idx",
+    )
+    .bind(i64::try_from(from)?)
+    .bind(i64::try_from(to).unwrap_or(i64::MAX))
+    .fetch_all(conn)
+    .await?
+    .into_iter()
+    .map(entry)
+    .collect::<anyhow::Result<Vec<_>>>()?;
     if let Some((i, e)) = entries
         .iter()
         .enumerate()
-        .find(|(i, e)| e.index != *i as u64)
+        .find(|(i, e)| e.index != from + *i as u64)
     {
-        anyhow::bail!("log_entries has a gap: index {} at position {i}", e.index);
+        anyhow::bail!(
+            "log_entries has a gap: index {} at position {}",
+            e.index,
+            from + i as u64
+        );
     }
     Ok(entries)
 }
 
-pub fn leaf_hashes(entries: &[Entry]) -> Vec<LogHash> {
-    entries.iter().map(Entry::leaf_hash).collect()
+/// Every committed entry from `from` on.
+pub async fn since(conn: &mut PgConnection, from: u64) -> anyhow::Result<Vec<Entry>> {
+    range(conn, from, u64::MAX).await
 }
 
 pub async fn append(

@@ -313,6 +313,31 @@ fn alarm(e: impl std::fmt::Display) -> LogSync {
     LogSync::Alarm(e.to_string())
 }
 
+/// The gateway serves at most this many entries per request.
+const ENTRIES_PAGE: u64 = 256;
+
+/// Entries `from..to`, fetched page by page.
+async fn fetch_entries(
+    http: &reqwest::Client,
+    gateway: &str,
+    from: u64,
+    to: u64,
+) -> Result<Vec<Entry>> {
+    let mut entries = vec![];
+    let mut next = from;
+    while next < to {
+        let end = to.min(next + ENTRIES_PAGE);
+        let url = format!("{}/v1/log/entries?from={next}&to={end}", base(gateway));
+        let page: Entries = get_json(http, url).await?;
+        if page.entries.is_empty() {
+            bail!("the gateway served no entries from #{next}");
+        }
+        next += page.entries.len() as u64;
+        entries.extend(page.entries);
+    }
+    Ok(entries)
+}
+
 async fn pinned_log_key(http: &reqwest::Client, home: &Home, gateway: &str) -> Result<LogKey> {
     if let Some(vkey) = home.read_text(LOG_KEY)? {
         return Ok(LogKey::parse(&vkey)?);
@@ -336,17 +361,9 @@ async fn sync_log(http: &reqwest::Client, home: &Home, gateway: &str) -> Result<
     };
     let checked = match &prev {
         None => {
-            let page: Entries = get_json(
-                http,
-                format!("{}/v1/log/entries?from=0&to={}", base(gateway), new.size),
-            )
-            .await?;
-            let leaves: Vec<LogHash> = page.entries.iter().map(Entry::leaf_hash).collect();
-            let indexes_ok = page
-                .entries
-                .iter()
-                .enumerate()
-                .all(|(i, e)| e.index == i as u64);
+            let entries = fetch_entries(http, gateway, 0, new.size).await?;
+            let leaves: Vec<LogHash> = entries.iter().map(Entry::leaf_hash).collect();
+            let indexes_ok = entries.iter().enumerate().all(|(i, e)| e.index == i as u64);
             if indexes_ok && leaves.len() as u64 == new.size && root(&leaves) == new.root {
                 Ok(())
             } else {
@@ -660,22 +677,16 @@ async fn log_prove(home: &Home, index: Option<u64>) -> Result<ExitCode> {
     let is_mine =
         |e: &Entry| e.kind == EntryKind::DeviceEnrolled && e.data["commitment"] == mine.as_str();
     let entry = match index {
-        Some(i) => {
-            let url = format!("{gateway}/v1/log/entries?from={i}&to={}", i + 1);
-            let page: Entries = get_json(&http, url).await?;
-            page.entries
-                .into_iter()
-                .find(|e| e.index == i)
-                .with_context(|| format!("the gateway did not serve entry #{i}"))?
-        }
-        None => {
-            let url = format!("{gateway}/v1/log/entries?from=0&to={}", cp.size);
-            let page: Entries = get_json(&http, url).await?;
-            page.entries
-                .into_iter()
-                .find(is_mine)
-                .context("no enrolment entry for this device in the log")?
-        }
+        Some(i) => fetch_entries(&http, gateway, i, i + 1)
+            .await?
+            .into_iter()
+            .find(|e| e.index == i)
+            .with_context(|| format!("the gateway did not serve entry #{i}"))?,
+        None => fetch_entries(&http, gateway, 0, cp.size)
+            .await?
+            .into_iter()
+            .find(is_mine)
+            .context("no enrolment entry for this device in the log")?,
     };
     let leaf = entry.leaf_hash();
     let url = format!(

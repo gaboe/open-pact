@@ -2,7 +2,7 @@ mod keys;
 mod translog;
 
 use std::fmt::Display;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::{
     Json, Router,
@@ -19,7 +19,7 @@ use open_pact_core::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use sqlx::{PgConnection, PgPool, postgres::PgPoolOptions};
+use sqlx::{PgPool, postgres::PgPoolOptions};
 
 use keys::Keys;
 
@@ -39,11 +39,21 @@ struct Log {
     signer: SigningKey,
     key: LogKey,
     witnesses: Vec<WitnessKey>,
+    cache: Mutex<LogCache>,
 }
 
-/// One consistent read of the whole log.
+/// Rows are append-only, so leaf hashes are read from the database once, and the checkpoint is
+/// signed once per tree size.
+#[derive(Default)]
+struct LogCache {
+    leaves: Vec<LogHash>,
+    signed: Option<(Checkpoint, Note)>,
+}
+
+/// The largest page `GET /v1/log/entries` serves.
+const MAX_ENTRIES: u64 = 256;
+
 struct Tree {
-    entries: Vec<Entry>,
     leaves: Vec<LogHash>,
 }
 
@@ -112,27 +122,55 @@ fn commitment(salt_hex: &str, device: &Pseudonym) -> Result<String, Reply> {
 }
 
 impl App {
-    async fn tree(&self, conn: &mut PgConnection) -> Result<Tree, Reply> {
-        let entries = translog::all(conn).await.map_err(internal)?;
-        let leaves = translog::leaf_hashes(&entries);
-        Ok(Tree { entries, leaves })
+    /// The committed log. Reads only rows the cache does not hold yet.
+    async fn tree(&self) -> Result<Tree, Reply> {
+        let known = self.log.cache.lock().expect("log cache").leaves.len();
+        let new = translog::since(&mut *self.conn().await?, known as u64)
+            .await
+            .map_err(internal)?;
+        let mut cache = self.log.cache.lock().expect("log cache");
+        let already = cache.leaves.len() - known;
+        if already < new.len() {
+            cache
+                .leaves
+                .extend(new[already..].iter().map(Entry::leaf_hash));
+        }
+        Ok(Tree {
+            leaves: cache.leaves.clone(),
+        })
     }
 
     /// The current checkpoint signed by the log key, with the witness cosignatures stored for it.
-    async fn checkpoint(&self, conn: &mut PgConnection) -> Result<Note, Reply> {
-        let tree = self.tree(conn).await?;
-        let checkpoint = Checkpoint {
-            origin: self.log.key.origin().to_string(),
-            size: tree.size(),
-            root: root(&tree.leaves),
+    async fn checkpoint(&self) -> Result<Note, Reply> {
+        let tree = self.tree().await?;
+        let cached = self
+            .log
+            .cache
+            .lock()
+            .expect("log cache")
+            .signed
+            .clone()
+            .filter(|(cp, _)| cp.size == tree.size());
+        let (checkpoint, mut note) = match cached {
+            Some(signed) => signed,
+            None => {
+                let checkpoint = Checkpoint {
+                    origin: self.log.key.origin().to_string(),
+                    size: tree.size(),
+                    root: root(&tree.leaves),
+                };
+                let note = self.log.key.sign(&self.log.signer, &checkpoint);
+                let signed = (checkpoint, note);
+                self.log.cache.lock().expect("log cache").signed = Some(signed.clone());
+                signed
+            }
         };
-        let mut note = self.log.key.sign(&self.log.signer, &checkpoint);
         let cosignatures: Vec<String> = sqlx::query_scalar(
             "SELECT signature FROM log_cosignatures WHERE size = $1 AND root = $2 ORDER BY witness",
         )
         .bind(i64::try_from(checkpoint.size).map_err(internal)?)
         .bind(checkpoint.root.to_string())
-        .fetch_all(conn)
+        .fetch_all(&self.db)
         .await
         .map_err(internal)?;
         for line in cosignatures {
@@ -176,7 +214,7 @@ async fn log_key(State(app): State<App>) -> impl IntoResponse {
 }
 
 async fn log_checkpoint(State(app): State<App>) -> Result<impl IntoResponse, Reply> {
-    let note = app.checkpoint(&mut *app.conn().await?).await?;
+    let note = app.checkpoint().await?;
     Ok((
         [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
         note.to_string(),
@@ -187,23 +225,31 @@ async fn log_entries(
     State(app): State<App>,
     Query(q): Query<RangeQuery>,
 ) -> Result<Json<Value>, Reply> {
-    let tree = app.tree(&mut *app.conn().await?).await?;
-    let (from, to) = (q.from.unwrap_or(0), q.to.unwrap_or(tree.size()));
-    if from > to || to > tree.size() {
-        return Err(bad_request(format!(
-            "need from <= to <= {}, got from={from} to={to}",
-            tree.size()
-        )));
-    }
-    let entries = &tree.entries[from as usize..to as usize];
+    let size = app.tree().await?.size();
+    let (from, to) = entries_range(q.from, q.to, size).map_err(bad_request)?;
+    let entries = translog::range(&mut *app.conn().await?, from, to)
+        .await
+        .map_err(internal)?;
     Ok(Json(json!({ "entries": entries })))
+}
+
+/// `to` defaults to one full page or the end of the log.
+fn entries_range(from: Option<u64>, to: Option<u64>, size: u64) -> Result<(u64, u64), String> {
+    let from = from.unwrap_or(0);
+    let to = to.unwrap_or_else(|| size.min(from.saturating_add(MAX_ENTRIES)));
+    if from > to || to > size || to - from > MAX_ENTRIES {
+        return Err(format!(
+            "need from <= to <= {size} and at most {MAX_ENTRIES} entries, got from={from} to={to}"
+        ));
+    }
+    Ok((from, to))
 }
 
 async fn inclusion(
     State(app): State<App>,
     Query(q): Query<InclusionQuery>,
 ) -> Result<Json<Value>, Reply> {
-    let tree = app.tree(&mut *app.conn().await?).await?;
+    let tree = app.tree().await?;
     let size = q.size.unwrap_or(tree.size());
     if size > tree.size() {
         return Err(bad_request(format!("the log has {} entries", tree.size())));
@@ -218,7 +264,7 @@ async fn consistency(
     State(app): State<App>,
     Query(q): Query<RangeQuery>,
 ) -> Result<Json<Value>, Reply> {
-    let tree = app.tree(&mut *app.conn().await?).await?;
+    let tree = app.tree().await?;
     let (Some(from), to) = (q.from, q.to.unwrap_or(tree.size())) else {
         return Err(bad_request("from is required"));
     };
@@ -240,8 +286,8 @@ async fn witness(State(app): State<App>, body: String) -> Result<Json<Value>, Re
         .key
         .verify(&note)
         .map_err(|e| reject(StatusCode::FORBIDDEN, e.to_string()))?;
+    let tree = app.tree().await?;
     let mut conn = app.conn().await?;
-    let tree = app.tree(&mut conn).await?;
     if checkpoint.size == 0
         || checkpoint.size > tree.size()
         || root(tree.prefix(checkpoint.size)) != checkpoint.root
@@ -376,8 +422,8 @@ async fn enroll(
             (salt, u64::try_from(index).map_err(internal)?)
         }
     };
-    let checkpoint = app.checkpoint(&mut tx).await?;
     tx.commit().await.map_err(internal)?;
+    let checkpoint = app.checkpoint().await?;
     Ok(Json(json!({
         "status": "enrolled",
         "device": device,
@@ -459,7 +505,7 @@ async fn claim(
     if !reasons.is_empty() {
         return Err(denied(reasons));
     }
-    let checkpoint = app.checkpoint(&mut *app.conn().await?).await?;
+    let checkpoint = app.checkpoint().await?;
     Ok(Json(json!({
         "status": "accepted",
         "warnings": warnings,
@@ -482,7 +528,7 @@ async fn index(State(app): State<App>) -> Result<Html<String>, Reply> {
     .fetch_one(&app.db)
     .await
     .map_err(internal)?;
-    let tree = app.tree(&mut *app.conn().await?).await?;
+    let tree = app.tree().await?;
     Ok(Html(format!(
         include_str!("index.html"),
         devices = devices,
@@ -573,6 +619,7 @@ async fn main() -> anyhow::Result<()> {
         key: LogKey::new(&log_origin()?, &PublicKey::from(&keys.log)),
         signer: keys.log.clone(),
         witnesses: witness_keys()?,
+        cache: Mutex::default(),
     };
     eprintln!("log key {}", log.key.vkey());
     for w in &log.witnesses {
@@ -617,5 +664,21 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = term.recv() => eprintln!("SIGTERM: finishing open requests"),
         _ = tokio::signal::ctrl_c() => eprintln!("SIGINT: finishing open requests"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn entries_are_served_in_pages_of_at_most_256() {
+        assert_eq!(entries_range(None, None, 1000), Ok((0, 256)));
+        assert_eq!(entries_range(Some(900), None, 1000), Ok((900, 1000)));
+        assert_eq!(entries_range(Some(10), Some(266), 1000), Ok((10, 266)));
+        assert!(entries_range(Some(10), Some(267), 1000).is_err());
+        assert!(entries_range(Some(5), Some(4), 1000).is_err());
+        assert!(entries_range(Some(0), Some(1001), 1000).is_err());
+        assert_eq!(entries_range(None, None, 0), Ok((0, 0)));
     }
 }
