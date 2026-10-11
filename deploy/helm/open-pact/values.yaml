@@ -5,6 +5,15 @@ image:
 
 imagePullSecrets: []
 
+gateway:
+  # Required. An existing Secret holding the key-encryption key: 32 random bytes, base64.
+  # It encrypts the gateway keys and claims in PostgreSQL. Keep a copy outside the cluster:
+  # without it the database cannot be read.
+  #   kubectl create secret generic pact-gateway-kek --from-literal=kek="$(openssl rand -base64 32)"
+  kekSecret:
+    name: ""
+    key: kek
+
 ingress:
   enabled: true
   host: pact.example.com
@@ -20,7 +29,8 @@ postgres:
   image: postgres:17
   database: pact
   user: pact
-  password: change-me
+  # Required unless existingSecret names a Secret with the password under existingSecretKey.
+  password: ""
   existingSecret: ""
   existingSecretKey: password
   storageClass: ""

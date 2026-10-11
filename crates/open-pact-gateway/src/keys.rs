@@ -8,6 +8,8 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use time::{Duration, OffsetDateTime};
 
+use crate::kek::Kek;
+
 pub struct Keys {
     pub manifest: SigningKey,
     pub log: SigningKey,
@@ -22,8 +24,12 @@ pub struct Ca {
 
 const CLOCK_SKEW: Duration = Duration::minutes(5);
 
+/// A row of `gateway_secrets`, sealed under the KEK. A row still in plaintext from before the
+/// KEK is sealed in place; the `WHERE value = old` makes a second process doing the same a no-op.
+/// A row that does not open is an error, never a reason to generate a new key.
 async fn secret(
     db: &PgPool,
+    kek: &Kek,
     name: &str,
     make: impl FnOnce() -> anyhow::Result<String>,
 ) -> anyhow::Result<String> {
@@ -31,29 +37,48 @@ async fn secret(
         sqlx::query_scalar::<_, String>("SELECT value FROM gateway_secrets WHERE name = $1")
             .bind(name)
     };
-    if let Some(value) = select().fetch_optional(db).await? {
-        return Ok(value);
+    let stored = match select().fetch_optional(db).await? {
+        Some(stored) => stored,
+        None => {
+            sqlx::query(
+                "INSERT INTO gateway_secrets (name, value) VALUES ($1, $2) ON CONFLICT (name) DO NOTHING",
+            )
+            .bind(name)
+            .bind(kek.seal(name, make()?.as_bytes()))
+            .execute(db)
+            .await?;
+            eprintln!("generated {name}");
+            select().fetch_one(db).await?
+        }
+    };
+    if Kek::is_sealed(&stored) {
+        let plain = kek
+            .open(name, &stored)
+            .context("is GATEWAY_KEK the key this database was sealed with?")?;
+        return String::from_utf8(plain).with_context(|| format!("{name} is not UTF-8"));
     }
-    sqlx::query(
-        "INSERT INTO gateway_secrets (name, value) VALUES ($1, $2) ON CONFLICT (name) DO NOTHING",
-    )
-    .bind(name)
-    .bind(make()?)
-    .execute(db)
-    .await?;
-    eprintln!("generated {name}");
-    Ok(select().fetch_one(db).await?)
+    sqlx::query("UPDATE gateway_secrets SET value = $1 WHERE name = $2 AND value = $3")
+        .bind(kek.seal(name, stored.as_bytes()))
+        .bind(name)
+        .bind(&stored)
+        .execute(db)
+        .await?;
+    eprintln!("encrypted plaintext {name} in place with the KEK");
+    Ok(stored)
 }
 
 impl Keys {
-    pub async fn load_or_create(db: &PgPool) -> anyhow::Result<Keys> {
+    pub async fn load_or_create(db: &PgPool, kek: &Kek) -> anyhow::Result<Keys> {
         let new_key = || Ok(dev_key::to_pem(&dev_key::generate()));
-        let manifest = dev_key::from_pem(&secret(db, "manifest_signing_key", new_key).await?)
+        let manifest = dev_key::from_pem(&secret(db, kek, "manifest_signing_key", new_key).await?)
             .context("manifest_signing_key")?;
-        let log = dev_key::from_pem(&secret(db, "log_signing_key", new_key).await?)
+        let log = dev_key::from_pem(&secret(db, kek, "log_signing_key", new_key).await?)
             .context("log_signing_key")?;
-        let ca_key = secret(db, "ca_key", || Ok(KeyPair::generate()?.serialize_pem())).await?;
-        let ca_cert = secret(db, "ca_cert", || {
+        let ca_key = secret(db, kek, "ca_key", || {
+            Ok(KeyPair::generate()?.serialize_pem())
+        })
+        .await?;
+        let ca_cert = secret(db, kek, "ca_cert", || {
             Ok(Ca::self_signed_pem(&KeyPair::from_pem(&ca_key)?)?)
         })
         .await?;
@@ -149,6 +174,53 @@ mod tests {
             .unwrap()
             .1
             .contents
+    }
+
+    async fn stored(db: &PgPool) -> Vec<(String, String)> {
+        sqlx::query_as("SELECT name, value FROM gateway_secrets ORDER BY name")
+            .fetch_all(db)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    #[ignore = "needs TEST_DATABASE_URL"]
+    async fn seals_new_and_plaintext_secrets_and_refuses_a_wrong_kek() {
+        let db = crate::testdb::fresh().await;
+        let kek = Kek::new(&[1; 32]);
+        let first = Keys::load_or_create(&db, &kek).await.unwrap();
+        let rows = stored(&db).await;
+        assert_eq!(rows.len(), 4);
+        assert!(
+            rows.iter()
+                .all(|(_, v)| Kek::is_sealed(v) && !v.contains("BEGIN"))
+        );
+
+        for (name, value) in &rows {
+            let plain = String::from_utf8(kek.open(name, value).unwrap()).unwrap();
+            sqlx::query("UPDATE gateway_secrets SET value = $1 WHERE name = $2")
+                .bind(plain)
+                .bind(name)
+                .execute(&db)
+                .await
+                .unwrap();
+        }
+        let upgraded = Keys::load_or_create(&db, &kek).await.unwrap();
+        assert_eq!(upgraded.ca.fingerprint, first.ca.fingerprint);
+        assert_eq!(
+            dev_key::to_pem(&upgraded.manifest),
+            dev_key::to_pem(&first.manifest)
+        );
+        assert_eq!(dev_key::to_pem(&upgraded.log), dev_key::to_pem(&first.log));
+        let resealed = stored(&db).await;
+        assert!(resealed.iter().all(|(_, v)| Kek::is_sealed(v)));
+
+        let wrong = Keys::load_or_create(&db, &Kek::new(&[2; 32])).await;
+        assert!(
+            wrong.is_err(),
+            "a wrong KEK must not load or replace the keys"
+        );
+        assert_eq!(stored(&db).await, resealed);
     }
 
     #[test]

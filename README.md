@@ -140,9 +140,29 @@ The gateway reads each log row from the database once and signs the checkpoint o
 
 On first start the gateway generates its company manifest-signing key, its log-signing key and a P-256 CA ("open-pact demo CA"), and stores them in the `gateway_secrets` table. This is for the demo only. In production these keys stay in an HSM or a cloud key vault and never reach the database.
 
+Each row of `gateway_secrets` is encrypted with AES-256-GCM under the key-encryption key in `GATEWAY_KEK`, with the row name as associated data. `GATEWAY_KEK` is 32 random bytes in base64. The gateway refuses to start without it. Only `DEV_INSECURE_KEK=1`, which `compose.yaml` sets, replaces it with a public development key. A gateway upgraded from a version without the KEK encrypts the plaintext rows in place on its first start and logs each one. A wrong key stops the gateway; it never generates new keys over rows it cannot read. Keep a copy of the key outside the database and its backups: without it, the keys and claims cannot be read. Rotating the KEK is not supported yet.
+
+In Kubernetes, create the Secret once and name it in the chart values:
+
+```sh
+kubectl create secret generic pact-gateway-kek --from-literal=kek="$(openssl rand -base64 32)"
+helm upgrade --install pact deploy/helm/open-pact \
+  --set gateway.kekSecret.name=pact-gateway-kek \
+  --set postgres.existingSecret=pact-postgres   # or --set postgres.password=...
+```
+
+The chart fails to render without `gateway.kekSecret.name`, and, for the bundled PostgreSQL, without `postgres.password` or `postgres.existingSecret`.
+
 ## Tests
 
 `scripts/smoke.sh` runs the full flow against a running gateway: an invitation with a wrong company key fingerprint (refused, nothing pinned), a remote `http://` gateway (refused), `join --yes --software-key` with the right invitation (it signs crafted claims with `device-dev.pem`), `check` denied while pending, a repeated `join`, reuse of the invitation by another device, three devices racing for one invitation, `devices approve` and `devices list`, `check`, `openssl verify` of the certificate, a replay of the client's own claim, a claim from an unenrolled device, chosen-result claims (failed check, a grace period that starts, ends after a day with the stored start moved back, and clears on a pass, undisclosed result, wrong manifest, tampered signature), `log show`, `log prove`, a witness cosignature, and the log alarm for a different root (split view), for a rollback, and the upgrade message for a v0.1.0 log head, a changed company key, and `devices revoke`. On a device that fails a 0-day-grace check, such as disk encryption off, `check` is denied and the smoke script stops there.
+
+`scripts/check-helm.sh` checks that the chart refuses to render without `gateway.kekSecret.name` and without a database password or secret. The gateway tests that need PostgreSQL are `#[ignore]`d in a plain `cargo test`. Run them against a throwaway database:
+
+```sh
+docker run -d --rm --name pact-testdb -e POSTGRES_PASSWORD=test -p 55432:5432 postgres:17
+TEST_DATABASE_URL=postgres://postgres:test@localhost:55432/postgres cargo test --workspace -- --include-ignored
+```
 
 ## Known gaps
 

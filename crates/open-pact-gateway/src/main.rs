@@ -1,6 +1,7 @@
 mod devices;
 mod grace;
 mod invitations;
+mod kek;
 mod keys;
 mod nonces;
 mod ratelimit;
@@ -31,6 +32,7 @@ use serde_json::{Value, json};
 use sqlx::{PgPool, postgres::PgPoolOptions};
 
 use devices::{Action, State as DeviceState, commitment};
+use kek::Kek;
 use keys::Keys;
 use ratelimit::Limiter;
 
@@ -813,7 +815,7 @@ async fn invite(db: &PgPool, url: &str, ttl: &str, note: &str) -> anyhow::Result
     if !matches!(parsed.scheme_str(), Some("https" | "http")) || parsed.host().is_none() {
         anyhow::bail!("--url must be an http(s) URL, got {url:?}");
     }
-    let keys = Keys::load_or_create(db).await?;
+    let keys = Keys::load_or_create(db, &Kek::from_env()?).await?;
     let (code, expires) = invitations::create(db, ttl, note).await?;
     let invitation = Invitation::new(
         url,
@@ -878,7 +880,8 @@ async fn serve(db: PgPool) -> anyhow::Result<()> {
         100_000,
     );
     let max_nonces = env_number("NONCE_MAX_OUTSTANDING", 10_000)?;
-    let keys = Keys::load_or_create(&db).await?;
+    let kek = Kek::from_env()?;
+    let keys = Keys::load_or_create(&db, &kek).await?;
     let log = Log {
         key: log_key(&keys)?,
         signer: keys.log.clone(),

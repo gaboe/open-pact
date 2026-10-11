@@ -6,7 +6,7 @@ metadata:
   name: {{ .Release.Name }}-postgres
 type: Opaque
 stringData:
-  {{ .Values.postgres.existingSecretKey }}: {{ .Values.postgres.password | quote }}
+  {{ .Values.postgres.existingSecretKey }}: {{ required "postgres.password or postgres.existingSecret is required" .Values.postgres.password | quote }}
 ---
 {{- end }}
 apiVersion: v1

@@ -24,6 +24,11 @@ spec:
             - name: http
               containerPort: 8080
           env:
+            - name: GATEWAY_KEK
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "gateway.kekSecret.name: create a Secret with a 32-byte base64 key-encryption key and name it here" .Values.gateway.kekSecret.name }}
+                  key: {{ .Values.gateway.kekSecret.key }}
             - name: LISTEN_ADDR
               value: 0.0.0.0:8080
             - name: LOG_ORIGIN

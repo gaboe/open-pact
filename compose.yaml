@@ -1,6 +1,7 @@
 services:
   db:
     image: postgres:17
+    # INSECURE development values. Never reuse them outside a local demo.
     environment:
       POSTGRES_USER: pact
       POSTGRES_PASSWORD: pact
@@ -15,6 +16,8 @@ services:
     environment:
       DATABASE_URL: postgres://pact:pact@db:5432/pact
       LISTEN_ADDR: 0.0.0.0:8080
+      # INSECURE: encrypts keys and claims with a public development key. Production sets GATEWAY_KEK.
+      DEV_INSECURE_KEK: "1"
       LOG_ORIGIN: pact.example.com/log
       # Written into invitations; the clients run on the host.
       PUBLIC_URL: http://localhost:${GATEWAY_PORT:-8080}
