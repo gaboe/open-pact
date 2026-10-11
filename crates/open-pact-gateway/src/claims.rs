@@ -1,7 +1,9 @@
 //! Claims at rest (PAPER 4.4, 4.8). Each claim gets a deletion deadline from the `claim_retention`
 //! it was accepted under and, with its device pseudonym and JWS, is sealed under the key of its
 //! deadline's calendar month (UTC). Period keys are sealed under the KEK. Retention deletes claims
-//! past their deadline, then the keys of ended months that no claim uses.
+//! past their deadline, then the keys of ended months that no claim uses. A database backup made
+//! before a key was deleted still holds it, so the claims stay readable from that backup with the
+//! KEK until the backup expires (R2-M2).
 
 use anyhow::Context;
 use chrono::{DateTime, Datelike, NaiveDate, Utc};

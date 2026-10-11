@@ -1036,6 +1036,11 @@ async fn serve(db: PgPool) -> anyhow::Result<()> {
     if sealed > 0 {
         eprintln!("sealed {sealed} plaintext claims from an earlier version");
     }
+    eprintln!(
+        "claim_retention {retention}: database backups hold sealed month keys, so a backup made \
+         before a purge still decrypts its claims with the KEK until the backup expires; keep \
+         database backups only as long as device owners were told"
+    );
     let dated = claims::set_missing_deadlines(&db, retention).await?;
     if dated > 0 {
         eprintln!(

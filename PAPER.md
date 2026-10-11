@@ -179,13 +179,13 @@ The company does not need to know what happens on the laptop at 22:00 on a Satur
 
 **What the company stores.** The gateway decides automatically; no person reviews claims day to day. The company stores the signed claims themselves. They are readable, but contain only the enumerated values and the listed metadata. Each claim is signed by the device key, so it verifies on its own. The company can show a regulator "device X signed `disk_encryption = full` on 3 November at 08:12" even if the owner's laptop has since died. The company cannot forge a claim, because it does not hold the device key. Privacy here rests on minimisation, not on encryption: nothing but enumerated values is ever sent.
 
-On disk, claims are encrypted with a key per period (for example per month). Deleting a period deletes its key, which makes the claims unreadable in every backup too (section 4.8).
+On disk, claims are encrypted with a key per period (for example per month). The period keys are encrypted under the gateway's key-encryption key (KEK) and stored in the same database. Deleting a period deletes its key. A logical dump made after that holds no key for the period. A backup made before it, a physical copy taken before the database reclaims the deleted row, and an archived write-ahead log still hold the encrypted key, so the company's backup retention decides when the claims are gone from backups too (section 4.8).
 
 We considered sealed copies, 2-of-3 key sharing with a third party, and time-lock encryption (drand). None of them can give the company access without the owner while also preventing an attacker holding the company's data from reading it, and time-locks need an external clock. For a handful of enumerated values the added complexity is not worth it.
 
 **Admin access.** The gateway has no claim browser. An admin sees a summary (how many devices comply) and approves new devices. Details for one device are shown only during an audit or incident, and each view is recorded in the transparency log. Limit: someone with root on the gateway server can bypass the interface. That is covered by the company's own access controls.
 
-**Deployment.** One Rust binary in a container with PostgreSQL (the company's existing instance or one alongside), HTTPS, on the company's infrastructure. Claims are encrypted by the gateway per period before they reach the database, so crypto-shredding does not depend on database internals or backups. The company manages its own keys (manifest signing key and gateway CA). open-pact documents the risks and recommends hardware key storage, but does not dictate how.
+**Deployment.** One Rust binary in a container with PostgreSQL (the company's existing instance or one alongside), HTTPS, on the company's infrastructure. Claims are encrypted by the gateway per period before they reach the database, so a database copy is unreadable without the KEK, which the company keeps outside the database and its backups. The company manages its own keys (manifest signing key and gateway CA). open-pact documents the risks and recommends hardware key storage, but does not dictate how.
 
 ### 4.5 Transparency log
 
@@ -224,9 +224,9 @@ The owner can stop the client (`open-pact-client stop`) or uninstall it at any t
 
 - **Automatic** when `claim_retention` ends.
 - **On request.** Owner and company both sign a deletion request with a scope (device, period). The gateway deletes the data and issues a signed deletion confirmation. The event (hashes of request and confirmation, not the data) goes into the transparency log.
-- **Backups.** Claims are encrypted per period on disk. Deleting the period key makes them unreadable in backups too.
+- **Backups.** Claims are encrypted per period on disk. The period keys are encrypted under the KEK and stored next to the claims, so a database backup holds both. When a claim's period key is deleted, backups made later cannot decrypt the claim. Backups made earlier can, for anyone who also holds the KEK, until they expire. A claim is therefore gone from every backup when its period key is deleted (at the latest when the month of its deadline ends) plus the longest time the company keeps database backups. The company states that backup retention to the owner; open-pact cannot enforce it.
 - **Exception.** Deletion is postponed while an audit, an incident or a legal retention duty is running. The owner gets the reason and the expected date in writing.
-- **Limit.** Cryptography cannot prove that the other side deleted everything. There is a signed confirmation and crypto-shredding.
+- **Limit.** Cryptography cannot prove that the other side deleted everything. There is a signed confirmation and deletion of period keys, which reaches earlier backups only when they expire.
 
 ### 4.9 Guarantees for the device owner
 
@@ -236,7 +236,7 @@ The owner can stop the client (`open-pact-client stop`) or uninstall it at any t
 | The company does not watch continuously | No telemetry. The gateway decides automatically and stores only signed enumerated values |
 | Admins do not look at individuals without cause | No claim browser, summary only. Single-device views during audit or incident, each recorded in the transparency log. Limit: root on the gateway server |
 | The company can prove compliance without me | Claims are signed by the device key and verify on their own |
-| Agreed deletion | Both signatures, signed confirmation, crypto-shredding of backups. Deletion at the other side cannot be proven cryptographically |
+| Agreed deletion | Both signatures, signed confirmation, deletion of period keys. Backups made earlier stay readable with the KEK until the company's stated backup retention ends. Deletion at the other side cannot be proven cryptographically |
 | I can stop it at any time | No service, no port, `open-pact-client stop`. The only consequence is loss of access |
 | Scope does not change without my knowledge | The client runs only a signed manifest, shows and logs every narrowing, and never updates itself |
 | Scope does not grow without my consent | Any expansion or tightening needs a new owner signature, with no emergency exception |
