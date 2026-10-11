@@ -223,7 +223,14 @@ fn virtualized() -> Virtualized {
 }
 
 fn collect_results(manifest: &Manifest, os: Os) -> BTreeMap<String, String> {
-    disclosable(manifest, os, checks::run_all(os))
+    let required: Vec<&str> = manifest
+        .body()
+        .controls
+        .iter()
+        .filter(|c| c.required.contains_key(&os))
+        .map(|c| c.id.as_str())
+        .collect();
+    disclosable(manifest, os, checks::run(os, &required))
 }
 
 fn disclosable(
@@ -701,6 +708,9 @@ async fn join(
             mismatch.replace(" changed: pinned ", " differs: the invitation names ")
         );
     }
+    checks::check_supported(&manifest).map_err(|e| {
+        anyhow::anyhow!("{e}; refusing to show or sign this manifest. Nothing was sent")
+    })?;
     wanted.save(home)?;
     println!("Gateway keys match the invitation:");
     print!("{}", invitation.describe());
@@ -852,6 +862,8 @@ async fn check(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
     if manifest.hash() != &enrolment.manifest {
         bail!("manifest.toml no longer matches the hash you signed");
     }
+    checks::check_supported(&manifest)
+        .map_err(|e| anyhow::anyhow!("{e}; nothing was run or sent"))?;
     let device = DeviceKey::load(&home.0)?;
     let os = current_os()?;
 
@@ -1273,5 +1285,60 @@ mod tests {
         assert!(!home.file(COMPANY_KEY).exists(), "nothing pinned");
         let error = format!("{:#}", joined.expect_err("join must fail"));
         assert!(error.contains("company key differs"), "{error}");
+    }
+
+    async fn join_with_manifest(toml: String) -> (FakeGateway, anyhow::Result<ExitCode>) {
+        let company = Company::new();
+        let published = Company::published(&toml, &company.key);
+        let (log, checkpoint) = (company.log.vkey(), company.empty_checkpoint());
+        let gateway = FakeGateway::start(move |line, _| match line {
+            "GET /v1/manifest" => (200, published.clone()),
+            "GET /v1/log/key" => (200, format!("{log}\n")),
+            "GET /v1/log/checkpoint" => (200, checkpoint.clone()),
+            _ => not_found(),
+        })
+        .await;
+        let invitation = Invitation::new(
+            &gateway.url,
+            &PublicKey::from(&company.key),
+            &company.log,
+            open_pact_core::InvitationCode::from_bytes([7; 32]),
+        )
+        .encode();
+        let dir = tempfile::tempdir().unwrap();
+        let joined = join(
+            &Home(dir.path().to_path_buf()),
+            &invitation,
+            true,
+            true,
+            false,
+        )
+        .await;
+        (gateway, joined)
+    }
+
+    #[tokio::test]
+    async fn join_refuses_a_builtin_this_client_does_not_implement() {
+        for (from, to) in [
+            (
+                r#"check = "builtin:disk_encryption@1""#,
+                r#"check = "builtin:nonexistent@999""#,
+            ),
+            (
+                r#"check = "builtin:disk_encryption@1""#,
+                r#"check = "builtin:disk_encryption@2""#,
+            ),
+            (r#"id = "firewall""#, r#"id = "installed_apps""#),
+        ] {
+            assert!(DEMO_MANIFEST.contains(from));
+            let (gateway, joined) = join_with_manifest(DEMO_MANIFEST.replace(from, to)).await;
+            assert_eq!(
+                gateway.posts(),
+                Vec::<String>::new(),
+                "{to}: nothing signed or sent"
+            );
+            let error = format!("{:#}", joined.expect_err(to));
+            assert!(error.contains("does not implement"), "{error}");
+        }
     }
 }
