@@ -92,7 +92,6 @@ impl Entry {
     }
 }
 
-/// The gateway signs `"{index}:{hash}"` so contractors can compare heads and prove a split view.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Head {
@@ -128,7 +127,6 @@ fn broken(msg: String) -> Error {
     Error::Log(msg)
 }
 
-/// `prev` is the head the client already verified; `None` means a full download from index 0 that pins the log key.
 pub fn verify_chain(prev: Option<&Head>, entries: &[Entry], head: &Head) -> Result<Head, Error> {
     if let Some(p) = prev
         && head.key != p.key

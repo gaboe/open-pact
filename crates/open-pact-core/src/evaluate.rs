@@ -1,4 +1,4 @@
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, TimeDelta, Utc};
 
 use crate::{Accepted, Claim, Manifest, ManifestHash, Os, Span, TrustLevel};
 
@@ -15,6 +15,10 @@ pub enum Reason {
         claimed: ManifestHash,
         enforced: ManifestHash,
     },
+    #[error("claim time {time} is older than claim_max_age {max_age}")]
+    Stale { time: DateTime<Utc>, max_age: Span },
+    #[error("claim time {0} is more than 5 minutes in the future")]
+    FromFuture(DateTime<Utc>),
     #[error("manifest is valid from {0}")]
     NotYetValid(NaiveDate),
     #[error("trust_level = {claimed:?}, {min:?} required")]
@@ -72,6 +76,19 @@ pub fn evaluate(manifest: &Manifest, claim: &Claim, now: DateTime<Utc>) -> Decis
         deny.push(Reason::WrongManifest {
             claimed: claim.manifest.clone(),
             enforced: manifest.hash().clone(),
+        });
+    }
+    if claim.time > now + TimeDelta::minutes(5) {
+        deny.push(Reason::FromFuture(claim.time));
+    }
+    if body
+        .claim_max_age
+        .min_duration()
+        .is_some_and(|max_age| now - claim.time > max_age)
+    {
+        deny.push(Reason::Stale {
+            time: claim.time,
+            max_age: body.claim_max_age.clone(),
         });
     }
     if now.date_naive() < body.valid_from {
@@ -299,8 +316,10 @@ mod tests {
     #[test]
     fn denies_before_valid_from() {
         let early = "2026-09-30T23:59:59Z".parse().unwrap();
+        let mut c = claim(&PASSING);
+        c.time = early;
         assert_eq!(
-            reasons(evaluate(&manifest(), &claim(&PASSING), early)),
+            reasons(evaluate(&manifest(), &c, early)),
             ["manifest is valid from 2026-10-01"]
         );
     }
@@ -314,6 +333,36 @@ mod tests {
         assert_eq!(
             reasons(evaluate(&m, &c, now())),
             ["trust_level = L0, L1 required"]
+        );
+    }
+
+    #[test]
+    fn denies_claim_older_than_claim_max_age() {
+        let mut c = claim(&PASSING);
+        c.time = now() - TimeDelta::hours(24);
+        assert_eq!(
+            evaluate(&manifest(), &c, now()),
+            Decision::Allow { warnings: vec![] }
+        );
+        c.time = now() - TimeDelta::hours(24) - TimeDelta::seconds(1);
+        assert_eq!(
+            reasons(evaluate(&manifest(), &c, now())),
+            ["claim time 2026-10-11 08:59:59 UTC is older than claim_max_age 24h"]
+        );
+    }
+
+    #[test]
+    fn denies_claim_from_the_future() {
+        let mut c = claim(&PASSING);
+        c.time = now() + TimeDelta::minutes(5);
+        assert_eq!(
+            evaluate(&manifest(), &c, now()),
+            Decision::Allow { warnings: vec![] }
+        );
+        c.time = now() + TimeDelta::minutes(6);
+        assert_eq!(
+            reasons(evaluate(&manifest(), &c, now())),
+            ["claim time 2026-10-12 09:06:00 UTC is more than 5 minutes in the future"]
         );
     }
 }

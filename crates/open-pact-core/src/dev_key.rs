@@ -18,10 +18,18 @@ pub fn generate() -> SigningKey {
     SigningKey::generate()
 }
 
+pub fn to_pem(key: &SigningKey) -> String {
+    key.to_pkcs8_pem(LineEnding::LF)
+        .expect("P-256 keys always encode")
+        .to_string()
+}
+
+pub fn from_pem(pem: &str) -> Result<SigningKey, p256::pkcs8::Error> {
+    SigningKey::from_pkcs8_pem(pem)
+}
+
 pub fn save(path: &Path, key: &SigningKey) -> Result<(), Error> {
-    let pem = key
-        .to_pkcs8_pem(LineEnding::LF)
-        .map_err(|e| key_error(path, e))?;
+    let pem = to_pem(key);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| key_error(path, e))?;
     }
@@ -35,7 +43,7 @@ pub fn save(path: &Path, key: &SigningKey) -> Result<(), Error> {
 
 pub fn load(path: &Path) -> Result<SigningKey, Error> {
     let pem = std::fs::read_to_string(path).map_err(|e| key_error(path, e))?;
-    SigningKey::from_pkcs8_pem(&pem).map_err(|e| key_error(path, e))
+    from_pem(&pem).map_err(|e| key_error(path, e))
 }
 
 pub fn load_or_create(path: &Path) -> Result<SigningKey, Error> {

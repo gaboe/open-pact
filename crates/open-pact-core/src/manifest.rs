@@ -81,6 +81,10 @@ impl Span {
         }
     }
 
+    pub fn min_duration(&self) -> Option<chrono::TimeDelta> {
+        chrono::TimeDelta::try_seconds(i64::try_from(self.min_secs()).ok()?)
+    }
+
     pub fn is_zero(&self) -> bool {
         self.amount == 0
     }
