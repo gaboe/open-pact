@@ -44,6 +44,7 @@ pub enum EntryKind {
     DeviceEnrolled,
     DeviceApproved,
     DeviceRevoked,
+    RetentionPurge,
 }
 
 impl EntryKind {
@@ -53,6 +54,7 @@ impl EntryKind {
             EntryKind::DeviceEnrolled => "device_enrolled",
             EntryKind::DeviceApproved => "device_approved",
             EntryKind::DeviceRevoked => "device_revoked",
+            EntryKind::RetentionPurge => "retention_purge",
         }
     }
 }

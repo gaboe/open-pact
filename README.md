@@ -120,6 +120,7 @@ The log is a Merkle tree with RFC 9162 (Certificate Transparency 2.0) hashing. A
 - `manifest_published` `{manifest}` is appended once per new manifest hash at gateway start.
 - `device_enrolled` `{commitment}` holds `sha256(salt || pseudonym)`, not the pseudonym. The owner keeps the 256-bit salt and can prove the entry is theirs.
 - `device_approved` and `device_revoked` `{commitment}` carry the same commitment when IT approves or revokes the device.
+- `retention_purge` `{claims, period_keys}` counts the claims and month keys that the retention job deleted. It holds no device data. A client older than this entry kind cannot read a log that contains one.
 
 **Checkpoints.** The gateway signs a checkpoint, the C2SP [tlog-checkpoint](https://c2sp.org/tlog-checkpoint) body `<origin>\n<size>\n<base64 root>\n`, in C2SP [signed-note](https://c2sp.org/signed-note) format. The key name is the origin, set by `LOG_ORIGIN` (default `pact.example.com/log`). The log key is ECDSA P-256, signed-note type `0x02` as transparency-dev/formats implements it: a DER signature over SHA-256, and a key ID from the DER public key. Most C2SP tools use Ed25519. P-256 keeps the log key in the same hardware as the other keys.
 
@@ -141,6 +142,8 @@ The gateway reads each log row from the database once and signs the checkpoint o
 On first start the gateway generates its company manifest-signing key, its log-signing key and a P-256 CA ("open-pact demo CA"), and stores them in the `gateway_secrets` table. This is for the demo only. In production these keys stay in an HSM or a cloud key vault and never reach the database.
 
 Each row of `gateway_secrets` is encrypted with AES-256-GCM under the key-encryption key in `GATEWAY_KEK`, with the row name as associated data. `GATEWAY_KEK` is 32 random bytes in base64. The gateway refuses to start without it. Only `DEV_INSECURE_KEK=1`, which `compose.yaml` sets, replaces it with a public development key. A gateway upgraded from a version without the KEK encrypts the plaintext rows in place on its first start and logs each one. A wrong key stops the gateway; it never generates new keys over rows it cannot read. Keep a copy of the key outside the database and its backups: without it, the keys and claims cannot be read. Rotating the KEK is not supported yet.
+
+**Claims at rest.** The gateway seals each stored claim, with its device pseudonym and JWS, under the key of its calendar month (UTC). Each month key is sealed under the KEK in `claim_keys`. Only `received_at` and the allow or deny flag stay readable, for the summary page. Every hour the gateway deletes claims older than the manifest's `claim_retention` (calendar months for `mo`). It then deletes the key of every month that ended before that cutoff, so copies of those claims in backups can no longer be decrypted. Each purge that deletes something appends a `retention_purge` log entry with the counts. On the first start after the upgrade, the gateway seals claims that earlier versions stored in plaintext. Their old plaintext can remain in PostgreSQL dead tuples, the WAL and earlier backups until those are vacuumed or expire.
 
 In Kubernetes, create the Secret once and name it in the chart values:
 

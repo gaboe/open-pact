@@ -1,10 +1,11 @@
+mod claims;
 mod devices;
 mod grace;
 mod invitations;
-mod kek;
 mod keys;
 mod nonces;
 mod ratelimit;
+mod seal;
 #[cfg(test)]
 mod testdb;
 mod translog;
@@ -24,7 +25,7 @@ use axum::{
 use clap::{Parser, Subcommand};
 use open_pact_core::{
     Checkpoint, Decision, Endorsement, EnrolRequest, Entry, EntryKind, Evaluation, FirstFailures,
-    Invitation, LogHash, LogKey, Manifest, Note, Pseudonym, PublicKey, Reason, SigningKey,
+    Invitation, LogHash, LogKey, Manifest, Note, Pseudonym, PublicKey, Reason, SigningKey, Span,
     WitnessKey, consistency_proof, evaluate, inclusion_proof, root, verify_claim,
 };
 use serde::Deserialize;
@@ -32,9 +33,9 @@ use serde_json::{Value, json};
 use sqlx::{PgPool, postgres::PgPoolOptions};
 
 use devices::{Action, State as DeviceState, commitment};
-use kek::Kek;
 use keys::Keys;
 use ratelimit::Limiter;
+use seal::SealingKey;
 
 #[derive(Parser)]
 #[command(
@@ -93,6 +94,7 @@ struct App {
     limiter: Arc<Limiter>,
     nonce_limiter: Arc<Limiter>,
     max_nonces: i64,
+    kek: Arc<SealingKey>,
 }
 
 struct Log {
@@ -440,6 +442,22 @@ async fn nonce(
     }
 }
 
+/// Hourly, so a purge entry in the log is at most an hour late and the log does not grow per tick.
+async fn enforce_retention(db: PgPool, retention: Span) {
+    let mut tick = tokio::time::interval(Duration::from_secs(3600));
+    loop {
+        tick.tick().await;
+        match claims::purge(&db, &retention, chrono::Utc::now()).await {
+            Ok(purged) if purged.claims > 0 || purged.period_keys > 0 => eprintln!(
+                "retention_purge: {} claims, {} period keys",
+                purged.claims, purged.period_keys
+            ),
+            Ok(_) => {}
+            Err(e) => eprintln!("retention purge: {e:#}"),
+        }
+    }
+}
+
 /// Expired nonces are refused anyway; deleting them keeps the table and the cap count small.
 async fn delete_expired_nonces(db: PgPool) {
     let mut tick = tokio::time::interval(Duration::from_secs(60));
@@ -623,6 +641,7 @@ async fn claim(
         Some(true) => {}
     }
     let manifest_hash = app.manifest.hash().as_str();
+    let now = chrono::Utc::now();
     let mut tx = app.db.begin().await.map_err(internal)?;
     let state = devices::state(&mut tx, &claim.device, manifest_hash)
         .await
@@ -639,7 +658,7 @@ async fn claim(
     let Evaluation {
         decision,
         first_failures,
-    } = evaluate(&app.manifest, claim, chrono::Utc::now(), &first_failures);
+    } = evaluate(&app.manifest, claim, now, &first_failures);
     let oversharing = matches!(&decision, Decision::Deny { reasons } if reasons.iter().any(Reason::breaks_disclosure_contract));
     let strings = |rs: &[Reason]| rs.iter().map(ToString::to_string).collect::<Vec<_>>();
     let (warnings, mut reasons) = match &decision {
@@ -675,14 +694,17 @@ async fn claim(
     }
     if enrolled && !oversharing {
         let payload = serde_json::to_value(claim).map_err(internal)?;
-        sqlx::query("INSERT INTO claims (device, claim, jws, allowed) VALUES ($1, $2, $3, $4)")
-            .bind(claim.device.as_str())
-            .bind(&payload)
-            .bind(verified.jws())
-            .bind(reasons.is_empty())
-            .execute(&mut *tx)
-            .await
-            .map_err(internal)?;
+        claims::store(
+            &mut tx,
+            &app.kek,
+            now,
+            &claim.device,
+            &payload,
+            verified.jws(),
+            reasons.is_empty(),
+        )
+        .await
+        .map_err(internal)?;
     }
     tx.commit().await.map_err(internal)?;
     if !reasons.is_empty() {
@@ -815,7 +837,7 @@ async fn invite(db: &PgPool, url: &str, ttl: &str, note: &str) -> anyhow::Result
     if !matches!(parsed.scheme_str(), Some("https" | "http")) || parsed.host().is_none() {
         anyhow::bail!("--url must be an http(s) URL, got {url:?}");
     }
-    let keys = Keys::load_or_create(db, &Kek::from_env()?).await?;
+    let keys = Keys::load_or_create(db, &SealingKey::kek_from_env()?).await?;
     let (code, expires) = invitations::create(db, ttl, note).await?;
     let invitation = Invitation::new(
         url,
@@ -880,7 +902,7 @@ async fn serve(db: PgPool) -> anyhow::Result<()> {
         100_000,
     );
     let max_nonces = env_number("NONCE_MAX_OUTSTANDING", 10_000)?;
-    let kek = Kek::from_env()?;
+    let kek = SealingKey::kek_from_env()?;
     let keys = Keys::load_or_create(&db, &kek).await?;
     let log = Log {
         key: log_key(&keys)?,
@@ -899,7 +921,15 @@ async fn serve(db: PgPool) -> anyhow::Result<()> {
     if auto_approve {
         eprintln!("AUTO_APPROVE=true: enrolled devices are approved without IT");
     }
+    let sealed = claims::seal_plaintext(&db, &kek).await?;
+    if sealed > 0 {
+        eprintln!("sealed {sealed} plaintext claims from an earlier version");
+    }
     tokio::spawn(delete_expired_nonces(db.clone()));
+    tokio::spawn(enforce_retention(
+        db.clone(),
+        manifest.body().claim_retention.clone(),
+    ));
     let app = Router::new()
         .route("/", get(index))
         .route("/healthz", get(healthz))
@@ -925,6 +955,7 @@ async fn serve(db: PgPool) -> anyhow::Result<()> {
             limiter: Arc::new(limiter),
             nonce_limiter: Arc::new(nonce_limiter),
             max_nonces,
+            kek: Arc::new(kek),
         });
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(

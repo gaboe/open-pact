@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use time::{Duration, OffsetDateTime};
 
-use crate::kek::Kek;
+use crate::seal::SealingKey;
 
 pub struct Keys {
     pub manifest: SigningKey,
@@ -29,7 +29,7 @@ const CLOCK_SKEW: Duration = Duration::minutes(5);
 /// A row that does not open is an error, never a reason to generate a new key.
 async fn secret(
     db: &PgPool,
-    kek: &Kek,
+    kek: &SealingKey,
     name: &str,
     make: impl FnOnce() -> anyhow::Result<String>,
 ) -> anyhow::Result<String> {
@@ -51,7 +51,7 @@ async fn secret(
             select().fetch_one(db).await?
         }
     };
-    if Kek::is_sealed(&stored) {
+    if SealingKey::is_sealed(&stored) {
         let plain = kek
             .open(name, &stored)
             .context("is GATEWAY_KEK the key this database was sealed with?")?;
@@ -68,7 +68,7 @@ async fn secret(
 }
 
 impl Keys {
-    pub async fn load_or_create(db: &PgPool, kek: &Kek) -> anyhow::Result<Keys> {
+    pub async fn load_or_create(db: &PgPool, kek: &SealingKey) -> anyhow::Result<Keys> {
         let new_key = || Ok(dev_key::to_pem(&dev_key::generate()));
         let manifest = dev_key::from_pem(&secret(db, kek, "manifest_signing_key", new_key).await?)
             .context("manifest_signing_key")?;
@@ -187,13 +187,13 @@ mod tests {
     #[ignore = "needs TEST_DATABASE_URL"]
     async fn seals_new_and_plaintext_secrets_and_refuses_a_wrong_kek() {
         let db = crate::testdb::fresh().await;
-        let kek = Kek::new(&[1; 32]);
+        let kek = SealingKey::new(&[1; 32]);
         let first = Keys::load_or_create(&db, &kek).await.unwrap();
         let rows = stored(&db).await;
         assert_eq!(rows.len(), 4);
         assert!(
             rows.iter()
-                .all(|(_, v)| Kek::is_sealed(v) && !v.contains("BEGIN"))
+                .all(|(_, v)| SealingKey::is_sealed(v) && !v.contains("BEGIN"))
         );
 
         for (name, value) in &rows {
@@ -213,9 +213,9 @@ mod tests {
         );
         assert_eq!(dev_key::to_pem(&upgraded.log), dev_key::to_pem(&first.log));
         let resealed = stored(&db).await;
-        assert!(resealed.iter().all(|(_, v)| Kek::is_sealed(v)));
+        assert!(resealed.iter().all(|(_, v)| SealingKey::is_sealed(v)));
 
-        let wrong = Keys::load_or_create(&db, &Kek::new(&[2; 32])).await;
+        let wrong = Keys::load_or_create(&db, &SealingKey::new(&[2; 32])).await;
         assert!(
             wrong.is_err(),
             "a wrong KEK must not load or replace the keys"

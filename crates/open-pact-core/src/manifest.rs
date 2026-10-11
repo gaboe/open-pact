@@ -85,6 +85,20 @@ impl Span {
         chrono::TimeDelta::try_seconds(i64::try_from(self.min_secs()).ok()?)
     }
 
+    /// The instant this span before `t`, in calendar months for `mo`, so `12mo` before
+    /// 2026-10-15 is 2025-10-15. `None` when that is before the start of the calendar.
+    pub fn before(
+        &self,
+        t: chrono::DateTime<chrono::Utc>,
+    ) -> Option<chrono::DateTime<chrono::Utc>> {
+        match self.unit {
+            Unit::Month => {
+                t.checked_sub_months(chrono::Months::new(u32::try_from(self.amount).ok()?))
+            }
+            _ => t.checked_sub_signed(self.min_duration()?),
+        }
+    }
+
     pub fn is_zero(&self) -> bool {
         self.amount == 0
     }
@@ -341,5 +355,28 @@ mod tests {
         assert!(span("1mo").certainly_shorter_or_equal(&span("31d")));
         assert!(span("12mo").certainly_shorter_or_equal(&span("12mo")));
         assert!(span("24h").certainly_shorter_or_equal(&span("1d")));
+    }
+
+    #[test]
+    fn before_counts_calendar_months_and_exact_hours() {
+        let t: chrono::DateTime<chrono::Utc> = "2026-03-31T10:00:00Z".parse().unwrap();
+        let span = |s: &str| Span::try_from(s.to_string()).unwrap();
+        assert_eq!(
+            span("12mo").before(t).unwrap().to_rfc3339(),
+            "2025-03-31T10:00:00+00:00"
+        );
+        assert_eq!(
+            span("1mo").before(t).unwrap().to_rfc3339(),
+            "2026-02-28T10:00:00+00:00"
+        );
+        assert_eq!(
+            span("1h").before(t).unwrap().to_rfc3339(),
+            "2026-03-31T09:00:00+00:00"
+        );
+        assert_eq!(
+            span("2w").before(t).unwrap().to_rfc3339(),
+            "2026-03-17T10:00:00+00:00"
+        );
+        assert_eq!(span("300000000mo").before(t), None);
     }
 }
