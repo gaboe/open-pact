@@ -51,6 +51,10 @@ The client keeps its files in `~/.config/open-pact/`, or in the directory given 
 
 Nothing runs in the background. To uninstall, delete the binary and the directory.
 
+## Verify a release
+
+The gateway image is reproducible: a pinned toolchain and builder, a static musl binary, `FROM scratch`, and timestamps fixed to the commit time. CI builds each release twice on separate runners and fails when the digests differ. To check a release yourself, run `scripts/verify-release.sh v0.0.1 ghcr.io/<owner>/open-pact-gateway@sha256:<digest>`. It rebuilds the tag from the public source, prints the digest, and exits nonzero on a mismatch. It needs Docker with buildx and takes several minutes. The gateway makes no outbound TLS calls, so the image carries no CA bundle (do not use `sslmode=verify-full` for PostgreSQL).
+
 ## Gateway API
 
 | Request | Response |
