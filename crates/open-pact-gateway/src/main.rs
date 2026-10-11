@@ -1,27 +1,77 @@
+mod devices;
+mod invitations;
 mod keys;
+mod ratelimit;
 mod translog;
 
 use std::fmt::Display;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::{
     Json, Router,
-    extract::{Query, State, rejection::JsonRejection},
+    extract::{ConnectInfo, Query, State, rejection::JsonRejection},
     http::{StatusCode, header},
     response::{Html, IntoResponse},
     routing::{get, post},
 };
+use clap::{Parser, Subcommand};
 use open_pact_core::{
-    Checkpoint, Decision, Endorsement, Entry, EntryKind, LogHash, LogKey, Manifest, Note,
-    Pseudonym, PublicKey, Reason, SignedManifest, SigningKey, WitnessKey, consistency_proof,
-    evaluate, inclusion_proof, root, verify_claim,
+    Checkpoint, Decision, Endorsement, Entry, EntryKind, Invitation, InvitationCode, LogHash,
+    LogKey, Manifest, Note, Pseudonym, PublicKey, Reason, SignedManifest, SigningKey, WitnessKey,
+    consistency_proof, evaluate, inclusion_proof, root, verify_claim,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use sqlx::{PgPool, postgres::PgPoolOptions};
 
+use devices::{Action, State as DeviceState, commitment};
 use keys::Keys;
+use ratelimit::Limiter;
+
+#[derive(Parser)]
+#[command(
+    name = "open-pact-gateway",
+    about = "open-pact gateway; without a command it serves HTTP"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Serve the HTTP API (the default)
+    Serve,
+    /// Create a one-time invitation; prints the opi1: string on stdout, a readable form on stderr
+    Invite {
+        /// How long the invitation stays valid: 30m, 72h, 7d (at most 30d)
+        #[arg(long, default_value = "72h")]
+        ttl: String,
+        /// Who the invitation is for. Stays in the gateway database, never in the log
+        #[arg(long, default_value = "")]
+        note: String,
+        /// The gateway URL the owner's client connects to
+        #[arg(long, env = "PUBLIC_URL")]
+        url: String,
+    },
+    /// List, approve or revoke devices
+    Devices {
+        #[command(subcommand)]
+        command: DevicesCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum DevicesCommand {
+    /// Every enrolment with its state and invitation note
+    List,
+    /// Approve the pending device whose pseudonym starts with these hex digits (at least 8)
+    Approve { prefix: String },
+    /// Revoke a device by its full pseudonym. Final: the device cannot be approved again
+    Revoke { pseudonym: String },
+}
 
 type Reply = (StatusCode, Json<Value>);
 
@@ -33,6 +83,8 @@ struct App {
     company: Endorsement,
     keys: Arc<Keys>,
     log: Arc<Log>,
+    auto_approve: bool,
+    limiter: Arc<Limiter>,
 }
 
 struct Log {
@@ -78,6 +130,7 @@ struct ClaimRequest {
 struct EnrollRequest {
     signed_manifest: SignedManifest,
     device_key: PublicKey,
+    invitation_code: InvitationCode,
 }
 
 #[derive(Deserialize)]
@@ -114,11 +167,9 @@ fn denied(reasons: Vec<String>) -> Reply {
     )
 }
 
-fn commitment(salt_hex: &str, device: &Pseudonym) -> Result<String, Reply> {
-    let mut commitment = Sha256::new();
-    commitment.update(hex::decode(salt_hex).map_err(internal)?);
-    commitment.update(device.as_str());
-    Ok(format!("sha256:{}", hex::encode(commitment.finalize())))
+/// The same answer for an unknown, expired, used and someone else's invitation.
+fn invalid_invitation() -> Reply {
+    denied(vec!["invalid or used invitation".into()])
 }
 
 impl App {
@@ -206,7 +257,7 @@ async fn legacy_log() -> Reply {
     )
 }
 
-async fn log_key(State(app): State<App>) -> impl IntoResponse {
+async fn log_key_text(State(app): State<App>) -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
         format!("{}\n", app.log.key.vkey()),
@@ -349,8 +400,17 @@ async fn nonce(State(app): State<App>) -> Result<Json<Value>, Reply> {
 
 async fn enroll(
     State(app): State<App>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     body: Result<Json<EnrollRequest>, JsonRejection>,
 ) -> Result<Json<Value>, Reply> {
+    if app.limiter.blocked(peer.ip(), Instant::now()) {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(
+                json!({"status": "denied", "reasons": ["too many failed enrolments from this address; try again later"]}),
+            ),
+        ));
+    }
     let Json(req) = body.map_err(|e| denied(vec![e.body_text()]))?;
     let signed = &req.signed_manifest;
     let manifest = signed.verify().map_err(|e| denied(vec![e.to_string()]))?;
@@ -367,43 +427,25 @@ async fn enroll(
         )]));
     }
     let device = Pseudonym::of(&req.device_key);
+    let invitation = req.invitation_code.hash();
     let owner_key = serde_json::to_value(&signed.owner.key).map_err(internal)?;
-    let fresh_salt = hex::encode(rand::random::<[u8; 32]>());
+    let invalid = || {
+        app.limiter.failed(peer.ip(), Instant::now());
+        invalid_invitation()
+    };
 
     let mut tx = app.db.begin().await.map_err(internal)?;
     translog::lock(&mut tx).await.map_err(internal)?;
-    let inserted: Option<String> = sqlx::query_scalar(
-        "INSERT INTO devices (pseudonym, manifest_hash, owner_key, owner_signature, salt) \
-         VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING RETURNING salt",
+    let existing: Option<(Value, String, String)> = sqlx::query_as(
+        "SELECT owner_key, salt, state FROM devices WHERE pseudonym = $1 AND manifest_hash = $2 FOR UPDATE",
     )
     .bind(device.as_str())
     .bind(app.manifest.hash().as_str())
-    .bind(&owner_key)
-    .bind(String::from(signed.owner.signature.clone()))
-    .bind(&fresh_salt)
     .fetch_optional(&mut *tx)
     .await
     .map_err(internal)?;
-    let (salt, log_index) = match inserted {
-        Some(salt) => {
-            let entry = translog::append(
-                &mut tx,
-                EntryKind::DeviceEnrolled,
-                json!({ "commitment": commitment(&salt, &device)? }),
-            )
-            .await
-            .map_err(internal)?;
-            (salt, entry.index)
-        }
-        None => {
-            let (existing_owner, salt): (Value, String) = sqlx::query_as(
-                "SELECT owner_key, salt FROM devices WHERE pseudonym = $1 AND manifest_hash = $2",
-            )
-            .bind(device.as_str())
-            .bind(app.manifest.hash().as_str())
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(internal)?;
+    let (salt, state, log_index) = match existing {
+        Some((existing_owner, salt, state)) => {
             if existing_owner != owner_key {
                 return Err((
                     StatusCode::CONFLICT,
@@ -412,14 +454,66 @@ async fn enroll(
                     ),
                 ));
             }
+            if !invitations::used_by(&mut tx, &invitation, &device)
+                .await
+                .map_err(internal)?
+            {
+                return Err(invalid());
+            }
             let index: i64 = sqlx::query_scalar(
                 "SELECT idx FROM log_entries WHERE kind = 'device_enrolled' AND data->>'commitment' = $1",
             )
-            .bind(commitment(&salt, &device)?)
+            .bind(commitment(&salt, device.as_str()).map_err(internal)?)
             .fetch_one(&mut *tx)
             .await
             .map_err(internal)?;
-            (salt, u64::try_from(index).map_err(internal)?)
+            let state = DeviceState::parse(&state).map_err(internal)?;
+            (salt, state, u64::try_from(index).map_err(internal)?)
+        }
+        None => {
+            if devices::revoked_anywhere(&mut tx, &device)
+                .await
+                .map_err(internal)?
+            {
+                return Err(denied(vec!["device revoked".into()]));
+            }
+            if !invitations::consume(&mut tx, &invitation, &device)
+                .await
+                .map_err(internal)?
+            {
+                return Err(invalid());
+            }
+            let salt = hex::encode(rand::random::<[u8; 32]>());
+            let state = if app.auto_approve {
+                DeviceState::Approved
+            } else {
+                DeviceState::Pending
+            };
+            sqlx::query(
+                "INSERT INTO devices (pseudonym, manifest_hash, owner_key, owner_signature, salt, state, invitation) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            )
+            .bind(device.as_str())
+            .bind(app.manifest.hash().as_str())
+            .bind(&owner_key)
+            .bind(String::from(signed.owner.signature.clone()))
+            .bind(&salt)
+            .bind(state.as_str())
+            .bind(invitation.as_str())
+            .execute(&mut *tx)
+            .await
+            .map_err(internal)?;
+            let committed =
+                json!({ "commitment": commitment(&salt, device.as_str()).map_err(internal)? });
+            let entry = translog::append(&mut tx, EntryKind::DeviceEnrolled, committed.clone())
+                .await
+                .map_err(internal)?;
+            if state == DeviceState::Approved {
+                translog::append(&mut tx, EntryKind::DeviceApproved, committed)
+                    .await
+                    .map_err(internal)?;
+            }
+            (salt, state, entry.index)
         }
     };
     tx.commit().await.map_err(internal)?;
@@ -434,6 +528,7 @@ async fn enroll(
     Ok(Json(json!({
         "status": "enrolled",
         "device": device,
+        "state": state.as_str(),
         "salt": salt,
         "log_index": log_index,
         "manifest_log_index": manifest_index,
@@ -463,14 +558,14 @@ async fn claim(
         Some(false) => return Err(denied(vec!["expired nonce".into()])),
         Some(true) => {}
     }
-    let enrolled: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM devices WHERE pseudonym = $1 AND manifest_hash = $2)",
+    let state = devices::state(
+        &mut *app.conn().await?,
+        &claim.device,
+        app.manifest.hash().as_str(),
     )
-    .bind(claim.device.as_str())
-    .bind(app.manifest.hash().as_str())
-    .fetch_one(&app.db)
     .await
     .map_err(internal)?;
+    let enrolled = state.is_some();
 
     let decision = evaluate(&app.manifest, claim, chrono::Utc::now());
     let oversharing = matches!(&decision, Decision::Deny { reasons } if reasons.iter().any(Reason::breaks_disclosure_contract));
@@ -479,8 +574,10 @@ async fn claim(
         Decision::Allow { warnings } => (strings(warnings), vec![]),
         Decision::Deny { reasons } => (vec![], strings(reasons)),
     };
-    if !enrolled {
-        reasons.insert(0, "device not enrolled".into());
+    match state.map(DeviceState::denial) {
+        None => reasons.insert(0, "device not enrolled".into()),
+        Some(Some(why)) => reasons.insert(0, why.into()),
+        Some(None) => {}
     }
     let mut certificate_pem = None;
     if let (true, Some(csr)) = (reasons.is_empty(), &claim.csr_pem) {
@@ -524,11 +621,13 @@ async fn claim(
 }
 
 async fn index(State(app): State<App>) -> Result<Html<String>, Reply> {
-    let devices: i64 = sqlx::query_scalar("SELECT count(*) FROM devices WHERE manifest_hash = $1")
-        .bind(app.manifest.hash().as_str())
-        .fetch_one(&app.db)
-        .await
-        .map_err(internal)?;
+    let devices: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM devices WHERE manifest_hash = $1 AND state = 'approved'",
+    )
+    .bind(app.manifest.hash().as_str())
+    .fetch_one(&app.db)
+    .await
+    .map_err(internal)?;
     let (allowed, denied): (i64, i64) = sqlx::query_as(
         "SELECT count(*) FILTER (WHERE allowed), count(*) FILTER (WHERE NOT allowed) \
          FROM claims WHERE received_at > now() - interval '24 hours'",
@@ -611,20 +710,94 @@ fn log_origin() -> anyhow::Result<String> {
     Ok(origin)
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let url = std::env::var("DATABASE_URL")?;
+fn env_flag(name: &str) -> anyhow::Result<bool> {
+    match std::env::var(name).as_deref() {
+        Err(_) | Ok("" | "false" | "0") => Ok(false),
+        Ok("true" | "1") => Ok(true),
+        Ok(other) => anyhow::bail!("{name} must be true or false, got {other:?}"),
+    }
+}
+
+fn env_number<T: std::str::FromStr>(name: &str, default: T) -> anyhow::Result<T> {
+    match std::env::var(name) {
+        Err(_) => Ok(default),
+        Ok(v) => v
+            .parse()
+            .map_err(|_| anyhow::anyhow!("{name} must be a number, got {v:?}")),
+    }
+}
+
+fn log_key(keys: &Keys) -> anyhow::Result<LogKey> {
+    Ok(LogKey::new(&log_origin()?, &PublicKey::from(&keys.log)))
+}
+
+async fn invite(db: &PgPool, url: &str, ttl: &str, note: &str) -> anyhow::Result<()> {
+    let ttl = invitations::parse_ttl(ttl)?;
+    let parsed = url.parse::<axum::http::Uri>()?;
+    if !matches!(parsed.scheme_str(), Some("https" | "http")) || parsed.host().is_none() {
+        anyhow::bail!("--url must be an http(s) URL, got {url:?}");
+    }
+    let keys = Keys::load_or_create(db).await?;
+    let (code, expires) = invitations::create(db, ttl, note).await?;
+    let invitation = Invitation::new(
+        url,
+        &PublicKey::from(&keys.manifest),
+        &log_key(&keys)?,
+        code,
+    );
+    eprint!(
+        "One-time invitation, valid until {expires}{}\n{}",
+        if note.is_empty() {
+            String::new()
+        } else {
+            format!(", for {note}")
+        },
+        invitation.describe()
+    );
+    eprintln!(
+        "Send the opi1: line to the owner. Confirm the company key fingerprint over a second channel.\n\
+         Approve the device with: open-pact-gateway devices approve <first 8+ hex digits of its pseudonym>"
+    );
+    println!("{}", invitation.encode());
+    Ok(())
+}
+
+async fn admin_devices(db: &PgPool, command: DevicesCommand) -> anyhow::Result<()> {
+    let (device, action) = match command {
+        DevicesCommand::List => {
+            print!("{}", devices::list(db).await?);
+            return Ok(());
+        }
+        DevicesCommand::Approve { prefix } => (
+            devices::pending_by_prefix(db, &prefix).await?,
+            Action::Approve,
+        ),
+        DevicesCommand::Revoke { pseudonym } => {
+            (devices::full_pseudonym(&pseudonym)?, Action::Revoke)
+        }
+    };
+    for (manifest, state) in devices::apply(db, &device, action).await? {
+        println!("{} {device} for {manifest}", state.as_str());
+    }
+    Ok(())
+}
+
+async fn serve(db: PgPool) -> anyhow::Result<()> {
     let addr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
     let manifest_path =
         std::env::var("MANIFEST_PATH").unwrap_or_else(|_| "examples/manifest.toml".into());
     let toml = std::fs::read_to_string(&manifest_path)?;
     let manifest = Manifest::parse(toml.as_bytes())?;
     eprintln!("enforcing {manifest_path} {}", manifest.hash());
-    let db = connect(&url).await?;
-    sqlx::migrate!("./migrations").run(&db).await?;
+    let auto_approve = env_flag("AUTO_APPROVE")?;
+    let limiter = Limiter::new(
+        env_number("ENROL_MAX_FAILURES", 10)?,
+        Duration::from_secs(env_number("ENROL_FAILURE_WINDOW_SECS", 600)?),
+        100_000,
+    );
     let keys = Keys::load_or_create(&db).await?;
     let log = Log {
-        key: LogKey::new(&log_origin()?, &PublicKey::from(&keys.log)),
+        key: log_key(&keys)?,
         signer: keys.log.clone(),
         witnesses: witness_keys()?,
         cache: Mutex::default(),
@@ -637,13 +810,16 @@ async fn main() -> anyhow::Result<()> {
     let company = Endorsement::sign(&keys.manifest, manifest.hash());
     eprintln!("company key {}", company.key.fingerprint());
     eprintln!("CA {}", keys.ca.fingerprint);
+    if auto_approve {
+        eprintln!("AUTO_APPROVE=true: enrolled devices are approved without IT");
+    }
     let app = Router::new()
         .route("/", get(index))
         .route("/healthz", get(healthz))
         .route("/v1/manifest", get(self::manifest))
         .route("/v1/enroll", post(enroll))
         .route("/v1/log", get(legacy_log))
-        .route("/v1/log/key", get(log_key))
+        .route("/v1/log/key", get(self::log_key_text))
         .route("/v1/log/checkpoint", get(log_checkpoint))
         .route("/v1/log/entries", get(log_entries))
         .route("/v1/log/proof/inclusion", get(inclusion))
@@ -658,12 +834,29 @@ async fn main() -> anyhow::Result<()> {
             company,
             keys: Arc::new(keys),
             log: Arc::new(log),
+            auto_approve,
+            limiter: Arc::new(limiter),
         });
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
     Ok(())
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    let db = connect(&std::env::var("DATABASE_URL")?).await?;
+    sqlx::migrate!("./migrations").run(&db).await?;
+    match cli.command.unwrap_or(Command::Serve) {
+        Command::Serve => serve(db).await,
+        Command::Invite { ttl, note, url } => invite(&db, &url, &ttl, note.trim()).await,
+        Command::Devices { command } => admin_devices(&db, command).await,
+    }
 }
 
 async fn shutdown_signal() {
