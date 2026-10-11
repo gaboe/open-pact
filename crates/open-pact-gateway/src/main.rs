@@ -332,6 +332,20 @@ async fn publish_manifest(db: &PgPool, manifest: &Manifest) -> anyhow::Result<()
     Ok(())
 }
 
+async fn connect(url: &str) -> anyhow::Result<PgPool> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        match PgPoolOptions::new().max_connections(10).connect(url).await {
+            Ok(db) => return Ok(db),
+            Err(e) if tokio::time::Instant::now() < deadline => {
+                eprintln!("database not ready, retrying: {e}");
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let url = std::env::var("DATABASE_URL")?;
@@ -341,10 +355,7 @@ async fn main() -> anyhow::Result<()> {
     let toml = std::fs::read_to_string(&manifest_path)?;
     let manifest = Manifest::parse(toml.as_bytes())?;
     eprintln!("enforcing {manifest_path} {}", manifest.hash());
-    let db = PgPoolOptions::new()
-        .max_connections(10)
-        .connect(&url)
-        .await?;
+    let db = connect(&url).await?;
     sqlx::migrate!("./migrations").run(&db).await?;
     let keys = Keys::load_or_create(&db).await?;
     publish_manifest(&db, &manifest).await?;
