@@ -3,7 +3,9 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use open_pact_core::{Endorsement, LogKey, Manifest, PublicKey, SigningKey, dev_key};
+use open_pact_core::{
+    Checkpoint, Endorsement, LogKey, Manifest, PublicKey, SigningKey, dev_key, root,
+};
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -106,15 +108,27 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<String> {
 pub struct Company {
     pub key: SigningKey,
     pub log: LogKey,
+    log_signer: SigningKey,
 }
 
 impl Company {
     pub fn new() -> Self {
-        let log = dev_key::generate();
+        let log_signer = dev_key::generate();
         Company {
             key: dev_key::generate(),
-            log: LogKey::new("pact.example.com/log", &PublicKey::from(&log)),
+            log: LogKey::new("pact.example.com/log", &PublicKey::from(&log_signer)),
+            log_signer,
         }
+    }
+
+    /// The body of `GET /v1/log/checkpoint` for an empty log.
+    pub fn empty_checkpoint(&self) -> String {
+        let checkpoint = Checkpoint {
+            origin: self.log.origin().into(),
+            size: 0,
+            root: root(&[]),
+        };
+        self.log.sign(&self.log_signer, &checkpoint).to_string()
     }
 
     pub fn fingerprint(&self) -> String {

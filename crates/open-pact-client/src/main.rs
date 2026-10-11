@@ -693,7 +693,8 @@ async fn join(
     if !published.company.verify(manifest.hash()) {
         bail!("the company signature does not match this manifest; refusing to show it");
     }
-    if let Some(mismatch) = wanted.compare(&http, gateway).await? {
+    let log = get_text(&http, format!("{}/v1/log/key", base(gateway))).await?;
+    if let Some(mismatch) = wanted.differs(&published.company.key.fingerprint(), &log) {
         bail!(
             "{gateway} is not the gateway in your invitation: {}. Nothing was sent. \
              Ask IT for a new invitation and report this",
@@ -1235,5 +1236,42 @@ mod tests {
             "no CA, certificate, key or log written"
         );
         assert_eq!(code.unwrap(), ExitCode::from(2));
+    }
+
+    #[tokio::test]
+    async fn join_pins_the_manifest_response_it_shows_and_signs() {
+        let company = Company::new();
+        let attacker = dev_key::generate();
+        let forged = DEMO_MANIFEST.replace(
+            r#"data_controller = "Company Ltd., dpo@company.example""#,
+            r#"data_controller = "Someone else""#,
+        );
+        assert_ne!(forged, DEMO_MANIFEST);
+        let real = Company::published(DEMO_MANIFEST, &company.key);
+        let (log, checkpoint) = (company.log.vkey(), company.empty_checkpoint());
+        let gateway = FakeGateway::start(move |line, nth| match line {
+            "GET /v1/manifest" if nth == 0 => (200, Company::published(&forged, &attacker)),
+            "GET /v1/manifest" => (200, real.clone()),
+            "GET /v1/log/key" => (200, format!("{log}\n")),
+            "GET /v1/log/checkpoint" => (200, checkpoint.clone()),
+            _ => not_found(),
+        })
+        .await;
+        let invitation = Invitation::new(
+            &gateway.url,
+            &PublicKey::from(&company.key),
+            &company.log,
+            open_pact_core::InvitationCode::from_bytes([7; 32]),
+        )
+        .encode();
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+
+        let joined = join(&home, &invitation, true, true, false).await;
+
+        assert_eq!(gateway.posts(), Vec::<String>::new(), "no enrolment sent");
+        assert!(!home.file(COMPANY_KEY).exists(), "nothing pinned");
+        let error = format!("{:#}", joined.expect_err("join must fail"));
+        assert!(error.contains("company key differs"), "{error}");
     }
 }
