@@ -26,6 +26,10 @@ spec:
           env:
             - name: LISTEN_ADDR
               value: 0.0.0.0:8080
+            - name: LOG_ORIGIN
+              value: {{ .Values.log.origin | quote }}
+            - name: WITNESS_KEYS
+              value: {{ join "," .Values.log.witnessKeys | quote }}
             {{- if .Values.database.externalUrl }}
             - name: DATABASE_URL
               value: {{ .Values.database.externalUrl | quote }}

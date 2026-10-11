@@ -25,3 +25,9 @@ postgres:
 
 database:
   externalUrl: ""
+
+log:
+  # Checkpoint origin and log key name (c2sp.org/tlog-checkpoint).
+  origin: pact.example.com/log
+  # Witness verifier keys (Ed25519 cosignature/v1) whose cosignatures POST /v1/log/witness accepts.
+  witnessKeys: []

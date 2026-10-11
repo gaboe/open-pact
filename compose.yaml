@@ -15,6 +15,9 @@ services:
     environment:
       DATABASE_URL: postgres://pact:pact@db:5432/pact
       LISTEN_ADDR: 0.0.0.0:8080
+      LOG_ORIGIN: pact.example.com/log
+      # Demo witness key from `cargo run -p open-pact-core --example dev_witness -- vkey`.
+      WITNESS_KEYS: witness.example.org/demo+10c00e9a+BDnDJtIcX1p95tKTK+ggaN1dSvTB9a0EYGVntufeUB5t
     ports:
       - "8080:8080"
     depends_on:

@@ -3,17 +3,13 @@ use open_pact_core::{Entry, EntryKind, LogHash};
 use serde_json::Value;
 use sqlx::PgConnection;
 
-type Row = (i64, String, Value, String, String);
+type Row = (i64, String, Value);
 
-const COLUMNS: &str = "SELECT idx, kind, data, prev_hash, hash FROM log_entries";
-
-fn entry((idx, kind, data, prev_hash, hash): Row) -> anyhow::Result<Entry> {
+fn entry((idx, kind, data): Row) -> anyhow::Result<Entry> {
     Ok(Entry {
         index: u64::try_from(idx)?,
         kind: serde_json::from_value(Value::String(kind)).context("log kind")?,
         data,
-        prev_hash: LogHash::try_from(prev_hash).map_err(anyhow::Error::msg)?,
-        hash: LogHash::try_from(hash).map_err(anyhow::Error::msg)?,
     })
 }
 
@@ -24,22 +20,26 @@ pub async fn lock(conn: &mut PgConnection) -> sqlx::Result<()> {
         .map(drop)
 }
 
-pub async fn last(conn: &mut PgConnection) -> anyhow::Result<Option<Entry>> {
-    sqlx::query_as::<_, Row>(&format!("{COLUMNS} ORDER BY idx DESC LIMIT 1"))
-        .fetch_optional(conn)
-        .await?
-        .map(entry)
-        .transpose()
-}
-
-pub async fn since(conn: &mut PgConnection, from: u64) -> anyhow::Result<Vec<Entry>> {
-    sqlx::query_as::<_, Row>(&format!("{COLUMNS} WHERE idx >= $1 ORDER BY idx"))
-        .bind(i64::try_from(from).unwrap_or(i64::MAX))
+/// Every entry in index order. The log is small, so proofs are computed from all leaves.
+pub async fn all(conn: &mut PgConnection) -> anyhow::Result<Vec<Entry>> {
+    let entries = sqlx::query_as::<_, Row>("SELECT idx, kind, data FROM log_entries ORDER BY idx")
         .fetch_all(conn)
         .await?
         .into_iter()
         .map(entry)
-        .collect()
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    if let Some((i, e)) = entries
+        .iter()
+        .enumerate()
+        .find(|(i, e)| e.index != *i as u64)
+    {
+        anyhow::bail!("log_entries has a gap: index {} at position {i}", e.index);
+    }
+    Ok(entries)
+}
+
+pub fn leaf_hashes(entries: &[Entry]) -> Vec<LogHash> {
+    entries.iter().map(Entry::leaf_hash).collect()
 }
 
 pub async fn append(
@@ -48,19 +48,19 @@ pub async fn append(
     data: Value,
 ) -> anyhow::Result<Entry> {
     lock(conn).await?;
-    let entry = match last(conn).await? {
-        Some(prev) => prev.next(kind, data),
-        None => Entry::first(kind, data),
+    let next: i64 = sqlx::query_scalar("SELECT count(*) FROM log_entries")
+        .fetch_one(&mut *conn)
+        .await?;
+    let entry = Entry {
+        index: u64::try_from(next)?,
+        kind,
+        data,
     };
-    sqlx::query(
-        "INSERT INTO log_entries (idx, kind, data, prev_hash, hash) VALUES ($1, $2, $3, $4, $5)",
-    )
-    .bind(i64::try_from(entry.index)?)
-    .bind(entry.kind.as_str())
-    .bind(&entry.data)
-    .bind(entry.prev_hash.to_string())
-    .bind(entry.hash.to_string())
-    .execute(conn)
-    .await?;
+    sqlx::query("INSERT INTO log_entries (idx, kind, data) VALUES ($1, $2, $3)")
+        .bind(next)
+        .bind(entry.kind.as_str())
+        .bind(&entry.data)
+        .execute(conn)
+        .await?;
     Ok(entry)
 }

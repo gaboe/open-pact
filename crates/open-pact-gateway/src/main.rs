@@ -7,13 +7,14 @@ use std::sync::Arc;
 use axum::{
     Json, Router,
     extract::{Query, State, rejection::JsonRejection},
-    http::StatusCode,
+    http::{StatusCode, header},
     response::{Html, IntoResponse},
     routing::{get, post},
 };
 use open_pact_core::{
-    Decision, Endorsement, EntryKind, Head, Manifest, Pseudonym, PublicKey, Reason, SignedManifest,
-    evaluate, verify_claim,
+    Checkpoint, Decision, Endorsement, Entry, EntryKind, LogHash, LogKey, Manifest, Note,
+    Pseudonym, PublicKey, Reason, SignedManifest, SigningKey, WitnessKey, consistency_proof,
+    evaluate, inclusion_proof, root, verify_claim,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -31,6 +32,29 @@ struct App {
     toml: Arc<str>,
     company: Endorsement,
     keys: Arc<Keys>,
+    log: Arc<Log>,
+}
+
+struct Log {
+    signer: SigningKey,
+    key: LogKey,
+    witnesses: Vec<WitnessKey>,
+}
+
+/// One consistent read of the whole log.
+struct Tree {
+    entries: Vec<Entry>,
+    leaves: Vec<LogHash>,
+}
+
+impl Tree {
+    fn size(&self) -> u64 {
+        self.leaves.len() as u64
+    }
+
+    fn prefix(&self, size: u64) -> &[LogHash] {
+        &self.leaves[..usize::try_from(size).expect("size was checked against the tree")]
+    }
 }
 
 #[derive(Deserialize)]
@@ -47,8 +71,15 @@ struct EnrollRequest {
 }
 
 #[derive(Deserialize)]
-struct LogQuery {
+struct RangeQuery {
     from: Option<u64>,
+    to: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct InclusionQuery {
+    index: u64,
+    size: Option<u64>,
 }
 
 fn internal(e: impl Display) -> Reply {
@@ -59,6 +90,13 @@ fn internal(e: impl Display) -> Reply {
     )
 }
 
+fn bad_request(reason: impl Display) -> Reply {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"status": "error", "reason": reason.to_string()})),
+    )
+}
+
 fn denied(reasons: Vec<String>) -> Reply {
     (
         StatusCode::FORBIDDEN,
@@ -66,13 +104,42 @@ fn denied(reasons: Vec<String>) -> Reply {
     )
 }
 
+fn commitment(salt_hex: &str, device: &Pseudonym) -> Result<String, Reply> {
+    let mut commitment = Sha256::new();
+    commitment.update(hex::decode(salt_hex).map_err(internal)?);
+    commitment.update(device.as_str());
+    Ok(format!("sha256:{}", hex::encode(commitment.finalize())))
+}
+
 impl App {
-    async fn head(&self, conn: &mut PgConnection) -> Result<Head, Reply> {
-        let last = translog::last(conn)
-            .await
-            .map_err(internal)?
-            .ok_or_else(|| internal("transparency log is empty"))?;
-        Ok(Head::sign(&self.keys.log, &last))
+    async fn tree(&self, conn: &mut PgConnection) -> Result<Tree, Reply> {
+        let entries = translog::all(conn).await.map_err(internal)?;
+        let leaves = translog::leaf_hashes(&entries);
+        Ok(Tree { entries, leaves })
+    }
+
+    /// The current checkpoint signed by the log key, with the witness cosignatures stored for it.
+    async fn checkpoint(&self, conn: &mut PgConnection) -> Result<Note, Reply> {
+        let tree = self.tree(conn).await?;
+        let checkpoint = Checkpoint {
+            origin: self.log.key.origin().to_string(),
+            size: tree.size(),
+            root: root(&tree.leaves),
+        };
+        let mut note = self.log.key.sign(&self.log.signer, &checkpoint);
+        let cosignatures: Vec<String> = sqlx::query_scalar(
+            "SELECT signature FROM log_cosignatures WHERE size = $1 AND root = $2 ORDER BY witness",
+        )
+        .bind(i64::try_from(checkpoint.size).map_err(internal)?)
+        .bind(checkpoint.root.to_string())
+        .fetch_all(conn)
+        .await
+        .map_err(internal)?;
+        for line in cosignatures {
+            note.signatures
+                .push(open_pact_core::NoteSignature::parse(&line).map_err(internal)?);
+        }
+        Ok(note)
     }
 
     async fn conn(&self) -> Result<sqlx::pool::PoolConnection<sqlx::Postgres>, Reply> {
@@ -91,18 +158,137 @@ async fn manifest(State(app): State<App>) -> Json<Value> {
     Json(json!({"toml": &*app.toml, "company": app.company}))
 }
 
-async fn log(State(app): State<App>, Query(q): Query<LogQuery>) -> Result<Json<Value>, Reply> {
-    let mut tx = app.db.begin().await.map_err(internal)?;
-    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
-        .execute(&mut *tx)
+async fn legacy_log() -> Reply {
+    (
+        StatusCode::GONE,
+        Json(json!({
+            "status": "gone",
+            "reason": "the transparency log is now a Merkle tree with signed checkpoints; update open-pact-client and run join again",
+        })),
+    )
+}
+
+async fn log_key(State(app): State<App>) -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        format!("{}\n", app.log.key.vkey()),
+    )
+}
+
+async fn log_checkpoint(State(app): State<App>) -> Result<impl IntoResponse, Reply> {
+    let note = app.checkpoint(&mut *app.conn().await?).await?;
+    Ok((
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        note.to_string(),
+    ))
+}
+
+async fn log_entries(
+    State(app): State<App>,
+    Query(q): Query<RangeQuery>,
+) -> Result<Json<Value>, Reply> {
+    let tree = app.tree(&mut *app.conn().await?).await?;
+    let (from, to) = (q.from.unwrap_or(0), q.to.unwrap_or(tree.size()));
+    if from > to || to > tree.size() {
+        return Err(bad_request(format!(
+            "need from <= to <= {}, got from={from} to={to}",
+            tree.size()
+        )));
+    }
+    let entries = &tree.entries[from as usize..to as usize];
+    Ok(Json(json!({ "entries": entries })))
+}
+
+async fn inclusion(
+    State(app): State<App>,
+    Query(q): Query<InclusionQuery>,
+) -> Result<Json<Value>, Reply> {
+    let tree = app.tree(&mut *app.conn().await?).await?;
+    let size = q.size.unwrap_or(tree.size());
+    if size > tree.size() {
+        return Err(bad_request(format!("the log has {} entries", tree.size())));
+    }
+    let proof = inclusion_proof(tree.prefix(size), q.index).map_err(bad_request)?;
+    Ok(Json(
+        json!({"index": q.index, "size": size, "proof": proof}),
+    ))
+}
+
+async fn consistency(
+    State(app): State<App>,
+    Query(q): Query<RangeQuery>,
+) -> Result<Json<Value>, Reply> {
+    let tree = app.tree(&mut *app.conn().await?).await?;
+    let (Some(from), to) = (q.from, q.to.unwrap_or(tree.size())) else {
+        return Err(bad_request("from is required"));
+    };
+    if to > tree.size() {
+        return Err(bad_request(format!("the log has {} entries", tree.size())));
+    }
+    let proof = consistency_proof(tree.prefix(to), from).map_err(bad_request)?;
+    Ok(Json(json!({"from": from, "to": to, "proof": proof})))
+}
+
+/// Takes a checkpoint signed by this log with witness cosignature lines appended, as a
+/// c2sp.org/tlog-witness add-checkpoint response would carry them, and stores the valid ones.
+async fn witness(State(app): State<App>, body: String) -> Result<Json<Value>, Reply> {
+    let reject =
+        |code, reason: String| (code, Json(json!({"status": "denied", "reasons": [reason]})));
+    let note = Note::parse(&body).map_err(bad_request)?;
+    let checkpoint = app
+        .log
+        .key
+        .verify(&note)
+        .map_err(|e| reject(StatusCode::FORBIDDEN, e.to_string()))?;
+    let mut conn = app.conn().await?;
+    let tree = app.tree(&mut conn).await?;
+    if checkpoint.size == 0
+        || checkpoint.size > tree.size()
+        || root(tree.prefix(checkpoint.size)) != checkpoint.root
+    {
+        return Err(reject(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "checkpoint of size {} does not match this log",
+                checkpoint.size
+            ),
+        ));
+    }
+    let mut accepted = vec![];
+    for sig in &note.signatures {
+        for w in &app.log.witnesses {
+            match w.verify(&checkpoint, sig) {
+                None => {}
+                Some(Err(e)) => {
+                    return Err(reject(StatusCode::FORBIDDEN, format!("{}: {e}", w.name())));
+                }
+                Some(Ok(_)) => accepted.push((w.name(), sig.to_string())),
+            }
+        }
+    }
+    if accepted.is_empty() {
+        return Err(reject(
+            StatusCode::FORBIDDEN,
+            "no cosignature from a key in WITNESS_KEYS".into(),
+        ));
+    }
+    for (name, line) in &accepted {
+        sqlx::query(
+            "INSERT INTO log_cosignatures (size, root, witness, signature) VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (size, root, witness) DO UPDATE SET signature = EXCLUDED.signature, received_at = now()",
+        )
+        .bind(i64::try_from(checkpoint.size).map_err(internal)?)
+        .bind(checkpoint.root.to_string())
+        .bind(name)
+        .bind(line.trim_end())
+        .execute(&mut *conn)
         .await
         .map_err(internal)?;
-    let entries = translog::since(&mut tx, q.from.unwrap_or(0))
-        .await
-        .map_err(internal)?;
-    let head = app.head(&mut tx).await?;
-    tx.commit().await.map_err(internal)?;
-    Ok(Json(json!({"entries": entries, "head": head})))
+    }
+    let names: Vec<&str> = accepted.iter().map(|(n, _)| *n).collect();
+    Ok(Json(
+        json!({"status": "stored", "size": checkpoint.size, "witnesses": names}),
+    ))
 }
 
 async fn nonce(State(app): State<App>) -> Result<Json<Value>, Reply> {
@@ -152,20 +338,16 @@ async fn enroll(
     .fetch_optional(&mut *tx)
     .await
     .map_err(internal)?;
-    let salt = match inserted {
+    let (salt, log_index) = match inserted {
         Some(salt) => {
-            let mut commitment = Sha256::new();
-            commitment.update(hex::decode(&salt).map_err(internal)?);
-            commitment.update(device.as_str());
-            let commitment = format!("sha256:{}", hex::encode(commitment.finalize()));
-            translog::append(
+            let entry = translog::append(
                 &mut tx,
                 EntryKind::DeviceEnrolled,
-                json!({ "commitment": commitment }),
+                json!({ "commitment": commitment(&salt, &device)? }),
             )
             .await
             .map_err(internal)?;
-            salt
+            (salt, entry.index)
         }
         None => {
             let (existing_owner, salt): (Value, String) = sqlx::query_as(
@@ -184,16 +366,24 @@ async fn enroll(
                     ),
                 ));
             }
-            salt
+            let index: i64 = sqlx::query_scalar(
+                "SELECT idx FROM log_entries WHERE kind = 'device_enrolled' AND data->>'commitment' = $1",
+            )
+            .bind(commitment(&salt, &device)?)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(internal)?;
+            (salt, u64::try_from(index).map_err(internal)?)
         }
     };
-    let head = app.head(&mut tx).await?;
+    let checkpoint = app.checkpoint(&mut tx).await?;
     tx.commit().await.map_err(internal)?;
     Ok(Json(json!({
         "status": "enrolled",
         "device": device,
         "salt": salt,
-        "log_head": head,
+        "log_index": log_index,
+        "log_checkpoint": checkpoint.to_string(),
     })))
 }
 
@@ -269,13 +459,13 @@ async fn claim(
     if !reasons.is_empty() {
         return Err(denied(reasons));
     }
-    let head = app.head(&mut *app.conn().await?).await?;
+    let checkpoint = app.checkpoint(&mut *app.conn().await?).await?;
     Ok(Json(json!({
         "status": "accepted",
         "warnings": warnings,
         "certificate_pem": certificate_pem,
         "ca_pem": app.keys.ca.cert_pem,
-        "log_head": head,
+        "log_checkpoint": checkpoint.to_string(),
     })))
 }
 
@@ -292,7 +482,7 @@ async fn index(State(app): State<App>) -> Result<Html<String>, Reply> {
     .fetch_one(&app.db)
     .await
     .map_err(internal)?;
-    let head = app.head(&mut *app.conn().await?).await?;
+    let tree = app.tree(&mut *app.conn().await?).await?;
     Ok(Html(format!(
         include_str!("index.html"),
         devices = devices,
@@ -300,8 +490,9 @@ async fn index(State(app): State<App>) -> Result<Html<String>, Reply> {
         denied = denied,
         manifest = app.manifest.hash(),
         company = app.company.key.fingerprint(),
-        log_index = head.index,
-        log_hash = head.hash,
+        log_size = tree.size(),
+        log_root = root(&tree.leaves),
+        log_witnesses = app.log.witnesses.len(),
         ca = app.keys.ca.fingerprint,
     )))
 }
@@ -346,6 +537,23 @@ async fn connect(url: &str) -> anyhow::Result<PgPool> {
     }
 }
 
+fn witness_keys() -> anyhow::Result<Vec<WitnessKey>> {
+    std::env::var("WITNESS_KEYS")
+        .unwrap_or_default()
+        .split([',', ' ', '\n'])
+        .filter(|k| !k.is_empty())
+        .map(|k| WitnessKey::parse(k).map_err(|e| anyhow::anyhow!("WITNESS_KEYS: {e}")))
+        .collect()
+}
+
+fn log_origin() -> anyhow::Result<String> {
+    let origin = std::env::var("LOG_ORIGIN").unwrap_or_else(|_| "pact.example.com/log".into());
+    if origin.is_empty() || origin.contains(|c: char| c.is_whitespace() || c == '+') {
+        anyhow::bail!("LOG_ORIGIN must be non-empty, without spaces or '+': {origin:?}");
+    }
+    Ok(origin)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let url = std::env::var("DATABASE_URL")?;
@@ -358,6 +566,15 @@ async fn main() -> anyhow::Result<()> {
     let db = connect(&url).await?;
     sqlx::migrate!("./migrations").run(&db).await?;
     let keys = Keys::load_or_create(&db).await?;
+    let log = Log {
+        key: LogKey::new(&log_origin()?, &PublicKey::from(&keys.log)),
+        signer: keys.log.clone(),
+        witnesses: witness_keys()?,
+    };
+    eprintln!("log key {}", log.key.vkey());
+    for w in &log.witnesses {
+        eprintln!("witness {}", w.vkey());
+    }
     publish_manifest(&db, &manifest).await?;
     let company = Endorsement::sign(&keys.manifest, manifest.hash());
     eprintln!("company key {}", company.key.fingerprint());
@@ -367,7 +584,13 @@ async fn main() -> anyhow::Result<()> {
         .route("/healthz", get(healthz))
         .route("/v1/manifest", get(self::manifest))
         .route("/v1/enroll", post(enroll))
-        .route("/v1/log", get(log))
+        .route("/v1/log", get(legacy_log))
+        .route("/v1/log/key", get(log_key))
+        .route("/v1/log/checkpoint", get(log_checkpoint))
+        .route("/v1/log/entries", get(log_entries))
+        .route("/v1/log/proof/inclusion", get(inclusion))
+        .route("/v1/log/proof/consistency", get(consistency))
+        .route("/v1/log/witness", post(witness))
         .route("/v1/nonce", post(nonce))
         .route("/v1/claim", post(claim))
         .with_state(App {
@@ -376,6 +599,7 @@ async fn main() -> anyhow::Result<()> {
             toml: toml.into(),
             company,
             keys: Arc::new(keys),
+            log: Arc::new(log),
         });
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app)
