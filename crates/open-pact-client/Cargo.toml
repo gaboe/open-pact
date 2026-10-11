@@ -19,6 +19,9 @@ hex = "0.4.3"
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring", "pem", "x509-parser"] }
 x509-parser = "0.18"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
 security-framework = "3.7"

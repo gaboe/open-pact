@@ -1053,6 +1053,11 @@ async fn run(cli: Cli) -> Result<ExitCode> {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // Rust ignores SIGPIPE, so `open-pact-client log show | head` would panic on a closed pipe.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     match run(Cli::parse()).await {
         Ok(code) => code,
         Err(e) => {

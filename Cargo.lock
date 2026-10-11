@@ -1468,6 +1468,7 @@ dependencies = [
  "clap",
  "core-foundation",
  "hex",
+ "libc",
  "open-pact-core",
  "rcgen",
  "reqwest",
