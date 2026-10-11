@@ -471,6 +471,13 @@ check = "builtin:auto_login@1"
 output = ["off", "on", "unknown"]
 required = { macos = "off", windows = "off", linux = "off" }
 grace = "0d"
+
+[log]
+# Demo only: this witness key comes from a public seed, so anyone can forge its cosignatures.
+# A real deployment lists witnesses run by someone other than the gateway operator.
+witnesses = [{ name = "witness.example.org/demo", key = "witness.example.org/demo+10c00e9a+BDnDJtIcX1p95tKTK+ggaN1dSvTB9a0EYGVntufeUB5t" }]
+witness_quorum = 1
+checkpoint_max_age = "1h"
 ```
 
 ## Sources

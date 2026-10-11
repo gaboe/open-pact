@@ -365,6 +365,7 @@ mod tests {
     fn policy(quorum: usize, witnesses: &[&Witness]) -> LogPolicy {
         LogPolicy {
             witnesses: witnesses.iter().map(|w| (*w).clone()).collect(),
+            allow_split_views: false,
             witness_quorum: quorum,
             checkpoint_max_age: Span::try_from("1h".to_string()).unwrap(),
         }

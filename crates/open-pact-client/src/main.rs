@@ -476,10 +476,12 @@ async fn sync_checkpoint(
         Ok(checkpoint) => checkpoint,
         Err(e) => return Ok(Err(e.to_string())),
     };
-    if policy.is_none_or(|p| p.witness_quorum == 0) {
+    if policy.is_none_or(|p| p.allow_split_views) {
         eprintln!(
-            "WARNING: the manifest requires no witness cosignatures. The gateway could show this \
-             device another log history than other devices (a split view) and nothing here would notice."
+            "\n!!! WARNING: SPLIT VIEWS ALLOWED !!!\n\
+             The signed manifest sets allow_split_views = true and lists no witnesses. The gateway \
+             could show this device another log history than other devices (a split view) and \
+             nothing here would notice.\n"
         );
     }
     let checked = match &prev {

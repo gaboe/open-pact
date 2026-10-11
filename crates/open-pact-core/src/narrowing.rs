@@ -149,8 +149,15 @@ mod tests {
 
     #[test]
     fn any_witness_policy_change_needs_the_owner() {
+        let listed = DEMO
+            .lines()
+            .find(|l| l.starts_with("witnesses = "))
+            .unwrap();
         rejected(
-            &[("witness_quorum = 1", "witness_quorum = 0")],
+            &[
+                (listed, "witnesses = []\nallow_split_views = true"),
+                ("witness_quorum = 1", "witness_quorum = 0"),
+            ],
             Violation::WitnessPolicyChanged,
         );
         rejected(
