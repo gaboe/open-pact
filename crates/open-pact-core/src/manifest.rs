@@ -102,9 +102,12 @@ impl TryFrom<String> for Span {
             "mo" => Unit::Month,
             _ => return Err(format!("duration {s:?} must end in h, d, w or mo")),
         };
-        let amount = digits
+        let amount: u64 = digits
             .parse()
             .map_err(|_| format!("duration {s:?} must start with a number"))?;
+        if amount > u64::MAX / (31 * DAY) {
+            return Err(format!("duration {s:?} is too long"));
+        }
         Ok(Span { amount, unit })
     }
 }
@@ -273,6 +276,23 @@ mod tests {
     }
 
     #[test]
+    fn paper_appendix_a_parses() {
+        let paper = include_str!("../../../PAPER.md");
+        let appendix = &paper[paper.find("## Appendix A").unwrap()..];
+        let start = appendix.find("```toml\n").unwrap() + "```toml\n".len();
+        let toml = &appendix[start..start + appendix[start..].find("```").unwrap()];
+        let m = Manifest::parse(toml.as_bytes()).unwrap();
+        assert_eq!(m.body().controls.len(), 15);
+        assert!(
+            !m.body()
+                .control("antimalware_active")
+                .unwrap()
+                .required
+                .contains_key(&Os::Linux)
+        );
+    }
+
+    #[test]
     fn required_accepts_a_list() {
         let toml = DEMO.replace(
             r#"required = { macos = "le_5min", windows = "le_5min", linux = "le_5min" }"#,
@@ -302,6 +322,10 @@ mod tests {
         rejects(r#"grace = "0d""#, r#"grace = "0 days""#);
         rejects(r#"source = "company_policy""#, r#"source = "vibes""#);
         rejects("manifest_version = 1", "manifest_version = 1\nextra = true");
+        rejects(
+            r#"claim_retention = "12mo""#,
+            r#"claim_retention = "300000000000000d""#,
+        );
     }
 
     #[test]

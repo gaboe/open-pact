@@ -38,7 +38,6 @@ fn added(old: &BTreeSet<String>, new: &BTreeSet<String>) -> Vec<String> {
     new.difference(old).cloned().collect()
 }
 
-/// Whether `new` may run under the owner's signature on `old` (PAPER 4.2).
 pub fn is_narrowing(old: &Manifest, new: &Manifest) -> Result<(), Vec<Violation>> {
     let (old, new) = (old.body(), new.body());
     let mut v = Vec::new();
