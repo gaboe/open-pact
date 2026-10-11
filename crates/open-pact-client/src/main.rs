@@ -1,3 +1,6 @@
+mod checks;
+mod locallog;
+
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
