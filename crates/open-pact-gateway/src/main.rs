@@ -491,7 +491,10 @@ async fn index(State(app): State<App>) -> Result<Html<String>, Reply> {
         manifest = app.manifest.hash(),
         company = app.company.key.fingerprint(),
         log_size = tree.size(),
-        log_root = root(&tree.leaves),
+        log_root = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(root(&tree.leaves).0)
+        },
         log_witnesses = app.log.witnesses.len(),
         ca = app.keys.ca.fingerprint,
     )))
