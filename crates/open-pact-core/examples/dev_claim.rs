@@ -1,5 +1,5 @@
-//! Prints a claim JWS signed by a throwaway key, for smoke tests that need chosen results.
-//! Usage: dev_claim <manifest.toml|sha256:...> <nonce> <os> [check=value ...]
+//! Prints a claim JWS with chosen results, for smoke tests. The key file is created if missing.
+//! Usage: dev_claim <key.pem> <manifest.toml|sha256:...> <nonce> <os> [check=value ...]
 
 use std::collections::BTreeMap;
 
@@ -10,9 +10,10 @@ use open_pact_core::{
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let [manifest, nonce, os, results @ ..] = args.as_slice() else {
+    let [key, manifest, nonce, os, results @ ..] = args.as_slice() else {
         return Err(
-            "usage: dev_claim <manifest.toml|sha256:...> <nonce> <os> [check=value ...]".into(),
+            "usage: dev_claim <key.pem> <manifest.toml|sha256:...> <nonce> <os> [check=value ...]"
+                .into(),
         );
     };
     let manifest = match ManifestHash::try_from(manifest.clone()) {
@@ -28,7 +29,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .ok_or("expected check=value")
         })
         .collect::<Result<BTreeMap<_, _>, _>>()?;
-    let key = dev_key::generate();
+    let key = dev_key::load_or_create(std::path::Path::new(key))?;
     let device_key = PublicKey::from(&key);
     let claim = Claim {
         manifest,
