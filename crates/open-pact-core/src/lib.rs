@@ -2,12 +2,14 @@ mod claim;
 mod crypto;
 pub mod dev_key;
 mod evaluate;
+mod log;
 mod manifest;
 mod narrowing;
 
 pub use claim::{Claim, VerifiedClaim, Virtualized, sign_claim, verify_claim};
 pub use crypto::{Endorsement, ManifestHash, Pseudonym, PublicKey, Signature, SignedManifest};
 pub use evaluate::{Decision, Reason, evaluate};
+pub use log::{Entry, EntryKind, Head, LogHash, verify_chain};
 pub use manifest::{Accepted, Control, Manifest, ManifestBody, Os, Source, Span, TrustLevel};
 pub use narrowing::{Violation, is_narrowing};
 pub use p256::ecdsa::SigningKey;
@@ -28,6 +30,8 @@ pub enum Error {
     PseudonymMismatch,
     #[error("signing key does not match the claim's device key")]
     KeyMismatch,
+    #[error("transparency log: {0}")]
+    Log(String),
     #[error("key file {path}: {reason}")]
     KeyFile { path: String, reason: String },
 }
