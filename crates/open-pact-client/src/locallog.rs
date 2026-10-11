@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
