@@ -378,6 +378,17 @@ async fn main() -> anyhow::Result<()> {
             keys: Arc::new(keys),
         });
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     Ok(())
+}
+
+async fn shutdown_signal() {
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("install SIGTERM handler");
+    tokio::select! {
+        _ = term.recv() => eprintln!("SIGTERM: finishing open requests"),
+        _ = tokio::signal::ctrl_c() => eprintln!("SIGINT: finishing open requests"),
+    }
 }
