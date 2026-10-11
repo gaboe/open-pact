@@ -45,22 +45,39 @@ impl EnrolRequest {
         owner: &SigningKey,
         device: &SigningKey,
     ) -> Result<Self, Error> {
+        Self::sign_with(
+            signed_manifest,
+            invitation_code,
+            owner,
+            &PublicKey::from(device),
+            |statement| Ok::<_, Error>(Signature::sign(device, statement)),
+        )
+    }
+
+    /// Signs with a device key held elsewhere, such as a Secure Enclave; `device_key` is the public
+    /// half of `sign_device`.
+    pub fn sign_with<E: From<Error>>(
+        signed_manifest: SignedManifest,
+        invitation_code: InvitationCode,
+        owner: &SigningKey,
+        device_key: &PublicKey,
+        sign_device: impl FnOnce(&[u8]) -> Result<Signature, E>,
+    ) -> Result<Self, E> {
         if signed_manifest.owner.key != PublicKey::from(owner) {
-            return Err(Error::KeyMismatch);
+            return Err(Error::KeyMismatch.into());
         }
         let manifest = Manifest::parse(signed_manifest.toml.as_bytes())?;
-        let device_key = PublicKey::from(device);
         let statement = enrol_statement(
             manifest.hash(),
             &invitation_code.hash(),
             &signed_manifest.owner.key,
-            &device_key,
+            device_key,
         );
         Ok(Self {
             owner_signature: Signature::sign(owner, &statement),
-            device_signature: Signature::sign(device, &statement),
+            device_signature: sign_device(&statement)?,
             signed_manifest,
-            device_key,
+            device_key: device_key.clone(),
             invitation_code,
         })
     }

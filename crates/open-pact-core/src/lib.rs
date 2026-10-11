@@ -9,7 +9,9 @@ mod manifest;
 mod narrowing;
 mod note;
 
-pub use claim::{Claim, LogCheckpoint, VerifiedClaim, Virtualized, sign_claim, verify_claim};
+pub use claim::{
+    Claim, LogCheckpoint, VerifiedClaim, Virtualized, sign_claim, sign_claim_with, verify_claim,
+};
 pub use crypto::{Endorsement, ManifestHash, Pseudonym, PublicKey, Signature, SignedManifest};
 pub use enrol::{EnrolRequest, enrol_statement};
 pub use evaluate::{Decision, Reason, evaluate};

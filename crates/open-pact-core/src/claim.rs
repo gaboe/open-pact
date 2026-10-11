@@ -91,18 +91,29 @@ impl VerifiedClaim {
 }
 
 pub fn sign_claim(claim: &Claim, key: &SigningKey) -> Result<String, Error> {
-    if claim.device_key != PublicKey::from(key) {
-        return Err(Error::KeyMismatch);
+    sign_claim_with(claim, &PublicKey::from(key), |input| {
+        Ok::<_, Error>(Signature::sign(key, input))
+    })
+}
+
+/// Signs with a key held elsewhere, such as a Secure Enclave; `key` is the public half of the signer.
+pub fn sign_claim_with<E: From<Error>>(
+    claim: &Claim,
+    key: &PublicKey,
+    sign: impl FnOnce(&[u8]) -> Result<Signature, E>,
+) -> Result<String, E> {
+    if &claim.device_key != key {
+        return Err(Error::KeyMismatch.into());
     }
     if claim.device != Pseudonym::of(&claim.device_key) {
-        return Err(Error::PseudonymMismatch);
+        return Err(Error::PseudonymMismatch.into());
     }
     let input = format!(
         "{}.{}",
         B64.encode(HEADER),
         B64.encode(claim.canonical_json())
     );
-    let signature = Signature::sign(key, input.as_bytes());
+    let signature = sign(input.as_bytes())?;
     Ok(format!("{input}.{}", signature.to_b64()))
 }
 

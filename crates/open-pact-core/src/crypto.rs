@@ -93,6 +93,13 @@ impl PublicKey {
         self.0.to_sec1_point(false).as_bytes().to_vec()
     }
 
+    /// Uncompressed SEC1 point (`04 || x || y`), the X9.63 form Security.framework exports.
+    pub fn from_sec1(bytes: &[u8]) -> Result<Self, Error> {
+        VerifyingKey::from_sec1_bytes(bytes)
+            .map(Self)
+            .map_err(|_| Error::InvalidKey)
+    }
+
     pub fn fingerprint(&self) -> String {
         format!("sha256:{}", sha256_hex(&self.sec1_uncompressed()))
     }
@@ -169,8 +176,15 @@ impl From<PublicKey> for Jwk {
 pub struct Signature(p256::ecdsa::Signature);
 
 impl Signature {
-    pub(crate) fn sign(key: &SigningKey, message: &[u8]) -> Self {
+    pub fn sign(key: &SigningKey, message: &[u8]) -> Self {
         Self(key.sign(message))
+    }
+
+    /// ASN.1 DER ECDSA, as hardware keys return it; normalized to low-S so each signature has one JWS form.
+    pub fn from_der(der: &[u8]) -> Option<Self> {
+        p256::ecdsa::Signature::from_der(der)
+            .ok()
+            .map(|sig| Self(sig.normalize_s()))
     }
 
     pub(crate) fn from_bytes(bytes: &[u8]) -> Option<Self> {
@@ -269,6 +283,38 @@ mod tests {
             Pseudonym::of(&public).as_str(),
             "pseudonym:256b1be32745d1d1c9d49121cc87bc451c4f2dfa756d89b4c910afaeb6258ae0"
         );
+    }
+
+    #[test]
+    fn der_signature_becomes_low_s_raw_that_verifies() {
+        let key = dev_key::generate();
+        let public = PublicKey::from(&key);
+        let sig: p256::ecdsa::Signature = key.sign(b"message");
+        let (r, s) = sig.split_scalars();
+        let high_s = p256::ecdsa::Signature::from_scalars(r.to_bytes(), (-*s).to_bytes()).unwrap();
+        let low = sig.normalize_s();
+        for der in [sig.to_der(), high_s.to_der()] {
+            let parsed = Signature::from_der(der.as_bytes()).unwrap();
+            assert_eq!(parsed.0.to_bytes(), low.to_bytes());
+            assert!(public.verify(b"message", &parsed));
+            let jws_form = Signature::try_from(parsed.to_b64()).unwrap();
+            assert!(public.verify(b"message", &jws_form));
+        }
+        assert!(!public.verify(
+            b"other",
+            &Signature::from_der(sig.to_der().as_bytes()).unwrap()
+        ));
+        assert!(Signature::from_der(&low.to_bytes()).is_none());
+    }
+
+    #[test]
+    fn sec1_public_key_roundtrips_and_rejects_garbage() {
+        let public = PublicKey::from(&dev_key::generate());
+        assert_eq!(
+            PublicKey::from_sec1(&public.sec1_uncompressed()).unwrap(),
+            public
+        );
+        assert!(PublicKey::from_sec1(&[4; 65]).is_err());
     }
 
     #[test]
