@@ -159,6 +159,26 @@ fn denied(reasons: Vec<String>) -> Reply {
     )
 }
 
+async fn bind_invitation(
+    tx: &mut sqlx::PgConnection,
+    req: &EnrolRequest,
+    device: &Pseudonym,
+    manifest: &str,
+) -> sqlx::Result<bool> {
+    sqlx::query(
+        "UPDATE devices SET invitation = $1, enrol_owner_signature = $2, enrol_device_signature = $3 \
+         WHERE pseudonym = $4 AND manifest_hash = $5",
+    )
+    .bind(req.invitation_code.hash().as_str())
+    .bind(String::from(req.owner_signature.clone()))
+    .bind(String::from(req.device_signature.clone()))
+    .bind(device.as_str())
+    .bind(manifest)
+    .execute(tx)
+    .await
+    .map(|r| r.rows_affected() == 1)
+}
+
 /// The same answer for an unknown, expired, used and someone else's invitation.
 fn invalid_invitation() -> Reply {
     denied(vec!["invalid or used invitation".into()])
@@ -428,8 +448,8 @@ async fn enroll(
 
     let mut tx = app.db.begin().await.map_err(internal)?;
     translog::lock(&mut tx).await.map_err(internal)?;
-    let existing: Option<(Value, String, String)> = sqlx::query_as(
-        "SELECT owner_key, salt, state FROM devices WHERE pseudonym = $1 AND manifest_hash = $2 FOR UPDATE",
+    let existing: Option<(Value, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT owner_key, salt, state, invitation FROM devices WHERE pseudonym = $1 AND manifest_hash = $2 FOR UPDATE",
     )
     .bind(device.as_str())
     .bind(app.manifest.hash().as_str())
@@ -437,7 +457,7 @@ async fn enroll(
     .await
     .map_err(internal)?;
     let (salt, state, log_index) = match existing {
-        Some((existing_owner, salt, state)) => {
+        Some((existing_owner, salt, state, stored_invitation)) => {
             if existing_owner != owner_key {
                 return Err((
                     StatusCode::CONFLICT,
@@ -446,10 +466,22 @@ async fn enroll(
                     ),
                 ));
             }
-            if !invitations::used_by(&mut tx, &invitation, &device)
-                .await
-                .map_err(internal)?
-            {
+            let accepted = match stored_invitation {
+                Some(_) => invitations::used_by(&mut tx, &invitation, &device)
+                    .await
+                    .map_err(internal)?,
+                // Enrolled before invitations existed: a fresh invitation binds the row and
+                // pins the client, and the device keeps its state.
+                None => {
+                    invitations::consume(&mut tx, &invitation, &device)
+                        .await
+                        .map_err(internal)?
+                        && bind_invitation(&mut tx, &req, &device, app.manifest.hash().as_str())
+                            .await
+                            .map_err(internal)?
+                }
+            };
+            if !accepted {
                 return Err(invalid());
             }
             let index: i64 = sqlx::query_scalar(

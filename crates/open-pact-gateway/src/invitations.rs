@@ -92,14 +92,12 @@ mod tests {
         }
     }
 
-    /// Runs against a real database when TEST_DATABASE_URL is set, for example a throwaway
+    /// Run with `cargo test -- --ignored` and TEST_DATABASE_URL set, for example to a throwaway
     /// `docker run -p 55432:5432 -e POSTGRES_PASSWORD=pact postgres:17`.
     #[tokio::test]
+    #[ignore = "needs TEST_DATABASE_URL"]
     async fn concurrent_enrolments_consume_one_invitation_once() {
-        let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
-            eprintln!("TEST_DATABASE_URL not set; skipping");
-            return;
-        };
+        let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL");
         let db = sqlx::postgres::PgPoolOptions::new()
             .max_connections(20)
             .connect(&url)
@@ -107,6 +105,15 @@ mod tests {
             .unwrap();
         sqlx::migrate!("./migrations").run(&db).await.unwrap();
         let (code, _) = create(&db, Duration::hours(1), "race").await.unwrap();
+        let stored: Vec<String> = sqlx::query_scalar(
+            "SELECT concat_ws(' ', hash, note, used_by) FROM invitations WHERE note = 'race' AND hash = $1",
+        )
+        .bind(code.hash().as_str())
+        .fetch_all(&db)
+        .await
+        .unwrap();
+        assert_eq!(stored, [format!("{} race", code.hash())]);
+        assert!(!stored[0].contains(&String::from(code.clone())));
         let attempts = (0..16u8).map(|i| {
             let (db, hash) = (db.clone(), code.hash());
             tokio::spawn(async move {
