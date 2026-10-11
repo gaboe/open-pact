@@ -44,7 +44,7 @@ jobs:
           sbom: false
           no-cache: true
           build-args: SOURCE_DATE_EPOCH=${{ steps.epoch.outputs.value }}
-          outputs: type=image,push=true,rewrite-timestamp=true
+          outputs: type=image,push=true,rewrite-timestamp=true,oci-mediatypes=true
           labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}
           tags: |
             ${{ env.GATEWAY_IMAGE }}:${{ github.sha }}
@@ -83,7 +83,7 @@ jobs:
           sbom: false
           no-cache: true
           build-args: SOURCE_DATE_EPOCH=${{ steps.epoch.outputs.value }}
-          outputs: type=image,push=true,rewrite-timestamp=true
+          outputs: type=image,push=true,rewrite-timestamp=true,oci-mediatypes=true
           labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}
           tags: |
             ${{ env.WITNESS_IMAGE }}:${{ github.sha }}
@@ -116,7 +116,7 @@ jobs:
           sbom: false
           no-cache: true
           build-args: SOURCE_DATE_EPOCH=${{ steps.epoch.outputs.value }}
-          outputs: type=oci,dest=${{ runner.temp }}/rebuild.tar,rewrite-timestamp=true
+          outputs: type=oci,dest=${{ runner.temp }}/rebuild.tar,rewrite-timestamp=true,oci-mediatypes=true
           labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}
 
       - name: Compare digests

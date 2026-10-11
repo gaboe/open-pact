@@ -4,6 +4,8 @@
 set -euo pipefail
 
 REPO_URL="${REPO_URL:-https://github.com/gaboe/open-pact.git}"
+# CI labels the image with this URL; the label is part of the image config and so of the digest.
+SOURCE_URL="${SOURCE_URL:-${REPO_URL%.git}}"
 
 target=""
 args=()
@@ -45,7 +47,8 @@ docker buildx --builder "$builder" build \
   --platform linux/amd64 \
   --provenance=false --sbom=false \
   --build-arg SOURCE_DATE_EPOCH="$epoch" \
-  --output "type=oci,dest=$work/image.tar,rewrite-timestamp=true" \
+  --label "org.opencontainers.image.source=$SOURCE_URL" \
+  --output "type=oci,dest=$work/image.tar,rewrite-timestamp=true,oci-mediatypes=true" \
   --metadata-file "$work/meta.json" \
   "$work/src"
 
