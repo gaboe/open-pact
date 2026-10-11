@@ -105,6 +105,9 @@ status=$?
 end=$(date +%s%N)
 echo "$out" | sed -n 's/^\(test .* \.\.\. \)\{0,1\}\([a-z_]* = .*\)$/\2/p'
 echo "elapsed_ms = $(( (end - start) / 1000000 ))"
-grep -q panicked /tmp/stderr && echo "panic = yes"
+if grep -q panicked /tmp/stderr; then
+    echo "panic = yes"
+    [ $status -ne 0 ] || status=101
+fi
 [ $status -eq 0 ] || { echo "exit = $status"; cat /tmp/stderr >&2; }
-exit 0
+exit $status

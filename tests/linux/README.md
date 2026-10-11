@@ -13,12 +13,40 @@ on Fedora, because a container has no systemd and cannot fake a past date.
 `patch-real` uses the history the image build wrote with the real package
 manager.
 
+## Expected values
+
+`expected.txt` lists the value each check must report per distro and variant.
+`scripts/linux-checks.sh` fails on any difference, on a nonzero container exit
+(the entrypoint exits with the test status), on a panic, and on a slow run.
+`selftest.sh` runs the script against a fake `docker` and proves it rejects a
+corrupted cell, an all-`unknown` run, and a failed process.
+
+Two cells depend on the clock and accept several values. `os_patch_age` in the
+real-history variants must be a date bucket, because the image build date sets
+it. Fedora `os_supported` follows the Fedora 43 end-of-life date.
+
+## What the checks count
+
+`disk_encryption` reads `lsblk -s` and judges every writable, non-removable,
+persistent block filesystem plus swap: `full` when all have a crypt ancestor,
+`partial` when some do, `none` when none do. Read-only and removable media,
+loop and optical devices, zram, squashfs/iso/tmpfs/overlay, and the boot
+mounts (`/boot`, `/boot/efi`, `/efi`) are excluded.
+
+`firewall` reports ufw as on only when `/etc/ufw/ufw.conf` has `ENABLED=yes`
+and the service is active. firewalld counts when `firewall-cmd --state` says
+`running`.
+
+`os_patch_age` counts a whole-system upgrade, or a transaction that upgraded
+a kernel or base OS package. A single application install or upgrade does not
+reset it.
+
 ## Checks that report `unknown` in a container, and why
 
 | Check | Baseline value | Reason |
 | --- | --- | --- |
 | `disk_encryption` | `unknown` | The container root is an overlay mount. `lsblk` lists no device mounted at `/`, so the root cannot be classified. |
-| `firewall` | `unknown` | `firewall-cmd` cannot reach firewalld (no D-Bus, no daemon). `systemctl is-active ufw` fails without systemd as init, and no `/etc/ufw/ufw.conf` says `ENABLED=yes`. |
+| `firewall` | `off` on Ubuntu, `unknown` on Fedora | `firewall-cmd` cannot reach firewalld (no D-Bus, no daemon). Ubuntu has no `ufw.conf` with `ENABLED=yes` and `systemctl is-active ufw` reports inactive, so it reads `off`. Fedora has neither, so it reads `unknown`. |
 | `screen_lock` | `unknown` | `XDG_CURRENT_DESKTOP` is unset. No desktop session runs. |
 | `auto_login` | `unknown` | No display manager config file exists. |
 | `secure_boot` | `unknown` | No `mokutil` and no EFI variables in the container. |
