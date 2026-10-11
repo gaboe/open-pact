@@ -1216,6 +1216,42 @@ mod tests {
             .collect()
     }
 
+    /// No sent request is kept in any column of any table, nor in any opened claim or its JWS:
+    /// not as PEM, not as base64 of its DER in either alphabet, not under a `csr_pem` key.
+    async fn assert_no_request_retained(db: &PgPool, pems: &[String]) {
+        use base64::Engine;
+        let tables: Vec<String> = sqlx::query_scalar(
+            "SELECT table_name::text FROM information_schema.tables WHERE table_schema = 'public'",
+        )
+        .fetch_all(db)
+        .await
+        .unwrap();
+        let mut texts = stored_text(db).await;
+        for table in tables {
+            texts.push(
+                sqlx::query_scalar(&format!(
+                    "SELECT coalesce(string_agg(row_to_json(t)::text, ' '), '') FROM {table} t"
+                ))
+                .fetch_one(db)
+                .await
+                .unwrap(),
+            );
+        }
+        let texts = texts.join("\n");
+        assert!(!texts.contains("csr_pem") && !texts.contains("CERTIFICATE REQUEST"));
+        for pem in pems {
+            let body: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
+            let der = base64::engine::general_purpose::STANDARD
+                .decode(&body)
+                .unwrap();
+            let url = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&der);
+            for encoded in [&body, &url] {
+                let chunk = &encoded[encoded.len() / 2..encoded.len() / 2 + 40];
+                assert!(!texts.contains(chunk), "a sent request is retained");
+            }
+        }
+    }
+
     /// M3: the request travels beside the JWS; the company keeps its hash and the certificate's.
     #[tokio::test]
     #[ignore = "needs TEST_DATABASE_URL"]
@@ -1232,9 +1268,8 @@ mod tests {
 
         let stored = stored_text(&db).await;
         assert_eq!(stored.len(), 1);
-        let pem_body = pem.lines().nth(1).unwrap();
-        assert!(!stored[0].contains("CERTIFICATE REQUEST") && !stored[0].contains(pem_body));
         assert!(stored[0].contains(&keys::certificate_sha256(certificate).unwrap()));
+        assert_no_request_retained(&db, &[pem]).await;
     }
 
     /// M3: a request with anything besides its key, or another request than the claim signs, gets no certificate.
@@ -1251,9 +1286,10 @@ mod tests {
             .serialize_request(&rcgen::KeyPair::generate().unwrap())
             .unwrap();
         let (other_pem, _) = bare_csr();
+        let sent_pems = [texty.pem().unwrap(), other_pem];
         for (signed, sent) in [
-            (CsrHash::of(texty.der()), texty.pem().unwrap()),
-            (CsrHash::of(&bare_csr().1), other_pem),
+            (CsrHash::of(texty.der()), &sent_pems[0]),
+            (CsrHash::of(&bare_csr().1), &sent_pems[1]),
         ] {
             let (key, mut claim) = enrolled_claim(&app, &db, DEMO).await;
             claim.csr_sha256 = Some(signed);
@@ -1263,12 +1299,12 @@ mod tests {
             assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
             assert!(body["reasons"].to_string().contains("csr"), "{body}");
         }
-        assert!(
-            stored_text(&db)
-                .await
-                .iter()
-                .all(|r| !r.contains("FICTIONAL"))
+        assert_eq!(
+            stored_text(&db).await.len(),
+            2,
+            "both denied claims are kept"
         );
+        assert_no_request_retained(&db, &sent_pems).await;
     }
 
     async fn post_from(app: &Router, path: &str, body: &str) -> StatusCode {
