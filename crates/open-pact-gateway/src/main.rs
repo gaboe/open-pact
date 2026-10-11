@@ -2,6 +2,7 @@ mod devices;
 mod grace;
 mod invitations;
 mod keys;
+mod nonces;
 mod ratelimit;
 #[cfg(test)]
 mod testdb;
@@ -88,6 +89,8 @@ struct App {
     log: Arc<Log>,
     auto_approve: bool,
     limiter: Arc<Limiter>,
+    nonce_limiter: Arc<Limiter>,
+    max_nonces: i64,
 }
 
 struct Log {
@@ -403,14 +406,47 @@ async fn witness(State(app): State<App>, body: String) -> Result<Json<Value>, Re
     ))
 }
 
-async fn nonce(State(app): State<App>) -> Result<Json<Value>, Reply> {
-    let nonce = hex::encode(rand::random::<[u8; 32]>());
-    sqlx::query("INSERT INTO nonces (nonce, expires_at) VALUES ($1, now() + interval '5 minutes')")
-        .bind(&nonce)
-        .execute(&app.db)
+fn too_many(reason: &str) -> Reply {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(json!({"status": "denied", "reasons": [reason]})),
+    )
+}
+
+async fn nonce(
+    State(app): State<App>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Result<Json<Value>, Reply> {
+    let now = Instant::now();
+    if app.nonce_limiter.blocked(peer.ip(), now) {
+        return Err(too_many(
+            "too many nonces requested from this address; try again later",
+        ));
+    }
+    app.nonce_limiter.record(peer.ip(), now);
+    match nonces::issue(&app.db, app.max_nonces)
         .await
-        .map_err(internal)?;
-    Ok(Json(json!({ "nonce": nonce })))
+        .map_err(internal)?
+    {
+        Some(nonce) => Ok(Json(json!({ "nonce": nonce }))),
+        None => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(
+                json!({"status": "error", "reason": "too many outstanding nonces; try again later"}),
+            ),
+        )),
+    }
+}
+
+/// Expired nonces are refused anyway; deleting them keeps the table and the cap count small.
+async fn delete_expired_nonces(db: PgPool) {
+    let mut tick = tokio::time::interval(Duration::from_secs(60));
+    loop {
+        tick.tick().await;
+        if let Err(e) = nonces::delete_expired(&db).await {
+            eprintln!("deleting expired nonces: {e}");
+        }
+    }
 }
 
 async fn enroll(
@@ -419,11 +455,8 @@ async fn enroll(
     body: Result<Json<EnrolRequest>, JsonRejection>,
 ) -> Result<Json<Value>, Reply> {
     if app.limiter.blocked(peer.ip(), Instant::now()) {
-        return Err((
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(
-                json!({"status": "denied", "reasons": ["too many failed enrolments from this address; try again later"]}),
-            ),
+        return Err(too_many(
+            "too many failed enrolments from this address; try again later",
         ));
     }
     let Json(req) = body.map_err(|e| denied(vec![e.body_text()]))?;
@@ -445,7 +478,7 @@ async fn enroll(
     let invitation = req.invitation_code.hash();
     let owner_key = serde_json::to_value(&signed.owner.key).map_err(internal)?;
     let invalid = || {
-        app.limiter.failed(peer.ip(), Instant::now());
+        app.limiter.record(peer.ip(), Instant::now());
         invalid_invitation()
     };
 
@@ -839,6 +872,12 @@ async fn serve(db: PgPool) -> anyhow::Result<()> {
         Duration::from_secs(env_number("ENROL_FAILURE_WINDOW_SECS", 600)?),
         100_000,
     );
+    let nonce_limiter = Limiter::new(
+        env_number("NONCE_MAX_PER_WINDOW", 600)?,
+        Duration::from_secs(env_number("NONCE_WINDOW_SECS", 60)?),
+        100_000,
+    );
+    let max_nonces = env_number("NONCE_MAX_OUTSTANDING", 10_000)?;
     let keys = Keys::load_or_create(&db).await?;
     let log = Log {
         key: log_key(&keys)?,
@@ -857,6 +896,7 @@ async fn serve(db: PgPool) -> anyhow::Result<()> {
     if auto_approve {
         eprintln!("AUTO_APPROVE=true: enrolled devices are approved without IT");
     }
+    tokio::spawn(delete_expired_nonces(db.clone()));
     let app = Router::new()
         .route("/", get(index))
         .route("/healthz", get(healthz))
@@ -880,6 +920,8 @@ async fn serve(db: PgPool) -> anyhow::Result<()> {
             log: Arc::new(log),
             auto_approve,
             limiter: Arc::new(limiter),
+            nonce_limiter: Arc::new(nonce_limiter),
+            max_nonces,
         });
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(

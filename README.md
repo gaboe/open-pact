@@ -61,7 +61,7 @@ The gateway image is reproducible: a pinned toolchain and builder, a static musl
 | --- | --- |
 | `GET /v1/manifest` | `{toml, company}`: the enforced manifest and the company's signature over its hash |
 | `POST /v1/enroll {signed_manifest, device_key, invitation_code, owner_signature, device_signature}` | `{status: "enrolled", device, state, salt, log_index, manifest_log_index, log_checkpoint}`. See [Enrolment](#enrolment). `state` is `pending` until IT approves. |
-| `POST /v1/nonce` | `{nonce}`, single use, valid 5 minutes |
+| `POST /v1/nonce` | `{nonce}`, single use, valid 5 minutes; 429 after `NONCE_MAX_PER_WINDOW` (default 600) nonces in `NONCE_WINDOW_SECS` (default 60) from one address, IPv6 per /64; 503 while `NONCE_MAX_OUTSTANDING` (default 10000) unexpired nonces exist. Expired nonces are deleted every minute |
 | `POST /v1/claim {jws}` | `{status: "accepted", warnings, certificate_pem, ca_pem, log_checkpoint}`, or 403 `{status: "denied", reasons}` |
 | `GET /v1/log/key` | the log verifier key, `<origin>+<key id>+<base64 key>` |
 | `GET /v1/log/checkpoint` | the signed checkpoint note, with stored witness cosignatures |
@@ -147,7 +147,7 @@ On first start the gateway generates its company manifest-signing key, its log-s
 ## Known gaps
 
 - The invitation is a bearer secret, and its fingerprints are only as authentic as the channel that carried it. A relay that forwards the public endpoints passes the fingerprint check and can use a code it intercepts. TLS and IT approval of the device code are the defences; confirm the company key fingerprint over a second channel.
-- Behind an ingress the gateway sees the ingress address, so the failure limit applies to all enrolments together. The gateway does not read `X-Forwarded-For`. The limit is in memory and per replica.
+- Behind an ingress the gateway sees the ingress address, so the enrolment failure limit applies to all enrolments together and the nonce limit to all devices together. Size `NONCE_MAX_PER_WINDOW` for the whole fleet in that case. The gateway does not read `X-Forwarded-For`. The limits are in memory and per replica.
 - Approval belongs to one manifest hash. When the gateway enforces a new manifest, the owner needs a new invitation and IT approves again.
 - The client prints witness cosignatures with the checkpoint but does not verify them, because it has no list of witness keys yet. The demo witness signs any checkpoint it is given; a real witness first checks a consistency proof from the last checkpoint it cosigned.
 - The summary page counts stored claims only. Replays, bad signatures, unenrolled devices and oversharing claims are refused without being stored.

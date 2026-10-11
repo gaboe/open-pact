@@ -34,6 +34,12 @@ spec:
               value: {{ .Values.autoApprove | quote }}
             - name: WITNESS_KEYS
               value: {{ join "," .Values.log.witnessKeys | quote }}
+            - name: NONCE_MAX_PER_WINDOW
+              value: {{ .Values.nonces.maxPerWindow | quote }}
+            - name: NONCE_WINDOW_SECS
+              value: {{ .Values.nonces.windowSecs | quote }}
+            - name: NONCE_MAX_OUTSTANDING
+              value: {{ .Values.nonces.maxOutstanding | quote }}
             {{- if .Values.database.externalUrl }}
             - name: DATABASE_URL
               value: {{ .Values.database.externalUrl | quote }}

@@ -32,6 +32,13 @@ database:
 # URL the clients use, written into invitations. Defaults to https://<ingress.host>.
 publicUrl: ""
 
+nonces:
+  # Per source address and window. Behind the ingress every device shares one address, so size it for the fleet.
+  maxPerWindow: 600
+  windowSecs: 60
+  # POST /v1/nonce answers 503 while this many unexpired nonces exist.
+  maxOutstanding: 10000
+
 # Approve enrolled devices without IT. Off: IT runs `open-pact-gateway devices approve`.
 autoApprove: false
 

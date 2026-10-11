@@ -3,11 +3,11 @@ use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// Counts failed enrolments per source address in fixed windows. IPv6 counts per /64, because
-/// one host usually holds the whole /64. Behind an ingress every request has the ingress address,
-/// so the limit then applies to all enrolments together.
+/// Counts events per source address in fixed windows: failed enrolments, issued nonces. IPv6
+/// counts per /64, because one host usually holds the whole /64. Behind an ingress every request
+/// has the ingress address, so the limit then applies to all clients together.
 pub struct Limiter {
-    max_failures: u32,
+    max_events: u32,
     window: Duration,
     capacity: usize,
     seen: Mutex<HashMap<IpAddr, (Instant, u32)>>,
@@ -27,9 +27,9 @@ fn bucket(ip: IpAddr) -> IpAddr {
 }
 
 impl Limiter {
-    pub fn new(max_failures: u32, window: Duration, capacity: usize) -> Self {
+    pub fn new(max_events: u32, window: Duration, capacity: usize) -> Self {
         Self {
-            max_failures,
+            max_events,
             window,
             capacity,
             seen: Mutex::new(HashMap::new()),
@@ -40,19 +40,19 @@ impl Limiter {
         let mut seen = self.seen.lock().expect("limiter lock");
         match seen.get(&bucket(ip)) {
             Some((start, count)) if now.duration_since(*start) < self.window => {
-                *count >= self.max_failures
+                *count >= self.max_events
             }
             _ => {
                 if seen.len() >= self.capacity {
                     seen.retain(|_, (start, _)| now.duration_since(*start) < self.window);
                 }
-                // Fails closed: while too many addresses fail at once, new addresses wait.
+                // Fails closed: while too many addresses are counted at once, new addresses wait.
                 seen.len() >= self.capacity
             }
         }
     }
 
-    pub fn failed(&self, ip: IpAddr, now: Instant) {
+    pub fn record(&self, ip: IpAddr, now: Instant) {
         let mut seen = self.seen.lock().expect("limiter lock");
         let entry = seen.entry(bucket(ip)).or_insert((now, 0));
         if now.duration_since(entry.0) >= self.window {
@@ -69,12 +69,12 @@ mod tests {
     const MIN: Duration = Duration::from_secs(60);
 
     #[test]
-    fn blocks_after_max_failures_until_the_window_ends() {
+    fn blocks_after_max_events_until_the_window_ends() {
         let l = Limiter::new(3, MIN, 100);
         let (ip, t0) = ("192.0.2.1".parse().unwrap(), Instant::now());
         for _ in 0..3 {
             assert!(!l.blocked(ip, t0));
-            l.failed(ip, t0);
+            l.record(ip, t0);
         }
         assert!(l.blocked(ip, t0 + Duration::from_secs(59)));
         assert!(!l.blocked("192.0.2.2".parse().unwrap(), t0));
@@ -85,7 +85,7 @@ mod tests {
     fn ipv6_addresses_in_one_64_share_a_count() {
         let l = Limiter::new(1, MIN, 100);
         let t0 = Instant::now();
-        l.failed("2001:db8:1:2::1".parse().unwrap(), t0);
+        l.record("2001:db8:1:2::1".parse().unwrap(), t0);
         assert!(l.blocked("2001:db8:1:2:ffff::9".parse().unwrap(), t0));
         assert!(!l.blocked("2001:db8:1:3::1".parse().unwrap(), t0));
     }
@@ -94,8 +94,8 @@ mod tests {
     fn a_full_table_drops_expired_entries_and_otherwise_fails_closed() {
         let l = Limiter::new(5, MIN, 2);
         let t0 = Instant::now();
-        l.failed("192.0.2.1".parse().unwrap(), t0);
-        l.failed("192.0.2.2".parse().unwrap(), t0);
+        l.record("192.0.2.1".parse().unwrap(), t0);
+        l.record("192.0.2.2".parse().unwrap(), t0);
         assert!(l.blocked("192.0.2.3".parse().unwrap(), t0));
         assert!(!l.blocked("192.0.2.3".parse().unwrap(), t0 + MIN));
     }
