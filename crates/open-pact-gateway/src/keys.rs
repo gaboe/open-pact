@@ -179,6 +179,46 @@ mod tests {
     }
 
     #[test]
+    fn takes_only_the_public_key_from_the_csr() {
+        let vpn_key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(vec!["vpn.example.com".to_string()]).unwrap();
+        params.distinguished_name = common_name("admin");
+        params
+            .distinguished_name
+            .push(DnType::OrganizationName, "Example Corp");
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let csr = params.serialize_request(&vpn_key).unwrap().pem().unwrap();
+        params.custom_extensions = vec![rcgen::CustomExtension::from_oid_content(
+            &[1, 3, 6, 1, 4, 1, 32473, 1],
+            vec![0x05, 0x00],
+        )];
+        let unknown = params.serialize_request(&vpn_key).unwrap().pem().unwrap();
+        assert!(ca().issue(&unknown, "abc", Duration::hours(1)).is_err());
+        let issued = ca().issue(&csr, "abc", Duration::hours(1)).unwrap();
+        let der = der(&issued);
+        let (_, cert) = X509Certificate::from_der(&der).unwrap();
+
+        assert_eq!(cert.subject().to_string(), "CN=abc");
+        let oids: Vec<String> = cert
+            .extensions()
+            .iter()
+            .map(|e| e.oid.to_id_string())
+            .collect();
+        assert_eq!(
+            oids,
+            [
+                "2.5.29.35", // authority key identifier
+                "2.5.29.15", // key usage: digitalSignature
+                "2.5.29.37", // extended key usage: clientAuth
+            ]
+        );
+        assert!(!cert.is_ca());
+        let ku = cert.key_usage().unwrap().unwrap().value;
+        assert!(ku.digital_signature() && !ku.key_cert_sign());
+    }
+
+    #[test]
     fn rejects_csr_with_a_broken_signature() {
         let pem = csr(&KeyPair::generate().unwrap());
         let mut lines: Vec<String> = pem.lines().map(str::to_string).collect();
