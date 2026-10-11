@@ -3,7 +3,7 @@ use std::fmt;
 
 use chrono::{DateTime, NaiveDate, TimeDelta, Utc};
 
-use crate::{Accepted, Claim, Manifest, ManifestHash, Os, Span, TrustLevel};
+use crate::{Accepted, Claim, Manifest, ManifestHash, Metadata, Os, Span, TrustLevel};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
@@ -97,6 +97,8 @@ pub enum Reason {
         claimed: TrustLevel,
         min: TrustLevel,
     },
+    #[error("{0} is not in disclosed_metadata")]
+    UndisclosedMetadata(Metadata),
     #[error("{id} is not in the manifest")]
     UnknownControl { id: String },
     #[error("{id} = {value} is not an output the manifest allows")]
@@ -123,7 +125,10 @@ impl Reason {
     pub fn breaks_disclosure_contract(&self) -> bool {
         matches!(
             self,
-            Reason::UnknownControl { .. } | Reason::UndisclosedValue { .. } | Reason::BadClient
+            Reason::UnknownControl { .. }
+                | Reason::UndisclosedValue { .. }
+                | Reason::UndisclosedMetadata(_)
+                | Reason::BadClient
         )
     }
 }
@@ -156,6 +161,14 @@ pub fn evaluate(
 
     if !is_client_version(&claim.client) {
         deny.push(Reason::BadClient);
+    }
+    for (field, sent) in [
+        (Metadata::Virtualized, claim.virtualized.is_some()),
+        (Metadata::LogCheckpoint, claim.log_checkpoint.is_some()),
+    ] {
+        if sent && !body.discloses(field) {
+            deny.push(Reason::UndisclosedMetadata(field));
+        }
     }
     if &claim.manifest != manifest.hash() {
         deny.push(Reason::WrongManifest {
@@ -289,7 +302,7 @@ mod tests {
             client: "open-pact-client 0.0.1".into(),
             os: Os::Macos,
             trust_level: TrustLevel::L0,
-            virtualized: Virtualized::No,
+            virtualized: Some(Virtualized::No),
             results: results
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -362,6 +375,27 @@ mod tests {
             assert!(reasons.iter().any(Reason::breaks_disclosure_contract));
             assert!(Reason::BadClient.to_string().starts_with("client must be"));
         }
+    }
+
+    #[test]
+    fn denies_metadata_the_manifest_does_not_list_and_does_not_store_it() {
+        let toml = DEMO.replace(r#", "log_checkpoint"]"#, "]");
+        assert_ne!(toml, DEMO);
+        let m = Manifest::parse(toml.as_bytes()).unwrap();
+        let mut c = claim(&PASSING);
+        c.manifest = m.hash().clone();
+        c.log_checkpoint = Some(crate::LogCheckpoint {
+            size: 1,
+            root: crate::LogHash([0; 32]),
+        });
+        let Decision::Deny { reasons } = decide(&m, &c, now()) else {
+            panic!("an unlisted log_checkpoint was allowed");
+        };
+        assert_eq!(
+            texts(&reasons),
+            ["log_checkpoint is not in disclosed_metadata"]
+        );
+        assert!(reasons[0].breaks_disclosure_contract());
     }
 
     #[test]

@@ -22,7 +22,9 @@ pub use log::{
     Entry, EntryKind, LogHash, consistency_proof, inclusion_proof, leaf_hash, root,
     verify_consistency, verify_inclusion,
 };
-pub use manifest::{Accepted, Control, Manifest, ManifestBody, Os, Source, Span, TrustLevel};
+pub use manifest::{
+    Accepted, Control, Manifest, ManifestBody, Metadata, Os, Source, Span, TrustLevel,
+};
 pub use narrowing::{Violation, is_narrowing};
 pub use note::{Checkpoint, LogKey, Note, NoteSignature, WitnessKey};
 pub use p256::ecdsa::SigningKey;

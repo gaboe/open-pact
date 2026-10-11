@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use crate::{Manifest, Os};
+use crate::{Manifest, Metadata, Os};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Violation {
@@ -21,7 +21,7 @@ pub enum Violation {
     #[error("claim_recipients adds {0:?}")]
     RecipientsAdded(Vec<String>),
     #[error("disclosed_metadata adds {0:?}")]
-    MetadataAdded(Vec<String>),
+    MetadataAdded(Vec<Metadata>),
     #[error("control {id} is stricter on {os}")]
     RequiredStricter { id: String, os: Os },
     #[error("control {id} has a shorter grace")]
@@ -34,7 +34,7 @@ pub enum Violation {
     TrustLevelHigher,
 }
 
-fn added(old: &BTreeSet<String>, new: &BTreeSet<String>) -> Vec<String> {
+fn added<T: Ord + Clone>(old: &BTreeSet<T>, new: &BTreeSet<T>) -> Vec<T> {
     new.difference(old).cloned().collect()
 }
 
@@ -162,8 +162,8 @@ mod tests {
                     r#"["Company IT security"]"#
                 ),
                 (
-                    r#", "virtualized", "os", "log_checkpoint"]"#,
-                    r#", "os", "log_checkpoint"]"#
+                    r#""virtualized", "log_checkpoint"]"#,
+                    r#""log_checkpoint"]"#
                 ),
                 (
                     r#"required = { macos = "le_5min", windows = "le_5min", linux = "le_5min" }"#,
@@ -243,9 +243,12 @@ mod tests {
 
     #[test]
     fn rejects_added_metadata() {
-        rejected(
-            &[(r#", "log_checkpoint"]"#, r#", "log_checkpoint", "in_eea"]"#)],
-            Violation::MetadataAdded(vec!["in_eea".into()]),
+        rejected_from(
+            (
+                r#""virtualized", "log_checkpoint"]"#,
+                r#""log_checkpoint"]"#,
+            ),
+            Violation::MetadataAdded(vec![Metadata::Virtualized]),
         );
     }
 

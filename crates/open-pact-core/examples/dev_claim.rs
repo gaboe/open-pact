@@ -40,7 +40,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         client: concat!("open-pact-client ", env!("CARGO_PKG_VERSION")).into(),
         os,
         trust_level: TrustLevel::L0,
-        virtualized: Virtualized::No,
+        virtualized: Some(Virtualized::No),
         results,
         csr_sha256: None,
         log_checkpoint: None,

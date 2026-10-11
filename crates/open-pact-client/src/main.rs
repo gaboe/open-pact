@@ -16,8 +16,9 @@ use clap::{Parser, Subcommand};
 use device_key::DeviceKey;
 use open_pact_core::{
     Checkpoint, Claim, CsrHash, Endorsement, EnrolRequest, Entry, EntryKind, Invitation,
-    LogCheckpoint, LogHash, LogKey, Manifest, ManifestHash, Note, Os, Pseudonym, PublicKey,
-    SignedManifest, Virtualized, dev_key, root, verify_claim, verify_consistency, verify_inclusion,
+    LogCheckpoint, LogHash, LogKey, Manifest, ManifestHash, Metadata, Note, Os, Pseudonym,
+    PublicKey, SignedManifest, Virtualized, dev_key, root, verify_claim, verify_consistency,
+    verify_inclusion,
 };
 use rcgen::{CertificateParams, DistinguishedName, KeyPair};
 use serde::{Deserialize, Serialize};
@@ -250,18 +251,21 @@ fn disclosable(
         .collect()
 }
 
+/// Probes and sends `virtualized` only if the signed manifest discloses it.
+fn disclosable_virtualized(
+    manifest: &Manifest,
+    probe: impl FnOnce() -> Virtualized,
+) -> Option<Virtualized> {
+    manifest.body().discloses(Metadata::Virtualized).then(probe)
+}
+
 /// The checkpoint goes into the claim only if the signed manifest discloses it.
 fn disclosable_checkpoint(manifest: &Manifest, cp: Option<Checkpoint>) -> Option<LogCheckpoint> {
-    cp.filter(|_| {
-        manifest
-            .body()
-            .disclosed_metadata
-            .contains("log_checkpoint")
-    })
-    .map(|cp| LogCheckpoint {
-        size: cp.size,
-        root: cp.root,
-    })
+    cp.filter(|_| manifest.body().discloses(Metadata::LogCheckpoint))
+        .map(|cp| LogCheckpoint {
+            size: cp.size,
+            root: cp.root,
+        })
 }
 
 fn base(gateway: &str) -> &str {
@@ -317,9 +321,7 @@ async fn get_json<T: for<'de> Deserialize<'de>>(http: &reqwest::Client, url: Str
 
 fn print_summary(manifest: &Manifest, company: &PublicKey, os: Os) {
     let b = manifest.body();
-    let list = |set: &std::collections::BTreeSet<String>| {
-        set.iter().cloned().collect::<Vec<_>>().join(", ")
-    };
+    let list = |set: &mut dyn Iterator<Item = String>| set.collect::<Vec<_>>().join(", ");
     println!("Manifest     {}", manifest.hash());
     println!(
         "Company key  {}  (matches your invitation)",
@@ -328,8 +330,14 @@ fn print_summary(manifest: &Manifest, company: &PublicKey, os: Os) {
     println!("Issuer       {}, valid from {}", b.issuer, b.valid_from);
     println!("Controller   {}", b.data_controller);
     println!("Retention    claims kept {}", b.claim_retention);
-    println!("Recipients   {}", list(&b.claim_recipients));
-    println!("Metadata     {}", list(&b.disclosed_metadata));
+    println!(
+        "Recipients   {}",
+        list(&mut b.claim_recipients.iter().cloned())
+    );
+    println!(
+        "Metadata     {}",
+        list(&mut b.disclosed_metadata.iter().map(ToString::to_string))
+    );
     println!(
         "Claims       valid {}, unknown results tolerated for {}, minimum trust {:?}",
         b.claim_max_age, b.unknown_grace, b.min_trust_level
@@ -898,7 +906,7 @@ async fn check(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
         client: concat!("open-pact-client ", env!("CARGO_PKG_VERSION")).into(),
         os,
         trust_level: device.trust_level(),
-        virtualized: virtualized(),
+        virtualized: disclosable_virtualized(&manifest, virtualized),
         results,
         csr_sha256: Some(CsrHash::of(&csr_der)),
         log_checkpoint,
@@ -1360,5 +1368,21 @@ mod tests {
         let info = &csr.certification_request_info;
         assert_eq!(info.subject.iter().count(), 0, "empty subject");
         assert!(info.attributes().is_empty(), "no attributes or extensions");
+    }
+
+    #[test]
+    fn probes_and_sends_virtualized_only_if_the_manifest_discloses_it() {
+        let listed = Manifest::parse(DEMO_MANIFEST.as_bytes()).unwrap();
+        assert_eq!(
+            disclosable_virtualized(&listed, || Virtualized::Yes),
+            Some(Virtualized::Yes)
+        );
+        let unlisted = DEMO_MANIFEST.replace(r#""virtualized", "#, "");
+        assert_ne!(unlisted, DEMO_MANIFEST);
+        let unlisted = Manifest::parse(unlisted.as_bytes()).unwrap();
+        assert_eq!(
+            disclosable_virtualized(&unlisted, || panic!("probed")),
+            None
+        );
     }
 }

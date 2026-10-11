@@ -135,6 +135,8 @@ curl -s localhost:8080/v1/log/checkpoint | cargo run -q -p open-pact-core --exam
 
 The gateway reads each log row from the database once and signs the checkpoint once per tree size. The checkpoint, the cosignatures and the proofs also verify with the Go packages `golang.org/x/mod/sumdb/note`, `github.com/transparency-dev/formats/note` and `github.com/transparency-dev/merkle/proof`. `log_entries` rejects `UPDATE`, `DELETE` and `TRUNCATE` with a trigger.
 
+**Mandatory disclosures.** `disclosed_metadata` must list every field a claim always carries: `manifest_hash`, `device_pseudonym`, `device_key`, `nonce`, `time`, `client_version`, `os`, `trust_level` and `vpn_certificate_request`. `virtualized` and `log_checkpoint` are optional: the client sends them only if the manifest lists them, and the gateway denies and does not store a claim that carries an unlisted one. Other names do not parse. The example manifest replaces `client_hash` with `client_version` and adds `device_key`, `nonce` and `vpn_certificate_request`, so its hash changes and owners sign it again with `join`.
+
 **Upgrade from v0.1.0.** Migration 0004 drops the hash-chain columns. The entries keep their order and become the leaves, and the log key stays. A client that holds a v0.1.0 `log-head.json` tells the owner to run `join` again, exits with status 1 and raises no alarm. `join` removes the old file and pins the checkpoint. `GET /v1/log` answers 410. The example manifest now lists `log_checkpoint` in `disclosed_metadata`, so its hash changes and owners sign it again at that `join`.
 
 ## Keys

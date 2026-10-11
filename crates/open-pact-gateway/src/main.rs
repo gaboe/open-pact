@@ -1114,7 +1114,7 @@ mod tests {
             client: "open-pact-client 0.0.1".into(),
             os: open_pact_core::Os::Linux,
             trust_level: open_pact_core::TrustLevel::L0,
-            virtualized: open_pact_core::Virtualized::No,
+            virtualized: Some(open_pact_core::Virtualized::No),
             results: [
                 ("disk_encryption", "full"),
                 ("firewall", "on"),
@@ -1251,6 +1251,34 @@ mod tests {
             post_from(&app, "/v1/nonce", "").await,
             StatusCode::TOO_MANY_REQUESTS
         );
+    }
+
+    /// H5: a claim with a field the manifest does not list is denied and not stored.
+    #[tokio::test]
+    #[ignore = "needs TEST_DATABASE_URL"]
+    async fn does_not_store_a_claim_with_metadata_the_manifest_does_not_list() {
+        let toml = DEMO.replace(r#""virtualized", "log_checkpoint"]"#, "]");
+        assert_ne!(toml, DEMO);
+        let (app, db) = test_app_with(&toml, 10, 100).await;
+        let (key, mut claim) = enrolled_claim(&app, &db, &toml).await;
+        claim.log_checkpoint = Some(open_pact_core::LogCheckpoint {
+            size: 1,
+            root: LogHash([0; 32]),
+        });
+        let jws = open_pact_core::sign_claim(&claim, &key).unwrap();
+        let (status, body) = post_json(&app, "/v1/claim", &json!({ "jws": jws })).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(
+            body["reasons"]
+                .to_string()
+                .contains("virtualized is not in disclosed_metadata")
+        );
+        assert!(
+            body["reasons"]
+                .to_string()
+                .contains("log_checkpoint is not in disclosed_metadata")
+        );
+        assert_eq!(stored_text(&db).await, Vec::<String>::new());
     }
 
     #[test]

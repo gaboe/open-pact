@@ -35,6 +35,57 @@ pub enum TrustLevel {
     L2,
 }
 
+/// A claim field besides `results`. Every claim carries the mandatory ones, so a manifest must list
+/// them all. The client sends an optional one only if the manifest lists it, and the gateway
+/// denies and does not store a claim with an optional field the manifest does not list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Metadata {
+    ManifestHash,
+    DevicePseudonym,
+    DeviceKey,
+    Nonce,
+    Time,
+    ClientVersion,
+    Os,
+    TrustLevel,
+    VpnCertificateRequest,
+    Virtualized,
+    LogCheckpoint,
+}
+
+impl Metadata {
+    pub const MANDATORY: [Metadata; 9] = [
+        Metadata::ManifestHash,
+        Metadata::DevicePseudonym,
+        Metadata::DeviceKey,
+        Metadata::Nonce,
+        Metadata::Time,
+        Metadata::ClientVersion,
+        Metadata::Os,
+        Metadata::TrustLevel,
+        Metadata::VpnCertificateRequest,
+    ];
+}
+
+impl fmt::Display for Metadata {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Metadata::ManifestHash => "manifest_hash",
+            Metadata::DevicePseudonym => "device_pseudonym",
+            Metadata::DeviceKey => "device_key",
+            Metadata::Nonce => "nonce",
+            Metadata::Time => "time",
+            Metadata::ClientVersion => "client_version",
+            Metadata::Os => "os",
+            Metadata::TrustLevel => "trust_level",
+            Metadata::VpnCertificateRequest => "vpn_certificate_request",
+            Metadata::Virtualized => "virtualized",
+            Metadata::LogCheckpoint => "log_checkpoint",
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Source {
@@ -206,7 +257,7 @@ pub struct ManifestBody {
     pub claim_max_age: Span,
     pub claim_retention: Span,
     pub claim_recipients: BTreeSet<String>,
-    pub disclosed_metadata: BTreeSet<String>,
+    pub disclosed_metadata: BTreeSet<Metadata>,
     pub data_controller: String,
     pub min_trust_level: TrustLevel,
     pub unknown_grace: Span,
@@ -219,7 +270,22 @@ impl ManifestBody {
         self.controls.iter().find(|c| c.id == id)
     }
 
+    pub fn discloses(&self, field: Metadata) -> bool {
+        self.disclosed_metadata.contains(&field)
+    }
+
     fn validate(&self) -> Result<(), String> {
+        let missing: Vec<String> = Metadata::MANDATORY
+            .iter()
+            .filter(|m| !self.discloses(**m))
+            .map(ToString::to_string)
+            .collect();
+        if !missing.is_empty() {
+            return Err(format!(
+                "disclosed_metadata must list {}: every claim carries them",
+                missing.join(", ")
+            ));
+        }
         if self.unknown_grace.is_zero() {
             return Err("unknown_grace must not be zero".into());
         }
@@ -344,6 +410,24 @@ mod tests {
             r#"claim_retention = "12mo""#,
             r#"claim_retention = "300000000000000d""#,
         );
+    }
+
+    #[test]
+    fn disclosed_metadata_must_list_every_mandatory_field_and_nothing_unknown() {
+        let line = DEMO
+            .lines()
+            .find(|l| l.starts_with("disclosed_metadata = "))
+            .unwrap();
+        for to in [
+            "disclosed_metadata = []",
+            r#"disclosed_metadata = ["log_checkpoint"]"#,
+            &line.replace(r#""trust_level", "#, ""),
+            &line.replace(r#""time", "#, r#""time", "home_address", "#),
+        ] {
+            assert_ne!(to, line);
+            let toml = DEMO.replace(line, to);
+            assert!(Manifest::parse(toml.as_bytes()).is_err(), "accepted {to}");
+        }
     }
 
     #[test]

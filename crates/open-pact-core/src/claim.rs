@@ -29,7 +29,9 @@ pub struct Claim {
     pub client: String,
     pub os: Os,
     pub trust_level: TrustLevel,
-    pub virtualized: Virtualized,
+    /// Sent only if the manifest lists `virtualized` in `disclosed_metadata`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub virtualized: Option<Virtualized>,
     pub results: BTreeMap<String, String>,
     /// The SHA-256 of the VPN key's certificate request. The request travels next to the JWS, so
     /// the signed claim, which the company keeps, holds only this hash.
@@ -179,7 +181,7 @@ mod tests {
             client: "open-pact-client 0.0.1".into(),
             os: Os::Macos,
             trust_level: TrustLevel::L0,
-            virtualized: Virtualized::No,
+            virtualized: Some(Virtualized::No),
             results: BTreeMap::from([
                 ("firewall".into(), "on".into()),
                 ("disk_encryption".into(), "full".into()),

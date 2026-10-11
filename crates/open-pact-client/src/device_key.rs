@@ -118,7 +118,7 @@ mod tests {
             client: "open-pact-client test".into(),
             os: Os::Macos,
             trust_level: key.trust_level(),
-            virtualized: Virtualized::No,
+            virtualized: Some(Virtualized::No),
             results: BTreeMap::from([("firewall".into(), "on".into())]),
             csr_sha256: None,
             log_checkpoint: None,
