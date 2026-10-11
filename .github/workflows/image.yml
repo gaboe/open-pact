@@ -10,7 +10,8 @@ permissions:
   contents: read
 
 env:
-  IMAGE: ghcr.io/${{ github.repository_owner }}/open-pact-gateway
+  GATEWAY_IMAGE: ghcr.io/${{ github.repository_owner }}/open-pact-gateway
+  WITNESS_IMAGE: ghcr.io/${{ github.repository_owner }}/open-pact-witness
 
 jobs:
   gateway:
@@ -46,14 +47,57 @@ jobs:
           outputs: type=image,push=true,rewrite-timestamp=true
           labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}
           tags: |
-            ${{ env.IMAGE }}:${{ github.sha }}
-            ${{ env.IMAGE }}:${{ github.ref_type == 'tag' && github.ref_name || 'main' }}
+            ${{ env.GATEWAY_IMAGE }}:${{ github.sha }}
+            ${{ env.GATEWAY_IMAGE }}:${{ github.ref_type == 'tag' && github.ref_name || 'main' }}
 
-      - run: echo "${IMAGE}@${{ steps.build.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
+      - run: echo "${GATEWAY_IMAGE}@${{ steps.build.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
+
+  witness:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - id: epoch
+        run: echo "value=$(git log -1 --format=%ct)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: witness
+          platforms: linux/amd64
+          provenance: false
+          sbom: false
+          no-cache: true
+          build-args: SOURCE_DATE_EPOCH=${{ steps.epoch.outputs.value }}
+          outputs: type=image,push=true,rewrite-timestamp=true
+          labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          tags: |
+            ${{ env.WITNESS_IMAGE }}:${{ github.sha }}
+            ${{ env.WITNESS_IMAGE }}:${{ github.ref_type == 'tag' && github.ref_name || 'main' }}
+
+      - run: echo "${WITNESS_IMAGE}@${{ steps.build.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
 
   rebuild:
-    needs: gateway
+    needs: [gateway, witness]
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [gateway, witness]
     steps:
       - uses: actions/checkout@v6
 
@@ -66,6 +110,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
+          target: ${{ matrix.image == 'witness' && 'witness' || '' }}
           platforms: linux/amd64
           provenance: false
           sbom: false
@@ -76,21 +121,22 @@ jobs:
 
       - name: Compare digests
         env:
-          PUBLISHED: ${{ needs.gateway.outputs.digest }}
+          IMAGE_NAME: ${{ matrix.image }}
+          PUBLISHED: ${{ matrix.image == 'witness' && needs.witness.outputs.digest || needs.gateway.outputs.digest }}
           REBUILT: ${{ steps.build.outputs.digest }}
         run: |
           {
-            echo "published: \`$PUBLISHED\`"
-            echo "rebuilt:   \`$REBUILT\`"
+            echo "${IMAGE_NAME} published: \`$PUBLISHED\`"
+            echo "${IMAGE_NAME} rebuilt:   \`$REBUILT\`"
           } >> "$GITHUB_STEP_SUMMARY"
           if [ "$PUBLISHED" != "$REBUILT" ]; then
-            echo "::error::independent rebuild produced a different digest"
+            echo "::error::independent rebuild of ${IMAGE_NAME} produced a different digest"
             exit 1
           fi
 
   release-note:
     if: github.ref_type == 'tag'
-    needs: [gateway, rebuild]
+    needs: [gateway, witness, rebuild]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -98,12 +144,15 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GH_REPO: ${{ github.repository }}
       TAG: ${{ github.ref_name }}
-      DIGEST: ${{ needs.gateway.outputs.digest }}
+      GATEWAY_DIGEST: ${{ needs.gateway.outputs.digest }}
+      WITNESS_DIGEST: ${{ needs.witness.outputs.digest }}
     steps:
-      - name: Add digest to the release note
+      - name: Add digests to the release note
         run: |
-          note="Image digest (rebuilt independently, identical): \`${IMAGE}@${DIGEST}\`
-          Verify with \`scripts/verify-release.sh ${TAG} ${IMAGE}@${DIGEST}\`."
+          note="Image digests (each rebuilt independently, identical):
+          - gateway: \`${GATEWAY_IMAGE}@${GATEWAY_DIGEST}\`
+          - witness: \`${WITNESS_IMAGE}@${WITNESS_DIGEST}\`
+          Verify with \`scripts/verify-release.sh ${TAG} ${GATEWAY_IMAGE}@${GATEWAY_DIGEST}\` and \`scripts/verify-release.sh --target witness ${TAG} ${WITNESS_IMAGE}@${WITNESS_DIGEST}\`."
           if gh release view "$TAG" >/dev/null 2>&1; then
             body=$(gh release view "$TAG" --json body --jq .body)
             gh release edit "$TAG" --notes "${body}"$'\n\n'"${note}"

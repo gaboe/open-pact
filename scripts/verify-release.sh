@@ -5,8 +5,23 @@ set -euo pipefail
 
 REPO_URL="${REPO_URL:-https://github.com/gaboe/open-pact.git}"
 
+target=""
+args=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --target) [ $# -ge 2 ] || { echo "--target needs a value" >&2; exit 2; }; target=$2; shift 2 ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+set -- ${args[@]+"${args[@]}"}
+case "${target:-gateway}" in
+  gateway) target_args=() ;;
+  witness) target_args=(--target witness) ;;
+  *) echo "--target must be gateway or witness" >&2; exit 2 ;;
+esac
+
 if [ $# -lt 1 ] || [ $# -gt 2 ]; then
-  echo "usage: $0 <tag> [<image-ref>]" >&2
+  echo "usage: $0 [--target gateway|witness] <tag> [<image-ref>]" >&2
   exit 2
 fi
 tag=$1
@@ -26,6 +41,7 @@ epoch=$(git -C "$work/src" log -1 --format=%ct)
 docker buildx create --name "$builder" --driver docker-container >/dev/null
 docker buildx --builder "$builder" build \
   --no-cache \
+  ${target_args[@]+"${target_args[@]}"} \
   --platform linux/amd64 \
   --provenance=false --sbom=false \
   --build-arg SOURCE_DATE_EPOCH="$epoch" \
