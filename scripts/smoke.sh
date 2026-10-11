@@ -32,7 +32,8 @@ echo "re-join is idempotent: same pseudonym, no new log entry"
 cat "$tmp/prove"
 grep -q '^INCLUDED in the checkpoint' "$tmp/prove"
 grep -q '^This entry is your enrolment' "$tmp/prove"
-"${client[@]}" log prove 0 | grep -q '"kind":"manifest_published"'
+"${client[@]}" log prove 0 > "$tmp/prove0"
+grep -q '"kind":"manifest_published"' "$tmp/prove0"
 echo "inclusion proofs verify for this device's enrolment and for entry 0"
 
 curl -fsS "$url/v1/log/checkpoint" | "$dev_witness" cosign > "$tmp/cosigned"
@@ -124,7 +125,8 @@ echo "the restored checkpoint verifies again"
 rm "$home/log-checkpoint.txt"
 echo '{"index": 3, "hash": "00"}' > "$home/log-head.json"
 expect_status "a v0.1.0 log head asks for re-join instead of an alarm" 1 'log format was upgraded'
-"${client[@]}" join --gateway "$url" --yes | grep -q '^Transparency log verified'
+"${client[@]}" join --gateway "$url" --yes > "$tmp/rejoin2"
+grep -q '^Transparency log verified' "$tmp/rejoin2"
 [ ! -e "$home/log-head.json" ]
 echo "join replaces the old head with a checkpoint"
 
