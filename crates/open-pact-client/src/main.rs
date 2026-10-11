@@ -9,9 +9,10 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use open_pact_core::{
-    Checkpoint, Claim, Endorsement, Entry, EntryKind, Invitation, LogCheckpoint, LogHash, LogKey,
-    Manifest, ManifestHash, Note, Os, Pseudonym, PublicKey, SignedManifest, TrustLevel,
-    Virtualized, dev_key, root, sign_claim, verify_claim, verify_consistency, verify_inclusion,
+    Checkpoint, Claim, Endorsement, EnrolRequest, Entry, EntryKind, Invitation, LogCheckpoint,
+    LogHash, LogKey, Manifest, ManifestHash, Note, Os, Pseudonym, PublicKey, SignedManifest,
+    TrustLevel, Virtualized, dev_key, root, sign_claim, verify_claim, verify_consistency,
+    verify_inclusion,
 };
 use rcgen::{CertificateParams, DistinguishedName, KeyPair};
 use serde::{Deserialize, Serialize};
@@ -688,13 +689,10 @@ async fn join(home: &Home, invitation: &str, yes: bool) -> Result<ExitCode> {
         company: published.company,
         owner: Endorsement::sign(&owner, manifest.hash()),
     };
+    let request = EnrolRequest::sign(signed, invitation.code.clone(), &owner, &device)?;
     let resp = http
         .post(format!("{}/v1/enroll", base(gateway)))
-        .json(&json!({
-            "signed_manifest": signed,
-            "device_key": PublicKey::from(&device),
-            "invitation_code": invitation.code,
-        }))
+        .json(&request)
         .send()
         .await?;
     let status = resp.status();

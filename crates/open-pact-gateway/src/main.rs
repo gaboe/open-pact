@@ -18,9 +18,9 @@ use axum::{
 };
 use clap::{Parser, Subcommand};
 use open_pact_core::{
-    Checkpoint, Decision, Endorsement, Entry, EntryKind, Invitation, InvitationCode, LogHash,
-    LogKey, Manifest, Note, Pseudonym, PublicKey, Reason, SignedManifest, SigningKey, WitnessKey,
-    consistency_proof, evaluate, inclusion_proof, root, verify_claim,
+    Checkpoint, Decision, Endorsement, EnrolRequest, Entry, EntryKind, Invitation, LogHash, LogKey,
+    Manifest, Note, Pseudonym, PublicKey, Reason, SigningKey, WitnessKey, consistency_proof,
+    evaluate, inclusion_proof, root, verify_claim,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -123,14 +123,6 @@ impl Tree {
 #[serde(deny_unknown_fields)]
 struct ClaimRequest {
     jws: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct EnrollRequest {
-    signed_manifest: SignedManifest,
-    device_key: PublicKey,
-    invitation_code: InvitationCode,
 }
 
 #[derive(Deserialize)]
@@ -401,7 +393,7 @@ async fn nonce(State(app): State<App>) -> Result<Json<Value>, Reply> {
 async fn enroll(
     State(app): State<App>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    body: Result<Json<EnrollRequest>, JsonRejection>,
+    body: Result<Json<EnrolRequest>, JsonRejection>,
 ) -> Result<Json<Value>, Reply> {
     if app.limiter.blocked(peer.ip(), Instant::now()) {
         return Err((
@@ -413,7 +405,7 @@ async fn enroll(
     }
     let Json(req) = body.map_err(|e| denied(vec![e.body_text()]))?;
     let signed = &req.signed_manifest;
-    let manifest = signed.verify().map_err(|e| denied(vec![e.to_string()]))?;
+    let manifest = req.verify().map_err(|e| denied(vec![e.to_string()]))?;
     if signed.company.key != app.company.key {
         return Err(denied(vec![
             "manifest is not signed by this gateway's company key".into(),
@@ -490,8 +482,8 @@ async fn enroll(
                 DeviceState::Pending
             };
             sqlx::query(
-                "INSERT INTO devices (pseudonym, manifest_hash, owner_key, owner_signature, salt, state, invitation) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                "INSERT INTO devices (pseudonym, manifest_hash, owner_key, owner_signature, salt, state, invitation, \
+                 enrol_owner_signature, enrol_device_signature) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
             )
             .bind(device.as_str())
             .bind(app.manifest.hash().as_str())
@@ -500,6 +492,8 @@ async fn enroll(
             .bind(&salt)
             .bind(state.as_str())
             .bind(invitation.as_str())
+            .bind(String::from(req.owner_signature.clone()))
+            .bind(String::from(req.device_signature.clone()))
             .execute(&mut *tx)
             .await
             .map_err(internal)?;

@@ -12,5 +12,7 @@ CREATE TABLE invitations (
 -- Devices enrolled before invitations existed stay approved, so an upgrade locks nobody out.
 ALTER TABLE devices
     ADD COLUMN state text NOT NULL DEFAULT 'approved' CHECK (state IN ('pending', 'approved', 'revoked')),
-    ADD COLUMN invitation text REFERENCES invitations (hash);
+    ADD COLUMN invitation text REFERENCES invitations (hash),
+    ADD COLUMN enrol_owner_signature text,
+    ADD COLUMN enrol_device_signature text;
 ALTER TABLE devices ALTER COLUMN state DROP DEFAULT;

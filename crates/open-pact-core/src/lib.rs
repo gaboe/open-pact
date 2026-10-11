@@ -1,6 +1,7 @@
 mod claim;
 mod crypto;
 pub mod dev_key;
+mod enrol;
 mod evaluate;
 mod invitation;
 mod log;
@@ -10,6 +11,7 @@ mod note;
 
 pub use claim::{Claim, LogCheckpoint, VerifiedClaim, Virtualized, sign_claim, verify_claim};
 pub use crypto::{Endorsement, ManifestHash, Pseudonym, PublicKey, Signature, SignedManifest};
+pub use enrol::{EnrolRequest, enrol_statement};
 pub use evaluate::{Decision, Reason, evaluate};
 pub use invitation::{InvalidInvitation, Invitation, InvitationCode, InvitationHash};
 pub use log::{
