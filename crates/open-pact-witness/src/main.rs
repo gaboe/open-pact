@@ -50,7 +50,8 @@ struct Memory {
 }
 
 impl Memory {
-    fn load(path: &Path) -> anyhow::Result<Memory> {
+    fn load(state: &StateFile) -> anyhow::Result<Memory> {
+        let path = &state.path;
         let stored: Stored = match std::fs::read(path) {
             Ok(bytes) => serde_json::from_slice(&bytes)?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Stored::default(),
@@ -70,8 +71,12 @@ impl Memory {
         })
     }
 
-    /// Writes a new temporary file, syncs it and renames it over the state file.
-    fn save(&self, path: &Path) -> anyhow::Result<()> {
+    /// Writes a new temporary file, syncs it and renames it over the state file. Checks before
+    /// and after that this process still holds the lock: a lock replaced after the rename can
+    /// never come back, so a match afterwards proves no other process loaded the state meanwhile.
+    fn save(&self, state: &StateFile) -> anyhow::Result<()> {
+        state.check_lock()?;
+        let path = &state.path;
         let stored = Stored {
             pinned_log_keys: self.pinned.iter().map(LogKey::vkey).collect(),
             checkpoints: self
@@ -101,6 +106,78 @@ impl Memory {
         written?;
         let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
         std::fs::File::open(dir.unwrap_or(Path::new(".")))?.sync_all()?;
+        state.check_lock()
+    }
+}
+
+/// Names `<state>.lockdir`. It is a directory: saves rename files, and a file cannot be renamed
+/// over a directory, so no witness's save can replace another's lock.
+const LOCK_SUFFIX: &str = ".lockdir";
+
+/// The state file and the lock that keeps other processes off it for as long as the witness
+/// runs. Two processes with one state could each cosign a different history.
+struct StateFile {
+    path: PathBuf,
+    lock_path: PathBuf,
+    lock: std::fs::File,
+}
+
+impl StateFile {
+    fn open(path: PathBuf) -> anyhow::Result<StateFile> {
+        if path.as_os_str().to_string_lossy().ends_with(LOCK_SUFFIX) {
+            bail!(
+                "{}: names ending in {LOCK_SUFFIX} are reserved for the lock of another state file",
+                path.display()
+            );
+        }
+        let mut lock_path = path.as_os_str().to_owned();
+        lock_path.push(LOCK_SUFFIX);
+        let lock_path = PathBuf::from(lock_path);
+        match std::fs::create_dir(&lock_path) {
+            Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => {
+                return Err(e).context(lock_path.display().to_string());
+            }
+            _ => {}
+        }
+        let lock = std::fs::File::open(&lock_path).context(lock_path.display().to_string())?;
+        if !lock.metadata()?.is_dir() {
+            bail!(
+                "{} is not a directory; another program uses the lock name of {}",
+                lock_path.display(),
+                path.display()
+            );
+        }
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => bail!(
+                "another witness process holds {}; run one process per state file",
+                lock_path.display()
+            ),
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(e).context(lock_path.display().to_string());
+            }
+        }
+        let state = StateFile {
+            path,
+            lock_path,
+            lock,
+        };
+        state.check_lock()?;
+        Ok(state)
+    }
+
+    /// Fails unless the lock path still names the directory this process locked.
+    fn check_lock(&self) -> anyhow::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let held = self.lock.metadata()?;
+        let named = std::fs::symlink_metadata(&self.lock_path)
+            .with_context(|| self.lock_path.display().to_string())?;
+        if (held.dev(), held.ino()) != (named.dev(), named.ino()) {
+            bail!(
+                "{} was replaced: another witness process may hold this state",
+                self.lock_path.display()
+            );
+        }
         Ok(())
     }
 }
@@ -111,33 +188,9 @@ struct Witness {
     logs: Vec<LogKey>,
     /// WITNESS_LOG_KEY_URL is set: not ready until that key is pinned.
     pins_log_key: bool,
-    path: PathBuf,
-    /// Keeps other processes off this state for as long as the witness runs.
-    _state_lock: std::fs::File,
+    state: StateFile,
     /// Held from the old-size check until the new checkpoint is on disk.
     memory: Mutex<Memory>,
-}
-
-/// Locks `<state>.lock` exclusively. Two processes with one state could each cosign a different
-/// history. The lock is on a separate file because each save renames a new file over the state.
-fn lock_state(path: &Path) -> anyhow::Result<std::fs::File> {
-    let mut name = path.as_os_str().to_owned();
-    name.push(".lock");
-    let name = PathBuf::from(name);
-    let lock = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&name)
-        .with_context(|| name.display().to_string())?;
-    match lock.try_lock() {
-        Ok(()) => Ok(lock),
-        Err(std::fs::TryLockError::WouldBlock) => bail!(
-            "another witness process holds {}; run one process per state file",
-            name.display()
-        ),
-        Err(std::fs::TryLockError::Error(e)) => Err(e).context(name.display().to_string()),
-    }
 }
 
 fn now() -> u64 {
@@ -166,12 +219,12 @@ async fn add(State(w): State<Arc<Witness>>, body: String) -> Response {
     match add_checkpoint(&logs, &memory.latest, &req) {
         Ok(cp) => {
             let previous = memory.latest.insert(cp.origin.clone(), cp.clone());
-            if let Err(e) = memory.save(&w.path) {
+            if let Err(e) = memory.save(&w.state) {
                 match previous {
                     Some(p) => memory.latest.insert(cp.origin.clone(), p),
                     None => memory.latest.remove(&cp.origin),
                 };
-                eprintln!("cannot store {}: {e:#}", w.path.display());
+                eprintln!("cannot store {}: {e:#}", w.state.path.display());
                 return text(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "state not stored\n".into(),
@@ -229,7 +282,7 @@ async fn pin_log_key(w: Arc<Witness>, url: String) {
             Ok(key) => {
                 let mut memory = w.memory.lock().await;
                 memory.pinned.push(key.clone());
-                match memory.save(&w.path) {
+                match memory.save(&w.state) {
                     Ok(()) => {
                         eprintln!(
                             "pinned log key {} from {url} (demo trust on first use)",
@@ -287,17 +340,17 @@ fn log_keys() -> anyhow::Result<Vec<LogKey>> {
 async fn serve() -> anyhow::Result<()> {
     let name = key_name()?;
     let signer = load_key(&key_file()?)?;
-    let path = PathBuf::from(env("WITNESS_STATE").unwrap_or_else(|| "witness-state.json".into()));
-    let state_lock = lock_state(&path)?;
-    let memory = Memory::load(&path).with_context(|| path.display().to_string())?;
+    let state = StateFile::open(PathBuf::from(
+        env("WITNESS_STATE").unwrap_or_else(|| "witness-state.json".into()),
+    ))?;
+    let memory = Memory::load(&state).with_context(|| state.path.display().to_string())?;
     let pin_url = env("WITNESS_LOG_KEY_URL").filter(|_| memory.pinned.is_empty());
     let witness = Arc::new(Witness {
         pins_log_key: pin_url.is_some(),
         key: WitnessKey::new(&name, signer.verifying_key()),
         signer,
         logs: log_keys()?,
-        path,
-        _state_lock: state_lock,
+        state,
         memory: Mutex::new(memory),
     });
     eprintln!("witness key {}", witness.key.vkey());
@@ -319,6 +372,7 @@ async fn serve() -> anyhow::Result<()> {
     }
     let addr = env("LISTEN_ADDR").unwrap_or_else(|| "0.0.0.0:8080".into());
     let listener = tokio::net::TcpListener::bind(&addr).await?;
+    eprintln!("listening on {}", listener.local_addr()?);
     axum::serve(listener, router(witness))
         .with_graceful_shutdown(async {
             let mut term =
@@ -418,15 +472,15 @@ mod tests {
 
     async fn start(log: &Log, path: &Path) -> anyhow::Result<Running> {
         let signer = ed25519_dalek::SigningKey::from_bytes(&[5; 32]);
-        let state_lock = lock_state(path)?;
+        let state = StateFile::open(path.to_path_buf())?;
+        let memory = Memory::load(&state)?;
         let witness = Arc::new(Witness {
             key: WitnessKey::new("witness.example.org/test", signer.verifying_key()),
             signer,
             logs: vec![log.key.clone()],
             pins_log_key: false,
-            path: path.to_path_buf(),
-            _state_lock: state_lock,
-            memory: Mutex::new(Memory::load(path)?),
+            state,
+            memory: Mutex::new(memory),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let url = format!("http://{}", listener.local_addr()?);
@@ -457,10 +511,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let neighbour = dir.path().join("state.tmp");
         std::fs::write(&neighbour, "another witness's state").unwrap();
-        let path = dir.path().join("state.json");
-        let memory = Memory::load(&path).unwrap();
-        memory.save(&path).unwrap();
-        memory.save(&path).unwrap();
+        let state = StateFile::open(dir.path().join("state.json")).unwrap();
+        let memory = Memory::load(&state).unwrap();
+        memory.save(&state).unwrap();
+        memory.save(&state).unwrap();
         assert_eq!(
             std::fs::read_to_string(&neighbour).unwrap(),
             "another witness's state"
@@ -468,7 +522,7 @@ mod tests {
         let mut names: Vec<String> = std::fs::read_dir(dir.path())
             .unwrap()
             .map(|e| e.unwrap().file_name().into_string().unwrap())
-            .filter(|n| !n.ends_with(".lock"))
+            .filter(|n| !n.ends_with(LOCK_SUFFIX))
             .collect();
         names.sort();
         assert_eq!(names, ["state.json", "state.tmp"]);
