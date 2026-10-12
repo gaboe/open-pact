@@ -498,14 +498,15 @@ fn parse_release_date(text: &str) -> Option<DateTime<Utc>> {
     .map(|t| t.with_timezone(&Utc))
 }
 
-/// Reads `apt-get -s upgrade`. A package in the security pocket with an `Inst` line, or any
-/// kept-back package, is an outstanding update. Output is understood only if it ends in the
+/// Reads `apt-get -s upgrade`. Any `Inst` line or kept-back package is an outstanding update:
+/// APT names only the candidate's pocket, so a security fix superseded by a newer `-updates`
+/// version would not show "security". Output is understood only if it ends in the
 /// `N upgraded, N newly installed` summary.
 fn parse_apt_security(out: &str) -> SecurityUpdates {
-    if out.lines().any(|l| {
-        (l.starts_with("Inst ") && l.to_lowercase().contains("security"))
-            || l.contains("have been kept back")
-    }) {
+    if out
+        .lines()
+        .any(|l| l.starts_with("Inst ") || l.contains("have been kept back"))
+    {
         SecurityUpdates::Pending
     } else if out
         .lines()
@@ -1462,9 +1463,11 @@ End-Date: 2026-10-05  09:00:05
         assert_eq!(parse_apt_security(kept), Pending);
         let inst = "Inst fictional-lib [1.0] (1.1 Fictional:1/stable-security [amd64])\n";
         assert_eq!(parse_apt_security(inst), Pending);
-        let plain = "Inst fictional-editor [1] (2 Fictional:1/stable [amd64])\n\
+        let superseded = "Inst fictional-lib [1.0] (1.2 Fictional:1/stable-updates [amd64])\n\
             1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n";
-        assert_eq!(parse_apt_security(plain), Clear);
+        assert_eq!(parse_apt_security(superseded), Pending);
+        let none = "0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n";
+        assert_eq!(parse_apt_security(none), Clear);
         assert_eq!(parse_apt_security(""), Unknown);
     }
 
