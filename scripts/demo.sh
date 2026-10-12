@@ -93,12 +93,17 @@ step "A log signs a fork (another root for a size the witness already cosigned):
 echo "(a test log whose key this script holds plays the gateway)"
 add_checkpoint() { curl -sS -o "$tmp/witnessed" -w '%{http_code}' --data-binary @- "$witness/add-checkpoint"; }
 size=1
-[ "$("$attacks" add 0 1 | add_checkpoint)" = 409 ] && size="$(cat "$tmp/witnessed")"
-next=$((size + 1))
-echo "honest checkpoint of size $next: $("$attacks" add "$size" "$next" | add_checkpoint)"
-cat "$tmp/witnessed"
-echo "forked checkpoint of size $next: $("$attacks" fork "$next" | add_checkpoint)"
-cat "$tmp/witnessed"
+first="$("$attacks" add 0 1 | add_checkpoint)"
+if [ "$first" = 404 ]; then
+  echo "(skipped: this witness does not follow the test log; run the demo against compose to see it)"
+else
+  [ "$first" = 409 ] && size="$(cat "$tmp/witnessed")"
+  next=$((size + 1))
+  echo "honest checkpoint of size $next: $("$attacks" add "$size" "$next" | add_checkpoint)"
+  cat "$tmp/witnessed"
+  echo "forked checkpoint of size $next: $("$attacks" fork "$next" | add_checkpoint)"
+  cat "$tmp/witnessed"
+fi
 
 step "So a forking gateway can show its victims only checkpoints without the cosignature: the client raises the alarm"
 python3 "$root/scripts/checkpoint-proxy.py" "$tmp/proxy-port" "$url" "$tmp/served" &
@@ -111,7 +116,7 @@ e = json.load(open(sys.argv[1]))
 e["gateway"] = sys.argv[2]
 json.dump(e, open(sys.argv[1], "w"))
 PY2
-grep -v '^— witness.example.org/' "$tmp/cosigned" > "$tmp/served"
+awk -v log_sig="— $(head -n 1 "$tmp/cosigned") " '!/^— / || index($0, log_sig) == 1' "$tmp/cosigned" > "$tmp/served"
 "${client[@]}" check > /dev/null || echo "(check exited with status $?)"
 
 step "A frozen checkpoint, replayed with a cosignature from two hours ago, raises the alarm too"
