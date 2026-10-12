@@ -918,42 +918,82 @@ fn vpn_csr(home: &Home) -> Result<(String, Vec<u8>)> {
     Ok((csr.pem()?, csr.der().to_vec()))
 }
 
-/// Checks a VPN CA and certificate before they replace the installed pair (R6-L1). Both must
-/// parse as one PEM certificate each and be valid now; the CA must be a CA; the certificate must
-/// carry this device's VPN key and verify under the CA's key. Returns a description of the
-/// certificate, if there is one.
-fn check_vpn_pair(
-    ca_pem: &str,
-    cert_pem: Option<&str>,
-    vpn_key: &KeyPair,
-) -> Result<Option<String>> {
+/// Checks the VPN CA and client certificate that will replace the installed pair, so a pair a
+/// VPN client could not use never replaces a working one (R6-L1, R7-L1). Each must be exactly
+/// one DER certificate, valid now, with no critical extension this check does not know. The CA
+/// must be a CA that may sign certificates. The certificate must carry this device's VPN key,
+/// name the CA as its issuer, verify under the CA's key, and be a client certificate that is
+/// not a CA, may sign, and is for client authentication. Returns a description of the
+/// certificate.
+fn check_vpn_pair(ca_pem: &str, cert_pem: &str, vpn_key: &KeyPair) -> Result<String> {
     let ca_der = pem_certificate(ca_pem).context("ca_pem")?;
-    let ca = x509_parser::parse_x509_certificate(&ca_der)
-        .context("ca_pem")?
-        .1;
+    let ca = whole_certificate(&ca_der).context("ca_pem")?;
     if !ca.is_ca() || !ca.validity().is_valid() {
         bail!("ca_pem is not a CA certificate valid now");
     }
-    let Some(cert_pem) = cert_pem else {
-        return Ok(None);
-    };
+    if !ca.key_usage()?.is_some_and(|ku| ku.value.key_cert_sign()) {
+        bail!("ca_pem may not sign certificates");
+    }
     let cert_der = pem_certificate(cert_pem).context("certificate_pem")?;
-    let cert = x509_parser::parse_x509_certificate(&cert_der)
-        .context("certificate_pem")?
-        .1;
+    let cert = whole_certificate(&cert_der).context("certificate_pem")?;
     if !cert.validity().is_valid() {
         bail!("certificate_pem is not valid now");
     }
     if cert.public_key().raw != rcgen::PublicKeyData::subject_public_key_info(vpn_key).as_slice() {
         bail!("certificate_pem is not for this device's VPN key");
     }
+    if cert.issuer().as_raw() != ca.subject().as_raw() {
+        bail!("certificate_pem names another issuer than ca_pem");
+    }
     cert.verify_signature(Some(ca.public_key()))
         .map_err(|e| anyhow::anyhow!("certificate_pem was not issued by ca_pem: {e}"))?;
-    Ok(Some(format!(
+    if cert.is_ca() {
+        bail!("certificate_pem is a CA certificate");
+    }
+    if !cert
+        .key_usage()?
+        .is_some_and(|ku| ku.value.digital_signature())
+    {
+        bail!("certificate_pem may not sign");
+    }
+    if !cert
+        .extended_key_usage()?
+        .is_some_and(|eku| eku.value.client_auth)
+    {
+        bail!("certificate_pem is not for client authentication");
+    }
+    Ok(format!(
         "subject {}, expires {}",
         cert.subject(),
         cert.validity().not_after
-    )))
+    ))
+}
+
+/// A certificate that is all of `der`, with no critical extension other than the basic
+/// constraints, key usages and subject names that `check_vpn_pair` reads or allows.
+fn whole_certificate(der: &[u8]) -> Result<x509_parser::certificate::X509Certificate<'_>> {
+    use x509_parser::oid_registry::{
+        OID_X509_EXT_BASIC_CONSTRAINTS, OID_X509_EXT_EXTENDED_KEY_USAGE, OID_X509_EXT_KEY_USAGE,
+        OID_X509_EXT_SUBJECT_ALT_NAME,
+    };
+    let (rest, cert) = x509_parser::parse_x509_certificate(der)?;
+    if !rest.is_empty() {
+        bail!("{} bytes follow the certificate", rest.len());
+    }
+    let known = [
+        OID_X509_EXT_BASIC_CONSTRAINTS,
+        OID_X509_EXT_KEY_USAGE,
+        OID_X509_EXT_EXTENDED_KEY_USAGE,
+        OID_X509_EXT_SUBJECT_ALT_NAME,
+    ];
+    if let Some(ext) = cert
+        .extensions()
+        .iter()
+        .find(|ext| ext.critical && !known.contains(&ext.oid))
+    {
+        bail!("unknown critical extension {}", ext.oid);
+    }
+    Ok(cert)
 }
 
 /// The DER of a text that is exactly one PEM certificate block.
@@ -1088,20 +1128,20 @@ async fn check(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
             }
             print_hints(&manifest, &claim.results, os);
             let vpn_key = KeyPair::from_pem(&std::fs::read_to_string(home.file("vpn-key.pem"))?)?;
-            let described = check_vpn_pair(&ca_pem, certificate_pem.as_deref(), &vpn_key)
+            let certificate_pem = certificate_pem.context(
+                "the accepted response carries no VPN certificate for the request this check sent; the installed ones are kept",
+            )?;
+            let described = check_vpn_pair(&ca_pem, &certificate_pem, &vpn_key)
                 .context("the accepted response carries an unusable VPN certificate or CA; the installed ones are kept")?;
-            let mut files = vec![("ca.pem", ca_pem.as_bytes())];
-            if let Some(cert) = &certificate_pem {
-                files.push(("vpn-cert.pem", cert.as_bytes()));
-            }
-            home.replace_all(&files)?;
-            if let Some(described) = described {
-                println!(
-                    "VPN certificate {} ({described})",
-                    home.file("vpn-cert.pem").display(),
-                );
-                println!("VPN CA          {}", home.file("ca.pem").display());
-            }
+            home.replace_all(&[
+                ("ca.pem", ca_pem.as_bytes()),
+                ("vpn-cert.pem", certificate_pem.as_bytes()),
+            ])?;
+            println!(
+                "VPN certificate {} ({described})",
+                home.file("vpn-cert.pem").display(),
+            );
+            println!("VPN CA          {}", home.file("ca.pem").display());
             true
         }
         Response::Denied { reasons } => {
@@ -1529,19 +1569,32 @@ mod tests {
 
     /// A VPN certificate and the CA a claim response carries.
     struct VpnPair {
-        cert: String,
+        cert: Option<String>,
         ca: String,
     }
 
-    /// A fictional VPN CA: a CA certificate unless `is_ca` is false.
+    /// A fictional VPN CA as the gateway makes it: a CA that signs certificates, unless `is_ca`
+    /// is false.
     fn test_ca(is_ca: bool) -> (CertificateParams, KeyPair) {
+        test_ca_with(is_ca, |_| {})
+    }
+
+    fn test_ca_with(
+        is_ca: bool,
+        edit: impl FnOnce(&mut CertificateParams),
+    ) -> (CertificateParams, KeyPair) {
         let mut params = CertificateParams::new(vec![]).unwrap();
         params
             .distinguished_name
             .push(rcgen::DnType::CommonName, "fictional VPN CA");
         if is_ca {
             params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Constrained(0));
+            params.key_usages = vec![
+                rcgen::KeyUsagePurpose::KeyCertSign,
+                rcgen::KeyUsagePurpose::CrlSign,
+            ];
         }
+        edit(&mut params);
         (params, KeyPair::generate().unwrap())
     }
 
@@ -1549,17 +1602,26 @@ mod tests {
         params.self_signed(key).unwrap().pem()
     }
 
-    /// A certificate for `key` issued by `ca`, expired since 2020 if `expired`.
-    fn issue_to(
+    /// A client certificate for `key` issued by `ca` as the gateway issues it, expired since 2020
+    /// if `expired`.
+    fn issue_to(key: &KeyPair, ca: &(CertificateParams, KeyPair), expired: bool) -> String {
+        issue_with(key, ca, |leaf| {
+            if expired {
+                leaf.not_before = rcgen::date_time_ymd(2020, 1, 1);
+                leaf.not_after = rcgen::date_time_ymd(2020, 2, 1);
+            }
+        })
+    }
+
+    fn issue_with(
         key: &KeyPair,
         (params, ca_key): &(CertificateParams, KeyPair),
-        expired: bool,
+        edit: impl FnOnce(&mut CertificateParams),
     ) -> String {
         let mut leaf = CertificateParams::new(vec![]).unwrap();
-        if expired {
-            leaf.not_before = rcgen::date_time_ymd(2020, 1, 1);
-            leaf.not_after = rcgen::date_time_ymd(2020, 2, 1);
-        }
+        leaf.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+        leaf.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+        edit(&mut leaf);
         leaf.signed_by(key, &rcgen::Issuer::from_params(params, ca_key))
             .unwrap()
             .pem()
@@ -1569,9 +1631,33 @@ mod tests {
     fn valid_pair(vpn: &KeyPair) -> VpnPair {
         let ca = test_ca(true);
         VpnPair {
-            cert: issue_to(vpn, &ca, false),
+            cert: Some(issue_to(vpn, &ca, false)),
             ca: ca_pem(&ca),
         }
+    }
+
+    /// A valid pair whose certificate gets the extra leaf settings of `edit`.
+    fn pair_with(vpn: &KeyPair, edit: impl FnOnce(&mut CertificateParams)) -> VpnPair {
+        let ca = test_ca(true);
+        VpnPair {
+            cert: Some(issue_with(vpn, &ca, edit)),
+            ca: ca_pem(&ca),
+        }
+    }
+
+    /// A PEM certificate block around `der`.
+    fn pem_of(der: &[u8]) -> String {
+        use base64::Engine as _;
+        let text = base64::engine::general_purpose::STANDARD.encode(der);
+        let lines: Vec<&str> = text
+            .as_bytes()
+            .chunks(64)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect();
+        format!(
+            "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+            lines.join("\n")
+        )
     }
 
     fn grown_checkpoint(
@@ -1590,9 +1676,9 @@ mod tests {
     #[tokio::test]
     async fn check_keeps_the_installed_pair_if_the_new_one_is_invalid() {
         type Pair = fn(&KeyPair) -> VpnPair;
-        let cases: [(&str, Pair); 7] = [
+        let cases: [(&str, Pair); 14] = [
             ("malformed certificate", |vpn| VpnPair {
-                cert: "FICTIONAL NOT A CERTIFICATE".into(),
+                cert: Some("FICTIONAL NOT A CERTIFICATE".into()),
                 ..valid_pair(vpn)
             }),
             ("malformed CA", |vpn| VpnPair {
@@ -1609,36 +1695,95 @@ mod tests {
             ("expired certificate", |vpn| {
                 let ca = test_ca(true);
                 VpnPair {
-                    cert: issue_to(vpn, &ca, true),
+                    cert: Some(issue_to(vpn, &ca, true)),
                     ca: ca_pem(&ca),
                 }
             }),
             ("CA that is not a CA", |vpn| {
                 let ca = test_ca(false);
                 VpnPair {
-                    cert: issue_to(vpn, &ca, false),
+                    cert: Some(issue_to(vpn, &ca, false)),
                     ca: ca_pem(&ca),
                 }
             }),
             ("certificate and CA swapped", |vpn| {
                 let pair = valid_pair(vpn);
                 VpnPair {
-                    cert: pair.ca,
-                    ca: pair.cert,
+                    cert: Some(pair.ca),
+                    ca: pair.cert.unwrap(),
+                }
+            }),
+            // R7-L1: each pair below is unusable for a VPN client, though the old checks pass it.
+            ("no certificate for the request sent", |vpn| VpnPair {
+                cert: None,
+                ..valid_pair(vpn)
+            }),
+            ("server-only certificate", |vpn| {
+                pair_with(vpn, |leaf| {
+                    leaf.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+                })
+            }),
+            ("certificate that may not sign", |vpn| {
+                pair_with(vpn, |leaf| {
+                    leaf.key_usages = vec![rcgen::KeyUsagePurpose::KeyEncipherment];
+                })
+            }),
+            ("certificate with an unknown critical extension", |vpn| {
+                pair_with(vpn, |leaf| {
+                    let mut ext =
+                        rcgen::CustomExtension::from_oid_content(&[2, 25, 7, 7], vec![5, 0]);
+                    ext.set_criticality(true);
+                    leaf.custom_extensions = vec![ext];
+                })
+            }),
+            ("issuer name that is not the CA's", |vpn| {
+                let ca = test_ca(true);
+                let renamed = test_ca_with(true, |p| {
+                    p.distinguished_name = rcgen::DistinguishedName::new();
+                    p.distinguished_name
+                        .push(rcgen::DnType::CommonName, "fictional other CA");
+                });
+                VpnPair {
+                    cert: Some(issue_to(
+                        vpn,
+                        &(renamed.0, KeyPair::from_pem(&ca.1.serialize_pem()).unwrap()),
+                        false,
+                    )),
+                    ca: ca_pem(&ca),
+                }
+            }),
+            ("CA that may not sign certificates", |vpn| {
+                let ca = test_ca_with(true, |p| {
+                    p.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+                });
+                VpnPair {
+                    cert: Some(issue_to(vpn, &ca, false)),
+                    ca: ca_pem(&ca),
+                }
+            }),
+            ("certificate with bytes after its DER", |vpn| {
+                let pair = valid_pair(vpn);
+                let mut der = pem_certificate(pair.cert.as_deref().unwrap()).unwrap();
+                der.extend([0, 0]);
+                VpnPair {
+                    cert: Some(pem_of(&der)),
+                    ..pair
                 }
             }),
         ];
+        let mut accepted = Vec::new();
         for (case, pair) in cases {
             let (code, before, after, _) =
                 check_with_response_checkpoint(grown_checkpoint, pair).await;
-            assert!(
-                code.as_ref().is_err() || code.as_ref().unwrap() != &ExitCode::SUCCESS,
-                "{case}: not a success"
-            );
-            for file in ["ca.pem", "vpn-cert.pem", "vpn-key.pem"] {
-                assert_eq!(after[file], before[file], "{case}: {file} unchanged");
+            let failed = code.as_ref().is_err() || code.as_ref().unwrap() != &ExitCode::SUCCESS;
+            let kept = ["ca.pem", "vpn-cert.pem", "vpn-key.pem"]
+                .iter()
+                .all(|file| after[*file] == before[*file]);
+            if !failed || !kept {
+                accepted.push(case);
             }
         }
+        assert_eq!(accepted, [""; 0], "cases that replaced the installed pair");
     }
 
     #[tokio::test]
@@ -1647,7 +1792,7 @@ mod tests {
             check_with_response_checkpoint(grown_checkpoint, valid_pair).await;
         assert_eq!(code.unwrap(), ExitCode::SUCCESS);
         assert_eq!(after["ca.pem"], pair.ca.as_bytes());
-        assert_eq!(after["vpn-cert.pem"], pair.cert.as_bytes());
+        assert_eq!(after["vpn-cert.pem"], pair.cert.unwrap().as_bytes());
         let stored = Note::parse(std::str::from_utf8(&after[LOG_CHECKPOINT]).unwrap()).unwrap();
         assert_eq!(Checkpoint::parse(&stored.text).unwrap().size, 3);
         assert_ne!(after[LOG_CHECKPOINT], before[LOG_CHECKPOINT]);
