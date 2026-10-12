@@ -57,8 +57,8 @@ enum Command {
     /// Create a one-time invitation; prints the opi1: string on stdout, a readable form on stderr
     Invite {
         /// How long the invitation stays valid: 30m, 72h, 7d (at most 30d)
-        #[arg(long, default_value = "72h")]
-        ttl: String,
+        #[arg(long, default_value = "72h", value_parser = invitations::parse_ttl)]
+        ttl: chrono::Duration,
         /// Who the invitation is for. Stays in the gateway database, never in the log
         #[arg(long, default_value = "")]
         note: String,
@@ -897,8 +897,7 @@ fn log_key(keys: &Keys) -> anyhow::Result<LogKey> {
     Ok(LogKey::new(&log_origin()?, &PublicKey::from(&keys.log)))
 }
 
-async fn invite(db: &PgPool, url: &str, ttl: &str, note: &str) -> anyhow::Result<()> {
-    let ttl = invitations::parse_ttl(ttl)?;
+async fn invite(db: &PgPool, url: &str, ttl: chrono::Duration, note: &str) -> anyhow::Result<()> {
     let parsed = url.parse::<axum::http::Uri>()?;
     if !matches!(parsed.scheme_str(), Some("https" | "http")) || parsed.host().is_none() {
         anyhow::bail!("--url must be an http(s) URL, got {url:?}");
@@ -1087,7 +1086,7 @@ async fn main() -> anyhow::Result<()> {
     sqlx::migrate!("./migrations").run(&db).await?;
     match cli.command.unwrap_or(Command::Serve) {
         Command::Serve => serve(db).await,
-        Command::Invite { ttl, note, url } => invite(&db, &url, &ttl, note.trim()).await,
+        Command::Invite { ttl, note, url } => invite(&db, &url, ttl, note.trim()).await,
         Command::Devices { command } => admin_devices(&db, command).await,
     }
 }
@@ -1111,6 +1110,27 @@ mod tests {
 
     const DEMO: &str = include_str!("../../../examples/manifest.toml");
     const TEST_KEK: [u8; 32] = [5; 32];
+
+    /// R4-L2: `invite --ttl` is checked where the command line is read, before any database or
+    /// key is touched, and bad input is an error message, never a panic.
+    #[test]
+    fn invite_refuses_a_bad_ttl_on_the_command_line() {
+        let invite = |ttl: &str| {
+            Cli::try_parse_from([
+                "open-pact-gateway",
+                "invite",
+                &format!("--ttl={ttl}"),
+                "--url=https://pact.example.com",
+            ])
+        };
+        assert!(invite("7d").is_ok());
+        for bad in ["", "é", "9223372036854775807d", "-5h", "FICTIONAL"] {
+            let Err(err) = invite(bad) else {
+                panic!("{bad:?} accepted");
+            };
+            assert!(err.to_string().contains("TTL"), "{bad:?}: {err}");
+        }
+    }
 
     async fn test_app(enrol_limit: u32, nonce_limit: u32) -> Router {
         test_app_with(DEMO, enrol_limit, nonce_limit).await.0

@@ -6,23 +6,21 @@ use sqlx::{PgConnection, PgPool};
 pub const MAX_TTL: Duration = Duration::days(30);
 const MAX_NOTE: usize = 200;
 
-/// `30m`, `72h` or `7d`, at most 30 days.
+/// `30m`, `72h` or `7d`, at most 30 days. The number is bounded before it becomes a duration.
 pub fn parse_ttl(text: &str) -> anyhow::Result<Duration> {
-    let (n, unit) = text.split_at(text.len().saturating_sub(1));
-    let n: i64 =
-        n.parse().ok().filter(|n| *n > 0).ok_or_else(|| {
-            anyhow::anyhow!("TTL must be a positive number with m, h or d: {text:?}")
-        })?;
-    let ttl = match unit {
-        "m" => Duration::minutes(n),
-        "h" => Duration::hours(n),
-        "d" => Duration::days(n),
-        _ => bail!("TTL must end in m, h or d: {text:?}"),
+    let minutes_per_unit = match text.as_bytes().last() {
+        Some(b'm') => 1,
+        Some(b'h') => 60,
+        Some(b'd') => 24 * 60,
+        _ => bail!("TTL must end in m, h or d, as in 30m, 72h or 7d: {text:?}"),
     };
-    if ttl > MAX_TTL {
-        bail!("TTL {text} is longer than 30 days");
+    let number = &text[..text.len() - 1];
+    let max = MAX_TTL.num_minutes() / minutes_per_unit;
+    match number.parse::<i64>() {
+        Ok(n) if (1..=max).contains(&n) => Ok(Duration::minutes(n * minutes_per_unit)),
+        Ok(n) if n > max => bail!("TTL {text} is longer than 30 days"),
+        _ => bail!("TTL must be a positive whole number before m, h or d: {text:?}"),
     }
-    Ok(ttl)
 }
 
 pub async fn create(
@@ -88,6 +86,24 @@ mod tests {
         assert_eq!(parse_ttl("72h").unwrap(), Duration::hours(72));
         assert_eq!(parse_ttl("30d").unwrap(), MAX_TTL);
         for bad in ["31d", "0h", "-1h", "h", "", "12", "1w", "1.5h"] {
+            assert!(parse_ttl(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// R4-L2: input that is not ASCII or does not fit a duration is a validation error, not a
+    /// panic.
+    #[test]
+    fn ttl_refuses_unicode_and_huge_input() {
+        for bad in [
+            "é",
+            "1é",
+            "5ḿ",
+            "9223372036854775807d",
+            "9223372036854775807m",
+            "99999999999999999999999h",
+            "-9223372036854775808d",
+            "FICTIONAL",
+        ] {
             assert!(parse_ttl(bad).is_err(), "{bad:?}");
         }
     }
