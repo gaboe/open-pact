@@ -49,6 +49,10 @@ struct Memory {
     latest: BTreeMap<String, Checkpoint>,
     /// The state file this process loaded or last wrote; `None` while there is none.
     file: Option<FileId>,
+    /// A save failed after its rename, so the disk may hold a checkpoint this memory does not
+    /// (R6-L2). The witness then cosigns nothing and reports unhealthy until a restart reloads
+    /// the state from disk.
+    uncertain: bool,
 }
 
 impl Memory {
@@ -69,6 +73,7 @@ impl Memory {
         };
         Ok(Memory {
             file,
+            uncertain: false,
             pinned: stored
                 .pinned_log_keys
                 .iter()
@@ -88,6 +93,9 @@ impl Memory {
     /// Also checks that the state name still holds the one file this process wrote, with no other
     /// name: a second name would survive the rename as a stale copy another process could load.
     fn save(&mut self, state: &StateFile) -> anyhow::Result<()> {
+        if self.uncertain {
+            bail!("a previous save failed after replacing the state file; restart the witness");
+        }
         state.check_lock()?;
         state.check_file(self.file)?;
         let path = &state.path;
@@ -122,11 +130,16 @@ impl Memory {
             let _ = std::fs::remove_file(&tmp);
         }
         let written = Some(written?);
-        std::fs::File::open(path.parent().expect("an absolute path"))?.sync_all()?;
-        state.check_lock()?;
-        state.check_file(written)?;
-        self.file = written;
-        Ok(())
+        let durable = (|| {
+            std::fs::File::open(path.parent().expect("an absolute path"))?.sync_all()?;
+            state.check_lock()?;
+            state.check_file(written)
+        })();
+        match durable {
+            Ok(()) => self.file = written,
+            Err(_) => self.uncertain = true,
+        }
+        durable
     }
 }
 
@@ -292,6 +305,12 @@ async fn add(State(w): State<Arc<Witness>>, body: String) -> Response {
         Err(e) => return text(StatusCode::BAD_REQUEST, format!("{e}\n")),
     };
     let mut memory = w.memory.lock().await;
+    if memory.uncertain {
+        return text(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "state uncertain after a storage error; restart the witness\n".into(),
+        );
+    }
     let logs: Vec<LogKey> = w.logs.iter().chain(&memory.pinned).cloned().collect();
     match add_checkpoint(&logs, &memory.latest, &req) {
         Ok(cp) => {
@@ -327,7 +346,15 @@ async fn add(State(w): State<Arc<Witness>>, body: String) -> Response {
 }
 
 async fn healthz(State(w): State<Arc<Witness>>) -> Response {
-    let pinned = !w.memory.lock().await.pinned.is_empty();
+    let memory = w.memory.lock().await;
+    if memory.uncertain {
+        return text(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "state uncertain after a storage error; restart the witness\n".into(),
+        );
+    }
+    let pinned = !memory.pinned.is_empty();
+    drop(memory);
     if !pinned && (w.pins_log_key || w.logs.is_empty()) {
         return text(StatusCode::SERVICE_UNAVAILABLE, "no log key yet\n".into());
     }
@@ -603,6 +630,69 @@ mod tests {
             .collect();
         names.sort();
         assert_eq!(names, ["state.json", "state.tmp"]);
+    }
+
+    async fn health(url: &str) -> u16 {
+        reqwest::get(format!("{url}/healthz"))
+            .await
+            .unwrap()
+            .status()
+            .as_u16()
+    }
+
+    fn set_mode(dir: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// R6-L2: a save that fails after the rename leaves the disk ahead of memory. The witness
+    /// must then stop cosigning and report unhealthy until a restart reloads the disk; a save
+    /// that fails before the rename changes nothing and the witness carries on.
+    #[tokio::test]
+    async fn a_storage_error_after_the_rename_stops_cosigning_until_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir(&state_dir).unwrap();
+        let path = state_dir.join("state.json");
+        let log = Log::new();
+        let first = start(&log, &path).await.unwrap();
+        assert_eq!(post(&first.url, log.body(0, 1, false)).await.0, 200);
+
+        set_mode(&state_dir, 0o500);
+        if std::fs::File::create(state_dir.join("probe")).is_ok() {
+            set_mode(&state_dir, 0o700);
+            eprintln!("skipped: permissions do not apply to this user");
+            return;
+        }
+        assert_eq!(
+            post(&first.url, log.body(1, 2, false)).await.0,
+            500,
+            "temporary file cannot be created"
+        );
+        set_mode(&state_dir, 0o700);
+        assert_eq!(health(&first.url).await, 200, "nothing changed on disk");
+        assert_eq!(post(&first.url, log.body(1, 1, false)).await.0, 200);
+
+        // Write and search, no read: the rename succeeds, opening the directory to sync fails.
+        set_mode(&state_dir, 0o300);
+        assert_eq!(post(&first.url, log.body(1, 2, false)).await.0, 500);
+        set_mode(&state_dir, 0o700);
+        assert_eq!(health(&first.url).await, 503, "state uncertain");
+        for (old, size) in [(1, 2), (1, 1), (2, 3)] {
+            let (status, body) = post(&first.url, log.body(old, size, false)).await;
+            assert_eq!(status, 503, "{old}->{size}: {body}");
+        }
+        first.stop().await;
+
+        let restarted = start(&log, &path).await.unwrap();
+        assert_eq!(health(&restarted.url).await, 200);
+        assert_eq!(
+            post(&restarted.url, log.body(0, 1, false)).await,
+            (409, "2\n".into()),
+            "the stored size-2 checkpoint is the state"
+        );
+        assert_eq!(post(&restarted.url, log.body(2, 3, false)).await.0, 200);
+        restarted.stop().await;
     }
 
     #[tokio::test]
