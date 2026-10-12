@@ -4,7 +4,8 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use open_pact_core::{
-    Checkpoint, Endorsement, LogKey, Manifest, PublicKey, SigningKey, dev_key, root,
+    Checkpoint, Endorsement, Entry, LogHash, LogKey, Manifest, Note, PublicKey, SigningKey,
+    WitnessKey, consistency_proof, dev_key, inclusion_proof, root,
 };
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -131,6 +132,11 @@ impl Company {
         self.log.sign(&self.log_signer, &checkpoint).to_string()
     }
 
+    /// A checkpoint note for `checkpoint`, signed with the log key.
+    pub fn sign(&self, checkpoint: &Checkpoint) -> Note {
+        self.log.sign(&self.log_signer, checkpoint)
+    }
+
     pub fn fingerprint(&self) -> String {
         PublicKey::from(&self.key).fingerprint()
     }
@@ -158,4 +164,72 @@ pub fn snapshot(dir: &std::path::Path) -> BTreeMap<String, Vec<u8>> {
             )
         })
         .collect()
+}
+
+/// A witness with its own key, as a manifest's [log] section lists it.
+pub struct Witness {
+    pub key: WitnessKey,
+    signer: ed25519_dalek::SigningKey,
+}
+
+impl Witness {
+    pub fn new() -> Self {
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
+        Witness {
+            key: WitnessKey::new("witness.example.org/test", signer.verifying_key()),
+            signer,
+        }
+    }
+
+    /// Adds a cosignature made at Unix time `at`.
+    pub fn cosign(&self, note: &mut Note, at: u64) {
+        let checkpoint = Checkpoint::parse(&note.text).unwrap();
+        note.signatures
+            .push(self.key.cosign(&self.signer, &checkpoint, at));
+    }
+}
+
+/// The Merkle checkpoint of the first `size` entries.
+pub fn checkpoint_of(origin: &str, entries: &[Entry], size: u64) -> Checkpoint {
+    Checkpoint {
+        origin: origin.into(),
+        size,
+        root: root(&leaves(&entries[..size as usize])),
+    }
+}
+
+fn leaves(entries: &[Entry]) -> Vec<LogHash> {
+    entries.iter().map(Entry::leaf_hash).collect()
+}
+
+/// Answers the log reads an honest gateway serves for `entries`: entry pages, inclusion proofs
+/// and consistency proofs. Returns `None` for any other request line.
+pub fn serve_log(entries: &[Entry], line: &str) -> Option<(u16, String)> {
+    let (path, query) = line.strip_prefix("GET ")?.split_once('?')?;
+    let arg = |name: &str| -> Option<u64> {
+        query
+            .split('&')
+            .find_map(|kv| kv.strip_prefix(name)?.strip_prefix('='))?
+            .parse()
+            .ok()
+    };
+    let body = match path {
+        "/v1/log/entries" => {
+            let (from, to) = (
+                arg("from")? as usize,
+                (arg("to")? as usize).min(entries.len()),
+            );
+            json!({ "entries": entries.get(from..to)? })
+        }
+        "/v1/log/proof/inclusion" => {
+            let size = arg("size")? as usize;
+            json!({ "proof": inclusion_proof(&leaves(entries.get(..size)?), arg("index")?).ok()? })
+        }
+        "/v1/log/proof/consistency" => {
+            let to = arg("to")? as usize;
+            json!({ "proof": consistency_proof(&leaves(entries.get(..to)?), arg("from")?).ok()? })
+        }
+        _ => return None,
+    };
+    Some((200, body.to_string()))
 }

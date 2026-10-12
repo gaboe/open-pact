@@ -125,6 +125,7 @@ enum Response {
         warnings: Vec<String>,
         certificate_pem: Option<String>,
         ca_pem: String,
+        log_checkpoint: Option<String>,
     },
     Denied {
         reasons: Vec<String>,
@@ -451,9 +452,7 @@ impl Pins {
     }
 }
 
-/// Fetches the gateway's checkpoint, checks the manifest's witness policy on it, and checks that
-/// it extends the one stored on this device. On first contact it downloads every entry and
-/// recomputes the root instead.
+/// Fetches the gateway's checkpoint and verifies it against the one stored on this device.
 async fn sync_checkpoint(
     http: &reqwest::Client,
     home: &Home,
@@ -464,17 +463,13 @@ async fn sync_checkpoint(
     if let Some(changed) = pins.compare(http, gateway).await? {
         return Ok(Err(changed));
     }
-    let key = pins.log;
     let prev = home.checkpoint()?;
     let text = get_text(http, format!("{}/v1/log/checkpoint", base(gateway))).await?;
-    let now = u64::try_from(chrono::Utc::now().timestamp()).context("clock")?;
-    let new = match Note::parse(&text).and_then(|note| {
-        let checkpoint = key.verify(&note)?;
-        verify_cosignatures(policy, &checkpoint, &note, now)?;
-        Ok(checkpoint)
-    }) {
-        Ok(checkpoint) => checkpoint,
-        Err(e) => return Ok(Err(e.to_string())),
+    let new = match verify_checkpoint(http, home, gateway, &pins.log, policy, prev.as_ref(), &text)
+        .await?
+    {
+        Ok(new) => new,
+        Err(e) => return Ok(Err(e)),
     };
     if policy.is_none_or(|p| p.allow_split_views) {
         eprintln!(
@@ -484,7 +479,31 @@ async fn sync_checkpoint(
              nothing here would notice.\n"
         );
     }
-    let checked = match &prev {
+    Ok(Ok(new))
+}
+
+/// Verifies a checkpoint note from the gateway: the pinned log key, the manifest's witness policy,
+/// and that it extends `prev`, the last checkpoint this device verified. Without `prev` it
+/// downloads every entry and recomputes the root instead. Stores the note only if all hold.
+async fn verify_checkpoint(
+    http: &reqwest::Client,
+    home: &Home,
+    gateway: &str,
+    key: &LogKey,
+    policy: Option<&LogPolicy>,
+    prev: Option<&Checkpoint>,
+    text: &str,
+) -> Result<Result<Checkpoint, String>> {
+    let now = u64::try_from(chrono::Utc::now().timestamp()).context("clock")?;
+    let new = match Note::parse(text).and_then(|note| {
+        let checkpoint = key.verify(&note)?;
+        verify_cosignatures(policy, &checkpoint, &note, now)?;
+        Ok(checkpoint)
+    }) {
+        Ok(checkpoint) => checkpoint,
+        Err(e) => return Ok(Err(e.to_string())),
+    };
+    let checked = match prev {
         None => {
             let entries = fetch_entries(http, gateway, 0, new.size).await?;
             let leaves: Vec<LogHash> = entries.iter().map(Entry::leaf_hash).collect();
@@ -899,11 +918,13 @@ async fn check(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
     let os = current_os()?;
 
     let http = http_client()?;
-    let sync = sync_log(&http, home, &manifest, &mut enrolment).await?;
-    if let LogSync::Alarm(_) = sync {
-        report_log(sync, home);
-        return Ok(ExitCode::from(2));
-    }
+    let (mut verified, own) = match sync_log(&http, home, &manifest, &mut enrolment).await? {
+        LogSync::Verified(cp, own) => (cp, own),
+        alarm => {
+            report_log(alarm, home);
+            return Ok(ExitCode::from(2));
+        }
+    };
     let results = collect_results(&manifest, os);
     let gateway = base(&enrolment.gateway);
     let log_checkpoint = disclosable_checkpoint(&manifest, home.checkpoint()?);
@@ -957,7 +978,32 @@ async fn check(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
             warnings,
             certificate_pem,
             ca_pem,
+            log_checkpoint,
         } => {
+            let checked = match log_checkpoint {
+                None => Ok(Err(
+                    "the accepted claim response has no log checkpoint".into()
+                )),
+                Some(text) => {
+                    let key = Pins::load(home)?.log;
+                    let policy = manifest.body().log.as_ref();
+                    verify_checkpoint(&http, home, gateway, &key, policy, Some(&verified), &text)
+                        .await
+                }
+            };
+            match checked? {
+                Ok(cp) => verified = cp,
+                Err(e) => {
+                    println!("ACCEPTED, but the response failed log verification");
+                    report_log(
+                        alarm(format!(
+                            "the checkpoint in the accepted claim response: {e}; no certificate was installed"
+                        )),
+                        home,
+                    );
+                    return Ok(ExitCode::from(2));
+                }
+            }
             println!("ACCEPTED");
             for w in &warnings {
                 println!("  warning: {w}");
@@ -984,7 +1030,7 @@ async fn check(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
             false
         }
     };
-    report_log(sync, home);
+    report_log(LogSync::Verified(verified, own), home);
     Ok(if accepted {
         ExitCode::SUCCESS
     } else {
@@ -1226,12 +1272,18 @@ mod tests {
         assert_eq!(disclosable_checkpoint(&unlisted, Some(cp)), None);
     }
 
-    use fake_gateway::{Company, DEMO_MANIFEST, FakeGateway, not_found, snapshot};
+    use fake_gateway::{
+        Company, DEMO_MANIFEST, FakeGateway, Witness, checkpoint_of, not_found, serve_log, snapshot,
+    };
 
     /// A device enrolled at `gateway` under the demo manifest, with a certificate from an earlier check.
     fn enrolled_home(dir: &Path, gateway: &str, company: &Company) -> Home {
+        enrolled_home_with(dir, gateway, company, DEMO_MANIFEST)
+    }
+
+    fn enrolled_home_with(dir: &Path, gateway: &str, company: &Company, toml: &str) -> Home {
         let home = Home(dir.to_path_buf());
-        let manifest = Manifest::parse(DEMO_MANIFEST.as_bytes()).unwrap();
+        let manifest = Manifest::parse(toml.as_bytes()).unwrap();
         let device = DeviceKey::load_or_create(dir, true).unwrap();
         let enrolment = Enrolment {
             gateway: gateway.into(),
@@ -1242,8 +1294,7 @@ mod tests {
         };
         home.write("enrolment.json", &serde_json::to_vec(&enrolment).unwrap())
             .unwrap();
-        home.write("manifest.toml", DEMO_MANIFEST.as_bytes())
-            .unwrap();
+        home.write("manifest.toml", toml.as_bytes()).unwrap();
         Pins {
             company: company.fingerprint(),
             log: company.log.clone(),
@@ -1285,6 +1336,178 @@ mod tests {
             "no CA, certificate, key or log written"
         );
         assert_eq!(code.unwrap(), ExitCode::from(2));
+    }
+
+    /// The demo manifest with only the cheap `os_supported` check and `witness` as its one witness.
+    fn witnessed_manifest(witness: &Witness) -> String {
+        let first = DEMO_MANIFEST.find("[[control]]").unwrap();
+        let kept = DEMO_MANIFEST
+            .find("[[control]]\nid = \"os_supported\"")
+            .unwrap();
+        let toml = format!("{}{}", &DEMO_MANIFEST[..first], &DEMO_MANIFEST[kept..]);
+        let demo = toml
+            .lines()
+            .find(|l| l.starts_with("witnesses = "))
+            .unwrap();
+        toml.replace(
+            demo,
+            &format!(
+                r#"witnesses = [{{ name = "witness.example.org/test", key = "{}" }}]"#,
+                witness.key.vkey()
+            ),
+        )
+    }
+
+    /// Runs `check` against a gateway with an honest, witnessed log of the device's manifest and
+    /// enrolment that grows by one entry while the claim is processed. `response` gives the
+    /// `log_checkpoint` of the accepted claim response from the log's entries.
+    /// Returns the exit code, the files before the check, the files after it and the certificate
+    /// the response carried.
+    async fn check_with_response_checkpoint(
+        response: impl FnOnce(&Company, &Witness, &[Entry], u64) -> Option<String>,
+    ) -> (
+        ExitCode,
+        BTreeMap<String, Vec<u8>>,
+        BTreeMap<String, Vec<u8>>,
+        String,
+    ) {
+        let (company, witness) = (Company::new(), Witness::new());
+        let toml = witnessed_manifest(&witness);
+        let manifest = Manifest::parse(toml.as_bytes()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let device = DeviceKey::load_or_create(dir.path(), true).unwrap();
+        let mine = commitment(&Enrolment {
+            gateway: String::new(),
+            manifest: manifest.hash().clone(),
+            device: Pseudonym::of(&device.public_key()),
+            salt: "00".repeat(32),
+            log_entries: None,
+        })
+        .unwrap();
+        let entries = vec![
+            Entry {
+                index: 0,
+                kind: EntryKind::ManifestPublished,
+                data: json!({ "manifest": manifest.hash().as_str() }),
+            },
+            Entry {
+                index: 1,
+                kind: EntryKind::DeviceEnrolled,
+                data: json!({ "commitment": mine }),
+            },
+            Entry {
+                index: 2,
+                kind: EntryKind::DeviceApproved,
+                data: json!({ "device": "another" }),
+            },
+        ];
+        let now = u64::try_from(chrono::Utc::now().timestamp()).unwrap();
+        let mut before_claim = company.sign(&checkpoint_of(company.log.origin(), &entries, 2));
+        witness.cosign(&mut before_claim, now);
+        let before_claim = before_claim.to_string();
+        let certificate = rcgen::generate_simple_self_signed(vec!["device".into()])
+            .unwrap()
+            .cert
+            .pem();
+        let mut claim = json!({
+            "status": "accepted",
+            "warnings": [],
+            "certificate_pem": certificate,
+            "ca_pem": "new CA",
+        });
+        if let Some(text) = response(&company, &witness, &entries, now) {
+            claim["log_checkpoint"] = text.into();
+        }
+        let (published, log) = (Company::published(&toml, &company.key), company.log.vkey());
+        let (claim, stored) = (claim.to_string(), before_claim.clone());
+        let gateway = FakeGateway::start(move |line, _| match line {
+            "GET /v1/manifest" => (200, published.clone()),
+            "GET /v1/log/key" => (200, format!("{log}\n")),
+            "GET /v1/log/checkpoint" => (200, stored.clone()),
+            "POST /v1/nonce" => (200, r#"{"nonce":"n"}"#.into()),
+            "POST /v1/claim" => (200, claim.clone()),
+            _ => serve_log(&entries, line).unwrap_or_else(not_found),
+        })
+        .await;
+        let home = enrolled_home_with(dir.path(), &gateway.url, &company, &toml);
+        home.write(LOG_CHECKPOINT, before_claim.as_bytes()).unwrap();
+        let before = snapshot(dir.path());
+
+        let code = check(&home, false).await.unwrap();
+
+        let posts = gateway.posts();
+        assert_eq!(
+            posts,
+            ["POST /v1/nonce", "POST /v1/claim"],
+            "the claim was sent"
+        );
+        (code, before, snapshot(dir.path()), certificate)
+    }
+
+    #[tokio::test]
+    async fn check_installs_the_certificate_of_a_verified_response_checkpoint() {
+        let (code, before, after, certificate) =
+            check_with_response_checkpoint(|company, witness, entries, now| {
+                let mut grown = company.sign(&checkpoint_of(company.log.origin(), entries, 3));
+                witness.cosign(&mut grown, now);
+                Some(grown.to_string())
+            })
+            .await;
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(after["ca.pem"], b"new CA");
+        assert_eq!(after["vpn-cert.pem"], certificate.as_bytes());
+        let stored = Note::parse(std::str::from_utf8(&after[LOG_CHECKPOINT]).unwrap()).unwrap();
+        assert_eq!(Checkpoint::parse(&stored.text).unwrap().size, 3);
+        assert_ne!(after[LOG_CHECKPOINT], before[LOG_CHECKPOINT]);
+    }
+
+    #[tokio::test]
+    async fn check_installs_nothing_if_the_response_checkpoint_fails_verification() {
+        type Respond = fn(&Company, &Witness, &[Entry], u64) -> Option<String>;
+        fn signed(company: &Company, witness: &Witness, cp: Checkpoint, at: u64) -> Option<String> {
+            let mut note = company.sign(&cp);
+            witness.cosign(&mut note, at);
+            Some(note.to_string())
+        }
+        let cases: [(&str, Respond); 8] = [
+            ("not a checkpoint", |_, _, _, _| {
+                Some("NOT A CHECKPOINT".into())
+            }),
+            ("no checkpoint", |_, _, _, _| None),
+            ("a fork at the stored size", |c, w, e, now| {
+                let fork = Checkpoint {
+                    root: LogHash([7; 32]),
+                    ..checkpoint_of(c.log.origin(), e, 2)
+                };
+                signed(c, w, fork, now)
+            }),
+            ("a grown fork", |c, w, e, now| {
+                let fork = Checkpoint {
+                    root: LogHash([7; 32]),
+                    ..checkpoint_of(c.log.origin(), e, 3)
+                };
+                signed(c, w, fork, now)
+            }),
+            ("a rollback", |c, w, e, now| {
+                signed(c, w, checkpoint_of(c.log.origin(), e, 1), now)
+            }),
+            ("no witness cosignature", |c, _, e, _| {
+                Some(c.sign(&checkpoint_of(c.log.origin(), e, 3)).to_string())
+            }),
+            ("a stale cosignature", |c, w, e, now| {
+                signed(c, w, checkpoint_of(c.log.origin(), e, 3), now - 2 * 3600)
+            }),
+            ("another log key", |c, w, e, now| {
+                signed(&Company::new(), w, checkpoint_of(c.log.origin(), e, 3), now)
+            }),
+        ];
+        for (case, response) in cases {
+            let (code, before, after, _) = check_with_response_checkpoint(response).await;
+            assert_eq!(code, ExitCode::from(2), "{case}: log alarm");
+            for file in ["ca.pem", "vpn-cert.pem", LOG_CHECKPOINT] {
+                assert_eq!(after[file], before[file], "{case}: {file} unchanged");
+            }
+        }
     }
 
     #[tokio::test]

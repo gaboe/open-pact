@@ -1547,6 +1547,7 @@ dependencies = [
  "chrono",
  "clap",
  "core-foundation",
+ "ed25519-dalek",
  "hex",
  "libc",
  "open-pact-core",
