@@ -70,13 +70,14 @@ spec:
             - name: DATABASE_URL
               value: {{ .Values.database.externalUrl | quote }}
             {{- else }}
-            - name: DB_PASSWORD
+            # The raw Secret value: a URL would need it percent-encoded, PostgreSQL needs it raw.
+            - name: PGPASSWORD
               valueFrom:
                 secretKeyRef:
                   name: {{ include "open-pact.secretName" . }}
                   key: {{ .Values.postgres.existingSecretKey }}
             - name: DATABASE_URL
-              value: postgres://{{ .Values.postgres.user }}:$(DB_PASSWORD)@{{ .Release.Name }}-postgres:5432/{{ .Values.postgres.database }}
+              value: postgres://{{ .Values.postgres.user }}@{{ .Release.Name }}-postgres:5432/{{ .Values.postgres.database }}
             {{- end }}
           readinessProbe:
             httpGet:

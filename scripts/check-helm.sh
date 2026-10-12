@@ -48,5 +48,24 @@ grep -q 'value: /etc/open-pact/custom/manifest.toml' <<< "$with_a"
 grep -q 'mountPath: /etc/open-pact/custom' <<< "$with_a"
 [ "$(grep checksum/manifest <<< "$with_a")" != "$(grep checksum/manifest <<< "$with_b")" ]
 echo "a custom manifest renders a ConfigMap, the mount, MANIFEST_PATH, and a checksum that changes with the text; without one, none of them"
+# PostgreSQL reads the raw Secret, so the gateway must get it raw too: as PGPASSWORD, never
+# inside the URL, where @ : / ? # % change how the URL parses.
+password='fict@:/?#%pw'
+database_env() { # rendered chart, secret name
+  local out="$1" secret="$2"
+  grep -q -x '              value: postgres://pact@t-postgres:5432/pact' <<< "$out" \
+    || { echo "FAIL: DATABASE_URL must name no password: $(grep -A1 'name: DATABASE_URL' <<< "$out")"; exit 1; }
+  ! grep -q 'DB_PASSWORD' <<< "$out" || { echo "FAIL: the password still reaches the URL"; exit 1; }
+  for container in PGPASSWORD POSTGRES_PASSWORD; do
+    grep -A4 "name: $container\$" <<< "$out" | tr -d ' \n' \
+      | grep -q "valueFrom:secretKeyRef:name:${secret}key:password" \
+      || { echo "FAIL: $container must come from Secret $secret"; exit 1; }
+  done
+}
+created="$(helm template t "$chart" "${kek[@]}" --set-string "postgres.password=$password")"
+grep -q -F "  password: \"$password\"" <<< "$created" || { echo "FAIL: the Secret must hold the raw password"; exit 1; }
+database_env "$created" t-postgres
+database_env "$(helm template t "$chart" "${kek[@]}" --set postgres.existingSecret=pact-postgres)" pact-postgres
+echo "the gateway reads a database password with @:/?#% as PGPASSWORD from the Secret postgres uses"
 echo "the witness needs its own key secret and the log keys it witnesses"
 echo "renders with the KEK secret and a chosen database password, existing secret or external database"
