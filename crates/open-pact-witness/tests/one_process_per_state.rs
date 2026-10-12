@@ -320,3 +320,30 @@ fn a_witness_whose_state_was_replaced_cosigns_nothing() {
     assert_eq!(status, 500, "{body}");
     assert_eq!(std::fs::read(&state).unwrap(), stored, "state unchanged");
 }
+
+/// Other spellings of the state directory, a symlink to it or a `..` path, find the same lock.
+#[test]
+fn another_spelling_of_the_state_directory_finds_the_same_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = dir.path().join("witness.key");
+    write_key(&key, 5);
+    let log = Log::new();
+    let states = dir.path().join("states");
+    std::fs::create_dir(&states).unwrap();
+    let running = Running::start(&key, &states.join("state.json"), &log);
+    assert_eq!(running.add(&log.add(0, 1)).0, 200);
+
+    let linked = dir.path().join("linked");
+    std::os::unix::fs::symlink(&states, &linked).unwrap();
+    for state in [
+        linked.join("state.json"),
+        states.join("..").join("states").join("state.json"),
+    ] {
+        let err = refused(command(&key, &state, &log.key.vkey()).spawn().unwrap());
+        assert!(
+            err.contains("another witness process"),
+            "{}: {err}",
+            state.display()
+        );
+    }
+}
