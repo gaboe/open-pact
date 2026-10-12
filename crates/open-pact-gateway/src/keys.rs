@@ -147,7 +147,9 @@ impl Ca {
 
 /// The DER of a certificate request that carries a P-256 public key and nothing else: canonical PEM
 /// with no text around it, an empty subject, no attributes and so no extensions. Any other field
-/// could carry text off the device. The signature is checked when the certificate is issued.
+/// could carry text off the device, so the request must be exactly the info, the parameterless
+/// ecdsa-with-SHA256 identifier and the signature. The signature is checked when the certificate
+/// is issued.
 pub fn bare_csr_der(csr_pem: &str) -> Result<Vec<u8>, String> {
     use x509_parser::certification_request::X509CertificationRequest;
     use x509_parser::oid_registry::{OID_EC_P256, OID_KEY_TYPE_EC_PUBLIC_KEY};
@@ -178,6 +180,14 @@ pub fn bare_csr_der(csr_pem: &str) -> Result<Vec<u8>, String> {
     if algorithm.algorithm != OID_KEY_TYPE_EC_PUBLIC_KEY || curve != Some(OID_EC_P256) {
         return Err(bad("the key must be P-256"));
     }
+    if info.version.0 != 0 {
+        return Err(bad("the version must be 1"));
+    }
+    if request_der(info.raw, &ECDSA_WITH_SHA256, &csr.signature_value) != pem.contents {
+        return Err(bad(
+            "the signature algorithm must be ecdsa-with-SHA256 without parameters",
+        ));
+    }
     Ok(pem.contents)
 }
 
@@ -200,6 +210,42 @@ fn canonical_pem(der: &[u8]) -> String {
     }
     pem.push_str("-----END CERTIFICATE REQUEST-----\n");
     pem
+}
+
+/// ecdsa-with-SHA256 with its parameters absent, as RFC 5758 section 3.2 requires.
+const ECDSA_WITH_SHA256: [u8; 12] = [
+    0x30, 0x0a, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02,
+];
+
+fn request_der(
+    info: &[u8],
+    algorithm: &[u8],
+    signature: &x509_parser::der_parser::asn1_rs::BitString,
+) -> Vec<u8> {
+    let mut bits = vec![signature.unused_bits];
+    bits.extend_from_slice(&signature.data);
+    let mut body = info.to_vec();
+    body.extend_from_slice(algorithm);
+    body.extend(der_tlv(0x03, &bits));
+    der_tlv(0x30, &body)
+}
+
+fn der_tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+    let len = content.len();
+    let mut out = vec![tag];
+    if len < 0x80 {
+        out.push(len as u8);
+    } else {
+        let bytes: Vec<u8> = len
+            .to_be_bytes()
+            .into_iter()
+            .skip_while(|b| *b == 0)
+            .collect();
+        out.push(0x80 | bytes.len() as u8);
+        out.extend(bytes);
+    }
+    out.extend_from_slice(content);
+    out
 }
 
 fn random_serial() -> SerialNumber {
@@ -381,6 +427,42 @@ mod tests {
                 "{what} accepted"
             );
         }
+    }
+
+    fn rebuild_with_signature_algorithm(pem: &str, algorithm: &[u8]) -> String {
+        use x509_parser::certification_request::X509CertificationRequest;
+        let der = der(pem);
+        let (_, csr) = X509CertificationRequest::from_der(&der).unwrap();
+        canonical_pem(&request_der(
+            csr.certification_request_info.raw,
+            algorithm,
+            &csr.signature_value,
+        ))
+    }
+
+    #[test]
+    fn rejects_extra_signature_algorithm_parameters() {
+        let bare = csr(&KeyPair::generate().unwrap());
+        assert_eq!(
+            rebuild_with_signature_algorithm(&bare, &ECDSA_WITH_SHA256),
+            bare
+        );
+        let oid = &ECDSA_WITH_SHA256[2..];
+        let mut with_text = oid.to_vec();
+        with_text.extend(der_tlv(0x0c, b"FICTIONAL extra parameter"));
+        let mut with_null = oid.to_vec();
+        with_null.extend([0x05, 0x00]);
+        for (what, algorithm) in [
+            ("text parameter", der_tlv(0x30, &with_text)),
+            ("NULL parameter", der_tlv(0x30, &with_null)),
+        ] {
+            let pem = rebuild_with_signature_algorithm(&bare, &algorithm);
+            assert!(
+                ca().issue(&pem, "abc", Duration::hours(1)).is_err(),
+                "{what} accepted"
+            );
+        }
+        assert!(ca().issue(&bare, "abc", Duration::hours(1)).is_ok());
     }
 
     #[test]
