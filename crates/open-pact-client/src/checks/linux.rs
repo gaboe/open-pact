@@ -99,16 +99,34 @@ trait PackageHost {
     fn run(&self, program: &str, args: &[&str]) -> Option<Ran>;
     /// The paths of the entries in a directory.
     fn list(&self, dir: &str) -> Option<Vec<String>>;
-    /// The size and SHA-256 of a file's bytes, or with `decode` of the content APT reads from
+    /// The size and `hash` of a file's bytes, or with `decode` of the content APT reads from
     /// it after decompression. `None` when the file cannot be read or decoded in time.
-    fn digest(&self, path: &str, decode: bool) -> Option<IndexDigest>;
+    fn digest(&self, path: &str, decode: bool, hash: Hash) -> Option<IndexDigest>;
 }
 
-/// An index's size and lowercase hex SHA-256, as a Release lists it.
+/// The checksum sections of a Release this check can verify, weakest first.
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
+enum Hash {
+    Sha256,
+    Sha512,
+}
+
+impl Hash {
+    const ALL: [Hash; 2] = [Hash::Sha256, Hash::Sha512];
+
+    fn section(self) -> &'static str {
+        match self {
+            Hash::Sha256 => "SHA256:",
+            Hash::Sha512 => "SHA512:",
+        }
+    }
+}
+
+/// An index's size and lowercase hex digest, as a Release lists it.
 #[derive(Debug, PartialEq)]
 struct IndexDigest {
     size: u64,
-    sha256: String,
+    hash: String,
 }
 
 struct System;
@@ -129,9 +147,9 @@ impl PackageHost for System {
             .collect()
     }
 
-    fn digest(&self, path: &str, decode: bool) -> Option<IndexDigest> {
+    fn digest(&self, path: &str, decode: bool, hash: Hash) -> Option<IndexDigest> {
         if !decode {
-            return hash_stream(fs::File::open(path).ok()?);
+            return hash_stream(fs::File::open(path).ok()?, hash);
         }
         // `apt-helper cat-file` decodes every compression APT stores lists in.
         let mut child = std::process::Command::new(APT_HELPER)
@@ -142,7 +160,7 @@ impl PackageHost for System {
             .spawn()
             .ok()?;
         let stdout = child.stdout.take()?;
-        let hasher = std::thread::spawn(move || hash_stream(stdout));
+        let hasher = std::thread::spawn(move || hash_stream(stdout, hash));
         let deadline = std::time::Instant::now() + super::exec::TIMEOUT;
         let status = loop {
             match child.try_wait() {
@@ -162,9 +180,15 @@ impl PackageHost for System {
     }
 }
 
-fn hash_stream(mut input: impl Read) -> Option<IndexDigest> {
-    use sha2::Digest;
-    let mut hasher = sha2::Sha256::new();
+fn hash_stream(input: impl Read, hash: Hash) -> Option<IndexDigest> {
+    match hash {
+        Hash::Sha256 => hash_with::<sha2::Sha256>(input),
+        Hash::Sha512 => hash_with::<sha2::Sha512>(input),
+    }
+}
+
+fn hash_with<D: sha2::Digest>(mut input: impl Read) -> Option<IndexDigest> {
+    let mut hasher = D::new();
     let mut size = 0u64;
     let mut chunk = vec![0u8; 1 << 16];
     loop {
@@ -180,7 +204,7 @@ fn hash_stream(mut input: impl Read) -> Option<IndexDigest> {
     }
     Some(IndexDigest {
         size,
-        sha256: hex::encode(hasher.finalize()),
+        hash: hex::encode(hasher.finalize()),
     })
 }
 
@@ -304,24 +328,47 @@ fn parse_index_targets(out: &str) -> Option<Vec<IndexTarget>> {
         .collect()
 }
 
-/// The index files the `SHA256` section of a Release lists, by name. Other hash sections and
+/// The lines of one checksum section of a Release, such as `SHA256:`. The other sections and
 /// the signature that follows are not part of it.
-fn release_indexes(release: &str) -> BTreeMap<&str, IndexDigest> {
+fn release_section<'a>(release: &'a str, header: &str) -> impl Iterator<Item = &'a str> {
     release
         .lines()
-        .skip_while(|l| l.trim_end() != "SHA256:")
+        .skip_while(move |l| l.trim_end() != header)
         .skip(1)
         .take_while(|l| l.starts_with(' '))
-        .filter_map(|l| match l.split_whitespace().collect::<Vec<_>>()[..] {
-            [sha256, size, name] => Some((
-                name,
-                IndexDigest {
-                    size: size.parse().ok()?,
-                    sha256: sha256.to_ascii_lowercase(),
-                },
-            )),
-            _ => None,
-        })
+}
+
+/// The index files the strongest checksum section of a Release lists, by name, and that
+/// section's hash (R7-L3). APT also verifies a download with the strongest hash it knows.
+fn release_indexes(release: &str) -> (Hash, BTreeMap<&str, IndexDigest>) {
+    let section = |hash: Hash| -> BTreeMap<&str, IndexDigest> {
+        release_section(release, hash.section())
+            .filter_map(|l| match l.split_whitespace().collect::<Vec<_>>()[..] {
+                [digest, size, name] => Some((
+                    name,
+                    IndexDigest {
+                        size: size.parse().ok()?,
+                        hash: digest.to_ascii_lowercase(),
+                    },
+                )),
+                _ => None,
+            })
+            .collect()
+    };
+    Hash::ALL
+        .into_iter()
+        .rev()
+        .map(|hash| (hash, section(hash)))
+        .find(|(_, listed)| !listed.is_empty())
+        .unwrap_or((Hash::Sha256, BTreeMap::new()))
+}
+
+/// Every index name a Release lists in any checksum section, usable by this check or not.
+fn release_names(release: &str) -> BTreeSet<&str> {
+    ["MD5Sum:", "SHA1:", "SHA256:", "SHA512:"]
+        .into_iter()
+        .flat_map(|header| release_section(release, header))
+        .filter_map(|l| l.split_whitespace().nth(2))
         .collect()
 }
 
@@ -335,10 +382,11 @@ fn release_indexes(release: &str) -> BTreeMap<&str, IndexDigest> {
 ///   within the last week, before its `Valid-Until`, and listing a Packages index for the
 ///   native architecture and for every foreign architecture dpkg installs packages for;
 /// - for every source, each Packages index APT would read (native, foreign or `all`
-///   architecture, listed in the Release's SHA256 section) cached with exactly the listed size
-///   and SHA-256. A stored form matches its own entry, or its decoded content matches the
-///   uncompressed entry. Only an index the Release lists as empty may be absent, because APT
-///   does not store it.
+///   architecture, listed in the Release or cached) cached with exactly the size and digest
+///   the Release's strongest checksum section (SHA512, else SHA256) lists for it, so an index
+///   listed without a usable hash fails (R7-L3). A stored form matches its own entry, or its
+///   decoded content matches the uncompressed entry. Only an index the Release lists as empty
+///   may be absent, because APT does not store it.
 ///
 /// Anything else, including a date that does not parse, means the cache is not proven.
 fn apt_security_lists_current(host: &impl PackageHost, now: DateTime<Utc>) -> bool {
@@ -394,7 +442,8 @@ fn apt_security_lists_current(host: &impl PackageHost, now: DateTime<Utc>) -> bo
         else {
             return false;
         };
-        let listed = release_indexes(&release);
+        let (hash, listed) = release_indexes(&release);
+        let named = release_names(&release);
         let arch_all_unused = release_field(&release, "No-Support-for-Architecture-all")
             .is_some_and(|v| v.split_whitespace().any(|w| w == "Packages"));
         let used: Vec<&IndexTarget> = targets
@@ -407,14 +456,15 @@ fn apt_security_lists_current(host: &impl PackageHost, now: DateTime<Utc>) -> bo
                 Some(arch) => architectures.contains(arch),
             })
             .filter(|t| {
-                APT_INDEX_SUFFIXES
-                    .iter()
-                    .any(|suffix| listed.contains_key(format!("{}{suffix}", t.meta_key).as_str()))
+                APT_INDEX_SUFFIXES.iter().any(|suffix| {
+                    named.contains(format!("{}{suffix}", t.meta_key).as_str())
+                        || cached.contains(&format!("{}{suffix}", t.filename))
+                })
             })
             .collect();
         if !used
             .iter()
-            .all(|t| index_matches(host, t, &listed, &cached))
+            .all(|t| index_matches(host, t, hash, &listed, &cached))
         {
             return false;
         }
@@ -444,6 +494,7 @@ fn apt_security_lists_current(host: &impl PackageHost, now: DateTime<Utc>) -> bo
 fn index_matches(
     host: &impl PackageHost,
     target: &IndexTarget,
+    hash: Hash,
     listed: &BTreeMap<&str, IndexDigest>,
     cached: &BTreeSet<String>,
 ) -> bool {
@@ -459,9 +510,9 @@ fn index_matches(
     stored.iter().all(|suffix| {
         let path = format!("{}{suffix}", target.filename);
         let as_stored = listed.get(format!("{}{suffix}", target.meta_key).as_str());
-        as_stored.is_some_and(|want| host.digest(&path, false).as_ref() == Some(want))
+        as_stored.is_some_and(|want| host.digest(&path, false, hash).as_ref() == Some(want))
             || (!suffix.is_empty()
-                && plain.is_some_and(|want| host.digest(&path, true).as_ref() == Some(want)))
+                && plain.is_some_and(|want| host.digest(&path, true, hash).as_ref() == Some(want)))
     })
 }
 
@@ -1538,8 +1589,8 @@ ID Command line                         Date and time       Action(s) Altered
         }
 
         /// A fake index decodes to its own text, whatever its suffix.
-        fn digest(&self, path: &str, _decode: bool) -> Option<IndexDigest> {
-            hash_stream(self.files.get(path)?.as_bytes())
+        fn digest(&self, path: &str, _decode: bool, hash: Hash) -> Option<IndexDigest> {
+            hash_stream(self.files.get(path)?.as_bytes(), hash)
         }
     }
 
@@ -2019,6 +2070,62 @@ ID Command line                          Date and time       Action(s) Altered
                     &format!("{}InRelease", source("suite0")),
                     &format!("{SECURITY_LISTS}MD5Sum:\n 0d 99 main/binary-amd64/Packages\n"),
                 ),
+            ),
+        ] {
+            assert_eq!(patch_age(&host, now()), "unknown", "{what}");
+        }
+    }
+
+    /// One SHA512 line of a Release: the hash and size of `content`, listed under `name`.
+    fn entry512(name: &str, content: &str) -> String {
+        let sha = hex::encode(<sha2::Sha512 as sha2::Digest>::digest(content.as_bytes()));
+        format!(" {sha} {} {name}\n", content.len())
+    }
+
+    /// R7-L3: an index is checked with the strongest hash its Release lists, so a source that
+    /// publishes only SHA512 is verified too, and a SHA256 match does not excuse a SHA512
+    /// mismatch. An index the Release lists without a usable hash leaves the cache unproven.
+    #[test]
+    fn apt_patch_age_verifies_the_strongest_listed_hash() {
+        let clear = Some((true, APT_CLEAR));
+        let pocket = |hashes: &str| {
+            apt_host(&[SECURITY_LISTS, RELEASE_POCKET], clear).with(
+                &format!("{}InRelease", source("suite1")),
+                &format!("{RELEASE_POCKET}{hashes}"),
+            )
+        };
+        let sha512_only = || {
+            pocket(&format!(
+                "SHA512:\n{}",
+                entry512("main/binary-amd64/Packages", INDEX)
+            ))
+        };
+        assert_eq!(
+            patch_age(&sha512_only(), now()),
+            "le_14d",
+            "complete SHA512-only source"
+        );
+        let older = INDEX.replace("1.1", "1.0");
+        for (what, host) in [
+            (
+                "SHA512-only source with a truncated index",
+                sha512_only().with(&packages("suite1"), "Package: fictional-lib\n"),
+            ),
+            (
+                "SHA512-only source with an older index",
+                sha512_only().with(&packages("suite1"), &older),
+            ),
+            (
+                "SHA256 matches but SHA512 does not",
+                pocket(&format!(
+                    "SHA256:\n{}SHA512:\n{}",
+                    entry("main/binary-amd64/Packages", INDEX),
+                    entry512("main/binary-amd64/Packages", &older)
+                )),
+            ),
+            (
+                "index listed with MD5 only",
+                pocket("MD5Sum:\n 0d 99 main/binary-amd64/Packages\n"),
             ),
         ] {
             assert_eq!(patch_age(&host, now()), "unknown", "{what}");
