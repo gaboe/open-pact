@@ -24,6 +24,7 @@ fedora default disk_encryption=unknown firewall=unknown screen_lock=unknown os_s
 * patch-stale os_patch_age=gt_30d
 * patch-rotated os_patch_age=gt_30d
 * patch-no-metadata os_patch_age=unknown
+ubuntu patch-expired os_patch_age=unknown
 * eol os_supported=no
 * autologin-gdm auto_login=on
 * autologin-sddm auto_login=on

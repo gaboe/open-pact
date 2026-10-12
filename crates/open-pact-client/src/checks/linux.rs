@@ -1,6 +1,6 @@
 use std::fs;
 
-use chrono::{NaiveDate, Utc};
+use chrono::{DateTime, Duration, NaiveDate, Utc};
 
 use super::buckets;
 use super::exec::{Ran, run, run_status};
@@ -19,6 +19,8 @@ const AUTOLOGIN_FILES: &[&str] = &[
 ];
 const AUTOLOGIN_DIRS: &[&str] = &["/etc/sddm.conf.d", "/etc/lightdm/lightdm.conf.d"];
 const APT_ROTATED_LOGS: u32 = 3;
+/// Security lists older than this may lack an update the archive has published since (R4-M1).
+const APT_SECURITY_LISTS_MAX_AGE: Duration = Duration::days(7);
 
 const UBUNTU_EOL: &[(&str, &str)] = &[
     ("22.04", "2027-06-01"),
@@ -91,8 +93,8 @@ pub fn os_supported() -> &'static str {
 trait PackageHost {
     fn read(&self, path: &str) -> Option<String>;
     fn run(&self, program: &str, args: &[&str]) -> Option<Ran>;
-    /// Whether APT has downloaded package lists to compare the installed versions with.
-    fn apt_lists_present(&self) -> bool;
+    /// The text of each `Release` and `InRelease` file APT has downloaded.
+    fn apt_releases(&self) -> Vec<String>;
 }
 
 struct System;
@@ -106,17 +108,20 @@ impl PackageHost for System {
         run_status(program, args)
     }
 
-    fn apt_lists_present(&self) -> bool {
-        fs::read_dir(APT_LISTS).is_ok_and(|entries| {
-            entries
-                .flatten()
-                .any(|e| e.file_name().to_string_lossy().contains("_Packages"))
-        })
+    fn apt_releases(&self) -> Vec<String> {
+        let Ok(entries) = fs::read_dir(APT_LISTS) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with("Release"))
+            .filter_map(|e| fs::read_to_string(e.path()).ok())
+            .collect()
     }
 }
 
 pub fn os_patch_age() -> &'static str {
-    patch_age(&System, Utc::now().date_naive())
+    patch_age(&System, Utc::now())
 }
 
 /// What the package manager says about outstanding security updates. Only `Clear` lets the date
@@ -130,14 +135,14 @@ enum SecurityUpdates {
 
 /// The age of the last whole-system upgrade, or `unknown` unless the security query ran, exited
 /// zero and showed nothing outstanding.
-fn patch_age(host: &impl PackageHost, today: NaiveDate) -> &'static str {
+fn patch_age(host: &impl PackageHost, now: DateTime<Utc>) -> &'static str {
     let (last, updates) = match host.read(APT_HISTORY) {
         Some(text) => (
             first_upgrade_date(
                 std::iter::once(text)
                     .chain((1..=APT_ROTATED_LOGS).filter_map(|n| read_rotated_apt_log(host, n))),
             ),
-            apt_security_updates(host),
+            apt_security_updates(host, now),
         ),
         None => (
             succeeded(host.run("dnf", &["history", "list"]))
@@ -147,7 +152,7 @@ fn patch_age(host: &impl PackageHost, today: NaiveDate) -> &'static str {
         ),
     };
     match (updates, last) {
-        (SecurityUpdates::Clear, Some(date)) => buckets::patch_age(date, today),
+        (SecurityUpdates::Clear, Some(date)) => buckets::patch_age(date, now.date_naive()),
         _ => "unknown",
     }
 }
@@ -156,11 +161,11 @@ fn succeeded(ran: Option<Ran>) -> Option<String> {
     ran.filter(|r| r.success).map(|r| r.text)
 }
 
-/// The parser reads apt's English messages, so the query runs in the C locale. Without
-/// downloaded package lists `apt-get -s upgrade` compares the installed packages with
-/// nothing and reports no upgrades.
-fn apt_security_updates(host: &impl PackageHost) -> SecurityUpdates {
-    if !host.apt_lists_present() {
+/// The parser reads apt's English messages, so the query runs in the C locale.
+/// `apt-get -s upgrade` compares the installed packages with the downloaded lists only, so
+/// without current security lists it reports no upgrades while some are outstanding.
+fn apt_security_updates(host: &impl PackageHost, now: DateTime<Utc>) -> SecurityUpdates {
+    if !apt_security_lists_current(&host.apt_releases(), now) {
         return SecurityUpdates::Unknown;
     }
     let query = [
@@ -173,6 +178,55 @@ fn apt_security_updates(host: &impl PackageHost) -> SecurityUpdates {
     ];
     succeeded(host.run("env", &query))
         .map_or(SecurityUpdates::Unknown, |out| parse_apt_security(&out))
+}
+
+/// Whether APT's downloaded lists can show every outstanding security update: there is a
+/// security suite (`Suite` or `Codename` ending in `-security`), and each one is published
+/// within the last week and has not passed its `Valid-Until`. A date that does not parse
+/// counts as stale.
+fn apt_security_lists_current(releases: &[String], now: DateTime<Utc>) -> bool {
+    let security: Vec<&String> = releases
+        .iter()
+        .filter(|text| {
+            ["Suite", "Codename"]
+                .iter()
+                .filter_map(|name| release_field(text, name))
+                .any(|suite| suite.ends_with("-security"))
+        })
+        .collect();
+    !security.is_empty()
+        && security.iter().all(|text| {
+            let published = release_field(text, "Date").and_then(parse_release_date);
+            let expired = release_field(text, "Valid-Until")
+                .map(|until| parse_release_date(until).is_none_or(|until| until <= now));
+            published.is_some_and(|date| now - date <= APT_SECURITY_LISTS_MAX_AGE)
+                && expired != Some(true)
+        })
+}
+
+fn release_field<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+    text.lines()
+        .find_map(|l| l.strip_prefix(name)?.strip_prefix(':'))
+        .map(str::trim)
+}
+
+/// Reads a Release date such as `Mon, 12 Oct 2026  1:43:41 UTC`: APT pads a one-digit hour
+/// with a space and writes the zone as `UTC`, `GMT` or a numeric offset.
+fn parse_release_date(text: &str) -> Option<DateTime<Utc>> {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let [.., day, month, year, time, zone] = words[..] else {
+        return None;
+    };
+    let zone = match zone {
+        "UTC" | "GMT" | "UT" | "Z" => "+0000",
+        offset => offset,
+    };
+    DateTime::parse_from_str(
+        &format!("{day} {month} {year} {time} {zone}"),
+        "%d %b %Y %H:%M:%S %z",
+    )
+    .ok()
+    .map(|t| t.with_timezone(&Utc))
 }
 
 /// Reads `apt-get -s upgrade`. A package in the security pocket with an `Inst` line, or any
@@ -1186,7 +1240,7 @@ ID Command line                         Date and time       Action(s) Altered
 
     struct FakeHost {
         apt_history: Option<String>,
-        apt_lists: bool,
+        apt_releases: Vec<String>,
         commands: Vec<(&'static str, Option<(bool, String)>)>,
     }
 
@@ -1201,8 +1255,8 @@ ID Command line                         Date and time       Action(s) Altered
             out.clone().map(|(success, text)| Ran { success, text })
         }
 
-        fn apt_lists_present(&self) -> bool {
-            self.apt_lists
+        fn apt_releases(&self) -> Vec<String> {
+            self.apt_releases.clone()
         }
     }
 
@@ -1212,14 +1266,26 @@ ID Command line                         Date and time       Action(s) Altered
     const DNF_HISTORY: &str = "dnf history list";
     const DNF_QUERY: &str = "dnf -C -q updateinfo list --security";
 
-    fn apt_host(lists: bool, query: Option<(bool, &str)>) -> FakeHost {
+    /// The security suite's Release header as Ubuntu writes it, published the day before `now()`.
+    const SECURITY_LISTS: &str = "-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA512\n\n\
+        Origin: Fictional\nSuite: fictional-security\nCodename: fictional\n\
+        Date: Sun, 11 Oct 2026  2:34:10 UTC\nSHA256:\n 00 1 main/Packages\n";
+    /// A release pocket: published once and never again, so its date says nothing.
+    const RELEASE_POCKET: &str = "Origin: Fictional\nSuite: fictional\nCodename: fictional\n\
+        Date: Thu, 25 Apr 2024 15:10:33 UTC\n";
+
+    fn now() -> DateTime<Utc> {
+        d(2026, 10, 12).and_hms_opt(12, 0, 0).unwrap().and_utc()
+    }
+
+    fn apt_host(lists: &[&str], query: Option<(bool, &str)>) -> FakeHost {
         FakeHost {
             apt_history: Some(apt_entry(
                 "2026-10-11",
                 "apt upgrade",
                 "fictional-lib:amd64 (1.0, 1.1)",
             )),
-            apt_lists: lists,
+            apt_releases: lists.iter().map(|l| l.to_string()).collect(),
             commands: vec![(APT_QUERY, owned(query))],
         }
     }
@@ -1227,7 +1293,7 @@ ID Command line                         Date and time       Action(s) Altered
     fn dnf_host(history: Option<(bool, &str)>, query: Option<(bool, &str)>) -> FakeHost {
         FakeHost {
             apt_history: None,
-            apt_lists: false,
+            apt_releases: Vec::new(),
             commands: vec![(DNF_HISTORY, owned(history)), (DNF_QUERY, owned(query))],
         }
     }
@@ -1245,16 +1311,19 @@ ID Command line                          Date and time       Action(s) Altered
     /// outstanding. Anything else leaves the patch age unknown.
     #[test]
     fn apt_patch_age_needs_a_readable_security_query() {
-        let today = d(2026, 10, 12);
+        let today = now();
         assert_eq!(
-            patch_age(&apt_host(true, Some((true, APT_CLEAR))), today),
+            patch_age(
+                &apt_host(&[SECURITY_LISTS, RELEASE_POCKET], Some((true, APT_CLEAR))),
+                today
+            ),
             "le_14d"
         );
         for (what, host) in [
             (
                 "pending",
                 apt_host(
-                    true,
+                    &[SECURITY_LISTS, RELEASE_POCKET],
                     Some((
                         true,
                         "Inst fictional-lib [1.0] (1.1 Fictional:1/stable-security [amd64])\n",
@@ -1264,24 +1333,82 @@ ID Command line                          Date and time       Action(s) Altered
             (
                 "failed",
                 apt_host(
-                    true,
+                    &[SECURITY_LISTS, RELEASE_POCKET],
                     Some((false, "E: Could not open lock file /var/lib/dpkg/lock\n")),
                 ),
             ),
-            ("timed out", apt_host(true, None)),
+            (
+                "timed out",
+                apt_host(&[SECURITY_LISTS, RELEASE_POCKET], None),
+            ),
             (
                 "unrecognized",
-                apt_host(true, Some((true, "FICTIONAL unexpected output\n"))),
+                apt_host(
+                    &[SECURITY_LISTS, RELEASE_POCKET],
+                    Some((true, "FICTIONAL unexpected output\n")),
+                ),
             ),
-            ("no package lists", apt_host(false, Some((true, APT_CLEAR)))),
+            ("no package lists", apt_host(&[], Some((true, APT_CLEAR)))),
         ] {
             assert_eq!(patch_age(&host, today), "unknown", "{what}");
         }
     }
 
+    /// R4-M1: with old or expired security lists, an empty simulation proves nothing. The
+    /// archive may hold a security update the lists do not show yet.
+    #[test]
+    fn apt_patch_age_needs_current_security_lists() {
+        let clear = Some((true, APT_CLEAR));
+        let debian = "Origin: Fictional\nSuite: stable-security\nCodename: fictional-security\n\
+            Date: Mon, 12 Oct 2026 06:00:00 +0000\nValid-Until: Mon, 19 Oct 2026 06:00:00 +0000\n";
+        assert_eq!(patch_age(&apt_host(&[debian], clear), now()), "le_14d");
+        let security =
+            |date: &str, until: &str| format!("Suite: fictional-security\nDate: {date}\n{until}");
+        for (what, lists) in [
+            (
+                "expired",
+                security(
+                    "Sat, 01 Jan 2000 00:00:00 +0000",
+                    "Valid-Until: Sun, 02 Jan 2000 00:00:00 +0000\n",
+                ),
+            ),
+            (
+                "past Valid-Until",
+                security(
+                    "Mon, 12 Oct 2026 06:00:00 +0000",
+                    "Valid-Until: Mon, 12 Oct 2026 07:00:00 +0000\n",
+                ),
+            ),
+            (
+                "older than a week",
+                security("Sat, 03 Oct 2026 12:00:00 UTC", ""),
+            ),
+            ("unreadable date", security("FICTIONAL", "")),
+            (
+                "unreadable Valid-Until",
+                security(
+                    "Mon, 12 Oct 2026 06:00:00 +0000",
+                    "Valid-Until: FICTIONAL\n",
+                ),
+            ),
+            ("no security suite", RELEASE_POCKET.to_string()),
+        ] {
+            let host = apt_host(&[RELEASE_POCKET, &lists], clear);
+            assert_eq!(patch_age(&host, now()), "unknown", "{what}");
+        }
+        let one_stale = apt_host(
+            &[
+                SECURITY_LISTS,
+                &security("Sat, 03 Oct 2026 12:00:00 UTC", ""),
+            ],
+            clear,
+        );
+        assert_eq!(patch_age(&one_stale, now()), "unknown", "one stale suite");
+    }
+
     #[test]
     fn dnf_patch_age_needs_a_readable_security_query() {
-        let today = d(2026, 10, 12);
+        let today = now();
         let upgraded = Some((true, DNF_UPGRADED));
         assert_eq!(
             patch_age(&dnf_host(upgraded, Some((true, ""))), today),
@@ -1324,7 +1451,7 @@ ID Command line                          Date and time       Action(s) Altered
 
     #[test]
     fn dnf_subset_flags_before_the_verb_do_not_reset_patch_age() {
-        let today = d(2026, 10, 12);
+        let today = now();
         let row = |cmd: &str| format!(" 3 {cmd:<37} 2026-10-11 15:52:37  46\n");
         for cmd in [
             "dnf --exclude=fictional-lib upgrade",

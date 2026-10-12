@@ -11,7 +11,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update \
+# The patch-age check needs security lists from the last week; a new value rebuilds this layer.
+ARG APT_LISTS_DATE
+RUN echo "lists of $APT_LISTS_DATE" \
+    && apt-get update \
     && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends \
         util-linux libglib2.0-bin gsettings-desktop-schemas dconf-gsettings-backend \

@@ -17,7 +17,7 @@ CHECKED=("${COLS[@]}" password_set)
 VARIANTS=(baseline firewalld-installed ufw-active ufw-active-disabled ufw-inactive
     gnome-default gnome-lock-5min gnome-lock-15min gnome-lock-off
     kde-5min kde-30min kde-off
-    patch-real patch-stale patch-rotated patch-no-metadata eol autologin-gdm autologin-sddm autologin-lightdm autologin-off
+    patch-real patch-stale patch-rotated patch-no-metadata patch-expired eol autologin-gdm autologin-sddm autologin-lightdm autologin-off
     clamav-active clamav-inactive)
 LIMIT_MS=${LIMIT_MS:-3000}
 
@@ -28,7 +28,8 @@ printf ' %s\n' ms
 fail=0
 for distro in ubuntu fedora; do
     img=open-pact-linux-$distro
-    docker build --quiet --platform "$PLATFORM" -f "tests/linux/Dockerfile.$distro" -t "$img" . >/dev/null \
+    docker build --quiet --platform "$PLATFORM" --build-arg "APT_LISTS_DATE=$(date +%F)" \
+        -f "tests/linux/Dockerfile.$distro" -t "$img" . >/dev/null \
         || { echo "build failed: $distro" >&2; exit 1; }
     for v in "${VARIANTS[@]}"; do
         out=$(docker run --rm --platform "$PLATFORM" "$img" "$v" 2>&1)
