@@ -48,7 +48,7 @@ DNF'
     fi
 }
 
-expired_security_lists() { # APT only: a fictional security archive whose cached lists expired
+fictional_archive() { # APT only: one configured fictional security archive, cached at 1.0
     arch=$(dpkg --print-architecture)
     archive=/tmp/fictional-archive
     mkdir -p "$archive" /var/log/apt
@@ -57,18 +57,15 @@ expired_security_lists() { # APT only: a fictional security archive whose cached
     printf 'deb [trusted=yes] file:%s ./\n' "$archive" >/etc/apt/sources.list
     printf 'Package: fictional-lib\nStatus: install ok installed\nPriority: optional\nSection: libs\nArchitecture: %s\nVersion: 1.0\nDescription: Fictional library\n\n' "$arch" >/var/lib/dpkg/status
     printf 'Start-Date: %s  06:00:00\nCommandline: apt upgrade\nUpgrade: fictional-lib:%s (0.9, 1.0)\nEnd-Date: %s  06:00:30\n' "$(date +%F)" "$arch" "$(date +%F)" >/var/log/apt/history.log
-    publish() { # version
-        printf 'Package: fictional-lib\nVersion: %s\nArchitecture: %s\nPriority: optional\nSection: libs\nFilename: fictional-lib.deb\nSize: 1234\nDescription: Fictional library\n\n' "$1" "$arch" >"$archive/Packages"
-        printf 'Origin: Fictional\nLabel: Fictional-security\nSuite: fictional-security\nCodename: fictional-security\nDate: %s\nSHA256:\n %s %s Packages\n' \
-            "$(date -Ru)" "$(sha256sum "$archive/Packages" | cut -d' ' -f1)" "$(wc -c <"$archive/Packages")" >"$archive/Release"
-    }
     publish 1.0
     apt-get update -qq
-    publish 2.0
-    for f in /var/lib/apt/lists/*_Release; do
-        sed -i 's/^Date:.*/Date: Sat, 01 Jan 2000 00:00:00 +0000/' "$f"
-        printf 'Valid-Until: Sun, 02 Jan 2000 00:00:00 +0000\n' >>"$f"
-    done
+}
+
+publish() { # version: the fictional archive now offers fictional-lib at that version
+    printf 'Package: fictional-lib\nVersion: %s\nArchitecture: %s\nPriority: optional\nSection: libs\nFilename: fictional-lib.deb\nSize: 1234\nDescription: Fictional library\n\n' "$1" "$arch" >"$archive/Packages"
+    printf 'Origin: Fictional\nLabel: Fictional-security\nSuite: fictional-security\nCodename: fictional-security\nDate: %s\nSHA256:\n %s %s Packages\n' \
+        "$(date -Ru)" \
+        "$(sha256sum "$archive/Packages" | cut -d' ' -f1)" "$(wc -c <"$archive/Packages")" >"$archive/Release"
 }
 
 case $variant in
@@ -93,7 +90,42 @@ case $variant in
     patch-no-metadata)
         if [ "$distro" = fedora ]; then dnf clean all >/dev/null; else rm -rf /var/lib/apt/lists/*; fi ;;
     patch-stale) stale_history ;;
-    patch-expired) [ "$distro" = fedora ] || expired_security_lists ;;
+    patch-expired) [ "$distro" = fedora ] || {
+        fictional_archive
+        publish 2.0
+        for f in /var/lib/apt/lists/*_Release; do
+            sed -i 's/^Date:.*/Date: Sat, 01 Jan 2000 00:00:00 +0000/' "$f"
+            printf 'Valid-Until: Sun, 02 Jan 2000 00:00:00 +0000\n' >>"$f"
+        done
+    } ;;
+    patch-apt-current) [ "$distro" = fedora ] || fictional_archive ;;
+    patch-apt-pending) [ "$distro" = fedora ] || {
+        fictional_archive
+        publish 2.0
+        apt-get update -qq
+    } ;;
+    patch-apt-no-packages) [ "$distro" = fedora ] || {
+        fictional_archive
+        publish 2.0
+        apt-get update -qq
+        rm /var/lib/apt/lists/*_Packages*
+    } ;;
+    patch-apt-orphan-release) [ "$distro" = fedora ] || {
+        fictional_archive
+        publish 2.0
+        for f in /var/lib/apt/lists/*_Release; do mv "$f" /var/lib/apt/lists/unconfigured.invalid_dists_fictional-security_Release; done
+    } ;;
+    patch-apt-uncached-source) [ "$distro" = fedora ] || {
+        fictional_archive
+        publish 2.0
+        mkdir -p /tmp/other-archive
+        : >/tmp/other-archive/Packages
+        printf 'Origin: Fictional\nSuite: other-security\nCodename: other-security\nDate: %s\nSHA256:\n %s 0 Packages\n' \
+            "$(date -Ru)" "$(sha256sum /tmp/other-archive/Packages | cut -d' ' -f1)" >/tmp/other-archive/Release
+        printf 'deb [trusted=yes] file:/tmp/other-archive ./\n' >/etc/apt/sources.list
+        apt-get update -qq
+        printf 'deb [trusted=yes] file:%s ./\n' "$archive" >>/etc/apt/sources.list
+    } ;;
     patch-rotated)
         if [ "$distro" = fedora ]; then
             stale_history

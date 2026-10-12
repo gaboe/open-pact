@@ -13,7 +13,19 @@ on Fedora, because a container has no systemd and cannot fake a past date.
 That `dnf` shim reports no security advisories. `patch-real` uses the history
 the image build wrote with the real package manager. The images keep the
 package metadata of their build, so the real security query runs against it.
-`patch-no-metadata` deletes that metadata, and the check must report `unknown`. `patch-expired` (APT only) points APT at a fictional local security archive, refreshes it, then publishes a newer package and backdates the cached `Release` past its `Valid-Until`; the check must report `unknown`. `linux-checks.sh` passes the date as a build argument, so the Ubuntu image fetches its lists again each day and `patch-real` sees security lists less than a week old.
+`patch-no-metadata` deletes that metadata, and the check must report `unknown`.
+The `patch-expired` and `patch-apt-*` variants (APT only) point APT at a
+fictional local security archive and refresh it:
+
+| Variant | Cache state | `os_patch_age` |
+| --- | --- | --- |
+| `patch-apt-current` | Complete, no newer package | date bucket |
+| `patch-apt-pending` | Complete, shows a newer package | `unknown` |
+| `patch-expired` | `Release` backdated past its `Valid-Until` | `unknown` |
+| `patch-apt-no-packages` | Fresh `Release`, Packages index deleted | `unknown` |
+| `patch-apt-orphan-release` | Configured `Release` moved to an unconfigured name | `unknown` |
+| `patch-apt-uncached-source` | Second security source configured, never refreshed | `unknown` |
+ `linux-checks.sh` passes the date as a build argument, so the Ubuntu image fetches its lists again each day and `patch-real` sees security lists less than a week old.
 
 ## Expected values
 
@@ -44,8 +56,13 @@ upgrade does not reset it, and neither does a dnf upgrade with a subset flag
 before or after the verb. The check reports `unknown` unless the security
 query (`apt-get -s upgrade` or `dnf -C -q updateinfo list --security`) exits
 zero, its output is understood, and it lists no outstanding update. APT also
-needs a downloaded security suite (`Suite` or `Codename` ending in `-security`)
-published within the last 7 days and not past its `Valid-Until`.
+reads the configured indexes from `apt-get indextargets --no-release-info`.
+Every configured source needs its downloaded `Release`, and the lists
+directory may hold no other `Release`. There must be a security suite
+(`Suite` or `Codename` ending in `-security`). Each one must be published
+within the last 7 days, not be past its `Valid-Until`, and list a Packages
+index for the system architecture. Each such index must be downloaded and
+readable, unless its `Release` lists it as empty.
 
 ## Checks that report `unknown` in a container, and why
 

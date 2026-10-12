@@ -1,4 +1,6 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Read;
 
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 
@@ -7,7 +9,6 @@ use super::exec::{Ran, run, run_status};
 
 const UFW_CONF: &str = "/etc/ufw/ufw.conf";
 const APT_HISTORY: &str = "/var/log/apt/history.log";
-const APT_LISTS: &str = "/var/lib/apt/lists";
 const SECURE_BOOT_EFIVAR: &str =
     "/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c";
 const AUTOLOGIN_FILES: &[&str] = &[
@@ -21,6 +22,8 @@ const AUTOLOGIN_DIRS: &[&str] = &["/etc/sddm.conf.d", "/etc/lightdm/lightdm.conf
 const APT_ROTATED_LOGS: u32 = 3;
 /// Security lists older than this may lack an update the archive has published since (R4-M1).
 const APT_SECURITY_LISTS_MAX_AGE: Duration = Duration::days(7);
+/// The plain name and the compressed forms APT may keep a downloaded index in.
+const APT_INDEX_SUFFIXES: &[&str] = &["", ".lz4", ".zst", ".gz", ".xz", ".bz2", ".lzma"];
 
 const UBUNTU_EOL: &[(&str, &str)] = &[
     ("22.04", "2027-06-01"),
@@ -93,8 +96,11 @@ pub fn os_supported() -> &'static str {
 trait PackageHost {
     fn read(&self, path: &str) -> Option<String>;
     fn run(&self, program: &str, args: &[&str]) -> Option<Ran>;
-    /// The text of each `Release` and `InRelease` file APT has downloaded.
-    fn apt_releases(&self) -> Vec<String>;
+    /// The paths of the entries in a directory.
+    fn list(&self, dir: &str) -> Option<Vec<String>>;
+    /// Whether a file exists and its content can be read. Indexes may be compressed, so this
+    /// does not decode text.
+    fn readable(&self, path: &str) -> bool;
 }
 
 struct System;
@@ -108,15 +114,15 @@ impl PackageHost for System {
         run_status(program, args)
     }
 
-    fn apt_releases(&self) -> Vec<String> {
-        let Ok(entries) = fs::read_dir(APT_LISTS) else {
-            return Vec::new();
-        };
+    fn list(&self, dir: &str) -> Option<Vec<String>> {
+        let entries = fs::read_dir(dir).ok()?;
         entries
-            .flatten()
-            .filter(|e| e.file_name().to_string_lossy().ends_with("Release"))
-            .filter_map(|e| fs::read_to_string(e.path()).ok())
+            .map(|e| Some(e.ok()?.path().to_str()?.to_string()))
             .collect()
+    }
+
+    fn readable(&self, path: &str) -> bool {
+        fs::File::open(path).is_ok_and(|mut f| f.read(&mut [0]).is_ok())
     }
 }
 
@@ -165,7 +171,7 @@ fn succeeded(ran: Option<Ran>) -> Option<String> {
 /// `apt-get -s upgrade` compares the installed packages with the downloaded lists only, so
 /// without current security lists it reports no upgrades while some are outstanding.
 fn apt_security_updates(host: &impl PackageHost, now: DateTime<Utc>) -> SecurityUpdates {
-    if !apt_security_lists_current(&host.apt_releases(), now) {
+    if !apt_security_lists_current(host, now) {
         return SecurityUpdates::Unknown;
     }
     let query = [
@@ -180,28 +186,165 @@ fn apt_security_updates(host: &impl PackageHost, now: DateTime<Utc>) -> Security
         .map_or(SecurityUpdates::Unknown, |out| parse_apt_security(&out))
 }
 
-/// Whether APT's downloaded lists can show every outstanding security update: there is a
-/// security suite (`Suite` or `Codename` ending in `-security`), and each one is published
-/// within the last week and has not passed its `Valid-Until`. A date that does not parse
-/// counts as stale.
-fn apt_security_lists_current(releases: &[String], now: DateTime<Utc>) -> bool {
-    let security: Vec<&String> = releases
-        .iter()
-        .filter(|text| {
-            ["Suite", "Codename"]
-                .iter()
-                .filter_map(|name| release_field(text, name))
-                .any(|suite| suite.ends_with("-security"))
+/// One index file APT is configured to download, as `apt-get indextargets` describes it.
+struct IndexTarget {
+    /// The index's path below the source's Release, such as `main/binary-amd64/Packages`.
+    meta_key: String,
+    /// Where APT keeps the download, before any compression suffix.
+    filename: String,
+    /// A `deb` Packages index, which the upgrade simulation reads.
+    packages: bool,
+    /// Absent for a flat repository, whose single index serves every architecture.
+    architecture: Option<String>,
+}
+
+impl IndexTarget {
+    /// The path of the source's Release without its `Release` or `InRelease` name. APT names
+    /// each download after its URI, and the index URI is the Release directory plus the meta
+    /// key, so the meta key, escaped the same way, ends the file name.
+    fn release_prefix(&self) -> Option<&str> {
+        self.filename.strip_suffix(&apt_file_name(&self.meta_key))
+    }
+}
+
+/// Escapes a URI path as APT's `URItoFileName` does: special and non-printable bytes become
+/// `%xx`, then `/` becomes `_`.
+fn apt_file_name(uri: &str) -> String {
+    uri.bytes()
+        .map(|b| match b {
+            b'/' => "_".to_string(),
+            b'\\' | b'|' | b'{' | b'}' | b'[' | b']' | b'<' | b'>' | b'"' | b'^' | b'~' | b'_'
+            | b'=' | b'!' | b'@' | b'#' | b'$' | b'%' | b'&' | b'*' => format!("%{b:02x}"),
+            b if b <= 0x20 || b >= 0x7f => format!("%{b:02x}"),
+            b => char::from(b).to_string(),
         })
+        .collect()
+}
+
+/// Reads the deb822 records of `apt-get indextargets --no-release-info`, which lists every
+/// configured index whether or not it was downloaded. A record without a meta key or file name
+/// makes the whole list unreadable.
+fn parse_index_targets(out: &str) -> Option<Vec<IndexTarget>> {
+    out.split("\n\n")
+        .filter(|record| !record.trim().is_empty())
+        .map(|record| {
+            let field = |name: &str| release_field(record, name).map(str::to_string);
+            Some(IndexTarget {
+                meta_key: field("MetaKey")?,
+                filename: field("Filename")?,
+                packages: field("Target-Of").as_deref() == Some("deb")
+                    && field("Identifier").as_deref() == Some("Packages"),
+                architecture: field("Architecture"),
+            })
+        })
+        .collect()
+}
+
+/// The index files a Release lists, by name, with their sizes.
+fn release_indexes(release: &str) -> BTreeMap<&str, u64> {
+    release
+        .lines()
+        .filter(|l| l.starts_with(' '))
+        .filter_map(|l| match l.split_whitespace().collect::<Vec<_>>()[..] {
+            [_, size, name] => Some((name, size.parse().ok()?)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether APT's downloaded lists can show every outstanding security update (R4-M1, R5-M1).
+/// Every configured source needs a readable Release, since without one nothing tells whether
+/// it is a security source, and the lists directory may hold no other Release. There must be a
+/// security source (`Suite` or `Codename` ending in `-security`). Each one is published within
+/// the last week, has not passed its `Valid-Until`, and lists a Packages index for the system
+/// architecture. Each such index is downloaded and readable, unless the Release lists it as
+/// empty, which APT does not store. A date that does not parse counts as stale.
+fn apt_security_lists_current(host: &impl PackageHost, now: DateTime<Utc>) -> bool {
+    let Some(arch) = succeeded(host.run("dpkg", &["--print-architecture"])) else {
+        return false;
+    };
+    let arch = arch.trim();
+    let Some(targets) = succeeded(host.run("apt-get", &["indextargets", "--no-release-info"]))
+        .and_then(|out| parse_index_targets(&out))
+    else {
+        return false;
+    };
+    let mut sources: BTreeMap<&str, Vec<&IndexTarget>> = BTreeMap::new();
+    for target in &targets {
+        match target.release_prefix() {
+            Some(prefix) => sources.entry(prefix).or_default().push(target),
+            None if target.packages => return false,
+            None => {}
+        }
+    }
+    let configured: BTreeSet<String> = sources
+        .keys()
+        .flat_map(|prefix| [format!("{prefix}InRelease"), format!("{prefix}Release")])
         .collect();
-    !security.is_empty()
-        && security.iter().all(|text| {
-            let published = release_field(text, "Date").and_then(parse_release_date);
-            let expired = release_field(text, "Valid-Until")
-                .map(|until| parse_release_date(until).is_none_or(|until| until <= now));
-            published.is_some_and(|date| now - date <= APT_SECURITY_LISTS_MAX_AGE)
-                && expired != Some(true)
-        })
+    let dirs: BTreeSet<&str> = targets
+        .iter()
+        .filter_map(|t| t.filename.rsplit_once('/').map(|(dir, _)| dir))
+        .collect();
+    for dir in dirs {
+        let Some(entries) = host.list(dir) else {
+            return false;
+        };
+        if entries
+            .iter()
+            .any(|path| path.ends_with("Release") && !configured.contains(path))
+        {
+            return false;
+        }
+    }
+    let mut security = 0;
+    for (prefix, targets) in &sources {
+        let Some(release) = host
+            .read(&format!("{prefix}InRelease"))
+            .or_else(|| host.read(&format!("{prefix}Release")))
+        else {
+            return false;
+        };
+        let is_security = ["Suite", "Codename"]
+            .iter()
+            .filter_map(|name| release_field(&release, name))
+            .any(|suite| suite.ends_with("-security"));
+        if !is_security {
+            continue;
+        }
+        security += 1;
+        if !release_current(&release, now) {
+            return false;
+        }
+        let listed = release_indexes(&release);
+        let indexes: Vec<&IndexTarget> = targets
+            .iter()
+            .copied()
+            .filter(|t| t.packages && t.architecture.as_deref().is_none_or(|a| a == arch))
+            .filter(|t| {
+                APT_INDEX_SUFFIXES
+                    .iter()
+                    .any(|suffix| listed.contains_key(format!("{}{suffix}", t.meta_key).as_str()))
+            })
+            .collect();
+        let usable = |t: &&IndexTarget| {
+            listed.get(t.meta_key.as_str()) == Some(&0)
+                || APT_INDEX_SUFFIXES
+                    .iter()
+                    .any(|suffix| host.readable(&format!("{}{suffix}", t.filename)))
+        };
+        if indexes.is_empty() || !indexes.iter().all(usable) {
+            return false;
+        }
+    }
+    security > 0
+}
+
+/// Whether a Release was published within the last week and has not passed its `Valid-Until`.
+fn release_current(release: &str, now: DateTime<Utc>) -> bool {
+    let published = release_field(release, "Date").and_then(parse_release_date);
+    let expired = release_field(release, "Valid-Until")
+        .map(|until| parse_release_date(until).is_none_or(|until| until <= now));
+    published.is_some_and(|date| now - date <= APT_SECURITY_LISTS_MAX_AGE) && expired != Some(true)
 }
 
 fn release_field<'a>(text: &'a str, name: &str) -> Option<&'a str> {
@@ -1239,14 +1382,13 @@ ID Command line                         Date and time       Action(s) Altered
     }
 
     struct FakeHost {
-        apt_history: Option<String>,
-        apt_releases: Vec<String>,
+        files: BTreeMap<String, String>,
         commands: Vec<(&'static str, Option<(bool, String)>)>,
     }
 
     impl PackageHost for FakeHost {
         fn read(&self, path: &str) -> Option<String> {
-            (path == APT_HISTORY).then(|| self.apt_history.clone())?
+            self.files.get(path).cloned()
         }
 
         fn run(&self, program: &str, args: &[&str]) -> Option<Ran> {
@@ -1255,12 +1397,58 @@ ID Command line                         Date and time       Action(s) Altered
             out.clone().map(|(success, text)| Ran { success, text })
         }
 
-        fn apt_releases(&self) -> Vec<String> {
-            self.apt_releases.clone()
+        fn list(&self, dir: &str) -> Option<Vec<String>> {
+            let prefix = format!("{dir}/");
+            Some(
+                self.files
+                    .keys()
+                    .filter(|p| p.strip_prefix(&prefix).is_some_and(|n| !n.contains('/')))
+                    .cloned()
+                    .collect(),
+            )
+        }
+
+        fn readable(&self, path: &str) -> bool {
+            self.files.contains_key(path)
+        }
+    }
+
+    impl FakeHost {
+        fn with(mut self, path: &str, text: &str) -> FakeHost {
+            self.files.insert(path.to_string(), text.to_string());
+            self
+        }
+
+        fn without(mut self, path: &str) -> FakeHost {
+            assert!(self.files.remove(path).is_some(), "{path} was not there");
+            self
+        }
+
+        /// Replaces what `command` prints; `None` stands for a command that did not finish.
+        fn answer(mut self, command: &str, out: Option<(bool, &str)>) -> FakeHost {
+            let (_, old) = self
+                .commands
+                .iter_mut()
+                .find(|(c, _)| *c == command)
+                .unwrap();
+            *old = owned(out);
+            self
+        }
+
+        /// Adds a configured source that has no Release and no index downloaded.
+        fn configure(self, suite: &str) -> FakeHost {
+            let targets = self
+                .run("apt-get", &["indextargets", "--no-release-info"])
+                .unwrap();
+            let targets = targets.text + &index_target(suite);
+            self.answer(INDEX_TARGETS, Some((true, &targets)))
         }
     }
 
     const APT_QUERY: &str = "env LC_ALL=C apt-get -s -o Debug::NoLocking=1 upgrade";
+    const INDEX_TARGETS: &str = "apt-get indextargets --no-release-info";
+    const ARCH: &str = "dpkg --print-architecture";
+    const LISTS: &str = "/var/lib/apt/lists";
     const APT_CLEAR: &str = "Reading package lists...\nCalculating upgrade...\n\
         0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n";
     const DNF_HISTORY: &str = "dnf history list";
@@ -1269,7 +1457,7 @@ ID Command line                         Date and time       Action(s) Altered
     /// The security suite's Release header as Ubuntu writes it, published the day before `now()`.
     const SECURITY_LISTS: &str = "-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA512\n\n\
         Origin: Fictional\nSuite: fictional-security\nCodename: fictional\n\
-        Date: Sun, 11 Oct 2026  2:34:10 UTC\nSHA256:\n 00 1 main/Packages\n";
+        Date: Sun, 11 Oct 2026  2:34:10 UTC\n";
     /// A release pocket: published once and never again, so its date says nothing.
     const RELEASE_POCKET: &str = "Origin: Fictional\nSuite: fictional\nCodename: fictional\n\
         Date: Thu, 25 Apr 2024 15:10:33 UTC\n";
@@ -1278,22 +1466,67 @@ ID Command line                         Date and time       Action(s) Altered
         d(2026, 10, 12).and_hms_opt(12, 0, 0).unwrap().and_utc()
     }
 
+    /// The file-name prefix APT gives to everything it downloads for a fictional `suite`.
+    fn source(suite: &str) -> String {
+        format!("{LISTS}/archive.example.invalid_debian_dists_{suite}_")
+    }
+
+    /// The amd64 Packages index of `suite`, where APT keeps it compressed.
+    fn packages(suite: &str) -> String {
+        format!("{}main_binary-amd64_Packages.lz4", source(suite))
+    }
+
+    /// The `indextargets` records of a configured `suite`: its amd64 and i386 Packages and a
+    /// translation whose name APT escapes.
+    fn index_target(suite: &str) -> String {
+        let prefix = source(suite);
+        format!(
+            "MetaKey: main/binary-amd64/Packages\nFilename: {prefix}main_binary-amd64_Packages\n\
+             Target-Of: deb\nIdentifier: Packages\nArchitecture: amd64\n\n\
+             MetaKey: main/binary-i386/Packages\nFilename: {prefix}main_binary-i386_Packages\n\
+             Target-Of: deb\nIdentifier: Packages\nArchitecture: i386\n\n\
+             MetaKey: main/i18n/Translation-en_GB\nFilename: {prefix}main_i18n_Translation-en%5fGB\n\
+             Target-Of: deb\nIdentifier: Translations\n\n"
+        )
+    }
+
+    /// A Release header followed by the index list APT checks downloads against.
+    fn listing(header: &str) -> String {
+        format!(
+            "{header}SHA256:\n 0f 1234 main/binary-amd64/Packages\n 0e 321 main/binary-amd64/Packages.xz\n"
+        )
+    }
+
+    /// A host with one configured source per Release header, each downloaded completely.
     fn apt_host(lists: &[&str], query: Option<(bool, &str)>) -> FakeHost {
-        FakeHost {
-            apt_history: Some(apt_entry(
-                "2026-10-11",
-                "apt upgrade",
-                "fictional-lib:amd64 (1.0, 1.1)",
-            )),
-            apt_releases: lists.iter().map(|l| l.to_string()).collect(),
-            commands: vec![(APT_QUERY, owned(query))],
+        let mut host = FakeHost {
+            files: BTreeMap::from([(
+                APT_HISTORY.to_string(),
+                apt_entry(
+                    "2026-10-11",
+                    "apt upgrade",
+                    "fictional-lib:amd64 (1.0, 1.1)",
+                ),
+            )]),
+            commands: vec![
+                (APT_QUERY, owned(query)),
+                (ARCH, Some((true, "amd64\n".to_string()))),
+                (INDEX_TARGETS, Some((true, String::new()))),
+            ],
+        };
+        for (n, header) in lists.iter().enumerate() {
+            let suite = format!("suite{n}");
+            host = host
+                .configure(&suite)
+                .with(&format!("{}InRelease", source(&suite)), &listing(header))
+                .with(&packages(&suite), "FICTIONAL compressed index");
         }
+        host
     }
 
     fn dnf_host(history: Option<(bool, &str)>, query: Option<(bool, &str)>) -> FakeHost {
         FakeHost {
-            apt_history: None,
-            apt_releases: Vec::new(),
+            files: BTreeMap::new(),
             commands: vec![(DNF_HISTORY, owned(history)), (DNF_QUERY, owned(query))],
         }
     }
@@ -1404,6 +1637,105 @@ ID Command line                          Date and time       Action(s) Altered
             clear,
         );
         assert_eq!(patch_age(&one_stale, now()), "unknown", "one stale suite");
+    }
+
+    /// R5-M1: a clear simulation counts only when the downloaded lists cover every configured
+    /// source and every Packages index of each security source.
+    #[test]
+    fn apt_patch_age_needs_every_security_index() {
+        let clear = Some((true, APT_CLEAR));
+        let complete = || apt_host(&[SECURITY_LISTS, RELEASE_POCKET], clear);
+        assert_eq!(patch_age(&complete(), now()), "le_14d", "complete");
+        let flat = apt_host(&[], clear)
+            .answer(
+                INDEX_TARGETS,
+                Some((
+                    true,
+                    "MetaKey: Packages\nFilename: /var/lib/apt/lists/_tmp_fictional-archive_._Packages\n\
+                     Target-Of: deb\nIdentifier: Packages\n\n",
+                )),
+            )
+            .with(
+                "/var/lib/apt/lists/_tmp_fictional-archive_._Release",
+                &format!("{SECURITY_LISTS}SHA256:\n 0f 1234 Packages\n"),
+            )
+            .with("/var/lib/apt/lists/_tmp_fictional-archive_._Packages", "FICTIONAL index");
+        assert_eq!(patch_age(&flat, now()), "le_14d", "flat repository");
+        let empty = complete().without(&packages("suite0")).with(
+            &format!("{}InRelease", source("suite0")),
+            &format!("{SECURITY_LISTS}SHA256:\n e3 0 main/binary-amd64/Packages\n"),
+        );
+        assert_eq!(
+            patch_age(&empty, now()),
+            "le_14d",
+            "an index listed as empty"
+        );
+
+        let pending = Some((
+            true,
+            "Inst fictional-lib [1.0] (1.1 Fictional:1/fictional-security [amd64])\n",
+        ));
+        let no_amd64 = format!("{SECURITY_LISTS}SHA256:\n 0f 1234 main/binary-i386/Packages\n");
+        for (what, host) in [
+            (
+                "pending update",
+                apt_host(&[SECURITY_LISTS, RELEASE_POCKET], pending),
+            ),
+            (
+                "Packages index removed",
+                complete().without(&packages("suite0")),
+            ),
+            (
+                "configured source without a Release",
+                complete().configure("suite2"),
+            ),
+            (
+                "pocket without a Release",
+                complete().without(&format!("{}InRelease", source("suite1"))),
+            ),
+            (
+                "second security source without its index",
+                apt_host(&[SECURITY_LISTS, SECURITY_LISTS], clear).without(&packages("suite1")),
+            ),
+            (
+                "second security source not downloaded",
+                apt_host(&[SECURITY_LISTS], clear).configure("suite1"),
+            ),
+            (
+                "orphan Release",
+                complete().with(
+                    &format!("{LISTS}/unconfigured.invalid_dists_fictional-security_Release"),
+                    &listing(SECURITY_LISTS),
+                ),
+            ),
+            (
+                "orphan Release for a missing configured one",
+                complete()
+                    .without(&format!("{}InRelease", source("suite0")))
+                    .with(
+                        &format!("{LISTS}/unconfigured.invalid_dists_fictional-security_Release"),
+                        &listing(SECURITY_LISTS),
+                    ),
+            ),
+            (
+                "no index for this architecture",
+                complete().with(&format!("{}InRelease", source("suite0")), &no_amd64),
+            ),
+            (
+                "index targets unavailable",
+                complete().answer(INDEX_TARGETS, None),
+            ),
+            (
+                "architecture unknown",
+                complete().answer(ARCH, Some((false, ""))),
+            ),
+            (
+                "unreadable index targets",
+                complete().answer(INDEX_TARGETS, Some((true, "Identifier: Packages\n"))),
+            ),
+        ] {
+            assert_eq!(patch_age(&host, now()), "unknown", "{what}");
+        }
     }
 
     #[test]
