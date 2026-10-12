@@ -1032,7 +1032,7 @@ async fn serve(db: PgPool) -> anyhow::Result<()> {
         eprintln!("AUTO_APPROVE=true: enrolled devices are approved without IT");
     }
     let retention = &manifest.body().claim_retention;
-    let sealed = claims::seal_plaintext(&db, &kek, retention).await?;
+    let sealed = claims::seal_plaintext(&db, &kek, manifest.hash(), retention).await?;
     if sealed > 0 {
         eprintln!("sealed {sealed} plaintext claims from an earlier version");
     }
@@ -1041,10 +1041,11 @@ async fn serve(db: PgPool) -> anyhow::Result<()> {
          before a purge still decrypts its claims with the KEK until the backup expires; keep \
          database backups only as long as device owners were told"
     );
-    let dated = claims::set_missing_deadlines(&db, retention).await?;
+    let dated = claims::set_missing_deadlines(&db, &kek, manifest.hash(), retention).await?;
     if dated > 0 {
         eprintln!(
-            "gave {dated} claims from an earlier version a deadline of {retention} after receipt"
+            "gave {dated} claims from an earlier version a deadline: {retention} after receipt \
+             under the current manifest, due now under any other manifest"
         );
     }
     tokio::spawn(delete_expired_nonces(db.clone()));

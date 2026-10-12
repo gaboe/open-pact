@@ -7,7 +7,7 @@
 
 use anyhow::Context;
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
-use open_pact_core::{EntryKind, Pseudonym, Span};
+use open_pact_core::{EntryKind, ManifestHash, Pseudonym, Span};
 use serde_json::{Value, json};
 use sqlx::{PgConnection, PgPool};
 
@@ -31,14 +31,22 @@ async fn period_key(
     kek: &SealingKey,
     period: NaiveDate,
 ) -> anyhow::Result<SealingKey> {
-    let name = key_name(period);
     sqlx::query(
         "INSERT INTO claim_keys (period, wrapped_key) VALUES ($1, $2) ON CONFLICT (period) DO NOTHING",
     )
     .bind(period)
-    .bind(kek.seal(&name, &rand::random::<[u8; 32]>()))
+    .bind(kek.seal(&key_name(period), &rand::random::<[u8; 32]>()))
     .execute(&mut *conn)
     .await?;
+    open_period_key(conn, kek, period).await
+}
+
+async fn open_period_key(
+    conn: &mut PgConnection,
+    kek: &SealingKey,
+    period: NaiveDate,
+) -> anyhow::Result<SealingKey> {
+    let name = key_name(period);
     let wrapped: String =
         sqlx::query_scalar("SELECT wrapped_key FROM claim_keys WHERE period = $1")
             .bind(period)
@@ -60,6 +68,24 @@ fn deadline(retention: &Span, received_at: DateTime<Utc>) -> anyhow::Result<Date
     retention
         .after(received_at)
         .context("claim_retention reaches past the calendar")
+}
+
+/// The deadline of a claim stored before deadlines were recorded (R3-M2). Only the current
+/// manifest's body is known, so a claim made under it keeps `received_at + retention`. A claim
+/// made under any other manifest, or with no manifest, had an unknown `claim_retention`. The
+/// shortest one a manifest allows is zero, so that claim is due at once and the next purge
+/// deletes it. A later manifest never extends the retention a device owner accepted.
+fn legacy_deadline(
+    current: &ManifestHash,
+    retention: &Span,
+    claim: &Value,
+    received_at: DateTime<Utc>,
+) -> anyhow::Result<DateTime<Utc>> {
+    if claim.get("manifest").and_then(Value::as_str) == Some(current.as_str()) {
+        deadline(retention, received_at)
+    } else {
+        Ok(received_at)
+    }
 }
 
 /// The claim is deleted at `now + retention` and sealed under the key of that deadline's month,
@@ -94,11 +120,12 @@ pub async fn store(
     Ok(())
 }
 
-/// Seals claims stored in plaintext by earlier versions, each with a deadline from `retention` and
+/// Seals claims stored in plaintext by earlier versions, each with its [`legacy_deadline`] and
 /// under the key of its month. Old plaintext can remain in dead tuples, the WAL and earlier backups.
 pub async fn seal_plaintext(
     db: &PgPool,
     kek: &SealingKey,
+    current: &ManifestHash,
     retention: &Span,
 ) -> anyhow::Result<u64> {
     type Plain = (i64, String, Value, Option<String>, DateTime<Utc>);
@@ -110,7 +137,7 @@ pub async fn seal_plaintext(
     let mut sealed = 0;
     for (id, device, claim, jws, received_at) in rows {
         let mut tx = db.begin().await?;
-        let delete_after = deadline(retention, received_at)?;
+        let delete_after = legacy_deadline(current, retention, &claim, received_at)?;
         let period = period_of(delete_after);
         let key = period_key(&mut tx, kek, period).await?;
         sealed += sqlx::query(
@@ -132,19 +159,31 @@ pub async fn seal_plaintext(
     Ok(sealed)
 }
 
-/// Gives claims sealed before deadlines existed the deadline `received_at + retention`. The
-/// retention they were accepted under was not recorded, so the current one stands in for it.
-pub async fn set_missing_deadlines(db: &PgPool, retention: &Span) -> anyhow::Result<u64> {
-    let rows: Vec<(i64, DateTime<Utc>)> =
-        sqlx::query_as("SELECT id, received_at FROM claims WHERE delete_after IS NULL")
-            .fetch_all(db)
-            .await?;
-    let (ids, deadlines): (Vec<i64>, Vec<DateTime<Utc>>) = rows
-        .into_iter()
-        .map(|(id, received_at)| Ok((id, deadline(retention, received_at)?)))
-        .collect::<anyhow::Result<Vec<_>>>()?
-        .into_iter()
-        .unzip();
+/// Gives claims sealed before deadlines existed their [`legacy_deadline`].
+pub async fn set_missing_deadlines(
+    db: &PgPool,
+    kek: &SealingKey,
+    current: &ManifestHash,
+    retention: &Span,
+) -> anyhow::Result<u64> {
+    let rows: Vec<(i64, DateTime<Utc>, NaiveDate, String)> = sqlx::query_as(
+        "SELECT id, received_at, period, sealed FROM claims WHERE delete_after IS NULL",
+    )
+    .fetch_all(db)
+    .await?;
+    let mut conn = db.acquire().await?;
+    let (mut ids, mut deadlines) = (vec![], vec![]);
+    for (id, received_at, period, sealed) in rows {
+        let key = open_period_key(&mut conn, kek, period).await?;
+        let body: Value = serde_json::from_slice(&key.open(&row_name(period), &sealed)?)?;
+        ids.push(id);
+        deadlines.push(legacy_deadline(
+            current,
+            retention,
+            &body["claim"],
+            received_at,
+        )?);
+    }
     Ok(sqlx::query(
         "UPDATE claims SET delete_after = d.at FROM unnest($1::bigint[], $2::timestamptz[]) AS d(id, at) \
          WHERE claims.id = d.id AND claims.delete_after IS NULL",
@@ -381,22 +420,88 @@ mod tests {
         assert_eq!(count(&db, "SELECT count(*) FROM claims").await, 0);
     }
 
+    /// R3-M2: a claim from before deadlines existed was accepted under a policy the gateway did
+    /// not record, so a longer current retention must not keep it.
+    #[tokio::test]
+    #[ignore = "needs TEST_DATABASE_URL"]
+    async fn migration_does_not_extend_a_legacy_claim_to_a_longer_current_retention() {
+        let db = testdb::fresh().await;
+        let kek = SealingKey::new(&[7; 32]);
+        let device = Pseudonym::of(&PublicKey::from(&dev_key::generate()));
+        let mut conn = db.acquire().await.unwrap();
+        let hour: Span = "1h".to_string().try_into().unwrap();
+        let year: Span = "12mo".to_string().try_into().unwrap();
+        let earlier = ManifestHash::of(b"fictional earlier manifest");
+        let current = ManifestHash::of(b"fictional current manifest");
+        let received = at("2026-10-15T08:00:00Z");
+        let now = at("2026-10-15T10:00:00Z");
+        for manifest in [&earlier, &current] {
+            let claim = json!({"manifest": manifest});
+            store(
+                &mut conn, &kek, &hour, received, &device, &claim, "jws", true,
+            )
+            .await
+            .unwrap();
+        }
+        sqlx::query("UPDATE claims SET delete_after = NULL")
+            .execute(&db)
+            .await
+            .unwrap();
+        for claim in [json!({"manifest": earlier}), json!({"manifest": current})] {
+            sqlx::query(
+                "INSERT INTO claims (device, claim, jws, allowed, received_at) VALUES \
+                 ('pseudonym:aa', $1, 'jws-a', true, $2)",
+            )
+            .bind(claim)
+            .bind(received)
+            .execute(&db)
+            .await
+            .unwrap();
+        }
+
+        seal_plaintext(&db, &kek, &current, &year).await.unwrap();
+        set_missing_deadlines(&db, &kek, &current, &year)
+            .await
+            .unwrap();
+        assert_eq!(
+            purge(&db, &year, now).await.unwrap().claims,
+            2,
+            "neither legacy claim may outlive the unknown policy it was accepted under"
+        );
+        let kept: Vec<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT delete_after FROM claims ORDER BY id")
+                .fetch_all(&db)
+                .await
+                .unwrap();
+        assert_eq!(
+            kept,
+            [at("2027-10-15T08:00:00Z"), at("2027-10-15T08:00:00Z")],
+            "claims made under the current manifest keep its retention"
+        );
+        for opened in open_all(&db, &kek).await.unwrap() {
+            assert_eq!(opened["claim"]["manifest"], current.as_str());
+        }
+    }
+
     #[tokio::test]
     #[ignore = "needs TEST_DATABASE_URL"]
     async fn seals_plaintext_claims_from_earlier_versions_in_place() {
         let db = testdb::fresh().await;
         let kek = SealingKey::new(&[4; 32]);
+        let current = ManifestHash::of(b"fictional current manifest");
+        let first = json!({"manifest": current, "results": {"firewall": "on"}});
         sqlx::query(
             "INSERT INTO claims (device, claim, jws, allowed, received_at) VALUES \
-             ('pseudonym:aa', '{\"results\": {\"firewall\": \"on\"}}', 'jws-a', true, '2026-08-05T12:00:00Z'), \
+             ('pseudonym:aa', $1, 'jws-a', true, '2026-08-05T12:00:00Z'), \
              ('pseudonym:bb', '{\"v\": 0}', NULL, NULL, '2026-10-02T12:00:00Z')",
         )
+        .bind(&first)
         .execute(&db)
         .await
         .unwrap();
         let day: Span = "1d".to_string().try_into().unwrap();
-        assert_eq!(seal_plaintext(&db, &kek, &day).await.unwrap(), 2);
-        assert_eq!(seal_plaintext(&db, &kek, &day).await.unwrap(), 0);
+        assert_eq!(seal_plaintext(&db, &kek, &current, &day).await.unwrap(), 2);
+        assert_eq!(seal_plaintext(&db, &kek, &current, &day).await.unwrap(), 0);
         assert_eq!(
             count(
                 &db,
@@ -408,7 +513,7 @@ mod tests {
         let opened = open_all(&db, &kek).await.unwrap();
         assert_eq!(
             opened[0],
-            json!({"device": "pseudonym:aa", "claim": {"results": {"firewall": "on"}}, "jws": "jws-a"})
+            json!({"device": "pseudonym:aa", "claim": first, "jws": "jws-a"})
         );
         assert_eq!(opened[1]["jws"], Value::Null);
         let periods: Vec<NaiveDate> = sqlx::query_scalar("SELECT period FROM claims ORDER BY id")
@@ -429,20 +534,23 @@ mod tests {
                 .unwrap();
         assert_eq!(
             deadlines,
-            [at("2026-08-06T12:00:00Z"), at("2026-10-03T12:00:00Z")]
+            [at("2026-08-06T12:00:00Z"), at("2026-10-02T12:00:00Z")],
+            "a claim with no manifest had an unknown retention and is due at once"
         );
     }
 
     #[tokio::test]
     #[ignore = "needs TEST_DATABASE_URL"]
-    async fn claims_sealed_without_a_deadline_get_one_from_the_current_retention() {
+    async fn claims_sealed_under_the_current_manifest_get_its_retention_as_a_deadline() {
         let db = testdb::fresh().await;
         let kek = SealingKey::new(&[6; 32]);
         let device = Pseudonym::of(&PublicKey::from(&dev_key::generate()));
         let mut conn = db.acquire().await.unwrap();
         let hour: Span = "1h".to_string().try_into().unwrap();
         let t = at("2026-01-31T08:00:00Z");
-        store(&mut conn, &kek, &hour, t, &device, &json!({}), "jws", true)
+        let current = ManifestHash::of(b"fictional current manifest");
+        let claim = json!({"manifest": current});
+        store(&mut conn, &kek, &hour, t, &device, &claim, "jws", true)
             .await
             .unwrap();
         sqlx::query("UPDATE claims SET delete_after = NULL")
@@ -450,8 +558,10 @@ mod tests {
             .await
             .unwrap();
         let month: Span = "1mo".to_string().try_into().unwrap();
-        assert_eq!(set_missing_deadlines(&db, &month).await.unwrap(), 1);
-        assert_eq!(set_missing_deadlines(&db, &month).await.unwrap(), 0);
+        let dated = set_missing_deadlines(&db, &kek, &current, &month);
+        assert_eq!(dated.await.unwrap(), 1);
+        let again = set_missing_deadlines(&db, &kek, &current, &month);
+        assert_eq!(again.await.unwrap(), 0);
         let deadline: DateTime<Utc> = sqlx::query_scalar("SELECT delete_after FROM claims")
             .fetch_one(&db)
             .await
