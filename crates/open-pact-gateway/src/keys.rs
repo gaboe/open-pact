@@ -149,8 +149,8 @@ impl Ca {
 /// with no text around it, an empty subject, no attributes and so no extensions. Any other field
 /// could carry text off the device, so the request must equal one rebuilt from the key point alone:
 /// version 1, the empty subject, the exact P-256 key info, no attributes, the parameterless
-/// ecdsa-with-SHA256 identifier and the signature. The signature is checked when the certificate
-/// is issued.
+/// ecdsa-with-SHA256 identifier and the signature, a BIT STRING with no unused bits. The signature
+/// itself is checked when the certificate is issued.
 pub fn bare_csr_der(csr_pem: &str) -> Result<Vec<u8>, String> {
     use x509_parser::certification_request::X509CertificationRequest;
     use x509_parser::oid_registry::{OID_EC_P256, OID_KEY_TYPE_EC_PUBLIC_KEY};
@@ -184,6 +184,9 @@ pub fn bare_csr_der(csr_pem: &str) -> Result<Vec<u8>, String> {
     let point = &info.subject_pki.subject_public_key;
     if point.unused_bits != 0 || point.data.len() != 65 || point.data[0] != 0x04 {
         return Err(bad("the key must be an uncompressed P-256 point"));
+    }
+    if csr.signature_value.unused_bits != 0 {
+        return Err(bad("the signature must have no unused bits"));
     }
     let mut spki = P256_KEY_INFO_PREFIX.to_vec();
     spki.extend_from_slice(&point.data);
@@ -246,7 +249,7 @@ fn request_der(
     algorithm: &[u8],
     signature: &x509_parser::der_parser::asn1_rs::BitString,
 ) -> Vec<u8> {
-    let mut bits = vec![signature.unused_bits];
+    let mut bits = vec![0];
     bits.extend_from_slice(&signature.data);
     let mut body = info.to_vec();
     body.extend_from_slice(algorithm);
@@ -491,9 +494,18 @@ mod tests {
 
     /// A request for `info`, freshly signed by `key`, so only its structure can make it fail.
     fn signed_request(key: &KeyPair, info: &[u8]) -> String {
+        signed_request_with_unused_bits(key, info, 0)
+    }
+
+    /// As `signed_request`, with the signature BIT STRING declaring `unused` padding bits. The
+    /// signature is drawn again until those trailing bits are zero, so only the count is wrong.
+    fn signed_request_with_unused_bits(key: &KeyPair, info: &[u8], unused: u8) -> String {
         use rcgen::SigningKey;
-        let mut bits = vec![0];
-        bits.extend(key.sign(info).unwrap());
+        let signature = std::iter::repeat_with(|| key.sign(info).unwrap())
+            .find(|s| s.last().unwrap() & 0x7f == 0 || unused == 0)
+            .unwrap();
+        let mut bits = vec![unused];
+        bits.extend(signature);
         let mut body = info.to_vec();
         body.extend_from_slice(&ECDSA_WITH_SHA256);
         body.extend(der_tlv(0x03, &bits));
@@ -535,6 +547,34 @@ mod tests {
             assert!(
                 ca().issue(&pem, "abc", Duration::hours(1)).is_err(),
                 "extra field {what} accepted"
+            );
+        }
+    }
+
+    /// R5-L1: a correctly signed request whose signature BIT STRING declares unused bits is not a
+    /// DER ECDSA signature.
+    #[test]
+    fn rejects_nonzero_unused_bits_in_the_signature() {
+        let key = KeyPair::generate().unwrap();
+        let info = der(&csr(&key));
+        let (_, parsed) =
+            x509_parser::certification_request::X509CertificationRequest::from_der(&info).unwrap();
+        let info = parsed.certification_request_info.raw;
+        let zero = signed_request_with_unused_bits(&key, info, 0);
+        assert!(
+            ca().issue(&zero, "abc", Duration::hours(1)).is_ok(),
+            "zero unused bits"
+        );
+        for unused in 1..=7 {
+            let pem = signed_request_with_unused_bits(&key, info, unused);
+            assert_eq!(
+                bare_csr_der(&pem).unwrap_err(),
+                "csr_pem must be a bare certificate request: the signature must have no unused bits",
+                "{unused} unused bits"
+            );
+            assert!(
+                ca().issue(&pem, "abc", Duration::hours(1)).is_err(),
+                "{unused} unused bits accepted"
             );
         }
     }
