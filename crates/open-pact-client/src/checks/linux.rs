@@ -102,6 +102,9 @@ trait PackageHost {
     /// The size and `hash` of a file's bytes, or with `decode` of the content APT reads from
     /// it after decompression. `None` when the file cannot be read or decoded in time.
     fn digest(&self, path: &str, decode: bool, hash: Hash) -> Option<IndexDigest>;
+    /// What identifies one version of a file without reading it: its inode, size and change
+    /// times. A directory's stamp does not vary. `None` when the file cannot be examined.
+    fn stamp(&self, path: &str) -> Option<String>;
 }
 
 /// The checksum sections of a Release this check can verify, weakest first.
@@ -178,6 +181,24 @@ impl PackageHost for System {
         let digest = hasher.join().ok()?;
         digest.filter(|_| status.success())
     }
+
+    fn stamp(&self, path: &str) -> Option<String> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = fs::symlink_metadata(path).ok()?;
+        if meta.is_dir() {
+            return Some("directory".into());
+        }
+        Some(format!(
+            "{}:{} {} {}.{} {}.{}",
+            meta.dev(),
+            meta.ino(),
+            meta.size(),
+            meta.mtime(),
+            meta.mtime_nsec(),
+            meta.ctime(),
+            meta.ctime_nsec()
+        ))
+    }
 }
 
 fn hash_stream(input: impl Read, hash: Hash) -> Option<IndexDigest> {
@@ -253,8 +274,14 @@ fn succeeded(ran: Option<Ran>) -> Option<String> {
 /// `apt-get -s upgrade` compares the installed packages with the downloaded lists only, so
 /// without current security lists it reports no upgrades while some are outstanding.
 /// Each APT command loads every cached index, so the simulation runs while the cache is being
-/// verified to stay within the check budget.
+/// verified to stay within the check budget. Both must describe one cache generation (R7-M1):
+/// the lists are stamped before the simulation starts and again after both finish, and any
+/// change, such as an `apt update` landing in between, makes the result unknown.
 fn apt_security_updates(host: &(impl PackageHost + Sync), now: DateTime<Utc>) -> SecurityUpdates {
+    let Some(config) = AptConfig::read(host) else {
+        return SecurityUpdates::Unknown;
+    };
+    let before = cache_generation(host, &config);
     let query = [
         "LC_ALL=C",
         "apt-get",
@@ -265,13 +292,66 @@ fn apt_security_updates(host: &(impl PackageHost + Sync), now: DateTime<Utc>) ->
     ];
     let (current, simulated) = std::thread::scope(|s| {
         let simulation = s.spawn(|| succeeded(host.run("env", &query)));
-        let current = apt_security_lists_current(host, now);
+        let current = apt_security_lists_current(host, &config, now);
         (current, simulation.join().ok().flatten())
     });
+    let unchanged = before.is_some() && before == cache_generation(host, &config);
     match simulated {
-        Some(out) if current => parse_apt_security(&out),
+        Some(out) if current && unchanged => parse_apt_security(&out),
         _ => SecurityUpdates::Unknown,
     }
+}
+
+/// The architectures dpkg installs packages for and the indexes APT is configured to download.
+struct AptConfig {
+    architectures: BTreeSet<String>,
+    targets: Vec<IndexTarget>,
+}
+
+impl AptConfig {
+    fn read(host: &impl PackageHost) -> Option<AptConfig> {
+        let native = succeeded(host.run("dpkg", &["--print-architecture"]))?;
+        let foreign = succeeded(host.run("dpkg", &["--print-foreign-architectures"]))?;
+        let targets = succeeded(host.run("apt-get", &["indextargets", "--no-release-info"]))
+            .and_then(|out| parse_index_targets(&out))?;
+        Some(AptConfig {
+            architectures: native
+                .split_whitespace()
+                .chain(foreign.split_whitespace())
+                .map(str::to_string)
+                .collect(),
+            targets,
+        })
+    }
+
+    /// The directories APT keeps the configured indexes and their Releases in.
+    fn dirs(&self) -> BTreeSet<&str> {
+        self.targets
+            .iter()
+            .filter_map(|t| t.filename.rsplit_once('/').map(|(dir, _)| dir))
+            .collect()
+    }
+}
+
+/// One version of the package lists: the stamp of every entry in the list directories, and the
+/// SHA-256 of every Release among them. Re-hashing every index would double the check's cost;
+/// a rewritten or replaced index gets a new stamp. `None` when an entry cannot be examined.
+fn cache_generation(
+    host: &impl PackageHost,
+    config: &AptConfig,
+) -> Option<BTreeMap<String, String>> {
+    let mut generation = BTreeMap::new();
+    for dir in config.dirs() {
+        for path in host.list(dir)? {
+            let mut stamp = host.stamp(&path)?;
+            if path.ends_with("Release") {
+                let release = host.read(&path)?;
+                stamp += &hash_stream(release.as_bytes(), Hash::Sha256)?.hash;
+            }
+            generation.insert(path, stamp);
+        }
+    }
+    Some(generation)
 }
 
 /// One index file APT is configured to download, as `apt-get indextargets` describes it.
@@ -389,24 +469,17 @@ fn release_names(release: &str) -> BTreeSet<&str> {
 ///   may be absent, because APT does not store it.
 ///
 /// Anything else, including a date that does not parse, means the cache is not proven.
-fn apt_security_lists_current(host: &impl PackageHost, now: DateTime<Utc>) -> bool {
-    let (Some(native), Some(foreign)) = (
-        succeeded(host.run("dpkg", &["--print-architecture"])),
-        succeeded(host.run("dpkg", &["--print-foreign-architectures"])),
-    ) else {
-        return false;
-    };
-    let architectures: BTreeSet<&str> = native
-        .split_whitespace()
-        .chain(foreign.split_whitespace())
-        .collect();
-    let Some(targets) = succeeded(host.run("apt-get", &["indextargets", "--no-release-info"]))
-        .and_then(|out| parse_index_targets(&out))
-    else {
-        return false;
-    };
+fn apt_security_lists_current(
+    host: &impl PackageHost,
+    config: &AptConfig,
+    now: DateTime<Utc>,
+) -> bool {
+    let AptConfig {
+        architectures,
+        targets,
+    } = config;
     let mut sources: BTreeMap<&str, Vec<&IndexTarget>> = BTreeMap::new();
-    for target in &targets {
+    for target in targets {
         match target.release_prefix() {
             Some(prefix) => sources.entry(prefix).or_default().push(target),
             None if target.packages => return false,
@@ -417,12 +490,8 @@ fn apt_security_lists_current(host: &impl PackageHost, now: DateTime<Utc>) -> bo
         .keys()
         .flat_map(|prefix| [format!("{prefix}InRelease"), format!("{prefix}Release")])
         .collect();
-    let dirs: BTreeSet<&str> = targets
-        .iter()
-        .filter_map(|t| t.filename.rsplit_once('/').map(|(dir, _)| dir))
-        .collect();
     let mut cached = BTreeSet::new();
-    for dir in dirs {
+    for dir in config.dirs() {
         let Some(entries) = host.list(dir) else {
             return false;
         };
@@ -477,11 +546,8 @@ fn apt_security_lists_current(host: &impl PackageHost, now: DateTime<Utc>) -> bo
         }
         security += 1;
         let flat = used.iter().any(|t| t.architecture.is_none());
-        let covered = |arch: &&str| {
-            flat || used
-                .iter()
-                .any(|t| t.architecture.as_deref() == Some(*arch))
-        };
+        let covered =
+            |arch: &String| flat || used.iter().any(|t| t.architecture.as_ref() == Some(arch));
         if !release_current(&release, now) || !architectures.iter().all(covered) {
             return false;
         }
@@ -1592,6 +1658,11 @@ ID Command line                         Date and time       Action(s) Altered
         fn digest(&self, path: &str, _decode: bool, hash: Hash) -> Option<IndexDigest> {
             hash_stream(self.files.get(path)?.as_bytes(), hash)
         }
+
+        /// A fake file is rewritten whenever its text changes.
+        fn stamp(&self, path: &str) -> Option<String> {
+            Some(hash_stream(self.files.get(path)?.as_bytes(), Hash::Sha256)?.hash)
+        }
     }
 
     impl FakeHost {
@@ -2130,6 +2201,98 @@ ID Command line                          Date and time       Action(s) Altered
         ] {
             assert_eq!(patch_age(&host, now()), "unknown", "{what}");
         }
+    }
+
+    /// A host whose package lists APT refreshes while the upgrade simulation runs: every
+    /// command and file read sees `before` until the simulation finishes, then `after`. Hashing
+    /// an index waits for the refresh, so validation hashes the refreshed cache.
+    struct RefreshingHost {
+        before: FakeHost,
+        after: FakeHost,
+        refreshed: std::sync::Mutex<bool>,
+        changed: std::sync::Condvar,
+    }
+
+    impl RefreshingHost {
+        fn new(before: FakeHost, after: FakeHost) -> RefreshingHost {
+            RefreshingHost {
+                before,
+                after,
+                refreshed: std::sync::Mutex::new(false),
+                changed: std::sync::Condvar::new(),
+            }
+        }
+
+        fn now(&self) -> &FakeHost {
+            if *self.refreshed.lock().unwrap() {
+                &self.after
+            } else {
+                &self.before
+            }
+        }
+    }
+
+    impl PackageHost for RefreshingHost {
+        fn read(&self, path: &str) -> Option<String> {
+            self.now().read(path)
+        }
+
+        fn run(&self, program: &str, args: &[&str]) -> Option<Ran> {
+            let ran = self.now().run(program, args);
+            if format!("{program} {}", args.join(" ")) == APT_QUERY {
+                *self.refreshed.lock().unwrap() = true;
+                self.changed.notify_all();
+            }
+            ran
+        }
+
+        fn list(&self, dir: &str) -> Option<Vec<String>> {
+            self.now().list(dir)
+        }
+
+        fn digest(&self, path: &str, decode: bool, hash: Hash) -> Option<IndexDigest> {
+            let refreshed = self.refreshed.lock().unwrap();
+            let _ = self
+                .changed
+                .wait_timeout_while(refreshed, std::time::Duration::from_secs(5), |r| !*r)
+                .unwrap();
+            self.now().digest(path, decode, hash)
+        }
+
+        fn stamp(&self, path: &str) -> Option<String> {
+            self.now().stamp(path)
+        }
+    }
+
+    /// R7-M1: the simulation and the validation must describe one cache generation. A refresh
+    /// that lands while the simulation runs makes the result unknown, even though the
+    /// refreshed cache on its own passes validation.
+    #[test]
+    fn apt_patch_age_needs_one_cache_generation() {
+        let clear = Some((true, APT_CLEAR));
+        let complete = || apt_host(&[SECURITY_LISTS, RELEASE_POCKET], clear);
+        let older = INDEX.replace("1.1", "1.0");
+        let stable = RefreshingHost::new(complete(), complete());
+        assert_eq!(patch_age(&stable, now()), "le_14d", "no refresh");
+        let refreshed =
+            RefreshingHost::new(complete().with(&packages("suite0"), &older), complete());
+        assert_eq!(
+            patch_age(&refreshed, now()),
+            "unknown",
+            "simulation read the older index, validation the refreshed one"
+        );
+        let new_release = RefreshingHost::new(
+            complete(),
+            complete().with(
+                &format!("{}InRelease", source("suite0")),
+                &listing(&SECURITY_LISTS.replace("2:34:10", "8:00:00")),
+            ),
+        );
+        assert_eq!(
+            patch_age(&new_release, now()),
+            "unknown",
+            "Release replaced during the simulation"
+        );
     }
 
     #[test]
