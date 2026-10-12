@@ -167,6 +167,47 @@ impl Home {
         Ok(path)
     }
 
+    /// Replaces several files as one change: each new content goes to a synced temporary file
+    /// first, then the renames run. If a rename fails, the files already replaced get their
+    /// earlier content back, so a failure leaves the earlier set in place.
+    fn replace_all(&self, files: &[(&str, &[u8])]) -> Result<()> {
+        std::fs::create_dir_all(&self.0)?;
+        let mut staged = Vec::new();
+        let result = (|| {
+            for (name, bytes) in files {
+                let tmp = self.file(&format!(".{name}.{}.tmp", std::process::id()));
+                let mut file = std::fs::File::create(&tmp)?;
+                staged.push(tmp.clone());
+                file.write_all(bytes)?;
+                file.sync_all()?;
+            }
+            let earlier: Vec<Option<Vec<u8>>> = files
+                .iter()
+                .map(|(name, _)| std::fs::read(self.file(name)).ok())
+                .collect();
+            for (i, ((name, _), tmp)) in files.iter().zip(&staged).enumerate() {
+                if let Err(e) = std::fs::rename(tmp, self.file(name)) {
+                    for ((name, _), old) in files[..i].iter().zip(&earlier) {
+                        match old {
+                            Some(old) => {
+                                let _ = std::fs::write(self.file(name), old);
+                            }
+                            None => {
+                                let _ = std::fs::remove_file(self.file(name));
+                            }
+                        }
+                    }
+                    return Err(e).with_context(|| self.file(name).display().to_string());
+                }
+            }
+            Ok(())
+        })();
+        for tmp in &staged {
+            let _ = std::fs::remove_file(tmp);
+        }
+        result
+    }
+
     fn read_text(&self, name: &str) -> Result<Option<String>> {
         let path = self.file(name);
         match std::fs::read_to_string(&path) {
@@ -877,14 +918,51 @@ fn vpn_csr(home: &Home) -> Result<(String, Vec<u8>)> {
     Ok((csr.pem()?, csr.der().to_vec()))
 }
 
-fn describe_cert(pem: &str) -> Result<String> {
-    let (_, pem) = x509_parser::pem::parse_x509_pem(pem.as_bytes())?;
-    let cert = pem.parse_x509()?;
-    Ok(format!(
+/// Checks a VPN CA and certificate before they replace the installed pair (R6-L1). Both must
+/// parse as one PEM certificate each and be valid now; the CA must be a CA; the certificate must
+/// carry this device's VPN key and verify under the CA's key. Returns a description of the
+/// certificate, if there is one.
+fn check_vpn_pair(
+    ca_pem: &str,
+    cert_pem: Option<&str>,
+    vpn_key: &KeyPair,
+) -> Result<Option<String>> {
+    let ca_der = pem_certificate(ca_pem).context("ca_pem")?;
+    let ca = x509_parser::parse_x509_certificate(&ca_der)
+        .context("ca_pem")?
+        .1;
+    if !ca.is_ca() || !ca.validity().is_valid() {
+        bail!("ca_pem is not a CA certificate valid now");
+    }
+    let Some(cert_pem) = cert_pem else {
+        return Ok(None);
+    };
+    let cert_der = pem_certificate(cert_pem).context("certificate_pem")?;
+    let cert = x509_parser::parse_x509_certificate(&cert_der)
+        .context("certificate_pem")?
+        .1;
+    if !cert.validity().is_valid() {
+        bail!("certificate_pem is not valid now");
+    }
+    if cert.public_key().raw != rcgen::PublicKeyData::subject_public_key_info(vpn_key).as_slice() {
+        bail!("certificate_pem is not for this device's VPN key");
+    }
+    cert.verify_signature(Some(ca.public_key()))
+        .map_err(|e| anyhow::anyhow!("certificate_pem was not issued by ca_pem: {e}"))?;
+    Ok(Some(format!(
         "subject {}, expires {}",
         cert.subject(),
         cert.validity().not_after
-    ))
+    )))
+}
+
+/// The DER of a text that is exactly one PEM certificate block.
+fn pem_certificate(text: &str) -> Result<Vec<u8>> {
+    let (rest, pem) = x509_parser::pem::parse_x509_pem(text.as_bytes())?;
+    if pem.label != "CERTIFICATE" || !rest.iter().all(u8::is_ascii_whitespace) {
+        bail!("not a single PEM certificate");
+    }
+    Ok(pem.contents)
 }
 
 fn print_hints(manifest: &Manifest, results: &BTreeMap<String, String>, os: Os) {
@@ -1009,15 +1087,20 @@ async fn check(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
                 println!("  warning: {w}");
             }
             print_hints(&manifest, &claim.results, os);
-            let ca = home.write("ca.pem", ca_pem.as_bytes())?;
-            if let Some(cert) = certificate_pem {
-                let path = home.write("vpn-cert.pem", cert.as_bytes())?;
+            let vpn_key = KeyPair::from_pem(&std::fs::read_to_string(home.file("vpn-key.pem"))?)?;
+            let described = check_vpn_pair(&ca_pem, certificate_pem.as_deref(), &vpn_key)
+                .context("the accepted response carries an unusable VPN certificate or CA; the installed ones are kept")?;
+            let mut files = vec![("ca.pem", ca_pem.as_bytes())];
+            if let Some(cert) = &certificate_pem {
+                files.push(("vpn-cert.pem", cert.as_bytes()));
+            }
+            home.replace_all(&files)?;
+            if let Some(described) = described {
                 println!(
-                    "VPN certificate {} ({})",
-                    path.display(),
-                    describe_cert(&cert)?
+                    "VPN certificate {} ({described})",
+                    home.file("vpn-cert.pem").display(),
                 );
-                println!("VPN CA          {}", ca.display());
+                println!("VPN CA          {}", home.file("ca.pem").display());
             }
             true
         }
@@ -1365,11 +1448,12 @@ mod tests {
     /// the response carried.
     async fn check_with_response_checkpoint(
         response: impl FnOnce(&Company, &Witness, &[Entry], u64) -> Option<String>,
+        pair: impl FnOnce(&KeyPair) -> VpnPair,
     ) -> (
-        ExitCode,
+        Result<ExitCode>,
         BTreeMap<String, Vec<u8>>,
         BTreeMap<String, Vec<u8>>,
-        String,
+        VpnPair,
     ) {
         let (company, witness) = (Company::new(), Witness::new());
         let toml = witnessed_manifest(&witness);
@@ -1405,15 +1489,14 @@ mod tests {
         let mut before_claim = company.sign(&checkpoint_of(company.log.origin(), &entries, 2));
         witness.cosign(&mut before_claim, now);
         let before_claim = before_claim.to_string();
-        let certificate = rcgen::generate_simple_self_signed(vec!["device".into()])
-            .unwrap()
-            .cert
-            .pem();
+        let vpn_key = KeyPair::generate().unwrap();
+        std::fs::write(dir.path().join("vpn-key.pem"), vpn_key.serialize_pem()).unwrap();
+        let pair = pair(&vpn_key);
         let mut claim = json!({
             "status": "accepted",
             "warnings": [],
-            "certificate_pem": certificate,
-            "ca_pem": "new CA",
+            "certificate_pem": pair.cert,
+            "ca_pem": pair.ca,
         });
         if let Some(text) = response(&company, &witness, &entries, now) {
             claim["log_checkpoint"] = text.into();
@@ -1433,7 +1516,7 @@ mod tests {
         home.write(LOG_CHECKPOINT, before_claim.as_bytes()).unwrap();
         let before = snapshot(dir.path());
 
-        let code = check(&home, false).await.unwrap();
+        let code = check(&home, false).await;
 
         let posts = gateway.posts();
         assert_eq!(
@@ -1441,21 +1524,130 @@ mod tests {
             ["POST /v1/nonce", "POST /v1/claim"],
             "the claim was sent"
         );
-        (code, before, snapshot(dir.path()), certificate)
+        (code, before, snapshot(dir.path()), pair)
+    }
+
+    /// A VPN certificate and the CA a claim response carries.
+    struct VpnPair {
+        cert: String,
+        ca: String,
+    }
+
+    /// A fictional VPN CA: a CA certificate unless `is_ca` is false.
+    fn test_ca(is_ca: bool) -> (CertificateParams, KeyPair) {
+        let mut params = CertificateParams::new(vec![]).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "fictional VPN CA");
+        if is_ca {
+            params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Constrained(0));
+        }
+        (params, KeyPair::generate().unwrap())
+    }
+
+    fn ca_pem((params, key): &(CertificateParams, KeyPair)) -> String {
+        params.self_signed(key).unwrap().pem()
+    }
+
+    /// A certificate for `key` issued by `ca`, expired since 2020 if `expired`.
+    fn issue_to(
+        key: &KeyPair,
+        (params, ca_key): &(CertificateParams, KeyPair),
+        expired: bool,
+    ) -> String {
+        let mut leaf = CertificateParams::new(vec![]).unwrap();
+        if expired {
+            leaf.not_before = rcgen::date_time_ymd(2020, 1, 1);
+            leaf.not_after = rcgen::date_time_ymd(2020, 2, 1);
+        }
+        leaf.signed_by(key, &rcgen::Issuer::from_params(params, ca_key))
+            .unwrap()
+            .pem()
+    }
+
+    /// A certificate for the device's VPN key, issued by the CA that comes with it.
+    fn valid_pair(vpn: &KeyPair) -> VpnPair {
+        let ca = test_ca(true);
+        VpnPair {
+            cert: issue_to(vpn, &ca, false),
+            ca: ca_pem(&ca),
+        }
+    }
+
+    fn grown_checkpoint(
+        company: &Company,
+        witness: &Witness,
+        entries: &[Entry],
+        now: u64,
+    ) -> Option<String> {
+        let mut grown = company.sign(&checkpoint_of(company.log.origin(), entries, 3));
+        witness.cosign(&mut grown, now);
+        Some(grown.to_string())
+    }
+
+    /// R6-L1: a replacement certificate and CA are checked before either installed file
+    /// changes, so a bad pair in an accepted response leaves the working pair in place.
+    #[tokio::test]
+    async fn check_keeps_the_installed_pair_if_the_new_one_is_invalid() {
+        type Pair = fn(&KeyPair) -> VpnPair;
+        let cases: [(&str, Pair); 7] = [
+            ("malformed certificate", |vpn| VpnPair {
+                cert: "FICTIONAL NOT A CERTIFICATE".into(),
+                ..valid_pair(vpn)
+            }),
+            ("malformed CA", |vpn| VpnPair {
+                ca: "FICTIONAL NOT A CA".into(),
+                ..valid_pair(vpn)
+            }),
+            ("certificate for another key", |_| {
+                valid_pair(&KeyPair::generate().unwrap())
+            }),
+            ("certificate from another CA", |vpn| VpnPair {
+                ca: ca_pem(&test_ca(true)),
+                ..valid_pair(vpn)
+            }),
+            ("expired certificate", |vpn| {
+                let ca = test_ca(true);
+                VpnPair {
+                    cert: issue_to(vpn, &ca, true),
+                    ca: ca_pem(&ca),
+                }
+            }),
+            ("CA that is not a CA", |vpn| {
+                let ca = test_ca(false);
+                VpnPair {
+                    cert: issue_to(vpn, &ca, false),
+                    ca: ca_pem(&ca),
+                }
+            }),
+            ("certificate and CA swapped", |vpn| {
+                let pair = valid_pair(vpn);
+                VpnPair {
+                    cert: pair.ca,
+                    ca: pair.cert,
+                }
+            }),
+        ];
+        for (case, pair) in cases {
+            let (code, before, after, _) =
+                check_with_response_checkpoint(grown_checkpoint, pair).await;
+            assert!(
+                code.as_ref().is_err() || code.as_ref().unwrap() != &ExitCode::SUCCESS,
+                "{case}: not a success"
+            );
+            for file in ["ca.pem", "vpn-cert.pem", "vpn-key.pem"] {
+                assert_eq!(after[file], before[file], "{case}: {file} unchanged");
+            }
+        }
     }
 
     #[tokio::test]
     async fn check_installs_the_certificate_of_a_verified_response_checkpoint() {
-        let (code, before, after, certificate) =
-            check_with_response_checkpoint(|company, witness, entries, now| {
-                let mut grown = company.sign(&checkpoint_of(company.log.origin(), entries, 3));
-                witness.cosign(&mut grown, now);
-                Some(grown.to_string())
-            })
-            .await;
-        assert_eq!(code, ExitCode::SUCCESS);
-        assert_eq!(after["ca.pem"], b"new CA");
-        assert_eq!(after["vpn-cert.pem"], certificate.as_bytes());
+        let (code, before, after, pair) =
+            check_with_response_checkpoint(grown_checkpoint, valid_pair).await;
+        assert_eq!(code.unwrap(), ExitCode::SUCCESS);
+        assert_eq!(after["ca.pem"], pair.ca.as_bytes());
+        assert_eq!(after["vpn-cert.pem"], pair.cert.as_bytes());
         let stored = Note::parse(std::str::from_utf8(&after[LOG_CHECKPOINT]).unwrap()).unwrap();
         assert_eq!(Checkpoint::parse(&stored.text).unwrap().size, 3);
         assert_ne!(after[LOG_CHECKPOINT], before[LOG_CHECKPOINT]);
@@ -1502,8 +1694,9 @@ mod tests {
             }),
         ];
         for (case, response) in cases {
-            let (code, before, after, _) = check_with_response_checkpoint(response).await;
-            assert_eq!(code, ExitCode::from(2), "{case}: log alarm");
+            let (code, before, after, _) =
+                check_with_response_checkpoint(response, valid_pair).await;
+            assert_eq!(code.unwrap(), ExitCode::from(2), "{case}: log alarm");
             for file in ["ca.pem", "vpn-cert.pem", LOG_CHECKPOINT] {
                 assert_eq!(after[file], before[file], "{case}: {file} unchanged");
             }
