@@ -24,6 +24,7 @@ const APT_ROTATED_LOGS: u32 = 3;
 const APT_SECURITY_LISTS_MAX_AGE: Duration = Duration::days(7);
 /// The plain name and the compressed forms APT may keep a downloaded index in.
 const APT_INDEX_SUFFIXES: &[&str] = &["", ".lz4", ".zst", ".gz", ".xz", ".bz2", ".lzma"];
+const APT_HELPER: &str = "/usr/lib/apt/apt-helper";
 
 const UBUNTU_EOL: &[(&str, &str)] = &[
     ("22.04", "2027-06-01"),
@@ -98,9 +99,16 @@ trait PackageHost {
     fn run(&self, program: &str, args: &[&str]) -> Option<Ran>;
     /// The paths of the entries in a directory.
     fn list(&self, dir: &str) -> Option<Vec<String>>;
-    /// Whether a file exists and its content can be read. Indexes may be compressed, so this
-    /// does not decode text.
-    fn readable(&self, path: &str) -> bool;
+    /// The size and SHA-256 of a file's bytes, or with `decode` of the content APT reads from
+    /// it after decompression. `None` when the file cannot be read or decoded in time.
+    fn digest(&self, path: &str, decode: bool) -> Option<IndexDigest>;
+}
+
+/// An index's size and lowercase hex SHA-256, as a Release lists it.
+#[derive(Debug, PartialEq)]
+struct IndexDigest {
+    size: u64,
+    sha256: String,
 }
 
 struct System;
@@ -121,9 +129,59 @@ impl PackageHost for System {
             .collect()
     }
 
-    fn readable(&self, path: &str) -> bool {
-        fs::File::open(path).is_ok_and(|mut f| f.read(&mut [0]).is_ok())
+    fn digest(&self, path: &str, decode: bool) -> Option<IndexDigest> {
+        if !decode {
+            return hash_stream(fs::File::open(path).ok()?);
+        }
+        // `apt-helper cat-file` decodes every compression APT stores lists in.
+        let mut child = std::process::Command::new(APT_HELPER)
+            .args(["cat-file", path])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        let stdout = child.stdout.take()?;
+        let hasher = std::thread::spawn(move || hash_stream(stdout));
+        let deadline = std::time::Instant::now() + super::exec::TIMEOUT;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+            }
+        };
+        let digest = hasher.join().ok()?;
+        digest.filter(|_| status.success())
     }
+}
+
+fn hash_stream(mut input: impl Read) -> Option<IndexDigest> {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    let mut size = 0u64;
+    let mut chunk = vec![0u8; 1 << 16];
+    loop {
+        match input.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                hasher.update(&chunk[..n]);
+                size += n as u64;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
+    Some(IndexDigest {
+        size,
+        sha256: hex::encode(hasher.finalize()),
+    })
 }
 
 pub fn os_patch_age() -> &'static str {
@@ -141,7 +199,7 @@ enum SecurityUpdates {
 
 /// The age of the last whole-system upgrade, or `unknown` unless the security query ran, exited
 /// zero and showed nothing outstanding.
-fn patch_age(host: &impl PackageHost, now: DateTime<Utc>) -> &'static str {
+fn patch_age(host: &(impl PackageHost + Sync), now: DateTime<Utc>) -> &'static str {
     let (last, updates) = match host.read(APT_HISTORY) {
         Some(text) => (
             first_upgrade_date(
@@ -170,10 +228,9 @@ fn succeeded(ran: Option<Ran>) -> Option<String> {
 /// The parser reads apt's English messages, so the query runs in the C locale.
 /// `apt-get -s upgrade` compares the installed packages with the downloaded lists only, so
 /// without current security lists it reports no upgrades while some are outstanding.
-fn apt_security_updates(host: &impl PackageHost, now: DateTime<Utc>) -> SecurityUpdates {
-    if !apt_security_lists_current(host, now) {
-        return SecurityUpdates::Unknown;
-    }
+/// Each APT command loads every cached index, so the simulation runs while the cache is being
+/// verified to stay within the check budget.
+fn apt_security_updates(host: &(impl PackageHost + Sync), now: DateTime<Utc>) -> SecurityUpdates {
     let query = [
         "LC_ALL=C",
         "apt-get",
@@ -182,8 +239,15 @@ fn apt_security_updates(host: &impl PackageHost, now: DateTime<Utc>) -> Security
         "Debug::NoLocking=1",
         "upgrade",
     ];
-    succeeded(host.run("env", &query))
-        .map_or(SecurityUpdates::Unknown, |out| parse_apt_security(&out))
+    let (current, simulated) = std::thread::scope(|s| {
+        let simulation = s.spawn(|| succeeded(host.run("env", &query)));
+        let current = apt_security_lists_current(host, now);
+        (current, simulation.join().ok().flatten())
+    });
+    match simulated {
+        Some(out) if current => parse_apt_security(&out),
+        _ => SecurityUpdates::Unknown,
+    }
 }
 
 /// One index file APT is configured to download, as `apt-get indextargets` describes it.
@@ -240,30 +304,54 @@ fn parse_index_targets(out: &str) -> Option<Vec<IndexTarget>> {
         .collect()
 }
 
-/// The index files a Release lists, by name, with their sizes.
-fn release_indexes(release: &str) -> BTreeMap<&str, u64> {
+/// The index files the `SHA256` section of a Release lists, by name. Other hash sections and
+/// the signature that follows are not part of it.
+fn release_indexes(release: &str) -> BTreeMap<&str, IndexDigest> {
     release
         .lines()
-        .filter(|l| l.starts_with(' '))
+        .skip_while(|l| l.trim_end() != "SHA256:")
+        .skip(1)
+        .take_while(|l| l.starts_with(' '))
         .filter_map(|l| match l.split_whitespace().collect::<Vec<_>>()[..] {
-            [_, size, name] => Some((name, size.parse().ok()?)),
+            [sha256, size, name] => Some((
+                name,
+                IndexDigest {
+                    size: size.parse().ok()?,
+                    sha256: sha256.to_ascii_lowercase(),
+                },
+            )),
             _ => None,
         })
         .collect()
 }
 
-/// Whether APT's downloaded lists can show every outstanding security update (R4-M1, R5-M1).
-/// Every configured source needs a readable Release, since without one nothing tells whether
-/// it is a security source, and the lists directory may hold no other Release. There must be a
-/// security source (`Suite` or `Codename` ending in `-security`). Each one is published within
-/// the last week, has not passed its `Valid-Until`, and lists a Packages index for the system
-/// architecture. Each such index is downloaded and readable, unless the Release lists it as
-/// empty, which APT does not store. A date that does not parse counts as stale.
+/// Whether the APT cache provably holds what the archive published (R4-M1, R5-M1, R6-M1,
+/// R6-M2). The upgrade simulation reads the cached Packages indexes without checking them, so
+/// a missing, truncated or older index hides updates. The check therefore needs:
+///
+/// - a readable Release for every configured source, and no Release APT is not configured
+///   for, since without one nothing tells whether it is a security source;
+/// - at least one security source (`Suite` or `Codename` ending in `-security`), each published
+///   within the last week, before its `Valid-Until`, and listing a Packages index for the
+///   native architecture and for every foreign architecture dpkg installs packages for;
+/// - for every source, each Packages index APT would read (native, foreign or `all`
+///   architecture, listed in the Release's SHA256 section) cached with exactly the listed size
+///   and SHA-256. A stored form matches its own entry, or its decoded content matches the
+///   uncompressed entry. Only an index the Release lists as empty may be absent, because APT
+///   does not store it.
+///
+/// Anything else, including a date that does not parse, means the cache is not proven.
 fn apt_security_lists_current(host: &impl PackageHost, now: DateTime<Utc>) -> bool {
-    let Some(arch) = succeeded(host.run("dpkg", &["--print-architecture"])) else {
+    let (Some(native), Some(foreign)) = (
+        succeeded(host.run("dpkg", &["--print-architecture"])),
+        succeeded(host.run("dpkg", &["--print-foreign-architectures"])),
+    ) else {
         return false;
     };
-    let arch = arch.trim();
+    let architectures: BTreeSet<&str> = native
+        .split_whitespace()
+        .chain(foreign.split_whitespace())
+        .collect();
     let Some(targets) = succeeded(host.run("apt-get", &["indextargets", "--no-release-info"]))
         .and_then(|out| parse_index_targets(&out))
     else {
@@ -285,6 +373,7 @@ fn apt_security_lists_current(host: &impl PackageHost, now: DateTime<Utc>) -> bo
         .iter()
         .filter_map(|t| t.filename.rsplit_once('/').map(|(dir, _)| dir))
         .collect();
+    let mut cached = BTreeSet::new();
     for dir in dirs {
         let Some(entries) = host.list(dir) else {
             return false;
@@ -295,6 +384,7 @@ fn apt_security_lists_current(host: &impl PackageHost, now: DateTime<Utc>) -> bo
         {
             return false;
         }
+        cached.extend(entries);
     }
     let mut security = 0;
     for (prefix, targets) in &sources {
@@ -304,6 +394,30 @@ fn apt_security_lists_current(host: &impl PackageHost, now: DateTime<Utc>) -> bo
         else {
             return false;
         };
+        let listed = release_indexes(&release);
+        let arch_all_unused = release_field(&release, "No-Support-for-Architecture-all")
+            .is_some_and(|v| v.split_whitespace().any(|w| w == "Packages"));
+        let used: Vec<&IndexTarget> = targets
+            .iter()
+            .copied()
+            .filter(|t| t.packages)
+            .filter(|t| match t.architecture.as_deref() {
+                None => true,
+                Some("all") => !arch_all_unused,
+                Some(arch) => architectures.contains(arch),
+            })
+            .filter(|t| {
+                APT_INDEX_SUFFIXES
+                    .iter()
+                    .any(|suffix| listed.contains_key(format!("{}{suffix}", t.meta_key).as_str()))
+            })
+            .collect();
+        if !used
+            .iter()
+            .all(|t| index_matches(host, t, &listed, &cached))
+        {
+            return false;
+        }
         let is_security = ["Suite", "Codename"]
             .iter()
             .filter_map(|name| release_field(&release, name))
@@ -312,31 +426,43 @@ fn apt_security_lists_current(host: &impl PackageHost, now: DateTime<Utc>) -> bo
             continue;
         }
         security += 1;
-        if !release_current(&release, now) {
-            return false;
-        }
-        let listed = release_indexes(&release);
-        let indexes: Vec<&IndexTarget> = targets
-            .iter()
-            .copied()
-            .filter(|t| t.packages && t.architecture.as_deref().is_none_or(|a| a == arch))
-            .filter(|t| {
-                APT_INDEX_SUFFIXES
-                    .iter()
-                    .any(|suffix| listed.contains_key(format!("{}{suffix}", t.meta_key).as_str()))
-            })
-            .collect();
-        let usable = |t: &&IndexTarget| {
-            listed.get(t.meta_key.as_str()) == Some(&0)
-                || APT_INDEX_SUFFIXES
-                    .iter()
-                    .any(|suffix| host.readable(&format!("{}{suffix}", t.filename)))
+        let flat = used.iter().any(|t| t.architecture.is_none());
+        let covered = |arch: &&str| {
+            flat || used
+                .iter()
+                .any(|t| t.architecture.as_deref() == Some(*arch))
         };
-        if indexes.is_empty() || !indexes.iter().all(usable) {
+        if !release_current(&release, now) || !architectures.iter().all(covered) {
             return false;
         }
     }
     security > 0
+}
+
+/// Whether every cached form of one index matches the Release, and at least one exists unless
+/// the Release lists the index as empty.
+fn index_matches(
+    host: &impl PackageHost,
+    target: &IndexTarget,
+    listed: &BTreeMap<&str, IndexDigest>,
+    cached: &BTreeSet<String>,
+) -> bool {
+    let plain = listed.get(target.meta_key.as_str());
+    let stored: Vec<&str> = APT_INDEX_SUFFIXES
+        .iter()
+        .copied()
+        .filter(|suffix| cached.contains(&format!("{}{suffix}", target.filename)))
+        .collect();
+    if stored.is_empty() {
+        return plain.is_some_and(|d| d.size == 0);
+    }
+    stored.iter().all(|suffix| {
+        let path = format!("{}{suffix}", target.filename);
+        let as_stored = listed.get(format!("{}{suffix}", target.meta_key).as_str());
+        as_stored.is_some_and(|want| host.digest(&path, false).as_ref() == Some(want))
+            || (!suffix.is_empty()
+                && plain.is_some_and(|want| host.digest(&path, true).as_ref() == Some(want)))
+    })
 }
 
 /// Whether a Release was published within the last week and has not passed its `Valid-Until`.
@@ -1408,8 +1534,9 @@ ID Command line                         Date and time       Action(s) Altered
             )
         }
 
-        fn readable(&self, path: &str) -> bool {
-            self.files.contains_key(path)
+        /// A fake index decodes to its own text, whatever its suffix.
+        fn digest(&self, path: &str, _decode: bool) -> Option<IndexDigest> {
+            hash_stream(self.files.get(path)?.as_bytes())
         }
     }
 
@@ -1448,6 +1575,7 @@ ID Command line                         Date and time       Action(s) Altered
     const APT_QUERY: &str = "env LC_ALL=C apt-get -s -o Debug::NoLocking=1 upgrade";
     const INDEX_TARGETS: &str = "apt-get indextargets --no-release-info";
     const ARCH: &str = "dpkg --print-architecture";
+    const FOREIGN_ARCHS: &str = "dpkg --print-foreign-architectures";
     const LISTS: &str = "/var/lib/apt/lists";
     const APT_CLEAR: &str = "Reading package lists...\nCalculating upgrade...\n\
         0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n";
@@ -1490,10 +1618,22 @@ ID Command line                         Date and time       Action(s) Altered
         )
     }
 
-    /// A Release header followed by the index list APT checks downloads against.
+    /// The content of every downloaded fictional Packages index.
+    const INDEX: &str = "Package: fictional-lib\nVersion: 1.1\nArchitecture: amd64\n\n";
+
+    /// One SHA256 line of a Release: the hash and size of `content`, listed under `name`.
+    fn entry(name: &str, content: &str) -> String {
+        let sha = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(content.as_bytes()));
+        format!(" {sha} {} {name}\n", content.len())
+    }
+
+    /// A Release header followed by the index list APT checks downloads against: the amd64 and
+    /// i386 Packages with the content of `INDEX`, and an xz form with a hash nothing matches.
     fn listing(header: &str) -> String {
         format!(
-            "{header}SHA256:\n 0f 1234 main/binary-amd64/Packages\n 0e 321 main/binary-amd64/Packages.xz\n"
+            "{header}MD5Sum:\n 0d 99 main/binary-amd64/Packages\nSHA256:\n{}{} 0e 321 main/binary-amd64/Packages.xz\n",
+            entry("main/binary-amd64/Packages", INDEX),
+            entry("main/binary-i386/Packages", INDEX),
         )
     }
 
@@ -1511,6 +1651,7 @@ ID Command line                         Date and time       Action(s) Altered
             commands: vec![
                 (APT_QUERY, owned(query)),
                 (ARCH, Some((true, "amd64\n".to_string()))),
+                (FOREIGN_ARCHS, Some((true, String::new()))),
                 (INDEX_TARGETS, Some((true, String::new()))),
             ],
         };
@@ -1519,7 +1660,7 @@ ID Command line                         Date and time       Action(s) Altered
             host = host
                 .configure(&suite)
                 .with(&format!("{}InRelease", source(&suite)), &listing(header))
-                .with(&packages(&suite), "FICTIONAL compressed index");
+                .with(&packages(&suite), INDEX);
         }
         host
     }
@@ -1657,13 +1798,16 @@ ID Command line                          Date and time       Action(s) Altered
             )
             .with(
                 "/var/lib/apt/lists/_tmp_fictional-archive_._Release",
-                &format!("{SECURITY_LISTS}SHA256:\n 0f 1234 Packages\n"),
+                &format!("{SECURITY_LISTS}SHA256:\n{}", entry("Packages", INDEX)),
             )
-            .with("/var/lib/apt/lists/_tmp_fictional-archive_._Packages", "FICTIONAL index");
+            .with("/var/lib/apt/lists/_tmp_fictional-archive_._Packages", INDEX);
         assert_eq!(patch_age(&flat, now()), "le_14d", "flat repository");
         let empty = complete().without(&packages("suite0")).with(
             &format!("{}InRelease", source("suite0")),
-            &format!("{SECURITY_LISTS}SHA256:\n e3 0 main/binary-amd64/Packages\n"),
+            &format!(
+                "{SECURITY_LISTS}SHA256:\n{}",
+                entry("main/binary-amd64/Packages", "")
+            ),
         );
         assert_eq!(
             patch_age(&empty, now()),
@@ -1675,7 +1819,10 @@ ID Command line                          Date and time       Action(s) Altered
             true,
             "Inst fictional-lib [1.0] (1.1 Fictional:1/fictional-security [amd64])\n",
         ));
-        let no_amd64 = format!("{SECURITY_LISTS}SHA256:\n 0f 1234 main/binary-i386/Packages\n");
+        let no_amd64 = format!(
+            "{SECURITY_LISTS}SHA256:\n{}",
+            entry("main/binary-i386/Packages", INDEX)
+        );
         for (what, host) in [
             (
                 "pending update",
@@ -1732,6 +1879,143 @@ ID Command line                          Date and time       Action(s) Altered
             (
                 "unreadable index targets",
                 complete().answer(INDEX_TARGETS, Some((true, "Identifier: Packages\n"))),
+            ),
+        ] {
+            assert_eq!(patch_age(&host, now()), "unknown", "{what}");
+        }
+    }
+
+    /// The i386 Packages index of `suite`.
+    fn foreign_packages(suite: &str) -> String {
+        format!("{}main_binary-i386_Packages.lz4", source(suite))
+    }
+
+    /// R6-M1: APT installs packages for every foreign architecture dpkg is configured with, so
+    /// each one needs a downloaded security index that matches the Release.
+    #[test]
+    fn apt_patch_age_covers_foreign_architectures() {
+        let clear = Some((true, APT_CLEAR));
+        let multiarch = || {
+            apt_host(&[SECURITY_LISTS, RELEASE_POCKET], clear)
+                .answer(FOREIGN_ARCHS, Some((true, "i386\n")))
+                .with(&foreign_packages("suite0"), INDEX)
+                .with(&foreign_packages("suite1"), INDEX)
+        };
+        assert_eq!(
+            patch_age(&multiarch(), now()),
+            "le_14d",
+            "complete multiarch"
+        );
+        let native_only = format!(
+            "{SECURITY_LISTS}SHA256:\n{}",
+            entry("main/binary-amd64/Packages", INDEX)
+        );
+        for (what, host) in [
+            (
+                "foreign security index removed",
+                multiarch().without(&foreign_packages("suite0")),
+            ),
+            (
+                "foreign security index stale",
+                multiarch().with(&foreign_packages("suite0"), ""),
+            ),
+            (
+                "security source publishes no foreign index",
+                multiarch().with(&format!("{}InRelease", source("suite0")), &native_only),
+            ),
+            (
+                "foreign architectures unknown",
+                multiarch().answer(FOREIGN_ARCHS, Some((false, ""))),
+            ),
+        ] {
+            assert_eq!(patch_age(&host, now()), "unknown", "{what}");
+        }
+    }
+
+    /// R6-M2: a downloaded index counts only when its size and SHA-256 match the entry the
+    /// Release lists for it, after APT decodes it or as stored.
+    #[test]
+    fn apt_patch_age_needs_indexes_that_match_the_release() {
+        let clear = Some((true, APT_CLEAR));
+        let complete = || apt_host(&[SECURITY_LISTS, RELEASE_POCKET], clear);
+        let plain = packages("suite0").replace(".lz4", "");
+        let older = INDEX.replace("1.1", "1.0");
+        assert_eq!(older.len(), INDEX.len());
+        let stored_xz = format!(
+            "{SECURITY_LISTS}SHA256:\n{}",
+            entry("main/binary-amd64/Packages.xz", "FICTIONAL xz bytes")
+        );
+        let as_listed_xz = complete()
+            .without(&packages("suite0"))
+            .with(&format!("{}InRelease", source("suite0")), &stored_xz)
+            .with(
+                &plain.replace("Packages", "Packages.xz"),
+                "FICTIONAL xz bytes",
+            );
+        assert_eq!(
+            patch_age(&as_listed_xz, now()),
+            "le_14d",
+            "stored form listed in the Release"
+        );
+        let arch_all = |extra: &str| {
+            complete()
+                .answer(
+                    INDEX_TARGETS,
+                    Some((
+                        true,
+                        &(index_target("suite0")
+                            + &index_target("suite1")
+                            + &format!(
+                                "MetaKey: main/binary-all/Packages\nFilename: {}main_binary-all_Packages\n\
+                                 Target-Of: deb\nIdentifier: Packages\nArchitecture: all\n\n",
+                                source("suite0")
+                            )),
+                    )),
+                )
+                .with(
+                    &format!("{}InRelease", source("suite0")),
+                    &(listing(&format!("{SECURITY_LISTS}{extra}"))
+                        + &entry("main/binary-all/Packages", INDEX)),
+                )
+        };
+        assert_eq!(
+            patch_age(
+                &arch_all("No-Support-for-Architecture-all: Packages\n"),
+                now()
+            ),
+            "le_14d",
+            "an arch-all index APT does not use"
+        );
+        for (what, host) in [
+            (
+                "empty plain index",
+                complete().without(&packages("suite0")).with(&plain, ""),
+            ),
+            (
+                "empty compressed index",
+                complete()
+                    .without(&packages("suite0"))
+                    .with(&plain.replace("Packages", "Packages.gz"), ""),
+            ),
+            (
+                "same size, older content",
+                complete().with(&packages("suite0"), &older),
+            ),
+            (
+                "a second, stale copy beside the current one",
+                complete().with(&plain, &older),
+            ),
+            (
+                "non-security source mismatched",
+                complete().with(&packages("suite1"), &older),
+            ),
+            ("arch-all index APT uses, missing", arch_all("")),
+            (
+                "Release without SHA256 entries",
+                complete().with(
+                    &format!("{}InRelease", source("suite0")),
+                    &format!("{SECURITY_LISTS}MD5Sum:\n 0d 99 main/binary-amd64/Packages\n"),
+                ),
             ),
         ] {
             assert_eq!(patch_age(&host, now()), "unknown", "{what}");

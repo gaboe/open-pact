@@ -17,6 +17,35 @@ shim() { # name, body
 distro=$ID
 
 # Baseline hides the firewalld client so "no firewall tooling" is a real state.
+multiarch_archive() { # APT only: a dists-layout security archive for the native and a foreign architecture
+    arch=$(dpkg --print-architecture)
+    foreign=i386
+    [ "$arch" != i386 ] || foreign=amd64
+    dpkg --add-architecture "$foreign"
+    archive=/tmp/fictional-multiarch
+    root=$archive/dists/fictional-security
+    rm -rf /etc/apt/sources.list /etc/apt/sources.list.d/* /var/lib/apt/lists/*
+    mkdir -p /var/lib/apt/lists/partial /var/log/apt "$root/main/binary-$arch" "$root/main/binary-$foreign"
+    printf 'deb [trusted=yes] file:%s fictional-security main\n' "$archive" >/etc/apt/sources.list
+    printf 'Package: fictional-lib\nStatus: install ok installed\nPriority: optional\nSection: libs\nArchitecture: %s\nVersion: 2.0\nMulti-Arch: same\nDescription: Fictional library\n\n' "$foreign" >/var/lib/dpkg/status
+    printf 'Start-Date: %s  06:00:00\nCommandline: apt upgrade\nUpgrade: fictional-lib:%s (1.0, 2.0)\nEnd-Date: %s  06:00:30\n' "$(date +%F)" "$foreign" "$(date +%F)" >/var/log/apt/history.log
+    for a in "$arch" "$foreign"; do
+        printf 'Package: fictional-lib\nVersion: %s\nArchitecture: %s\nPriority: optional\nSection: libs\nMulti-Arch: same\nFilename: fictional-lib-%s.deb\nSize: 1234\nDescription: Fictional library\n\n' "$1" "$a" "$a" >"$root/main/binary-$a/Packages"
+    done
+    {
+        printf 'Origin: Fictional\nSuite: fictional-security\nCodename: fictional-security\nDate: %s\nArchitectures: %s %s\nComponents: main\nSHA256:\n' "$(date -Ru)" "$arch" "$foreign"
+        for a in "$arch" "$foreign"; do
+            printf ' %s %s main/binary-%s/Packages\n' "$(sha256sum "$root/main/binary-$a/Packages" | cut -d' ' -f1)" "$(wc -c <"$root/main/binary-$a/Packages")" "$a"
+        done
+    } >"$root/Release"
+    apt-get update -qq
+}
+
+cached_index() { # the one cached Packages index of the flat fictional archive, without its suffix
+    index=$(find /var/lib/apt/lists -maxdepth 1 -type f -name '*_Packages*' | head -1)
+    printf '%s\n' "${index%.*}"
+}
+
 case $variant in
     firewalld-installed) ;;
     *) command -v firewall-cmd >/dev/null && mv "$(command -v firewall-cmd)" /tmp/firewall-cmd.hidden ;;
@@ -125,6 +154,42 @@ case $variant in
         printf 'deb [trusted=yes] file:/tmp/other-archive ./\n' >/etc/apt/sources.list
         apt-get update -qq
         printf 'deb [trusted=yes] file:%s ./\n' "$archive" >>/etc/apt/sources.list
+    } ;;
+    patch-apt-multiarch-current) [ "$distro" = fedora ] || multiarch_archive 2.0 ;;
+    patch-apt-foreign-missing) [ "$distro" = fedora ] || {
+        multiarch_archive 3.0
+        rm /var/lib/apt/lists/*_binary-"$foreign"_Packages*
+    } ;;
+    patch-apt-empty-index) [ "$distro" = fedora ] || {
+        fictional_archive
+        publish 2.0
+        apt-get update -qq
+        plain=$(cached_index)
+        rm /var/lib/apt/lists/*_Packages*
+        : >"$plain"
+    } ;;
+    patch-apt-empty-gzip) [ "$distro" = fedora ] || {
+        fictional_archive
+        publish 2.0
+        apt-get update -qq
+        plain=$(cached_index)
+        rm /var/lib/apt/lists/*_Packages*
+        printf '' | gzip >"$plain.gz"
+    } ;;
+    patch-apt-older-index) [ "$distro" = fedora ] || {
+        fictional_archive
+        publish 2.0
+        apt-get update -qq
+        plain=$(cached_index)
+        rm /var/lib/apt/lists/*_Packages*
+        sed 's/^Version: 2.0$/Version: 1.0/' "$archive/Packages" >"$plain"
+    } ;;
+    patch-apt-listed-empty) [ "$distro" = fedora ] || {
+        fictional_archive
+        : >"$archive/Packages"
+        printf 'Origin: Fictional\nSuite: fictional-security\nCodename: fictional-security\nDate: %s\nSHA256:\n %s 0 Packages\n' \
+            "$(date -Ru)" "$(sha256sum "$archive/Packages" | cut -d' ' -f1)" >"$archive/Release"
+        apt-get update -qq
     } ;;
     patch-rotated)
         if [ "$distro" = fedora ]; then

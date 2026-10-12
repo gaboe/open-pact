@@ -19,6 +19,8 @@ VARIANTS=(baseline firewalld-installed ufw-active ufw-active-disabled ufw-inacti
     kde-5min kde-30min kde-off
     patch-real patch-stale patch-rotated patch-no-metadata patch-expired
     patch-apt-current patch-apt-pending patch-apt-no-packages patch-apt-orphan-release patch-apt-uncached-source
+    patch-apt-multiarch-current patch-apt-foreign-missing patch-apt-empty-index patch-apt-empty-gzip
+    patch-apt-older-index patch-apt-listed-empty
     eol autologin-gdm autologin-sddm autologin-lightdm autologin-off
     clamav-active clamav-inactive)
 LIMIT_MS=${LIMIT_MS:-3000}

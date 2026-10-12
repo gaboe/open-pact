@@ -13,3 +13,8 @@ open-pact-core = { path = "crates/open-pact-core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "signal"] }
+
+# The patch-age check hashes every cached APT index within the 3 s check budget, also in
+# the debug build the Linux container tests run.
+[profile.dev.package.sha2]
+opt-level = 3
