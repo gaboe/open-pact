@@ -134,6 +134,32 @@ enum Response {
 
 struct Home(PathBuf);
 
+/// The directory of VPN credential generations, the link to the installed one, and the files
+/// each generation holds, CA first.
+const VPN_DIR: &str = "vpn";
+const VPN_CURRENT: &str = "current";
+const VPN_FILES: [&str; 2] = ["ca.pem", "vpn-cert.pem"];
+
+#[cfg(test)]
+thread_local! {
+    /// The number of install steps left before a test interrupts the process, if it does.
+    static INTERRUPT_AFTER: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Where an interruption could leave the installed files half changed. A test can stop the
+/// install here as if the process were killed.
+fn interruption_point() {
+    #[cfg(test)]
+    INTERRUPT_AFTER.with(|left| match left.get() {
+        Some(0 | 1) => {
+            left.set(None);
+            panic!("interrupted");
+        }
+        Some(n) => left.set(Some(n - 1)),
+        None => {}
+    });
+}
+
 impl Home {
     fn new(dir: Option<PathBuf>) -> Result<Home> {
         match dir {
@@ -167,45 +193,101 @@ impl Home {
         Ok(path)
     }
 
-    /// Replaces several files as one change: each new content goes to a synced temporary file
-    /// first, then the renames run. If a rename fails, the files already replaced get their
-    /// earlier content back, so a failure leaves the earlier set in place.
-    fn replace_all(&self, files: &[(&str, &[u8])]) -> Result<()> {
-        std::fs::create_dir_all(&self.0)?;
-        let mut staged = Vec::new();
-        let result = (|| {
-            for (name, bytes) in files {
-                let tmp = self.file(&format!(".{name}.{}.tmp", std::process::id()));
-                let mut file = std::fs::File::create(&tmp)?;
-                staged.push(tmp.clone());
-                file.write_all(bytes)?;
-                file.sync_all()?;
-            }
-            let earlier: Vec<Option<Vec<u8>>> = files
-                .iter()
-                .map(|(name, _)| std::fs::read(self.file(name)).ok())
-                .collect();
-            for (i, ((name, _), tmp)) in files.iter().zip(&staged).enumerate() {
-                if let Err(e) = std::fs::rename(tmp, self.file(name)) {
-                    for ((name, _), old) in files[..i].iter().zip(&earlier) {
-                        match old {
-                            Some(old) => {
-                                let _ = std::fs::write(self.file(name), old);
-                            }
-                            None => {
-                                let _ = std::fs::remove_file(self.file(name));
-                            }
-                        }
-                    }
-                    return Err(e).with_context(|| self.file(name).display().to_string());
-                }
-            }
-            Ok(())
-        })();
-        for tmp in &staged {
-            let _ = std::fs::remove_file(tmp);
+    /// Installs a VPN CA and certificate as one generation (R7-L2). Both files go into a new
+    /// `vpn/<generation>/` directory, then a single rename points the `vpn/current` link at it.
+    /// The documented `ca.pem` and `vpn-cert.pem` are links into `vpn/current/`, so every
+    /// interruption leaves the earlier pair or the new one, never a mix.
+    fn install_vpn_pair(&self, ca: &[u8], cert: &[u8]) -> Result<()> {
+        self.recover_vpn()?;
+        if !self.file(VPN_DIR).join(VPN_CURRENT).exists()
+            && let (Ok(ca), Ok(cert)) = (
+                std::fs::read(self.file(VPN_FILES[0])),
+                std::fs::read(self.file(VPN_FILES[1])),
+            )
+        {
+            self.switch_vpn_generation(&ca, &cert)?;
+            self.link_vpn_files()?;
         }
-        result
+        self.switch_vpn_generation(ca, cert)?;
+        self.link_vpn_files()?;
+        self.recover_vpn()
+    }
+
+    /// Writes a new generation and points `vpn/current` at it.
+    fn switch_vpn_generation(&self, ca: &[u8], cert: &[u8]) -> Result<()> {
+        let vpn = self.file(VPN_DIR);
+        let generation = format!(
+            "{}-{}",
+            chrono::Utc::now().timestamp_nanos_opt().context("clock")?,
+            std::process::id()
+        );
+        let dir = vpn.join(&generation);
+        std::fs::create_dir_all(&dir).with_context(|| dir.display().to_string())?;
+        for (name, bytes) in VPN_FILES.iter().zip([ca, cert]) {
+            let mut file = std::fs::File::create(dir.join(name))?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            interruption_point();
+        }
+        std::fs::File::open(&dir)?.sync_all()?;
+        let link = vpn.join(format!(".{VPN_CURRENT}.{}.tmp", std::process::id()));
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&generation, &link)?;
+        interruption_point();
+        std::fs::rename(&link, vpn.join(VPN_CURRENT))
+            .with_context(|| vpn.join(VPN_CURRENT).display().to_string())?;
+        interruption_point();
+        std::fs::File::open(&vpn)?.sync_all()?;
+        Ok(())
+    }
+
+    /// Makes each documented VPN file a link into `vpn/current/`, replacing a plain file.
+    fn link_vpn_files(&self) -> Result<()> {
+        for name in VPN_FILES {
+            let target = Path::new(VPN_DIR).join(VPN_CURRENT).join(name);
+            let path = self.file(name);
+            if std::fs::read_link(&path).is_ok_and(|t| t == target) {
+                continue;
+            }
+            let link = self.file(&format!(".{name}.{}.tmp", std::process::id()));
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink(&target, &link)?;
+            std::fs::rename(&link, &path).with_context(|| path.display().to_string())?;
+            interruption_point();
+        }
+        std::fs::File::open(&self.0)?.sync_all()?;
+        Ok(())
+    }
+
+    /// Restores one whole VPN pair after an interrupted install: keeps only the generation
+    /// `vpn/current` points at, and links the documented files to it. Does nothing in a home
+    /// that has never installed a generation.
+    fn recover_vpn(&self) -> Result<()> {
+        let vpn = self.file(VPN_DIR);
+        let entries = match std::fs::read_dir(&vpn) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e).with_context(|| vpn.display().to_string()),
+        };
+        let current = std::fs::read_link(vpn.join(VPN_CURRENT)).ok();
+        for entry in entries {
+            let entry = entry?;
+            let name = PathBuf::from(entry.file_name());
+            if name == Path::new(VPN_CURRENT) || current.as_ref() == Some(&name) {
+                continue;
+            }
+            let path = entry.path();
+            if entry.file_type()?.is_dir() {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            }
+            .with_context(|| path.display().to_string())?;
+        }
+        if current.is_some() {
+            self.link_vpn_files()?;
+        }
+        Ok(())
     }
 
     fn read_text(&self, name: &str) -> Result<Option<String>> {
@@ -1022,6 +1104,7 @@ fn print_hints(manifest: &Manifest, results: &BTreeMap<String, String>, os: Os) 
 async fn check(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
     let mut enrolment = home.enrolment()?;
     check_scheme(&enrolment.gateway, insecure_dev)?;
+    home.recover_vpn()?;
     if home.has_legacy_log_head() {
         print_log_upgrade(home);
         return Ok(ExitCode::FAILURE);
@@ -1133,10 +1216,7 @@ async fn check(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
             )?;
             let described = check_vpn_pair(&ca_pem, &certificate_pem, &vpn_key)
                 .context("the accepted response carries an unusable VPN certificate or CA; the installed ones are kept")?;
-            home.replace_all(&[
-                ("ca.pem", ca_pem.as_bytes()),
-                ("vpn-cert.pem", certificate_pem.as_bytes()),
-            ])?;
+            home.install_vpn_pair(ca_pem.as_bytes(), certificate_pem.as_bytes())?;
             println!(
                 "VPN certificate {} ({described})",
                 home.file("vpn-cert.pem").display(),
@@ -1938,6 +2018,56 @@ mod tests {
             let error = format!("{:#}", joined.expect_err(to));
             assert!(error.contains("does not implement"), "{error}");
         }
+    }
+
+    /// R7-L2: wherever an install of a new VPN pair is interrupted, the recovery at the next
+    /// start shows one whole pair, the earlier or the new, through the documented paths.
+    #[test]
+    fn an_interrupted_vpn_install_leaves_one_whole_pair() {
+        let read = |home: &Home| {
+            ["ca.pem", "vpn-cert.pem"].map(|name| std::fs::read(home.file(name)).unwrap())
+        };
+        let earlier = [b"earlier CA".to_vec(), b"earlier certificate".to_vec()];
+        let new = [b"new CA".to_vec(), b"new certificate".to_vec()];
+        type Setup = fn(&Home);
+        let layouts: [(&str, Setup); 2] = [
+            ("plain files", |home| {
+                home.write("ca.pem", b"earlier CA").unwrap();
+                home.write("vpn-cert.pem", b"earlier certificate").unwrap();
+            }),
+            ("an installed pair", |home| {
+                home.install_vpn_pair(b"earlier CA", b"earlier certificate")
+                    .unwrap();
+            }),
+        ];
+        let mut mixed = Vec::new();
+        for (layout, setup) in layouts {
+            for step in 1.. {
+                let dir = tempfile::tempdir().unwrap();
+                let home = Home(dir.path().to_path_buf());
+                setup(&home);
+                INTERRUPT_AFTER.with(|left| left.set(Some(step)));
+                let finished = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    home.install_vpn_pair(b"new CA", b"new certificate")
+                }))
+                .is_ok();
+                INTERRUPT_AFTER.with(|left| left.set(None));
+                home.recover_vpn().unwrap();
+                let pair = read(&home);
+                if pair != earlier && pair != new {
+                    mixed.push(format!("{layout}, step {step}"));
+                }
+                if finished {
+                    assert_eq!(pair, new, "{layout}: installed");
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            mixed,
+            [""; 0].map(String::from),
+            "interruptions that left a mixed pair"
+        );
     }
 
     #[test]

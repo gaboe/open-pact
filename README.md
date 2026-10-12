@@ -44,10 +44,13 @@ The client keeps its files in `~/.config/open-pact/`, or in the directory given 
 | `device-dev.pem` | device key as a software file, instead of `device-se.key` |
 | `vpn-key.pem` | VPN certificate key; only its certificate request leaves the device |
 | `manifest.toml`, `enrolment.json` | the signed manifest, gateway URL and the salt that opens the enrolment commitment |
-| `vpn-cert.pem`, `ca.pem` | the last VPN client certificate and the gateway CA |
+| `vpn-cert.pem`, `ca.pem` | the last VPN client certificate and the gateway CA: links into `vpn/current/` |
+| `vpn/current/` | a link to the installed VPN credential generation `vpn/<generation>/`; a new certificate and CA replace the earlier pair with one rename of this link |
 | `company-key.txt`, `log-key.txt` | the company key fingerprint and the log key, pinned from the invitation at `join` |
 | `log-checkpoint.txt` | the last verified, gateway-signed log checkpoint |
 | `claims.jsonl` | every claim sent and every response, byte for byte |
+
+A VPN client that reads the certificate and the CA as two files gets one consistent pair from `vpn/current/`. The two top-level links can straddle a replacement between two reads.
 
 Nothing runs in the background. To uninstall, delete the binary and the directory.
 
