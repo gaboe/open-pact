@@ -257,3 +257,66 @@ fn a_witness_whose_lock_was_replaced_cosigns_nothing() {
     assert!(!body.contains("witness.example.org/test"), "{body}");
     assert_eq!(std::fs::read(&state).unwrap(), stored, "state unchanged");
 }
+
+/// R4-H1: a second name for the state file must not get a second lock. Both processes would load
+/// one history and then sign two.
+#[test]
+fn a_symlink_or_hard_link_to_a_held_state_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = dir.path().join("witness.key");
+    write_key(&key, 5);
+    let log = Log::new();
+    let state = dir.path().join("state.json");
+    let running = Running::start(&key, &state, &log);
+    assert_eq!(running.add(&log.add(0, 1)).0, 200);
+
+    let symlink = dir.path().join("symlink.json");
+    std::os::unix::fs::symlink(&state, &symlink).unwrap();
+    let err = refused(command(&key, &symlink, &log.key.vkey()).spawn().unwrap());
+    assert!(err.contains("symlink"), "symlink: {err}");
+
+    let hard_link = dir.path().join("hard-link.json");
+    std::fs::hard_link(&state, &hard_link).unwrap();
+    let err = refused(command(&key, &hard_link, &log.key.vkey()).spawn().unwrap());
+    assert!(err.contains("links"), "hard link: {err}");
+}
+
+/// R4-H1: a hard link made while the witness runs would become a stale copy at the next save, and
+/// a second process could start on it. The witness stops saving instead.
+#[test]
+fn a_witness_whose_state_gained_a_hard_link_cosigns_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = dir.path().join("witness.key");
+    write_key(&key, 5);
+    let log = Log::new();
+    let state = dir.path().join("state.json");
+    let running = Running::start(&key, &state, &log);
+    assert_eq!(running.add(&log.add(0, 1)).0, 200);
+    let stored = std::fs::read(&state).unwrap();
+
+    std::fs::hard_link(&state, dir.path().join("hard-link.json")).unwrap();
+    let (status, body) = running.add(&log.add(1, 2));
+    assert_eq!(status, 500, "{body}");
+    assert_eq!(std::fs::read(&state).unwrap(), stored, "state unchanged");
+}
+
+/// R4-H1: a witness that finds a different file under its state name, for example one another
+/// process saved, must not overwrite it.
+#[test]
+fn a_witness_whose_state_was_replaced_cosigns_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = dir.path().join("witness.key");
+    write_key(&key, 5);
+    let log = Log::new();
+    let state = dir.path().join("state.json");
+    let running = Running::start(&key, &state, &log);
+    assert_eq!(running.add(&log.add(0, 1)).0, 200);
+
+    let other = dir.path().join("other.json");
+    std::fs::copy(&state, &other).unwrap();
+    std::fs::rename(&other, &state).unwrap();
+    let stored = std::fs::read(&state).unwrap();
+    let (status, body) = running.add(&log.add(1, 2));
+    assert_eq!(status, 500, "{body}");
+    assert_eq!(std::fs::read(&state).unwrap(), stored, "state unchanged");
+}

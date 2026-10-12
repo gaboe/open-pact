@@ -27,7 +27,7 @@ const USAGE: &str = "usage: open-pact-witness [serve | keygen | vkey]
 Environment:
   WITNESS_NAME         key name, for example witness.example.org/w1 (required)
   WITNESS_KEY_FILE     Ed25519 seed as 64 hex digits; keygen creates it (required)
-  WITNESS_STATE        state file (default witness-state.json)
+  WITNESS_STATE        state file, one name only (default witness-state.json)
   WITNESS_LOG_KEYS     comma-separated verifier keys of the logs to witness
   WITNESS_LOG_KEY_URL  demo only: pin the key this URL serves on first start
   LISTEN_ADDR          default 0.0.0.0:8080";
@@ -47,17 +47,28 @@ struct Stored {
 struct Memory {
     pinned: Vec<LogKey>,
     latest: BTreeMap<String, Checkpoint>,
+    /// The state file this process loaded or last wrote; `None` while there is none.
+    file: Option<FileId>,
 }
 
 impl Memory {
     fn load(state: &StateFile) -> anyhow::Result<Memory> {
-        let path = &state.path;
-        let stored: Stored = match std::fs::read(path) {
-            Ok(bytes) => serde_json::from_slice(&bytes)?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Stored::default(),
-            Err(e) => return Err(e.into()),
+        use std::io::Read;
+        let file = state.named()?;
+        let stored: Stored = match file {
+            None => Stored::default(),
+            Some(id) => {
+                let mut opened = std::fs::File::open(&state.path)?;
+                if file_id(&opened.metadata()?) != id {
+                    bail!("{} changed while it was read", state.path.display());
+                }
+                let mut bytes = Vec::new();
+                opened.read_to_end(&mut bytes)?;
+                serde_json::from_slice(&bytes)?
+            }
         };
         Ok(Memory {
+            file,
             pinned: stored
                 .pinned_log_keys
                 .iter()
@@ -74,8 +85,11 @@ impl Memory {
     /// Writes a new temporary file, syncs it and renames it over the state file. Checks before
     /// and after that this process still holds the lock: a lock replaced after the rename can
     /// never come back, so a match afterwards proves no other process loaded the state meanwhile.
-    fn save(&self, state: &StateFile) -> anyhow::Result<()> {
+    /// Also checks that the state name still holds the one file this process wrote, with no other
+    /// name: a second name would survive the rename as a stale copy another process could load.
+    fn save(&mut self, state: &StateFile) -> anyhow::Result<()> {
         state.check_lock()?;
+        state.check_file(self.file)?;
         let path = &state.path;
         let stored = Stored {
             pinned_log_keys: self.pinned.iter().map(LogKey::vkey).collect(),
@@ -99,15 +113,29 @@ impl Memory {
         let written = serde_json::to_writer_pretty(&file, &stored)
             .map_err(anyhow::Error::from)
             .and_then(|()| Ok(file.sync_all()?))
-            .and_then(|()| Ok(std::fs::rename(&tmp, path)?));
+            .and_then(|()| Ok(file_id(&file.metadata()?)))
+            .and_then(|id| {
+                std::fs::rename(&tmp, path)?;
+                Ok(id)
+            });
         if written.is_err() {
             let _ = std::fs::remove_file(&tmp);
         }
-        written?;
-        let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
-        std::fs::File::open(dir.unwrap_or(Path::new(".")))?.sync_all()?;
-        state.check_lock()
+        let written = Some(written?);
+        std::fs::File::open(path.parent().expect("an absolute path"))?.sync_all()?;
+        state.check_lock()?;
+        state.check_file(written)?;
+        self.file = written;
+        Ok(())
     }
+}
+
+/// A file's device and inode.
+type FileId = (u64, u64);
+
+fn file_id(metadata: &std::fs::Metadata) -> FileId {
+    use std::os::unix::fs::MetadataExt;
+    (metadata.dev(), metadata.ino())
 }
 
 /// Names `<state>.lockdir`. It is a directory: saves rename files, and a file cannot be renamed
@@ -115,7 +143,9 @@ impl Memory {
 const LOCK_SUFFIX: &str = ".lockdir";
 
 /// The state file and the lock that keeps other processes off it for as long as the witness
-/// runs. Two processes with one state could each cosign a different history.
+/// runs. Two processes with one state could each cosign a different history. The lock sits next
+/// to the state, so every spelling of the directory finds the same lock; a second name for the
+/// file itself is refused.
 struct StateFile {
     path: PathBuf,
     lock_path: PathBuf,
@@ -130,6 +160,17 @@ impl StateFile {
                 path.display()
             );
         }
+        let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+            bail!("{}: WITNESS_STATE must name a file", path.display());
+        };
+        let dir = if dir.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            dir
+        };
+        let path = std::fs::canonicalize(dir)
+            .with_context(|| dir.display().to_string())?
+            .join(name);
         let mut lock_path = path.as_os_str().to_owned();
         lock_path.push(LOCK_SUFFIX);
         let lock_path = PathBuf::from(lock_path);
@@ -163,7 +204,43 @@ impl StateFile {
             lock,
         };
         state.check_lock()?;
+        state.named()?;
         Ok(state)
+    }
+
+    /// The file the state name holds now, if any. Refuses a symlink or a file with more than one
+    /// name: each other name could start a witness with its own lock on this history.
+    fn named(&self) -> anyhow::Result<Option<FileId>> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = match std::fs::symlink_metadata(&self.path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            other => other.with_context(|| self.path.display().to_string())?,
+        };
+        if metadata.file_type().is_symlink() {
+            bail!(
+                "{} is a symlink; set WITNESS_STATE to the file it names",
+                self.path.display()
+            );
+        }
+        if metadata.nlink() != 1 {
+            bail!(
+                "{} has {} hard links; a state file must have exactly one name",
+                self.path.display(),
+                metadata.nlink()
+            );
+        }
+        Ok(Some(file_id(&metadata)))
+    }
+
+    /// Fails unless the state name still holds `expected` and nothing else names it.
+    fn check_file(&self, expected: Option<FileId>) -> anyhow::Result<()> {
+        if self.named()? != expected {
+            bail!(
+                "{} was replaced: another witness process may hold this state",
+                self.path.display()
+            );
+        }
+        Ok(())
     }
 
     /// Fails unless the lock path still names the directory this process locked.
@@ -512,7 +589,7 @@ mod tests {
         let neighbour = dir.path().join("state.tmp");
         std::fs::write(&neighbour, "another witness's state").unwrap();
         let state = StateFile::open(dir.path().join("state.json")).unwrap();
-        let memory = Memory::load(&state).unwrap();
+        let mut memory = Memory::load(&state).unwrap();
         memory.save(&state).unwrap();
         memory.save(&state).unwrap();
         assert_eq!(
