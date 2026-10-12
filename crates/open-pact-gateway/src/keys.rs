@@ -147,7 +147,8 @@ impl Ca {
 
 /// The DER of a certificate request that carries a P-256 public key and nothing else: canonical PEM
 /// with no text around it, an empty subject, no attributes and so no extensions. Any other field
-/// could carry text off the device, so the request must be exactly the info, the parameterless
+/// could carry text off the device, so the request must equal one rebuilt from the key point alone:
+/// version 1, the empty subject, the exact P-256 key info, no attributes, the parameterless
 /// ecdsa-with-SHA256 identifier and the signature. The signature is checked when the certificate
 /// is issued.
 pub fn bare_csr_der(csr_pem: &str) -> Result<Vec<u8>, String> {
@@ -180,12 +181,20 @@ pub fn bare_csr_der(csr_pem: &str) -> Result<Vec<u8>, String> {
     if algorithm.algorithm != OID_KEY_TYPE_EC_PUBLIC_KEY || curve != Some(OID_EC_P256) {
         return Err(bad("the key must be P-256"));
     }
-    if info.version.0 != 0 {
-        return Err(bad("the version must be 1"));
+    let point = &info.subject_pki.subject_public_key;
+    if point.unused_bits != 0 || point.data.len() != 65 || point.data[0] != 0x04 {
+        return Err(bad("the key must be an uncompressed P-256 point"));
     }
-    if request_der(info.raw, &ECDSA_WITH_SHA256, &csr.signature_value) != pem.contents {
+    let mut spki = P256_KEY_INFO_PREFIX.to_vec();
+    spki.extend_from_slice(&point.data);
+    if request_der(
+        &request_info(&spki),
+        &ECDSA_WITH_SHA256,
+        &csr.signature_value,
+    ) != pem.contents
+    {
         return Err(bad(
-            "the signature algorithm must be ecdsa-with-SHA256 without parameters",
+            "only the key and ecdsa-with-SHA256, with no other fields or parameters",
         ));
     }
     Ok(pem.contents)
@@ -210,6 +219,21 @@ fn canonical_pem(der: &[u8]) -> String {
     }
     pem.push_str("-----END CERTIFICATE REQUEST-----\n");
     pem
+}
+
+/// SubjectPublicKeyInfo up to the 65-byte uncompressed point: id-ecPublicKey with the named curve
+/// prime256v1 as its only parameter, then the BIT STRING header with no unused bits.
+const P256_KEY_INFO_PREFIX: [u8; 26] = [
+    0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a,
+    0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00,
+];
+
+/// CertificationRequestInfo with version 1, an empty subject, `spki` and no attributes.
+fn request_info(spki: &[u8]) -> Vec<u8> {
+    let mut body = vec![0x02, 0x01, 0x00, 0x30, 0x00];
+    body.extend_from_slice(spki);
+    body.extend([0xa0, 0x00]);
+    der_tlv(0x30, &body)
 }
 
 /// ecdsa-with-SHA256 with its parameters absent, as RFC 5758 section 3.2 requires.
@@ -463,6 +487,56 @@ mod tests {
             );
         }
         assert!(ca().issue(&bare, "abc", Duration::hours(1)).is_ok());
+    }
+
+    /// A request for `info`, freshly signed by `key`, so only its structure can make it fail.
+    fn signed_request(key: &KeyPair, info: &[u8]) -> String {
+        use rcgen::SigningKey;
+        let mut bits = vec![0];
+        bits.extend(key.sign(info).unwrap());
+        let mut body = info.to_vec();
+        body.extend_from_slice(&ECDSA_WITH_SHA256);
+        body.extend(der_tlv(0x03, &bits));
+        canonical_pem(&der_tlv(0x30, &body))
+    }
+
+    /// R4-L1: a field appended inside the public key info or its algorithm identifier is text the
+    /// device sends beyond its key, even in a correctly signed request.
+    #[test]
+    fn rejects_extra_fields_inside_the_public_key_info() {
+        use x509_parser::certification_request::X509CertificationRequest;
+        let key = KeyPair::generate().unwrap();
+        let bare = der(&csr(&key));
+        let (_, parsed) = X509CertificationRequest::from_der(&bare).unwrap();
+        let spki = parsed.certification_request_info.subject_pki.raw;
+        let (algorithm, public_key) = spki[2..].split_at(spki[3] as usize + 2);
+        assert_eq!(request_info(spki), parsed.certification_request_info.raw);
+        let note = der_tlv(0x0c, b"FICTIONAL private note");
+        let in_key_info = der_tlv(0x30, &[algorithm, public_key, &note].concat());
+        let in_algorithm = der_tlv(
+            0x30,
+            &[
+                &der_tlv(0x30, &[&algorithm[2..], &note].concat()),
+                public_key,
+            ]
+            .concat(),
+        );
+
+        let resigned = signed_request(&key, &request_info(spki));
+        assert!(
+            ca().issue(&resigned, "abc", Duration::hours(1)).is_ok(),
+            "the re-signed bare request"
+        );
+        for (what, spki) in [
+            ("in SubjectPublicKeyInfo", in_key_info),
+            ("in its AlgorithmIdentifier", in_algorithm),
+        ] {
+            let pem = signed_request(&key, &request_info(&spki));
+            assert!(
+                ca().issue(&pem, "abc", Duration::hours(1)).is_err(),
+                "extra field {what} accepted"
+            );
+        }
     }
 
     #[test]
