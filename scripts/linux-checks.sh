@@ -17,7 +17,7 @@ CHECKED=("${COLS[@]}" password_set)
 VARIANTS=(baseline firewalld-installed ufw-active ufw-active-disabled ufw-inactive
     gnome-default gnome-lock-5min gnome-lock-15min gnome-lock-off
     kde-5min kde-30min kde-off
-    patch-real patch-stale patch-rotated eol autologin-gdm autologin-sddm autologin-lightdm autologin-off
+    patch-real patch-stale patch-rotated patch-no-metadata eol autologin-gdm autologin-sddm autologin-lightdm autologin-off
     clamav-active clamav-inactive)
 LIMIT_MS=${LIMIT_MS:-3000}
 

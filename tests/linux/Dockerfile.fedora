@@ -11,8 +11,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 FROM fedora:43
 RUN dnf -y upgrade --refresh \
-    && dnf -y install util-linux glib2 gsettings-desktop-schemas dconf firewalld \
-    && dnf clean all
+    && dnf -y install util-linux glib2 gsettings-desktop-schemas dconf firewalld
 COPY --from=build /open-pact-checks /usr/local/bin/open-pact-checks
 COPY tests/linux/entrypoint.sh /usr/local/bin/entrypoint.sh
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

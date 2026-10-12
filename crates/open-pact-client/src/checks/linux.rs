@@ -3,10 +3,11 @@ use std::fs;
 use chrono::{NaiveDate, Utc};
 
 use super::buckets;
-use super::exec::run;
+use super::exec::{Ran, run, run_status};
 
 const UFW_CONF: &str = "/etc/ufw/ufw.conf";
 const APT_HISTORY: &str = "/var/log/apt/history.log";
+const APT_LISTS: &str = "/var/lib/apt/lists";
 const SECURE_BOOT_EFIVAR: &str =
     "/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c";
 const AUTOLOGIN_FILES: &[&str] = &[
@@ -86,57 +87,139 @@ pub fn os_supported() -> &'static str {
     })
 }
 
+/// The files and commands the patch-age check reads, so tests can supply them.
+trait PackageHost {
+    fn read(&self, path: &str) -> Option<String>;
+    fn run(&self, program: &str, args: &[&str]) -> Option<Ran>;
+    /// Whether APT has downloaded package lists to compare the installed versions with.
+    fn apt_lists_present(&self) -> bool;
+}
+
+struct System;
+
+impl PackageHost for System {
+    fn read(&self, path: &str) -> Option<String> {
+        fs::read_to_string(path).ok()
+    }
+
+    fn run(&self, program: &str, args: &[&str]) -> Option<Ran> {
+        run_status(program, args)
+    }
+
+    fn apt_lists_present(&self) -> bool {
+        fs::read_dir(APT_LISTS).is_ok_and(|entries| {
+            entries
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().contains("_Packages"))
+        })
+    }
+}
+
 pub fn os_patch_age() -> &'static str {
-    let last = match fs::read_to_string(APT_HISTORY) {
-        Ok(text) => first_upgrade_date(
-            std::iter::once(text).chain((1..=APT_ROTATED_LOGS).filter_map(read_rotated_apt_log)),
+    patch_age(&System, Utc::now().date_naive())
+}
+
+/// What the package manager says about outstanding security updates. Only `Clear` lets the date
+/// of the last whole-system upgrade stand for the patch age (R3-M1).
+#[derive(Debug, PartialEq)]
+enum SecurityUpdates {
+    Clear,
+    Pending,
+    Unknown,
+}
+
+/// The age of the last whole-system upgrade, or `unknown` unless the security query ran, exited
+/// zero and showed nothing outstanding.
+fn patch_age(host: &impl PackageHost, today: NaiveDate) -> &'static str {
+    let (last, updates) = match host.read(APT_HISTORY) {
+        Some(text) => (
+            first_upgrade_date(
+                std::iter::once(text)
+                    .chain((1..=APT_ROTATED_LOGS).filter_map(|n| read_rotated_apt_log(host, n))),
+            ),
+            apt_security_updates(host),
         ),
-        Err(_) => run("dnf", &["history", "list"]).and_then(|t| parse_dnf_history(&t)),
+        None => (
+            succeeded(host.run("dnf", &["history", "list"]))
+                .and_then(|out| parse_dnf_history(&out)),
+            succeeded(host.run("dnf", &["-C", "-q", "updateinfo", "list", "--security"]))
+                .map_or(SecurityUpdates::Unknown, |out| parse_dnf_security(&out)),
+        ),
     };
-    if security_updates_pending() {
-        return "unknown";
+    match (updates, last) {
+        (SecurityUpdates::Clear, Some(date)) => buckets::patch_age(date, today),
+        _ => "unknown",
     }
-    last.map_or("unknown", |d| {
-        buckets::patch_age(d, Utc::now().date_naive())
-    })
 }
 
-fn security_updates_pending() -> bool {
-    if fs::metadata(APT_HISTORY).is_ok() {
-        return run("apt-get", &["-s", "-o", "Debug::NoLocking=1", "upgrade"])
-            .is_some_and(|t| apt_security_pending(&t));
-    }
-    run("dnf", &["-C", "-q", "updateinfo", "list", "--security"])
-        .is_some_and(|t| dnf_security_pending(&t))
+fn succeeded(ran: Option<Ran>) -> Option<String> {
+    ran.filter(|r| r.success).map(|r| r.text)
 }
 
-/// Reads `apt-get -s upgrade`. A package in the security pocket with an
-/// `Inst` line, or any kept-back package, is an outstanding update.
-pub fn apt_security_pending(out: &str) -> bool {
-    out.lines().any(|l| {
+/// The parser reads apt's English messages, so the query runs in the C locale. Without
+/// downloaded package lists `apt-get -s upgrade` compares the installed packages with
+/// nothing and reports no upgrades.
+fn apt_security_updates(host: &impl PackageHost) -> SecurityUpdates {
+    if !host.apt_lists_present() {
+        return SecurityUpdates::Unknown;
+    }
+    let query = [
+        "LC_ALL=C",
+        "apt-get",
+        "-s",
+        "-o",
+        "Debug::NoLocking=1",
+        "upgrade",
+    ];
+    succeeded(host.run("env", &query))
+        .map_or(SecurityUpdates::Unknown, |out| parse_apt_security(&out))
+}
+
+/// Reads `apt-get -s upgrade`. A package in the security pocket with an `Inst` line, or any
+/// kept-back package, is an outstanding update. Output is understood only if it ends in the
+/// `N upgraded, N newly installed` summary.
+fn parse_apt_security(out: &str) -> SecurityUpdates {
+    if out.lines().any(|l| {
         (l.starts_with("Inst ") && l.to_lowercase().contains("security"))
             || l.contains("have been kept back")
-    })
+    }) {
+        SecurityUpdates::Pending
+    } else if out
+        .lines()
+        .any(|l| l.contains(" upgraded, ") && l.contains(" newly installed"))
+    {
+        SecurityUpdates::Clear
+    } else {
+        SecurityUpdates::Unknown
+    }
 }
 
-/// Reads `dnf updateinfo list --security`. Each advisory is one line that
-/// starts with an id such as `FICTIONAL-2026-0001`.
-pub fn dnf_security_pending(out: &str) -> bool {
-    out.lines().any(|l| {
+/// Reads `dnf -q updateinfo list --security`. Each advisory is one line that starts with an id
+/// such as `FICTIONAL-2026-0001`. Output with no advisory is understood only if it is empty.
+fn parse_dnf_security(out: &str) -> SecurityUpdates {
+    let advisory = |l: &str| {
         let mut t = l.split_whitespace();
         let id = t.next().unwrap_or("");
         t.count() >= 2
             && id.contains('-')
             && id.chars().any(|c| c.is_ascii_digit())
             && id.chars().next().is_some_and(|c| c.is_ascii_uppercase())
-    })
+    };
+    if out.lines().any(advisory) {
+        SecurityUpdates::Pending
+    } else if out.trim().is_empty() {
+        SecurityUpdates::Clear
+    } else {
+        SecurityUpdates::Unknown
+    }
 }
 
-fn read_rotated_apt_log(n: u32) -> Option<String> {
+fn read_rotated_apt_log(host: &impl PackageHost, n: u32) -> Option<String> {
     let path = format!("{APT_HISTORY}.{n}");
-    fs::read_to_string(&path)
-        .ok()
-        .or_else(|| run("gzip", &["-dc", &format!("{path}.gz")]))
+    host.read(&path).or_else(|| {
+        host.run("gzip", &["-dc", &format!("{path}.gz")])
+            .map(|r| r.text)
+    })
 }
 
 pub fn auto_login() -> &'static str {
@@ -549,25 +632,24 @@ const DNF_SUBSET_FLAGS: &[&str] = &[
     "--skip-broken",
 ];
 
+/// Subset flags count on both sides of the verb: `dnf --exclude=x upgrade` narrows the set too.
 fn is_dnf_upgrade(command: &str) -> bool {
-    let mut tokens = command
+    let tokens: Vec<&str> = command
         .split(|c: char| c.is_whitespace() || c == '|')
         .filter(|t| !t.is_empty())
         .skip_while(|t| t.chars().all(|c| c.is_ascii_digit()))
         .filter(|t| !t.rsplit('/').next().is_some_and(is_dnf_program))
-        .skip_while(|t| t.starts_with('-'));
-    let Some(verb) = tokens.next() else {
+        .collect();
+    let Some(at) = tokens.iter().position(|t| !t.starts_with('-')) else {
         return false;
     };
-    if !DNF_UPGRADE_COMMANDS.contains(&verb) {
+    let (before, verb, after) = (&tokens[..at], tokens[at], &tokens[at + 1..]);
+    let narrows = |t: &&str| DNF_SUBSET_FLAGS.iter().any(|f| t.starts_with(f));
+    if !DNF_UPGRADE_COMMANDS.contains(&verb) || before.iter().any(narrows) {
         return false;
     }
-    if DNF_SYSTEM_UPGRADE_COMMANDS.contains(&verb) {
-        return true;
-    }
-    let rest: Vec<&str> = tokens.collect();
-    rest.iter()
-        .all(|t| t.starts_with('-') && !DNF_SUBSET_FLAGS.iter().any(|f| t.starts_with(f)))
+    DNF_SYSTEM_UPGRADE_COMMANDS.contains(&verb)
+        || after.iter().all(|t| t.starts_with('-') && !narrows(t))
 }
 
 fn is_dnf_program(name: &str) -> bool {
@@ -1052,23 +1134,27 @@ End-Date: 2026-10-05  09:00:05
 
     #[test]
     fn apt_kept_back_or_pending_security_updates_are_detected() {
+        use SecurityUpdates::*;
         let kept = "The following packages have been kept back:\n  fictional-lib\n";
-        assert!(apt_security_pending(kept));
+        assert_eq!(parse_apt_security(kept), Pending);
         let inst = "Inst fictional-lib [1.0] (1.1 Fictional:1/stable-security [amd64])\n";
-        assert!(apt_security_pending(inst));
-        let plain = "Inst fictional-editor [1] (2 Fictional:1/stable [amd64])\n0 upgraded\n";
-        assert!(!apt_security_pending(plain));
-        assert!(!apt_security_pending(""));
+        assert_eq!(parse_apt_security(inst), Pending);
+        let plain = "Inst fictional-editor [1] (2 Fictional:1/stable [amd64])\n\
+            1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n";
+        assert_eq!(parse_apt_security(plain), Clear);
+        assert_eq!(parse_apt_security(""), Unknown);
     }
 
     #[test]
     fn dnf_pending_security_advisories_are_detected() {
+        use SecurityUpdates::*;
         let out = "FICTIONAL-2026-0001 Important/Sec. fictional-lib-1.1.x86_64\n";
-        assert!(dnf_security_pending(out));
-        assert!(!dnf_security_pending(""));
-        assert!(!dnf_security_pending(
-            "Last metadata expiration check: 1 day, 0:00:00 ago.\n"
-        ));
+        assert_eq!(parse_dnf_security(out), Pending);
+        assert_eq!(parse_dnf_security(""), Clear);
+        assert_eq!(
+            parse_dnf_security("Last metadata expiration check: 1 day, 0:00:00 ago.\n"),
+            Unknown
+        );
     }
 
     #[test]
@@ -1096,6 +1182,162 @@ ID Command line                         Date and time       Action(s) Altered
         assert_eq!(parse_dnf_history(excluded), None);
         let only_filtered = " 9 dnf upgrade fictional-editor 2026-10-11 09:00:00 1\n";
         assert_eq!(parse_dnf_history(only_filtered), None);
+    }
+
+    struct FakeHost {
+        apt_history: Option<String>,
+        apt_lists: bool,
+        commands: Vec<(&'static str, Option<(bool, String)>)>,
+    }
+
+    impl PackageHost for FakeHost {
+        fn read(&self, path: &str) -> Option<String> {
+            (path == APT_HISTORY).then(|| self.apt_history.clone())?
+        }
+
+        fn run(&self, program: &str, args: &[&str]) -> Option<Ran> {
+            let line = format!("{program} {}", args.join(" "));
+            let (_, out) = self.commands.iter().find(|(c, _)| *c == line)?;
+            out.clone().map(|(success, text)| Ran { success, text })
+        }
+
+        fn apt_lists_present(&self) -> bool {
+            self.apt_lists
+        }
+    }
+
+    const APT_QUERY: &str = "env LC_ALL=C apt-get -s -o Debug::NoLocking=1 upgrade";
+    const APT_CLEAR: &str = "Reading package lists...\nCalculating upgrade...\n\
+        0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n";
+    const DNF_HISTORY: &str = "dnf history list";
+    const DNF_QUERY: &str = "dnf -C -q updateinfo list --security";
+
+    fn apt_host(lists: bool, query: Option<(bool, &str)>) -> FakeHost {
+        FakeHost {
+            apt_history: Some(apt_entry(
+                "2026-10-11",
+                "apt upgrade",
+                "fictional-lib:amd64 (1.0, 1.1)",
+            )),
+            apt_lists: lists,
+            commands: vec![(APT_QUERY, owned(query))],
+        }
+    }
+
+    fn dnf_host(history: Option<(bool, &str)>, query: Option<(bool, &str)>) -> FakeHost {
+        FakeHost {
+            apt_history: None,
+            apt_lists: false,
+            commands: vec![(DNF_HISTORY, owned(history)), (DNF_QUERY, owned(query))],
+        }
+    }
+
+    fn owned(out: Option<(bool, &str)>) -> Option<(bool, String)> {
+        out.map(|(success, text)| (success, text.to_string()))
+    }
+
+    const DNF_UPGRADED: &str = "\
+ID Command line                          Date and time       Action(s) Altered
+ 3 dnf -y upgrade --refresh              2026-10-11 15:52:37                46
+";
+
+    /// R3-M1: only a query that ran and was understood can show that no security update is
+    /// outstanding. Anything else leaves the patch age unknown.
+    #[test]
+    fn apt_patch_age_needs_a_readable_security_query() {
+        let today = d(2026, 10, 12);
+        assert_eq!(
+            patch_age(&apt_host(true, Some((true, APT_CLEAR))), today),
+            "le_14d"
+        );
+        for (what, host) in [
+            (
+                "pending",
+                apt_host(
+                    true,
+                    Some((
+                        true,
+                        "Inst fictional-lib [1.0] (1.1 Fictional:1/stable-security [amd64])\n",
+                    )),
+                ),
+            ),
+            (
+                "failed",
+                apt_host(
+                    true,
+                    Some((false, "E: Could not open lock file /var/lib/dpkg/lock\n")),
+                ),
+            ),
+            ("timed out", apt_host(true, None)),
+            (
+                "unrecognized",
+                apt_host(true, Some((true, "FICTIONAL unexpected output\n"))),
+            ),
+            ("no package lists", apt_host(false, Some((true, APT_CLEAR)))),
+        ] {
+            assert_eq!(patch_age(&host, today), "unknown", "{what}");
+        }
+    }
+
+    #[test]
+    fn dnf_patch_age_needs_a_readable_security_query() {
+        let today = d(2026, 10, 12);
+        let upgraded = Some((true, DNF_UPGRADED));
+        assert_eq!(
+            patch_age(&dnf_host(upgraded, Some((true, ""))), today),
+            "le_14d"
+        );
+        for (what, host) in [
+            (
+                "pending",
+                dnf_host(
+                    upgraded,
+                    Some((
+                        true,
+                        "FICTIONAL-2026-0001 Important/Sec. fictional-lib-1.1.x86_64\n",
+                    )),
+                ),
+            ),
+            (
+                "no cache",
+                dnf_host(
+                    upgraded,
+                    Some((
+                        false,
+                        "Cache-only enabled but no cache for repository \"updates\"\n",
+                    )),
+                ),
+            ),
+            ("timed out", dnf_host(upgraded, None)),
+            (
+                "unrecognized",
+                dnf_host(upgraded, Some((true, "FICTIONAL unexpected output\n"))),
+            ),
+            (
+                "history failed",
+                dnf_host(Some((false, DNF_UPGRADED)), Some((true, ""))),
+            ),
+        ] {
+            assert_eq!(patch_age(&host, today), "unknown", "{what}");
+        }
+    }
+
+    #[test]
+    fn dnf_subset_flags_before_the_verb_do_not_reset_patch_age() {
+        let today = d(2026, 10, 12);
+        let row = |cmd: &str| format!(" 3 {cmd:<37} 2026-10-11 15:52:37  46\n");
+        for cmd in [
+            "dnf --exclude=fictional-lib upgrade",
+            "dnf --security --sec-severity=Critical upgrade",
+            "dnf -x fictional-lib upgrade",
+        ] {
+            let host = dnf_host(Some((true, &row(cmd))), Some((true, "")));
+            assert_eq!(patch_age(&host, today), "unknown", "{cmd}");
+        }
+        for cmd in ["dnf --security upgrade", "dnf -y --refresh upgrade"] {
+            let host = dnf_host(Some((true, &row(cmd))), Some((true, "")));
+            assert_eq!(patch_age(&host, today), "le_14d", "{cmd}");
+        }
     }
 
     #[test]

@@ -15,8 +15,7 @@ RUN apt-get update \
     && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends \
         util-linux libglib2.0-bin gsettings-desktop-schemas dconf-gsettings-backend \
-        ufw firewalld \
-    && rm -rf /var/lib/apt/lists/*
+        ufw firewalld
 COPY --from=build /open-pact-checks /usr/local/bin/open-pact-checks
 COPY tests/linux/entrypoint.sh /usr/local/bin/entrypoint.sh
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

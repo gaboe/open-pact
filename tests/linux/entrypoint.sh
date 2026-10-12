@@ -36,7 +36,8 @@ ufw_conf() { # yes|no
 
 stale_history() {
     if [ "$distro" = fedora ]; then
-        shim dnf 'cat <<DNF
+        shim dnf '[ "$1" = history ] || exit 0
+cat <<DNF
 ID Command line                Date and time       Action(s)  Altered
  12 upgrade                    2024-01-09 08:15:02 Upgrade         3
  11 install example-tool       2024-01-02 09:00:00 Install         1
@@ -66,6 +67,8 @@ case $variant in
     kde-off) export XDG_CURRENT_DESKTOP=KDE; mkdir -p "$HOME/.config"
         printf '[Daemon]\nAutolock=false\n' >"$HOME/.config/kscreenlockerrc" ;;
     patch-real) ;;
+    patch-no-metadata)
+        if [ "$distro" = fedora ]; then dnf clean all >/dev/null; else rm -rf /var/lib/apt/lists/*; fi ;;
     patch-stale) stale_history ;;
     patch-rotated)
         if [ "$distro" = fedora ]; then

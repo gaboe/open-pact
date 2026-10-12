@@ -10,8 +10,10 @@ Real tools run wherever a container can run them: `gsettings` (keyfile backend),
 `firewall-cmd`, `lsblk`, `gzip`, `dnf`. Only `systemctl` is replaced by a shim
 (variants `ufw-*`, `clamav-*`), and `dnf` in `patch-stale` and `patch-rotated`
 on Fedora, because a container has no systemd and cannot fake a past date.
-`patch-real` uses the history the image build wrote with the real package
-manager.
+That `dnf` shim reports no security advisories. `patch-real` uses the history
+the image build wrote with the real package manager. The images keep the
+package metadata of their build, so the real security query runs against it.
+`patch-no-metadata` deletes that metadata, and the check must report `unknown`.
 
 ## Expected values
 
@@ -37,9 +39,12 @@ mounts (`/boot`, `/boot/efi`, `/efi`) are excluded.
 and the service is active. firewalld counts when `firewall-cmd --state` says
 `running`.
 
-`os_patch_age` counts a whole-system upgrade, or a transaction that upgraded
-a kernel or base OS package. A single application install or upgrade does not
-reset it.
+`os_patch_age` counts a whole-system upgrade. A single application install or
+upgrade does not reset it, and neither does a dnf upgrade with a subset flag
+before or after the verb. The check reports `unknown` unless the security
+query (`apt-get -s upgrade` or `dnf -C -q updateinfo list --security`) exits
+zero, its output is understood, and it lists no outstanding update. APT also
+needs downloaded package lists.
 
 ## Checks that report `unknown` in a container, and why
 

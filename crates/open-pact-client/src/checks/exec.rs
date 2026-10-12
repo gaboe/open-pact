@@ -8,7 +8,18 @@ pub const TIMEOUT: Duration = Duration::from_secs(3);
 
 type Captured = Arc<Mutex<Vec<u8>>>;
 
+/// Output of a command that exited before the timeout, with stdout and stderr together.
+pub struct Ran {
+    pub success: bool,
+    pub text: String,
+}
+
+/// The output of `program`, whatever its exit status. `None` when it cannot start or times out.
 pub fn run(program: &str, args: &[&str]) -> Option<String> {
+    run_status(program, args).map(|ran| ran.text)
+}
+
+pub fn run_status(program: &str, args: &[&str]) -> Option<Ran> {
     let mut child = Command::new(program)
         .args(args)
         .stdin(Stdio::null())
@@ -21,9 +32,9 @@ pub fn run(program: &str, args: &[&str]) -> Option<String> {
         child.stderr.take().map(drain),
     ];
     let deadline = Instant::now() + TIMEOUT;
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
             _ => {
                 let _ = child.kill();
@@ -31,7 +42,7 @@ pub fn run(program: &str, args: &[&str]) -> Option<String> {
                 return None;
             }
         }
-    }
+    };
     let grace = (Instant::now() + Duration::from_millis(250)).min(deadline);
     let mut text = String::new();
     for (buf, reader) in readers.into_iter().flatten() {
@@ -41,7 +52,10 @@ pub fn run(program: &str, args: &[&str]) -> Option<String> {
         let bytes = buf.lock().ok()?;
         text.push_str(&String::from_utf8_lossy(&bytes));
     }
-    Some(text)
+    Some(Ran {
+        success: status.success(),
+        text,
+    })
 }
 
 /// A background grandchild can keep the pipe open after the child exits, so
@@ -71,6 +85,13 @@ mod tests {
     fn captures_stdout_and_stderr() {
         let out = run("sh", &["-c", "echo out; echo err >&2"]).unwrap();
         assert!(out.contains("out") && out.contains("err"));
+    }
+
+    #[test]
+    fn reports_the_exit_status() {
+        assert!(run_status("sh", &["-c", "echo ok"]).unwrap().success);
+        let failed = run_status("sh", &["-c", "echo no >&2; exit 1"]).unwrap();
+        assert!(!failed.success && failed.text.contains("no"));
     }
 
     #[test]
