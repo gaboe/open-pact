@@ -125,7 +125,8 @@ pub fn add_checkpoint(
     if stored.map_or(0, |c| c.size) != req.old_size {
         return Err(Refusal::Conflict(stored.map_or(0, |c| c.size)));
     }
-    match stored {
+    // A stored empty tree has no history to extend, so it is checked like a first checkpoint.
+    match stored.filter(|c| c.size > 0) {
         None if !req.proof.is_empty() => Err(Refusal::Unprocessable(
             "a proof from size 0 must be empty".into(),
         )),
@@ -279,6 +280,38 @@ mod tests {
             Ok(next),
             "the same checkpoint again gets a fresh cosignature"
         );
+    }
+
+    #[test]
+    fn an_accepted_empty_checkpoint_can_be_renewed_and_extended() {
+        let f = Fixture::new();
+        let logs = [f.key.clone()];
+        let empty = f.checkpoint(0);
+        assert_eq!(
+            add_checkpoint(&logs, &BTreeMap::new(), &f.request(0, &empty)),
+            Ok(empty.clone())
+        );
+        assert_eq!(
+            add_checkpoint(&logs, &stored(&empty), &f.request(0, &empty)),
+            Ok(empty.clone()),
+            "renewal"
+        );
+        assert_eq!(
+            add_checkpoint(&logs, &stored(&empty), &f.request(0, &f.checkpoint(1))),
+            Ok(f.checkpoint(1)),
+            "growth"
+        );
+        let other_empty = Checkpoint {
+            root: LogHash([3; 32]),
+            ..empty.clone()
+        };
+        let refusal =
+            add_checkpoint(&logs, &stored(&empty), &f.request(0, &other_empty)).unwrap_err();
+        assert_eq!(refusal.status(), 422, "an empty tree with another root");
+        let mut with_proof = f.request(0, &f.checkpoint(2));
+        with_proof.proof = vec![f.leaves[0]];
+        let refusal = add_checkpoint(&logs, &stored(&empty), &with_proof).unwrap_err();
+        assert_eq!(refusal.status(), 422, "a proof from size 0");
     }
 
     #[test]

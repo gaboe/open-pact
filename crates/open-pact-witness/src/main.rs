@@ -475,6 +475,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_empty_checkpoint_does_not_block_later_ones_across_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let log = Log::new();
+        let first = start(&log, &path).await.unwrap();
+        assert_eq!(post(&first.url, log.body(0, 0, false)).await.0, 200);
+        assert_eq!(
+            post(&first.url, log.body(0, 0, false)).await.0,
+            200,
+            "renewal"
+        );
+        first.stop().await;
+
+        let restarted = start(&log, &path).await.unwrap();
+        assert_eq!(post(&restarted.url, log.body(0, 0, false)).await.0, 200);
+        let (status, body) = post(&restarted.url, log.body(0, 1, false)).await;
+        assert_eq!(status, 200, "growth: {body}");
+        assert_eq!(post(&restarted.url, log.body(1, 3, false)).await.0, 200);
+        restarted.stop().await;
+    }
+
+    #[tokio::test]
     async fn cosigns_extensions_refuses_forks_and_remembers_across_restarts() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
