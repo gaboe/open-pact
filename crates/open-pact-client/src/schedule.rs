@@ -169,6 +169,18 @@ impl Drop for ScheduleLock {
     }
 }
 
+fn lock_path(path: &Path) -> Result<ScheduleLock> {
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)?;
+    file.try_lock()
+        .context("another schedule command is running")?;
+    Ok(ScheduleLock(file))
+}
+
 fn lock(home: &Home) -> Result<ScheduleLock> {
     let mut directory = std::fs::DirBuilder::new();
     directory.recursive(true);
@@ -178,15 +190,16 @@ fn lock(home: &Home) -> Result<ScheduleLock> {
         directory.mode(0o700);
     }
     directory.create(&home.0)?;
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(home.file(LOCK))?;
-    file.try_lock()
-        .context("another schedule command is running")?;
-    Ok(ScheduleLock(file))
+    lock_path(&home.file(LOCK))
+}
+
+fn lock_system_state(home: &Home) -> Result<ScheduleLock> {
+    let parent = home.0.parent().context("SYSTEM state parent is missing")?;
+    let mut directory = std::fs::DirBuilder::new();
+    directory.recursive(true);
+    directory.create(parent)?;
+    let lock = home.0.with_extension("lock");
+    lock_path(&lock).context("SYSTEM report state is in use; retry this command")
 }
 
 fn save<T: Serialize>(home: &Home, name: &str, value: &T) -> Result<()> {
@@ -500,7 +513,7 @@ fn register(job: &Job, action: RegistrationAction) -> Result<()> {
                 )?;
             }
             RegistrationAction::Uninstall => {
-                windows_uninstall(job)?;
+                windows_uninstall(job, false)?;
             }
         },
     }
@@ -556,6 +569,13 @@ function AssertProtected($path) {
         }
     }
 }
+function ProgramFilesPath { [Environment]::GetFolderPath('ProgramFiles') }
+function IsAdminOwner($owner) {
+    if (@('S-1-5-18','S-1-5-32-544') -contains $owner) { return $true }
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    return $identity.User.Value -eq $owner -and $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
 function ProtectedDirectory($path) {
     if (-not [IO.Directory]::Exists($path)) {
         $acl = New-Object Security.AccessControl.DirectorySecurity
@@ -570,6 +590,58 @@ function ProtectedDirectory($path) {
     }
     AssertProtected $path
 }
+function ResetSystemStateDirectory($path) {
+    if (-not [IO.Directory]::Exists($path)) {
+        ProtectedDirectory $path
+        return
+    }
+    $item = Get-Item -LiteralPath $path -Force
+    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Protected path is a reparse point' }
+    $acl = [IO.Directory]::GetAccessControl($path)
+    $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+    if (-not (IsAdminOwner $owner)) { throw 'Protected path has a non-admin owner' }
+    $acl.SetAccessRuleProtection($true,$false)
+    foreach ($rule in @($acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]))) {
+        [void]$acl.RemoveAccessRuleAll($rule)
+    }
+    foreach ($sid in @('S-1-5-18','S-1-5-32-544')) {
+        $identity = New-Object Security.Principal.SecurityIdentifier($sid)
+        $rule = New-Object Security.AccessControl.FileSystemAccessRule($identity,'FullControl','ContainerInherit,ObjectInherit','None','Allow')
+        [void]$acl.AddAccessRule($rule)
+    }
+    $acl.SetOwner((New-Object Security.Principal.SecurityIdentifier('S-1-5-32-544')))
+    [IO.Directory]::SetAccessControl($path,$acl)
+    AssertProtected $path
+}
+function RemovePendingDeletes($path) {
+    if (-not [IO.Directory]::Exists($path)) { return }
+    Get-ChildItem -LiteralPath $path -Filter 'open-pact-client.exe.delete-*' -File -ErrorAction SilentlyContinue | ForEach-Object {
+        try { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop } catch {}
+    }
+}
+function IsSystemTask($task) {
+    $user = $task.Definition.Principal.UserId
+    return @('SYSTEM','NT AUTHORITY\SYSTEM','S-1-5-18') -contains $user.ToUpperInvariant()
+}
+function QueueBinaryRemoval($binary) {
+    if (-not ('OpenPactNative' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class OpenPactNative {
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true, EntryPoint = "MoveFileExW")]
+    public static extern bool MoveFileEx(string existing, string destination, int flags);
+}
+'@
+    }
+    $pending = "$binary.delete-$([Guid]::NewGuid().ToString('N'))"
+    [IO.File]::Move($binary,$pending)
+    if (-not [OpenPactNative]::MoveFileEx($pending,$null,4)) {
+        $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        try { [IO.File]::Move($pending,$binary) } catch {}
+        throw (New-Object ComponentModel.Win32Exception($errorCode))
+    }
+}
 "#;
 
 fn windows_protected_paths(home: &Home, copy_binary: bool) -> Result<(PathBuf, PathBuf)> {
@@ -579,7 +651,7 @@ fn windows_protected_paths(home: &Home, copy_binary: bool) -> Result<(PathBuf, P
     let source = powershell_literal(text(&std::env::current_exe()?)?);
     let script = format!(
         r#"{PROTECTED_DIRECTORY}
-$program = [Environment]::GetFolderPath('ProgramFiles')
+$program = ProgramFilesPath
 AssertProtected $program
 $install = Join-Path $program 'open-pact'
 ProtectedDirectory $install
@@ -589,6 +661,7 @@ if ({copy}) {{
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = New-Object Security.Principal.WindowsPrincipal($identity)
     if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {{ exit 5 }}
+    RemovePendingDeletes $install
     if ([IO.Path]::GetFullPath({source}) -ne $binary) {{ Copy-Item -LiteralPath {source} -Destination $binary -Force }}
     AssertProtected $binary
 }}
@@ -597,7 +670,7 @@ ProtectedDirectory $data
 $data = Join-Path $data 'system'
 ProtectedDirectory $data
 $data = Join-Path $data '{hash}'
-ProtectedDirectory $data
+ResetSystemStateDirectory $data
 Write-Output $binary
 Write-Output $data
 "#,
@@ -613,7 +686,29 @@ Write-Output $data
     Ok((binary, state))
 }
 
-fn windows_uninstall_script(job: &Job) -> String {
+fn windows_task_kind_script(job: &Job) -> String {
+    format!(
+        r#"$ErrorActionPreference = 'Stop'
+function IsSystemTask($task) {{
+    $user = $task.Definition.Principal.UserId
+    return @('SYSTEM','NT AUTHORITY\SYSTEM','S-1-5-18') -contains $user.ToUpperInvariant()
+}}
+$service = New-Object -ComObject 'Schedule.Service'
+$service.Connect()
+    $folder = $service.GetFolder('\')
+try {{ $task = $folder.GetTask({id}) }} catch {{
+    $failure = $_.Exception
+    while ($null -ne $failure.InnerException) {{ $failure = $failure.InnerException }}
+    if (($failure.HResult -band 0xffff) -ne 2) {{ throw }}
+    $task = $null
+}}
+if ($null -ne $task -and (IsSystemTask $task)) {{ Write-Output 'system' }} else {{ Write-Output 'user-or-missing' }}
+"#,
+        id = powershell_literal(&job.id)
+    )
+}
+
+fn windows_uninstall_script(job: &Job, expected_system: bool) -> String {
     format!(
         r#"{PROTECTED_DIRECTORY}
 $service = New-Object -ComObject 'Schedule.Service'
@@ -625,27 +720,59 @@ try {{ $task = $folder.GetTask({id}) }} catch {{
     if (($failure.HResult -band 0xffff) -ne 2) {{ throw }}
     $task = $null
 }}
-if ($null -ne $task) {{ $folder.DeleteTask({id},0) }}
-$remaining = @($folder.GetTasks(1) | Where-Object {{ $_.Name.StartsWith('org.open-pact.report.') }})
-if ($remaining.Count -eq 0) {{
-    $install = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'open-pact'
-    if (Test-Path -LiteralPath $install) {{
-        AssertProtected $install
-        $binary = Join-Path $install 'open-pact-client.exe'
-        if (Test-Path -LiteralPath $binary) {{ AssertProtected $binary; Remove-Item -LiteralPath $binary -Force }}
+$wasSystem = $null -ne $task -and (IsSystemTask $task)
+if ($wasSystem -ne {expected_system}) {{ throw 'scheduled task changed during uninstall; retry schedule uninstall' }}
+if ($wasSystem) {{
+    $program = ProgramFilesPath
+    AssertProtected $program
+    $install = Join-Path $program 'open-pact'
+    if (Test-Path -LiteralPath $install) {{ AssertProtected $install; RemovePendingDeletes $install }}
+}}
+if ($null -ne $task) {{ $folder.DeleteTask({id},0); Write-Output '__OPEN_PACT_TASK_REMOVED__' }}
+if ($wasSystem) {{
+    Write-Output '__OPEN_PACT_REMOVED_SYSTEM__'
+    try {{
+        $remaining = @($folder.GetTasks(1) | Where-Object {{ $_.Name.StartsWith('org.open-pact.report.') -and (IsSystemTask $_) }})
+        if ($remaining.Count -eq 0) {{
+            $install = Join-Path (ProgramFilesPath) 'open-pact'
+            if (Test-Path -LiteralPath $install) {{
+                AssertProtected $install
+                $binary = Join-Path $install 'open-pact-client.exe'
+                if (Test-Path -LiteralPath $binary) {{ AssertProtected $binary; QueueBinaryRemoval $binary; Write-Output 'The SYSTEM client binary is queued for removal at the next reboot.' }}
+            }}
+        }} else {{ Write-Output 'Kept the shared SYSTEM binary because another SYSTEM task remains.' }}
+    }} catch {{
+        Write-Output '__OPEN_PACT_BINARY_REMOVAL_FAILED__'
+        Write-Output "SYSTEM task removal succeeded, but client binary cleanup failed: $($_.Exception.Message)"
     }}
-}} else {{ Write-Output 'Kept the shared SYSTEM binary because another open-pact task remains.' }}
+}} elseif ($null -ne $task) {{
+    Write-Output '__OPEN_PACT_REMOVED_USER__'
+}}
 "#,
-        id = powershell_literal(&job.id)
+        id = powershell_literal(&job.id),
+        expected_system = if expected_system { "$true" } else { "$false" }
     )
 }
 
-fn windows_uninstall(job: &Job) -> Result<()> {
-    let message = windows_powershell(&windows_uninstall_script(job))?;
-    if !message.is_empty() {
-        println!("{message}");
+fn windows_task_is_system(job: &Job) -> Result<bool> {
+    Ok(windows_powershell(&windows_task_kind_script(job))? == "system")
+}
+
+fn windows_uninstall(job: &Job, expected_system: bool) -> Result<(bool, bool, bool)> {
+    let output = windows_powershell(&windows_uninstall_script(job, expected_system))?;
+    let mut removed = false;
+    let mut removed_system = false;
+    let mut binary_cleanup_failed = false;
+    for line in output.lines() {
+        match line {
+            "__OPEN_PACT_TASK_REMOVED__" => removed = true,
+            "__OPEN_PACT_REMOVED_SYSTEM__" => removed_system = true,
+            "__OPEN_PACT_BINARY_REMOVAL_FAILED__" => binary_cleanup_failed = true,
+            "__OPEN_PACT_REMOVED_USER__" => {}
+            message => println!("{message}"),
+        }
     }
-    Ok(())
+    Ok((removed, removed_system, binary_cleanup_failed))
 }
 
 fn validate_system_install(system: bool, os: open_pact_core::Os) -> Result<()> {
@@ -656,21 +783,62 @@ fn validate_system_install(system: bool, os: open_pact_core::Os) -> Result<()> {
 }
 
 pub(crate) async fn run(home: &Home, command: Command) -> Result<()> {
+    let os = crate::current_os()?;
     if let Command::Install { system, .. } = &command
         && *system
     {
-        validate_system_install(true, crate::current_os()?)?;
+        validate_system_install(true, os)?;
     }
     let system_run = matches!(&command, Command::Run { system: true });
-    let state_home = if system_run {
-        validate_system_install(true, crate::current_os()?)?;
-        Home(windows_protected_paths(home, false)?.1)
-    } else {
-        Home(home.0.clone())
-    };
-    let _lock = lock(&state_home)?;
+    if system_run {
+        validate_system_install(true, os)?;
+    }
     let absolute = std::fs::canonicalize(&home.0)?;
     let home = Home(absolute);
+    let system_install = matches!(&command, Command::Install { system: true, .. });
+    if let Command::Install {
+        collector,
+        vpn_probe,
+        system: true,
+    } = &command
+    {
+        Config::new(collector.clone(), vpn_probe.clone())?;
+        home.enrolment()?;
+        crate::DeviceKey::load(&home.0)?;
+        validate_windows_home(&home.0)?;
+    }
+    let uninstall_job =
+        if os == open_pact_core::Os::Windows && matches!(&command, Command::Uninstall) {
+            Some(Job::new(&std::env::current_exe()?, &home.0)?)
+        } else {
+            None
+        };
+    let system_uninstall = uninstall_job
+        .as_ref()
+        .map(windows_task_is_system)
+        .transpose()?
+        .unwrap_or(false);
+    let protected_paths = if os == open_pact_core::Os::Windows
+        && (system_run || system_install || system_uninstall)
+    {
+        Some(windows_protected_paths(&home, system_install)?)
+    } else {
+        None
+    };
+    let state_home = protected_paths
+        .as_ref()
+        .map(|(_, state)| Home(state.clone()))
+        .unwrap_or_else(|| Home(home.0.clone()));
+    let _home_lock = if system_install || system_uninstall {
+        Some(lock(&Home(home.0.clone()))?)
+    } else {
+        None
+    };
+    let _lock = if system_run || system_install || system_uninstall {
+        lock_system_state(&state_home)?
+    } else {
+        lock(&state_home)?
+    };
     match command {
         Command::Probe { .. } => unreachable!(),
         Command::Run { .. } => {
@@ -699,18 +867,18 @@ pub(crate) async fn run(home: &Home, command: Command) -> Result<()> {
             let config = Config::new(collector, vpn_probe)?;
             home.enrolment()?;
             crate::DeviceKey::load(&home.0)?;
-            if crate::current_os()? == open_pact_core::Os::Windows {
+            if os == open_pact_core::Os::Windows {
                 validate_windows_home(&home.0)?;
             }
             let (executable, install_state) = if system {
-                let (binary, state) = windows_protected_paths(&home, true)?;
-                (binary, Home(state))
+                let (binary, state) = protected_paths
+                    .as_ref()
+                    .context("SYSTEM install paths were not prepared")?;
+                (binary.clone(), Home(state.clone()))
             } else {
                 (std::env::current_exe()?, Home(home.0.clone()))
             };
-            if crate::current_os()? == open_pact_core::Os::Windows
-                && text(&executable)?.contains('%')
-            {
+            if os == open_pact_core::Os::Windows && text(&executable)?.contains('%') {
                 bail!("choose an executable path without %");
             }
             let mut job = Job::new(&executable, &home.0)?;
@@ -731,8 +899,21 @@ pub(crate) async fn run(home: &Home, command: Command) -> Result<()> {
             );
         }
         Command::Uninstall => {
-            let job = Job::new(&std::env::current_exe()?, &home.0)?;
-            register(&job, RegistrationAction::Uninstall)?;
+            let job = uninstall_job.unwrap_or(Job::new(&std::env::current_exe()?, &home.0)?);
+            if os == open_pact_core::Os::Windows {
+                let (removed, removed_system, binary_cleanup_failed) =
+                    windows_uninstall(&job, system_uninstall)?;
+                if removed && removed_system {
+                    std::fs::remove_dir_all(&state_home.0).context(
+                        "SYSTEM task was removed, but SYSTEM report state cleanup failed",
+                    )?;
+                }
+                if binary_cleanup_failed {
+                    bail!("SYSTEM task and state were removed, but client binary cleanup failed");
+                }
+            } else {
+                register(&job, RegistrationAction::Uninstall)?;
+            }
             for name in [
                 CONFIG,
                 STATE,
@@ -773,10 +954,14 @@ mod tests {
     #[test]
     fn uninstall_distinguishes_denied_missing_and_existing_tasks() {
         let job = Job::new(Path::new("client.exe"), Path::new("fixture-home")).unwrap();
-        let action = windows_uninstall_script(&job);
+        let action = windows_uninstall_script(&job, false);
         let setup = r#"
 $script:deleted = $false
 $script:failure = 5
+$script:program = Join-Path $env:TEMP 'open-pact-fictional-program-files'
+function ProgramFilesPath { return $script:program }
+function AssertProtected($path) {}
+function RemovePendingDeletes($path) {}
 function New-Object {
     param([string]$ComObject)
     if ($ComObject -ne 'Schedule.Service') { throw 'unexpected COM creation' }
@@ -784,10 +969,10 @@ function New-Object {
     $folder | Add-Member ScriptMethod GetTask {
         param($id)
         if ($script:failure -ne 0) { throw [Runtime.InteropServices.COMException]::new('Přístup byl odepřen', (0x80070000L + $script:failure - 0x100000000L)) }
-        return [pscustomobject]@{ Name = $id }
+        return [pscustomobject]@{ Name = $id; Definition = [pscustomobject]@{ Principal = [pscustomobject]@{ UserId = 'EXAMPLE\\user' } } }
     }
     $folder | Add-Member ScriptMethod DeleteTask { param($id,$flags); $script:deleted = $true }
-    $folder | Add-Member ScriptMethod GetTasks { param($flags); return ,([pscustomobject]@{ Name = 'org.open-pact.report.other' }) }
+    $folder | Add-Member ScriptMethod GetTasks { param($flags); return ,([pscustomobject]@{ Name = 'org.open-pact.report.other'; Definition = [pscustomobject]@{ Principal = [pscustomobject]@{ UserId = 'EXAMPLE\\user' } } }) }
     $service = [pscustomobject]@{ Folder = $folder }
     $service | Add-Member ScriptMethod Connect {}
     $service | Add-Member ScriptMethod GetFolder { param($path); return $this.Folder }
@@ -811,6 +996,117 @@ function New-Object {
         assert!(output.contains("query_code=5 deleted=False caught=True"));
         assert!(output.contains("query_code=2 deleted=False caught=False"));
         assert!(output.contains("query_code=0 deleted=True caught=False"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn current_user_uninstall_does_not_touch_the_protected_directory() {
+        let job = Job::new(Path::new("client.exe"), Path::new("fixture-home")).unwrap();
+        let action = windows_uninstall_script(&job, false);
+        let setup = r#"
+$script:deleted = $false
+function ProgramFilesPath { throw 'current-user uninstall read Program Files' }
+function AssertProtected($path) { throw 'current-user uninstall checked a protected path' }
+function New-Object {
+    param([string]$ComObject)
+    if ($ComObject -ne 'Schedule.Service') { throw 'unexpected COM creation' }
+    $folder = [pscustomobject]@{}
+    $folder | Add-Member ScriptMethod GetTask { param($id); return [pscustomobject]@{ Name = $id; Definition = [pscustomobject]@{ Principal = [pscustomobject]@{ UserId = 'EXAMPLE\\user' } } } }
+    $folder | Add-Member ScriptMethod DeleteTask { param($id,$flags); $script:deleted = $true }
+    $folder | Add-Member ScriptMethod GetTasks { param($flags); return ,@() }
+    $service = [pscustomobject]@{ Folder = $folder }
+    $service | Add-Member ScriptMethod Connect {}
+    $service | Add-Member ScriptMethod GetFolder { param($path); return $this.Folder }
+    return $service
+}
+"#;
+        let checks = r#"& $action | Out-Null
+if (-not $script:deleted) { throw 'current-user task was not removed' }
+Write-Output 'limited_uninstall_removed_task_without_protected_access'
+"#;
+        let script = format!("{setup}\n$action = {{\n{action}\n}}\n{checks}");
+        assert_eq!(
+            windows_powershell(&script).unwrap(),
+            "limited_uninstall_removed_task_without_protected_access"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn system_state_acl_reset_removes_existing_read_access() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = powershell_literal(dir.path().join("readable-state").to_str().unwrap());
+        let script = format!(
+            r#"{PROTECTED_DIRECTORY}
+[IO.Directory]::CreateDirectory({path}) | Out-Null
+$acl = [IO.Directory]::GetAccessControl({path})
+$everyone = New-Object Security.Principal.SecurityIdentifier('S-1-1-0')
+$rule = New-Object Security.AccessControl.FileSystemAccessRule($everyone,'ReadAndExecute','ContainerInherit,ObjectInherit','None','Allow')
+[void]$acl.AddAccessRule($rule)
+[IO.Directory]::SetAccessControl({path},$acl)
+ResetSystemStateDirectory {path}
+$acl = [IO.Directory]::GetAccessControl({path})
+$sids = @($acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]) | ForEach-Object {{ $_.IdentityReference.Value }} | Sort-Object -Unique)
+if (-not $acl.AreAccessRulesProtected) {{ throw 'state ACL inherits from its parent' }}
+if (($sids -join ',') -ne 'S-1-5-18,S-1-5-32-544') {{ throw "unexpected state ACL principals: $($sids -join ',')" }}
+Write-Output 'state_acl_reset_to_system_and_administrators'
+"#
+        );
+        assert_eq!(
+            windows_powershell(&script).unwrap(),
+            "state_acl_reset_to_system_and_administrators"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_running_client_image_can_be_renamed() {
+        const READY: &str = "OPEN_PACT_RENAME_READY";
+        const STOP: &str = "OPEN_PACT_RENAME_STOP";
+        if let (Ok(ready), Ok(stop)) = (std::env::var(READY), std::env::var(STOP)) {
+            std::fs::write(ready, "ready").unwrap();
+            while !Path::new(&stop).exists() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("open-pact-client.exe");
+        let renamed = dir.path().join("open-pact-client.exe.delete-fictional");
+        std::fs::copy(std::env::current_exe().unwrap(), &image).unwrap();
+        let ready = dir.path().join("ready");
+        let stop = dir.path().join("stop");
+        let mut child = std::process::Command::new(&image)
+            .args([
+                "--exact",
+                "schedule::tests::a_running_client_image_can_be_renamed",
+                "--nocapture",
+            ])
+            .env(READY, &ready)
+            .env(STOP, &stop)
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if !ready.exists() {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("child test process did not start");
+        }
+        if let Err(error) = std::fs::rename(&image, &renamed) {
+            let _ = std::fs::write(&stop, "stop");
+            let _ = child.wait();
+            panic!("rename running client image: {error}");
+        }
+        let old_image_exists = image.exists();
+        let renamed_image_exists = renamed.exists();
+        std::fs::write(&stop, "stop").unwrap();
+        let child_succeeded = child.wait().unwrap().success();
+        assert!(!old_image_exists);
+        assert!(renamed_image_exists);
+        assert!(child_succeeded);
     }
 
     #[cfg(windows)]
@@ -1334,6 +1630,37 @@ Write-Output 'refused'
         drop(guard);
         assert!(lock(&home).is_ok());
         drop(inherited);
+    }
+
+    #[test]
+    fn system_state_lock_allows_removal_of_the_locked_state_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state").join("fictional-hash");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(state.join(STATE), "{}").unwrap();
+        let home = Home(state.clone());
+        let guard = lock_system_state(&home).unwrap();
+        let error = lock_system_state(&home).err().unwrap();
+        assert!(error.to_string().contains("retry this command"));
+        std::fs::remove_dir_all(&state).unwrap();
+        drop(guard);
+        assert!(!state.exists());
+        assert!(dir.path().join("state/fictional-hash.lock").exists());
+    }
+
+    #[test]
+    fn windows_uninstall_limits_protected_cleanup_to_a_system_task() {
+        let job = Job::new(Path::new("client.exe"), Path::new("fixture-home")).unwrap();
+        let script = windows_uninstall_script(&job, true);
+        let program_files = script.find("$program = ProgramFilesPath").unwrap();
+        let system_guard = script
+            .find("$wasSystem = $null -ne $task -and (IsSystemTask $task)")
+            .unwrap();
+        assert!(system_guard < program_files);
+        assert!(script.contains("QueueBinaryRemoval $binary"));
+        assert!(script.contains("MoveFileEx($pending,$null,4)"));
+        assert!(script.contains("RemovePendingDeletes $install"));
+        assert!(!script.contains("Remove-Item -LiteralPath $binary"));
     }
 
     #[test]
