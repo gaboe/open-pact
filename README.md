@@ -204,7 +204,7 @@ TEST_DATABASE_URL=postgres://postgres:test@localhost:55432/postgres cargo test -
 
 ## Bounded integer controls
 
-`os_patch_age_days` replaces the bucket-based patch-age control. This is a breaking manifest and claim change. Owners sign the new manifest again. Clients report whole days as a JSON integer, or `"unknown"` when they cannot establish an age within 0 to 3650 days. Windows uses the date of a successful cumulative-update installation from Windows Update Agent history. Missing qualifying history returns `"unknown"`.
+`os_patch_age_days` replaces the bucket-based patch-age control. This is a breaking manifest and claim change. Owners sign the new manifest again. Clients report whole days as a JSON integer, or `"unknown"` when they cannot establish an age within 0 to 3650 days. Windows reads the latest successfully installed OS `Package_for_RollupFix` servicing package with `Get-WindowsPackage -Online`. This requires administrator or SYSTEM access. Unrelated updates and pending packages do not count. Missing evidence and future timestamps return `"unknown"`.
 
 ```toml
 [[control]]
@@ -255,9 +255,13 @@ Windows collects the controls in one cached PowerShell batch. A missing source, 
 
 Defender metrics require Defender in Normal mode with its antivirus and service enabled. Other antivirus providers return `unknown` for these metrics. Detection values describe retained Defender history, not proof that a device has never had malware. Standard users get `unknown` for the controls that enforce elevation. Access failures also return `unknown`.
 
-Windows browser discovery checks standard Program Files and per-user Local AppData installations. Chromium profiles use Local AppData user-data directories. Firefox uses Roaming AppData profiles and installation-directory `distribution/policies.json`. Machine registry policy takes precedence over user policy. Recommended Chromium policy stays below explicit user preferences. Firefox supports JSON Preferences policy and legacy per-preference DWORD policy. Conflicting policy providers return `unknown`.
+Windows `screen_lock` uses a machine inactivity limit first. Otherwise it reads the effective screen-saver policy before local desktop settings. It requires a positive timer, secure mode, and an existing `.scr` file. As SYSTEM, it reads the HKU hives of interactive users. The weakest readable user setting decides. Missing users, unloaded hives, and unreadable evidence return `unknown`.
 
-As SYSTEM, the reader checks every non-special Windows user profile and its loaded HKEY_USERS policy hive. It returns `unknown` for an installed browser with an unloaded hive or unreadable settings. It does not load hives or change permissions. Custom installation and profile locations are outside discovery. SmartScreen must be readable and on for Windows `web_protection=on`; Windows never reports `n/a`.
+Windows `os_supported` uses an edition-aware lifecycle table for client, IoT Enterprise, LTSC/LTSB, and Server releases. Older systems use `ReleaseId` when `DisplayVersion` is absent. Missing lifecycle entries and unverified Windows 10 ESU status return `unknown`.
+
+Windows browser discovery checks standard Program Files and per-user Local AppData installations. Chromium profiles use Local AppData user-data directories or a mandatory `UserDataDir` policy. Hidden profiles are included. Missing or unreadable policy directories return `unknown`. Known mandatory protection policy still decides when a profile read fails. Firefox uses Roaming AppData profiles and installation-directory `distribution/policies.json`. Machine registry policy takes precedence over user policy. Recommended Chromium policy stays below explicit user preferences. Firefox supports JSON Preferences policy and legacy per-preference DWORD policy. Firefox registry policy takes precedence over the distribution file.
+
+As SYSTEM, the reader checks every non-special Windows user profile and its loaded HKEY_USERS policy hive. It returns `unknown` for an installed browser with an unloaded hive or unreadable settings. It does not load hives or change permissions. Custom installation locations and command-line `--user-data-dir` overrides are outside discovery. Unsupported `UserDataDir` variables return `unknown`. SmartScreen must be readable and on for Windows `web_protection=on`; Windows never reports `n/a`.
 
 
 `antimalware_active` now checks XProtect instead of Gatekeeper. This is a breaking mechanism change. [Apple describes XProtect as macOS antivirus technology](https://support.apple.com/guide/security/protecting-against-malware-sec469d47bd8/web). The signature-age reader matches `CFBundleShortVersionString` with an `XProtectPlistConfigData` receipt in `InstallHistory.plist`. It uses the matching receipt date because a bundle build date or file modification date does not establish when definitions were installed.

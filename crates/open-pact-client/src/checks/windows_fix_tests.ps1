@@ -156,6 +156,46 @@ try {
         $actual = @(FirefoxBrowser $root (Join-Path $root 'firefox.exe') 'user')
         Assert ($actual[0].policy.policies.Preferences['browser.safebrowsing.malware.enabled'] -eq 0) 'Known Firefox mandatory off policy was lost'
     }
+    Case '2 screen-saver executable must exist' {
+        $exe = Join-Path $root 'fictional.scr'
+        function RegValue($path,$name) {
+            switch ($name) {
+                'ScreenSaveActive' { return '1' }
+                'ScreenSaverIsSecure' { return '1' }
+                'ScreenSaveTimeOut' { return '300' }
+                'SCRNSAVE.EXE' { return $exe }
+            }
+            return ''
+        }
+        function PolicyValue($path,$name) { return '' }
+        Assert ((UserScreenSaver 'user') -eq '1|1|300|missing') 'Missing executable was accepted'
+        New-Item -ItemType Directory -Path $root -Force | Out-Null
+        Set-Content -LiteralPath $exe -Value 'fictional source fixture'
+        Assert ((UserScreenSaver 'user') -eq '1|1|300|valid') 'Existing executable was not established'
+    }
+    Case '11 SYSTEM resolves all interactive users and no SYSTEM hive' {
+        function Get-CimInstance { return @([pscustomobject]@{LogonType=2}, [pscustomobject]@{LogonType=10}) }
+        function Get-CimAssociatedInstance {
+            param($InputObject)
+            return [pscustomobject]@{SID=('S-1-5-21-111-222-333-' + $InputObject.LogonType)}
+        }
+        $actual = @(ScreenUserRoots $true)
+        Assert ($actual.Count -eq 2) 'Interactive users were dropped'
+        Assert (@($actual | Where-Object { $_ -notlike 'Registry::HKEY_USERS\S-1-5-21-*' }).Count -eq 0) 'SYSTEM HKCU was used'
+    }
+    Case '1 only installed OS rollups count and partial timestamps stay unknown' {
+        $date = [DateTime]::UtcNow.AddDays(-7)
+        foreach ($unrelated in @('Package_for_DotNetRollup~31bf3856ad364e35~amd64~~1.0','Package_for_KB890830','Package_for_Defender','Package_for_Office','Package_for_Driver')) {
+            function Get-WindowsPackage { return [pscustomobject]@{PackageName=$unrelated;PackageState='Installed';InstallTime=$date} }
+            Assert (((Tokens @(Section 'patch_date')).patch_date) -eq '') "Unrelated package accepted: $unrelated"
+        }
+        foreach ($state in @('Staged','InstallPending','UninstallPending','NotPresent')) {
+            function Get-WindowsPackage { return [pscustomobject]@{PackageName='Package_for_RollupFix~31bf3856ad364e35~amd64~~26100.33650.1.0';PackageState=$state;InstallTime=$date} }
+            Assert (((Tokens @(Section 'patch_date')).patch_date) -eq '') "Unsuccessful package accepted: $state"
+        }
+        function Get-WindowsPackage { return [pscustomobject]@{PackageName='Package_for_RollupFix~31bf3856ad364e35~amd64~~26100.33650.1.0';PackageState='Installed';InstallTime=$null} }
+        Assert (((Tokens @(Section 'patch_date')).patch_date) -eq '') 'Missing timestamp accepted'
+    }
     Case '3 screen-saver GPO overrides local enabled values' {
         $identity = [pscustomobject]@{IsSystem=$false}
         function RegValue($path,$name) {

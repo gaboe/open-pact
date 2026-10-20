@@ -23,6 +23,10 @@ jobs:
         shell: powershell
         run: ./crates/open-pact-client/src/checks/windows_browser_tests.ps1
 
+      - name: Verify Windows fix source fixtures
+        shell: powershell
+        run: ./crates/open-pact-client/src/checks/windows_fix_tests.ps1
+
       - name: Record runner privilege
         shell: pwsh
         run: |

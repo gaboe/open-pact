@@ -29,12 +29,7 @@ pub fn screen_lock() -> ControlValue {
         },
         _ => {}
     }
-    parse_screen_saver(
-        value("screen_active"),
-        value("screen_secure"),
-        value("screen_timeout"),
-    )
-    .into()
+    parse_screen_savers(value("screen_savers").unwrap_or_default()).into()
 }
 
 pub fn os_supported() -> ControlValue {
@@ -297,92 +292,285 @@ pub fn parse_screen_saver(
 ) -> &'static str {
     match (active, secure) {
         (Some("0"), _) | (Some("1"), Some("0")) => "none",
-        (Some("1"), Some("1")) => timeout
-            .and_then(|t| t.trim().parse::<u64>().ok())
-            .map_or("unknown", buckets::lock_delay),
+        (Some("1"), Some("1")) => {
+            timeout
+                .and_then(|t| t.trim().parse::<u64>().ok())
+                .map_or("unknown", |seconds| {
+                    if seconds == 0 {
+                        "none"
+                    } else {
+                        buckets::lock_delay(seconds)
+                    }
+                })
+        }
         _ => "unknown",
     }
 }
 
+fn parse_screen_savers(data: &str) -> &'static str {
+    let mut weakest = "le_5min";
+    if data.is_empty() {
+        return "unknown";
+    }
+    for user in data.split(';') {
+        let fields: Vec<_> = user.split('|').collect();
+        let [active, secure, timeout, executable] = fields.as_slice() else {
+            return "unknown";
+        };
+        let state = parse_screen_saver(Some(active), Some(secure), Some(timeout));
+        let state = match (state, *executable) {
+            ("none" | "unknown", _) => state,
+            (_, "valid") => state,
+            (_, "missing") => "none",
+            _ => "unknown",
+        };
+        if state == "unknown" {
+            return "unknown";
+        }
+        let rank = |value| match value {
+            "none" => 3,
+            "gt_15min" => 2,
+            "le_15min" => 1,
+            _ => 0,
+        };
+        if rank(state) > rank(weakest) {
+            weakest = state;
+        }
+    }
+    weakest
+}
+
+struct Lifecycle {
+    build: u32,
+    version: &'static str,
+    editions: &'static [&'static str],
+    server: bool,
+    end: (i32, u32, u32),
+}
+
+const CONSUMER: &[&str] = &[
+    "Core",
+    "CoreSingleLanguage",
+    "Professional",
+    "ProfessionalEducation",
+    "ProfessionalWorkstation",
+];
+const ENTERPRISE: &[&str] = &["Enterprise", "Education", "ServerRdsh"];
+const ENTERPRISE_IOT: &[&str] = &["Enterprise", "Education", "ServerRdsh", "IoTEnterprise"];
+const LTSC: &[&str] = &["EnterpriseS"];
+const IOT_LTSC: &[&str] = &["IoTEnterpriseS"];
+const LTSC_IOT: &[&str] = &["EnterpriseS", "IoTEnterpriseS"];
+const SERVER: &[&str] = &[
+    "ServerStandard",
+    "ServerDatacenter",
+    "ServerStandardEval",
+    "ServerDatacenterEval",
+    "ServerAzureCor",
+    "ServerDatacenterAzureEdition",
+    "ServerSolution",
+];
+
+const LIFECYCLES: &[Lifecycle] = &[
+    Lifecycle {
+        build: 10240,
+        version: "1507",
+        editions: LTSC_IOT,
+        server: false,
+        end: (2025, 10, 14),
+    },
+    Lifecycle {
+        build: 14393,
+        version: "1607",
+        editions: LTSC_IOT,
+        server: false,
+        end: (2026, 10, 13),
+    },
+    Lifecycle {
+        build: 17763,
+        version: "1809",
+        editions: LTSC_IOT,
+        server: false,
+        end: (2029, 1, 9),
+    },
+    Lifecycle {
+        build: 19044,
+        version: "21H2",
+        editions: LTSC,
+        server: false,
+        end: (2027, 1, 12),
+    },
+    Lifecycle {
+        build: 19044,
+        version: "21H2",
+        editions: IOT_LTSC,
+        server: false,
+        end: (2032, 1, 13),
+    },
+    Lifecycle {
+        build: 26100,
+        version: "24H2",
+        editions: LTSC,
+        server: false,
+        end: (2029, 10, 9),
+    },
+    Lifecycle {
+        build: 26100,
+        version: "24H2",
+        editions: IOT_LTSC,
+        server: false,
+        end: (2034, 10, 10),
+    },
+    Lifecycle {
+        build: 22000,
+        version: "21H2",
+        editions: CONSUMER,
+        server: false,
+        end: (2023, 10, 10),
+    },
+    Lifecycle {
+        build: 22000,
+        version: "21H2",
+        editions: ENTERPRISE_IOT,
+        server: false,
+        end: (2024, 10, 8),
+    },
+    Lifecycle {
+        build: 22621,
+        version: "22H2",
+        editions: CONSUMER,
+        server: false,
+        end: (2024, 10, 8),
+    },
+    Lifecycle {
+        build: 22621,
+        version: "22H2",
+        editions: ENTERPRISE_IOT,
+        server: false,
+        end: (2025, 10, 14),
+    },
+    Lifecycle {
+        build: 22631,
+        version: "23H2",
+        editions: CONSUMER,
+        server: false,
+        end: (2025, 11, 11),
+    },
+    Lifecycle {
+        build: 22631,
+        version: "23H2",
+        editions: ENTERPRISE_IOT,
+        server: false,
+        end: (2026, 11, 10),
+    },
+    Lifecycle {
+        build: 26100,
+        version: "24H2",
+        editions: CONSUMER,
+        server: false,
+        end: (2026, 10, 13),
+    },
+    Lifecycle {
+        build: 26100,
+        version: "24H2",
+        editions: ENTERPRISE_IOT,
+        server: false,
+        end: (2027, 10, 12),
+    },
+    Lifecycle {
+        build: 26200,
+        version: "25H2",
+        editions: CONSUMER,
+        server: false,
+        end: (2027, 10, 12),
+    },
+    Lifecycle {
+        build: 26200,
+        version: "25H2",
+        editions: ENTERPRISE_IOT,
+        server: false,
+        end: (2028, 10, 10),
+    },
+    Lifecycle {
+        build: 26300,
+        version: "26H2",
+        editions: CONSUMER,
+        server: false,
+        end: (2028, 10, 9),
+    },
+    Lifecycle {
+        build: 26300,
+        version: "26H2",
+        editions: ENTERPRISE_IOT,
+        server: false,
+        end: (2029, 10, 9),
+    },
+    Lifecycle {
+        build: 28000,
+        version: "26H1",
+        editions: CONSUMER,
+        server: false,
+        end: (2028, 3, 14),
+    },
+    Lifecycle {
+        build: 28000,
+        version: "26H1",
+        editions: ENTERPRISE,
+        server: false,
+        end: (2029, 3, 13),
+    },
+    Lifecycle {
+        build: 14393,
+        version: "",
+        editions: SERVER,
+        server: true,
+        end: (2027, 1, 12),
+    },
+    Lifecycle {
+        build: 17763,
+        version: "",
+        editions: SERVER,
+        server: true,
+        end: (2029, 1, 9),
+    },
+    Lifecycle {
+        build: 20348,
+        version: "",
+        editions: SERVER,
+        server: true,
+        end: (2031, 10, 14),
+    },
+    Lifecycle {
+        build: 26100,
+        version: "",
+        editions: SERVER,
+        server: true,
+        end: (2034, 11, 14),
+    },
+];
+
 pub fn parse_os_supported(data: &str, today: NaiveDate) -> &'static str {
-    let mut fields = data.split('|');
-    let (Some(build), Some(version), Some(edition), Some(install_type)) =
-        (fields.next(), fields.next(), fields.next(), fields.next())
-    else {
+    let fields: Vec<_> = data.split('|').collect();
+    let [build, version, edition, install_type] = fields.as_slice() else {
         return "unknown";
     };
     let Ok(build) = build.parse::<u32>() else {
         return "unknown";
     };
-    if !install_type.eq_ignore_ascii_case("Client") {
-        return "no";
-    }
-    if !is_known_client_edition(edition) {
-        return "unknown";
-    }
-    let supported_until = match (build, version, edition) {
-        (14393, "1607", "EnterpriseS") => Some((2026, 10, 13)),
-        (14393, "1607", "IoTEnterpriseS") => Some((2032, 1, 13)),
-        (17763, "1809", "EnterpriseS" | "IoTEnterpriseS") => Some((2029, 1, 9)),
-        (19044, "21H2", "EnterpriseS") => Some((2027, 1, 12)),
-        (19044, "21H2", "IoTEnterpriseS") => Some((2032, 1, 13)),
-        (22631, "23H2", "Enterprise" | "Education") => Some((2026, 11, 10)),
-        (26100, "24H2", "EnterpriseS") => Some((2029, 10, 9)),
-        (26100, "24H2", "IoTEnterpriseS") => Some((2034, 10, 10)),
-        (26100, "24H2", "Enterprise" | "Education") => Some((2027, 10, 12)),
-        (
-            26100,
-            "24H2",
-            "Core"
-            | "CoreSingleLanguage"
-            | "Professional"
-            | "ProfessionalEducation"
-            | "ProfessionalWorkstation",
-        ) => Some((2026, 10, 13)),
-        (
-            26200,
-            "25H2",
-            "Core"
-            | "CoreSingleLanguage"
-            | "Professional"
-            | "ProfessionalEducation"
-            | "ProfessionalWorkstation",
-        ) => Some((2027, 10, 12)),
-        (26200, "25H2", "Enterprise" | "Education") => Some((2028, 10, 11)),
-        (build, "26H1", edition) if build >= 28000 && is_consumer_edition(edition) => {
-            Some((2028, 3, 15))
-        }
-        (build, "26H1", "Enterprise" | "Education") if build >= 28000 => Some((2029, 3, 14)),
-        (build, "26H2", edition) if build >= 26300 && is_consumer_edition(edition) => {
-            Some((2028, 10, 9))
-        }
-        (build, "26H2", "Enterprise" | "Education") if build >= 26300 => Some((2029, 10, 9)),
-        (19045, "22H2", _) => return "unknown",
-        (_, _, edition) if edition.ends_with('S') => return "unknown",
-        _ => None,
+    let server = match *install_type {
+        "Client" => false,
+        "Server" | "Server Core" => true,
+        _ => return "unknown",
     };
-    supported_until
-        .and_then(|(y, m, d)| NaiveDate::from_ymd_opt(y, m, d))
-        .map_or("no", |end| if today <= end { "yes" } else { "no" })
-}
-
-fn is_consumer_edition(edition: &str) -> bool {
-    matches!(
-        edition,
-        "Core"
-            | "CoreSingleLanguage"
-            | "Professional"
-            | "ProfessionalEducation"
-            | "ProfessionalWorkstation"
-    )
-}
-
-fn is_known_client_edition(edition: &str) -> bool {
-    is_consumer_edition(edition)
-        || matches!(
-            edition,
-            "Enterprise" | "Education" | "EnterpriseS" | "IoTEnterprise" | "IoTEnterpriseS"
-        )
+    LIFECYCLES
+        .iter()
+        .find(|row| {
+            row.build == build
+                && row.server == server
+                && row.editions.contains(edition)
+                && (server || version.is_empty() || row.version == *version)
+        })
+        .and_then(|row| NaiveDate::from_ymd_opt(row.end.0, row.end.1, row.end.2))
+        .map_or("unknown", |end| if today <= end { "yes" } else { "no" })
 }
 
 pub fn parse_auto_login(value: &str) -> &'static str {
@@ -419,6 +607,10 @@ mod tests {
     #[cfg(windows)]
     fn native_batch_emits_every_metric() {
         for key in [
+            "screen_savers",
+            "lock_policy",
+            "os",
+            "patch_date",
             "preboot",
             "signature_days",
             "full_scan_days",
@@ -654,6 +846,62 @@ mod tests {
             "none"
         );
         assert_eq!(parse_screen_saver(None, None, None), "unknown");
+    }
+
+    #[test]
+    fn screen_savers_require_executable_evidence_and_all_users() {
+        for (data, expected) in [
+            ("1|1|300|valid", "le_5min"),
+            ("1|1|300|missing", "none"),
+            ("1|1|300|unknown", "unknown"),
+            ("1|1|0|valid", "none"),
+            ("0|||unknown", "none"),
+            ("1|0||unknown", "none"),
+            ("1|1|300|valid;1|1|1200|valid", "gt_15min"),
+            ("1|1|300|valid;0|||unknown", "none"),
+            ("1|1|300|valid;!|!|!|unknown", "unknown"),
+            ("!|!|!|unknown;0|||unknown", "unknown"),
+            ("1|1|300|valid;", "unknown"),
+            ("", "unknown"),
+            ("unknown", "unknown"),
+        ] {
+            assert_eq!(parse_screen_savers(data), expected, "{data}");
+        }
+    }
+
+    #[test]
+    fn every_lifecycle_row_and_edition_is_reachable_at_its_boundary() {
+        for row in LIFECYCLES {
+            let last = NaiveDate::from_ymd_opt(row.end.0, row.end.1, row.end.2).unwrap();
+            for edition in row.editions {
+                for install in if row.server {
+                    &["Server", "Server Core"][..]
+                } else {
+                    &["Client"][..]
+                } {
+                    for version in [row.version, ""] {
+                        let raw = format!("{}|{version}|{edition}|{install}", row.build);
+                        assert_eq!(parse_os_supported(&raw, last), "yes", "{raw}");
+                        assert_eq!(
+                            parse_os_supported(&raw, last.succ_opt().unwrap()),
+                            "no",
+                            "{raw}"
+                        );
+                    }
+                }
+            }
+        }
+        let today = NaiveDate::from_ymd_opt(2026, 10, 20).unwrap();
+        for raw in [
+            "26100|24H2|UnknownEdition|Client",
+            "26100|24H2|Professional|Server",
+            "28001|26H1|Professional|Client",
+            "26100|future|Professional|Client",
+            "26100|24H2|Professional|Other",
+            "26100|24H2|Professional|Client|extra",
+        ] {
+            assert_eq!(parse_os_supported(raw, today), "unknown", "{raw}");
+        }
     }
 
     #[test]

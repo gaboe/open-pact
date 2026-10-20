@@ -437,12 +437,27 @@ fn smartscreen(text: &str) -> Protection {
 }
 
 fn windows_browser(browser: &Value) -> Protection {
-    if browser.get("unreadable").is_some() {
-        return Protection::Unknown;
-    }
     let Some(policy) = browser.get("policy").filter(|v| v.is_object()) else {
         return Protection::Unknown;
     };
+    if browser.get("unreadable").is_some() {
+        return match browser.get("kind").and_then(Value::as_str) {
+            Some("firefox") => {
+                let mut missing = Map::new();
+                for key in FIREFOX_KEYS {
+                    missing.insert(key.to_string(), Value::Null);
+                }
+                firefox_state(&missing, policy)
+            }
+            Some(kind @ ("chrome" | "brave" | "edge")) => chromium_with_recommendation(
+                &Value::Object(Map::new()),
+                policy,
+                None,
+                kind == "edge",
+            ),
+            _ => Protection::Unknown,
+        };
+    }
     match browser.get("kind").and_then(Value::as_str) {
         Some("firefox") => {
             if policy.get("policies").is_some_and(|v| !v.is_object())
@@ -452,10 +467,17 @@ fn windows_browser(browser: &Value) -> Protection {
             {
                 return Protection::Unknown;
             }
-            let Some(text) = browser.get("prefs").and_then(Value::as_str) else {
-                return Protection::Unknown;
-            };
-            firefox_prefs(text).map_or(Protection::Unknown, |prefs| firefox_state(&prefs, policy))
+            let prefs = browser
+                .get("prefs")
+                .and_then(Value::as_str)
+                .and_then(|text| firefox_prefs(text).ok())
+                .unwrap_or_else(|| {
+                    FIREFOX_KEYS
+                        .iter()
+                        .map(|key| (key.to_string(), Value::Null))
+                        .collect()
+                });
+            firefox_state(&prefs, policy)
         }
         Some(kind @ ("chrome" | "brave" | "edge")) => {
             let Some(prefs) = browser.get("prefs").filter(|v| v.is_object()) else {
@@ -487,6 +509,33 @@ pub fn windows(screen: &str, text: &str) -> &'static str {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn windows_firefox_mandatory_policy_survives_malformed_preferences() {
+        let policy = json!({"policies":{"Preferences":{"browser.safebrowsing.malware.enabled":0}}});
+        assert_eq!(
+            windows_browser(
+                &json!({"kind":"firefox","policy":policy,"prefs":"user_pref(\"browser.safebrowsing.malware.enabled\", broken);"})
+            ),
+            Protection::Off
+        );
+        let locked = json!({"policies":{"Preferences":{
+            "browser.safebrowsing.malware.enabled":{"Value":true,"Status":"locked"},
+            "browser.safebrowsing.phishing.enabled":{"Value":true,"Status":"locked"}
+        }}});
+        assert_eq!(
+            windows_browser(&json!({"kind":"firefox","policy":locked,"unreadable":true})),
+            Protection::On
+        );
+        let unlocked = json!({"policies":{"Preferences":{
+            "browser.safebrowsing.malware.enabled":{"Value":true,"Status":"default"},
+            "browser.safebrowsing.phishing.enabled":{"Value":true,"Status":"user"}
+        }}});
+        assert_eq!(
+            windows_browser(&json!({"kind":"firefox","policy":unlocked,"unreadable":true})),
+            Protection::Unknown
+        );
+    }
+
     #[test]
     fn windows_mandatory_policy_survives_profile_read_failure() {
         for (kind, policy, expected) in [

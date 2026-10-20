@@ -1,5 +1,9 @@
 $ErrorActionPreference = 'Stop'
-. ([scriptblock]::Create((Get-Content -Raw (Join-Path $PSScriptRoot 'windows.ps1')))) | Out-Null
+$ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot 'windows.ps1'), [ref]$null, [ref]$null)
+foreach ($fn in $ast.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst]}, $false)) {
+    . ([scriptblock]::Create($fn.Extent.Text))
+}
+$now = [DateTime]::UtcNow
 function Assert($condition, $message) { if (-not $condition) { throw $message } }
 $root = Join-Path ([IO.Path]::GetTempPath()) ([Guid]::NewGuid().ToString())
 try {
@@ -30,7 +34,7 @@ try {
     }
     $policy = BrowserPolicy 'machine' 'user' @('SafeBrowsingProtectionLevel','SafeBrowsingEnabled')
     Assert ($policy.SafeBrowsingProtectionLevel -eq 0) 'Machine policy did not take precedence'
-    Assert ($policy.SafeBrowsingEnabled -eq $true) 'User policy fallback failed'
+    Assert ((BrowserPolicy 'machine' 'user' @('SafeBrowsingEnabled')).SafeBrowsingEnabled -eq $true) 'User policy fallback failed'
     $registry['user|SafeBrowsingProtectionLevel'] = '!'
     $failed = $false
     try { BrowserPolicy 'machine' 'user' @('SafeBrowsingProtectionLevel') | Out-Null } catch { $failed = $true }
@@ -56,9 +60,9 @@ try {
     Assert ($items[0].prefs.Contains('false') -and $items[0].prefs.Contains('true')) 'Firefox user.js order lost'
     Assert ($items[0].policy.policies.Preferences['browser.safebrowsing.phishing.enabled'] -eq 0) 'Firefox machine policy precedence failed'
     Set-Content -LiteralPath (Join-Path $firefoxRoot 'profiles.ini') -Value "[Profile0]`nPath=C:\fictional\external`nIsRelative=0"
-    $failed = $false
-    try { FirefoxBrowser $root $app 'HKCU:' | Out-Null } catch { $failed = $true }
-    Assert $failed 'External Firefox profile accepted'
+    $external = @(FirefoxBrowser $root $app 'HKCU:')
+    Assert ($external[0].unreadable -eq $true) 'External Firefox profile accepted'
+    Assert ($external[0].policy.policies.Preferences['browser.safebrowsing.phishing.enabled'] -eq 0) 'External profile hid mandatory Firefox policy'
     Write-Output 'Windows browser source fixtures passed'
 } finally {
     Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
