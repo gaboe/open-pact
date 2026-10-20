@@ -1,0 +1,82 @@
+name: client-release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            binary: open-pact-client-aarch64-apple-darwin
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            binary: open-pact-client-x86_64-apple-darwin
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            binary: open-pact-client-x86_64-unknown-linux-musl
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            binary: open-pact-client-x86_64-pc-windows-msvc.exe
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install --yes musl-tools
+      - name: Build client
+        run: cargo build --locked --release --package open-pact-client --target ${{ matrix.target }}
+      - name: Name release binary
+        shell: bash
+        run: cp "target/${{ matrix.target }}/release/open-pact-client${{ matrix.target == 'x86_64-pc-windows-msvc' && '.exe' || '' }}" "${{ matrix.binary }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: client-${{ matrix.target }}
+          path: ${{ matrix.binary }}
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: client-*
+          merge-multiple: true
+          path: dist
+      - uses: actions/checkout@v6
+      - name: Include third-party data license
+        run: cp NOTICE dist/NOTICE
+      - uses: sigstore/cosign-installer@v4.1.2
+      - name: Create checksums and signatures
+        working-directory: dist
+        run: |
+          sha256sum open-pact-client-* NOTICE > SHA256SUMS
+          for file in open-pact-client-* NOTICE SHA256SUMS; do
+            cosign sign-blob --yes --bundle "$file.sigstore.json" "$file"
+          done
+      - name: Attach assets to the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --verify-tag --title "$TAG" --notes "" || gh release view "$TAG" >/dev/null
+          fi
+          gh release upload "$TAG" dist/* --clobber
