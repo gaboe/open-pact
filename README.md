@@ -286,7 +286,7 @@ grace = "1d"
 
 Integer outputs always allow `"unknown"`. Both bounds are inclusive signed 32-bit integers. A requirement uses `{ max = 30 }` for at most 30, or `{ min = 90 }` for at least 90. The limit must be within the output range. Numeric strings, fractions, other strings and out-of-range values are refused. Unknown values use `unknown_grace`. A smaller output range is narrowing. Lowering a maximum or raising a minimum is stricter and needs owner consent. Switching comparison direction or output kind also needs consent. Manifest hashes remain SHA-256 of the exact TOML bytes. Claims retain JCS encoding.
 
-The screen-lock output `"none"` means no screen lock. It replaces `"off"` in this breaking change. An enumerated control may declare `"n/a"` and accept it for an OS where the control does not apply. The gateway treats `"n/a"` as a declared string value, with no special bypass.
+The screen-lock output `"none"` means no screen lock. It replaces `"off"` in this breaking change. An enumerated control may declare `"n/a"` and accept it for an OS where the control does not apply. The gateway treats `"n/a"` as a declared string value, with no special bypass. When a check returns `"n/a"`, the client sends `"unknown"` only when the manifest allows `"unknown"` and does not allow `"n/a"`.
 
 
 ## Additional security checks

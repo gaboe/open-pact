@@ -398,7 +398,16 @@ fn disclosable(
         .iter()
         .filter_map(|c| {
             let value = all.remove(&c.id)?;
-            c.output.contains(&value).then(|| (c.id.clone(), value))
+            if c.output.contains(&value) {
+                return Some((c.id.clone(), value));
+            }
+            if value == "n/a" {
+                let unknown = open_pact_core::ControlValue::from("unknown");
+                if c.output.contains(&unknown) {
+                    return Some((c.id.clone(), unknown));
+                }
+            }
+            None
         })
         .collect()
 }
@@ -1532,6 +1541,130 @@ mod tests {
             let sent = disclosable(&manifest, Os::Linux, all);
             assert_eq!(sent.get("os_patch_age_days"), expected.then_some(&value));
         }
+    }
+
+    #[test]
+    fn substitutes_unknown_when_na_is_not_disclosed_but_unknown_is() {
+        let template = include_str!("../../../examples/manifest.toml");
+        let old_numeric_outputs = template
+            .replace(
+                "output = { integer = { min = 0, max = 10000 }, values = [\"n/a\"] }",
+                "output = { integer = { min = 0, max = 10000 } }",
+            )
+            .replace(
+                "output = { integer = { min = 0, max = 8760 }, values = [\"none\", \"n/a\"] }",
+                "output = { integer = { min = 0, max = 8760 } }",
+            )
+            .replace(
+                "id = \"antimalware_detections_7d\"\nsource = \"company_policy\"\ncheck = \"builtin:antimalware_detections_7d@1\"\noutput = { integer = { min = 0, max = 10000 } }\nrequired = {}",
+                "id = \"antimalware_detections_7d\"\nsource = \"company_policy\"\ncheck = \"builtin:antimalware_detections_7d@1\"\noutput = { integer = { min = 0, max = 10000 } }\nrequired = { macos = { max = 0 } }",
+            )
+            .replace(
+                "id = \"antimalware_last_detection_hours\"\nsource = \"company_policy\"\ncheck = \"builtin:antimalware_last_detection_hours@1\"\noutput = { integer = { min = 0, max = 8760 } }\nrequired = {}",
+                "id = \"antimalware_last_detection_hours\"\nsource = \"company_policy\"\ncheck = \"builtin:antimalware_last_detection_hours@1\"\noutput = { integer = { min = 0, max = 8760 } }\nrequired = { macos = { max = 0 } }",
+            )
+            .replace(
+                "output = [\"on\", \"off\", \"unknown\", \"n/a\"]",
+                "output = [\"on\", \"off\", \"unknown\"]",
+            )
+            .replace(
+                "required = { macos = \"full\", windows = \"full\", linux = \"full\" }",
+                "required = {}",
+            )
+            .replace(
+                "required = { macos = \"on\", windows = \"on\", linux = \"on\" }",
+                "required = {}",
+            )
+            .replace(
+                "required = { macos = \"le_5min\", windows = \"le_5min\", linux = \"le_5min\" }",
+                "required = {}",
+            )
+            .replace(
+                "required = { macos = { max = 30 }, windows = { max = 30 }, linux = { max = 30 } }",
+                "required = {}",
+            )
+            .replace(
+                "required = { macos = \"yes\", windows = \"yes\", linux = \"yes\" }",
+                "required = {}",
+            );
+        let manifest = Manifest::parse(old_numeric_outputs.as_bytes()).unwrap();
+        let all = BTreeMap::from([
+            ("antimalware_detections_7d".into(), "n/a".into()),
+            ("antimalware_last_detection_hours".into(), "n/a".into()),
+            ("web_protection".into(), "n/a".into()),
+        ]);
+
+        let sent = disclosable(&manifest, Os::Macos, all);
+
+        assert_eq!(sent["antimalware_detections_7d"], "unknown");
+        assert_eq!(sent["antimalware_last_detection_hours"], "unknown");
+        assert_eq!(sent["web_protection"], "unknown");
+
+        let key = PublicKey::from(&dev_key::generate());
+        let time = "2026-10-20T12:00:00Z".parse().unwrap();
+        let claim = Claim {
+            manifest: manifest.hash().clone(),
+            device: Pseudonym::of(&key),
+            device_key: key,
+            nonce: "n".into(),
+            time,
+            client: "open-pact-client 0.0.1".into(),
+            os: Os::Macos,
+            trust_level: open_pact_core::TrustLevel::L0,
+            virtualized: Some(Virtualized::No),
+            results: sent,
+            csr_sha256: None,
+            log_checkpoint: None,
+        };
+        let decision = open_pact_core::evaluate(
+            &manifest,
+            &claim,
+            time,
+            &open_pact_core::FirstFailures::new(),
+        )
+        .decision;
+        let open_pact_core::Decision::Allow { warnings } = decision else {
+            panic!("unknown detection results should receive unknown_grace");
+        };
+        let warnings = warnings.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings.iter().any(|warning| {
+            warning.starts_with("antimalware_detections_7d = unknown")
+                && warning.ends_with("access ends in 7d")
+        }));
+        assert!(warnings.iter().any(|warning| {
+            warning.starts_with("antimalware_last_detection_hours = unknown")
+                && warning.ends_with("access ends in 7d")
+        }));
+    }
+
+    #[test]
+    fn keeps_na_when_declared_and_omits_na_when_unknown_is_not_declared() {
+        let template = include_str!("../../../examples/manifest.toml");
+        let manifest = Manifest::parse(template.as_bytes()).unwrap();
+        let all = BTreeMap::from([
+            ("antimalware_detections_7d".into(), "n/a".into()),
+            ("antimalware_last_detection_hours".into(), "n/a".into()),
+        ]);
+        let sent = disclosable(&manifest, Os::Macos, all);
+        assert_eq!(sent["antimalware_detections_7d"], "n/a");
+        assert_eq!(sent["antimalware_last_detection_hours"], "n/a");
+
+        let no_fallback = template
+            .replace(
+                "output = { integer = { min = 0, max = 10000 }, values = [\"n/a\"] }",
+                "output = [\"0\", \"1\"]",
+            )
+            .replace(
+                "output = { integer = { min = 0, max = 8760 }, values = [\"none\", \"n/a\"] }",
+                "output = [\"0\", \"1\"]",
+            );
+        let manifest = Manifest::parse(no_fallback.as_bytes()).unwrap();
+        let all = BTreeMap::from([
+            ("antimalware_detections_7d".into(), "n/a".into()),
+            ("antimalware_last_detection_hours".into(), "n/a".into()),
+        ]);
+        assert!(disclosable(&manifest, Os::Macos, all).is_empty());
     }
 
     #[test]
