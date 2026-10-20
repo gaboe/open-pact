@@ -1568,7 +1568,7 @@ mod tests {
 
     #[test]
     fn substitutes_unknown_when_na_is_not_disclosed_but_unknown_is() {
-        let template = include_str!("../../../examples/manifest.toml");
+        let template = include_str!("../../../examples/manifest.toml").replace("\r\n", "\n");
         let old_numeric_outputs = template
             .replace(
                 "output = { integer = { min = 0, max = 10000 }, values = [\"n/a\"] }",
