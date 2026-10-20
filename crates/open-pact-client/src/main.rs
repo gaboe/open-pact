@@ -160,6 +160,11 @@ thread_local! {
     static INTERRUPT_AFTER: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
+#[cfg(all(test, windows))]
+thread_local! {
+    static VPN_RENAME_ERROR: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
 /// Where an interruption could leave the installed files half changed. A test can stop the
 /// install here as if the process were killed.
 fn interruption_point() {
@@ -195,6 +200,16 @@ fn read_home_file(path: &Path) -> std::io::Result<Vec<u8>> {
     }
     #[cfg(not(windows))]
     std::fs::read(path)
+}
+
+#[cfg(windows)]
+struct VpnLock(std::fs::File);
+
+#[cfg(windows)]
+impl Drop for VpnLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
 }
 
 impl Home {
@@ -242,27 +257,24 @@ impl Home {
         }
         #[cfg(windows)]
         {
-            self.recover_vpn()?;
+            let _lock = self.lock_vpn()?;
+            self.recover_vpn_locked()?;
             let vpn = self.file(VPN_DIR);
-            let generation = format!(
-                "{}-{}",
-                chrono::Utc::now().timestamp_nanos_opt().context("clock")?,
-                std::process::id()
-            );
-            let dir = vpn.join(&generation);
-            std::fs::create_dir_all(&vpn)?;
-            std::fs::create_dir(&dir)?;
-            for (name, bytes) in VPN_FILES.iter().zip([ca, cert]) {
-                let mut file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(dir.join(name))?;
-                file.write_all(bytes)?;
-                file.sync_all()?;
-                interruption_point();
+            if self.vpn_generation(VPN_CURRENT)?.is_none()
+                && let (Ok(old_ca), Ok(old_cert)) = (
+                    read_home_file(&self.file(VPN_FILES[0])),
+                    read_home_file(&self.file(VPN_FILES[1])),
+                )
+            {
+                let baseline = self.write_windows_vpn_generation(&old_ca, &old_cert)?;
+                Self::replace_vpn_file(&vpn.join(VPN_CURRENT), baseline.as_bytes())?;
+            }
+            let generation = self.write_windows_vpn_generation(ca, cert)?;
+            if let Some(current) = self.vpn_generation(VPN_CURRENT)? {
+                Self::replace_vpn_file(&vpn.join("previous"), current.as_bytes())?;
             }
             Self::replace_vpn_file(&vpn.join(VPN_CURRENT), generation.as_bytes())?;
-            self.recover_vpn()
+            self.recover_vpn_locked()
         }
         #[cfg(unix)]
         {
@@ -363,11 +375,34 @@ impl Home {
     }
 
     #[cfg(windows)]
+    fn write_windows_vpn_generation(&self, ca: &[u8], cert: &[u8]) -> Result<String> {
+        let vpn = self.file(VPN_DIR);
+        let generation = format!(
+            "{}-{}",
+            chrono::Utc::now().timestamp_nanos_opt().context("clock")?,
+            std::process::id()
+        );
+        let dir = vpn.join(&generation);
+        std::fs::create_dir(&dir)?;
+        for (name, bytes) in VPN_FILES.iter().zip([ca, cert]) {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(dir.join(name))?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            interruption_point();
+        }
+        Ok(generation)
+    }
+
+    #[cfg(windows)]
     fn replace_vpn_file(path: &Path, bytes: &[u8]) -> Result<()> {
         let temp = path.with_file_name(format!(
-            ".{}.{}.tmp",
+            ".{}.{}-{}.tmp",
             path.file_name().context("VPN file name")?.to_string_lossy(),
-            std::process::id()
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().context("clock")?
         ));
         let mut file = std::fs::OpenOptions::new()
             .write(true)
@@ -378,25 +413,63 @@ impl Home {
         drop(file);
         interruption_point();
         // Rust uses MoveFileExW with MOVEFILE_REPLACE_EXISTING on Windows.
+        #[cfg(test)]
+        VPN_RENAME_ERROR.with(|target| -> Result<()> {
+            if target.borrow().as_deref() == Some(path) {
+                target.replace(None);
+                return Err(std::io::Error::from_raw_os_error(32).into());
+            }
+            Ok(())
+        })?;
         std::fs::rename(&temp, path).with_context(|| path.display().to_string())?;
         interruption_point();
         Ok(())
     }
 
     #[cfg(windows)]
-    fn recover_vpn(&self) -> Result<()> {
+    fn lock_vpn(&self) -> Result<VpnLock> {
         let vpn = self.file(VPN_DIR);
-        let current = match read_home_file(&vpn.join(VPN_CURRENT)) {
+        std::fs::create_dir_all(&vpn)?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(vpn.join("write.lock"))?;
+        file.lock().context("lock VPN files")?;
+        Ok(VpnLock(file))
+    }
+
+    #[cfg(windows)]
+    fn recover_vpn(&self) -> Result<()> {
+        // A command such as uninstall must not recreate a missing home.
+        if !self.file(VPN_DIR).exists() {
+            return Ok(());
+        }
+        let _lock = self.lock_vpn()?;
+        self.recover_vpn_locked()
+    }
+
+    #[cfg(windows)]
+    fn vpn_generation(&self, pointer: &str) -> Result<Option<String>> {
+        match read_home_file(&self.file(VPN_DIR).join(pointer)) {
             Ok(bytes) => {
                 let name = String::from_utf8(bytes).context("VPN generation is not UTF-8")?;
                 if name.is_empty() || !name.bytes().all(|b| b.is_ascii_digit() || b == b'-') {
                     bail!("invalid VPN generation name");
                 }
-                Some(name)
+                Ok(Some(name))
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(e).context("read selected VPN generation"),
-        };
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).context("read VPN generation"),
+        }
+    }
+
+    #[cfg(windows)]
+    fn recover_vpn_locked(&self) -> Result<()> {
+        let vpn = self.file(VPN_DIR);
+        let current = self.vpn_generation(VPN_CURRENT)?;
+        let previous = self.vpn_generation("previous")?;
         // Read the complete selected pair before changing either documented file.
         let pair = current
             .as_ref()
@@ -408,6 +481,48 @@ impl Home {
                 ])
             })
             .transpose()?;
+        if let Some(pair) = pair {
+            for (name, bytes) in VPN_FILES.iter().zip(pair) {
+                let path = self.file(name);
+                let refresh = (|| -> Result<()> {
+                    match read_home_file(&path) {
+                        Ok(existing) if existing == bytes => return Ok(()),
+                        Ok(_) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(e).with_context(|| path.display().to_string()),
+                    }
+                    Self::replace_vpn_file(&path, &bytes)
+                })();
+                if let Err(error) = refresh {
+                    if let Some(previous) = &previous {
+                        // An earlier process may have stopped after replacing a flat file.
+                        for restored in VPN_FILES {
+                            let bytes = read_home_file(&vpn.join(previous).join(restored))?;
+                            let path = self.file(restored);
+                            if read_home_file(&path).ok().as_ref() != Some(&bytes) {
+                                Self::replace_vpn_file(&path, &bytes)
+                                    .context("restore previous VPN flat file")?;
+                            }
+                        }
+                        Self::replace_vpn_file(&vpn.join(VPN_CURRENT), previous.as_bytes())?;
+                    } else {
+                        for restored in VPN_FILES {
+                            let path = self.file(restored);
+                            if path.exists() {
+                                std::fs::remove_file(path)?;
+                            }
+                        }
+                        std::fs::remove_file(vpn.join(VPN_CURRENT))?;
+                    }
+                    return Err(error).with_context(|| {
+                        format!(
+                            "cannot replace {}; close the VPN client and run check again",
+                            path.display()
+                        )
+                    });
+                }
+            }
+        }
         for parent in [&self.0, &vpn] {
             let entries = match std::fs::read_dir(parent) {
                 Ok(entries) => entries,
@@ -419,7 +534,8 @@ impl Home {
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
                 let temporary = if parent == &vpn {
-                    name.starts_with(".current.") && name.ends_with(".tmp")
+                    (name.starts_with(".current.") || name.starts_with(".previous."))
+                        && name.ends_with(".tmp")
                 } else {
                     VPN_FILES
                         .iter()
@@ -428,24 +544,13 @@ impl Home {
                 };
                 let old_generation = parent == &vpn
                     && entry.file_type()?.is_dir()
-                    && current.as_deref() != Some(name.as_ref());
+                    && current.as_deref() != Some(name.as_ref())
+                    && previous.as_deref() != Some(name.as_ref());
                 if old_generation {
                     std::fs::remove_dir_all(entry.path())?;
                 } else if temporary {
                     std::fs::remove_file(entry.path())?;
                 }
-            }
-        }
-        if let Some(pair) = pair {
-            for (name, bytes) in VPN_FILES.iter().zip(pair) {
-                let path = self.file(name);
-                match read_home_file(&path) {
-                    Ok(existing) if existing == bytes => continue,
-                    Ok(_) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(e).with_context(|| path.display().to_string()),
-                }
-                Self::replace_vpn_file(&path, &bytes)?;
             }
         }
         Ok(())
@@ -1516,6 +1621,10 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
     let home = Home::new(cli.home)?;
+    #[cfg(windows)]
+    if let Err(error) = home.recover_vpn() {
+        eprintln!("warning: VPN recovery failed: {error:#}");
+    }
     match cli.command {
         Command::Join {
             invitation,
@@ -2537,10 +2646,19 @@ mod tests {
                 } else {
                     assert!(VPN_FILES.iter().all(|name| !home.file(name).exists()));
                 }
-                assert_eq!(
-                    std::fs::read_dir(home.file(VPN_DIR)).unwrap().count(),
-                    if selected.is_some() { 2 } else { 0 }
-                );
+                let generations: Vec<_> = std::fs::read_dir(home.file(VPN_DIR))
+                    .unwrap()
+                    .map(|entry| entry.unwrap())
+                    .filter(|entry| entry.file_type().unwrap().is_dir())
+                    .collect();
+                for entry in &generations {
+                    let name = entry.file_name().into_string().unwrap();
+                    assert!(
+                        Some(&name) == home.vpn_generation(VPN_CURRENT).unwrap().as_ref()
+                            || Some(&name) == home.vpn_generation("previous").unwrap().as_ref()
+                    );
+                }
+                assert!(generations.len() <= 2);
                 assert!(!std::fs::read_dir(&home.0).unwrap().any(|entry| {
                     entry
                         .unwrap()
@@ -2578,8 +2696,173 @@ mod tests {
             VPN_FILES.map(|name| std::fs::read(home.file(name)).unwrap()),
             selected
         );
-        assert_eq!(std::fs::read_dir(vpn).unwrap().count(), 2);
+        assert_eq!(std::fs::read_dir(vpn).unwrap().count(), 3);
         assert!(!home.file(".ca.pem.123.tmp").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_vpn_reader_retries_after_two_switches() {
+        for switches in [1, 2] {
+            let dir = tempfile::tempdir().unwrap();
+            let home = Home(dir.path().to_path_buf());
+            home.install_vpn_pair(b"CA one", b"certificate one")
+                .unwrap();
+            let vpn = home.file(VPN_DIR);
+            let first = home.vpn_generation(VPN_CURRENT).unwrap().unwrap();
+            let mut attempts = 0;
+            let pair = loop {
+                attempts += 1;
+                let before = home.vpn_generation(VPN_CURRENT).unwrap().unwrap();
+                let ca = std::fs::read(vpn.join(&before).join(VPN_FILES[0]));
+                if attempts == 1 {
+                    home.install_vpn_pair(b"CA two", b"certificate two")
+                        .unwrap();
+                    assert!(vpn.join(&first).join(VPN_FILES[1]).exists());
+                    if switches == 2 {
+                        home.install_vpn_pair(b"CA three", b"certificate three")
+                            .unwrap();
+                        assert!(!vpn.join(&first).exists());
+                    }
+                }
+                let cert = std::fs::read(vpn.join(&before).join(VPN_FILES[1]));
+                let after = home.vpn_generation(VPN_CURRENT).unwrap().unwrap();
+                if before == after
+                    && let (Ok(ca), Ok(cert)) = (ca, cert)
+                {
+                    break [ca, cert];
+                }
+                assert!(attempts < 10);
+            };
+            assert_eq!(attempts, 2);
+            assert_eq!(Some(pair), selected_windows_vpn_pair(&home));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_vpn_sharing_violation_rolls_back_the_pair() {
+        use std::os::windows::fs::OpenOptionsExt;
+        for native in [false, true] {
+            for baseline in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let home = Home(dir.path().to_path_buf());
+                let old = [b"old CA".to_vec(), b"old certificate".to_vec()];
+                if baseline {
+                    for (name, bytes) in VPN_FILES.iter().zip(&old) {
+                        home.write(name, bytes).unwrap();
+                    }
+                } else {
+                    home.install_vpn_pair(&old[0], &old[1]).unwrap();
+                }
+                let held = if native {
+                    Some(
+                        std::fs::OpenOptions::new()
+                            .read(true)
+                            .share_mode(1 | 2)
+                            .open(home.file(VPN_FILES[1]))
+                            .unwrap(),
+                    )
+                } else {
+                    VPN_RENAME_ERROR.with(|target| target.replace(Some(home.file(VPN_FILES[1]))));
+                    None
+                };
+                let error = home
+                    .install_vpn_pair(b"new CA", b"new certificate")
+                    .unwrap_err();
+                let message = format!("{error:#}");
+                assert!(message.contains("vpn-cert.pem"), "{message}");
+                assert!(
+                    message.contains("close the VPN client and run check again"),
+                    "{message}"
+                );
+                assert!(
+                    error.chain().any(|cause| cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.raw_os_error() == Some(32))),
+                    "{message}"
+                );
+                assert_eq!(selected_windows_vpn_pair(&home), Some(old.clone()));
+                assert_eq!(
+                    VPN_FILES.map(|name| std::fs::read(home.file(name)).unwrap()),
+                    old
+                );
+                drop(held);
+                home.recover_vpn().unwrap();
+                home.install_vpn_pair(b"new CA", b"new certificate")
+                    .unwrap();
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_vpn_lock_serializes_install_and_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+        home.install_vpn_pair(b"CA one", b"certificate one")
+            .unwrap();
+        let guard = home.lock_vpn().unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            for recover in [false, true] {
+                let home = &home;
+                let started = started_tx.clone();
+                let done = done_tx.clone();
+                scope.spawn(move || {
+                    started.send(()).unwrap();
+                    if recover {
+                        home.recover_vpn().unwrap();
+                    } else {
+                        home.install_vpn_pair(b"CA two", b"certificate two")
+                            .unwrap();
+                    }
+                    done.send(()).unwrap();
+                });
+            }
+            started_rx.recv().unwrap();
+            started_rx.recv().unwrap();
+            assert!(
+                done_rx
+                    .recv_timeout(std::time::Duration::from_millis(100))
+                    .is_err()
+            );
+            assert_eq!(selected_windows_vpn_pair(&home).unwrap()[0], b"CA one");
+            drop(guard);
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+        });
+        assert_eq!(selected_windows_vpn_pair(&home).unwrap()[0], b"CA two");
+        home.recover_vpn().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_vpn_startup_recovers_for_log_and_warns_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+        home.install_vpn_pair(b"CA one", b"certificate one")
+            .unwrap();
+        home.write(LOG_CHECKPOINT, b"fictional checkpoint").unwrap();
+        home.write(VPN_FILES[0], b"interrupted flat copy").unwrap();
+        let cli = || {
+            Cli::parse_from([
+                "open-pact-client",
+                "--home",
+                dir.path().to_str().unwrap(),
+                "log",
+                "head",
+            ])
+        };
+        assert_eq!(run(cli()).await.unwrap(), ExitCode::SUCCESS);
+        assert_eq!(std::fs::read(home.file(VPN_FILES[0])).unwrap(), b"CA one");
+        std::fs::write(home.file(VPN_DIR).join(VPN_CURRENT), b"../invalid").unwrap();
+        assert_eq!(run(cli()).await.unwrap(), ExitCode::SUCCESS);
     }
 
     #[cfg(windows)]

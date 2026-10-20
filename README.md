@@ -44,13 +44,17 @@ The client keeps its files in `~/.config/open-pact/`, or in the directory given 
 | `device-dev.pem` | device key as a software file, instead of `device-se.key` |
 | `vpn-key.pem` | VPN certificate key; only its certificate request leaves the device |
 | `manifest.toml`, `enrolment.json` | the signed manifest, gateway URL and the salt that opens the enrolment commitment |
-| `vpn-cert.pem`, `ca.pem` | the last VPN client certificate and the gateway CA: links into `vpn/current/` |
-| `vpn/current/` | a link to the installed VPN credential generation `vpn/<generation>/`; a new certificate and CA replace the earlier pair with one rename of this link |
+| `vpn-cert.pem`, `ca.pem` | the last VPN client certificate and the gateway CA; Unix links into `vpn/current/`, Windows flat copies |
+| `vpn/current` | Unix directory link to `vpn/<generation>/`; Windows text file containing the selected generation name |
 | `company-key.txt`, `log-key.txt` | the company key fingerprint and the log key, pinned from the invitation at `join` |
 | `log-checkpoint.txt` | the last verified, gateway-signed log checkpoint |
 | `claims.jsonl` | every claim sent and every response, byte for byte |
 
-A VPN client that reads the certificate and the CA as two files gets one consistent pair from `vpn/current/`. The two top-level links can straddle a replacement between two reads.
+On Unix, `vpn/current/` is a directory link. The two top-level links can straddle a replacement between two reads.
+
+On Windows, `vpn/current` is a text pointer, not a directory. A pair reader reads its generation name, reads both files from `vpn/<generation>/`, then reads `vpn/current` again. If the name changed or a file is missing, the reader discards both files and retries. The client keeps the current and previous generations. A home-wide OS file lock serializes Windows installation and recovery.
+
+Windows replaces the flat copies sequentially, so a reader can briefly see different generations. If replacement fails, the client restores the changed flat files and selects the previous generation. Close the VPN client and run `check` again when the error names a locked file. Every command that uses the home attempts recovery at startup. Recovery errors produce a warning; commands that need VPN files also return the error. New Windows files and directories inherit the home ACL. The client does not preserve an explicit ACL from a replaced file.
 
 No job runs in the background unless you install a report schedule. Before you delete the binary and the directory, run `open-pact-client schedule uninstall`.
 
