@@ -445,6 +445,28 @@ mod tests {
     }
 
     #[test]
+    fn user_firefox_policy_does_not_hide_current_disabled_preference() {
+        let prefs = firefox_prefs(
+            "user_pref(\"browser.safebrowsing.malware.enabled\", false);",
+        )
+        .unwrap();
+        let policy = json!({"policies":{"Preferences":{"browser.safebrowsing.malware.enabled":{"Value":true,"Status":"user"}}}});
+        assert_eq!(firefox_state(&prefs, &policy), Protection::Off);
+    }
+
+    #[test]
+    fn numeric_firefox_policy_values_are_booleans() {
+        let actual: Vec<_> = [0, 1]
+            .into_iter()
+            .map(|value| {
+                let policy = json!({"policies":{"Preferences":{"browser.safebrowsing.malware.enabled":{"Value":value,"Status":"locked"}}}});
+                firefox_state(&Map::new(), &policy)
+            })
+            .collect();
+        assert_eq!(actual, vec![Protection::Off, Protection::On]);
+    }
+
+    #[test]
     fn file_reader_distinguishes_absence_from_unreadable_or_malformed() {
         let root = tempfile::tempdir().unwrap();
         assert_eq!(
@@ -477,5 +499,61 @@ mod tests {
         assert_eq!(profiles(root.path(), false).unwrap(), vec![profile.clone()]);
         std::os::unix::fs::symlink(&profile, root.path().join("Profile 1")).unwrap();
         assert!(profiles(root.path(), false).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn custom_profile_symlink_inside_data_root_is_discovered() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("FictionalStorage/Custom");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(
+            target.join("Preferences"),
+            r#"{"safebrowsing":{"enabled":false}}"#,
+        )
+        .unwrap();
+        let link = root.path().join("Custom");
+        std::os::unix::fs::symlink("FictionalStorage/Custom", &link).unwrap();
+        assert_eq!(profiles(root.path(), false).unwrap(), vec![link]);
+    }
+
+    #[test]
+    fn chromium_recommended_policy_applies_below_user_preferences() {
+        let home = tempfile::tempdir().unwrap();
+        let prefs_dir = home.path().join("Library/Preferences");
+        fs::create_dir_all(&prefs_dir).unwrap();
+        fs::write(
+            prefs_dir.join("org.openpact.fictional-browser.plist"),
+            "<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>SafeBrowsingProtectionLevel</key><integer>0</integer></dict></plist>",
+        )
+        .unwrap();
+        assert_eq!(
+            chromium_browser(
+                home.path(),
+                "FictionalBrowser",
+                "org.openpact.fictional-browser",
+                false,
+            ),
+            Protection::Off
+        );
+
+        let profile = home
+            .path()
+            .join("Library/Application Support/FictionalBrowser/Default");
+        fs::create_dir_all(&profile).unwrap();
+        fs::write(
+            profile.join("Preferences"),
+            r#"{"safebrowsing":{"enabled":true}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            chromium_browser(
+                home.path(),
+                "FictionalBrowser",
+                "org.openpact.fictional-browser",
+                false,
+            ),
+            Protection::On
+        );
     }
 }

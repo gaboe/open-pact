@@ -217,6 +217,12 @@ mod tests {
             "unknown"
         );
     }
+
+    #[test]
+    fn failed_xprotect_scan_is_not_healthy() {
+        let service = "system/com.apple.XProtect.daemon.scan = {\n program = /Library/Apple/System/Library/CoreServices/XProtect.app/Contents/MacOS/XProtect\n state = spawn scheduled\n last exit code = 78\n}";
+        assert_ne!(parse_xprotect("disabled services = {\n}\n", Some(service)), "yes");
+    }
     #[test]
     fn signature_receipt_must_match_installed_definitions() {
         let history = r#"[
@@ -244,6 +250,16 @@ mod tests {
                 NaiveDate::from_ymd_opt(2026, 10, 1).unwrap()
             ),
             "unknown"
+        );
+    }
+
+    #[test]
+    fn signature_age_counts_completed_elapsed_days() {
+        let history = "[\n 0 => {\n \"date\" => 2026-10-19 23:59:00 +0000\n \"displayName\" => \"XProtectPlistConfigData\"\n \"displayVersion\" => \"5367\"\n }\n]";
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-20T00:01:00Z").unwrap();
+        assert_eq!(
+            parse_signature_age(history, "5367", now.date_naive()),
+            ControlValue::Integer(0)
         );
     }
     #[test]
