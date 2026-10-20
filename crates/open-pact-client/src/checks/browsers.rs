@@ -714,6 +714,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn chromium_recommended_policy_applies_below_user_preferences() {
         let home = tempfile::tempdir().unwrap();
         let prefs_dir = home.path().join("Library/Preferences");
