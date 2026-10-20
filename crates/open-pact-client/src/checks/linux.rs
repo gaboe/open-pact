@@ -183,21 +183,29 @@ impl PackageHost for System {
     }
 
     fn stamp(&self, path: &str) -> Option<String> {
-        use std::os::unix::fs::MetadataExt;
-        let meta = fs::symlink_metadata(path).ok()?;
-        if meta.is_dir() {
-            return Some("directory".into());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let meta = fs::symlink_metadata(path).ok()?;
+            if meta.is_dir() {
+                return Some("directory".into());
+            }
+            Some(format!(
+                "{}:{} {} {}.{} {}.{}",
+                meta.dev(),
+                meta.ino(),
+                meta.size(),
+                meta.mtime(),
+                meta.mtime_nsec(),
+                meta.ctime(),
+                meta.ctime_nsec()
+            ))
         }
-        Some(format!(
-            "{}:{} {} {}.{} {}.{}",
-            meta.dev(),
-            meta.ino(),
-            meta.size(),
-            meta.mtime(),
-            meta.mtime_nsec(),
-            meta.ctime(),
-            meta.ctime_nsec()
-        ))
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            None
+        }
     }
 }
 

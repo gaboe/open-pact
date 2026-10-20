@@ -198,22 +198,31 @@ impl Home {
     /// The documented `ca.pem` and `vpn-cert.pem` are links into `vpn/current/`, so every
     /// interruption leaves the earlier pair or the new one, never a mix.
     fn install_vpn_pair(&self, ca: &[u8], cert: &[u8]) -> Result<()> {
-        self.recover_vpn()?;
-        if !self.file(VPN_DIR).join(VPN_CURRENT).exists()
-            && let (Ok(ca), Ok(cert)) = (
-                std::fs::read(self.file(VPN_FILES[0])),
-                std::fs::read(self.file(VPN_FILES[1])),
-            )
+        #[cfg(not(unix))]
         {
-            self.switch_vpn_generation(&ca, &cert)?;
-            self.link_vpn_files()?;
+            let _ = (ca, cert);
+            bail!("installing the VPN pair is not supported on this OS yet");
         }
-        self.switch_vpn_generation(ca, cert)?;
-        self.link_vpn_files()?;
-        self.recover_vpn()
+        #[cfg(unix)]
+        {
+            self.recover_vpn()?;
+            if !self.file(VPN_DIR).join(VPN_CURRENT).exists()
+                && let (Ok(ca), Ok(cert)) = (
+                    std::fs::read(self.file(VPN_FILES[0])),
+                    std::fs::read(self.file(VPN_FILES[1])),
+                )
+            {
+                self.switch_vpn_generation(&ca, &cert)?;
+                self.link_vpn_files()?;
+            }
+            self.switch_vpn_generation(ca, cert)?;
+            self.link_vpn_files()?;
+            self.recover_vpn()
+        }
     }
 
     /// Writes a new generation and points `vpn/current` at it.
+    #[cfg(unix)]
     fn switch_vpn_generation(&self, ca: &[u8], cert: &[u8]) -> Result<()> {
         let vpn = self.file(VPN_DIR);
         let generation = format!(
@@ -242,6 +251,7 @@ impl Home {
     }
 
     /// Makes each documented VPN file a link into `vpn/current/`, replacing a plain file.
+    #[cfg(unix)]
     fn link_vpn_files(&self) -> Result<()> {
         for name in VPN_FILES {
             let target = Path::new(VPN_DIR).join(VPN_CURRENT).join(name);
@@ -262,6 +272,7 @@ impl Home {
     /// Restores one whole VPN pair after an interrupted install: keeps only the generation
     /// `vpn/current` points at, and links the documented files to it. Does nothing in a home
     /// that has never installed a generation.
+    #[cfg(unix)]
     fn recover_vpn(&self) -> Result<()> {
         let vpn = self.file(VPN_DIR);
         let entries = match std::fs::read_dir(&vpn) {
@@ -287,6 +298,11 @@ impl Home {
         if current.is_some() {
             self.link_vpn_files()?;
         }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn recover_vpn(&self) -> Result<()> {
         Ok(())
     }
 
@@ -2022,6 +2038,7 @@ mod tests {
 
     /// R7-L2: wherever an install of a new VPN pair is interrupted, the recovery at the next
     /// start shows one whole pair, the earlier or the new, through the documented paths.
+    #[cfg(unix)]
     #[test]
     fn an_interrupted_vpn_install_leaves_one_whole_pair() {
         let read = |home: &Home| {
