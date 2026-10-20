@@ -40,10 +40,6 @@ Emit 'screen_timeout' (RegValue 'HKCU:\Control Panel\Desktop' 'ScreenSaveTimeOut
 $current = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
 Emit 'os' (@($current.CurrentBuild, $current.DisplayVersion, $current.EditionID, $current.InstallationType) -join '|')
 Emit 'autologin' (RegValue 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' 'AutoAdminLogon')
-try {
-    $dates = @(Get-HotFix | Where-Object InstalledOn | ForEach-Object { try { ([datetime]$_.InstalledOn).ToString('yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture) } catch {} })
-    Emit 'updates' ($dates -join ' ')
-} catch { Emit 'updates' '' }
 "#;
 
 static VALUES: OnceLock<BTreeMap<String, String>> = OnceLock::new();
@@ -81,11 +77,8 @@ pub fn os_supported() -> &'static str {
 }
 
 pub fn os_patch_age() -> &'static str {
-    value("updates")
-        .and_then(parse_last_update)
-        .map_or("unknown", |last| {
-            buckets::patch_age(last, Utc::now().date_naive())
-        })
+    // Get-HotFix omits the Windows Update-supplied cumulative updates needed for this check.
+    "unknown"
 }
 
 pub fn auto_login() -> &'static str {
@@ -264,12 +257,6 @@ fn is_known_client_edition(edition: &str) -> bool {
         )
 }
 
-pub fn parse_last_update(out: &str) -> Option<NaiveDate> {
-    out.split_whitespace()
-        .filter_map(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
-        .max()
-}
-
 pub fn parse_auto_login(value: &str) -> &'static str {
     match value.trim() {
         "1" => "on",
@@ -390,10 +377,8 @@ mod tests {
     }
 
     #[test]
-    fn last_update() {
-        let out = "2026-08-12\r\n2026-09-09\r\n2026-07-08\r\n";
-        assert_eq!(parse_last_update(out), NaiveDate::from_ymd_opt(2026, 9, 9));
-        assert_eq!(parse_last_update(""), None);
+    fn patch_age_is_unknown_without_lcu_evidence() {
+        assert_eq!(os_patch_age(), "unknown");
     }
 
     #[test]
