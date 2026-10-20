@@ -11,6 +11,10 @@ Status: proof of concept, not for production. On a Mac, `join` creates the devic
 - `crates/open-pact-gateway` HTTP gateway, small CA and transparency log, backed by PostgreSQL; admin commands `invite` and `devices`
 - `deploy/helm/open-pact` Helm chart (values use placeholders)
 
+## Guides
+
+See the [deployment and client guides](docs/README.md).
+
 ## Run
 
 ```sh
