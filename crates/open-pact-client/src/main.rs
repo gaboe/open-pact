@@ -1881,6 +1881,7 @@ mod tests {
         assert_eq!(accepted, [""; 0], "cases that replaced the installed pair");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn check_installs_the_certificate_of_a_verified_response_checkpoint() {
         let (code, before, after, pair) =
