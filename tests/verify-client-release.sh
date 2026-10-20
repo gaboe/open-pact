@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# The expected file list is in byte order.
+export LC_ALL=C
 
 script=$(cd "$(dirname "$0")/.." && pwd)/scripts/verify-client-release.sh
 tmp=$(mktemp -d)
