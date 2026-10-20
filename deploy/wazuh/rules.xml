@@ -1,0 +1,31 @@
+<group name="open_pact,">
+  <rule id="100500" level="3">
+    <field name="open_pact.schema_version">^1$</field>
+    <description>open-pact device status</description>
+  </rule>
+  <rule id="100501" level="8">
+    <if_sid>100500</if_sid>
+    <field name="open_pact.verdict">^deny$</field>
+    <description>open-pact denied device access</description>
+  </rule>
+  <rule id="100502" level="7">
+    <if_sid>100500</if_sid>
+    <field name="open_pact.result_os_patch_age_days" type="pcre2">^(?:3[1-9]|[4-9][0-9]|[1-9][0-9]{2,})$</field>
+    <description>open-pact OS patch age exceeds 30 days</description>
+  </rule>
+  <rule id="100503" level="7">
+    <if_sid>100500</if_sid>
+    <field name="open_pact.result_antimalware_signature_age_days" type="pcre2">^(?:[4-9]|[1-9][0-9]+)$</field>
+    <description>open-pact antimalware signatures exceed 3 days</description>
+  </rule>
+  <rule id="100504" level="10">
+    <if_sid>100500</if_sid>
+    <field name="open_pact.result_antimalware_detections_7d" type="pcre2">^[1-9][0-9]*$</field>
+    <description>open-pact antimalware detected threats in the last 7 days</description>
+  </rule>
+  <rule id="100505" level="10">
+    <if_sid>100500</if_sid>
+    <field name="open_pact.result_log_cleared_hours" type="pcre2">^(?!(?:none|n/a)$).+$</field>
+    <description>open-pact reports cleared logs</description>
+  </rule>
+</group>

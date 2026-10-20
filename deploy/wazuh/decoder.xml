@@ -1,0 +1,4 @@
+<decoder name="open-pact-json">
+  <prematch type="pcre2">^\s*\{"open_pact":</prematch>
+  <plugin_decoder>JSON_Decoder</plugin_decoder>
+</decoder>

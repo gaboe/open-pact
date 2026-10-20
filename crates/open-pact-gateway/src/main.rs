@@ -6,6 +6,7 @@ mod keys;
 mod nonces;
 mod ratelimit;
 mod seal;
+mod siem;
 #[cfg(test)]
 mod testdb;
 mod translog;
@@ -98,6 +99,7 @@ struct App {
     nonce_limiter: Arc<Limiter>,
     max_nonces: i64,
     kek: Arc<SealingKey>,
+    siem: Option<siem::Exporter>,
 }
 
 struct Log {
@@ -731,6 +733,12 @@ async fn claim(
         .map_err(internal)?;
     }
     tx.commit().await.map_err(internal)?;
+    if enrolled
+        && !oversharing
+        && let Some(exporter) = &app.siem
+    {
+        exporter.submit(siem::event(&app.manifest, claim, &reasons, &warnings));
+    }
     if !reasons.is_empty() {
         return Err(denied(reasons));
     }
@@ -1052,7 +1060,9 @@ async fn serve(db: PgPool) -> anyhow::Result<()> {
         db.clone(),
         manifest.body().claim_retention.clone(),
     ));
+    let siem = siem::from_env(&manifest);
     let app = App {
+        siem,
         db,
         manifest: Arc::new(manifest),
         toml: toml.into(),
@@ -1149,6 +1159,7 @@ mod tests {
         };
         let minute = Duration::from_secs(60);
         let app = router(App {
+            siem: None,
             db: db.clone(),
             company: Endorsement::sign(&keys.manifest, manifest.hash()),
             manifest: Arc::new(manifest),

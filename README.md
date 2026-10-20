@@ -58,7 +58,7 @@ No job runs in the background unless you install a report schedule. Before you d
 
 Client releases include binaries for macOS, Linux, and Windows. They also include `NOTICE`, `SHA256SUMS`, and Sigstore bundles for each binary, `NOTICE`, and `SHA256SUMS`. Verify a client release with `scripts/verify-client-release.sh v0.2.0`. The script downloads these files from the GitHub release, checks their hashes, and verifies their signatures against the tagged release workflow. It needs GitHub CLI, Cosign, and `sha256sum` or `shasum`. Set `GH_REPO` to check a release from a fork.
 
-The gateway image is reproducible: a pinned toolchain and builder, a static musl binary, `FROM scratch`, and timestamps fixed to the commit time. CI builds each release twice on separate runners and fails when the digests differ. The witness image (`ghcr.io/<owner>/open-pact-witness`, the Dockerfile `witness` target) is built and checked the same way. To check a release yourself, run `scripts/verify-release.sh v0.0.1 ghcr.io/<owner>/open-pact-gateway@sha256:<digest>`, or add `--target witness` and the witness image reference. It rebuilds the tag from the public source, prints the digest, and exits nonzero on a mismatch. It needs Docker with buildx and takes several minutes. The gateway makes no outbound TLS calls, so the image carries no CA bundle (do not use `sslmode=verify-full` for PostgreSQL).
+The gateway image is reproducible: a pinned toolchain and builder, a static musl binary, `FROM scratch`, and timestamps fixed to the commit time. CI builds each release twice on separate runners and fails when the digests differ. The witness image (`ghcr.io/<owner>/open-pact-witness`, the Dockerfile `witness` target) is built and checked the same way. To check a release yourself, run `scripts/verify-release.sh v0.0.1 ghcr.io/<owner>/open-pact-gateway@sha256:<digest>`, or add `--target witness` and the witness image reference. It rebuilds the tag from the public source, prints the digest, and exits nonzero on a mismatch. It needs Docker with buildx and takes several minutes. The image carries no system CA bundle. Optional SIEM TLS uses its explicitly mounted CA file. Do not use `sslmode=verify-full` for PostgreSQL without providing its CA.
 
 ## License
 
@@ -83,6 +83,58 @@ This project is licensed under the Apache License, Version 2.0. See [LICENSE](LI
 A claim is accepted only if the device is enrolled for the enforced manifest and approved, the `client` field is exactly `open-pact-client <major>.<minor>.<patch>`, the nonce is unused, the claim time is within `claim_max_age` and not more than 5 minutes ahead, and the results meet the manifest. The client posts `{"jws": ..., "csr_pem": ...}`. The certificate request travels beside the JWS, and the signed claim carries only `csr_sha256`, the SHA-256 of the request's DER. The request must carry a P-256 public key and nothing else: canonical PEM with no text around it, an empty subject, and no attributes or extensions. If the request matches `csr_sha256`, the gateway issues a client certificate for its public key: CN = the pseudonym's 64 hex digits, extended key usage `clientAuth`, key usage `digitalSignature` and an authority key identifier, valid 24 hours or `claim_max_age` if shorter. The gateway stores the signed claim and the certificate's SHA-256, never the request. Each version component in `client` is a `u32` without leading zeros, so the field stays short.
 
 **Grace.** The gateway stores, per device, manifest and control, the time it first saw a required control fail or report `unknown`. A passing value clears it; a missing result denies at once and keeps it. While the failure is younger than the control's `grace` (or `unknown_grace` for `unknown`), the claim is accepted with a warning such as `firewall = off, on required, access ends in 23h`. After that it is denied with `firewall = off, on required, grace 1d ended`. `grace = "0d"` denies the first failed claim. Changing between a failed value and `unknown` keeps the first time. Only a claim that passes the client, manifest, time, trust level and disclosure checks from an enrolled device changes the stored times.
+
+## SIEM export
+
+The gateway can send one JSON event for each committed claim evaluation from an enrolled device. This includes allow and deny verdicts for pending, approved, and revoked devices. It exports nothing for invalid signatures, invalid or used nonces, unenrolled devices, disclosure violations, or failed database commits. There is no collector-report endpoint. The counterparty needs no collector on the device.
+
+Export is off by default. Configure one sink:
+
+| Variable | Meaning |
+| --- | --- |
+| `GATEWAY_SIEM_SYSLOG_URL` | `tls://siem.example.com:6514`, with an explicit port. No credentials, path, query, or fragment. Plain TCP and UDP are refused. |
+| `GATEWAY_SIEM_CA` | Path to PEM CA certificates for that receiver. Only these CAs are trusted. The receiver certificate must match the URL hostname or IP address. |
+| `GATEWAY_SIEM_FILE` | Alternative sink. Append one JSON object per line to this path. Its parent directory must exist and be writable by the gateway. |
+| `GATEWAY_SIEM_RETENTION_DAYS` | Optional whole, nonnegative days. Startup warns when this exceeds the manifest's calendar `claim_retention`. |
+
+An invalid sink configuration disables export and logs a warning. It does not prevent the gateway from serving claims. Configuring both sinks is invalid. In Helm, set `siem.enabled=true`, `siem.syslogUrl`, `siem.caSecret.name`, and `siem.retentionDays`. The existing Secret's `siem.caSecret.key` defaults to `ca.pem`. The chart mounts it read-only. Restart the gateway after changing the CA Secret.
+
+Claim handling queues the event without network or file writes. A separate thread retries failures after 1, 2, 4, 8, 16, 32, then 60 seconds. Connect, socket read, and socket write timeouts are 5 seconds. DNS resolution runs only in the delivery thread. The queue holds at most 1024 events, including the event being sent. Overflow drops the oldest event and increments `siem_dropped_total`, reported in a warning. No metrics endpoint exists. An event already being sent can still arrive after the queue drops it. A retry cannot remove a newer event. The queue is memory only. A restart or shutdown loses queued events. TLS write success does not prove manager ingestion, and retries can produce duplicates. This export is best effort, not an audit delivery guarantee.
+
+The SIEM keeps its own copy. Gateway retention does not delete that copy. The manifest's `claim_retention` must not be shorter than the retention of SIEM events, receiver files, indexes, archives, and backups. Declare the SIEM recipients in `claim_recipients` before the owner signs. `GATEWAY_SIEM_RETENTION_DAYS` checks a configuration statement. It cannot enforce the SIEM's retention.
+
+### Event schema version 1
+
+Each JSON event has exactly one top-level key, `open_pact`. Its fields are flat. Reasons and warnings are arrays of gateway-generated strings. All control results use `result_<control id>` so a control cannot replace event metadata. The value keeps its original JSON type, string or integer. Only declared control results that the claim actually supplied are included. Missing results remain absent. No raw logs, public keys, nonce, JWS, certificate request, certificate, source address, or other device data are exported.
+
+| Field under `open_pact` | Type and meaning |
+| --- | --- |
+| `schema_version` | Integer, currently `1`. |
+| `time` | RFC 3339 UTC time from the signed claim. |
+| `device_pseudonym` | String, the enrolled device's pseudonym. |
+| `manifest_hash` | String, the hash in the signed claim. |
+| `client_version` | String, for example `open-pact-client 0.2.0`. |
+| `os` | `macos`, `windows`, or `linux`. |
+| `verified_trust_level` | `L0` until the gateway supports attestation. |
+| `asserted_trust_level` | `L0`, `L1`, or `L2`, as asserted by the client. |
+| `verdict` | `allow` or `deny`, including enrolment state and certificate-request checks. |
+| `reasons` | Array, empty for allow. |
+| `warnings` | Array, including failures still within grace on an allow verdict. |
+| `result_<control id>` | The result exactly as disclosed, with no derived values. For example `result_os_patch_age_days: 31`. |
+
+TLS sends RFC 5424 messages with facility `local0`, severity `informational`, app name `open-pact`, and message ID `status`. The timestamp and hostname in the syslog header are NILVALUE. The JSON body contains the signed claim time. RFC 5425 octet counting prefixes the UTF-8 byte length of the complete syslog message and one space. File output contains only JSON and a newline, without a syslog header or length prefix.
+
+### Wazuh receiver
+
+Sample files are in [deploy/wazuh](deploy/wazuh). Terminate TLS with the sample [rsyslog configuration](deploy/wazuh/rsyslog.conf) beside the Wazuh manager. Install the rsyslog GnuTLS module and a receiver certificate. Restrict its TLS port to the gateway at the firewall. This sample authenticates the receiver to the gateway. It does not authenticate the gateway with a client certificate. The receiver writes only JSON message bodies to `/var/log/open-pact/events.jsonl`. Give that file to a Wazuh agent with [agent-localfile.xml](deploy/wazuh/agent-localfile.xml). A gateway on the receiver host can instead write that file directly with `GATEWAY_SIEM_FILE`. Set file permissions, rotation, and retention for the gateway writer and Wazuh reader.
+
+Install [rules.xml](deploy/wazuh/rules.xml) in the manager's local rules directory. Reserve IDs 100500 through 100505 or change them to avoid local conflicts. Wazuh's [JSON decoder](https://documentation.wazuh.com/current/user-manual/ruleset/decoders/json-decoder.html) reads these events and exposes dynamic fields. An optional [decoder.xml](deploy/wazuh/decoder.xml) shows the same JSON plugin for a receiver with a custom decoder chain. Rules match fields, so either JSON decoder can supply them. See the official [decoder syntax](https://documentation.wazuh.com/current/user-manual/ruleset/ruleset-xml-syntax/decoders.html).
+
+The rules alert on deny, numeric `os_patch_age_days > 30`, numeric `antimalware_signature_age_days > 3`, numeric `antimalware_detections_7d > 0`, and a present `log_cleared_hours` other than `none` or `n/a`. These are control IDs, not check names. The manifest must declare these exact IDs and numeric outputs for the numeric rules. The export does not turn bucketed results such as `gt_30d` into numbers. Wazuh can select one matching child rule for an event with several failures; inspect the event's complete fields and reasons.
+
+A missing event cannot trigger these event-driven rules. On the SIEM side, maintain an expected-device list and a last-ingestion time per `open_pact.device_pseudonym`. Run a scheduled check every few minutes and emit a separate alert when an expected device has no event for more than two hours. Use receiver ingestion time, not the signed claim time. Include devices that never sent a first report, and remove devices that no longer need reports. A two-hour silence policy also requires an agreed claim schedule. The optional collector report schedule sends reports to a separate collector endpoint, not claims to this gateway.
+
+The XML is checked for well-formedness. The samples are unverified against a real Wazuh manager. Before use, run `/var/ossec/bin/wazuh-logtest` with allow, deny, threshold-boundary, `none`, `n/a`, and absent-field fixtures on the target manager. Validate the rsyslog configuration there with `rsyslogd -N1`.
 
 ## Enrolment
 

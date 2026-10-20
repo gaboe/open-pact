@@ -125,3 +125,13 @@ witness:
     readOnlyRootFilesystem: true
     capabilities:
       drop: [ALL]
+
+# Optional SIEM export. TLS only. The CA Secret must contain PEM certificates.
+siem:
+  enabled: false
+  syslogUrl: tls://siem.example.com:6514
+  caSecret:
+    name: ""
+    key: ca.pem
+  # Set to the SIEM's actual retention. A value above claim_retention logs a warning.
+  retentionDays: 30

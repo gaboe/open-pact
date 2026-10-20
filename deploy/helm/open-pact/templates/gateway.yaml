@@ -41,6 +41,14 @@ spec:
             - name: http
               containerPort: 8080
           env:
+            {{- if .Values.siem.enabled }}
+            - name: GATEWAY_SIEM_SYSLOG_URL
+              value: {{ required "siem.syslogUrl is required" .Values.siem.syslogUrl | quote }}
+            - name: GATEWAY_SIEM_CA
+              value: /etc/open-pact/siem/ca.pem
+            - name: GATEWAY_SIEM_RETENTION_DAYS
+              value: {{ .Values.siem.retentionDays | quote }}
+            {{- end }}
             {{- if .Values.manifest }}
             - name: MANIFEST_PATH
               value: /etc/open-pact/custom/manifest.toml
@@ -88,17 +96,34 @@ spec:
               path: /healthz
               port: http
             initialDelaySeconds: 10
-          {{- if .Values.manifest }}
+          {{- if or .Values.manifest .Values.siem.enabled }}
           volumeMounts:
+            {{- if .Values.siem.enabled }}
+            - name: siem-ca
+              mountPath: /etc/open-pact/siem
+              readOnly: true
+            {{- end }}
+            {{- if .Values.manifest }}
             - name: manifest
               mountPath: /etc/open-pact/custom
               readOnly: true
+            {{- end }}
           {{- end }}
-      {{- if .Values.manifest }}
+      {{- if or .Values.manifest .Values.siem.enabled }}
       volumes:
+        {{- if .Values.siem.enabled }}
+        - name: siem-ca
+          secret:
+            secretName: {{ required "siem.caSecret.name is required when SIEM is enabled" .Values.siem.caSecret.name }}
+            items:
+              - key: {{ .Values.siem.caSecret.key | quote }}
+                path: ca.pem
+        {{- end }}
+        {{- if .Values.manifest }}
         - name: manifest
           configMap:
             name: {{ .Release.Name }}-manifest
+        {{- end }}
       {{- end }}
 ---
 apiVersion: v1
