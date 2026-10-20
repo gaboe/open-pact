@@ -19,6 +19,18 @@ jobs:
       - name: Test Windows client
         run: cargo test -p open-pact-client -- --show-output
 
+      - name: Measure isolated native batches
+        if: always()
+        shell: powershell
+        run: |
+          $failed = $false
+          foreach ($attempt in 1..5) {
+            Write-Output "isolated_batch_attempt=$attempt"
+            cargo test -p open-pact-client native_batch_emits_every_metric -- --show-output
+            if ($LASTEXITCODE -ne 0) { $failed = $true }
+          }
+          if ($failed) { throw "An isolated native batch failed" }
+
       - name: Verify Windows VPN pair recovery and accepted responses
         run: |
           cargo test -p open-pact-client windows_vpn_
@@ -171,6 +183,7 @@ jobs:
           }
 
       - name: Probe invariant batch values
+        if: always()
         shell: powershell
         run: |
           $timer = [Diagnostics.Stopwatch]::StartNew()
