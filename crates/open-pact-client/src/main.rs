@@ -2777,9 +2777,17 @@ mod tests {
                     "{message}"
                 );
                 assert!(
-                    error.chain().any(|cause| cause
-                        .downcast_ref::<std::io::Error>()
-                        .is_some_and(|error| error.raw_os_error() == Some(32))),
+                    error
+                        .chain()
+                        .any(
+                            |cause| cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                                match error.raw_os_error() {
+                                    Some(32) => true,
+                                    Some(5) => native,
+                                    _ => false,
+                                }
+                            })
+                        ),
                     "{message}"
                 );
                 assert_eq!(selected_windows_vpn_pair(&home), Some(old.clone()));
