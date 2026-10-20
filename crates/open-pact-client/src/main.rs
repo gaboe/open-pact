@@ -1345,6 +1345,13 @@ fn log_show(path: &Path) -> Result<()> {
 }
 
 async fn run(cli: Cli) -> Result<ExitCode> {
+    if let Command::Schedule {
+        command: schedule::Command::Probe { address },
+    } = &cli.command
+    {
+        schedule::probe_blocking(address)?;
+        return Ok(ExitCode::SUCCESS);
+    }
     let home = Home::new(cli.home)?;
     match cli.command {
         Command::Join {

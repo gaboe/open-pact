@@ -20,7 +20,7 @@ pub(crate) enum Command {
         #[arg(long)]
         collector: String,
         #[arg(long)]
-        vpn_probe: String,
+        vpn_probe: Option<String>,
     },
     /// Remove the report job, its configuration and report state
     Uninstall,
@@ -37,6 +37,24 @@ pub(crate) enum Command {
 struct Config {
     collector: String,
     vpn_probe: String,
+}
+
+impl Config {
+    fn new(collector: String, vpn_probe: Option<String>) -> Result<Self> {
+        let url = report::collector_url(&collector)?;
+        let vpn_probe = vpn_probe.unwrap_or_else(|| {
+            format!(
+                "{}:{}",
+                url.host().unwrap(),
+                url.port_or_known_default().unwrap()
+            )
+        });
+        probe_address(&vpn_probe)?;
+        Ok(Self {
+            collector,
+            vpn_probe,
+        })
+    }
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -125,7 +143,7 @@ pub(crate) async fn vpn_up(probe: &str) -> bool {
     .await
 }
 
-fn probe_blocking(address: &str) -> Result<()> {
+pub(crate) fn probe_blocking(address: &str) -> Result<()> {
     use std::net::{TcpStream, ToSocketAddrs};
     probe_address(address)?;
     for address in address.to_socket_addrs()? {
@@ -136,7 +154,16 @@ fn probe_blocking(address: &str) -> Result<()> {
     bail!("VPN probe failed")
 }
 
-fn lock(home: &Home) -> Result<File> {
+struct ScheduleLock(File);
+
+impl Drop for ScheduleLock {
+    fn drop(&mut self) {
+        // A concurrent spawn can inherit the descriptor until exec closes it.
+        let _ = self.0.unlock();
+    }
+}
+
+fn lock(home: &Home) -> Result<ScheduleLock> {
     let mut directory = std::fs::DirBuilder::new();
     directory.recursive(true);
     #[cfg(unix)]
@@ -153,7 +180,7 @@ fn lock(home: &Home) -> Result<File> {
         .open(home.file(LOCK))?;
     file.try_lock()
         .context("another schedule command is running")?;
-    Ok(file)
+    Ok(ScheduleLock(file))
 }
 
 fn save<T: Serialize>(home: &Home, name: &str, value: &T) -> Result<()> {
@@ -446,9 +473,6 @@ fn register(job: &Job, install: bool) -> Result<()> {
 }
 
 pub(crate) async fn run(home: &Home, command: Command) -> Result<()> {
-    if let Command::Probe { address } = &command {
-        return probe_blocking(address);
-    }
     let _lock = lock(home)?;
     let absolute = std::fs::canonicalize(&home.0)?;
     let home = Home(absolute);
@@ -476,19 +500,11 @@ pub(crate) async fn run(home: &Home, command: Command) -> Result<()> {
             collector,
             vpn_probe,
         } => {
-            report::collector_url(&collector)?;
-            probe_address(&vpn_probe)?;
+            let config = Config::new(collector, vpn_probe)?;
             home.enrolment()?;
             crate::DeviceKey::load(&home.0)?;
             let job = Job::new(&std::env::current_exe()?, &home.0)?;
-            save(
-                &home,
-                CONFIG,
-                &Config {
-                    collector,
-                    vpn_probe,
-                },
-            )?;
+            save(&home, CONFIG, &config)?;
             save(&home, STATE, &State::default())?;
             register(&job, true)?;
             println!(
@@ -840,7 +856,7 @@ mod tests {
 
     #[tokio::test]
     async fn vpn_probe_connects_to_a_listening_port() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         assert!(vpn_up(&address.to_string()).await);
         drop(listener);
@@ -851,7 +867,7 @@ mod tests {
     async fn scheduled_run_persists_connectivity_and_keeps_failed_reconnect_due() {
         let dir = tempfile::tempdir().unwrap();
         let home = Home(dir.path().to_path_buf());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let probe = listener.local_addr().unwrap().to_string();
         save(
             &home,
@@ -885,6 +901,83 @@ mod tests {
         let disconnected: State = home.read_json(STATE).unwrap().unwrap();
         assert!(!disconnected.vpn_up);
         assert_eq!(disconnected.last_success, connected.last_success);
+    }
+
+    #[tokio::test]
+    async fn hostname_probe_without_home() {
+        const ADDRESS: &str = "OPEN_PACT_TEST_PROBE_ADDRESS";
+        if let Ok(address) = std::env::var(ADDRESS) {
+            assert!(std::env::var_os("HOME").is_none());
+            let cli = <crate::Cli as clap::Parser>::try_parse_from([
+                "open-pact-client",
+                "schedule",
+                "probe",
+                "--address",
+                &address,
+            ])
+            .unwrap();
+            assert_eq!(
+                crate::run(cli).await.unwrap(),
+                std::process::ExitCode::SUCCESS
+            );
+            return;
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "schedule::tests::hostname_probe_without_home",
+                "--nocapture",
+            ])
+            .env_remove("HOME")
+            .env(
+                ADDRESS,
+                format!("localhost:{}", listener.local_addr().unwrap().port()),
+            )
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn default_probe_uses_collector_host_and_port() {
+        for (collector, expected) in [
+            (
+                "https://collector.example.org/status",
+                "collector.example.org:443",
+            ),
+            (
+                "https://collector.example.org:8443/status",
+                "collector.example.org:8443",
+            ),
+            ("https://[::1]:8443/status", "[::1]:8443"),
+        ] {
+            let config = Config::new(collector.into(), None).unwrap();
+            assert_eq!(config.vpn_probe, expected);
+        }
+        let config = Config::new(
+            "https://collector.example.org/status".into(),
+            Some("vpn.example.org:9443".into()),
+        )
+        .unwrap();
+        assert_eq!(config.vpn_probe, "vpn.example.org:9443");
+    }
+
+    #[test]
+    fn dropping_guard_unlocks_even_with_an_inherited_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+        let guard = lock(&home).unwrap();
+        let inherited = guard.0.try_clone().unwrap();
+        assert!(lock(&home).is_err());
+        drop(guard);
+        assert!(lock(&home).is_ok());
+        drop(inherited);
     }
 
     #[test]

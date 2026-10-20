@@ -219,15 +219,17 @@ The collector receives the compact JWS as `application/jose`. It must verify ES2
 
 ## Schedule reports while the VPN is connected
 
-Install a user job with an address reachable through your VPN:
+Install a user job with an internal collector address reachable only through your VPN:
 
 ```sh
-open-pact-client schedule install --collector https://collector.example.org/status --vpn-probe vpn.example.org:443
+open-pact-client schedule install --collector https://collector.internal.example.org/status
 open-pact-client schedule uninstall
 ```
 
 Use the same `--home` for installation and removal. Keep the binary at its installed path. The scheduler runs under your OS user account. macOS uses a launchd LaunchAgent. Linux uses a systemd user timer and requires a running user manager. Windows uses Task Scheduler. These jobs run without a separate open-pact daemon. No job exists until you run `schedule install`.
 
-Every five minutes, the job tries a TCP connection to `--vpn-probe`, with a two-second timeout that includes name resolution. A successful connection means VPN connectivity for this check. Choose an address that is unavailable outside the VPN. The job sends on the first observed connection and then when at least 55 minutes have passed since the last acknowledgement. The job checks the probe again after it prepares the report and before it starts the collector request. It sends nothing if either probe fails. DNS runs in a child process that the parent kills at the two-second deadline. A disconnect and reconnect entirely between two probes is not observed. A failed send retries on a later run. A lost acknowledgement can cause a duplicate report on retry. If the clock moves behind the last acknowledgement time, the next connected run retries and resets that time.
+The collector must have an internal address that is reachable only through the VPN. VPN routing makes off-VPN sends impossible. A public collector cannot meet this requirement, even with a separate VPN probe. A probe can succeed just before the VPN disconnects.
+
+Every five minutes, the job tries a TCP connection to the collector host and port, with a two-second timeout that includes name resolution. HTTPS uses port 443 unless the collector URL gives another port. Use `--vpn-probe host:port` to override this target. Choose a probe address that is unavailable outside the VPN. A successful connection records connectivity for this check. The job sends on the first observed connection and then when at least 55 minutes have passed since the last acknowledgement. The job checks the probe again after it prepares the report and before it starts the collector request. It sends nothing if either probe fails. DNS runs in a child process that the parent kills at the two-second deadline. A disconnect and reconnect entirely between two probes is not observed. A failed send retries on a later run. A lost acknowledgement can cause a duplicate report on retry. If the clock moves behind the last acknowledgement time, the next connected run retries and resets that time.
 
 The client home holds `report-schedule.json`, `report-state.json`, and `report-schedule.lock`. The state records the last observed VPN state, a pending reconnect report, and the last acknowledged report time. A lock prevents overlapping runs. Reinstallation replaces this home's job and resets its report state. Each home has a separate job name. `schedule uninstall` removes the OS job, its generated files, its configuration, and its report state. The reusable lock file remains. `stop` prints the removal command with the home path quoted for POSIX shells, or PowerShell on Windows. On Unix, new scheduler homes have mode `0700`. Configuration and state files have mode `0600`, or keep stricter owner permissions on replacement. Collector request errors omit the URL so query tokens do not enter the error log.
