@@ -412,6 +412,13 @@ fn windows_browser(browser: &Value) -> Protection {
     };
     match browser.get("kind").and_then(Value::as_str) {
         Some("firefox") => {
+            if policy.get("policies").is_some_and(|v| !v.is_object())
+                || policy
+                    .pointer("/policies/Preferences")
+                    .is_some_and(|v| !v.is_object())
+            {
+                return Protection::Unknown;
+            }
             let Some(text) = browser.get("prefs").and_then(Value::as_str) else {
                 return Protection::Unknown;
             };
@@ -515,6 +522,11 @@ mod tests {
         firefox["policy"]["policies"]["Preferences"]["browser.safebrowsing.phishing.enabled"]["Status"] =
             json!("user");
         assert_eq!(windows_browser(&firefox), Protection::Off);
+        firefox["policy"] = json!({"policies":{"Preferences":false}});
+        assert_eq!(windows_browser(&firefox), Protection::Unknown);
+        firefox["policy"] = json!({"policies":false});
+        assert_eq!(windows_browser(&firefox), Protection::Unknown);
+        firefox["policy"] = json!({});
         firefox["prefs"] = json!("user_pref(\"browser.safebrowsing.phishing.enabled\", bad);");
         assert_eq!(windows_browser(&firefox), Protection::Unknown);
     }
