@@ -706,13 +706,14 @@ using System;
 using System.Runtime.InteropServices;
 public static class OpenPactNative {
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true, EntryPoint = "MoveFileExW")]
-    public static extern bool MoveFileEx(string existing, string destination, int flags);
+    private static extern bool MoveFileEx(string existing, string destination, int flags);
+    public static bool QueueDelete(string existing) { return MoveFileEx(existing, null, 4); }
 }
 '@
     }
     $pending = "$binary.delete-$([Guid]::NewGuid().ToString('N'))"
     [IO.File]::Move($binary,$pending)
-    if (-not [OpenPactNative]::MoveFileEx($pending,$null,4)) {
+    if (-not [OpenPactNative]::QueueDelete($pending)) {
         $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
         try { [IO.File]::Move($pending,$binary) } catch {}
         throw (New-Object ComponentModel.Win32Exception($errorCode))
