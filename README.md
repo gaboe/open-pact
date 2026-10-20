@@ -234,7 +234,7 @@ All checks run read-only as the device owner. Each external command has a three-
 | `antimalware_full_scan_age_days` | `n/a` | `unknown`, no reliable clamscan full-scan record |
 | `antimalware_detections_7d` | `unknown`, unified-log events have no verified detection schema or retention guarantee | `unknown` |
 | `antimalware_last_detection_hours` | `unknown`, same unified-log limitation | `unknown` |
-| `web_protection` | Safari, Chrome, Edge, Brave and Firefox profiles and readable managed policies | `unknown` |
+| `web_protection` | Chrome, Edge, Brave and Firefox profiles and readable managed policies. Safari is not checked because its settings need Full Disk Access. | `unknown` |
 | `local_log_retention_days` | `n/a`, unified log retention is size-based | Age of the oldest readable system journal entry; permission warnings mean `unknown` |
 | `process_audit`, `powershell_logging` | `n/a` | `n/a` |
 | `log_cleared_hours` | `n/a` | `n/a` |
@@ -243,7 +243,7 @@ Windows registers these additional controls with `unknown` helpers pending its i
 
 `antimalware_active` now checks XProtect instead of Gatekeeper. This is a breaking mechanism change. [Apple describes XProtect as macOS antivirus technology](https://support.apple.com/guide/security/protecting-against-malware-sec469d47bd8/web). The signature-age reader matches `CFBundleShortVersionString` with an `XProtectPlistConfigData` receipt in `InstallHistory.plist`. It uses the matching receipt date because a bundle build date or file modification date does not establish when definitions were installed.
 
-Web protection is `on` only when every installed supported browser is on. Any known disabled browser gives `off`. Otherwise an unreadable browser gives `unknown`, and a local diagnostic names that browser. Missing preference keys use browser defaults. Safari container access can require user-granted file access. The reader does not request access or change settings. Browser installations outside standard system and user Applications directories and profiles stored outside standard browser data directories are not discovered.
+Web protection is `on` only when every installed supported browser is on. Any known disabled browser gives `off`. Otherwise an unreadable browser gives `unknown`, and a local diagnostic names that browser. Missing preference keys use browser defaults. Safari is not checked because its settings need Full Disk Access. If no supported browser is installed, the value is `n/a`. Browser installations outside standard system and user Applications directories and profiles stored outside standard browser data directories are not discovered.
 
 Integer outputs can declare `values = ["n/a"]`, `values = ["none"]`, or both beside `integer`. Only these two additional text values are allowed. They must be unique. An OS can require a declared text value. Numeric requirements do not accept text values. Adding a text value expands disclosure and requires consent. For example:
 

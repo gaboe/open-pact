@@ -15,7 +15,7 @@ const COMPLIANT: &[(&str, &[&str])] = &[
     ("antimalware_full_scan_age_days", &["n/a"]),
     ("antimalware_detections_7d", &[]),
     ("antimalware_last_detection_hours", &["none"]),
-    ("web_protection", &["on"]),
+    ("web_protection", &["on", "n/a"]),
     ("local_log_retention_days", &["n/a"]),
     ("process_audit", &["on", "n/a"]),
     ("powershell_logging", &["on", "n/a"]),
@@ -119,6 +119,9 @@ pub fn fix_hint(check: &str, value: &str, os: Os) -> Option<&'static str> {
         ("antimalware_signature_age_days", Os::Linux) => {
             Some("Update the ClamAV daily database with freshclam.")
         }
+        ("web_protection", Os::Macos) => Some(
+            "Enable Safe Browsing in every installed Chrome, Edge, Brave, or Firefox browser. Safari is not checked because its settings need Full Disk Access.",
+        ),
         ("web_protection", _) => Some(
             "Enable fraudulent website warnings or Safe Browsing in every installed browser. Check managed policies too.",
         ),

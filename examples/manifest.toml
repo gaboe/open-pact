@@ -133,7 +133,7 @@ grace = "1d"
 id = "web_protection"
 source = "company_policy"
 check = "builtin:web_protection@1"
-output = ["on", "off", "unknown"]
+output = ["on", "off", "unknown", "n/a"]
 required = {}
 grace = "1d"
 

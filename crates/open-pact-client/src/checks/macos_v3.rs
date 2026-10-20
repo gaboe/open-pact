@@ -1,6 +1,6 @@
 use std::fs;
 
-use chrono::{NaiveDate, Utc};
+use chrono::{DateTime, Utc};
 use open_pact_core::ControlValue;
 use serde_json::Value;
 
@@ -75,7 +75,17 @@ fn parse_xprotect(disabled: &str, service: Option<&str>) -> &'static str {
     }
     match service {
         // An on-demand daemon can be idle between scans. It must still be registered.
-        Some(text) if text.contains(SCAN_SERVICE) && text.contains("program = ") => "yes",
+        Some(text)
+            if text.contains(SCAN_SERVICE)
+                && text.contains("program = ")
+                && !text.lines().map(str::trim).any(|line| {
+                    line.strip_prefix("last exit code = ")
+                        .is_some_and(|code| code.parse::<i32>() != Ok(0))
+                        || line == "state = spawn scheduled"
+                }) =>
+        {
+            "yes"
+        }
         _ => "unknown",
     }
 }
@@ -97,10 +107,10 @@ pub fn antimalware_signature_age_days() -> ControlValue {
     let Some(history) = command("/usr/bin/plutil", &["-p", HISTORY]) else {
         return "unknown".into();
     };
-    parse_signature_age(&history, version.trim(), Utc::now().date_naive())
+    parse_signature_age(&history, version.trim(), Utc::now())
 }
 
-fn parse_signature_age(history: &str, installed_version: &str, today: NaiveDate) -> ControlValue {
+fn parse_signature_age(history: &str, installed_version: &str, now: DateTime<Utc>) -> ControlValue {
     if !history.trim_start().starts_with('[') || !history.trim_end().ends_with(']') {
         return "unknown".into();
     }
@@ -114,9 +124,9 @@ fn parse_signature_age(history: &str, installed_version: &str, today: NaiveDate)
             name = "";
             version = "";
         } else if let Some(value) = line.strip_prefix("\"date\" => ") {
-            date = value
-                .get(..10)
-                .and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok());
+            date = DateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S %z")
+                .ok()
+                .map(|date| date.with_timezone(&Utc));
         } else if let Some(value) = line.strip_prefix("\"displayName\" => ") {
             name = value.trim_matches('"');
         } else if let Some(value) = line.strip_prefix("\"displayVersion\" => ") {
@@ -127,7 +137,7 @@ fn parse_signature_age(history: &str, installed_version: &str, today: NaiveDate)
     }
     last.map_or_else(
         || "unknown".into(),
-        |day| bounded_age((today - day).num_days(), 3650),
+        |date| bounded_age((now - date).num_days(), 3650),
     )
 }
 
@@ -221,7 +231,10 @@ mod tests {
     #[test]
     fn failed_xprotect_scan_is_not_healthy() {
         let service = "system/com.apple.XProtect.daemon.scan = {\n program = /Library/Apple/System/Library/CoreServices/XProtect.app/Contents/MacOS/XProtect\n state = spawn scheduled\n last exit code = 78\n}";
-        assert_ne!(parse_xprotect("disabled services = {\n}\n", Some(service)), "yes");
+        assert_eq!(
+            parse_xprotect("disabled services = {\n}\n", Some(service)),
+            "unknown"
+        );
     }
     #[test]
     fn signature_receipt_must_match_installed_definitions() {
@@ -237,17 +250,21 @@ mod tests {
     "displayVersion" => "163"
   }
 ]"#;
-        let now = NaiveDate::from_ymd_opt(2026, 10, 20).unwrap();
+        let now = DateTime::parse_from_rfc3339("2026-10-20T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
         assert_eq!(
             parse_signature_age(history, "5367", now),
-            ControlValue::Integer(6)
+            ControlValue::Integer(5)
         );
         assert_eq!(parse_signature_age(history, "5366", now), "unknown");
         assert_eq!(
             parse_signature_age(
                 history,
                 "5367",
-                NaiveDate::from_ymd_opt(2026, 10, 1).unwrap()
+                DateTime::parse_from_rfc3339("2026-10-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc)
             ),
             "unknown"
         );
@@ -258,7 +275,7 @@ mod tests {
         let history = "[\n 0 => {\n \"date\" => 2026-10-19 23:59:00 +0000\n \"displayName\" => \"XProtectPlistConfigData\"\n \"displayVersion\" => \"5367\"\n }\n]";
         let now = chrono::DateTime::parse_from_rfc3339("2026-10-20T00:01:00Z").unwrap();
         assert_eq!(
-            parse_signature_age(history, "5367", now.date_naive()),
+            parse_signature_age(history, "5367", now.with_timezone(&Utc)),
             ControlValue::Integer(0)
         );
     }

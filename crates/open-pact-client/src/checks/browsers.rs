@@ -50,18 +50,14 @@ fn flag(value: Option<&Value>) -> Protection {
     }
 }
 
-fn chromium(prefs: &Value, policy: &Value, edge: bool) -> Protection {
+fn chromium(prefs: &Value, policy: &Value, recommended: &Value, edge: bool) -> Protection {
     let key = if edge {
         "SmartScreenEnabled"
     } else {
         "SafeBrowsingEnabled"
     };
     if !edge && let Some(level) = policy.get("SafeBrowsingProtectionLevel") {
-        return match level.as_i64() {
-            Some(0) => Protection::Off,
-            Some(1 | 2) => Protection::On,
-            _ => Protection::Unknown,
-        };
+        return protection_level(level);
     }
     if let Some(value) = policy.get(key) {
         return flag(Some(value));
@@ -71,7 +67,21 @@ fn chromium(prefs: &Value, policy: &Value, edge: bool) -> Protection {
     } else {
         "/safebrowsing/enabled"
     };
-    flag(prefs.pointer(pointer))
+    if let Some(value) = prefs.pointer(pointer) {
+        return flag(Some(value));
+    }
+    if !edge && let Some(level) = recommended.get("SafeBrowsingProtectionLevel") {
+        return protection_level(level);
+    }
+    Protection::On
+}
+
+fn protection_level(value: &Value) -> Protection {
+    match value.as_i64() {
+        Some(0) => Protection::Off,
+        Some(1 | 2) => Protection::On,
+        _ => Protection::Unknown,
+    }
 }
 
 fn profiles(root: &Path, firefox: bool) -> Result<Vec<PathBuf>, ()> {
@@ -80,6 +90,7 @@ fn profiles(root: &Path, firefox: bool) -> Result<Vec<PathBuf>, ()> {
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(vec![]),
         Err(_) => return Err(()),
     };
+    let canonical_root = root.canonicalize().map_err(|_| ())?;
     let mut found = vec![];
     for entry in entries {
         let entry = entry.map_err(|_| ())?;
@@ -91,6 +102,14 @@ fn profiles(root: &Path, firefox: bool) -> Result<Vec<PathBuf>, ()> {
         if kind.is_symlink() {
             if profile {
                 return Err(());
+            }
+            let path = entry.path();
+            if path.join("Preferences").try_exists().map_err(|_| ())? {
+                let target = path.canonicalize().map_err(|_| ())?;
+                if !target.starts_with(&canonical_root) || !target.is_dir() {
+                    return Err(());
+                }
+                found.push(path);
             }
             continue;
         }
@@ -135,42 +154,40 @@ fn managed(domain: &str, home: &Path) -> Result<Value, ()> {
     Ok(Value::Object(result))
 }
 
-fn safari(home: &Path) -> Protection {
-    let Ok(policy) = managed("com.apple.Safari", home) else {
-        return Protection::Unknown;
-    };
-    if let Some(value) = policy.get("WarnAboutFraudulentWebsites") {
-        return flag(Some(value));
+fn recommended(domain: &str, home: &Path) -> Result<Value, ()> {
+    let mut result = optional_json(
+        &PathBuf::from(format!("/Library/Preferences/{domain}.plist")),
+        true,
+    )?;
+    let user = optional_json(
+        &home.join(format!("Library/Preferences/{domain}.plist")),
+        true,
+    )?;
+    for (key, value) in user.as_object().ok_or(())? {
+        result[key] = value.clone();
     }
-    let files = [
-        "Library/Preferences/com.apple.Safari.plist",
-        "Library/Containers/com.apple.Safari/Data/Library/Preferences/com.apple.Safari.plist",
-    ];
-    let mut states = vec![];
-    for file in files {
-        states.push(match optional_json(&home.join(file), true) {
-            Ok(v) => flag(v.get("WarnAboutFraudulentWebsites")),
-            Err(()) => Protection::Unknown,
-        });
-    }
-    merge(&states)
+    Ok(result)
 }
 
 fn chromium_browser(home: &Path, data: &str, domain: &str, edge: bool) -> Protection {
     let Ok(policy) = managed(domain, home) else {
         return Protection::Unknown;
     };
+    let Ok(recommended) = recommended(domain, home) else {
+        return Protection::Unknown;
+    };
     let Ok(dirs) = profiles(&home.join("Library/Application Support").join(data), false) else {
         return Protection::Unknown;
     };
     if dirs.is_empty() {
-        return chromium(&Value::Object(Map::new()), &policy, edge);
+        return chromium(&Value::Object(Map::new()), &policy, &recommended, edge);
     }
     let states: Vec<_> = dirs
         .iter()
         .map(|dir| {
-            optional_json(&dir.join("Preferences"), false)
-                .map_or(Protection::Unknown, |v| chromium(&v, &policy, edge))
+            optional_json(&dir.join("Preferences"), false).map_or(Protection::Unknown, |v| {
+                chromium(&v, &policy, &recommended, edge)
+            })
         })
         .collect();
     merge(&states)
@@ -229,17 +246,26 @@ fn firefox_state(prefs: &Map<String, Value>, policy: &Value) -> Protection {
                         .and_then(Value::as_str)
                         .unwrap_or("default")
                     {
-                        "locked" | "user" => Some(value),
+                        "locked" => Some(value),
+                        "user" => prefs.get(*key).or(Some(value)),
                         "default" => prefs.get(*key).or(Some(value)),
                         _ => return Protection::Unknown,
                     }
                 }
                 other => other.or_else(|| prefs.get(*key)),
             };
-            flag(value)
+            firefox_flag(value)
         })
         .collect();
     merge(&states)
+}
+
+fn firefox_flag(value: Option<&Value>) -> Protection {
+    match value.and_then(Value::as_i64) {
+        Some(0) => Protection::Off,
+        Some(1) => Protection::On,
+        _ => flag(value),
+    }
 }
 
 fn standard_firefox_profiles(ini: &str) -> bool {
@@ -301,13 +327,23 @@ fn firefox(home: &Path, app: &Path) -> Protection {
     merge(&states)
 }
 
+fn web_protection(states: &[Protection]) -> &'static str {
+    if states.is_empty() {
+        return "n/a";
+    }
+    match merge(states) {
+        Protection::On => "on",
+        Protection::Off => "off",
+        Protection::Unknown => "unknown",
+    }
+}
+
 pub fn macos() -> &'static str {
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
         return "unknown";
     };
     let mut states = vec![];
     for (name, data, domain, edge) in [
-        ("Safari", "", "", false),
         ("Google Chrome", "Google/Chrome", "com.google.Chrome", false),
         (
             "Microsoft Edge",
@@ -337,10 +373,10 @@ pub fn macos() -> &'static str {
                 }
                 Ok(_) => (),
             }
-            let state = match name {
-                "Safari" => safari(&home),
-                "Firefox" => firefox(&home, &app),
-                _ => chromium_browser(&home, data, domain, edge),
+            let state = if name == "Firefox" {
+                firefox(&home, &app)
+            } else {
+                chromium_browser(&home, data, domain, edge)
             };
             if state == Protection::Unknown {
                 eprintln!("web_protection: {name} settings are unreadable or unsupported");
@@ -348,11 +384,7 @@ pub fn macos() -> &'static str {
             states.push(state);
         }
     }
-    match merge(&states) {
-        Protection::On => "on",
-        Protection::Off => "off",
-        Protection::Unknown => "unknown",
-    }
+    web_protection(&states)
 }
 
 #[cfg(test)]
@@ -361,28 +393,46 @@ mod tests {
     use serde_json::json;
     #[test]
     fn chromium_defaults_and_policy_precedence() {
-        assert_eq!(chromium(&json!({}), &json!({}), false), Protection::On);
-        let off = json!({"safebrowsing":{"enabled":false}});
-        assert_eq!(chromium(&off, &json!({}), false), Protection::Off);
         assert_eq!(
-            chromium(&off, &json!({"SafeBrowsingEnabled":true}), false),
+            chromium(&json!({}), &json!({}), &json!({}), false),
+            Protection::On
+        );
+        let off = json!({"safebrowsing":{"enabled":false}});
+        assert_eq!(
+            chromium(&off, &json!({}), &json!({}), false),
+            Protection::Off
+        );
+        assert_eq!(
+            chromium(
+                &off,
+                &json!({"SafeBrowsingEnabled":true}),
+                &json!({}),
+                false
+            ),
             Protection::On
         );
         assert_eq!(
             chromium(
                 &json!({}),
                 &json!({"SafeBrowsingEnabled":true,"SafeBrowsingProtectionLevel":0}),
+                &json!({}),
                 false
             ),
             Protection::Off
         );
         assert_eq!(
-            chromium(&json!({}), &json!({"SafeBrowsingProtectionLevel":3}), false),
+            chromium(
+                &json!({}),
+                &json!({"SafeBrowsingProtectionLevel":3}),
+                &json!({}),
+                false
+            ),
             Protection::Unknown
         );
         assert_eq!(
             chromium(
                 &json!({"edge":{"smartscreen":{"enabled":false}}}),
+                &json!({}),
                 &json!({}),
                 true
             ),
@@ -418,6 +468,21 @@ mod tests {
         assert_eq!(merge(&[]), Protection::Unknown);
         assert_eq!(flag(Some(&json!("false"))), Protection::Unknown);
     }
+
+    #[test]
+    fn safari_only_is_not_applicable() {
+        assert_eq!(web_protection(&[]), "n/a");
+    }
+
+    #[test]
+    fn safari_and_chrome_on_is_on() {
+        assert_eq!(web_protection(&[Protection::On]), "on");
+    }
+
+    #[test]
+    fn safari_and_firefox_off_is_off() {
+        assert_eq!(web_protection(&[Protection::Off]), "off");
+    }
     #[test]
     fn managed_defaults_do_not_hide_a_disabled_firefox_preference() {
         let prefs =
@@ -446,10 +511,8 @@ mod tests {
 
     #[test]
     fn user_firefox_policy_does_not_hide_current_disabled_preference() {
-        let prefs = firefox_prefs(
-            "user_pref(\"browser.safebrowsing.malware.enabled\", false);",
-        )
-        .unwrap();
+        let prefs =
+            firefox_prefs("user_pref(\"browser.safebrowsing.malware.enabled\", false);").unwrap();
         let policy = json!({"policies":{"Preferences":{"browser.safebrowsing.malware.enabled":{"Value":true,"Status":"user"}}}});
         assert_eq!(firefox_state(&prefs, &policy), Protection::Off);
     }
@@ -479,7 +542,12 @@ mod tests {
         assert!(optional_json(&file, false).is_err());
         fs::write(&file, r#"{"safebrowsing":{"enabled":false}}"#).unwrap();
         assert_eq!(
-            chromium(&optional_json(&file, false).unwrap(), &json!({}), false),
+            chromium(
+                &optional_json(&file, false).unwrap(),
+                &json!({}),
+                &json!({}),
+                false
+            ),
             Protection::Off
         );
     }
