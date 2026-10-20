@@ -133,4 +133,21 @@ mod tests {
         );
         assert!(start.elapsed() < Duration::from_secs(6));
     }
+
+    #[cfg(windows)]
+    #[test]
+    fn explicit_timeout_kills_a_hanging_program_on_windows() {
+        let timeout = Duration::from_millis(200);
+        let start = Instant::now();
+        assert_eq!(
+            run_with_timeout(
+                "powershell.exe",
+                &["-NoProfile", "-Command", "Start-Sleep -Seconds 30"],
+                timeout
+            ),
+            None
+        );
+        assert!(start.elapsed() >= timeout);
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
 }
