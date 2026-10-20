@@ -317,10 +317,12 @@ Windows collects the controls in one cached PowerShell batch. A missing source, 
 | `web_protection` | Explorer SmartScreen plus Chrome, Edge, Brave, and Firefox preferences and HKLM/HKCU policies | Registry and browser-profile read access |
 | `local_log_retention_days` | Shorter age of the oldest Security and System records | SYSTEM or elevated administrator |
 | `process_audit` | Native Process Creation audit-policy success flag and command-line policy | SYSTEM or elevated administrator |
-| `powershell_logging` | Windows PowerShell ScriptBlockLogging policy, machine before current user | Registry read access |
+| `powershell_logging` | Windows PowerShell ScriptBlockLogging policy, machine before interactive users, weakest user policy wins | Registry read access |
 | `log_cleared_hours` | Latest Security event 1102 or System event 104; `none` after both readable logs have no matching event | SYSTEM or elevated administrator |
 
 Defender metrics require Defender in Normal mode with its antivirus and service enabled. Other antivirus providers return `unknown` for these metrics. Detection values describe retained Defender history, not proof that a device has never had malware. Standard users get `unknown` for the controls that enforce elevation. Access failures also return `unknown`.
+
+On Windows, `preboot_auth`, `local_log_retention_days`, `process_audit`, and `log_cleared_hours` need SYSTEM or an elevated administrator. The `web_protection` check also needs SYSTEM to read browser settings for other user profiles. Install the report task with `schedule install --system` to run these checks as SYSTEM. The task reads Windows settings and reports their values. It does not change those settings.
 
 Windows `screen_lock` uses a machine inactivity limit first. Otherwise it reads the effective screen-saver policy before local desktop settings. It requires a positive timer, secure mode, and an existing `.scr` file. As SYSTEM, it reads the HKU hives of interactive users. The weakest readable user setting decides. Missing users, unloaded hives, and unreadable evidence return `unknown`.
 
@@ -363,14 +365,16 @@ The collector receives the compact JWS as `application/jose`. It must verify ES2
 
 ## Schedule reports while the VPN is connected
 
-Install a user job with an internal collector address reachable only through your VPN:
+Install a report job with an internal collector address reachable only through your VPN:
 
 ```sh
 open-pact-client schedule install --collector https://collector.internal.example.org/status
 open-pact-client schedule uninstall
 ```
 
-Use the same `--home` for installation and removal. Keep the binary at its installed path. The scheduler runs under your OS user account. macOS uses a launchd LaunchAgent. Linux uses a systemd user timer and requires a running user manager. Windows uses Task Scheduler. These jobs run without a separate open-pact daemon. No job exists until you run `schedule install`.
+Use the same `--home` for installation and removal. Uninstall can remove the job after its home directory is missing when you pass the same absolute path. Keep the binary at its installed path. By default, the task runs under your OS user account. macOS uses a launchd LaunchAgent. Linux uses a systemd user timer and requires a running user manager. Windows uses Task Scheduler. These jobs run without a separate open-pact daemon. No job exists until you run `schedule install`.
+
+On Windows, run `schedule install --system --collector https://collector.internal.example.org/status` from an elevated prompt to create a SYSTEM task with the highest run level. The installer copies the client into `%ProgramFiles%\open-pact\open-pact-client.exe` and refuses a directory that non-administrators can write. SYSTEM reads configuration, enrolment, manifest, and device key from the selected user's absolute `--home` path. It refuses reparse-point files. SYSTEM keeps its lock and report state under `%ProgramData%\open-pact\system\<home hash>`, with access limited to SYSTEM and Administrators. Choose a Windows home path without `%`. Run `schedule uninstall --system` from an elevated prompt with the same `--home`. Removal keeps the shared binary while another SYSTEM open-pact task remains. Without `--system`, Windows keeps the current-user, limited task. Other operating systems reject `--system`.
 
 The collector must have an internal address that is reachable only through the VPN. VPN routing makes off-VPN sends impossible. A public collector cannot meet this requirement, even with a separate VPN probe. A probe can succeed just before the VPN disconnects.
 
@@ -378,4 +382,6 @@ Every five minutes, the job tries a TCP connection to the collector host and por
 
 On Windows, the job also sends after Security event 1102 clears the Security log or Microsoft Defender records a new detection. The task user must belong to the built-in `Event Log Readers` group to read the Security log. A SYSTEM task can also read it. Without either access, only the antimalware trigger works. The first successful read of each event source after install, upgrade, or when that source becomes readable sets its baseline and sends no event report. Later event updates are saved only after the collector acknowledges the report. The job sends at most one extra report per five-minute run. macOS and Linux keep their current schedule.
 
-The client home holds `report-schedule.json`, `report-state.json`, and `report-schedule.lock`. The state records the last observed VPN state, a pending reconnect report, the last acknowledged report time, and Windows event times. A lock prevents overlapping runs. Reinstallation replaces this home's job and resets its report state. Each home has a separate job name. `schedule uninstall` removes the OS job, its generated files, its configuration, and its report state. The reusable lock file remains. `stop` prints the removal command with the home path quoted for POSIX shells, or PowerShell on Windows. On Unix, new scheduler homes have mode `0700`. Configuration and state files have mode `0600`, or keep stricter owner permissions on replacement. Collector request errors omit the URL so query tokens do not enter the error log.
+The client home holds `report-schedule.json`. Limited jobs also keep `report-state.json` and `report-schedule.lock` there. SYSTEM jobs keep `report-state.json` in their protected state directory and use a sibling `<home hash>.lock` file. The state records the last observed VPN state, a pending reconnect report, the last acknowledged report time, and Windows event times. A lock prevents overlapping runs. Reinstallation replaces this home's job and resets its report state. Each home has a separate job name. `schedule uninstall` removes the limited OS job, its generated files, and its user-home configuration and report state. On Windows, this mode never accesses protected ProgramData or Program Files paths. It refuses a SYSTEM task or a denied task query and asks you to run `schedule uninstall --system` from an elevated prompt.
+
+Windows `schedule uninstall --system` requires elevation. It removes this home's task, whether SYSTEM or limited, and its protected state directory under the state lock. A held state lock leaves the task in place and asks you to retry. Cleanup uses the files that remain, so it also works after a failed removal, a replacement limited task, or a missing home. When no SYSTEM task remains, it removes pending binary leftovers and renames the shared binary for deletion at the next reboot. It lists remaining files and returns an error while cleanup remains incomplete, including queued files that still exist. Retry from an elevated prompt after the binary stops or after reboot. Lock files remain. `stop` prints the removal command with the home path quoted for POSIX shells, or PowerShell on Windows. On Unix, new scheduler homes have mode `0700`. Configuration and state files have mode `0600`, or keep stricter owner permissions on replacement. Collector request errors omit the URL so query tokens do not enter the error log.

@@ -31,7 +31,9 @@ impl DeviceKey {
             #[cfg(not(target_os = "macos"))]
             bail!("{} needs a Mac's Secure Enclave", blob_path.display());
         }
-        Ok(Self::Software(dev_key::load(&home.join(SOFTWARE_FILE))?))
+        let bytes = crate::read_home_file(&home.join(SOFTWARE_FILE))?;
+        let pem = std::str::from_utf8(&bytes)?;
+        Ok(Self::Software(dev_key::from_pem(pem)?))
     }
 
     /// Reuses the key on disk. A new key goes into the Secure Enclave when there is one, unless `software`.

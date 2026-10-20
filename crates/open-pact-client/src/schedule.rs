@@ -1,5 +1,5 @@
 use std::fs::{File, OpenOptions};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -21,11 +21,21 @@ pub(crate) enum Command {
         collector: String,
         #[arg(long)]
         vpn_probe: Option<String>,
+        /// Run Windows checks as SYSTEM to read machine-wide settings
+        #[arg(long)]
+        system: bool,
     },
     /// Remove the report job, its configuration and report state
-    Uninstall,
+    Uninstall {
+        /// Remove Windows SYSTEM state and the shared protected binary
+        #[arg(long)]
+        system: bool,
+    },
     #[command(hide = true)]
-    Run,
+    Run {
+        #[arg(long)]
+        system: bool,
+    },
     #[command(hide = true)]
     Probe {
         #[arg(long)]
@@ -250,6 +260,23 @@ impl Drop for ScheduleLock {
     }
 }
 
+fn lock_path(path: &Path) -> Result<ScheduleLock> {
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)?;
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            bail!("another schedule command is running");
+        }
+        Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+    }
+    Ok(ScheduleLock(file))
+}
+
 fn lock(home: &Home) -> Result<ScheduleLock> {
     let mut directory = std::fs::DirBuilder::new();
     directory.recursive(true);
@@ -259,15 +286,29 @@ fn lock(home: &Home) -> Result<ScheduleLock> {
         directory.mode(0o700);
     }
     directory.create(&home.0)?;
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(home.file(LOCK))?;
-    file.try_lock()
-        .context("another schedule command is running")?;
-    Ok(ScheduleLock(file))
+    lock_path(&home.file(LOCK))
+}
+
+fn lock_system_state(home: &Home) -> Result<ScheduleLock> {
+    let parent = home.0.parent().context("SYSTEM state parent is missing")?;
+    let mut directory = std::fs::DirBuilder::new();
+    directory.recursive(true);
+    directory.create(parent)?;
+    let lock = home.0.with_extension("lock");
+    match lock_path(&lock) {
+        Ok(lock) => Ok(lock),
+        Err(error)
+            if error
+                .to_string()
+                .contains("another schedule command is running") =>
+        {
+            Err(error).context("SYSTEM report state is in use; retry this command")
+        }
+        Err(error) => Err(error).context(format!(
+            "cannot lock SYSTEM report state at {}; run from an elevated prompt",
+            home.0.display()
+        )),
+    }
 }
 
 fn save<T: Serialize>(home: &Home, name: &str, value: &T) -> Result<()> {
@@ -355,6 +396,24 @@ struct Job {
     argv: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TaskRunAs {
+    CurrentUser,
+    System,
+}
+
+#[derive(Clone, Copy)]
+enum RegistrationAction {
+    Install(TaskRunAs),
+    Uninstall,
+}
+
+impl RegistrationAction {
+    fn installs(self) -> bool {
+        matches!(self, Self::Install(_))
+    }
+}
+
 impl Job {
     fn new(executable: &Path, home: &Path) -> Result<Self> {
         let id = format!(
@@ -421,8 +480,8 @@ impl Job {
         )
     }
 
-    fn schtasks_install(&self) -> Vec<String> {
-        vec![
+    fn schtasks_install(&self, run_as: TaskRunAs) -> Vec<String> {
+        let mut args = vec![
             "/Create".into(),
             "/TN".into(),
             self.id.clone(),
@@ -436,10 +495,18 @@ impl Job {
                 .map(|arg| windows_arg(arg))
                 .collect::<Vec<_>>()
                 .join(" "),
-            "/RL".into(),
-            "LIMITED".into(),
-            "/F".into(),
-        ]
+        ];
+        match run_as {
+            TaskRunAs::CurrentUser => args.extend(["/RL".into(), "LIMITED".into()]),
+            TaskRunAs::System => args.extend([
+                "/RU".into(),
+                "SYSTEM".into(),
+                "/RL".into(),
+                "HIGHEST".into(),
+            ]),
+        }
+        args.push("/F".into());
+        args
     }
 }
 
@@ -448,11 +515,20 @@ fn execute(program: &str, args: &[&str]) -> Result<()> {
         .args(args)
         .output()
         .with_context(|| format!("start {program}"))?;
+    command_result(program, output)
+}
+
+fn command_result(program: &str, output: std::process::Output) -> Result<()> {
     if !output.status.success() {
-        bail!(
-            "{program} failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        if program == "schtasks.exe" {
+            bail!(
+                "schtasks.exe failed with code {:?}; run from an elevated prompt. {stderr} {stdout}",
+                output.status.code()
+            );
+        }
+        bail!("{program} failed: {}", stderr);
     }
     Ok(())
 }
@@ -461,6 +537,56 @@ fn user_home() -> Result<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .context("HOME is not set")
+}
+
+fn schedule_home(path: &Path, allow_missing: bool) -> Result<PathBuf> {
+    match std::fs::canonicalize(path) {
+        Ok(path) => Ok(path),
+        Err(error) if allow_missing && error.kind() == std::io::ErrorKind::NotFound => {
+            let absolute = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                std::env::current_dir()?.join(path)
+            };
+            let absolute = normalize_absolute_path(&absolute);
+            let mut existing = absolute.clone();
+            let mut missing = Vec::new();
+            let canonical = loop {
+                match std::fs::canonicalize(&existing) {
+                    Ok(path) => break path,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        if let Some(name) = existing.file_name() {
+                            missing.push(name.to_os_string());
+                            existing.pop();
+                        } else {
+                            return Err(error).context("resolve schedule home");
+                        }
+                    }
+                    Err(error) => return Err(error).context("resolve schedule home"),
+                }
+            };
+            let mut normalized = canonical;
+            for component in missing.iter().rev() {
+                normalized.push(component);
+            }
+            Ok(normalized)
+        }
+        Err(error) => Err(error).context("resolve schedule home"),
+    }
+}
+
+fn normalize_absolute_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            component => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
 }
 
 fn systemd_dir() -> Result<PathBuf> {
@@ -491,7 +617,7 @@ fn remove_if_exists(path: &Path) -> Result<()> {
     }
 }
 
-fn register(job: &Job, install: bool) -> Result<()> {
+fn register(job: &Job, action: RegistrationAction) -> Result<()> {
     match crate::current_os()? {
         open_pact_core::Os::Macos => {
             let path = user_home()?
@@ -507,7 +633,7 @@ fn register(job: &Job, install: bool) -> Result<()> {
             if loaded {
                 execute("launchctl", &["bootout", &target])?;
             }
-            if install {
+            if action.installs() {
                 std::fs::create_dir_all(path.parent().context("LaunchAgents directory")?)?;
                 std::fs::write(&path, job.plist())?;
                 execute("launchctl", &["bootstrap", &domain, text(&path)?])?;
@@ -520,7 +646,7 @@ fn register(job: &Job, install: bool) -> Result<()> {
             let service = dir.join(format!("{}.service", job.id));
             let timer = dir.join(format!("{}.timer", job.id));
             let timer_name = format!("{}.timer", job.id);
-            if install {
+            if action.installs() {
                 std::fs::create_dir_all(&dir)?;
                 std::fs::write(&service, job.service())?;
                 std::fs::write(&timer, job.timer())?;
@@ -537,89 +663,507 @@ fn register(job: &Job, install: bool) -> Result<()> {
                 execute("systemctl", &["--user", "daemon-reload"])?;
             }
         }
-        open_pact_core::Os::Windows => {
-            if install {
-                let args = job.schtasks_install();
+        open_pact_core::Os::Windows => match action {
+            RegistrationAction::Install(run_as) => {
+                let args = job.schtasks_install(run_as);
                 execute(
                     "schtasks.exe",
                     &args.iter().map(String::as_str).collect::<Vec<_>>(),
                 )?;
-            } else {
-                let exists = std::process::Command::new("schtasks.exe")
-                    .args(["/Query", "/TN", &job.id])
-                    .output()?
-                    .status
-                    .success();
-                if exists {
-                    execute("schtasks.exe", &["/Delete", "/TN", &job.id, "/F"])?;
-                }
             }
+            RegistrationAction::Uninstall => {
+                windows_uninstall(job, false)?;
+            }
+        },
+    }
+    Ok(())
+}
+
+fn validate_windows_home(home: &Path) -> Result<()> {
+    if text(home)?.contains('%') {
+        bail!("choose a home path without %");
+    }
+    Ok(())
+}
+
+fn powershell_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn windows_powershell(script: &str) -> Result<String> {
+    let script =
+        format!("[Console]::OutputEncoding = New-Object Text.UTF8Encoding($false);\n{script}");
+    let output = std::process::Command::new("powershell.exe")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &script,
+        ])
+        .output()
+        .context("start Windows scheduler helper")?;
+    if !output.status.success() {
+        bail!(
+            "Windows scheduler helper failed with code {:?}; run from an elevated prompt. {} {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+}
+
+const PROTECTED_DIRECTORY: &str = r#"
+$ErrorActionPreference = 'Stop'
+function AssertProtected($path) {
+    $item = Get-Item -LiteralPath $path -Force
+    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Protected path is a reparse point' }
+    $acl = if ($item.PSIsContainer) { [IO.Directory]::GetAccessControl($path) } else { [IO.File]::GetAccessControl($path) }
+    $allowed = @('S-1-5-18','S-1-5-32-544','S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
+    $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+    if ($allowed -notcontains $owner) { throw 'Protected path has a non-admin owner' }
+    foreach ($rule in $acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])) {
+        if ($rule.AccessControlType -eq 'Allow' -and -not ($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) -and ($rule.FileSystemRights -band 0xD0156) -and $allowed -notcontains $rule.IdentityReference.Value) {
+            throw 'Protected path ACL grants write or modify to a non-admin principal'
         }
+    }
+}
+function ProgramFilesPath { [Environment]::GetFolderPath('ProgramFiles') }
+function IsAdminOwner($owner) {
+    if (@('S-1-5-18','S-1-5-32-544') -contains $owner) { return $true }
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    return $identity.User.Value -eq $owner -and $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+function ProtectedDirectory($path) {
+    if (-not [IO.Directory]::Exists($path)) {
+        $acl = New-Object Security.AccessControl.DirectorySecurity
+        $acl.SetAccessRuleProtection($true,$false)
+        $acl.SetOwner((New-Object Security.Principal.SecurityIdentifier('S-1-5-32-544')))
+        foreach ($sid in @('S-1-5-18','S-1-5-32-544')) {
+            $identity = New-Object Security.Principal.SecurityIdentifier($sid)
+            $rule = New-Object Security.AccessControl.FileSystemAccessRule($identity,'FullControl','ContainerInherit,ObjectInherit','None','Allow')
+            $acl.AddAccessRule($rule)
+        }
+        [void][IO.Directory]::CreateDirectory($path,$acl)
+    }
+    AssertProtected $path
+}
+function ResetSystemStateDirectory($path) {
+    if (-not [IO.Directory]::Exists($path)) {
+        ProtectedDirectory $path
+        return
+    }
+    $item = Get-Item -LiteralPath $path -Force
+    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Protected path is a reparse point' }
+    $acl = [IO.Directory]::GetAccessControl($path)
+    $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+    if (-not (IsAdminOwner $owner)) { throw 'Protected path has a non-admin owner' }
+    $acl.SetAccessRuleProtection($true,$false)
+    foreach ($rule in @($acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]))) {
+        [void]$acl.RemoveAccessRuleAll($rule)
+    }
+    foreach ($sid in @('S-1-5-18','S-1-5-32-544')) {
+        $identity = New-Object Security.Principal.SecurityIdentifier($sid)
+        $rule = New-Object Security.AccessControl.FileSystemAccessRule($identity,'FullControl','ContainerInherit,ObjectInherit','None','Allow')
+        [void]$acl.AddAccessRule($rule)
+    }
+    $acl.SetOwner((New-Object Security.Principal.SecurityIdentifier('S-1-5-32-544')))
+    [IO.Directory]::SetAccessControl($path,$acl)
+    AssertProtected $path
+}
+function RemovePendingDeletes($path, $strict = $false) {
+    if (-not [IO.Directory]::Exists($path)) { return }
+    $failed = [Collections.Generic.List[string]]::new()
+    $errorMode = if ($strict) { 'Stop' } else { 'SilentlyContinue' }
+    Get-ChildItem -LiteralPath $path -Filter 'open-pact-client.exe.delete-*' -File -Force -ErrorAction $errorMode | ForEach-Object {
+        try { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop } catch { [void]$failed.Add($_.FullName) }
+    }
+    if ($strict -and $failed.Count -gt 0) { throw "could not remove SYSTEM binary leftovers: $($failed -join ', ')" }
+}
+function IsSystemTask($task) {
+    $user = $task.Definition.Principal.UserId
+    return @('SYSTEM','NT AUTHORITY\SYSTEM','S-1-5-18') -contains $user.ToUpperInvariant()
+}
+function QueueBinaryRemoval($binary) {
+    if (-not ('OpenPactNative' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class OpenPactNative {
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true, EntryPoint = "MoveFileExW")]
+    private static extern bool MoveFileEx(string existing, string destination, int flags);
+    public static bool QueueDelete(string existing) { return MoveFileEx(existing, null, 4); }
+}
+'@
+    }
+    $pending = "$binary.delete-$([Guid]::NewGuid().ToString('N'))"
+    [IO.File]::Move($binary,$pending)
+    if (-not [OpenPactNative]::QueueDelete($pending)) {
+        $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        try { [IO.File]::Move($pending,$binary) } catch {}
+        throw (New-Object ComponentModel.Win32Exception($errorCode))
+    }
+}
+"#;
+
+fn windows_protected_paths(home: &Home, copy_binary: bool) -> Result<(PathBuf, PathBuf)> {
+    let absolute = &home.0;
+    validate_windows_home(absolute)?;
+    let hash = hex::encode(Sha256::digest(text(absolute)?.as_bytes()));
+    let source = powershell_literal(text(&std::env::current_exe()?)?);
+    let script = format!(
+        r#"{PROTECTED_DIRECTORY}
+$program = ProgramFilesPath
+AssertProtected $program
+$install = Join-Path $program 'open-pact'
+ProtectedDirectory $install
+$binary = Join-Path $install 'open-pact-client.exe'
+if (Test-Path -LiteralPath $binary) {{ AssertProtected $binary }}
+if ({copy}) {{
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {{ exit 5 }}
+    RemovePendingDeletes $install
+    if ([IO.Path]::GetFullPath({source}) -ne $binary) {{ Copy-Item -LiteralPath {source} -Destination $binary -Force }}
+    AssertProtected $binary
+}}
+$data = Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'open-pact'
+ProtectedDirectory $data
+$data = Join-Path $data 'system'
+ProtectedDirectory $data
+$data = Join-Path $data '{hash}'
+ResetSystemStateDirectory $data
+Write-Output $binary
+Write-Output $data
+"#,
+        copy = if copy_binary { "$true" } else { "$false" },
+    );
+    let paths = windows_powershell(&script)?;
+    let mut lines = paths.lines();
+    let binary = PathBuf::from(lines.next().context("protected binary path missing")?);
+    let state = PathBuf::from(lines.next().context("protected state path missing")?);
+    if lines.next().is_some() {
+        bail!("unexpected protected path output");
+    }
+    Ok((binary, state))
+}
+
+fn windows_task_query_script(job: &Job) -> String {
+    format!(
+        r#"$ErrorActionPreference = 'Stop'
+function IsSystemTask($task) {{
+    $user = $task.Definition.Principal.UserId
+    return @('SYSTEM','NT AUTHORITY\SYSTEM','S-1-5-18') -contains $user.ToUpperInvariant()
+}}
+$service = New-Object -ComObject 'Schedule.Service'
+$service.Connect()
+$folder = $service.GetFolder('\')
+try {{ $task = $folder.GetTask({id}) }} catch {{
+    $failure = $_.Exception
+    while ($null -ne $failure.InnerException) {{ $failure = $failure.InnerException }}
+    if (($failure.HResult -band 0xffff) -ne 2) {{ throw }}
+    $task = $null
+}}
+"#,
+        id = powershell_literal(&job.id)
+    )
+}
+
+fn windows_require_elevation() -> Result<()> {
+    windows_powershell(
+        r#"$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$principal = New-Object Security.Principal.WindowsPrincipal($identity)
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    throw 'run `schedule uninstall --system` from an elevated prompt'
+}"#,
+    )?;
+    Ok(())
+}
+
+fn windows_uninstall_script(job: &Job, system: bool) -> String {
+    let query = windows_task_query_script(job);
+    format!(
+        r#"{query}
+if (-not {system} -and $null -ne $task -and (IsSystemTask $task)) {{
+    throw 'run `schedule uninstall --system` from an elevated prompt'
+}}
+if ($null -ne $task) {{ $folder.DeleteTask({id},0) }}
+try {{
+    $task = $folder.GetTask({id})
+}} catch {{
+    $failure = $_.Exception
+    while ($null -ne $failure.InnerException) {{ $failure = $failure.InnerException }}
+    if (($failure.HResult -band 0xffff) -eq 2) {{ return }}
+    throw
+}}
+throw 'scheduled task remains: {name}'
+"#,
+        system = if system { "$true" } else { "$false" },
+        id = powershell_literal(&job.id),
+        name = job.id,
+    )
+}
+
+fn windows_uninstall(job: &Job, system: bool) -> Result<()> {
+    windows_powershell(&windows_uninstall_script(job, system))
+        .context("run `schedule uninstall --system` from an elevated prompt")?;
+    Ok(())
+}
+
+fn windows_existing_system_state(home: &Path) -> Result<Option<PathBuf>> {
+    validate_windows_home(home)?;
+    let hash = hex::encode(Sha256::digest(text(home)?.as_bytes()));
+    let output = windows_powershell(&format!(
+        r#"{PROTECTED_DIRECTORY}
+$data = Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'open-pact'
+$system = Join-Path $data 'system'
+$state = Join-Path $system '{hash}'
+if (Test-Path -LiteralPath $state) {{
+    AssertProtected $data
+    AssertProtected $system
+    AssertProtected $state
+    Write-Output $state
+}}
+"#
+    ))?;
+    Ok(if output.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(output))
+    })
+}
+
+fn windows_cleanup_binary(job: &Job) -> Result<()> {
+    let query = windows_task_query_script(job);
+    let output = windows_powershell(&format!(
+        r#"{PROTECTED_DIRECTORY}
+{query}
+$install = Join-Path (ProgramFilesPath) 'open-pact'
+if (-not (Test-Path -LiteralPath $install)) {{ return }}
+AssertProtected $install
+$remaining = @($folder.GetTasks(1) | Where-Object {{ $_.Name.StartsWith('org.open-pact.report.') -and (IsSystemTask $_) }})
+if ($remaining.Count -gt 0) {{
+    Write-Output 'Kept the shared SYSTEM binary because another SYSTEM task remains.'
+    return
+}}
+$failure = $null
+try {{
+    RemovePendingDeletes $install $true
+    $binary = Join-Path $install 'open-pact-client.exe'
+    if (Test-Path -LiteralPath $binary) {{
+        AssertProtected $binary
+        QueueBinaryRemoval $binary
+        Write-Output 'The SYSTEM client binary is queued for removal at the next reboot.'
+    }}
+}} catch {{ $failure = $_.Exception.Message }}
+$leftovers = @(Get-ChildItem -LiteralPath $install -Filter 'open-pact-client.exe*' -File -Force -ErrorAction Stop)
+if ($leftovers.Count -gt 0) {{
+    throw "SYSTEM files remain: $($leftovers.FullName -join ', '). $failure Retry schedule uninstall --system, or reboot for queued files."
+}}
+if ($null -ne $failure) {{ throw $failure }}
+"#
+    ))?;
+    if !output.is_empty() {
+        println!("{output}");
+    }
+    Ok(())
+}
+
+fn windows_system_uninstall(job: &Job, home: &Home) -> Result<()> {
+    let state = windows_existing_system_state(&home.0)?;
+    let _state_lock = state
+        .as_ref()
+        .map(|path| lock_system_state(&Home(path.clone())))
+        .transpose()
+        .context("SYSTEM uninstall stopped before task or binary cleanup")?;
+    let mut failures = Vec::new();
+    if let Err(error) = windows_uninstall(job, true) {
+        failures.push(format!("task {}: {error:#}", job.id));
+    }
+    if let Some(state) = state
+        && let Err(error) = std::fs::remove_dir_all(&state)
+    {
+        failures.push(format!(
+            "SYSTEM report state remains at {}: {error}",
+            state.display()
+        ));
+    }
+    if let Err(error) = windows_cleanup_binary(job) {
+        failures.push(format!("{error:#}"));
+    }
+    if !failures.is_empty() {
+        bail!("SYSTEM cleanup incomplete:\n{}", failures.join("\n"));
+    }
+    Ok(())
+}
+
+fn validate_system_install(system: bool, os: open_pact_core::Os) -> Result<()> {
+    if system && os != open_pact_core::Os::Windows {
+        bail!("schedule install --system is available only on Windows");
+    }
+    Ok(())
+}
+
+async fn run_report(
+    home: &Home,
+    state_home: &Home,
+    config: &Config,
+    read_events: impl FnOnce() -> checks::EventMarkerReads,
+) -> Result<()> {
+    let mut state: State = state_home.read_json(STATE)?.unwrap_or_default();
+    state.observe(vpn_up(&config.vpn_probe).await);
+    save(state_home, STATE, &state)?;
+    let events = if state.vpn_up {
+        read_events()
+    } else {
+        checks::EventMarkerReads::default()
+    };
+    let now = chrono::Utc::now().timestamp();
+    if state.should_send(now) || state.should_send_events(events) {
+        let acknowledged =
+            report::run_scheduled(home, &config.collector, &config.vpn_probe).await?;
+        state.sent(acknowledged, chrono::Utc::now().timestamp(), events);
+        save(state_home, STATE, &state)?;
+    } else if !state.baseline().security_log_cleared || !state.baseline().antimalware_detection {
+        state.establish_baseline(events);
+        save(state_home, STATE, &state)?;
     }
     Ok(())
 }
 
 pub(crate) async fn run(home: &Home, command: Command) -> Result<()> {
-    let _lock = lock(home)?;
-    let absolute = std::fs::canonicalize(&home.0)?;
+    let os = crate::current_os()?;
+    if let Command::Install { system, .. } = &command
+        && *system
+    {
+        validate_system_install(true, os)?;
+    }
+    let system_run = matches!(&command, Command::Run { system: true });
+    if system_run {
+        validate_system_install(true, os)?;
+    }
+    let uninstall = matches!(&command, Command::Uninstall { .. });
+    let absolute = schedule_home(&home.0, uninstall)?;
     let home = Home(absolute);
+    let system_install = matches!(&command, Command::Install { system: true, .. });
+    if let Command::Install {
+        collector,
+        vpn_probe,
+        system: true,
+    } = &command
+    {
+        Config::new(collector.clone(), vpn_probe.clone())?;
+        home.enrolment()?;
+        crate::DeviceKey::load(&home.0)?;
+        validate_windows_home(&home.0)?;
+    }
+    let system_uninstall = matches!(&command, Command::Uninstall { system: true });
+    if system_uninstall {
+        validate_system_install(true, os)?;
+        windows_require_elevation()?;
+    }
+    let protected_paths = if os == open_pact_core::Os::Windows && (system_run || system_install) {
+        Some(windows_protected_paths(&home, system_install)?)
+    } else {
+        None
+    };
+    let state_home = protected_paths
+        .as_ref()
+        .map(|(_, state)| Home(state.clone()))
+        .unwrap_or_else(|| Home(home.0.clone()));
+    let home_exists = home.0.exists();
+    let _home_lock = if system_install {
+        Some(lock(&home)?)
+    } else {
+        None
+    };
+    let _lock = if system_run || system_install {
+        Some(lock_system_state(&state_home)?)
+    } else if !uninstall || home_exists {
+        Some(lock(&state_home)?)
+    } else {
+        None
+    };
     match command {
         Command::Probe { .. } => unreachable!(),
-        Command::Run => {
+        Command::Run { .. } => {
             let config: Config = home
                 .read_json(CONFIG)?
                 .context("report schedule is not installed")?;
             report::collector_url(&config.collector)?;
             probe_address(&config.vpn_probe)?;
-            let mut state: State = home.read_json(STATE)?.unwrap_or_default();
-            state.observe(vpn_up(&config.vpn_probe).await);
-            save(&home, STATE, &state)?;
-            let events = if state.vpn_up {
-                checks::event_markers()
-            } else {
-                checks::EventMarkerReads::default()
-            };
-            let now = chrono::Utc::now().timestamp();
-            if state.should_send(now) || state.should_send_events(events) {
-                let acknowledged =
-                    report::run_scheduled(&home, &config.collector, &config.vpn_probe).await?;
-                state.sent(acknowledged, chrono::Utc::now().timestamp(), events);
-                save(&home, STATE, &state)?;
-            } else if !state.baseline().security_log_cleared
-                || !state.baseline().antimalware_detection
-            {
-                state.establish_baseline(events);
-                save(&home, STATE, &state)?;
-            }
+            run_report(&home, &state_home, &config, checks::event_markers).await?;
         }
         Command::Install {
             collector,
             vpn_probe,
+            system,
         } => {
             let config = Config::new(collector, vpn_probe)?;
             home.enrolment()?;
             crate::DeviceKey::load(&home.0)?;
-            let job = Job::new(&std::env::current_exe()?, &home.0)?;
+            if os == open_pact_core::Os::Windows {
+                validate_windows_home(&home.0)?;
+            }
+            let (executable, install_state) = if system {
+                let (binary, state) = protected_paths
+                    .as_ref()
+                    .context("SYSTEM install paths were not prepared")?;
+                (binary.clone(), Home(state.clone()))
+            } else {
+                (std::env::current_exe()?, Home(home.0.clone()))
+            };
+            if os == open_pact_core::Os::Windows && text(&executable)?.contains('%') {
+                bail!("choose an executable path without %");
+            }
+            let mut job = Job::new(&executable, &home.0)?;
+            if system {
+                job.argv.push("--system".into());
+            }
             save(&home, CONFIG, &config)?;
-            save(&home, STATE, &State::default())?;
-            register(&job, true)?;
+            save(&install_state, STATE, &State::default())?;
+            let run_as = if system {
+                TaskRunAs::System
+            } else {
+                TaskRunAs::CurrentUser
+            };
+            register(&job, RegistrationAction::Install(run_as))?;
             println!(
                 "Installed {}. The OS checks VPN connectivity every five minutes.",
                 job.id
             );
         }
-        Command::Uninstall => {
+        Command::Uninstall { system } => {
             let job = Job::new(&std::env::current_exe()?, &home.0)?;
-            register(&job, false)?;
-            for name in [
-                CONFIG,
-                STATE,
-                "report-state.json.tmp",
-                "report-schedule.json.tmp",
-            ] {
-                remove_if_exists(&home.file(name))?;
+            if os == open_pact_core::Os::Windows {
+                if system {
+                    windows_system_uninstall(&job, &home)?;
+                } else {
+                    windows_uninstall(&job, false)?;
+                    println!(
+                        "SYSTEM leftovers, if any, are removed with schedule uninstall --system from an elevated prompt."
+                    );
+                }
+            } else {
+                register(&job, RegistrationAction::Uninstall)?;
             }
-            println!("Removed {} and its report configuration and state.", job.id);
+            if home_exists {
+                for name in [
+                    CONFIG,
+                    STATE,
+                    "report-state.json.tmp",
+                    "report-schedule.json.tmp",
+                ] {
+                    remove_if_exists(&home.file(name))?;
+                }
+            }
+            if home_exists {
+                println!("Removed {} and its report configuration and state.", job.id);
+            } else {
+                println!("Removed {}. The home directory does not exist.", job.id);
+            }
         }
     }
     Ok(())
@@ -628,6 +1172,281 @@ pub(crate) async fn run(home: &Home, command: Command) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_home_keeps_the_install_task_identifier() {
+        let dir = tempfile::tempdir().unwrap();
+        let home_path = dir.path().join("fictional-home");
+        std::fs::create_dir(&home_path).unwrap();
+        let install_home = schedule_home(&home_path, false).unwrap();
+        let install_job = Job::new(Path::new("client"), &install_home).unwrap();
+        std::fs::remove_dir(&home_path).unwrap();
+        let uninstall_home = schedule_home(&home_path, true).unwrap();
+        let uninstall_job = Job::new(Path::new("client"), &uninstall_home).unwrap();
+        assert_eq!(install_home, uninstall_home);
+        assert_eq!(install_job.id, uninstall_job.id);
+        assert!(!home_path.exists());
+    }
+
+    fn jobs_before_and_after_home_removal() -> (Job, Job) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fictional-home");
+        std::fs::create_dir(&path).unwrap();
+        let install = Job::new(Path::new("client"), &schedule_home(&path, false).unwrap()).unwrap();
+        std::fs::remove_dir(&path).unwrap();
+        let uninstall =
+            Job::new(Path::new("client"), &schedule_home(&path, true).unwrap()).unwrap();
+        assert!(!path.exists());
+        assert_eq!(install.id, uninstall.id);
+        (install, uninstall)
+    }
+
+    #[test]
+    fn launchd_label_uses_the_install_task_identifier() {
+        let (install, uninstall) = jobs_before_and_after_home_removal();
+        assert!(
+            uninstall
+                .plist()
+                .contains(&format!("<string>{}</string>", install.id))
+        );
+    }
+
+    #[test]
+    fn systemd_names_use_the_install_task_identifier() {
+        let (install, uninstall) = jobs_before_and_after_home_removal();
+        assert!(
+            uninstall
+                .timer()
+                .contains(&format!("Unit={}.service", install.id))
+        );
+    }
+
+    #[test]
+    fn schtasks_name_uses_the_install_task_identifier() {
+        let (install, uninstall) = jobs_before_and_after_home_removal();
+        assert_eq!(
+            uninstall.schtasks_install(TaskRunAs::CurrentUser)[2],
+            install.id
+        );
+    }
+
+    #[test]
+    fn windows_home_keeps_literal_percent_out_of_task_actions() {
+        let error = validate_windows_home(Path::new(r"C:\Example%USERNAME%\pact")).unwrap_err();
+        assert!(error.to_string().contains("choose a home path without %"));
+        validate_windows_home(Path::new(r"C:\Example user\pact")).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn localized_schtasks_failure_requires_elevation() {
+        let output = std::process::Command::new("sh")
+            .args(["-c", "echo 'CHYBA: Přístup byl odepřen.' >&2; exit 1"])
+            .output()
+            .unwrap();
+        let error = command_result("schtasks.exe", output).unwrap_err();
+        assert!(error.to_string().contains("run from an elevated prompt"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn uninstall_distinguishes_denied_missing_and_existing_tasks() {
+        let job = Job::new(Path::new("client.exe"), Path::new("fixture-home")).unwrap();
+        let action = windows_uninstall_script(&job, false);
+        let setup = r#"
+$script:deleted = $false
+$script:failure = 5
+$script:userId = 'EXAMPLE\user'
+$script:program = Join-Path $env:TEMP 'open-pact-fictional-program-files'
+function ProgramFilesPath { return $script:program }
+function AssertProtected($path) {}
+function RemovePendingDeletes($path, $strict = $false) {}
+function New-Object {
+    param([string]$ComObject)
+    if ($ComObject -ne 'Schedule.Service') { throw 'unexpected COM creation' }
+    $folder = [pscustomobject]@{}
+    $folder | Add-Member ScriptMethod GetTask {
+        param($id)
+        if ($script:deleted) { throw [Runtime.InteropServices.COMException]::new('missing', -2147024894) }
+        if ($script:failure -ne 0) { throw [Runtime.InteropServices.COMException]::new('Přístup byl odepřen', (0x80070000L + $script:failure - 0x100000000L)) }
+        return [pscustomobject]@{ Name = $id; Definition = [pscustomobject]@{ Principal = [pscustomobject]@{ UserId = $script:userId } } }
+    }
+    $folder | Add-Member ScriptMethod DeleteTask { param($id,$flags); $script:deleted = $true }
+    $folder | Add-Member ScriptMethod GetTasks { param($flags); return ,([pscustomobject]@{ Name = 'org.open-pact.report.other'; Definition = [pscustomobject]@{ Principal = [pscustomobject]@{ UserId = 'EXAMPLE\\user' } } }) }
+    $service = [pscustomobject]@{ Folder = $folder }
+    $service | Add-Member ScriptMethod Connect {}
+    $service | Add-Member ScriptMethod GetFolder { param($path); return $this.Folder }
+    return $service
+}
+
+"#;
+        let checks = r#"$script:failure = 0
+$script:userId = 'SYSTEM'
+$caught = $false
+try { & $action | Out-Null } catch { $caught = $_.Exception.Message -like '*schedule uninstall --system*' }
+if (-not $caught -or $script:deleted) { throw 'limited uninstall did not refuse SYSTEM task' }
+$script:userId = 'EXAMPLE\user'
+foreach ($code in @(5,2,0)) {
+    $script:failure = $code
+    $script:deleted = $false
+    $caught = $false
+    try { & $action | Out-Null } catch { $caught = $true; Write-Output $_.Exception.Message }
+    if ($code -eq 5 -and (-not $caught -or $script:deleted)) { throw 'denied query returned success or deleted' }
+    if ($code -eq 2 -and ($caught -or $script:deleted)) { throw 'missing task did not converge' }
+    if ($code -eq 0 -and ($caught -or -not $script:deleted)) { throw 'existing task not deleted' }
+    Write-Output "query_code=$code deleted=$script:deleted caught=$caught"
+}
+"#;
+        let script = format!("{setup}\n$action = {{\n{action}\n}}\n{checks}");
+        let output = windows_powershell(&script).unwrap();
+        assert!(output.contains("query_code=5 deleted=False caught=True"));
+        assert!(output.contains("query_code=2 deleted=False caught=False"));
+        assert!(output.contains("query_code=0 deleted=True caught=False"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn current_user_uninstall_ignores_an_admin_only_program_directory() {
+        let job = Job::new(Path::new("client.exe"), Path::new("fixture-home")).unwrap();
+        let action = windows_uninstall_script(&job, false);
+        let setup = r#"
+$script:deleted = $false
+$script:program = Join-Path $env:TEMP ('open-pact-fictional-program-' + [Guid]::NewGuid().ToString('N'))
+$install = Join-Path $script:program 'open-pact'
+$acl = [Security.AccessControl.DirectorySecurity]::new()
+$acl.SetAccessRuleProtection($true,$false)
+$acl.SetOwner([Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'))
+foreach ($sid in @('S-1-5-18','S-1-5-32-544')) {
+    $identity = [Security.Principal.SecurityIdentifier]::new($sid)
+    $rule = [Security.AccessControl.FileSystemAccessRule]::new($identity,'FullControl','ContainerInherit,ObjectInherit','None','Allow')
+    [void]$acl.AddAccessRule($rule)
+}
+[IO.Directory]::CreateDirectory($install,$acl) | Out-Null
+function ProgramFilesPath { return $script:program }
+function AssertProtected($path) { throw 'current-user uninstall checked an admin-only path' }
+function New-Object {
+    param([string]$ComObject)
+    if ($ComObject -ne 'Schedule.Service') { throw 'unexpected COM creation' }
+    $folder = [pscustomobject]@{}
+    $folder | Add-Member ScriptMethod GetTask { param($id); if ($script:deleted) { throw [Runtime.InteropServices.COMException]::new('missing', -2147024894) }; return [pscustomobject]@{ Name = $id; Definition = [pscustomobject]@{ Principal = [pscustomobject]@{ UserId = 'EXAMPLE\\user' } } } }
+    $folder | Add-Member ScriptMethod DeleteTask { param($id,$flags); $script:deleted = $true }
+    $folder | Add-Member ScriptMethod GetTasks { param($flags); return ,@() }
+    $service = [pscustomobject]@{ Folder = $folder }
+    $service | Add-Member ScriptMethod Connect {}
+    $service | Add-Member ScriptMethod GetFolder { param($path); return $this.Folder }
+    return $service
+}
+"#;
+        let checks = r#"& $action | Out-Null
+if (-not $script:deleted) { throw 'current-user task was not removed' }
+Write-Output 'limited_uninstall_removed_task_without_protected_access'
+"#;
+        let script = format!("{setup}\n$action = {{\n{action}\n}}\n{checks}");
+        assert_eq!(
+            windows_powershell(&script).unwrap(),
+            "limited_uninstall_removed_task_without_protected_access"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn system_state_acl_reset_removes_existing_read_access() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = powershell_literal(dir.path().join("readable-state").to_str().unwrap());
+        let script = format!(
+            r#"{PROTECTED_DIRECTORY}
+[IO.Directory]::CreateDirectory({path}) | Out-Null
+$acl = [IO.Directory]::GetAccessControl({path})
+$everyone = New-Object Security.Principal.SecurityIdentifier('S-1-1-0')
+$rule = New-Object Security.AccessControl.FileSystemAccessRule($everyone,'ReadAndExecute','ContainerInherit,ObjectInherit','None','Allow')
+[void]$acl.AddAccessRule($rule)
+[IO.Directory]::SetAccessControl({path},$acl)
+ResetSystemStateDirectory {path}
+$acl = [IO.Directory]::GetAccessControl({path})
+$sids = @($acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]) | ForEach-Object {{ $_.IdentityReference.Value }} | Sort-Object -Unique)
+if (-not $acl.AreAccessRulesProtected) {{ throw 'state ACL inherits from its parent' }}
+if (($sids -join ',') -ne 'S-1-5-18,S-1-5-32-544') {{ throw "unexpected state ACL principals: $($sids -join ',')" }}
+Write-Output 'state_acl_reset_to_system_and_administrators'
+"#
+        );
+        assert_eq!(
+            windows_powershell(&script).unwrap(),
+            "state_acl_reset_to_system_and_administrators"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_running_client_image_can_be_renamed() {
+        const READY: &str = "OPEN_PACT_RENAME_READY";
+        const STOP: &str = "OPEN_PACT_RENAME_STOP";
+        if let (Ok(ready), Ok(stop)) = (std::env::var(READY), std::env::var(STOP)) {
+            std::fs::write(ready, "ready").unwrap();
+            while !Path::new(&stop).exists() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("open-pact-client.exe");
+        let renamed = dir.path().join("open-pact-client.exe.delete-fictional");
+        std::fs::copy(std::env::current_exe().unwrap(), &image).unwrap();
+        let ready = dir.path().join("ready");
+        let stop = dir.path().join("stop");
+        let mut child = std::process::Command::new(&image)
+            .args([
+                "--exact",
+                "schedule::tests::a_running_client_image_can_be_renamed",
+                "--nocapture",
+            ])
+            .env(READY, &ready)
+            .env(STOP, &stop)
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if !ready.exists() {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("child test process did not start");
+        }
+        if let Err(error) = std::fs::rename(&image, &renamed) {
+            let _ = std::fs::write(&stop, "stop");
+            let _ = child.wait();
+            panic!("rename running client image: {error}");
+        }
+        let old_image_exists = image.exists();
+        let renamed_image_exists = renamed.exists();
+        std::fs::write(&stop, "stop").unwrap();
+        let child_succeeded = child.wait().unwrap().success();
+        assert!(!old_image_exists);
+        assert!(renamed_image_exists);
+        assert!(child_succeeded);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn system_storage_refuses_non_admin_writers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = powershell_literal(dir.path().join("protected").to_str().unwrap());
+        let script = format!(
+            r#"{PROTECTED_DIRECTORY}
+ProtectedDirectory {path}
+AssertProtected {path}
+$acl = [IO.Directory]::GetAccessControl({path})
+$everyone = New-Object Security.Principal.SecurityIdentifier('S-1-1-0')
+$acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($everyone,'Modify','Allow')))
+[IO.Directory]::SetAccessControl({path},$acl)
+try {{ AssertProtected {path}; throw 'unsafe ACL accepted' }} catch {{
+    if ($_.Exception.Message -notlike '*non-admin principal*') {{ throw }}
+}}
+Write-Output 'refused'
+"#
+        );
+        assert_eq!(windows_powershell(&script).unwrap(), "refused");
+    }
 
     fn enrolled_home(dir: &Path) -> Home {
         let home = Home(dir.to_path_buf());
@@ -658,6 +1477,18 @@ mod tests {
         )
         .unwrap();
         home
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "Windows CI prepares fictional homes for native CLI verification"]
+    fn prepare_windows_schedule_homes() {
+        let root = PathBuf::from(std::env::var_os("OPEN_PACT_SCHEDULE_FIXTURE").unwrap());
+        for name in ["limited", "system", "missing", "retry"] {
+            let path = root.join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            enrolled_home(&path);
+        }
     }
 
     #[tokio::test]
@@ -710,7 +1541,7 @@ mod tests {
             },
         )
         .unwrap();
-        let result = run(&home, Command::Run).await;
+        let result = run(&home, Command::Run { system: false }).await;
         close.join().unwrap();
         assert!(went_down.load(Ordering::SeqCst));
         assert!(!vpn_up(&probe_address).await);
@@ -1041,22 +1872,70 @@ mod tests {
     }
 
     #[test]
-    fn windows_task_runs_every_five_minutes_with_separate_arguments() {
+    fn windows_task_runs_every_five_minutes_as_the_current_user() {
         let job = Job::new(
             Path::new(r"C:\Example App\open-pact-client.exe"),
             Path::new(r"C:\Example User\pact"),
         )
         .unwrap();
-        let args = job.schtasks_install();
-        assert!(args.windows(4).any(|a| a == ["/SC", "MINUTE", "/MO", "5"]));
-        let tr = args.iter().position(|arg| arg == "/TR").unwrap();
         assert_eq!(
-            args[tr + 1],
-            r#""C:\Example App\open-pact-client.exe" "--home" "C:\Example User\pact" "schedule" "run""#
+            job.schtasks_install(TaskRunAs::CurrentUser),
+            vec![
+                "/Create",
+                "/TN",
+                job.id.as_str(),
+                "/SC",
+                "MINUTE",
+                "/MO",
+                "5",
+                "/TR",
+                r#""C:\Example App\open-pact-client.exe" "--home" "C:\Example User\pact" "schedule" "run""#,
+                "/RL",
+                "LIMITED",
+                "/F",
+            ]
         );
         assert_eq!(windows_arg("a\\"), "\"a\\\\\"");
         assert_eq!(windows_arg("a\"b"), "\"a\\\"b\"");
         assert!(Job::new(Path::new("/bin/client\nother"), Path::new("/home/example")).is_err());
+    }
+
+    #[test]
+    fn windows_system_task_runs_every_five_minutes_with_explicit_user_home() {
+        let job = Job::new(
+            Path::new(r"C:\Example App\open-pact-client.exe"),
+            Path::new(r"C:\Example User\pact"),
+        )
+        .unwrap();
+        assert_eq!(
+            job.schtasks_install(TaskRunAs::System),
+            vec![
+                "/Create",
+                "/TN",
+                job.id.as_str(),
+                "/SC",
+                "MINUTE",
+                "/MO",
+                "5",
+                "/TR",
+                r#""C:\Example App\open-pact-client.exe" "--home" "C:\Example User\pact" "schedule" "run""#,
+                "/RU",
+                "SYSTEM",
+                "/RL",
+                "HIGHEST",
+                "/F",
+            ]
+        );
+    }
+
+    #[test]
+    fn system_task_install_is_refused_on_non_windows() {
+        for os in [open_pact_core::Os::Macos, open_pact_core::Os::Linux] {
+            let error = validate_system_install(true, os).unwrap_err();
+            assert!(error.to_string().contains("available only on Windows"));
+            validate_system_install(false, os).unwrap();
+        }
+        validate_system_install(true, open_pact_core::Os::Windows).unwrap();
     }
 
     #[test]
@@ -1092,6 +1971,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn event_trigger_uses_system_state_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().join("user-home"));
+        let state_home = Home(
+            dir.path()
+                .join("ProgramData/open-pact/system/fictional-home"),
+        );
+        std::fs::create_dir_all(&home.0).unwrap();
+        std::fs::create_dir_all(&state_home.0).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let config = Config {
+            collector: "https://collector.example.org/status".into(),
+            vpn_probe: listener.local_addr().unwrap().to_string(),
+        };
+        save(
+            &state_home,
+            STATE,
+            &State {
+                vpn_up: true,
+                last_success: Some(chrono::Utc::now().timestamp()),
+                ..State::default()
+            },
+        )
+        .unwrap();
+        let events = |timestamp| checks::EventMarkerReads {
+            security_log_cleared: checks::EventMarkerRead::Read(Some(timestamp)),
+            antimalware_detection: checks::EventMarkerRead::Unknown,
+        };
+        run_report(&home, &state_home, &config, || events(100))
+            .await
+            .unwrap();
+        let baseline: State = state_home.read_json(STATE).unwrap().unwrap();
+        assert_eq!(
+            baseline.last_events.unwrap().security_log_cleared,
+            Some(100)
+        );
+        assert!(!baseline.should_send(chrono::Utc::now().timestamp()));
+        let error = run_report(&home, &state_home, &config, || events(101))
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("enrol"), "{error:#}");
+        let pending: State = state_home.read_json(STATE).unwrap().unwrap();
+        assert_eq!(pending.last_events, baseline.last_events);
+        assert!(pending.should_send_events(events(101)));
+        assert!(home.read_json::<State>(STATE).unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn scheduled_run_persists_connectivity_and_keeps_failed_reconnect_due() {
         let dir = tempfile::tempdir().unwrap();
         let home = Home(dir.path().to_path_buf());
@@ -1119,7 +2046,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            run(&home, Command::Run).await.is_err(),
+            run(&home, Command::Run { system: false }).await.is_err(),
             "no enrolment for report"
         );
         let connected: State = home.read_json(STATE).unwrap().unwrap();
@@ -1127,16 +2054,13 @@ mod tests {
         assert!(connected.reconnect_pending);
         assert!(connected.should_send(chrono::Utc::now().timestamp()));
         drop(listener);
-        save(
-            &home,
-            CONFIG,
-            &Config {
-                collector: "https://collector.example.org/status".into(),
-                vpn_probe: "127.0.0.1:1".into(),
-            },
-        )
-        .unwrap();
-        run(&home, Command::Run).await.unwrap();
+        let reserved = tokio::net::TcpSocket::new_v4().unwrap();
+        reserved.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let refused = reserved.local_addr().unwrap().to_string();
+        let mut config: Config = home.read_json(CONFIG).unwrap().unwrap();
+        config.vpn_probe = refused;
+        save(&home, CONFIG, &config).unwrap();
+        run(&home, Command::Run { system: false }).await.unwrap();
         let disconnected: State = home.read_json(STATE).unwrap().unwrap();
         assert!(!disconnected.vpn_up);
         assert_eq!(disconnected.last_success, connected.last_success);
@@ -1217,6 +2141,37 @@ mod tests {
         drop(guard);
         assert!(lock(&home).is_ok());
         drop(inherited);
+    }
+
+    #[test]
+    fn system_state_lock_allows_removal_of_the_locked_state_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state").join("fictional-hash");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(state.join(STATE), "{}").unwrap();
+        let home = Home(state.clone());
+        let guard = lock_system_state(&home).unwrap();
+        let error = lock_system_state(&home).err().unwrap();
+        assert!(error.to_string().contains("retry this command"));
+        std::fs::remove_dir_all(&state).unwrap();
+        drop(guard);
+        assert!(!state.exists());
+        assert!(dir.path().join("state/fictional-hash.lock").exists());
+    }
+
+    #[test]
+    fn limited_uninstall_never_includes_protected_path_operations() {
+        let job = Job::new(Path::new("client.exe"), Path::new("fixture-home")).unwrap();
+        let script = windows_uninstall_script(&job, false);
+        for forbidden in [
+            "ProgramFiles",
+            "CommonApplicationData",
+            "AssertProtected",
+            "ResetSystemStateDirectory",
+        ] {
+            assert!(!script.contains(forbidden), "{forbidden}");
+        }
+        assert!(script.contains("schedule uninstall --system"));
     }
 
     #[test]

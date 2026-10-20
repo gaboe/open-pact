@@ -174,6 +174,29 @@ fn interruption_point() {
     });
 }
 
+fn read_home_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    #[cfg(windows)]
+    {
+        use std::io::Read;
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(0x00200000) // FILE_FLAG_OPEN_REPARSE_POINT
+            .open(path)?;
+        if file.metadata()?.file_attributes() & 0x400 != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "home file is a reparse point",
+            ));
+        }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }
+    #[cfg(not(windows))]
+    std::fs::read(path)
+}
+
 impl Home {
     fn new(dir: Option<PathBuf>) -> Result<Home> {
         match dir {
@@ -191,7 +214,7 @@ impl Home {
 
     fn read_json<T: for<'de> Deserialize<'de>>(&self, name: &str) -> Result<Option<T>> {
         let path = self.file(name);
-        match std::fs::read(&path) {
+        match read_home_file(&path) {
             Ok(bytes) => Ok(Some(
                 serde_json::from_slice(&bytes).with_context(|| format!("{}", path.display()))?,
             )),
@@ -1692,6 +1715,34 @@ mod tests {
     use fake_gateway::{
         Company, DEMO_MANIFEST, FakeGateway, Witness, checkpoint_of, not_found, serve_log, snapshot,
     };
+
+    #[test]
+    fn home_reader_returns_file_bytes_and_missing_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data");
+        std::fs::write(&path, b"fixture").unwrap();
+        assert_eq!(read_home_file(&path).unwrap(), b"fixture");
+        assert_eq!(
+            read_home_file(&dir.path().join("missing"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn home_reader_refuses_reparse_point_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("file");
+        let link = dir.path().join("link");
+        std::fs::write(&file, b"fixture").unwrap();
+        std::os::windows::fs::symlink_file(&file, &link).unwrap();
+        assert_eq!(
+            read_home_file(&link).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
 
     /// A device enrolled at `gateway` under the demo manifest, with a certificate from an earlier check.
     fn enrolled_home(dir: &Path, gateway: &str, company: &Company) -> Home {
