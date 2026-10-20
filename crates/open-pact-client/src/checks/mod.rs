@@ -114,14 +114,8 @@ const MACOS: Registry = &[
         macos_v3::antimalware_signature_age_days,
     ),
     ("antimalware_full_scan_age_days", macos_v3::not_applicable),
-    (
-        "antimalware_detections_7d",
-        macos_v3::antimalware_detections_7d,
-    ),
-    (
-        "antimalware_last_detection_hours",
-        macos_v3::antimalware_last_detection_hours,
-    ),
+    ("antimalware_detections_7d", macos_v3::not_applicable),
+    ("antimalware_last_detection_hours", macos_v3::not_applicable),
     ("web_protection", macos_v3::web_protection),
     ("local_log_retention_days", macos_v3::not_applicable),
     ("process_audit", macos_v3::not_applicable),
@@ -236,6 +230,19 @@ mod tests {
     fn runs_only_the_requested_checks() {
         let ran = run(Os::Windows, &["firewall", "not_a_check"]);
         assert_eq!(ran.into_keys().collect::<Vec<_>>(), ["firewall"]);
+    }
+
+    #[test]
+    fn macos_detection_history_is_not_available() {
+        let values = run(
+            Os::Macos,
+            &[
+                "antimalware_detections_7d",
+                "antimalware_last_detection_hours",
+            ],
+        );
+        assert_eq!(values["antimalware_detections_7d"], "n/a");
+        assert_eq!(values["antimalware_last_detection_hours"], "n/a");
     }
 
     #[test]

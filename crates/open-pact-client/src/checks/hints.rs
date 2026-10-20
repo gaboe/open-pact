@@ -13,8 +13,8 @@ const COMPLIANT: &[(&str, &[&str])] = &[
     ("preboot_auth", &["user_secret"]),
     ("antimalware_signature_age_days", &[]),
     ("antimalware_full_scan_age_days", &["n/a"]),
-    ("antimalware_detections_7d", &[]),
-    ("antimalware_last_detection_hours", &["none"]),
+    ("antimalware_detections_7d", &["n/a"]),
+    ("antimalware_last_detection_hours", &["none", "n/a"]),
     ("web_protection", &["on", "n/a"]),
     ("local_log_retention_days", &["n/a"]),
     ("process_audit", &["on", "n/a"]),
@@ -189,6 +189,16 @@ mod tests {
     fn compliant_values_need_no_hint() {
         assert_eq!(fix_hint("disk_encryption", "full", Os::Macos), None);
         assert_eq!(fix_hint("auto_login", "off", Os::Linux), None);
+    }
+
+    #[test]
+    fn unavailable_detection_history_needs_no_hint() {
+        for check in [
+            "antimalware_detections_7d",
+            "antimalware_last_detection_hours",
+        ] {
+            assert_eq!(fix_hint(check, "n/a", Os::Macos), None);
+        }
     }
 
     #[test]

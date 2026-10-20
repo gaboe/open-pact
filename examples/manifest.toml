@@ -117,7 +117,7 @@ grace = "1d"
 id = "antimalware_detections_7d"
 source = "company_policy"
 check = "builtin:antimalware_detections_7d@1"
-output = { integer = { min = 0, max = 10000 } }
+output = { integer = { min = 0, max = 10000 }, values = ["n/a"] }
 required = {}
 grace = "1d"
 
@@ -125,7 +125,7 @@ grace = "1d"
 id = "antimalware_last_detection_hours"
 source = "company_policy"
 check = "builtin:antimalware_last_detection_hours@1"
-output = { integer = { min = 0, max = 8760 }, values = ["none"] }
+output = { integer = { min = 0, max = 8760 }, values = ["none", "n/a"] }
 required = {}
 grace = "1d"
 

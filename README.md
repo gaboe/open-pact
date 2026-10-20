@@ -291,7 +291,7 @@ The screen-lock output `"none"` means no screen lock. It replaces `"off"` in thi
 
 ## Additional security checks
 
-All checks are read-only. macOS and Linux checks run as the device owner. Windows checks support a SYSTEM scheduled task or an elevated administrator. Each external command has a three-second timeout, except the XProtect log query and the single Windows PowerShell batch, which each have a twenty-second timeout. Command output uses the C locale. Unsupported sources return `unknown`.
+All checks are read-only. macOS and Linux checks run as the device owner. Windows checks support a SYSTEM scheduled task or an elevated administrator. Each external command has a three-second timeout, except the single Windows PowerShell batch, which has a twenty-second timeout. Command output uses the C locale. Unsupported sources return `unknown`.
 
 | Control | macOS | Linux |
 | --- | --- | --- |
@@ -299,8 +299,8 @@ All checks are read-only. macOS and Linux checks run as the device owner. Window
 | `antimalware_active` | XProtect bundle and Remediator executable present, scan service registered and enabled | Existing ClamAV service check |
 | `antimalware_signature_age_days` | Whole days since the receipt for the installed XProtect definitions version | Age of the daily ClamAV CVD or CLD embedded timestamp in standard database directories |
 | `antimalware_full_scan_age_days` | `n/a` | `unknown`, no reliable clamscan full-scan record |
-| `antimalware_detections_7d` | `unknown`, unified-log events have no verified detection schema or retention guarantee | `unknown` |
-| `antimalware_last_detection_hours` | `unknown`, same unified-log limitation | `unknown` |
+| `antimalware_detections_7d` | `n/a`, Apple has no stable XProtect detection format and the seven-day log query takes over twenty seconds | `unknown` |
+| `antimalware_last_detection_hours` | `n/a`, Apple has no stable XProtect detection format and the seven-day log query takes over twenty seconds | `unknown` |
 | `web_protection` | Chrome, Edge, Brave and Firefox profiles and readable managed policies. Safari is not checked because its settings need Full Disk Access. | `unknown` |
 | `local_log_retention_days` | `n/a`, unified log retention is size-based | Age of the oldest readable system journal entry; permission warnings mean `unknown` |
 | `process_audit`, `powershell_logging` | `n/a` | `n/a` |

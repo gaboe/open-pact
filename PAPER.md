@@ -107,7 +107,7 @@ grace = "0d"
 
 An enumerated output may include `"n/a"`. Each OS requirement must explicitly accept it to pass. Screen lock uses `"none"` when there is no screen lock.
 
-An integer control declares `output = { integer = { min = 0, max = 3650 } }`. Both bounds are inclusive signed 32-bit integers. The bounds must be ordered. An integer output also permits the string `"unknown"`. Each OS requirement uses `{ max = 30 }` or `{ min = 90 }`, with one limit inside the declared range. Claims carry JSON integers, never numeric strings. Other types and values outside the range are refused. A smaller range is narrowing. Lowering a maximum, raising a minimum or switching comparison direction needs owner consent. Unknown values use `unknown_grace`. Manifest hashes remain SHA-256 of the exact TOML bytes. Claims retain JCS encoding.
+An integer control declares `output = { integer = { min = 0, max = 3650 } }`. Both bounds are inclusive signed 32-bit integers. The bounds must be ordered. An integer output also permits the string `"unknown"` and may declare `"n/a"` or `"none"` in `values`. Each OS requirement uses `{ max = 30 }` or `{ min = 90 }`, with one limit inside the declared range. Claims carry JSON integers, never numeric strings. Other types and values outside the range are refused. A smaller range is narrowing. Lowering a maximum, raising a minimum or switching comparison direction needs owner consent. Unknown values use `unknown_grace`. Manifest hashes remain SHA-256 of the exact TOML bytes. Claims retain JCS encoding.
 
 - **Outputs are enumerations or bounded integers.** `disk_encryption` discloses at most two bits. No disk names, partition lists or serial numbers.
 - **`check` refers only to checks compiled into the client.** There is no `builtin:shell` and no `builtin:osquery`. A new check means a new client release, public review and a new manifest. This is the technical answer to "how do you guarantee the configuration will not change after we agree".
@@ -416,6 +416,8 @@ check = "builtin:antimalware_active@1"   # Windows: Security Center; macOS: XPro
 # antimalware_full_scan_age_days, antimalware_detections_7d,
 # antimalware_last_detection_hours, web_protection, local_log_retention_days,
 # process_audit, powershell_logging, log_cleared_hours. See README for sources.
+# macOS reports n/a for both detection metrics because Apple has no stable
+# XProtect detection format and the seven-day query takes over twenty seconds.
 output = ["yes", "no", "unknown"]
 required = { macos = "yes", windows = "yes" }   # omitted on Linux
 grace = "3d"

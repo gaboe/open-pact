@@ -2,9 +2,8 @@ use std::fs;
 
 use chrono::{DateTime, Utc};
 use open_pact_core::ControlValue;
-use serde_json::Value;
 
-use super::exec::{run_status, run_with_timeout};
+use super::exec::run_status;
 
 const XPROTECT: &str =
     "/Library/Apple/System/Library/CoreServices/XProtect.bundle/Contents/Info.plist";
@@ -162,38 +161,6 @@ pub fn unknown() -> ControlValue {
     "unknown".into()
 }
 
-pub fn antimalware_detections_7d() -> ControlValue {
-    detection_log()
-}
-pub fn antimalware_last_detection_hours() -> ControlValue {
-    detection_log()
-}
-
-fn detection_log() -> ControlValue {
-    let output = run_with_timeout(
-        "/usr/bin/log",
-        &[
-            "show",
-            "--style",
-            "json",
-            "--last",
-            "7d",
-            "--info",
-            "--predicate",
-            "subsystem BEGINSWITH \"com.apple.XProtect\" OR process BEGINSWITH \"XProtectRemediator\"",
-        ],
-        std::time::Duration::from_secs(20),
-    );
-    parse_detection_log(output.as_deref())
-}
-
-fn parse_detection_log(output: Option<&str>) -> ControlValue {
-    // Apple does not publish a stable detection-event schema or guarantee seven days of
-    // retention. Empty, redacted, partial or unrecognized output cannot establish zero.
-    let _ = output.and_then(|s| serde_json::from_str::<Value>(s).ok());
-    "unknown".into()
-}
-
 pub fn web_protection() -> ControlValue {
     super::browsers::macos().into()
 }
@@ -294,17 +261,6 @@ mod tests {
         assert_eq!(parse_signature_age(history, "5367", now), "unknown");
     }
 
-    #[test]
-    fn log_absence_and_unverified_events_never_mean_zero() {
-        for out in [
-            None,
-            Some("[]"),
-            Some("log: Operation not permitted"),
-            Some(r#"[{"eventMessage":"<private>"}]"#),
-        ] {
-            assert_eq!(parse_detection_log(out), "unknown");
-        }
-    }
     #[test]
     fn explicit_platform_sentinels() {
         assert_eq!(not_applicable(), "n/a");
