@@ -95,11 +95,20 @@ Export is off by default. Configure one sink:
 | `GATEWAY_SIEM_SYSLOG_URL` | `tls://siem.example.com:6514`, with an explicit port. No credentials, path, query, or fragment. Plain TCP and UDP are refused. |
 | `GATEWAY_SIEM_CA` | Path to PEM CA certificates for that receiver. Only these CAs are trusted. The receiver certificate must match the URL hostname or IP address. |
 | `GATEWAY_SIEM_FILE` | Alternative sink. Append one JSON object per line to this path. Its parent directory must exist and be writable by the gateway. |
+| `GATEWAY_SIEM_FILE_MODE` | Optional file mode for new event files. Use `0600` for owner access or `0640` to opt in to group read. The default is `0600`. |
 | `GATEWAY_SIEM_RETENTION_DAYS` | Optional whole, nonnegative days. Startup warns when this exceeds the manifest's calendar `claim_retention`. |
 
-An invalid sink configuration disables export and logs a warning. It does not prevent the gateway from serving claims. Configuring both sinks is invalid. In Helm, set `siem.enabled=true`, `siem.syslogUrl`, `siem.caSecret.name`, and `siem.retentionDays`. The existing Secret's `siem.caSecret.key` defaults to `ca.pem`. The chart mounts it read-only. Restart the gateway after changing the CA Secret.
+An invalid sink configuration disables export and logs a warning. It does not prevent the gateway from serving claims. Configuring both sinks is invalid. The gateway is the only writer to a file sink. If a write fails after part of a line, the next attempt adds a newline before the retried event. The damaged prefix stays an invalid line.
 
-Claim handling queues the event without network or file writes. A separate thread retries failures after 1, 2, 4, 8, 16, 32, then 60 seconds. Connect, socket read, and socket write timeouts are 5 seconds. DNS resolution runs only in the delivery thread. The queue holds at most 1024 events, including the event being sent. Overflow drops the oldest event and increments `siem_dropped_total`, reported in a warning. No metrics endpoint exists. An event already being sent can still arrive after the queue drops it. A retry cannot remove a newer event. The queue is memory only. A restart or shutdown loses queued events. TLS write success does not prove manager ingestion, and retries can produce duplicates. This export is best effort, not an audit delivery guarantee.
+New files use mode `0600`, including files created after rotation. Set `GATEWAY_SIEM_FILE_MODE=0640` only when a Wazuh reader needs group access. Add the gateway process to a group that can read the file. The mode accepts only `0600` or `0640`.
+
+In Helm, set `siem.enabled=true`, `siem.syslogUrl`, `siem.caSecret.name`, and `siem.retentionDays`. The existing Secret's `siem.caSecret.key` defaults to `ca.pem`. The chart mounts it read-only. Restart the gateway after you change the CA Secret. The chart exposes `siem.fileMode`, but its built-in sink uses TLS, so this mode applies only when you configure a file sink.
+
+Claim handling queues events without network or file writes. The delivery thread retries failures after 1, 2, 4, 8, 16, and 32 seconds, then every 60 seconds. Connect, socket read, and socket write timeouts are 5 seconds. DNS resolution runs only in the delivery thread.
+
+The queue holds at most 1024 events, including the event being sent. Overflow drops the oldest event and increments `siem_dropped_total`. A separate reporter logs the drop count delta once per minute when it changes. It reports drops even if delivery is blocked. No metrics endpoint exists.
+
+An event already being sent can still arrive after the queue drops it. A retry cannot remove a newer event. The queue is in memory, so a restart or shutdown loses queued events. TLS write success does not prove manager ingestion. Retries can produce duplicates. This export does not guarantee audit delivery.
 
 The SIEM keeps its own copy. Gateway retention does not delete that copy. The manifest's `claim_retention` must not be shorter than the retention of SIEM events, receiver files, indexes, archives, and backups. Declare the SIEM recipients in `claim_recipients` before the owner signs. `GATEWAY_SIEM_RETENTION_DAYS` checks a configuration statement. It cannot enforce the SIEM's retention.
 

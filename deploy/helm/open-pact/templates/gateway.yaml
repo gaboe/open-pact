@@ -42,12 +42,17 @@ spec:
               containerPort: 8080
           env:
             {{- if .Values.siem.enabled }}
+            {{- if not (has .Values.siem.fileMode (list "0600" "0640")) }}
+            {{- fail "siem.fileMode must be \"0600\" or \"0640\"" }}
+            {{- end }}
             - name: GATEWAY_SIEM_SYSLOG_URL
               value: {{ required "siem.syslogUrl is required" .Values.siem.syslogUrl | quote }}
             - name: GATEWAY_SIEM_CA
               value: /etc/open-pact/siem/ca.pem
             - name: GATEWAY_SIEM_RETENTION_DAYS
               value: {{ .Values.siem.retentionDays | quote }}
+            - name: GATEWAY_SIEM_FILE_MODE
+              value: {{ .Values.siem.fileMode | quote }}
             {{- end }}
             {{- if .Values.manifest }}
             - name: MANIFEST_PATH

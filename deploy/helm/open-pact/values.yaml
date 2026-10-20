@@ -135,3 +135,5 @@ siem:
     key: ca.pem
   # Set to the SIEM's actual retention. A value above claim_retention logs a warning.
   retentionDays: 30
+  # File sinks default to owner-only access. Use 0640 only for a group-readable Wazuh file.
+  fileMode: "0600"

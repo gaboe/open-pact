@@ -1,10 +1,10 @@
 use std::{
     collections::VecDeque,
     fs::{File, OpenOptions},
-    io::{BufReader, Write},
+    io::{BufReader, Read, Seek, SeekFrom, Write},
     net::{TcpStream, ToSocketAddrs},
     sync::{
-        Arc, Condvar, Mutex,
+        Arc, Condvar, Mutex, Weak,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
@@ -53,14 +53,81 @@ fn frame(json: &[u8]) -> Vec<u8> {
     framed
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum FileMode {
+    #[default]
+    OwnerOnly,
+    GroupReadable,
+}
+
+impl FileMode {
+    fn parse(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "0600" => Ok(Self::OwnerOnly),
+            "0640" => Ok(Self::GroupReadable),
+            _ => bail!("SIEM file mode must be 0600 or 0640"),
+        }
+    }
+
+    #[cfg(unix)]
+    fn unix_mode(self) -> u32 {
+        match self {
+            Self::OwnerOnly => 0o600,
+            Self::GroupReadable => 0o640,
+        }
+    }
+}
+
 enum Sink {
-    File(std::path::PathBuf),
+    File {
+        path: std::path::PathBuf,
+        mode: FileMode,
+    },
     Tls {
         host: String,
         port: u16,
         name: ServerName<'static>,
         config: Arc<ClientConfig>,
     },
+    #[cfg(test)]
+    Blocking(Arc<BlockingSink>),
+}
+
+#[cfg(test)]
+struct BlockingSink {
+    state: Mutex<(bool, bool)>,
+    changed: Condvar,
+}
+
+#[cfg(test)]
+impl BlockingSink {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new((false, false)),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn deliver(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.0 = true;
+        self.changed.notify_all();
+        while !state.1 {
+            state = self.changed.wait(state).unwrap();
+        }
+    }
+
+    fn wait_until_started(&self) {
+        let mut state = self.state.lock().unwrap();
+        while !state.0 {
+            state = self.changed.wait(state).unwrap();
+        }
+    }
+
+    fn release(&self) {
+        self.state.lock().unwrap().1 = true;
+        self.changed.notify_all();
+    }
 }
 
 impl Sink {
@@ -104,11 +171,18 @@ impl Sink {
 
     fn deliver(&self, json: &[u8]) -> anyhow::Result<()> {
         match self {
-            Self::File(path) => {
-                let mut line = json.to_vec();
-                line.push(b'\n');
-                let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-                file.write_all(&line)?;
+            Self::File { path, mode } => {
+                let mut options = OpenOptions::new();
+                options.create(true).append(true).read(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(mode.unix_mode());
+                }
+                #[cfg(not(unix))]
+                let _ = mode;
+                let mut file = options.open(path)?;
+                append_json_line(&mut file, json)?;
                 file.flush()?;
             }
             Self::Tls {
@@ -134,9 +208,24 @@ impl Sink {
                 stream.conn.send_close_notify();
                 stream.flush()?;
             }
+            #[cfg(test)]
+            Self::Blocking(blocker) => blocker.deliver(),
         }
         Ok(())
     }
+}
+
+fn append_json_line(file: &mut (impl Read + Write + Seek), json: &[u8]) -> std::io::Result<()> {
+    if file.seek(SeekFrom::End(0))? > 0 {
+        file.seek(SeekFrom::End(-1))?;
+        let mut last = [0];
+        file.read_exact(&mut last)?;
+        if last[0] != b'\n' {
+            file.write_all(b"\n")?;
+        }
+    }
+    file.write_all(json)?;
+    file.write_all(b"\n")
 }
 
 #[derive(Default)]
@@ -150,6 +239,7 @@ struct Shared {
     queue: Mutex<Queue>,
     ready: Condvar,
     dropped: AtomicU64,
+    reported_drops: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -157,7 +247,15 @@ pub struct Exporter(Arc<Shared>);
 
 impl Exporter {
     fn start(sink: Sink) -> anyhow::Result<Self> {
+        Self::start_with_report_interval(sink, Duration::from_secs(60))
+    }
+
+    fn start_with_report_interval(sink: Sink, report_interval: Duration) -> anyhow::Result<Self> {
         let exporter = Self(Arc::default());
+        let reporter = Arc::downgrade(&exporter.0);
+        std::thread::Builder::new()
+            .name("siem-drop-reporter".into())
+            .spawn(move || report_drops(reporter, report_interval))?;
         let worker = exporter.clone();
         std::thread::Builder::new()
             .name("siem-delivery".into())
@@ -181,15 +279,7 @@ impl Exporter {
 
     fn run(&self, sink: Sink) {
         let mut backoff = 1;
-        let mut reported_drops = 0;
         loop {
-            let dropped = self.0.dropped.load(Ordering::Relaxed);
-            if dropped != reported_drops {
-                eprintln!(
-                    "WARNING: SIEM queue full, dropped oldest events; siem_dropped_total={dropped}"
-                );
-                reported_drops = dropped;
-            }
             let (id, bytes) = {
                 let mut queue = self.0.queue.lock().unwrap();
                 while queue.events.is_empty() {
@@ -215,6 +305,24 @@ impl Exporter {
     }
 }
 
+fn report_drops(shared: Weak<Shared>, interval: Duration) {
+    loop {
+        std::thread::sleep(interval);
+        let Some(shared) = shared.upgrade() else {
+            return;
+        };
+        let dropped = shared.dropped.load(Ordering::Relaxed);
+        let reported = shared.reported_drops.load(Ordering::Relaxed);
+        if dropped > reported {
+            eprintln!(
+                "WARNING: SIEM queue full, dropped {delta} oldest events; siem_dropped_total={dropped}",
+                delta = dropped - reported
+            );
+            shared.reported_drops.store(dropped, Ordering::Relaxed);
+        }
+    }
+}
+
 fn configured(manifest: &Manifest) -> anyhow::Result<Option<Exporter>> {
     let url = std::env::var("GATEWAY_SIEM_SYSLOG_URL")
         .ok()
@@ -226,7 +334,17 @@ fn configured(manifest: &Manifest) -> anyhow::Result<Option<Exporter>> {
         (None, None) => return Ok(None),
         (Some(_), Some(_)) => bail!("configure only one SIEM sink"),
         (Some(url), None) => Sink::tls(&url, &std::env::var("GATEWAY_SIEM_CA")?)?,
-        (None, Some(path)) => Sink::File(path.into()),
+        (None, Some(path)) => {
+            let mode = std::env::var("GATEWAY_SIEM_FILE_MODE")
+                .ok()
+                .map(|value| FileMode::parse(&value))
+                .transpose()?
+                .unwrap_or_default();
+            Sink::File {
+                path: path.into(),
+                mode,
+            }
+        }
     };
     if let Ok(days) = std::env::var("GATEWAY_SIEM_RETENTION_DAYS") {
         let days: i64 = days
@@ -270,10 +388,52 @@ mod tests {
     use super::*;
     use open_pact_core::{Pseudonym, PublicKey, dev_key};
     use rustls::{ServerConfig, ServerConnection, pki_types::PrivatePkcs8KeyDer};
-    use std::{io::Read, net::TcpListener};
+    use std::{
+        io::{Cursor, Error},
+        net::TcpListener,
+    };
 
     fn temporary() -> std::path::PathBuf {
         std::env::temp_dir().join(format!("open-pact-siem-{:032x}", rand::random::<u128>()))
+    }
+
+    struct PartialWriter {
+        data: Cursor<Vec<u8>>,
+        remaining: usize,
+        failed: bool,
+    }
+
+    impl Read for PartialWriter {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.data.read(buffer)
+        }
+    }
+
+    impl Write for PartialWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            if self.failed {
+                return self.data.write(buffer);
+            }
+            if self.remaining == 0 {
+                self.failed = true;
+                return Err(Error::other("injected partial write"));
+            }
+            let written = self
+                .data
+                .write(&buffer[..buffer.len().min(self.remaining)])?;
+            self.remaining -= written;
+            Ok(written)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.data.flush()
+        }
+    }
+
+    impl Seek for PartialWriter {
+        fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+            self.data.seek(position)
+        }
     }
 
     fn claim(manifest: &Manifest) -> Claim {
@@ -338,9 +498,19 @@ mod tests {
     }
 
     #[test]
+    fn file_mode_defaults_to_owner_only_and_validates_group_read_opt_in() {
+        assert_eq!(FileMode::default(), FileMode::OwnerOnly);
+        assert_eq!(FileMode::parse("0640").unwrap(), FileMode::GroupReadable);
+        assert!(FileMode::parse("0660").is_err());
+    }
+
+    #[test]
     fn file_sink_appends_one_json_object_per_line() {
         let path = temporary();
-        let sink = Sink::File(path.clone());
+        let sink = Sink::File {
+            path: path.clone(),
+            mode: FileMode::default(),
+        };
         let event = json!({"open_pact": {"verdict": "deny"}}).to_string();
         sink.deliver(event.as_bytes()).unwrap();
         sink.deliver(event.as_bytes()).unwrap();
@@ -348,7 +518,69 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             format!("{event}\n{event}\n")
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        let rotated = path.with_extension("jsonl.1");
+        std::fs::rename(&path, &rotated).unwrap();
+        sink.deliver(event.as_bytes()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
         std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(rotated).unwrap();
+    }
+
+    #[test]
+    fn retry_separates_an_event_after_an_injected_partial_write() {
+        let event = json!({"open_pact": {"verdict": "allow"}});
+        let bytes = serde_json::to_vec(&event).unwrap();
+        let mut writer = PartialWriter {
+            data: Cursor::default(),
+            remaining: 12,
+            failed: false,
+        };
+        assert!(append_json_line(&mut writer, &bytes).is_err());
+        append_json_line(&mut writer, &bytes).unwrap();
+        let contents = String::from_utf8(writer.data.into_inner()).unwrap();
+        let lines: Vec<_> = contents.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(serde_json::from_str::<Value>(lines[0]).is_err());
+        assert_eq!(serde_json::from_str::<Value>(lines[1]).unwrap(), event);
+    }
+
+    #[test]
+    fn queue_drops_are_reported_while_delivery_is_blocked() {
+        let blocker = Arc::new(BlockingSink::new());
+        let exporter = Exporter::start_with_report_interval(
+            Sink::Blocking(blocker.clone()),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+        exporter.submit(json!({"sequence": 0}));
+        blocker.wait_until_started();
+        for sequence in 1..=CAPACITY {
+            exporter.submit(json!({"sequence": sequence}));
+        }
+        assert_eq!(exporter.0.dropped.load(Ordering::Relaxed), 1);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while exporter.0.reported_drops.load(Ordering::Relaxed) == 0
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(exporter.0.reported_drops.load(Ordering::Relaxed), 1);
+        blocker.release();
     }
 
     fn server() -> (String, String, std::thread::JoinHandle<Vec<u8>>) {
@@ -429,16 +661,26 @@ mod tests {
     fn worker_retries_failed_file_delivery() {
         let directory = temporary();
         let path = directory.join("events.jsonl");
-        let exporter = Exporter::start(Sink::File(path.clone())).unwrap();
+        let exporter = Exporter::start(Sink::File {
+            path: path.clone(),
+            mode: FileMode::default(),
+        })
+        .unwrap();
         exporter.submit(json!({"open_pact": {"verdict": "allow"}}));
         std::thread::sleep(Duration::from_millis(100));
         std::fs::create_dir(&directory).unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while !path.exists() && std::time::Instant::now() < deadline {
+        let mut delivered = None;
+        while delivered.is_none() && std::time::Instant::now() < deadline {
+            delivered = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|contents| serde_json::from_str::<Value>(&contents).ok());
+            if delivered.is_some() {
+                break;
+            }
             std::thread::sleep(Duration::from_millis(20));
         }
-        let value: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(value["open_pact"]["verdict"], "allow");
+        assert_eq!(delivered.unwrap()["open_pact"]["verdict"], "allow");
         std::fs::remove_dir_all(directory).unwrap();
     }
 }
