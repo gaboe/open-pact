@@ -19,5 +19,12 @@ jobs:
       - name: Test Windows client
         run: cargo test -p open-pact-client
 
+      - name: Record runner privilege
+        shell: pwsh
+        run: |
+          $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+          $admin = ([Security.Principal.WindowsPrincipal]::new($identity)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+          Write-Output "runner_is_administrator=$admin"
+
       - name: Print checks on this Windows runner
         run: cargo test -p open-pact-client -- --ignored print_run_all_on_this_machine --nocapture

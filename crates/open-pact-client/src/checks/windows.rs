@@ -6,94 +6,26 @@ use std::time::Duration;
 use super::buckets;
 use super::exec::run_with_timeout;
 use open_pact_core::ControlValue;
-const POWERSHELL: &str = r#"
-$ErrorActionPreference = 'Stop'
-function Emit($key, $value) { if ($null -eq $value) { $value = '' }; [Console]::WriteLine("$key`t$value") }
-function RunSection([scriptblock]$work) { & $work }
-function RegValue($path, $name) {
-    try {
-        $item = Get-ItemProperty -LiteralPath $path -ErrorAction Stop
-        if ($null -eq $item.PSObject.Properties[$name]) { return '' }
-        return [string]$item.$name
-    } catch { return '!' }
-}
-RunSection {
-    try { $bitlocker = (New-Object -ComObject Shell.Application).NameSpace($env:SystemDrive).Self.ExtendedProperty('System.Volume.BitLockerProtection'); Emit 'bitlocker' $bitlocker } catch { Emit 'bitlocker' '' }
-}
-RunSection {
-    try {
-        $profiles = @(Get-NetFirewallProfile -PolicyStore ActiveStore | Sort-Object Name)
-        if ($profiles.Count -eq 3) { Emit 'firewall' (($profiles | ForEach-Object { $_.Enabled.ToString() }) -join ' ') } else { Emit 'firewall' '' }
-    } catch { Emit 'firewall' '' }
-}
-RunSection {
-    try {
-        $products = @(Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntivirusProduct -ErrorAction Stop)
-        if ($products.Count -gt 0) { Emit 'antimalware' (($products | ForEach-Object { $_.productState }) -join ' ') }
-        else { throw 'No Security Center products' }
-    } catch {
-        try {
-            $status = Get-MpComputerStatus -ErrorAction Stop
-            if ($null -ne $status.AntivirusEnabled -and $null -ne $status.RealTimeProtectionEnabled) {
-                if ($status.AMRunningMode -eq 'Normal' -and $status.AntivirusEnabled -and $status.RealTimeProtectionEnabled) { Emit 'antimalware' 'defender=yes' }
-                else { Emit 'antimalware' '' }
-            } else { Emit 'antimalware' '' }
-        } catch { Emit 'antimalware' '' }
-    }
-}
-RunSection {
-    Emit 'secure_boot' (RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\State' 'UEFISecureBootEnabled')
-    Emit 'lock_policy' (RegValue 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' 'InactivityTimeoutSecs')
-    Emit 'screen_active' (RegValue 'HKCU:\Control Panel\Desktop' 'ScreenSaveActive')
-    Emit 'screen_secure' (RegValue 'HKCU:\Control Panel\Desktop' 'ScreenSaverIsSecure')
-    Emit 'screen_timeout' (RegValue 'HKCU:\Control Panel\Desktop' 'ScreenSaveTimeOut')
-    Emit 'autologin' (RegValue 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' 'AutoAdminLogon')
-}
-RunSection {
-    $current = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
-    Emit 'os' (@($current.CurrentBuild, $current.DisplayVersion, $current.EditionID, $current.InstallationType) -join '|')
-}
-RunSection {
-    try {
-        $session = New-Object -ComObject Microsoft.Update.Session
-        $searcher = $session.CreateUpdateSearcher()
-        $history = @($searcher.QueryHistory(0, 100) | Where-Object { $_.ResultCode -eq 2 -and $_.Operation -eq 1 } | Sort-Object Date -Descending)
-        $rollupId = '28BC880E-0592-4CBF-8F95-C79B17911D5F'
-        $securityId = '0FA1201D-4330-4FA8-8AE9-B877473B6441'
-        $selected = $null
-        foreach ($entry in $history) {
-            $categories = @($entry.Categories | ForEach-Object { $_.CategoryID })
-            if ($categories -notcontains $rollupId -and $categories -notcontains $securityId) { continue }
-            $updateId = $entry.UpdateIdentity.UpdateID
-            $search = $searcher.Search("UpdateID='$updateId'")
-            if ($search.Updates.Count -eq 0) { continue }
-            $kbIds = @($search.Updates.Item(0).KBArticleIDs)
-            if ($categories -contains $rollupId -or $kbIds -contains '5126646') { $selected = $entry.Date; break }
-        }
-        if ($null -ne $selected) { Emit 'patch_date' $selected.ToString('yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture) }
-        else { Emit 'patch_date' '' }
-    } catch { Emit 'patch_date' '' }
-}
-"#;
+const POWERSHELL: &str = include_str!("windows.ps1");
 
 static VALUES: OnceLock<BTreeMap<String, String>> = OnceLock::new();
 
-pub fn disk_encryption() -> &'static str {
-    value("bitlocker").map_or("unknown", parse_bitlocker)
+pub fn disk_encryption() -> ControlValue {
+    value("bitlocker").map_or("unknown", parse_bitlocker).into()
 }
 
-pub fn firewall() -> &'static str {
-    value("firewall").map_or("unknown", parse_firewall)
+pub fn firewall() -> ControlValue {
+    value("firewall").map_or("unknown", parse_firewall).into()
 }
 
 /// A lock timeout set by policy wins over the user's secure screen saver.
-pub fn screen_lock() -> &'static str {
+pub fn screen_lock() -> ControlValue {
     match value("lock_policy") {
-        Some("!") | None => return "unknown",
+        Some("!") | None => return "unknown".into(),
         Some(value) if !value.is_empty() => match parse_dword(value) {
-            Some(seconds) if seconds > 0 => return buckets::lock_delay(u64::from(seconds)),
+            Some(seconds) if seconds > 0 => return buckets::lock_delay(u64::from(seconds)).into(),
             Some(_) => {}
-            None => return "unknown",
+            None => return "unknown".into(),
         },
         _ => {}
     }
@@ -102,12 +34,15 @@ pub fn screen_lock() -> &'static str {
         value("screen_secure"),
         value("screen_timeout"),
     )
+    .into()
 }
 
-pub fn os_supported() -> &'static str {
-    value("os").map_or("unknown", |data| {
-        parse_os_supported(data, Utc::now().date_naive())
-    })
+pub fn os_supported() -> ControlValue {
+    value("os")
+        .map_or("unknown", |data| {
+            parse_os_supported(data, Utc::now().date_naive())
+        })
+        .into()
 }
 
 pub fn os_patch_age_days() -> ControlValue {
@@ -121,22 +56,27 @@ fn parse_patch_age(text: &str, today: NaiveDate) -> ControlValue {
     parse_last_update(text)
         .and_then(|date| {
             let days = today.signed_duration_since(date).num_days();
-            (days >= 0).then_some(ControlValue::Integer(days))
+            i32::try_from(days)
+                .ok()
+                .filter(|days| *days >= 0)
+                .map(ControlValue::Integer)
         })
         .unwrap_or_else(|| "unknown".into())
 }
 
-pub fn auto_login() -> &'static str {
-    value("autologin").map_or("unknown", |value| {
-        if value == "!" {
-            "unknown"
-        } else {
-            parse_auto_login(value)
-        }
-    })
+pub fn auto_login() -> ControlValue {
+    value("autologin")
+        .map_or("unknown", |value| {
+            if value == "!" {
+                "unknown"
+            } else {
+                parse_auto_login(value)
+            }
+        })
+        .into()
 }
 
-pub fn secure_boot() -> &'static str {
+pub fn secure_boot() -> ControlValue {
     value("secure_boot")
         .filter(|v| *v != "!")
         .and_then(parse_dword)
@@ -145,10 +85,140 @@ pub fn secure_boot() -> &'static str {
             1 => "on",
             _ => "unknown",
         })
+        .into()
 }
 
-pub fn antimalware_active() -> &'static str {
-    value("antimalware").map_or("unknown", parse_antimalware)
+pub fn antimalware_active() -> ControlValue {
+    value("antimalware")
+        .map_or("unknown", parse_antimalware)
+        .into()
+}
+
+pub fn preboot_auth() -> ControlValue {
+    parse_preboot(value("preboot").unwrap_or_default()).into()
+}
+
+pub fn antimalware_signature_age_days() -> ControlValue {
+    number("signature_days", 3650, false)
+}
+
+pub fn antimalware_full_scan_age_days() -> ControlValue {
+    number("full_scan_days", 3650, false)
+}
+
+pub fn antimalware_detections_7d() -> ControlValue {
+    number("detections_7d", 10000, false)
+}
+
+pub fn antimalware_last_detection_hours() -> ControlValue {
+    number("last_detection_hours", 8760, true)
+}
+
+pub fn local_log_retention_days() -> ControlValue {
+    parse_retention(value("log_retention").unwrap_or_default())
+}
+
+pub fn process_audit() -> ControlValue {
+    parse_process_audit(value("process_audit").unwrap_or_default()).into()
+}
+
+pub fn powershell_logging() -> ControlValue {
+    parse_logging(value("powershell_logging").unwrap_or_default()).into()
+}
+
+pub fn log_cleared_hours() -> ControlValue {
+    number("log_cleared", 8760, true)
+}
+
+fn number(key: &str, max: i32, none: bool) -> ControlValue {
+    parse_number(value(key).unwrap_or_default(), max, none)
+}
+
+fn parse_number(text: &str, max: i32, none: bool) -> ControlValue {
+    if none && text == "none" {
+        return "none".into();
+    }
+    if text.is_empty() || !text.bytes().all(|c| c.is_ascii_digit()) {
+        return "unknown".into();
+    }
+    text.parse::<i32>()
+        .ok()
+        .filter(|v| *v <= max)
+        .map(ControlValue::Integer)
+        .unwrap_or_else(|| "unknown".into())
+}
+
+fn parse_preboot(text: &str) -> &'static str {
+    let Some((status, types)) = text.split_once('|') else {
+        return "unknown";
+    };
+    if status == "0" && types.is_empty() {
+        return "none";
+    }
+    if status != "1" {
+        return "unknown";
+    }
+    let types: Option<Vec<u32>> = types.split(',').map(|t| t.parse().ok()).collect();
+    let Some(types) = types else {
+        return "unknown";
+    };
+    // Recovery passwords do not establish the normal startup unlock method.
+    if types.iter().any(|t| !matches!(t, 1..=10)) {
+        return "unknown";
+    }
+    if types.contains(&1) {
+        return "hardware_only";
+    }
+    if types.iter().any(|t| matches!(t, 2 | 5 | 7 | 9 | 10)) {
+        return "unknown";
+    }
+    if types.iter().any(|t| matches!(t, 4 | 6 | 8)) {
+        "user_secret"
+    } else {
+        "unknown"
+    }
+}
+
+fn parse_retention(text: &str) -> ControlValue {
+    let Some((security, system)) = text.split_once('|') else {
+        return "unknown".into();
+    };
+    match (
+        parse_number(security, i32::MAX, false),
+        parse_number(system, i32::MAX, false),
+    ) {
+        (ControlValue::Integer(a), ControlValue::Integer(b)) => ControlValue::Integer(a.min(b)),
+        _ => "unknown".into(),
+    }
+}
+
+fn parse_process_audit(text: &str) -> &'static str {
+    let Some((flags, command_line)) = text.split_once('|') else {
+        return "unknown";
+    };
+    let Some(flags) = parse_dword(flags).filter(|f| *f <= 7) else {
+        return "unknown";
+    };
+    if !matches!(command_line, "" | "0" | "1") {
+        return "unknown";
+    }
+    if flags & 1 != 0 && command_line == "1" {
+        "on"
+    } else {
+        "off"
+    }
+}
+
+fn parse_logging(text: &str) -> &'static str {
+    let Some((machine, user)) = text.split_once('|') else {
+        return "unknown";
+    };
+    let effective = if machine.is_empty() { user } else { machine };
+    match effective {
+        "1" => "on",
+        "" | "0" => "off",
+        _ => "unknown",
+    }
 }
 
 fn value(name: &str) -> Option<&'static str> {
@@ -336,6 +406,122 @@ pub fn parse_antimalware(out: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preboot_protectors_exclude_recovery_and_weak_unlock_paths() {
+        for (raw, expected) in [
+            ("0|", "none"),
+            ("1|1,3", "hardware_only"),
+            ("1|4,3", "user_secret"),
+            ("1|6,3", "user_secret"),
+            ("1|8,3", "user_secret"),
+            ("1|1,4,3", "hardware_only"),
+            ("1|3", "unknown"),
+            ("1|2,4", "unknown"),
+            ("1|0,4", "unknown"),
+            ("1|", "unknown"),
+            ("unknown", "unknown"),
+            ("Access denied", "unknown"),
+        ] {
+            assert_eq!(parse_preboot(raw), expected, "{raw}");
+        }
+    }
+
+    #[test]
+    fn numeric_metrics_reject_missing_localized_and_out_of_range_values() {
+        for (raw, expected) in [("0", 0), ("3", 3), ("3650", 3650)] {
+            assert_eq!(
+                parse_number(raw, 3650, false),
+                ControlValue::Integer(expected)
+            );
+        }
+        for raw in [
+            "",
+            "unknown",
+            "!",
+            "-1",
+            "+1",
+            "3.0",
+            "3,0",
+            "3651",
+            "18446744073709551616",
+            "none",
+            "n/a",
+        ] {
+            assert_eq!(parse_number(raw, 3650, false), "unknown", "{raw}");
+        }
+        assert_eq!(
+            parse_number("10000", 10000, false),
+            ControlValue::Integer(10000)
+        );
+        assert_eq!(parse_number("10001", 10000, false), "unknown");
+        assert_eq!(
+            parse_number("8760", 8760, true),
+            ControlValue::Integer(8760)
+        );
+        assert_eq!(parse_number("8761", 8760, true), "unknown");
+        assert_eq!(parse_number("none", 8760, true), "none");
+    }
+
+    #[test]
+    fn retention_needs_both_logs_and_reports_the_shorter_history() {
+        assert_eq!(parse_retention("12|30"), ControlValue::Integer(12));
+        assert_eq!(parse_retention("31|0"), ControlValue::Integer(0));
+        assert_eq!(parse_retention("4000|5000"), ControlValue::Integer(4000));
+        for raw in ["12|unknown", "unknown|12", "12|", "12", "12|30|40", "!"] {
+            assert_eq!(parse_retention(raw), "unknown", "{raw}");
+        }
+    }
+
+    #[test]
+    fn process_creation_requires_success_audit_and_command_line() {
+        for (raw, expected) in [
+            ("1|1", "on"),
+            ("3|1", "on"),
+            ("0|1", "off"),
+            ("2|1", "off"),
+            ("4|1", "off"),
+            ("1|0", "off"),
+            ("1|", "off"),
+            ("1|!", "unknown"),
+            ("!|1", "unknown"),
+            ("8|1", "unknown"),
+            ("unknown", "unknown"),
+        ] {
+            assert_eq!(parse_process_audit(raw), expected, "{raw}");
+        }
+    }
+
+    #[test]
+    fn script_block_logging_uses_machine_policy_before_user_policy() {
+        for (raw, expected) in [
+            ("1|0", "on"),
+            ("0|1", "off"),
+            ("|1", "on"),
+            ("|0", "off"),
+            ("|", "off"),
+            ("!|1", "unknown"),
+            ("|!", "unknown"),
+            ("2|", "unknown"),
+            ("unknown", "unknown"),
+        ] {
+            assert_eq!(parse_logging(raw), expected, "{raw}");
+        }
+    }
+
+    #[test]
+    fn patch_age_returns_integer_days_and_rejects_future_dates() {
+        let today = NaiveDate::from_ymd_opt(2026, 10, 20).unwrap();
+        assert_eq!(
+            parse_patch_age("2026-10-13", today),
+            ControlValue::Integer(7)
+        );
+        assert_eq!(
+            parse_patch_age("2026-10-20", today),
+            ControlValue::Integer(0)
+        );
+        assert_eq!(parse_patch_age("2026-10-21", today), "unknown");
+    }
 
     #[test]
     fn dword() {

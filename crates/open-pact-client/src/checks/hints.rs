@@ -27,6 +27,22 @@ pub fn fix_hint(check: &str, value: &str, os: Os) -> Option<&'static str> {
     if good.contains(&value) {
         return None;
     }
+    if value == "unknown"
+        && os == Os::Windows
+        && matches!(
+            check,
+            "preboot_auth"
+                | "antimalware_detections_7d"
+                | "antimalware_last_detection_hours"
+                | "local_log_retention_days"
+                | "process_audit"
+                | "log_cleared_hours"
+        )
+    {
+        return Some(
+            "Run the client as a SYSTEM scheduled task or an administrator. Check that the Windows security provider and event logs are available.",
+        );
+    }
     if value == "unknown" {
         return Some(
             "This check could not read the setting. Make sure the system tool it uses is installed and run the check again.",
@@ -122,6 +138,24 @@ pub fn fix_hint(check: &str, value: &str, os: Os) -> Option<&'static str> {
         ("web_protection", Os::Macos) => Some(
             "Enable Safe Browsing in every installed Chrome, Edge, Brave, or Firefox browser. Safari is not checked because its settings need Full Disk Access.",
         ),
+        ("antimalware_signature_age_days", Os::Windows) => Some(
+            "Update Microsoft Defender security intelligence in Windows Security > Virus & threat protection.",
+        ),
+        ("antimalware_full_scan_age_days", Os::Windows) => Some(
+            "Run a Microsoft Defender full scan in Windows Security > Virus & threat protection > Scan options.",
+        ),
+        ("local_log_retention_days", Os::Windows) => Some(
+            "Increase the Security and System event log sizes in Event Viewer. Keep enough history for the required number of days.",
+        ),
+        ("process_audit", Os::Windows) => Some(
+            "Enable successful Audit Process Creation and Include command line in process creation events in Group Policy.",
+        ),
+        ("powershell_logging", Os::Windows) => Some(
+            "Enable Turn on PowerShell Script Block Logging in Group Policy > Windows Components > Windows PowerShell.",
+        ),
+        ("log_cleared_hours", Os::Windows) => Some(
+            "Review Security event 1102 and System event 104 in Event Viewer. Investigate why the logs were cleared.",
+        ),
         ("web_protection", _) => Some(
             "Enable fraudulent website warnings or Safe Browsing in every installed browser. Check managed policies too.",
         ),
@@ -137,7 +171,6 @@ pub fn fix_hint(check: &str, value: &str, os: Os) -> Option<&'static str> {
         ("process_audit" | "powershell_logging" | "log_cleared_hours", _) => {
             Some("Review Windows audit and PowerShell logging policy and event history.")
         }
-        ("antimalware_signature_age_days", _) => Some("Update antivirus security intelligence."),
         ("local_log_retention_days", _) => {
             Some("Review the system log storage policy. macOS unified log retention is size-based.")
         }

@@ -1594,9 +1594,7 @@ mod tests {
     fn witnessed_manifest(witness: &Witness) -> String {
         let manifest = DEMO_MANIFEST.replace("\r\n", "\n");
         let first = manifest.find("[[control]]").unwrap();
-        let kept = manifest
-            .find("[[control]]\nid = \"os_supported\"")
-            .unwrap();
+        let kept = manifest.find("[[control]]\nid = \"os_supported\"").unwrap();
         let log = manifest.find("[log]").unwrap();
         let end = manifest[kept + 1..log]
             .find("[[control]]")

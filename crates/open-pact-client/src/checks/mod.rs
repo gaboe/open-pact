@@ -72,9 +72,9 @@ const MACOS: Registry = &[
     ("screen_lock", || macos::screen_lock().into()),
     ("os_supported", || macos::os_supported().into()),
     ("os_patch_age_days", macos::os_patch_age_days),
-    ("password_set", || unknown().into()),
+    ("password_set", macos_v3::unknown),
     ("auto_login", || macos::auto_login().into()),
-    ("secure_boot", || unknown().into()),
+    ("secure_boot", macos_v3::unknown),
     ("antimalware_active", || macos::antimalware_active().into()),
     ("preboot_auth", macos_v3::preboot_auth),
     (
@@ -103,7 +103,7 @@ const LINUX: Registry = &[
     ("screen_lock", || linux::screen_lock().into()),
     ("os_supported", || linux::os_supported().into()),
     ("os_patch_age_days", linux::os_patch_age_days),
-    ("password_set", || unknown().into()),
+    ("password_set", macos_v3::unknown),
     ("auto_login", || linux::auto_login().into()),
     ("secure_boot", || linux::secure_boot().into()),
     ("antimalware_active", || linux::antimalware_active().into()),
@@ -126,27 +126,42 @@ const LINUX: Registry = &[
 ];
 
 const WINDOWS: Registry = &[
-    ("disk_encryption", || windows::disk_encryption().into()),
-    ("firewall", || windows::firewall().into()),
-    ("screen_lock", || windows::screen_lock().into()),
-    ("os_supported", || windows::os_supported().into()),
+    ("disk_encryption", windows::disk_encryption),
+    ("firewall", windows::firewall),
+    ("screen_lock", windows::screen_lock),
+    ("os_supported", windows::os_supported),
     ("os_patch_age_days", windows::os_patch_age_days),
-    ("password_set", || unknown().into()),
-    ("auto_login", || windows::auto_login().into()),
-    ("secure_boot", || windows::secure_boot().into()),
+    ("password_set", macos_v3::unknown),
+    ("auto_login", windows::auto_login),
+    ("secure_boot", windows::secure_boot),
     ("antimalware_active", || {
         windows::antimalware_active().into()
     }),
-    ("preboot_auth", || unknown().into()),
-    ("antimalware_signature_age_days", || unknown().into()),
-    ("antimalware_full_scan_age_days", || unknown().into()),
-    ("antimalware_detections_7d", || unknown().into()),
-    ("antimalware_last_detection_hours", || unknown().into()),
-    ("web_protection", || unknown().into()),
-    ("local_log_retention_days", || unknown().into()),
-    ("process_audit", || unknown().into()),
-    ("powershell_logging", || unknown().into()),
-    ("log_cleared_hours", || unknown().into()),
+    ("preboot_auth", windows::preboot_auth),
+    (
+        "antimalware_signature_age_days",
+        windows::antimalware_signature_age_days,
+    ),
+    (
+        "antimalware_full_scan_age_days",
+        windows::antimalware_full_scan_age_days,
+    ),
+    (
+        "antimalware_detections_7d",
+        windows::antimalware_detections_7d,
+    ),
+    (
+        "antimalware_last_detection_hours",
+        windows::antimalware_last_detection_hours,
+    ),
+    ("web_protection", macos_v3::unknown),
+    (
+        "local_log_retention_days",
+        windows::local_log_retention_days,
+    ),
+    ("process_audit", windows::process_audit),
+    ("powershell_logging", windows::powershell_logging),
+    ("log_cleared_hours", windows::log_cleared_hours),
 ];
 
 fn registry(os: Os) -> Registry {
