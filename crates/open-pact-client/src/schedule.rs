@@ -860,7 +860,13 @@ mod tests {
         let address = listener.local_addr().unwrap();
         assert!(vpn_up(&address.to_string()).await);
         drop(listener);
-        assert!(!vpn_up(&address.to_string()).await);
+
+        // A closed ephemeral port can be rebound by a parallel test; a bound socket that never
+        // listens keeps the port reserved and refuses connections.
+        let reserved = tokio::net::TcpSocket::new_v4().unwrap();
+        reserved.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let refused = reserved.local_addr().unwrap();
+        assert!(!vpn_up(&refused.to_string()).await);
     }
 
     #[tokio::test]
