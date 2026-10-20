@@ -234,6 +234,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn windows_checks_report_unknown_off_windows() {
         let all = run_all(Os::Windows);
         assert_eq!(all.len(), BUILTINS.len());
