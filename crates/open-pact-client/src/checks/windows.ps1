@@ -1,6 +1,6 @@
 
 $ErrorActionPreference = 'Stop'
-function Emit($key, $value) { if ($null -eq $value) { $value = '' }; [Console]::WriteLine("$key`t$value") }
+function Emit($key, $value) { if ($null -eq $value) { $value = '' }; Write-Output "$key`t$value" }
 function RunSection([scriptblock]$work) { & $work }
 function RegValue($path, $name) {
     try {
