@@ -58,7 +58,7 @@ fn parse_patch_age(text: &str, today: NaiveDate) -> ControlValue {
             let days = today.signed_duration_since(date).num_days();
             i32::try_from(days)
                 .ok()
-                .filter(|days| *days >= 0)
+                .filter(|days| (0..=3650).contains(days))
                 .map(ControlValue::Integer)
         })
         .unwrap_or_else(|| "unknown".into())
@@ -426,6 +426,48 @@ mod tests {
     }
 
     #[test]
+    fn captured_windows_admin_batch_values() {
+        let values = parse_values(concat!(
+            "preboot\t0|\r\n",
+            "signature_days\t0\r\n",
+            "full_scan_days\tunknown\r\n",
+            "detections_7d\t0\r\n",
+            "last_detection_hours\tnone\r\n",
+            "log_retention\t12|12\r\n",
+            "log_cleared\t296\r\n",
+            "process_audit\t1|\r\n",
+            "powershell_logging\t|\r\n",
+        ));
+        assert_eq!(parse_preboot(&values["preboot"]), "none");
+        assert_eq!(
+            parse_number(&values["signature_days"], 3650, false),
+            ControlValue::Integer(0)
+        );
+        assert_eq!(
+            parse_number(&values["full_scan_days"], 3650, false),
+            "unknown"
+        );
+        assert_eq!(
+            parse_number(&values["detections_7d"], 10000, false),
+            ControlValue::Integer(0)
+        );
+        assert_eq!(
+            parse_number(&values["last_detection_hours"], 8760, true),
+            "none"
+        );
+        assert_eq!(
+            parse_retention(&values["log_retention"]),
+            ControlValue::Integer(12)
+        );
+        assert_eq!(
+            parse_number(&values["log_cleared"], 8760, true),
+            ControlValue::Integer(296)
+        );
+        assert_eq!(parse_process_audit(&values["process_audit"]), "off");
+        assert_eq!(parse_logging(&values["powershell_logging"]), "off");
+    }
+
+    #[test]
     fn preboot_protectors_exclude_recovery_and_weak_unlock_paths() {
         for (raw, expected) in [
             ("0|", "none"),
@@ -539,6 +581,7 @@ mod tests {
             ControlValue::Integer(0)
         );
         assert_eq!(parse_patch_age("2026-10-21", today), "unknown");
+        assert_eq!(parse_patch_age("2000-01-01", today), "unknown");
     }
 
     #[test]
