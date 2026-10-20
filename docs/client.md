@@ -1,20 +1,24 @@
 # Install and use the client
 
-The client runs only the checks that the signed manifest names. It sends a signed claim to the gateway when you run `check`. It sends a separate status report only when you run `report` or install a report schedule.
+The client sends results only for controls and outputs that the signed manifest permits. On Windows, a selected check can run a cached PowerShell batch that also reads other controls, browser profiles, and event sources. The client sends only permitted results in its claim or report. It sends a signed claim when you run `check`. It sends a separate status report when you run `report` or install a report schedule.
 
-## Verify and install a release
+## Verify a release
 
-Download the client release files and the verification script from the same repository. Verify the release before you install the binary:
+Run the verification script for the release tag:
 
 ```sh
 scripts/verify-client-release.sh v0.2.0
 ```
 
-The script checks the release hashes and Sigstore signatures against the tagged release workflow. It needs GitHub CLI, Cosign, and `sha256sum` or `shasum`. Set `GH_REPO` when you verify a release from a fork. Install the verified binary in a directory that your account can execute.
+The script downloads the release assets to a temporary directory. It checks their hashes and Sigstore signatures against the tagged release workflow. It deletes that directory when it exits. The script does not verify a binary that you downloaded separately, and it does not leave a verified binary to install. Do not treat a separate download as verified by this command. A script change is advisable so it can verify a local file or keep its verified binary.
+
+The script needs GitHub CLI, Cosign, and `sha256sum` or `shasum`. Set `GH_REPO` when you verify a release from a fork.
 
 ## Join and check the gateway
 
-Get a one-time `opi1:` invitation from the gateway operator. Confirm the company key fingerprint with the operator over a second channel. Join with the invitation:
+On Windows, set `HOME` before you run the client. The client does not use `USERPROFILE` or `APPDATA` as a fallback. In PowerShell, set an absolute path with `$env:HOME = Join-Path $env:USERPROFILE 'pact'`.
+
+Get a one-time `opi1:` invitation from the gateway operator. Confirm the gateway key fingerprint with the operator over a second channel. Join with the invitation:
 
 ```sh
 open-pact-client join 'opi1:replace-with-your-invitation'
@@ -30,7 +34,7 @@ After the operator approves the device, check it:
 open-pact-client check
 ```
 
-The client runs the checks in the signed manifest and sends one signed claim. It verifies the response and log checkpoint. It installs the VPN certificate and CA when the gateway accepts the claim. A denied check returns the gateway's reason. A log verification failure raises an alarm and exits with status 2.
+The client runs the checks in the signed manifest and sends one signed claim. It verifies the response and log checkpoint. On macOS and Linux, it installs the VPN certificate and CA when the gateway accepts the claim. Windows does not install the VPN certificate or CA yet. A Windows check can receive an accepted response, then exit with an error during certificate installation. A denied check returns the gateway's reason. A log verification failure raises an alarm and exits with status 2.
 
 Run `open-pact-client log head` to show the last verified checkpoint. Run `open-pact-client log prove` to verify the inclusion proof for this device's enrolment. Run `open-pact-client log show` to print the local record of claims and gateway responses.
 
@@ -54,9 +58,9 @@ Choose a collector URL that the device can reach only through the VPN. Install a
 open-pact-client schedule install --collector https://collector.internal.example.org/status
 ```
 
-The scheduler checks a TCP connection to the collector host every five minutes. It sends the first report after it detects a VPN connection. It sends again after at least 55 minutes have passed since the last acknowledged report. It checks the VPN probe before preparing the report and again before sending it. Set `--vpn-probe host:port` if the collector host is not a suitable probe. A failed send retries on a later run. A lost acknowledgement can cause a duplicate report.
+The scheduler checks a TCP connection to the collector host every five minutes. It sends the first report after it detects a VPN connection. A transition from disconnected to connected also triggers a report. Otherwise, it sends again after at least 55 minutes have passed since the last acknowledged report. It checks the VPN probe before preparing the report and again before sending it. Set `--vpn-probe host:port` if the collector host is not a suitable probe. A failed send retries on a later run. A lost acknowledgement can cause a duplicate report.
 
-On Windows, the task also sends an extra report after it detects a new Security event 1102 or a new Defender detection. The next task run occurs within five minutes. The first successful read of each event source sets its baseline and does not send an event report. Later events trigger at most one extra report per five-minute run. The task saves event markers only after the collector acknowledges the report.
+On Windows, the task also sends an extra report after it detects a new Security event 1102 or a new Defender detection. The next task run occurs within five minutes. The first successful read of each event source sets its baseline and does not send an event report. Later events trigger at most one extra report per five-minute run. The task saves the first event baseline even when no report is due. It saves later event marker advances only after the collector acknowledges a report.
 
 For a limited Windows task, add the task user to the built-in `Event Log Readers` group to read Security event 1102. A SYSTEM task can read the Security log without that group. Without either access, the Security log clear trigger is unavailable. The Defender detection trigger still works when Defender history is readable.
 
@@ -102,12 +106,12 @@ The VPN certificate request travels beside the signed claim. It contains the VPN
 
 | Symptom | Check |
 | --- | --- |
-| Release verification fails | Download the script, checksums, signature bundles, and binary from the same release. Check that Cosign and GitHub CLI are installed. |
+| Release verification fails | Get `scripts/verify-client-release.sh` from the matching repository tag or its source archive. Check that GitHub CLI and Cosign are installed. The script deletes the release copy that it verifies, so it does not verify a separate binary download. |
 | `join` refuses the gateway | Confirm the invitation URL, company key fingerprint, HTTPS certificate, and pinned log key with the gateway operator. |
-| `join` says the manifest needs consent | Read the displayed changes. Sign only if you accept the new manifest hash. |
-| `check` says the device is pending | Give the device code to the gateway operator and wait for approval. |
+| `join` rejects a changed manifest | Join again with the changed manifest. The owner must sign its new hash, and an operator must approve the new device code. |
+| `check` says the device is pending | Give the device code to the gateway operator. Wait for approval. |
 | A check returns `unknown` on Windows | Run the task as an elevated administrator or install it with `schedule install --system` when the control needs machine-wide access. |
 | Windows event reports do not trigger | Check Event Log Readers access for the limited task user. Check that Defender history can be read. |
-| Linux schedule install cannot reach systemd | Start the user systemd manager, then run `schedule install` again. |
+| Linux schedule install cannot reach systemd | Start the user systemd manager. Run `schedule install` again. |
 | Schedule does not send | Check that the collector uses HTTPS, the VPN probe is reachable only through the VPN, and the binary remains at its installed path. |
 | `schedule uninstall` cannot find the job | Use the same absolute `--home` path that you used to install it. |

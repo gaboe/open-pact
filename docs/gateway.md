@@ -21,11 +21,15 @@ Create a Kubernetes Secret for the KEK and one for the PostgreSQL password. The 
 ```sh
 kubectl create secret generic pact-gateway-kek --from-literal=kek="$(openssl rand -base64 32)"
 helm upgrade --install pact deploy/helm/open-pact \
+  --set image.repository=registry.example.org/open-pact/gateway \
+  --set image.tag=0.2.0 \
+  --set witness.image.repository=registry.example.org/open-pact/witness \
+  --set witness.image.tag=0.2.0 \
   --set gateway.kekSecret.name=pact-gateway-kek \
   --set postgres.existingSecret=pact-postgres
 ```
 
-Set `postgres.password` instead of `postgres.existingSecret` only when your deployment system protects the value. Set `publicUrl` to the HTTPS address that clients will use. The chart writes that URL into invitations. Set `log.origin` to the public log name that you want clients to pin.
+Set `image.repository` and `image.tag` to the gateway image that you built or approved. Set `witness.image.repository` and `witness.image.tag` to the witness image. The chart defaults point to placeholder addresses. Set `postgres.password` instead of `postgres.existingSecret` only when your deployment system protects the value. Set `publicUrl` to the HTTPS address that clients will use. The chart writes that URL into invitations. Set `log.origin` to the public log name that you want clients to pin.
 
 The chart refuses to render without a KEK Secret name and a password for its bundled PostgreSQL. To enforce your own manifest, provide the TOML file with `--set-file manifest=manifest.toml`. Helm puts it in a ConfigMap, mounts it at `/etc/open-pact/custom/manifest.toml`, sets `MANIFEST_PATH`, and restarts the gateway when the file changes.
 
@@ -43,14 +47,7 @@ Write the manifest as TOML. Include the check IDs and output types that the clie
 
 The gateway publishes the enforced manifest and appends its hash to the transparency log. A changed manifest has a new hash. Enrol the device again with a new invitation, and approve it again. Approval applies to one manifest hash.
 
-The client accepts a machine-verifiable narrowing under the old owner signature. It displays the change before first use. A narrowing can:
-
-- Remove controls or allowed outputs.
-- Narrow integer bounds or shorten `claim_retention`.
-- Reduce recipients or disclosed metadata.
-- Make a required value less strict or lengthen a grace period.
-
-A narrowing must keep `data_controller`, each built-in check, and the witness policy unchanged. It cannot add a control or expand outputs. It cannot require a stricter value, shorten `grace`, `unknown_grace`, or `claim_max_age`, or raise the minimum trust level. Changes outside these limits need the owner to review and sign the new hash.
+The core library can validate whether a manifest change is a narrowing under the old owner signature. The current client and gateway do not apply that capability when they check an enrolled device. Every changed manifest needs a new join, a new owner signature, and operator approval. The owner signs the new manifest hash during the join.
 
 Review retention before each rollout. PostgreSQL stores encrypted claims until the manifest deadline. A backup can keep a deleted claim readable while it still contains the month key and the KEK. Expire database backups and WAL archives in line with the retention that owners accepted.
 
@@ -80,6 +77,8 @@ A witness keeps its own Ed25519 key and latest checkpoint. Run it under a differ
 
 Create the key with `open-pact-witness keygen`. Store the seed in a secret and the witness state on persistent storage. Add the witness name and verifier key to the manifest's `[log]` section. Set `witness_quorum` above half the witness count. Configure the gateway's `log.witnessUrls` to send checkpoints to the witness. Deploy the witness as a separate Helm release with `gateway.enabled=false`, `witness.enabled=true`, its key Secret, persistent storage, and confirmed `witness.logKeys`.
 
+Set `witness.image.repository` and `witness.image.tag` to the witness image that you built or approved before you install this release. The chart defaults point to a placeholder address.
+
 Generate the witness key on a trusted host. The command writes the private seed to `witness.key` and prints the verifier key for the manifest:
 
 ```sh
@@ -88,6 +87,8 @@ kubectl create secret generic pact-witness-key --from-file=witness.key
 helm upgrade --install pact-witness deploy/helm/open-pact \
   --set gateway.enabled=false \
   --set witness.enabled=true \
+  --set witness.image.repository=registry.example.org/open-pact/witness \
+  --set witness.image.tag=0.2.0 \
   --set witness.name=witness.example.org/w1 \
   --set witness.keySecret.name=pact-witness-key \
   --set 'witness.logKeys[0]=pact.example.com/log+<id>+<base64-key>'
@@ -101,7 +102,7 @@ Run one process per witness key and state file. Do not run the same key on two h
 
 SIEM export is off by default. Choose one sink. The TLS syslog sink accepts `GATEWAY_SIEM_SYSLOG_URL=tls://siem.example.com:6514` and `GATEWAY_SIEM_CA=/path/to/ca.pem`. It requires an explicit port and a CA file. The receiver certificate must match the URL host. The file sink uses `GATEWAY_SIEM_FILE=/var/log/open-pact/events.jsonl` and requires an existing writable parent directory. Do not configure both sinks.
 
-New file events use mode `0600`. Set `GATEWAY_SIEM_FILE_MODE=0640` only when a Wazuh reader needs group access. Add the gateway process to that group and grant the directory group read and execute access. The mode accepts only `0600` or `0640`. Keep the gateway as the only writer to this file.
+New Unix files use mode `0600` by default. The `GATEWAY_SIEM_FILE_MODE` setting accepts only `0600` or `0640`. Set it to `0640` before the gateway creates the file when a Wazuh reader needs group access. The process umask can remove group-read access. Add the gateway process to the Wazuh group. Grant that group read and execute access to the parent directory. For an existing file, change its group and mode yourself. For example, run `chgrp wazuh /var/log/open-pact/events.jsonl`. Then run `chmod g+r /var/log/open-pact/events.jsonl`. Keep the gateway as the only writer to this file.
 
 For Helm, set `siem.enabled=true`, `siem.syslogUrl`, `siem.caSecret.name`, and `siem.retentionDays`. The Secret key defaults to `ca.pem`. The chart mounts the CA read-only. Restart the gateway after you change the CA Secret. The chart exposes `siem.fileMode`, but its built-in sink uses TLS. `fileMode` applies only to a separately configured file sink.
 
@@ -141,5 +142,5 @@ The chart restarts the gateway when the manifest changes. Confirm that the gatew
 | Device approval no longer applies | Enrol and approve the device against the current manifest hash. |
 | Witness rejects a checkpoint | Check the manifest witness key, quorum, witness state, and gateway `log.witnessUrls`. Keep one process per witness state. |
 | SIEM export is disabled | Check gateway logs for invalid sink configuration. Configure one sink and verify the CA or file path. |
-| SIEM drop count increases | Restore receiver access and inspect queue overflow. The in-memory queue cannot recover dropped events after restart. |
-| Wazuh cannot read file events | Set `GATEWAY_SIEM_FILE_MODE=0640`, grant group access to the directory, and add both processes to the group. |
+| SIEM drop count increases | Restore receiver access. Inspect queue overflow. The in-memory queue cannot recover dropped events after restart. |
+| Wazuh cannot read file events | Set `GATEWAY_SIEM_FILE_MODE=0640` before the gateway creates the file. Grant the Wazuh group access to the parent directory. Add the gateway process to that group. Add the Wazuh agent to that group. |

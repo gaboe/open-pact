@@ -4,7 +4,7 @@ This page lists the built-in controls in `crates/open-pact-client/src/checks/mod
 
 | Control | macOS | Windows | Linux | Required privilege |
 | --- | --- | --- | --- | --- |
-| `disk_encryption` | `full`, `none`, or `unknown` from FileVault | `full`, `partial`, `none`, or `unknown` from BitLocker | `full`, `partial`, `none`, or `unknown` from root-volume encryption | Run as the device user. |
+| `disk_encryption` | `full`, `none`, or `unknown` from FileVault | `full`, `partial`, `none`, or `unknown` from BitLocker | `full`, `partial`, `none`, or `unknown` from mounted writable, persistent local disks and swap; excludes boot and removable media | Run as the device user. |
 | `firewall` | `on`, `off`, or `unknown` | `on`, `off`, or `unknown` | `on`, `off`, or `unknown` | Run as the device user. |
 | `screen_lock` | `le_5min`, `le_15min`, `gt_15min`, `none`, or `unknown` | `le_5min`, `le_15min`, `gt_15min`, `none`, or `unknown` | `le_5min`, `le_15min`, `gt_15min`, `none`, or `unknown` | Windows SYSTEM reads interactive user profiles. Other checks use the device user. |
 | `os_supported` | `yes`, `no`, or `unknown` | `yes`, `no`, or `unknown` | `yes`, `no`, or `unknown` | Run as the device user. |
@@ -19,12 +19,15 @@ This page lists the built-in controls in `crates/open-pact-client/src/checks/mod
 | `antimalware_detections_7d` | `n/a` | Integer count or `unknown` | `unknown` | Run as the device user. |
 | `antimalware_last_detection_hours` | `n/a` | Integer hours, `none`, or `unknown` | `unknown` | Run as the device user. |
 | `web_protection` | `on`, `off`, `n/a`, or `unknown` from Chrome, Edge, Brave, and Firefox; Safari is not checked | `on`, `off`, or `unknown` from SmartScreen and supported browsers | `unknown` | Windows needs SYSTEM to inspect other user profiles. macOS and Linux use the device user. |
-| `local_log_retention_days` | `n/a`; unified log retention is size-based | Integer days or `unknown` from Security and System logs | Integer days or `unknown` from the system journal | Windows needs administrator or SYSTEM access. macOS and Linux use the device user. |
+| `local_log_retention_days` | `n/a`; unified log retention is size-based | Integer days or `unknown` from Security and System logs | Integer days or `unknown` from the system journal | Windows needs administrator or SYSTEM access. The Linux device user needs read access to the system journal. macOS uses the device user. |
 | `process_audit` | `n/a` | `on`, `off`, or `unknown` | `n/a` | Windows needs administrator or SYSTEM access. |
 | `powershell_logging` | `n/a` | `on`, `off`, or `unknown` | `n/a` | Run as the device user with registry read access. |
 | `log_cleared_hours` | `n/a` | Integer hours, `none`, or `unknown` from Security and System logs | `n/a` | Windows needs administrator or SYSTEM access to read both logs. |
-| Device key protection | `secure_enclave` or `os_permissions` with `--software-key` | `os_permissions` | `os_permissions` | Device user. |
+| VPN certificate installation | Supported | Not supported yet | Supported | Device user. |
+| Device key protection | `secure_enclave` or `os_permissions` | `os_permissions` | `os_permissions` | Device user. |
 | Report scheduler | launchd LaunchAgent, every five minutes | Task Scheduler, every five minutes; limited user or SYSTEM | systemd user timer, every five minutes | Windows SYSTEM install and uninstall need an elevated prompt. Linux needs a running user manager. |
+
+When a control returns `n/a`, the client sends `n/a` only if the manifest allows that value. Otherwise, it sends `unknown` when the manifest allows `unknown`. If neither value is allowed, the client omits the result. An omitted required result can cause the gateway to deny the claim.
 
 ## Windows access limits
 
@@ -36,7 +39,7 @@ Defender controls require Microsoft Defender Antivirus in Normal mode with the s
 
 ## Key protection
 
-On macOS, `join` creates the device key in the Secure Enclave unless you pass `--software-key`. The client stores a wrapped key file in its home directory. The key cannot leave that Mac, but the client does not bind it to a signed application. The gateway cannot verify the claimed trust level. It records every claim as verified trust level `L0`.
+On macOS, `join` uses an existing software key if one is present. Otherwise, it tries to create the device key in the Secure Enclave unless you pass `--software-key`. If Secure Enclave creation fails, the client warns and creates a software key. The client stores a wrapped key file in its home directory when it uses the Secure Enclave. That key cannot leave the Mac. The gateway records every claim as verified trust level `L0`.
 
 On Windows and Linux, and on macOS with `--software-key`, the device key is a software key protected by operating-system file permissions. These keys report protection `os_permissions` and trust level `L0`. The owner signing key and VPN certificate key are software keys on every platform.
 
