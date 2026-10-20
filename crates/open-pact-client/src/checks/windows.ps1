@@ -1,5 +1,6 @@
 
 $ErrorActionPreference = 'Stop'
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 function Emit($key, $value) { if ($null -eq $value) { $value = '' }; Write-Output "$key`t$value" }
 function RunSection([scriptblock]$work) { & $work }
 function RegValue($path, $name) {
@@ -8,6 +9,46 @@ function RegValue($path, $name) {
         if ($null -eq $item.PSObject.Properties[$name]) { return '' }
         return [string]$item.$name
     } catch { return '!' }
+}
+function PolicyValue($path, $name) {
+    try {
+        if (-not (Test-Path -LiteralPath $path -ErrorAction Stop)) { return '' }
+        return RegValue $path $name
+    } catch { return '!' }
+}
+function ScreenUserRoots($isSystem) {
+    if (-not $isSystem) { return 'HKCU:' }
+    $sessions = @(Get-CimInstance Win32_LogonSession -Filter 'LogonType=2 OR LogonType=10 OR LogonType=11' -ErrorAction Stop)
+    $sids = @(foreach ($session in $sessions) {
+        Get-CimAssociatedInstance -InputObject $session -Association Win32_LoggedOnUser -ResultClassName Win32_Account -ErrorAction Stop | ForEach-Object {
+            if ($_.SID -match '^S-1-(5-21|12-1)-') { $_.SID }
+        }
+    }) | Sort-Object -Unique
+    if (@($sids).Count -eq 0) { throw 'No interactive user' }
+    foreach ($sid in $sids) { 'Registry::HKEY_USERS\' + $sid }
+}
+function UserScreenSaver($userRoot) {
+    $local = $userRoot + '\Control Panel\Desktop'
+    $policy = $userRoot + '\Software\Policies\Microsoft\Windows\Control Panel\Desktop'
+    $values = @{}
+    foreach ($name in @('ScreenSaveActive','ScreenSaverIsSecure','ScreenSaveTimeOut','SCRNSAVE.EXE')) {
+        $value = PolicyValue $policy $name
+        if ($value -eq '') { $value = RegValue $local $name }
+        $values[$name] = $value
+    }
+    $exe = $values['SCRNSAVE.EXE']
+    $valid = 'unknown'
+    if ($exe -ne '' -and $exe -ne '!') {
+        $exe = $exe.Trim('"')
+        $exe = $exe -replace '(?i)%windir%|%systemroot%', $env:windir
+        if ($exe -notmatch '%' -and [IO.Path]::GetExtension($exe) -eq '.scr') {
+            if (-not [IO.Path]::IsPathRooted($exe)) { $exe = Join-Path $env:windir ('System32\' + $exe) }
+            try {
+                if (Test-Path -LiteralPath $exe -PathType Leaf -ErrorAction Stop) { $valid = 'valid' } else { $valid = 'missing' }
+            } catch {}
+        }
+    }
+    return (@($values['ScreenSaveActive'], $values['ScreenSaverIsSecure'], $values['ScreenSaveTimeOut'], $valid) -join '|')
 }
 RunSection {
     try { $bitlocker = (New-Object -ComObject Shell.Application).NameSpace($env:SystemDrive).Self.ExtendedProperty('System.Volume.BitLockerProtection'); Emit 'bitlocker' $bitlocker } catch { Emit 'bitlocker' '' }
@@ -36,38 +77,36 @@ RunSection {
 RunSection {
     Emit 'secure_boot' (RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\State' 'UEFISecureBootEnabled')
     Emit 'lock_policy' (RegValue 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' 'InactivityTimeoutSecs')
-    Emit 'screen_active' (RegValue 'HKCU:\Control Panel\Desktop' 'ScreenSaveActive')
-    Emit 'screen_secure' (RegValue 'HKCU:\Control Panel\Desktop' 'ScreenSaverIsSecure')
-    Emit 'screen_timeout' (RegValue 'HKCU:\Control Panel\Desktop' 'ScreenSaveTimeOut')
+    try {
+        $isSystem = $identity.IsSystem
+        $savers = @(foreach ($userRoot in ScreenUserRoots $isSystem) { UserScreenSaver $userRoot })
+        Emit 'screen_savers' ($savers -join ';')
+    } catch { Emit 'screen_savers' 'unknown' }
     Emit 'autologin' (RegValue 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' 'AutoAdminLogon')
 }
 RunSection {
     $current = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
-    Emit 'os' (@($current.CurrentBuild, $current.DisplayVersion, $current.EditionID, $current.InstallationType) -join '|')
+    $version = $current.DisplayVersion
+    if (-not $version) { $version = $current.ReleaseId }
+    Emit 'os' (@($current.CurrentBuild, $version, $current.EditionID, $current.InstallationType) -join '|')
 }
 RunSection {
     try {
-        $session = New-Object -ComObject Microsoft.Update.Session
-        $searcher = $session.CreateUpdateSearcher()
-        $history = @($searcher.QueryHistory(0, 100) | Where-Object { $_.ResultCode -eq 2 -and $_.Operation -eq 1 } | Sort-Object Date -Descending)
-        $rollupId = '28BC880E-0592-4CBF-8F95-C79B17911D5F'
-        $securityId = '0FA1201D-4330-4FA8-8AE9-B877473B6441'
+        $packages = @(Get-WindowsPackage -Online -ErrorAction Stop | Where-Object {
+            $_.PackageName -match '^Package_for_RollupFix~31bf3856ad364e35~(amd64|arm64|x86)~~[0-9.]+$' -and $_.PackageState -eq 'Installed'
+        })
         $selected = $null
-        foreach ($entry in $history) {
-            $categories = @($entry.Categories | ForEach-Object { $_.CategoryID })
-            if ($categories -notcontains $rollupId -and $categories -notcontains $securityId) { continue }
-            $updateId = $entry.UpdateIdentity.UpdateID
-            $search = $searcher.Search("UpdateID='$updateId'")
-            if ($search.Updates.Count -eq 0) { continue }
-            $kbIds = @($search.Updates.Item(0).KBArticleIDs)
-            if ($categories -contains $rollupId -or $kbIds -contains '5126646') { $selected = $entry.Date; break }
+        $now = [DateTime]::UtcNow
+        foreach ($package in $packages) {
+            $date = $package.InstallTime
+            if ($date -isnot [DateTime] -or $date.Year -lt 2000 -or $date.ToUniversalTime() -gt $now) { throw 'Invalid OS rollup timestamp' }
+            if ($null -eq $selected -or $date -gt $selected) { $selected = $date }
         }
-        if ($null -ne $selected) { Emit 'patch_date' $selected.ToString('yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture) }
+        if ($null -ne $selected) { Emit 'patch_date' $selected.ToUniversalTime().ToString('yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture) }
         else { Emit 'patch_date' '' }
     } catch { Emit 'patch_date' '' }
 }
 
-$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $admin = ([Security.Principal.WindowsPrincipal]::new($identity)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 $now = [DateTime]::UtcNow
 function Age($date, $unit) {
@@ -76,12 +115,6 @@ function Age($date, $unit) {
     if ($span.Ticks -lt 0) { return 'unknown' }
     if ($unit -eq 'days') { return [Math]::Floor($span.TotalDays).ToString([Globalization.CultureInfo]::InvariantCulture) }
     return [Math]::Floor($span.TotalHours).ToString([Globalization.CultureInfo]::InvariantCulture)
-}
-function PolicyValue($path, $name) {
-    try {
-        if (-not (Test-Path -LiteralPath $path -ErrorAction Stop)) { return '' }
-        return RegValue $path $name
-    } catch { return '!' }
 }
 RunSection {
     try {
@@ -188,7 +221,7 @@ function ReadJson($path) {
 }
 function BrowserPolicy($machinePath, $userPath, $names) {
     $result = @{}
-    foreach ($name in $names) {
+    foreach ($name in @($names | Sort-Object { if ($_ -eq 'SafeBrowsingProtectionLevel') { 0 } else { 1 } })) {
         $machine = PolicyValue $machinePath $name
         if ($machine -eq '!') { throw 'Unreadable policy' }
         $value = $machine
@@ -198,6 +231,7 @@ function BrowserPolicy($machinePath, $userPath, $names) {
             if ($name -eq 'SafeBrowsingProtectionLevel') {
                 if ($value -notmatch '^[012]$') { throw 'Invalid protection level' }
                 $result[$name] = [int]$value
+                return $result
             } else {
                 if ($value -notmatch '^[01]$') { throw 'Invalid policy flag' }
                 $result[$name] = ($value -eq '1')
@@ -225,8 +259,8 @@ function ChromiumPrefs($path, $edge) {
 }
 function BrowserDirs($root, $firefox) {
     if (-not (Test-Path -LiteralPath $root -ErrorAction Stop)) { return }
-    if (((Get-Item -LiteralPath $root -ErrorAction Stop).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'External profile root' }
-    foreach ($dir in Get-ChildItem -LiteralPath $root -Directory -ErrorAction Stop) {
+    if (((Get-Item -LiteralPath $root -Force -ErrorAction Stop).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'External profile root' }
+    foreach ($dir in Get-ChildItem -LiteralPath $root -Directory -Force -ErrorAction Stop) {
         $isProfile = $firefox -or $dir.Name -eq 'Default' -or $dir.Name -like 'Profile *' -or $dir.Name -eq 'Guest Profile'
         $preferences = Test-Path -LiteralPath (Join-Path $dir.FullName 'Preferences') -ErrorAction Stop
         if ($isProfile -or $preferences) {
@@ -260,36 +294,67 @@ function FirefoxRegistry($root) {
     return $result
 }
 function FirefoxBrowser($homePath, $app, $userRoot) {
-    $root = Join-Path $homePath 'AppData\Roaming\Mozilla\Firefox'
-    $ini = Join-Path $root 'profiles.ini'
-    if (Test-Path -LiteralPath $ini -ErrorAction Stop) {
-        foreach ($line in Get-Content -LiteralPath $ini -ErrorAction Stop) {
-            if ($line.Trim() -match '^Path=(.*)$') {
-                $relative = $Matches[1].Replace('\', '/')
-                if (-not $relative.StartsWith('Profiles/') -or $relative.Split('/') -contains '..') { throw 'External Firefox profile' }
-            }
-            if ($line.Trim() -eq 'IsRelative=0') { throw 'Absolute Firefox profile' }
-        }
-    }
-    $machine = FirefoxRegistry 'HKLM:'
-    $user = FirefoxRegistry $userRoot
-    foreach ($name in $user.Keys) { if (-not $machine.ContainsKey($name)) { $machine[$name] = $user[$name] } }
-    $policyFile = ReadJson (Join-Path (Split-Path $app) 'distribution\policies.json')
-    if ($machine.Count -gt 0 -and $null -ne $policyFile.PSObject.Properties['policies']) { throw 'Conflicting Firefox policy providers' }
-    $policy = $policyFile
-    if ($machine.Count -gt 0) { $policy = @{policies=@{Preferences=$machine}} }
-    $dirs = @(BrowserDirs (Join-Path $root 'Profiles') $true)
-    if ($dirs.Count -eq 0) { return @{kind='firefox'; policy=$policy; prefs=''} }
-    foreach ($dir in $dirs) {
-        $lines = @()
-        foreach ($file in @('prefs.js', 'user.js')) {
-            $path = Join-Path $dir $file
-            if (Test-Path -LiteralPath $path -ErrorAction Stop) {
-                $lines += @(Get-Content -LiteralPath $path -ErrorAction Stop | Where-Object { $_ -match 'browser\.safebrowsing\.(malware|phishing)\.enabled' })
+    $policy = @{}
+    try {
+        $machine = FirefoxRegistry 'HKLM:'
+        $policy = @{policies=@{Preferences=$machine}}
+        if ($userRoot -like 'Registry::HKEY_USERS*' -and -not (Test-Path -LiteralPath $userRoot -ErrorAction Stop)) { throw 'Unloaded user policy hive' }
+        $user = FirefoxRegistry $userRoot
+        foreach ($name in $user.Keys) { if (-not $machine.ContainsKey($name)) { $machine[$name] = $user[$name] } }
+        if ($machine.Count -eq 0) { $policy = ReadJson (Join-Path (Split-Path $app) 'distribution\policies.json') }
+        $root = Join-Path $homePath 'AppData\Roaming\Mozilla\Firefox'
+        $ini = Join-Path $root 'profiles.ini'
+        if (Test-Path -LiteralPath $ini -ErrorAction Stop) {
+            foreach ($line in Get-Content -LiteralPath $ini -ErrorAction Stop) {
+                if ($line.Trim() -match '^Path=(.*)$') {
+                    $relative = $Matches[1].Replace('\', '/')
+                    if (-not $relative.StartsWith('Profiles/') -or $relative.Split('/') -contains '..') { throw 'External Firefox profile' }
+                }
+                if ($line.Trim() -eq 'IsRelative=0') { throw 'Absolute Firefox profile' }
             }
         }
-        @{kind='firefox'; policy=$policy; prefs=($lines -join "`n")}
-    }
+        $dirs = @(BrowserDirs (Join-Path $root 'Profiles') $true)
+        if ($dirs.Count -eq 0) { return @{kind='firefox'; policy=$policy; prefs=''} }
+        foreach ($dir in $dirs) {
+            $lines = @()
+            foreach ($file in @('prefs.js', 'user.js')) {
+                $path = Join-Path $dir $file
+                if (Test-Path -LiteralPath $path -ErrorAction Stop) {
+                    $lines += @(Get-Content -LiteralPath $path -ErrorAction Stop | Where-Object { $_ -match 'browser\.safebrowsing\.(malware|phishing)\.enabled' })
+                }
+            }
+            @{kind='firefox'; policy=$policy; prefs=($lines -join "`n")}
+        }
+    } catch { @{kind='firefox'; policy=$policy; unreadable=$true} }
+}
+function ChromiumBrowser($browser, $local, $userRoot) {
+    $policy = @{}
+    try {
+        $suffix = '\SOFTWARE\Policies\' + $browser.Policy
+        $names = @('SafeBrowsingProtectionLevel','SafeBrowsingEnabled')
+        if ($browser.Kind -eq 'edge') { $names = @('SmartScreenEnabled') }
+        $policy = BrowserPolicy ('HKLM:' + $suffix) ($userRoot + $suffix) $names
+        if ($userRoot -like 'Registry::HKEY_USERS*' -and -not (Test-Path -LiteralPath $userRoot -ErrorAction Stop)) { throw 'Unloaded user policy hive' }
+        $recommended = $null
+        try { $recommended = BrowserPolicy ('HKLM:' + $suffix + '\Recommended') ($userRoot + $suffix + '\Recommended') $names } catch {}
+        $dataRoot = Join-Path $local $browser.Data
+        $override = PolicyValue ('HKLM:' + $suffix) 'UserDataDir'
+        if ($override -eq '') { $override = PolicyValue ($userRoot + $suffix) 'UserDataDir' }
+        if ($override -eq '!') { throw 'Unreadable user-data policy' }
+        if ($override -ne '') {
+            $variables = @{'${local_app_data}'=$local; '${roaming_app_data}'=(Join-Path (Split-Path $local) 'Roaming'); '${profile}'=(Split-Path (Split-Path $local)); '${windows}'=$env:windir}
+            foreach ($name in $variables.Keys) { if ($variables[$name]) { $override = $override.Replace($name, $variables[$name]) } }
+            if (-not [IO.Path]::IsPathRooted($override) -or $override -match '\$\{|%') { throw 'Unsupported user-data policy variable' }
+            if (-not (Test-Path -LiteralPath $override -PathType Container -ErrorAction Stop)) { throw 'Missing user-data policy directory' }
+            $dataRoot = $override
+        }
+        $dirs = @(BrowserDirs $dataRoot $false)
+        if ($dirs.Count -eq 0) { return @{kind=$browser.Kind; policy=$policy; recommended=$recommended; prefs=@{}} }
+        foreach ($dir in $dirs) {
+            $prefs = ChromiumPrefs (Join-Path $dir 'Preferences') ($browser.Kind -eq 'edge')
+            @{kind=$browser.Kind; policy=$policy; recommended=$recommended; prefs=$prefs}
+        }
+    } catch { @{kind=$browser.Kind; policy=$policy; unreadable=$true} }
 }
 RunSection {
     try {
@@ -322,22 +387,10 @@ RunSection {
                         }
                     })
                     if ($apps.Count -eq 0) { continue }
-                    if (-not (Test-Path -LiteralPath $userRoot -ErrorAction Stop)) { throw 'Unloaded user policy hive' }
                     if ($browser.Kind -eq 'firefox') {
                         foreach ($app in $apps) { $items += @(FirefoxBrowser $homePath $app $userRoot) }
                     } else {
-                        $suffix = '\SOFTWARE\Policies\' + $browser.Policy
-                        $names = @('SafeBrowsingEnabled', 'SafeBrowsingProtectionLevel')
-                        if ($browser.Kind -eq 'edge') { $names = @('SmartScreenEnabled') }
-                        $policy = BrowserPolicy ('HKLM:' + $suffix) ($userRoot + $suffix) $names
-                        $recommended = $null
-                        try { $recommended = BrowserPolicy ('HKLM:' + $suffix + '\Recommended') ($userRoot + $suffix + '\Recommended') $names } catch {}
-                        $dirs = @(BrowserDirs (Join-Path $local $browser.Data) $false)
-                        if ($dirs.Count -eq 0) { $items += @{kind=$browser.Kind; policy=$policy; recommended=$recommended; prefs=@{}} }
-                        foreach ($dir in $dirs) {
-                            $prefs = ChromiumPrefs (Join-Path $dir 'Preferences') ($browser.Kind -eq 'edge')
-                            $items += @{kind=$browser.Kind; policy=$policy; recommended=$recommended; prefs=$prefs}
-                        }
+                        $items += @(ChromiumBrowser $browser $local $userRoot)
                     }
                 } catch { $items += @{kind=$browser.Kind; unreadable=$true} }
             }
