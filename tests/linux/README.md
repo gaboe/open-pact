@@ -17,9 +17,9 @@ package metadata of their build, so the real security query runs against it.
 The `patch-expired` and `patch-apt-*` variants (APT only) point APT at a
 fictional local security archive and refresh it:
 
-| Variant | Cache state | `os_patch_age` |
+| Variant | Cache state | `os_patch_age_days` |
 | --- | --- | --- |
-| `patch-apt-current` | Complete, no newer package | date bucket |
+| `patch-apt-current` | Complete, no newer package | integer day count |
 | `patch-apt-pending` | Complete, shows a newer package | `unknown` |
 | `patch-expired` | `Release` backdated past its `Valid-Until` | `unknown` |
 | `patch-apt-no-packages` | Fresh `Release`, Packages index deleted | `unknown` |
@@ -35,8 +35,8 @@ fictional local security archive and refresh it:
 `selftest.sh` runs the script against a fake `docker` and proves it rejects a
 corrupted cell, an all-`unknown` run, and a failed process.
 
-Two cells depend on the clock and accept several values. `os_patch_age` in the
-real-history variants must be a date bucket, because the image build date sets
+Two cells depend on the clock and accept several values. `os_patch_age_days` in the
+real-history variants must be a integer day count, because the image build date sets
 it. Fedora `os_supported` follows the Fedora 43 end-of-life date.
 
 ## What the checks count
@@ -51,7 +51,7 @@ mounts (`/boot`, `/boot/efi`, `/efi`) are excluded.
 and the service is active. firewalld counts when `firewall-cmd --state` says
 `running`.
 
-`os_patch_age` counts a whole-system upgrade. A single application install or
+`os_patch_age_days` counts a whole-system upgrade. A single application install or
 upgrade does not reset it, and neither does a dnf upgrade with a subset flag
 before or after the verb. The check reports `unknown` unless the security
 query (`apt-get -s upgrade` or `dnf -C -q updateinfo list --security`) exits
@@ -76,5 +76,5 @@ readable, unless its `Release` lists it as empty.
 | `antimalware_active` | `unknown` | `systemctl` cannot query units without systemd. |
 | `password_set` | `unknown` | The check has no Linux implementation. |
 
-`os_supported` and `os_patch_age` give real answers: `/etc/os-release`,
+`os_supported` and `os_patch_age_days` give real answers: `/etc/os-release`,
 `/var/log/apt/history.log` and `dnf history` all exist in the container.

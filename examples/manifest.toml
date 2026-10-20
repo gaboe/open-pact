@@ -32,8 +32,17 @@ id = "screen_lock"
 source = "customer_contract"
 source_ref = "Flow-down of RTS 2024/1774 Art. 13(l)"
 check = "builtin:screen_lock@1"
-output = ["le_5min", "le_15min", "gt_15min", "off", "unknown"]
+output = ["le_5min", "le_15min", "gt_15min", "none", "unknown"]
 required = { macos = "le_5min", windows = "le_5min", linux = "le_5min" }
+grace = "1d"
+
+[[control]]
+id = "os_patch_age_days"
+source = "company_policy"
+rationale = "Limit the age of the last whole-system OS update."
+check = "builtin:os_patch_age_days@1"
+output = { integer = { min = 0, max = 3650 } }
+required = { macos = { max = 30 }, windows = { max = 30 }, linux = { max = 30 } }
 grace = "1d"
 
 [[control]]

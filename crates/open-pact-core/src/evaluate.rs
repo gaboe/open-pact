@@ -216,7 +216,7 @@ pub fn evaluate(
             None => deny.push(Reason::UnknownControl { id: id.clone() }),
             Some(c) if !c.output.contains(value) => deny.push(Reason::UndisclosedValue {
                 id: id.clone(),
-                value: value.clone(),
+                value: value.to_string(),
             }),
             Some(_) => {}
         }
@@ -260,7 +260,7 @@ pub fn evaluate(
         } else {
             Reason::Failed {
                 id,
-                value: value.clone(),
+                value: value.to_string(),
                 required,
                 grace,
             }
@@ -316,9 +316,8 @@ mod tests {
             os: Os::Macos,
             trust_level: TrustLevel::L0,
             virtualized: Some(Virtualized::No),
-            results: results
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
+            results: std::iter::once(("os_patch_age_days".into(), 14.into()))
+                .chain(results.iter().map(|(k, v)| (k.to_string(), (*v).into())))
                 .collect::<BTreeMap<_, _>>(),
             csr_sha256: None,
             log_checkpoint: None,
@@ -335,7 +334,7 @@ mod tests {
     fn with(overrides: &[(&str, &str)]) -> Claim {
         let mut c = claim(&PASSING);
         for (k, v) in overrides {
-            c.results.insert(k.to_string(), v.to_string());
+            c.results.insert(k.to_string(), (*v).into());
         }
         c
     }

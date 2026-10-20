@@ -26,7 +26,8 @@ pub use log::{
     verify_consistency, verify_inclusion,
 };
 pub use manifest::{
-    Accepted, Control, LogPolicy, Manifest, ManifestBody, Metadata, Os, Source, Span, TrustLevel,
+    Accepted, AcceptedValues, Control, ControlValue, IntegerOutput, IntegerRange, LogPolicy,
+    Manifest, ManifestBody, Maximum, Metadata, Minimum, Os, Output, Source, Span, TrustLevel,
     Witness,
 };
 pub use narrowing::{Violation, is_narrowing};

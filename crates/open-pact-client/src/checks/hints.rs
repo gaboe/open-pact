@@ -5,7 +5,7 @@ const COMPLIANT: &[(&str, &[&str])] = &[
     ("firewall", &["on"]),
     ("screen_lock", &["le_5min"]),
     ("os_supported", &["yes"]),
-    ("os_patch_age", &["le_14d"]),
+    ("os_patch_age_days", &[]),
     ("password_set", &["yes"]),
     ("auto_login", &["off"]),
     ("secure_boot", &["on"]),
@@ -59,11 +59,11 @@ pub fn fix_hint(check: &str, value: &str, os: Os) -> Option<&'static str> {
         ("os_supported", Os::Linux) => {
             Some("Upgrade to a release that still receives security updates.")
         }
-        ("os_patch_age", Os::Macos) => {
+        ("os_patch_age_days", Os::Macos) => {
             Some("Install updates: System Settings > General > Software Update.")
         }
-        ("os_patch_age", Os::Windows) => Some("Install updates: Settings > Windows Update."),
-        ("os_patch_age", Os::Linux) => Some(
+        ("os_patch_age_days", Os::Windows) => Some("Install updates: Settings > Windows Update."),
+        ("os_patch_age_days", Os::Linux) => Some(
             "Install updates: run 'sudo apt update && sudo apt upgrade' or 'sudo dnf upgrade'.",
         ),
         ("password_set", Os::Macos) => {
@@ -125,7 +125,7 @@ mod tests {
     fn every_failing_value_has_a_hint_on_every_os() {
         for (check, good) in COMPLIANT {
             for os in Os::ALL {
-                for value in ["none", "off", "on", "no", "gt_30d", "unknown"] {
+                for value in ["none", "off", "on", "no", "31", "unknown"] {
                     if good.contains(&value) || (*check == "secure_boot" && os == Os::Macos) {
                         continue;
                     }

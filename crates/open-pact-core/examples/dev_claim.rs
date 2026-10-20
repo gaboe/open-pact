@@ -5,8 +5,8 @@
 use std::collections::BTreeMap;
 
 use open_pact_core::{
-    Claim, LogCheckpoint, LogHash, Manifest, ManifestHash, Os, Pseudonym, PublicKey, TrustLevel,
-    Virtualized, dev_key, sign_claim,
+    Claim, ControlValue, LogCheckpoint, LogHash, Manifest, ManifestHash, Os, Pseudonym, PublicKey,
+    TrustLevel, Virtualized, dev_key, sign_claim,
 };
 
 fn log_checkpoint() -> Result<Option<LogCheckpoint>, Box<dyn std::error::Error>> {
@@ -41,7 +41,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .map(|kv| {
             kv.split_once('=')
-                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .map(|(k, v)| {
+                    (
+                        k.to_string(),
+                        v.parse::<i32>()
+                            .map(ControlValue::Integer)
+                            .unwrap_or_else(|_| v.into()),
+                    )
+                })
                 .ok_or("expected check=value")
         })
         .collect::<Result<BTreeMap<_, _>, _>>()?;

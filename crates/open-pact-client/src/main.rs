@@ -347,7 +347,7 @@ fn virtualized() -> Virtualized {
     }
 }
 
-fn collect_results(manifest: &Manifest, os: Os) -> BTreeMap<String, String> {
+fn collect_results(manifest: &Manifest, os: Os) -> BTreeMap<String, open_pact_core::ControlValue> {
     let required: Vec<&str> = manifest
         .body()
         .controls
@@ -361,8 +361,8 @@ fn collect_results(manifest: &Manifest, os: Os) -> BTreeMap<String, String> {
 fn disclosable(
     manifest: &Manifest,
     os: Os,
-    mut all: BTreeMap<String, String>,
-) -> BTreeMap<String, String> {
+    mut all: BTreeMap<String, open_pact_core::ControlValue>,
+) -> BTreeMap<String, open_pact_core::ControlValue> {
     manifest
         .body()
         .controls
@@ -477,7 +477,7 @@ fn print_summary(manifest: &Manifest, company: &PublicKey, os: Os) {
         if let Some(why) = &c.rationale {
             println!("  {:<20} why: {why}", "");
         }
-        println!("  {:<20} can report: {}", "", c.output.join(", "));
+        println!("  {:<20} can report: {}", "", c.output);
     }
     println!();
 }
@@ -1087,7 +1087,11 @@ fn pem_certificate(text: &str) -> Result<Vec<u8>> {
     Ok(pem.contents)
 }
 
-fn print_hints(manifest: &Manifest, results: &BTreeMap<String, String>, os: Os) {
+fn print_hints(
+    manifest: &Manifest,
+    results: &BTreeMap<String, open_pact_core::ControlValue>,
+    os: Os,
+) {
     for c in &manifest.body().controls {
         let (Some(required), Some(value)) = (c.required.get(&os), results.get(&c.id)) else {
             continue;
@@ -1095,7 +1099,7 @@ fn print_hints(manifest: &Manifest, results: &BTreeMap<String, String>, os: Os) 
         if required.contains(value) {
             continue;
         }
-        if let Some(hint) = checks::fix_hint(&c.id, value, os) {
+        if let Some(hint) = checks::fix_hint(&c.id, &value.to_string(), os) {
             println!("  fix {}: {hint}", c.id);
         }
     }
@@ -1439,7 +1443,7 @@ mod tests {
                 ("os_supported", "unknown"),
                 ("antimalware_active", "yes"),
             ]
-            .map(|(k, v)| (k.to_string(), v.to_string())),
+            .map(|(k, v)| (k.to_string(), v.into())),
         );
         let ids = |os| -> Vec<String> {
             disclosable(&manifest, os, all.clone())
@@ -1451,6 +1455,24 @@ mod tests {
             ["disk_encryption", "firewall", "screen_lock"]
         );
         assert_eq!(ids(Os::Linux), ["disk_encryption", "screen_lock"]);
+    }
+
+    #[test]
+    fn sends_numeric_results_only_within_declared_bounds() {
+        use open_pact_core::ControlValue;
+        let manifest = Manifest::parse(include_bytes!("../../../examples/manifest.toml")).unwrap();
+        for (value, expected) in [
+            (ControlValue::Integer(0), true),
+            (ControlValue::Integer(3650), true),
+            (ControlValue::Integer(-1), false),
+            (ControlValue::Integer(3651), false),
+            ("unknown".into(), true),
+            ("30".into(), false),
+        ] {
+            let all = BTreeMap::from([("os_patch_age_days".into(), value.clone())]);
+            let sent = disclosable(&manifest, Os::Linux, all);
+            assert_eq!(sent.get("os_patch_age_days"), expected.then_some(&value));
+        }
     }
 
     #[test]

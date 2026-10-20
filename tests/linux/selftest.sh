@@ -16,9 +16,10 @@ cat >"$bin/docker" <<'FAKE'
 variant=${*: -1}
 img=${*: -2:1}
 distro=${img##*-}
-for c in disk_encryption firewall screen_lock os_supported os_patch_age password_set auto_login secure_boot antimalware_active; do
+for c in disk_encryption firewall screen_lock os_supported os_patch_age_days password_set auto_login secure_boot antimalware_active; do
     want=$(expected "$distro" "$variant" "$c")
     value=${want%%|*}
+    value=${value%%..*}
     [ "$FAKE_MODE" != unknowns ] || value=unknown
     [ "$FAKE_MODE-$distro-$variant-$c" != corrupt-ubuntu-ufw-active-firewall ] || value=off
     echo "$c = $value"
@@ -30,6 +31,15 @@ FAKE
 chmod +x "$bin/docker"
 
 status=0
+for value in 0 14 3650; do
+    matches "$value" "0..3650" || status=1
+done
+for value in -1 3651 unknown 1.5 01 999999999999999999999999; do
+    if matches "$value" "0..3650"; then
+        echo "FAIL range accepted $value"
+        status=1
+    fi
+done
 check() { # mode, expect "pass" or "fail"
     FAKE_MODE=$1 PATH="$bin:$PATH" scripts/linux-checks.sh >/dev/null 2>&1
     rc=$?

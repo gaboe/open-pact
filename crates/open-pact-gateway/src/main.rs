@@ -1207,7 +1207,8 @@ mod tests {
                 ("os_supported", "yes"),
             ]
             .into_iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .map(|(k, v)| (k.to_string(), v.into()))
+            .chain(std::iter::once(("os_patch_age_days".into(), 14.into())))
             .collect(),
             csr_sha256: None,
             log_checkpoint: None,

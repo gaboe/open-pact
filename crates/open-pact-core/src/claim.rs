@@ -5,8 +5,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CsrHash, Error, LogHash, ManifestHash, Os, Pseudonym, PublicKey, Signature, SigningKey,
-    TrustLevel,
+    ControlValue, CsrHash, Error, LogHash, ManifestHash, Os, Pseudonym, PublicKey, Signature,
+    SigningKey, TrustLevel,
 };
 
 const HEADER: &str = r#"{"alg":"ES256","typ":"open-pact-claim+jws"}"#;
@@ -32,7 +32,7 @@ pub struct Claim {
     /// Sent only if the manifest lists `virtualized` in `disclosed_metadata`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub virtualized: Option<Virtualized>,
-    pub results: BTreeMap<String, String>,
+    pub results: BTreeMap<String, ControlValue>,
     /// The SHA-256 of the VPN key's certificate request. The request travels next to the JWS, so
     /// the signed claim, which the company keeps, holds only this hash.
     #[serde(default, skip_serializing_if = "Option::is_none")]

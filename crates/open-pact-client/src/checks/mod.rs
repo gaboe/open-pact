@@ -7,7 +7,7 @@ mod windows;
 
 use std::collections::BTreeMap;
 
-use open_pact_core::{Control, Manifest, Os};
+use open_pact_core::{Control, ControlValue, Manifest, Os};
 
 pub use hints::fix_hint;
 
@@ -18,7 +18,7 @@ const BUILTINS: &[(&str, u32)] = &[
     ("firewall", 1),
     ("screen_lock", 1),
     ("os_supported", 1),
-    ("os_patch_age", 1),
+    ("os_patch_age_days", 1),
     ("password_set", 1),
     ("auto_login", 1),
     ("secure_boot", 1),
@@ -50,43 +50,43 @@ pub fn check_supported(manifest: &Manifest) -> Result<(), String> {
     }
 }
 
-type CheckFn = fn() -> &'static str;
+type CheckFn = fn() -> ControlValue;
 type Registry = &'static [(&'static str, CheckFn)];
 
 const MACOS: Registry = &[
-    ("disk_encryption", macos::disk_encryption),
-    ("firewall", macos::firewall),
-    ("screen_lock", macos::screen_lock),
-    ("os_supported", macos::os_supported),
-    ("os_patch_age", macos::os_patch_age),
-    ("password_set", windows::unknown),
-    ("auto_login", macos::auto_login),
-    ("secure_boot", windows::unknown),
-    ("antimalware_active", macos::antimalware_active),
+    ("disk_encryption", || macos::disk_encryption().into()),
+    ("firewall", || macos::firewall().into()),
+    ("screen_lock", || macos::screen_lock().into()),
+    ("os_supported", || macos::os_supported().into()),
+    ("os_patch_age_days", macos::os_patch_age_days),
+    ("password_set", || windows::unknown().into()),
+    ("auto_login", || macos::auto_login().into()),
+    ("secure_boot", || windows::unknown().into()),
+    ("antimalware_active", || macos::antimalware_active().into()),
 ];
 
 const LINUX: Registry = &[
-    ("disk_encryption", linux::disk_encryption),
-    ("firewall", linux::firewall),
-    ("screen_lock", linux::screen_lock),
-    ("os_supported", linux::os_supported),
-    ("os_patch_age", linux::os_patch_age),
-    ("password_set", windows::unknown),
-    ("auto_login", linux::auto_login),
-    ("secure_boot", linux::secure_boot),
-    ("antimalware_active", linux::antimalware_active),
+    ("disk_encryption", || linux::disk_encryption().into()),
+    ("firewall", || linux::firewall().into()),
+    ("screen_lock", || linux::screen_lock().into()),
+    ("os_supported", || linux::os_supported().into()),
+    ("os_patch_age_days", linux::os_patch_age_days),
+    ("password_set", || windows::unknown().into()),
+    ("auto_login", || linux::auto_login().into()),
+    ("secure_boot", || linux::secure_boot().into()),
+    ("antimalware_active", || linux::antimalware_active().into()),
 ];
 
 const WINDOWS: Registry = &[
-    ("disk_encryption", windows::unknown),
-    ("firewall", windows::unknown),
-    ("screen_lock", windows::unknown),
-    ("os_supported", windows::unknown),
-    ("os_patch_age", windows::unknown),
-    ("password_set", windows::unknown),
-    ("auto_login", windows::unknown),
-    ("secure_boot", windows::unknown),
-    ("antimalware_active", windows::unknown),
+    ("disk_encryption", || windows::unknown().into()),
+    ("firewall", || windows::unknown().into()),
+    ("screen_lock", || windows::unknown().into()),
+    ("os_supported", || windows::unknown().into()),
+    ("os_patch_age_days", || windows::unknown().into()),
+    ("password_set", || windows::unknown().into()),
+    ("auto_login", || windows::unknown().into()),
+    ("secure_boot", || windows::unknown().into()),
+    ("antimalware_active", || windows::unknown().into()),
 ];
 
 fn registry(os: Os) -> Registry {
@@ -98,13 +98,13 @@ fn registry(os: Os) -> Registry {
 }
 
 /// Runs the registered checks whose id is in `ids`, and no other.
-pub fn run(os: Os, ids: &[&str]) -> BTreeMap<String, String> {
+pub fn run(os: Os, ids: &[&str]) -> BTreeMap<String, ControlValue> {
     registry(os)
         .iter()
         .filter(|(id, _)| ids.contains(id))
         .map(|(id, check)| {
-            let value = std::panic::catch_unwind(check).unwrap_or("unknown");
-            ((*id).to_string(), value.to_string())
+            let value = std::panic::catch_unwind(check).unwrap_or_else(|_| "unknown".into());
+            ((*id).to_string(), value)
         })
         .collect()
 }
@@ -113,7 +113,7 @@ pub fn run(os: Os, ids: &[&str]) -> BTreeMap<String, String> {
 mod tests {
     use super::*;
 
-    fn run_all(os: Os) -> BTreeMap<String, String> {
+    fn run_all(os: Os) -> BTreeMap<String, ControlValue> {
         let ids: Vec<&str> = BUILTINS.iter().map(|(id, _)| *id).collect();
         run(os, &ids)
     }
@@ -174,10 +174,9 @@ mod tests {
             ("firewall", &["on", "off", "unknown"]),
             (
                 "screen_lock",
-                &["le_5min", "le_15min", "gt_15min", "off", "unknown"],
+                &["le_5min", "le_15min", "gt_15min", "none", "unknown"],
             ),
             ("os_supported", &["yes", "no", "unknown"]),
-            ("os_patch_age", &["le_14d", "le_30d", "gt_30d", "unknown"]),
             ("password_set", &["yes", "no", "unknown"]),
             ("auto_login", &["off", "on", "unknown"]),
             ("secure_boot", &["on", "off", "unknown"]),
@@ -185,8 +184,17 @@ mod tests {
         ];
         for os in Os::ALL {
             let results = run_all(os);
+            assert!(
+                matches!(
+                    &results["os_patch_age_days"],
+                    ControlValue::Integer(0..=3650)
+                ) || results["os_patch_age_days"] == "unknown"
+            );
             for (id, values) in allowed {
-                assert!(values.contains(&results[*id].as_str()), "{os:?} {id}");
+                assert!(
+                    values.contains(&results[*id].to_string().as_str()),
+                    "{os:?} {id}"
+                );
             }
         }
     }

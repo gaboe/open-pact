@@ -12,7 +12,7 @@ open-pact replaces "trust our configuration" with a signed, verifiable exchange.
 
 **For management and legal.** DORA and the Czech implementation of NIS2 require security measures and contractual assurance from suppliers. They do not name a product and do not require monitoring of subcontractors' own devices. The DORA risk management RTS, which binds the bank and reaches suppliers by contract, asks for remote management and wipe of the financial entity's data, controls that cannot be bypassed without authorisation, and denial of access to non-compliant endpoints. open-pact implements the denial of access directly. It addresses the bypass requirement by gating and detection rather than prevention (section 5), It does not implement remote wipe of the entity's data (Art. 11(2)(f)(i)); no solution without full-device wipe can do that on an offline stolen laptop, and Intune's Retire and Wipe also run only when the device next checks in. The bank must either accept that gap for approved data classes or require a remote work profile for projects that need it (section 4.6). Every check carries its source, the manifest supplies the data list, purpose, retention and recipients for the GDPR Article 13 notice, and signed claims let the company prove compliance to a regulator even if a contractor is unreachable.
 
-**For contractors.** The client has no check that reads files, lists applications or logs activity, it accepts no commands, and its output format can only carry the enumerated values listed in the manifest. You can read every line of its code, see every claim you have sent, and stop it at any time. The only consequence of stopping is losing access. The scope cannot grow without your signature, and it cannot even shrink without you being told.
+**For contractors.** The client has no check that reads files, lists applications or logs activity, it accepts no commands, and its output format can only carry the enumerated values or bounded integers listed in the manifest. You can read every line of its code, see every claim you have sent, and stop it at any time. The only consequence of stopping is losing access. The scope cannot grow without your signature, and it cannot even shrink without you being told.
 
 ## 1. The problem
 
@@ -105,7 +105,11 @@ required = { macos = "full", windows = "full", linux = "full" }
 grace = "0d"
 ```
 
-- **Outputs are enumerations, not text.** `disk_encryption` discloses at most two bits. No disk names, partition lists or serial numbers.
+An enumerated output may include `"n/a"`. Each OS requirement must explicitly accept it to pass. Screen lock uses `"none"` when there is no screen lock.
+
+An integer control declares `output = { integer = { min = 0, max = 3650 } }`. Both bounds are inclusive signed 32-bit integers. The bounds must be ordered. An integer output also permits the string `"unknown"`. Each OS requirement uses `{ max = 30 }` or `{ min = 90 }`, with one limit inside the declared range. Claims carry JSON integers, never numeric strings. Other types and values outside the range are refused. A smaller range is narrowing. Lowering a maximum, raising a minimum or switching comparison direction needs owner consent. Unknown values use `unknown_grace`. Manifest hashes remain SHA-256 of the exact TOML bytes. Claims retain JCS encoding.
+
+- **Outputs are enumerations or bounded integers.** `disk_encryption` discloses at most two bits. No disk names, partition lists or serial numbers.
 - **`check` refers only to checks compiled into the client.** There is no `builtin:shell` and no `builtin:osquery`. A new check means a new client release, public review and a new manifest. This is the technical answer to "how do you guarantee the configuration will not change after we agree".
 - **Every check names its source**, so the owner and the auditor can see what is law and what is policy.
 - **Requirements are set per operating system.** A check can require different values on macOS, Windows and Linux, or be omitted on one of them.
@@ -120,7 +124,7 @@ grace = "0d"
 
 A change of scope means a new version, a new hash and a new owner signature. Silent consent after a deadline is technically impossible. The one exception is narrowing. The client accepts the old signature only if all of these hold:
 
-- every check in the new manifest existed in the old one, and its set of outputs is a subset of the old set;
+- every check in the new manifest existed in the old one, and its set of outputs is a subset of the old set. Integer ranges must stay within the old inclusive bounds. Changing output kind needs consent;
 - `claim_retention` is equal or shorter;
 - `data_controller`, `claim_recipients` and `disclosed_metadata` are unchanged or smaller;
 - no `required` value is stricter and no `grace` is shorter;
@@ -150,7 +154,7 @@ When the device connects, the client produces a claim and signs it with the devi
   "results": {
     "disk_encryption": "full",
     "secure_boot": "on",
-    "os_patch_age": "le_14d",
+    "os_patch_age_days": 14,
     "firewall": "on"
   },
   "log_checkpoint": { "size": 42, "root": "m1Rw..." }
@@ -177,7 +181,7 @@ The company does not need to know what happens on the laptop at 22:00 on a Satur
 - **VPN integration uses short-lived certificates.** The gateway is a small certificate authority. A compliant device gets a VPN client certificate valid for, say, 24 hours. The certificate key is generated on the device, in hardware, and never leaves it. VPN gateways such as FortiGate already verify client certificates, so they need no plugin, only trust in this CA. A non-compliant device gets no new certificate and cannot connect once the old one expires. Whether the VPN client (for example FortiClient) can use a non-exportable key held in the TPM or Secure Enclave is to verify on each platform. RADIUS or Entra ID Conditional Access are alternatives, also to verify.
 - **Gateway outage.** The last valid certificate stays valid until `claim_max_age`. A new claim is sent once the gateway is back. An outage does not stop everyone at once.
 
-**What the company stores.** The gateway decides automatically; no person reviews claims day to day. The company stores the signed claims themselves. They are readable, but contain only the enumerated values and the listed metadata. Each claim is signed by the device key, so it verifies on its own. The company can show a regulator "device X signed `disk_encryption = full` on 3 November at 08:12" even if the owner's laptop has since died. The company cannot forge a claim, because it does not hold the device key. Privacy here rests on minimisation, not on encryption: nothing but enumerated values is ever sent.
+**What the company stores.** The gateway decides automatically; no person reviews claims day to day. The company stores the signed claims themselves. They are readable, but contain only the enumerated values, bounded integers and listed metadata. Each claim is signed by the device key, so it verifies on its own. The company can show a regulator "device X signed `disk_encryption = full` on 3 November at 08:12" even if the owner's laptop has since died. The company cannot forge a claim, because it does not hold the device key. Privacy here rests on minimisation, not on encryption: only declared values and metadata are sent.
 
 On disk, claims are encrypted with a key per period (for example per month). The period keys are encrypted under the gateway's key-encryption key (KEK) and stored in the same database. Deleting a period deletes its key. A logical dump made after that holds no key for the period. A backup made before it, a physical copy taken before the database reclaims the deleted row, and an archived write-ahead log still hold the encrypted key, so the company's backup retention decides when the claims are gone from backups too (section 4.8).
 
@@ -233,7 +237,7 @@ The owner can stop the client (`open-pact-client stop`) or uninstall it at any t
 | Guarantee | How it is enforced |
 |---|---|
 | I know what I sent | Local log of every claim, byte for byte, with encrypted backup |
-| The company does not watch continuously | No telemetry. The gateway decides automatically and stores only signed enumerated values |
+| The company does not watch continuously | No telemetry. The gateway decides automatically and stores only signed enumerated values or bounded integers |
 | Admins do not look at individuals without cause | No claim browser, summary only. Single-device views during audit or incident, each recorded in the transparency log. Limit: root on the gateway server |
 | The company can prove compliance without me | Claims are signed by the device key and verify on their own |
 | Agreed deletion | Both signatures, signed confirmation, deletion of period keys. Backups made earlier stay readable with the KEK until the company's stated backup retention ends. Deletion at the other side cannot be proven cryptographically |
@@ -283,7 +287,7 @@ Writing the client itself in Lean is possible (Lean compiles to C and runs on al
 Lean is used for what it does best: an executable model of the protocol rules, with proofs. The model covers:
 
 1. **Narrowing.** A manifest change passes without the owner's signature only if it is a true narrowing (section 4.2). No new check, wider output, stricter value, shorter grace or longer retention gets through unsigned.
-2. **Disclosure contract.** A claim contains only fields the manifest lists, and every value belongs to its declared enumeration, so `results` carries at most Σ log₂|enumeration| bits. The metadata in `disclosed_metadata` is counted separately.
+2. **Disclosure contract.** A claim contains only fields the manifest lists, and every value belongs to its declared enumeration or inclusive integer range. An integer output also permits `"unknown"`. Thus `results` carries at most Σ log₂|output| bits, counting every integer in a range and its unknown value. The metadata in `disclosed_metadata` is counted separately.
 3. **Transparency log.** A verified consistency proof means that the old tree is an unchanged prefix of the new one, and a verified inclusion proof means that the entry is in the tree with that root.
 4. **Grace periods.** `unknown` never denies access immediately, and `grace` behaves as the manifest says.
 
@@ -295,10 +299,10 @@ The Rust implementation is tied to the model by differential random testing, the
 
 | Objection | open-pact answer |
 |---|---|
-| Can IT see my files? | With MDM the answer is "no, because we have not switched it on". With open-pact it is "no, because the client has no such check and its output is an enumeration". You can verify that in the code. |
+| Can IT see my files? | With MDM the answer is "no, because we have not switched it on". With open-pact it is "no, because the client has no such check and its output is an enumeration or a bounded integer". You can verify that in the code. |
 | My clients do not expect an intermediary to see logs or run scripts with system rights. | open-pact has no remote execution and no logs. Your client can read the manifest and see exactly what leaves. Each company has its own manifest and device pseudonym. |
 | The documentation lives on a wiki whose history can be deleted. | The transparency log (section 4.5). The wiki can keep explaining; the signed manifest is what binds. |
-| What data is collected, how long is it kept, who can access it (GDPR Art. 13)? | The manifest lists the data (enumerations and `disclosed_metadata`), purpose (`rationale`), source, retention, recipients and controller. The company's Art. 13 notice adds the legal basis and data subject rights. |
+| What data is collected, how long is it kept, who can access it (GDPR Art. 13)? | The manifest lists the data (enumerations, bounded integers and `disclosed_metadata`), purpose (`rationale`), source, retention, recipients and controller. The company's Art. 13 notice adds the legal basis and data subject rights. |
 | Which agents run, with which rights? What does "company connection" mean? Can admins run commands? | One open-source client, running only when connecting. No commands from the server. "Company connection" is exactly the moment the gateway asks for a claim. |
 | A SIEM agent can send diffs and run commands. How do you guarantee the configuration will not change after we agree? | Checks are compiled in, not configured from the server. Expanding them needs a new release, a new manifest and a new owner signature. |
 | I develop on Linux. | Ubuntu and Fedora with GNOME and KDE are supported from the first version. Other desktops return `unknown` for screen lock (with grace). Encryption (LUKS), firewall (ufw, firewalld, nftables) and updates work everywhere. |
@@ -314,7 +318,7 @@ The Rust implementation is tied to the model by differential random testing, the
 - **osquery / Fleet.** Open source, but essentially SQL over the whole system, sent by the server. Same problem as Wazuh: the capability is unlimited and only configuration limits it. Usable as a library for some checks, not as a trust model.
 - **Kolide (now part of 1Password) and "Honest Security"** (honest.security). Closest in spirit: the user sees what is checked and fixes it. It is a commercial product with server-configured queries.
 
-open-pact adds three things we have not found combined in any existing tool: compiled-in checks instead of configurable ones, consent bound to a manifest hash, and output limited to enumerations with a stated source.
+open-pact adds three things we have not found combined in any existing tool: compiled-in checks instead of configurable ones, consent bound to a manifest hash, and output limited to enumerations or bounded integers with a stated source.
 
 ## 9. Roadmap
 
@@ -328,7 +332,7 @@ The repository holds both parts: the client and the gateway. A company deploys t
 6. **Lean model and differential testing** from the proof of concept onward: narrowing rule, disclosure contract, log proofs and grace periods, checked against the Rust code in CI.
 7. **Optional.** A tray icon, the Decree 409 logging module.
 
-Out of scope on purpose: remote execution, log collection, wiping personal devices, location, and any check whose output is not a small enumeration. Work rules such as daily pushes to a repository, approved AI tools or approved storage are contractual duties checked on the server or by audit, not device state.
+Out of scope on purpose: remote execution, log collection, wiping personal devices, location, and any check whose output is not a small enumeration or an explicitly bounded integer. Work rules such as daily pushes to a repository, approved AI tools or approved storage are contractual duties checked on the server or by audit, not device state.
 
 ## Appendix A. Example first manifest
 
@@ -362,12 +366,12 @@ required = { macos = "on", windows = "on", linux = "on" }
 grace = "3d"
 
 [[control]]
-id = "os_patch_age"
+id = "os_patch_age_days"
 source = "customer_contract"
 source_ref = "Flow-down of RTS 2024/1774 Art. 10"
-check = "builtin:os_patch_age@1"
-output = ["le_14d", "le_30d", "gt_30d", "unknown"]
-required = { macos = "le_14d", windows = "le_14d", linux = "le_14d" }
+check = "builtin:os_patch_age_days@1"
+output = { integer = { min = 0, max = 3650 } }
+required = { macos = { max = 30 }, windows = { max = 30 }, linux = { max = 30 } }
 grace = "3d"
 
 [[control]]
@@ -383,7 +387,7 @@ id = "screen_lock"
 source = "customer_contract"
 source_ref = "Flow-down of RTS 2024/1774 Art. 13(l)"
 check = "builtin:screen_lock@1"
-output = ["le_5min", "le_15min", "gt_15min", "off", "unknown"]
+output = ["le_5min", "le_15min", "gt_15min", "none", "unknown"]
 required = { macos = "le_5min", windows = "le_5min", linux = "le_5min" }
 grace = "1d"
 

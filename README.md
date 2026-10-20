@@ -201,3 +201,22 @@ TEST_DATABASE_URL=postgres://postgres:test@localhost:55432/postgres cargo test -
 - The Secure Enclave device key proves that claims come from this Mac, but it is not bound to the client's code signature as PAPER.md section 5 describes. The client keeps the wrapped key in `device-se.key`, not in the keychain, so it needs no keychain entitlement, and any program on the same Mac that can read the file can sign with it. A Developer ID signed client with a keychain access group closes this. The Secure Enclave key protects against key theft: its private key cannot be copied off the Mac. It does not prove anything to the gateway, because the trust level in a claim is what the client asserts. Without attestation the gateway records that assertion as `asserted_trust_level`, counts every claim as `verified_trust_level` L0, and denies every claim when `min_trust_level` is L1 or L2, with the reason that the level needs attestation, which is not available.
 - The VPN certificate key and the owner key are still software keys.
 - The CN is the pseudonym's hex digest without the `pseudonym:` prefix, because X.509 limits a CN to 64 characters.
+
+## Bounded integer controls
+
+`os_patch_age_days` replaces the bucket-based patch-age control. This is a breaking manifest and claim change. Owners sign the new manifest again. Clients report whole days as a JSON integer, or `"unknown"` when they cannot establish an age within 0 to 3650 days. Windows reports `"unknown"` until its check is implemented.
+
+```toml
+[[control]]
+id = "os_patch_age_days"
+source = "company_policy"
+rationale = "Limit the age of the last whole-system OS update."
+check = "builtin:os_patch_age_days@1"
+output = { integer = { min = 0, max = 3650 } }
+required = { macos = { max = 30 }, windows = { max = 30 }, linux = { max = 30 } }
+grace = "1d"
+```
+
+Integer outputs always allow `"unknown"`. Both bounds are inclusive signed 32-bit integers. A requirement uses `{ max = 30 }` for at most 30, or `{ min = 90 }` for at least 90. The limit must be within the output range. Numeric strings, fractions, other strings and out-of-range values are refused. Unknown values use `unknown_grace`. A smaller output range is narrowing. Lowering a maximum or raising a minimum is stricter and needs owner consent. Switching comparison direction or output kind also needs consent. Manifest hashes remain SHA-256 of the exact TOML bytes. Claims retain JCS encoding.
+
+The screen-lock output `"none"` means no screen lock. It replaces `"off"` in this breaking change. An enumerated control may declare `"n/a"` and accept it for an OS where the control does not apply. The gateway treats `"n/a"` as a declared string value, with no special bypass.

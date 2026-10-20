@@ -3,13 +3,13 @@
 # A "default" row applies to every variant; a variant row overrides single keys.
 # "a|b|c" lists the values a run may report.
 #
-# REAL is a bucket from the history the image build wrote with the real
+# REAL is a day count from the history the image build wrote with the real
 # package manager, so it depends on the build date. It must still be a date
-# bucket, never unknown.
+# count, never unknown.
 # Fedora os_supported follows the clock (Fedora 43 reaches end of life on
 # 2026-12-09), so a fresh image may report either value.
-ubuntu default disk_encryption=unknown firewall=off screen_lock=unknown os_supported=yes os_patch_age=le_14d|le_30d|gt_30d password_set=unknown auto_login=unknown secure_boot=unknown antimalware_active=unknown
-fedora default disk_encryption=unknown firewall=unknown screen_lock=unknown os_supported=yes|no os_patch_age=le_14d|le_30d|gt_30d password_set=unknown auto_login=unknown secure_boot=unknown antimalware_active=unknown
+ubuntu default disk_encryption=unknown firewall=off screen_lock=unknown os_supported=yes os_patch_age_days=0..3650 password_set=unknown auto_login=unknown secure_boot=unknown antimalware_active=unknown
+fedora default disk_encryption=unknown firewall=unknown screen_lock=unknown os_supported=yes|no os_patch_age_days=0..3650 password_set=unknown auto_login=unknown secure_boot=unknown antimalware_active=unknown
 
 * ufw-active firewall=on antimalware_active=no
 * ufw-active-disabled firewall=off antimalware_active=no
@@ -17,25 +17,25 @@ fedora default disk_encryption=unknown firewall=unknown screen_lock=unknown os_s
 * gnome-default screen_lock=le_5min
 * gnome-lock-5min screen_lock=le_5min
 * gnome-lock-15min screen_lock=le_15min
-* gnome-lock-off screen_lock=off
+* gnome-lock-off screen_lock=none
 * kde-5min screen_lock=le_5min
 * kde-30min screen_lock=gt_15min
-* kde-off screen_lock=off
-* patch-stale os_patch_age=gt_30d
-* patch-rotated os_patch_age=gt_30d
-* patch-no-metadata os_patch_age=unknown
-ubuntu patch-expired os_patch_age=unknown
-ubuntu patch-apt-current os_patch_age=le_14d
-ubuntu patch-apt-pending os_patch_age=unknown
-ubuntu patch-apt-no-packages os_patch_age=unknown
-ubuntu patch-apt-orphan-release os_patch_age=unknown
-ubuntu patch-apt-uncached-source os_patch_age=unknown
-ubuntu patch-apt-multiarch-current os_patch_age=le_14d
-ubuntu patch-apt-foreign-missing os_patch_age=unknown
-ubuntu patch-apt-empty-index os_patch_age=unknown
-ubuntu patch-apt-empty-gzip os_patch_age=unknown
-ubuntu patch-apt-older-index os_patch_age=unknown
-ubuntu patch-apt-listed-empty os_patch_age=le_14d
+* kde-off screen_lock=none
+* patch-stale os_patch_age_days=31..3650
+* patch-rotated os_patch_age_days=31..3650
+* patch-no-metadata os_patch_age_days=unknown
+ubuntu patch-expired os_patch_age_days=unknown
+ubuntu patch-apt-current os_patch_age_days=0..14
+ubuntu patch-apt-pending os_patch_age_days=unknown
+ubuntu patch-apt-no-packages os_patch_age_days=unknown
+ubuntu patch-apt-orphan-release os_patch_age_days=unknown
+ubuntu patch-apt-uncached-source os_patch_age_days=unknown
+ubuntu patch-apt-multiarch-current os_patch_age_days=0..14
+ubuntu patch-apt-foreign-missing os_patch_age_days=unknown
+ubuntu patch-apt-empty-index os_patch_age_days=unknown
+ubuntu patch-apt-empty-gzip os_patch_age_days=unknown
+ubuntu patch-apt-older-index os_patch_age_days=unknown
+ubuntu patch-apt-listed-empty os_patch_age_days=0..14
 * eol os_supported=no
 * autologin-gdm auto_login=on
 * autologin-sddm auto_login=on

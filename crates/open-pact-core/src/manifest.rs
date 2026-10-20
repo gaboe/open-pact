@@ -210,8 +210,131 @@ impl fmt::Display for Span {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ControlValue {
+    Text(String),
+    Integer(i32),
+}
+
+impl From<&str> for ControlValue {
+    fn from(value: &str) -> Self {
+        Self::Text(value.into())
+    }
+}
+impl From<String> for ControlValue {
+    fn from(value: String) -> Self {
+        Self::Text(value)
+    }
+}
+impl From<i32> for ControlValue {
+    fn from(value: i32) -> Self {
+        Self::Integer(value)
+    }
+}
+impl PartialEq<str> for ControlValue {
+    fn eq(&self, other: &str) -> bool {
+        matches!(self, Self::Text(text) if text == other)
+    }
+}
+impl PartialEq<&str> for ControlValue {
+    fn eq(&self, other: &&str) -> bool {
+        self == *other
+    }
+}
+impl fmt::Display for ControlValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Text(text) => f.write_str(text),
+            Self::Integer(n) => n.fmt(f),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Output {
+    Enumerated(Vec<String>),
+    Integer(IntegerOutput),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntegerOutput {
+    pub integer: IntegerRange,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntegerRange {
+    pub min: i32,
+    pub max: i32,
+}
+
+impl Output {
+    pub fn contains(&self, value: &ControlValue) -> bool {
+        match (self, value) {
+            (Self::Enumerated(values), ControlValue::Text(text)) => values.contains(text),
+            (Self::Integer(bounds), ControlValue::Integer(n)) => {
+                (bounds.integer.min..=bounds.integer.max).contains(n)
+            }
+            (Self::Integer(_), ControlValue::Text(text)) => text == "unknown",
+            _ => false,
+        }
+    }
+    pub fn is_subset_of(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Enumerated(values), Self::Enumerated(old)) => {
+                values.iter().all(|v| old.contains(v))
+            }
+            (Self::Integer(now), Self::Integer(old)) => {
+                now.integer.min >= old.integer.min && now.integer.max <= old.integer.max
+            }
+            _ => false,
+        }
+    }
+    fn validate(&self) -> bool {
+        match self {
+            Self::Enumerated(values) => {
+                !values.is_empty() && values.iter().collect::<BTreeSet<_>>().len() == values.len()
+            }
+            Self::Integer(bounds) => bounds.integer.min <= bounds.integer.max,
+        }
+    }
+}
+impl fmt::Display for Output {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Enumerated(values) => f.write_str(&values.join(", ")),
+            Self::Integer(bounds) => write!(
+                f,
+                "integer {}..={}, unknown",
+                bounds.integer.min, bounds.integer.max
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Accepted {
+    Values(AcceptedValues),
+    Max(Maximum),
+    Min(Minimum),
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Maximum {
+    pub max: i32,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Minimum {
+    pub min: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(from = "OneOrMany")]
-pub struct Accepted(pub BTreeSet<String>);
+pub struct AcceptedValues(pub BTreeSet<String>);
 
 #[derive(Deserialize)]
 #[serde(untagged)]
@@ -219,28 +342,58 @@ enum OneOrMany {
     One(String),
     Many(Vec<String>),
 }
-
-impl From<OneOrMany> for Accepted {
+impl From<OneOrMany> for AcceptedValues {
     fn from(v: OneOrMany) -> Self {
-        Accepted(match v {
+        Self(match v {
             OneOrMany::One(s) => BTreeSet::from([s]),
             OneOrMany::Many(v) => v.into_iter().collect(),
         })
     }
 }
-
 impl Accepted {
-    pub fn contains(&self, value: &str) -> bool {
-        self.0.contains(value)
+    pub fn contains(&self, value: &ControlValue) -> bool {
+        match (self, value) {
+            (Self::Values(values), ControlValue::Text(text)) => values.0.contains(text),
+            (Self::Max(limit), ControlValue::Integer(n)) => *n <= limit.max,
+            (Self::Min(limit), ControlValue::Integer(n)) => *n >= limit.min,
+            _ => false,
+        }
+    }
+    pub fn is_superset_of(&self, old: &Self) -> bool {
+        match (self, old) {
+            (Self::Values(now), Self::Values(old)) => now.0.is_superset(&old.0),
+            (Self::Max(now), Self::Max(old)) => now.max >= old.max,
+            (Self::Min(now), Self::Min(old)) => now.min <= old.min,
+            _ => false,
+        }
+    }
+    fn valid_for(&self, output: &Output) -> bool {
+        match (self, output) {
+            (Self::Values(values), Output::Enumerated(outputs)) => {
+                !values.0.is_empty() && values.0.iter().all(|v| outputs.contains(v))
+            }
+            (Self::Max(limit), Output::Integer(bounds)) => {
+                (bounds.integer.min..=bounds.integer.max).contains(&limit.max)
+            }
+            (Self::Min(limit), Output::Integer(bounds)) => {
+                (bounds.integer.min..=bounds.integer.max).contains(&limit.min)
+            }
+            _ => false,
+        }
     }
 }
-
 impl fmt::Display for Accepted {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let values: Vec<&str> = self.0.iter().map(String::as_str).collect();
-        match values.as_slice() {
-            [one] => f.write_str(one),
-            many => write!(f, "one of {}", many.join(", ")),
+        match self {
+            Self::Values(values) => {
+                let values: Vec<&str> = values.0.iter().map(String::as_str).collect();
+                match values.as_slice() {
+                    [one] => f.write_str(one),
+                    many => write!(f, "one of {}", many.join(", ")),
+                }
+            }
+            Self::Max(limit) => write!(f, "<= {}", limit.max),
+            Self::Min(limit) => write!(f, ">= {}", limit.min),
         }
     }
 }
@@ -253,7 +406,7 @@ pub struct Control {
     pub source_ref: Option<String>,
     pub rationale: Option<String>,
     pub check: String,
-    pub output: Vec<String>,
+    pub output: Output,
     pub required: BTreeMap<Os, Accepted>,
     pub grace: Span,
 }
@@ -380,14 +533,16 @@ impl ManifestBody {
             if !c.check.starts_with("builtin:") {
                 return Err(format!("{}: check must be builtin:<name>@<version>", c.id));
             }
-            let outputs: BTreeSet<&String> = c.output.iter().collect();
-            if outputs.is_empty() || outputs.len() != c.output.len() {
-                return Err(format!("{}: output must be non-empty and unique", c.id));
+            if !c.output.validate() {
+                return Err(format!(
+                    "{}: output must be a non-empty unique enumeration or an ordered integer range",
+                    c.id
+                ));
             }
             for (os, accepted) in &c.required {
-                if accepted.0.is_empty() || !accepted.0.iter().all(|v| outputs.contains(v)) {
+                if !accepted.valid_for(&c.output) {
                     return Err(format!(
-                        "{}: required.{os} must be a non-empty subset of output",
+                        "{}: required.{os} must match the output kind and stay within output",
                         c.id
                     ));
                 }
@@ -436,7 +591,7 @@ mod tests {
         let disk = m.body().control("disk_encryption").unwrap();
         assert_eq!(
             disk.required[&Os::Macos],
-            Accepted(BTreeSet::from(["full".to_string()]))
+            Accepted::Values(AcceptedValues(BTreeSet::from(["full".to_string()])))
         );
         assert!(disk.grace.is_zero());
         assert_eq!(m.body().min_trust_level, TrustLevel::L0);
@@ -467,7 +622,7 @@ mod tests {
         );
         let m = Manifest::parse(toml.as_bytes()).unwrap();
         let lock = m.body().control("screen_lock").unwrap();
-        assert!(lock.required[&Os::Macos].contains("le_15min"));
+        assert!(lock.required[&Os::Macos].contains(&"le_15min".into()));
         assert!(!lock.required.contains_key(&Os::Linux));
     }
 

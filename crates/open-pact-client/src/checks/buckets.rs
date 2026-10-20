@@ -1,10 +1,9 @@
 use chrono::NaiveDate;
 
-pub fn patch_age(last: NaiveDate, today: NaiveDate) -> &'static str {
+pub fn patch_age(last: NaiveDate, today: NaiveDate) -> open_pact_core::ControlValue {
     match (today - last).num_days() {
-        d if d <= 14 => "le_14d",
-        d if d <= 30 => "le_30d",
-        _ => "gt_30d",
+        days @ 0..=3650 => open_pact_core::ControlValue::Integer(days as i32),
+        _ => "unknown".into(),
     }
 }
 
@@ -25,12 +24,41 @@ mod tests {
     }
 
     #[test]
-    fn patch_age_bucket_edges() {
+    fn patch_age_day_edges() {
         let today = d(2026, 10, 31);
-        assert_eq!(patch_age(d(2026, 10, 17), today), "le_14d");
-        assert_eq!(patch_age(d(2026, 10, 16), today), "le_30d");
-        assert_eq!(patch_age(d(2026, 10, 1), today), "le_30d");
-        assert_eq!(patch_age(d(2026, 9, 30), today), "gt_30d");
+        assert_eq!(
+            patch_age(d(2026, 10, 17), today),
+            open_pact_core::ControlValue::Integer(14)
+        );
+        assert_eq!(
+            patch_age(d(2026, 10, 16), today),
+            open_pact_core::ControlValue::Integer(15)
+        );
+        assert_eq!(
+            patch_age(d(2026, 10, 1), today),
+            open_pact_core::ControlValue::Integer(30)
+        );
+        assert_eq!(
+            patch_age(d(2026, 9, 30), today),
+            open_pact_core::ControlValue::Integer(31)
+        );
+    }
+
+    #[test]
+    fn patch_age_rejects_future_and_excessive_dates() {
+        let today = d(2026, 10, 31);
+        for days in [0, 3650] {
+            assert_eq!(
+                patch_age(today - chrono::TimeDelta::days(days), today),
+                open_pact_core::ControlValue::Integer(days as i32)
+            );
+        }
+        for days in [-1, 3651] {
+            assert_eq!(
+                patch_age(today - chrono::TimeDelta::days(days), today),
+                "unknown"
+            );
+        }
     }
 
     #[test]

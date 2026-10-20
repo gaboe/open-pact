@@ -229,7 +229,7 @@ fn hash_with<D: sha2::Digest>(mut input: impl Read) -> Option<IndexDigest> {
     })
 }
 
-pub fn os_patch_age() -> &'static str {
+pub fn os_patch_age_days() -> open_pact_core::ControlValue {
     patch_age(&System, Utc::now())
 }
 
@@ -244,7 +244,7 @@ enum SecurityUpdates {
 
 /// The age of the last whole-system upgrade, or `unknown` unless the security query ran, exited
 /// zero and showed nothing outstanding.
-fn patch_age(host: &(impl PackageHost + Sync), now: DateTime<Utc>) -> &'static str {
+fn patch_age(host: &(impl PackageHost + Sync), now: DateTime<Utc>) -> open_pact_core::ControlValue {
     let (last, updates) = match host.read(APT_HISTORY) {
         Some(text) => (
             first_upgrade_date(
@@ -262,7 +262,7 @@ fn patch_age(host: &(impl PackageHost + Sync), now: DateTime<Utc>) -> &'static s
     };
     match (updates, last) {
         (SecurityUpdates::Clear, Some(date)) => buckets::patch_age(date, now.date_naive()),
-        _ => "unknown",
+        _ => "unknown".into(),
     }
 }
 
@@ -919,7 +919,7 @@ pub fn parse_gnome_lock(lock_enabled: &str, idle_delay: &str, lock_delay: &str) 
         return "unknown";
     };
     if !enabled || idle == 0 {
-        return "off";
+        return "none";
     }
     buckets::lock_delay(idle.saturating_add(delay))
 }
@@ -942,7 +942,7 @@ pub fn parse_kscreenlocker(ini: &str) -> &'static str {
         }
     }
     if !autolock {
-        return "off";
+        return "none";
     }
     buckets::lock_delay(timeout_min.saturating_mul(60))
 }
@@ -998,7 +998,7 @@ fn first_date(line: &str) -> Option<NaiveDate> {
 /// `unattended-upgrade`, with no package names) that upgraded something and
 /// finished without an error. An application upgrade, a base package alone,
 /// or an interrupted transaction never resets the age. Held-back and skipped
-/// packages leave no trace in history, so `os_patch_age` also asks the package
+/// packages leave no trace in history, so `os_patch_age_days` also asks the package
 /// manager for outstanding security updates and reports `unknown` when any
 /// remain. Without a qualifying entry the age is unknown.
 const APT_FULL_UPGRADE_VERBS: &[&str] =
@@ -1442,11 +1442,11 @@ sde1      part 1 0 ext4 /mnt/archive
         );
         assert_eq!(
             parse_gnome_lock("false\n", "uint32 300\n", "uint32 0\n"),
-            "off"
+            "none"
         );
         assert_eq!(
             parse_gnome_lock("true\n", "uint32 0\n", "uint32 0\n"),
-            "off"
+            "none"
         );
         assert_eq!(
             parse_gnome_lock("", "uint32 300\n", "uint32 0\n"),
@@ -1462,7 +1462,7 @@ sde1      part 1 0 ext4 /mnt/archive
             "le_5min"
         );
         assert_eq!(parse_kscreenlocker(ini), "le_15min");
-        assert_eq!(parse_kscreenlocker("[Daemon]\nAutolock=false\n"), "off");
+        assert_eq!(parse_kscreenlocker("[Daemon]\nAutolock=false\n"), "none");
         assert_eq!(parse_kscreenlocker(""), "le_5min");
         assert_eq!(parse_kscreenlocker("[Daemon]\nTimeout=30\n"), "gt_15min");
     }
@@ -1816,7 +1816,7 @@ ID Command line                          Date and time       Action(s) Altered
                 &apt_host(&[SECURITY_LISTS, RELEASE_POCKET], Some((true, APT_CLEAR))),
                 today
             ),
-            "le_14d"
+            open_pact_core::ControlValue::Integer(1)
         );
         for (what, host) in [
             (
@@ -1860,7 +1860,10 @@ ID Command line                          Date and time       Action(s) Altered
         let clear = Some((true, APT_CLEAR));
         let debian = "Origin: Fictional\nSuite: stable-security\nCodename: fictional-security\n\
             Date: Mon, 12 Oct 2026 06:00:00 +0000\nValid-Until: Mon, 19 Oct 2026 06:00:00 +0000\n";
-        assert_eq!(patch_age(&apt_host(&[debian], clear), now()), "le_14d");
+        assert_eq!(
+            patch_age(&apt_host(&[debian], clear), now()),
+            open_pact_core::ControlValue::Integer(1)
+        );
         let security =
             |date: &str, until: &str| format!("Suite: fictional-security\nDate: {date}\n{until}");
         for (what, lists) in [
@@ -1911,7 +1914,11 @@ ID Command line                          Date and time       Action(s) Altered
     fn apt_patch_age_needs_every_security_index() {
         let clear = Some((true, APT_CLEAR));
         let complete = || apt_host(&[SECURITY_LISTS, RELEASE_POCKET], clear);
-        assert_eq!(patch_age(&complete(), now()), "le_14d", "complete");
+        assert_eq!(
+            patch_age(&complete(), now()),
+            open_pact_core::ControlValue::Integer(1),
+            "complete"
+        );
         let flat = apt_host(&[], clear)
             .answer(
                 INDEX_TARGETS,
@@ -1926,7 +1933,11 @@ ID Command line                          Date and time       Action(s) Altered
                 &format!("{SECURITY_LISTS}SHA256:\n{}", entry("Packages", INDEX)),
             )
             .with("/var/lib/apt/lists/_tmp_fictional-archive_._Packages", INDEX);
-        assert_eq!(patch_age(&flat, now()), "le_14d", "flat repository");
+        assert_eq!(
+            patch_age(&flat, now()),
+            open_pact_core::ControlValue::Integer(1),
+            "flat repository"
+        );
         let empty = complete().without(&packages("suite0")).with(
             &format!("{}InRelease", source("suite0")),
             &format!(
@@ -1936,7 +1947,7 @@ ID Command line                          Date and time       Action(s) Altered
         );
         assert_eq!(
             patch_age(&empty, now()),
-            "le_14d",
+            open_pact_core::ControlValue::Integer(1),
             "an index listed as empty"
         );
 
@@ -2028,7 +2039,7 @@ ID Command line                          Date and time       Action(s) Altered
         };
         assert_eq!(
             patch_age(&multiarch(), now()),
-            "le_14d",
+            open_pact_core::ControlValue::Integer(1),
             "complete multiarch"
         );
         let native_only = format!(
@@ -2079,7 +2090,7 @@ ID Command line                          Date and time       Action(s) Altered
             );
         assert_eq!(
             patch_age(&as_listed_xz, now()),
-            "le_14d",
+            open_pact_core::ControlValue::Integer(1),
             "stored form listed in the Release"
         );
         let arch_all = |extra: &str| {
@@ -2108,7 +2119,7 @@ ID Command line                          Date and time       Action(s) Altered
                 &arch_all("No-Support-for-Architecture-all: Packages\n"),
                 now()
             ),
-            "le_14d",
+            open_pact_core::ControlValue::Integer(1),
             "an arch-all index APT does not use"
         );
         for (what, host) in [
@@ -2173,7 +2184,7 @@ ID Command line                          Date and time       Action(s) Altered
         };
         assert_eq!(
             patch_age(&sha512_only(), now()),
-            "le_14d",
+            open_pact_core::ControlValue::Integer(1),
             "complete SHA512-only source"
         );
         let older = INDEX.replace("1.1", "1.0");
@@ -2273,7 +2284,11 @@ ID Command line                          Date and time       Action(s) Altered
         let complete = || apt_host(&[SECURITY_LISTS, RELEASE_POCKET], clear);
         let older = INDEX.replace("1.1", "1.0");
         let stable = RefreshingHost::new(complete(), complete());
-        assert_eq!(patch_age(&stable, now()), "le_14d", "no refresh");
+        assert_eq!(
+            patch_age(&stable, now()),
+            open_pact_core::ControlValue::Integer(1),
+            "no refresh"
+        );
         let refreshed =
             RefreshingHost::new(complete().with(&packages("suite0"), &older), complete());
         assert_eq!(
@@ -2301,7 +2316,7 @@ ID Command line                          Date and time       Action(s) Altered
         let upgraded = Some((true, DNF_UPGRADED));
         assert_eq!(
             patch_age(&dnf_host(upgraded, Some((true, ""))), today),
-            "le_14d"
+            open_pact_core::ControlValue::Integer(1)
         );
         for (what, host) in [
             (
@@ -2352,7 +2367,11 @@ ID Command line                          Date and time       Action(s) Altered
         }
         for cmd in ["dnf --security upgrade", "dnf -y --refresh upgrade"] {
             let host = dnf_host(Some((true, &row(cmd))), Some((true, "")));
-            assert_eq!(patch_age(&host, today), "le_14d", "{cmd}");
+            assert_eq!(
+                patch_age(&host, today),
+                open_pact_core::ControlValue::Integer(1),
+                "{cmd}"
+            );
         }
     }
 
@@ -2448,8 +2467,8 @@ ID Command line                          Date and time       Action(s) Altered
 
     #[test]
     fn kde_lock_keys_tolerate_spaces_and_case() {
-        assert_eq!(parse_kscreenlocker("[Daemon]\nAutolock = false\n"), "off");
-        assert_eq!(parse_kscreenlocker("[Daemon]\nAutolock=False\n"), "off");
+        assert_eq!(parse_kscreenlocker("[Daemon]\nAutolock = false\n"), "none");
+        assert_eq!(parse_kscreenlocker("[Daemon]\nAutolock=False\n"), "none");
         assert_eq!(parse_kscreenlocker("[Daemon]\nTimeout = 20\n"), "gt_15min");
     }
 

@@ -19,7 +19,13 @@ expected() {
     ' "$EXPECTED_FILE"
 }
 
-# True when VALUE is one of the "|"-separated ALLOWED values.
+# True for a declared string value or an integer in an inclusive min..max range.
 matches() {
+    if [[ "$2" =~ ^([0-9]+)\.\.([0-9]+)$ ]]; then
+        [[ "$1" =~ ^(0|[1-9][0-9]{0,3})$ ]] || return 1
+        local low=${2%%..*} high=${2##*..}
+        [ "$1" -ge "$low" ] && [ "$1" -le "$high" ]
+        return
+    fi
     [ -n "$2" ] && [[ "|$2|" == *"|$1|"* ]]
 }

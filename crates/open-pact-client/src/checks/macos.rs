@@ -23,12 +23,13 @@ pub fn os_supported() -> &'static str {
     run("sw_vers", &["-productVersion"]).map_or("unknown", |t| parse_os_supported(&t))
 }
 
-pub fn os_patch_age() -> &'static str {
+pub fn os_patch_age_days() -> open_pact_core::ControlValue {
     run("plutil", &["-p", INSTALL_HISTORY])
         .and_then(|t| parse_last_macos_update(&t))
-        .map_or("unknown", |last| {
-            buckets::patch_age(last, Utc::now().date_naive())
-        })
+        .map_or_else(
+            || "unknown".into(),
+            |last| buckets::patch_age(last, Utc::now().date_naive()),
+        )
 }
 
 pub fn auto_login() -> &'static str {
@@ -69,7 +70,7 @@ pub fn parse_firewall(out: &str) -> &'static str {
 
 pub fn parse_screen_lock(out: &str) -> &'static str {
     if out.contains("screenLock is off") {
-        return "off";
+        return "none";
     }
     if out.contains("delay is immediate") {
         return "le_5min";
@@ -176,7 +177,7 @@ mod tests {
             parse_screen_lock(&line("delay is 3600 seconds")),
             "gt_15min"
         );
-        assert_eq!(parse_screen_lock(&line("is off")), "off");
+        assert_eq!(parse_screen_lock(&line("is off")), "none");
         assert_eq!(parse_screen_lock("garbage"), "unknown");
     }
 

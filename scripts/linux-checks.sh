@@ -12,7 +12,7 @@ cd "$(dirname "$0")/.."
 PLATFORM=${PLATFORM:-}
 [ -n "$PLATFORM" ] || case $(uname -m) in arm64 | aarch64) PLATFORM=linux/arm64 ;; *) PLATFORM=linux/amd64 ;; esac
 
-COLS=(disk_encryption firewall screen_lock os_supported os_patch_age auto_login secure_boot antimalware_active)
+COLS=(disk_encryption firewall screen_lock os_supported os_patch_age_days auto_login secure_boot antimalware_active)
 CHECKED=("${COLS[@]}" password_set)
 VARIANTS=(baseline firewalld-installed ufw-active ufw-active-disabled ufw-inactive
     gnome-default gnome-lock-5min gnome-lock-15min gnome-lock-off

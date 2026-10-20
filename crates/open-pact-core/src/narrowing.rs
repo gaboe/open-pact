@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use crate::{Manifest, Metadata, Os};
+use crate::{Manifest, Metadata, Os, Output};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Violation {
@@ -14,6 +14,8 @@ pub enum Violation {
     },
     #[error("control {id} adds outputs {added:?}")]
     OutputsAdded { id: String, added: Vec<String> },
+    #[error("control {id} widens or changes its output kind")]
+    OutputWidened { id: String },
     #[error("claim_retention is longer")]
     RetentionLonger,
     #[error("data_controller changed")]
@@ -56,23 +58,22 @@ pub fn is_narrowing(old: &Manifest, new: &Manifest) -> Result<(), Vec<Violation>
                 new: c.check.clone(),
             });
         }
-        let extra: Vec<String> = c
-            .output
-            .iter()
-            .filter(|x| !o.output.contains(x))
-            .cloned()
-            .collect();
-        if !extra.is_empty() {
-            v.push(Violation::OutputsAdded {
-                id: c.id.clone(),
-                added: extra,
-            });
+        if !c.output.is_subset_of(&o.output) {
+            match (&c.output, &o.output) {
+                (Output::Enumerated(now), Output::Enumerated(old)) => {
+                    v.push(Violation::OutputsAdded {
+                        id: c.id.clone(),
+                        added: now.iter().filter(|x| !old.contains(x)).cloned().collect(),
+                    })
+                }
+                _ => v.push(Violation::OutputWidened { id: c.id.clone() }),
+            }
         }
         for os in Os::ALL {
             let stricter = match (o.required.get(&os), c.required.get(&os)) {
                 (_, None) => false,
                 (None, Some(_)) => true,
-                (Some(was), Some(now)) => !now.0.is_superset(&was.0),
+                (Some(was), Some(now)) => !now.is_superset_of(was),
             };
             if stricter {
                 v.push(Violation::RequiredStricter {
