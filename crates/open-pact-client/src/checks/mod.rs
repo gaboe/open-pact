@@ -179,7 +179,7 @@ mod tests {
             ("firewall", &["on", "off", "unknown"]),
             (
                 "screen_lock",
-                &["le_5min", "le_15min", "gt_15min", "off", "unknown"],
+                &["le_5min", "le_15min", "gt_15min", "none", "unknown"],
             ),
             ("os_supported", &["yes", "no", "unknown"]),
             ("os_patch_age", &["le_14d", "le_30d", "gt_30d", "unknown"]),
