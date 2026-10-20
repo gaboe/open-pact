@@ -546,7 +546,7 @@ $ErrorActionPreference = 'Stop'
 function AssertProtected($path) {
     $item = Get-Item -LiteralPath $path -Force
     if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Protected path is a reparse point' }
-    $acl = Get-Acl -LiteralPath $path
+    $acl = if ($item.PSIsContainer) { [IO.Directory]::GetAccessControl($path) } else { [IO.File]::GetAccessControl($path) }
     $allowed = @('S-1-5-18','S-1-5-32-544','S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
     $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
     if ($allowed -notcontains $owner) { throw 'Protected path has a non-admin owner' }
@@ -822,10 +822,10 @@ function New-Object {
             r#"{PROTECTED_DIRECTORY}
 ProtectedDirectory {path}
 AssertProtected {path}
-$acl = Get-Acl -LiteralPath {path}
+$acl = [IO.Directory]::GetAccessControl({path})
 $everyone = New-Object Security.Principal.SecurityIdentifier('S-1-1-0')
 $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($everyone,'Modify','Allow')))
-Set-Acl -LiteralPath {path} -AclObject $acl
+[IO.Directory]::SetAccessControl({path},$acl)
 try {{ AssertProtected {path}; throw 'unsafe ACL accepted' }} catch {{
     if ($_.Exception.Message -notlike '*non-admin principal*') {{ throw }}
 }}
