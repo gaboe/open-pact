@@ -115,6 +115,21 @@ fn os_version(os: Os) -> Result<String> {
 }
 
 pub(crate) async fn run(home: &Home, collector: &str, dry_run: bool) -> Result<()> {
+    run_with_probe(home, collector, dry_run, None)
+        .await
+        .map(|_| ())
+}
+
+pub(crate) async fn run_scheduled(home: &Home, collector: &str, probe: &str) -> Result<bool> {
+    run_with_probe(home, collector, false, Some(probe)).await
+}
+
+async fn run_with_probe(
+    home: &Home,
+    collector: &str,
+    dry_run: bool,
+    probe: Option<&str>,
+) -> Result<bool> {
     let url = collector_url(collector)?;
     let enrolment = home.enrolment()?;
     let manifest = Manifest::parse(&std::fs::read(home.file("manifest.toml"))?)?;
@@ -132,7 +147,7 @@ pub(crate) async fn run(home: &Home, collector: &str, dry_run: bool) -> Result<(
     if dry_run {
         println!("{}", serde_json::to_string_pretty(&report)?);
         println!("{jws}");
-        return Ok(());
+        return Ok(false);
     }
     let http = reqwest::Client::builder()
         .use_rustls_tls()
@@ -142,12 +157,18 @@ pub(crate) async fn run(home: &Home, collector: &str, dry_run: bool) -> Result<(
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(30))
         .build()?;
+    if let Some(probe) = probe
+        && !crate::schedule::vpn_up(probe).await
+    {
+        return Ok(false);
+    }
     let response = http
         .post(url)
         .header(reqwest::header::CONTENT_TYPE, "application/jose")
         .body(jws)
         .send()
         .await
+        .map_err(reqwest::Error::without_url)
         .context("send report to collector")?;
     if !response.status().is_success() {
         bail!(
@@ -156,7 +177,7 @@ pub(crate) async fn run(home: &Home, collector: &str, dry_run: bool) -> Result<(
         );
     }
     println!("Collector acknowledged report {}", report.report_id);
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(test)]

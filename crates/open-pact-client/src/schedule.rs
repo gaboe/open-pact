@@ -26,6 +26,11 @@ pub(crate) enum Command {
     Uninstall,
     #[command(hide = true)]
     Run,
+    #[command(hide = true)]
+    Probe {
+        #[arg(long)]
+        address: String,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -55,7 +60,7 @@ impl State {
             && (self.reconnect_pending
                 || self
                     .last_success
-                    .is_none_or(|last| now.saturating_sub(last) >= 55 * 60))
+                    .is_none_or(|last| now < last || now.saturating_sub(last) >= 55 * 60))
     }
 
     fn acknowledged(&mut self, now: i64) {
@@ -81,19 +86,65 @@ fn probe_address(raw: &str) -> Result<()> {
     Ok(())
 }
 
-async fn vpn_up(probe: &str) -> bool {
-    matches!(
-        tokio::time::timeout(
-            Duration::from_secs(2),
-            tokio::net::TcpStream::connect(probe)
-        )
-        .await,
-        Ok(Ok(_))
+async fn probe_process(command: &mut tokio::process::Command, limit: Duration) -> bool {
+    command
+        .kill_on_drop(true)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let Ok(mut child) = command.spawn() else {
+        return false;
+    };
+    match tokio::time::timeout(limit, child.wait()).await {
+        Ok(Ok(status)) => status.success(),
+        _ => {
+            let _ = child.kill().await;
+            false
+        }
+    }
+}
+
+pub(crate) async fn vpn_up(probe: &str) -> bool {
+    if let Ok(address) = probe.parse::<std::net::SocketAddr>() {
+        return matches!(
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                tokio::net::TcpStream::connect(address)
+            )
+            .await,
+            Ok(Ok(_))
+        );
+    }
+    let Ok(executable) = std::env::current_exe() else {
+        return false;
+    };
+    // System DNS can block indefinitely. Only a separate process can be cancelled.
+    probe_process(
+        tokio::process::Command::new(executable).args(["schedule", "probe", "--address", probe]),
+        Duration::from_secs(2),
     )
+    .await
+}
+
+fn probe_blocking(address: &str) -> Result<()> {
+    use std::net::{TcpStream, ToSocketAddrs};
+    probe_address(address)?;
+    for address in address.to_socket_addrs()? {
+        if TcpStream::connect_timeout(&address, Duration::from_secs(2)).is_ok() {
+            return Ok(());
+        }
+    }
+    bail!("VPN probe failed")
 }
 
 fn lock(home: &Home) -> Result<File> {
-    std::fs::create_dir_all(&home.0)?;
+    let mut directory = std::fs::DirBuilder::new();
+    directory.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        directory.mode(0o700);
+    }
+    directory.create(&home.0)?;
     let file = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -107,12 +158,39 @@ fn lock(home: &Home) -> Result<File> {
 
 fn save<T: Serialize>(home: &Home, name: &str, value: &T) -> Result<()> {
     let temp = home.file(&format!("{name}.tmp"));
-    let mut file = File::create(&temp)?;
-    use std::io::Write;
-    file.write_all(&serde_json::to_vec_pretty(value)?)?;
-    file.sync_all()?;
-    std::fs::rename(temp, home.file(name))?;
+    remove_if_exists(&temp)?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mode = std::fs::metadata(home.file(name))
+            .map(|metadata| metadata.permissions().mode() & 0o600)
+            .unwrap_or(0o600);
+        options.mode(mode);
+    }
+    let mut file = options.open(&temp)?;
+    let result = (|| -> Result<()> {
+        use std::io::Write;
+        file.write_all(&serde_json::to_vec_pretty(value)?)?;
+        file.sync_all()?;
+        std::fs::rename(&temp, home.file(name))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result?;
     Ok(())
+}
+
+pub(crate) fn uninstall_command(home: &Path) -> String {
+    let raw = home.to_string_lossy();
+    #[cfg(windows)]
+    let quoted = format!("'{}'", raw.replace('\'', "''"));
+    #[cfg(not(windows))]
+    let quoted = format!("'{}'", raw.replace('\'', "'\"'\"'"));
+    format!("open-pact-client --home {quoted} schedule uninstall")
 }
 
 fn text(path: &Path) -> Result<&str> {
@@ -206,7 +284,15 @@ impl Job {
         let args = self
             .argv
             .iter()
-            .map(|arg| systemd_arg(arg))
+            .enumerate()
+            .map(|(index, arg)| {
+                // Systemd expands environment variables in arguments, but not in the executable.
+                if index == 0 {
+                    systemd_arg(arg).replace("$$", "$")
+                } else {
+                    systemd_arg(arg)
+                }
+            })
             .collect::<Vec<_>>()
             .join(" ");
         format!(
@@ -360,10 +446,14 @@ fn register(job: &Job, install: bool) -> Result<()> {
 }
 
 pub(crate) async fn run(home: &Home, command: Command) -> Result<()> {
+    if let Command::Probe { address } = &command {
+        return probe_blocking(address);
+    }
     let _lock = lock(home)?;
     let absolute = std::fs::canonicalize(&home.0)?;
     let home = Home(absolute);
     match command {
+        Command::Probe { .. } => unreachable!(),
         Command::Run => {
             let config: Config = home
                 .read_json(CONFIG)?
@@ -374,8 +464,11 @@ pub(crate) async fn run(home: &Home, command: Command) -> Result<()> {
             state.observe(vpn_up(&config.vpn_probe).await);
             save(&home, STATE, &state)?;
             if state.should_send(chrono::Utc::now().timestamp()) {
-                report::run(&home, &config.collector, false).await?;
-                state.acknowledged(chrono::Utc::now().timestamp());
+                if report::run_scheduled(&home, &config.collector, &config.vpn_probe).await? {
+                    state.acknowledged(chrono::Utc::now().timestamp());
+                } else {
+                    state.observe(false);
+                }
                 save(&home, STATE, &state)?;
             }
         }
@@ -424,6 +517,224 @@ pub(crate) async fn run(home: &Home, command: Command) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn enrolled_home(dir: &Path) -> Home {
+        let home = Home(dir.to_path_buf());
+        let key = crate::DeviceKey::load_or_create(dir, true).unwrap();
+        let manifest = include_str!("../../../examples/manifest.toml")
+            .lines()
+            .map(|line| {
+                if line.starts_with("required =") {
+                    "required = {}"
+                } else {
+                    line
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let parsed = open_pact_core::Manifest::parse(manifest.as_bytes()).unwrap();
+        home.write("manifest.toml", manifest.as_bytes()).unwrap();
+        home.write(
+            "enrolment.json",
+            &serde_json::to_vec(&crate::Enrolment {
+                gateway: "https://gateway.example.org".into(),
+                manifest: parsed.hash().clone(),
+                device: open_pact_core::Pseudonym::of(&key.public_key()),
+                salt: "fictional-review-fixture".into(),
+                log_entries: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        home
+    }
+
+    #[tokio::test]
+    async fn send_error_hides_collector_query_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = enrolled_home(dir.path());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let collector = format!(
+            "https://{}/status?token=fictional-secret",
+            listener.local_addr().unwrap()
+        );
+        drop(listener);
+        let error = report::run(&home, &collector, false).await.unwrap_err();
+        let logged = format!("error: {error:#}");
+        println!("{logged}");
+        assert!(logged.contains("send report to collector"), "{logged}");
+        assert!(!logged.contains("fictional-secret"));
+    }
+
+    #[tokio::test]
+    async fn vpn_disconnect_during_preparation_prevents_send() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let home = enrolled_home(dir.path());
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let probe_address = probe.local_addr().unwrap().to_string();
+        let collector_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let collector = format!(
+            "https://{}/status",
+            collector_listener.local_addr().unwrap()
+        );
+        drop(collector_listener);
+        let went_down = Arc::new(AtomicBool::new(false));
+        let observed = went_down.clone();
+        let close = std::thread::spawn(move || {
+            let (stream, _) = probe.accept().unwrap();
+            drop(stream);
+            drop(probe);
+            observed.store(true, Ordering::SeqCst);
+        });
+        save(
+            &home,
+            CONFIG,
+            &Config {
+                collector,
+                vpn_probe: probe_address.clone(),
+            },
+        )
+        .unwrap();
+        let result = run(&home, Command::Run).await;
+        close.join().unwrap();
+        assert!(went_down.load(Ordering::SeqCst));
+        assert!(!vpn_up(&probe_address).await);
+        assert!(result.is_ok(), "{result:?}");
+        let state: State = home.read_json(STATE).unwrap().unwrap();
+        assert!(!state.vpn_up);
+        assert!(state.reconnect_pending);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uninstall_command_preserves_shell_metacharacters() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home with 'quotes' $cash `false` ; & end");
+        let command = uninstall_command(&home);
+        let output = std::process::Command::new("sh")
+            .args([
+                "-c",
+                &format!(
+                    "set -- {command}; printf '%s\\n' \"$#\" \"$1\" \"$2\" \"$3\" \"$4\" \"$5\""
+                ),
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            [
+                "5",
+                "open-pact-client",
+                "--home",
+                home.to_str().unwrap(),
+                "schedule",
+                "uninstall"
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probe_timeout_kills_and_reaps_the_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .args(["-c", "echo $$ > \"$PID_FILE\"; exec sleep 30"])
+            .env("PID_FILE", &pid_file);
+        let started = std::time::Instant::now();
+        assert!(!probe_process(&mut command, Duration::from_millis(200)).await);
+        assert!(started.elapsed() < Duration::from_secs(3));
+        let pid: i32 = std::fs::read_to_string(pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_schedule_home_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().join("new-home"));
+        let _guard = lock(&home).unwrap();
+        assert_eq!(
+            std::fs::metadata(home.0).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    #[test]
+    fn clock_rollback_recovers_within_an_hour() {
+        let mut state = State::default();
+        state.observe(true);
+        state.acknowledged(100_000);
+        assert!(state.should_send(100_000 - 86_400 + 2 * 3600));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saves_keep_config_and_state_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+        save(&home, CONFIG, &"fictional-token").unwrap();
+        assert_eq!(
+            std::fs::metadata(home.file(CONFIG))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        std::fs::set_permissions(home.file(CONFIG), std::fs::Permissions::from_mode(0o400))
+            .unwrap();
+        save(&home, CONFIG, &"fictional-token").unwrap();
+        assert_eq!(
+            std::fs::metadata(home.file(CONFIG))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o400
+        );
+        save(&home, STATE, &State::default()).unwrap();
+        assert_eq!(
+            std::fs::metadata(home.file(STATE))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn systemd_executable_keeps_one_dollar_sign() {
+        let job = Job::new(
+            Path::new("/opt/client $cash %raw"),
+            Path::new("/tmp/home $cash"),
+        )
+        .unwrap();
+        assert!(
+            job.service()
+                .contains(r#"ExecStart="/opt/client $cash %%raw" "--home" "/tmp/home $$cash""#)
+        );
+    }
+
     #[test]
     fn send_decision_table_and_reconnect_retry() {
         let now = 100_000;
@@ -456,8 +767,8 @@ mod tests {
         state.acknowledged(now + 120);
         assert!(!state.should_send(now + 121));
         assert!(
-            !state.should_send(now - 1),
-            "clock rollback does not cause a send"
+            state.should_send(now - 1),
+            "clock rollback retries instead of suppressing reports"
         );
     }
 

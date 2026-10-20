@@ -1372,8 +1372,8 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         } => log_show(&home.file("claims.jsonl")).map(|()| ExitCode::SUCCESS),
         Command::Stop => {
             println!(
-                "Run `open-pact-client --home {} schedule uninstall` to stop scheduled reports.",
-                home.0.display()
+                "Run `{}` to stop scheduled reports.",
+                schedule::uninstall_command(&home.0)
             );
             println!("To uninstall, delete the binary and {}.", home.0.display());
             Ok(ExitCode::SUCCESS)
