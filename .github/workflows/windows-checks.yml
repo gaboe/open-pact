@@ -20,13 +20,4 @@ jobs:
         run: cargo test -p open-pact-client
 
       - name: Print checks on this Windows runner
-        env:
-          OPEN_PACT_WINDOWS_TIMINGS: "1"
         run: cargo test -p open-pact-client -- --ignored print_run_all_on_this_machine --nocapture
-
-      - name: Inspect installed Windows updates
-        shell: pwsh
-        run: |
-          $os = Get-CimInstance Win32_OperatingSystem
-          "OS: $($os.Caption), version $($os.Version), build $($os.BuildNumber)"
-          Get-HotFix | Sort-Object InstalledOn -Descending | Select-Object -First 10 HotFixID, InstalledOn, Description | Format-Table -AutoSize

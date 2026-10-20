@@ -8,11 +8,7 @@ use super::exec::run_with_timeout;
 const POWERSHELL: &str = r#"
 $ErrorActionPreference = 'Stop'
 function Emit($key, $value) { if ($null -eq $value) { $value = '' }; [Console]::WriteLine("$key`t$value") }
-function Timed($name, [scriptblock]$work) {
-    $watch = [Diagnostics.Stopwatch]::StartNew()
-    & $work
-    if ($env:OPEN_PACT_WINDOWS_TIMINGS -eq '1') { [Console]::Error.WriteLine("timing.$name`t$($watch.Elapsed.TotalSeconds)") }
-}
+function RunSection([scriptblock]$work) { & $work }
 function RegValue($path, $name) {
     try {
         $item = Get-ItemProperty -LiteralPath $path -ErrorAction Stop
@@ -20,16 +16,16 @@ function RegValue($path, $name) {
         return [string]$item.$name
     } catch { return '!' }
 }
-Timed 'bitlocker' {
+RunSection {
     try { $bitlocker = (New-Object -ComObject Shell.Application).NameSpace($env:SystemDrive).Self.ExtendedProperty('System.Volume.BitLockerProtection'); Emit 'bitlocker' $bitlocker } catch { Emit 'bitlocker' '' }
 }
-Timed 'firewall' {
+RunSection {
     try {
         $profiles = @(Get-NetFirewallProfile -PolicyStore ActiveStore | Sort-Object Name)
         if ($profiles.Count -eq 3) { Emit 'firewall' (($profiles | ForEach-Object { $_.Enabled.ToString() }) -join ' ') } else { Emit 'firewall' '' }
     } catch { Emit 'firewall' '' }
 }
-Timed 'antimalware' {
+RunSection {
     try {
         $products = @(Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntivirusProduct -ErrorAction Stop)
         if ($products.Count -gt 0) { Emit 'antimalware' (($products | ForEach-Object { $_.productState }) -join ' ') }
@@ -44,7 +40,7 @@ Timed 'antimalware' {
         } catch { Emit 'antimalware' '' }
     }
 }
-Timed 'registry' {
+RunSection {
     Emit 'secure_boot' (RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\State' 'UEFISecureBootEnabled')
     Emit 'lock_policy' (RegValue 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' 'InactivityTimeoutSecs')
     Emit 'screen_active' (RegValue 'HKCU:\Control Panel\Desktop' 'ScreenSaveActive')
@@ -52,36 +48,30 @@ Timed 'registry' {
     Emit 'screen_timeout' (RegValue 'HKCU:\Control Panel\Desktop' 'ScreenSaveTimeOut')
     Emit 'autologin' (RegValue 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' 'AutoAdminLogon')
 }
-Timed 'os' {
+RunSection {
     $current = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
     Emit 'os' (@($current.CurrentBuild, $current.DisplayVersion, $current.EditionID, $current.InstallationType) -join '|')
 }
-Timed 'wua' {
+RunSection {
     try {
         $session = New-Object -ComObject Microsoft.Update.Session
         $searcher = $session.CreateUpdateSearcher()
         $history = @($searcher.QueryHistory(0, 100) | Where-Object { $_.ResultCode -eq 2 -and $_.Operation -eq 1 } | Sort-Object Date -Descending)
-        if ($env:OPEN_PACT_WINDOWS_TIMINGS -eq '1') { Emit 'wua.history_count' $history.Count }
         $rollupId = '28BC880E-0592-4CBF-8F95-C79B17911D5F'
+        $securityId = '0FA1201D-4330-4FA8-8AE9-B877473B6441'
         $selected = $null
-        $candidateIndex = 0
         foreach ($entry in $history) {
+            $categories = @($entry.Categories | ForEach-Object { $_.CategoryID })
+            if ($categories -notcontains $rollupId -and $categories -notcontains $securityId) { continue }
             $updateId = $entry.UpdateIdentity.UpdateID
             $search = $searcher.Search("UpdateID='$updateId'")
             if ($search.Updates.Count -eq 0) { continue }
-            $update = $search.Updates.Item(0)
-            $categories = @($update.Categories | ForEach-Object { $_.CategoryID })
-            $kbIds = @($update.KBArticleIDs)
-            if ($env:OPEN_PACT_WINDOWS_TIMINGS -eq '1') { Emit "wua.candidate.$candidateIndex" "$($entry.Date.ToString('yyyy-MM-dd'))|$($kbIds -join ',')|$($categories -join ',')" }
-            $candidateIndex++
+            $kbIds = @($search.Updates.Item(0).KBArticleIDs)
             if ($categories -contains $rollupId -or $kbIds -contains '5126646') { $selected = $entry.Date; break }
         }
         if ($null -ne $selected) { Emit 'patch_date' $selected.ToString('yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture) }
         else { Emit 'patch_date' '' }
-    } catch {
-        Emit 'patch_date' ''
-        if ($env:OPEN_PACT_WINDOWS_TIMINGS -eq '1') { Emit 'wua.error' $_.Exception.GetType().FullName }
-    }
+    } catch { Emit 'patch_date' '' }
 }
 "#;
 
@@ -169,17 +159,6 @@ fn value(name: &str) -> Option<&'static str> {
         parse_values(&out)
     });
     values.get(name).map(String::as_str)
-}
-
-#[cfg(windows)]
-pub fn diagnostics() -> Vec<(String, String)> {
-    VALUES
-        .get()
-        .into_iter()
-        .flat_map(|values| values.iter())
-        .filter(|(key, _)| key.starts_with("timing.") || key.starts_with("wua."))
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect()
 }
 
 fn parse_values(out: &str) -> BTreeMap<String, String> {
