@@ -207,11 +207,11 @@ mod tests {
 
     #[test]
     fn rejects_new_control() {
-        let extra = "\n[[control]]\nid = \"secure_boot\"\nsource = \"standard\"\ncheck = \"builtin:secure_boot@1\"\noutput = [\"on\", \"off\"]\nrequired = {}\ngrace = \"0d\"\n";
+        let extra = "\n[[control]]\nid = \"fictional_new_control\"\nsource = \"standard\"\ncheck = \"builtin:fictional_new_control@1\"\noutput = [\"on\", \"off\"]\nrequired = {}\ngrace = \"0d\"\n";
         rejected(
             &[("grace = \"14d\"\n", &format!("grace = \"14d\"\n{extra}"))],
             Violation::NewControl {
-                id: "secure_boot".into(),
+                id: "fictional_new_control".into(),
             },
         );
     }

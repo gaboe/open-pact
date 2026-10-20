@@ -10,6 +10,16 @@ const COMPLIANT: &[(&str, &[&str])] = &[
     ("auto_login", &["off"]),
     ("secure_boot", &["on"]),
     ("antimalware_active", &["yes"]),
+    ("preboot_auth", &["user_secret"]),
+    ("antimalware_signature_age_days", &[]),
+    ("antimalware_full_scan_age_days", &["n/a"]),
+    ("antimalware_detections_7d", &[]),
+    ("antimalware_last_detection_hours", &["none"]),
+    ("web_protection", &["on"]),
+    ("local_log_retention_days", &["n/a"]),
+    ("process_audit", &["on", "n/a"]),
+    ("powershell_logging", &["on", "n/a"]),
+    ("log_cleared_hours", &["none", "n/a"]),
 ];
 
 pub fn fix_hint(check: &str, value: &str, os: Os) -> Option<&'static str> {
@@ -88,13 +98,45 @@ pub fn fix_hint(check: &str, value: &str, os: Os) -> Option<&'static str> {
             Some("Enable Secure Boot in the UEFI firmware settings and use a signed bootloader.")
         }
         ("antimalware_active", Os::Macos) => Some(
-            "Turn on Gatekeeper: run 'sudo spctl --global-enable' or System Settings > Privacy & Security > Allow applications from.",
+            "Install macOS security updates and restore the XProtect scan service if it was disabled.",
         ),
         ("antimalware_active", Os::Windows) => {
             Some("Turn on real-time protection: Windows Security > Virus & threat protection.")
         }
         ("antimalware_active", Os::Linux) => {
             Some("Install and start an antimalware service such as ClamAV (clamav-daemon).")
+        }
+        ("preboot_auth", Os::Macos) => {
+            Some("Enable FileVault in System Settings > Privacy & Security > FileVault.")
+        }
+        ("preboot_auth", Os::Linux) => {
+            Some("Use a passphrase to unlock the LUKS root volume before boot.")
+        }
+        ("preboot_auth", Os::Windows) => Some("Require a BitLocker startup PIN."),
+        ("antimalware_signature_age_days", Os::Macos) => Some(
+            "Install security data updates in System Settings > General > Software Update > Automatic Updates.",
+        ),
+        ("antimalware_signature_age_days", Os::Linux) => {
+            Some("Update the ClamAV daily database with freshclam.")
+        }
+        ("web_protection", _) => Some(
+            "Enable fraudulent website warnings or Safe Browsing in every installed browser. Check managed policies too.",
+        ),
+        ("local_log_retention_days", Os::Linux) => {
+            Some("Review journald storage limits and access to the system journal.")
+        }
+        ("antimalware_full_scan_age_days", _) => {
+            Some("Review the antivirus scan history. XProtect has no user-requested full scan.")
+        }
+        ("antimalware_detections_7d" | "antimalware_last_detection_hours", _) => {
+            Some("Review detections in the antivirus history and resolve active threats.")
+        }
+        ("process_audit" | "powershell_logging" | "log_cleared_hours", _) => {
+            Some("Review Windows audit and PowerShell logging policy and event history.")
+        }
+        ("antimalware_signature_age_days", _) => Some("Update antivirus security intelligence."),
+        ("local_log_retention_days", _) => {
+            Some("Review the system log storage policy. macOS unified log retention is size-based.")
         }
         _ => None,
     }

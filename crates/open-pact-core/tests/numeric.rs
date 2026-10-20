@@ -204,3 +204,27 @@ fn screen_lock_none_replaces_off() {
         Decision::Deny { reasons } if reasons.iter().any(|r| r.breaks_disclosure_contract()))
     );
 }
+
+#[test]
+fn reported_only_values_are_disclosed_without_access_requirements() {
+    let m = manifest(DEMO);
+    assert!(
+        m.body()
+            .control("antimalware_detections_7d")
+            .unwrap()
+            .required
+            .is_empty()
+    );
+    let mut c = claim(&m, 14.into());
+    c.results
+        .insert("antimalware_detections_7d".into(), 5.into());
+    assert_eq!(
+        evaluate(&m, &c, c.time, &FirstFailures::new()).decision,
+        Decision::Allow { warnings: vec![] }
+    );
+    c.results
+        .insert("antimalware_detections_7d".into(), 10001.into());
+    assert!(
+        matches!(evaluate(&m, &c, c.time, &FirstFailures::new()).decision, Decision::Deny { reasons } if reasons.iter().any(|r| r.breaks_disclosure_contract()))
+    );
+}

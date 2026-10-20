@@ -45,7 +45,7 @@ pub fn auto_login() -> &'static str {
 }
 
 pub fn antimalware_active() -> &'static str {
-    run("spctl", &["--status"]).map_or("unknown", |t| parse_spctl(&t))
+    super::macos_v3::antimalware_active()
 }
 
 pub fn parse_fdesetup(out: &str) -> &'static str {
@@ -138,16 +138,6 @@ pub fn parse_auto_login(out: &str) -> &'static str {
     }
 }
 
-pub fn parse_spctl(out: &str) -> &'static str {
-    if out.contains("assessments enabled") {
-        "yes"
-    } else if out.contains("assessments disabled") {
-        "no"
-    } else {
-        "unknown"
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,12 +222,5 @@ mod tests {
         assert_eq!(parse_auto_login(absent), "off");
         assert_eq!(parse_auto_login("alice\n"), "on");
         assert_eq!(parse_auto_login(""), "unknown");
-    }
-
-    #[test]
-    fn spctl() {
-        assert_eq!(parse_spctl("assessments enabled"), "yes");
-        assert_eq!(parse_spctl("assessments disabled"), "no");
-        assert_eq!(parse_spctl("usage: spctl"), "unknown");
     }
 }

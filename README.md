@@ -220,3 +220,38 @@ grace = "1d"
 Integer outputs always allow `"unknown"`. Both bounds are inclusive signed 32-bit integers. A requirement uses `{ max = 30 }` for at most 30, or `{ min = 90 }` for at least 90. The limit must be within the output range. Numeric strings, fractions, other strings and out-of-range values are refused. Unknown values use `unknown_grace`. A smaller output range is narrowing. Lowering a maximum or raising a minimum is stricter and needs owner consent. Switching comparison direction or output kind also needs consent. Manifest hashes remain SHA-256 of the exact TOML bytes. Claims retain JCS encoding.
 
 The screen-lock output `"none"` means no screen lock. It replaces `"off"` in this breaking change. An enumerated control may declare `"n/a"` and accept it for an OS where the control does not apply. The gateway treats `"n/a"` as a declared string value, with no special bypass.
+
+
+## Additional security checks
+
+All checks run read-only as the device owner. Each external command has a three-second timeout, except the seven-day XProtect log query, which has a twenty-second timeout. Command output uses the C locale. Unsupported sources return `unknown`.
+
+| Control | macOS | Linux |
+| --- | --- | --- |
+| `preboot_auth` | FileVault on means `user_secret`, off means `none` | No encryption means `none`; an unverified LUKS unlock method means `unknown` |
+| `antimalware_active` | XProtect bundle and Remediator executable present, scan service registered and enabled | Existing ClamAV service check |
+| `antimalware_signature_age_days` | Whole days since the receipt for the installed XProtect definitions version | Age of the daily ClamAV CVD or CLD embedded timestamp in standard database directories |
+| `antimalware_full_scan_age_days` | `n/a` | `unknown`, no reliable clamscan full-scan record |
+| `antimalware_detections_7d` | `unknown`, unified-log events have no verified detection schema or retention guarantee | `unknown` |
+| `antimalware_last_detection_hours` | `unknown`, same unified-log limitation | `unknown` |
+| `web_protection` | Safari, Chrome, Edge, Brave and Firefox profiles and readable managed policies | `unknown` |
+| `local_log_retention_days` | `n/a`, unified log retention is size-based | Age of the oldest readable system journal entry; permission warnings mean `unknown` |
+| `process_audit`, `powershell_logging` | `n/a` | `n/a` |
+| `log_cleared_hours` | `n/a` | `n/a` |
+
+Windows registers these additional controls with `unknown` helpers pending its implementation. A missing source, command failure, timeout or unrecognized output returns `unknown`.
+
+`antimalware_active` now checks XProtect instead of Gatekeeper. This is a breaking mechanism change. [Apple describes XProtect as macOS antivirus technology](https://support.apple.com/guide/security/protecting-against-malware-sec469d47bd8/web). The signature-age reader matches `CFBundleShortVersionString` with an `XProtectPlistConfigData` receipt in `InstallHistory.plist`. It uses the matching receipt date because a bundle build date or file modification date does not establish when definitions were installed.
+
+Web protection is `on` only when every installed supported browser is on. Any known disabled browser gives `off`. Otherwise an unreadable browser gives `unknown`, and a local diagnostic names that browser. Missing preference keys use browser defaults. Safari container access can require user-granted file access. The reader does not request access or change settings. Browser installations outside standard system and user Applications directories and profiles stored outside standard browser data directories are not discovered.
+
+Integer outputs can declare `values = ["n/a"]`, `values = ["none"]`, or both beside `integer`. Only these two additional text values are allowed. They must be unique. An OS can require a declared text value. Numeric requirements do not accept text values. Adding a text value expands disclosure and requires consent. For example:
+
+```toml
+output = { integer = { min = 0, max = 3650 }, values = ["n/a"] }
+required = { macos = "n/a", linux = { max = 7 } }
+```
+
+The added controls in the fictional example use `required = {}` to report values without changing its access baseline. The client runs and discloses every listed control. The gateway checks disclosure bounds but applies no access requirement when the OS has no entry in `required`. A policy can require signature freshness with `required = { macos = { max = 3 } }`. Detection counts have no zero-detection requirement.
+
+The ClamAV parser uses the [documented database header](https://docs.clamav.net/manual/Signatures.html). The journal reader uses [journalctl oldest-entry selection](https://freedesktop.org/software/systemd/man/latest/journalctl.html).

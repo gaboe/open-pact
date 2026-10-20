@@ -261,6 +261,8 @@ pub enum Output {
 #[serde(deny_unknown_fields)]
 pub struct IntegerOutput {
     pub integer: IntegerRange,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub values: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -277,7 +279,9 @@ impl Output {
             (Self::Integer(bounds), ControlValue::Integer(n)) => {
                 (bounds.integer.min..=bounds.integer.max).contains(n)
             }
-            (Self::Integer(_), ControlValue::Text(text)) => text == "unknown",
+            (Self::Integer(bounds), ControlValue::Text(text)) => {
+                text == "unknown" || bounds.values.contains(text)
+            }
             _ => false,
         }
     }
@@ -287,7 +291,9 @@ impl Output {
                 values.iter().all(|v| old.contains(v))
             }
             (Self::Integer(now), Self::Integer(old)) => {
-                now.integer.min >= old.integer.min && now.integer.max <= old.integer.max
+                now.integer.min >= old.integer.min
+                    && now.integer.max <= old.integer.max
+                    && now.values.iter().all(|v| old.values.contains(v))
             }
             _ => false,
         }
@@ -297,7 +303,14 @@ impl Output {
             Self::Enumerated(values) => {
                 !values.is_empty() && values.iter().collect::<BTreeSet<_>>().len() == values.len()
             }
-            Self::Integer(bounds) => bounds.integer.min <= bounds.integer.max,
+            Self::Integer(bounds) => {
+                bounds.integer.min <= bounds.integer.max
+                    && bounds
+                        .values
+                        .iter()
+                        .all(|v| matches!(v.as_str(), "n/a" | "none"))
+                    && bounds.values.iter().collect::<BTreeSet<_>>().len() == bounds.values.len()
+            }
         }
     }
 }
@@ -307,8 +320,14 @@ impl fmt::Display for Output {
             Self::Enumerated(values) => f.write_str(&values.join(", ")),
             Self::Integer(bounds) => write!(
                 f,
-                "integer {}..={}, unknown",
-                bounds.integer.min, bounds.integer.max
+                "integer {}..={}, unknown{}",
+                bounds.integer.min,
+                bounds.integer.max,
+                if bounds.values.is_empty() {
+                    String::new()
+                } else {
+                    format!(", {}", bounds.values.join(", "))
+                }
             ),
         }
     }
@@ -371,6 +390,9 @@ impl Accepted {
         match (self, output) {
             (Self::Values(values), Output::Enumerated(outputs)) => {
                 !values.0.is_empty() && values.0.iter().all(|v| outputs.contains(v))
+            }
+            (Self::Values(values), Output::Integer(bounds)) => {
+                !values.0.is_empty() && values.0.iter().all(|v| bounds.values.contains(v))
             }
             (Self::Max(limit), Output::Integer(bounds)) => {
                 (bounds.integer.min..=bounds.integer.max).contains(&limit.max)

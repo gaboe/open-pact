@@ -53,6 +53,122 @@ output = ["yes", "no"]
 required = { macos = "yes", windows = "yes", linux = "yes" }
 grace = "14d"
 
+# These additional checks report values without an access requirement in this demo.
+# For signature freshness, a policy can set required = { macos = { max = 3 } }.
+# A detection count is evidence, not a requirement that must equal zero.
+
+[[control]]
+id = "password_set"
+source = "company_policy"
+check = "builtin:password_set@1"
+output = ["yes", "no", "unknown"]
+required = {}
+grace = "1d"
+
+[[control]]
+id = "auto_login"
+source = "company_policy"
+check = "builtin:auto_login@1"
+output = ["off", "on", "unknown"]
+required = {}
+grace = "1d"
+
+[[control]]
+id = "secure_boot"
+source = "company_policy"
+check = "builtin:secure_boot@1"
+output = ["on", "off", "unknown"]
+required = {}
+grace = "1d"
+
+[[control]]
+id = "antimalware_active"
+source = "company_policy"
+check = "builtin:antimalware_active@1"
+output = ["yes", "no", "unknown"]
+required = {}
+grace = "1d"
+
+[[control]]
+id = "preboot_auth"
+source = "company_policy"
+check = "builtin:preboot_auth@1"
+output = ["user_secret", "hardware_only", "none", "unknown"]
+required = {}
+grace = "1d"
+
+[[control]]
+id = "antimalware_signature_age_days"
+source = "company_policy"
+check = "builtin:antimalware_signature_age_days@1"
+output = { integer = { min = 0, max = 3650 } }
+required = {}
+grace = "1d"
+
+[[control]]
+id = "antimalware_full_scan_age_days"
+source = "company_policy"
+check = "builtin:antimalware_full_scan_age_days@1"
+output = { integer = { min = 0, max = 3650 }, values = ["n/a"] }
+required = {}
+grace = "1d"
+
+[[control]]
+id = "antimalware_detections_7d"
+source = "company_policy"
+check = "builtin:antimalware_detections_7d@1"
+output = { integer = { min = 0, max = 10000 } }
+required = {}
+grace = "1d"
+
+[[control]]
+id = "antimalware_last_detection_hours"
+source = "company_policy"
+check = "builtin:antimalware_last_detection_hours@1"
+output = { integer = { min = 0, max = 8760 }, values = ["none"] }
+required = {}
+grace = "1d"
+
+[[control]]
+id = "web_protection"
+source = "company_policy"
+check = "builtin:web_protection@1"
+output = ["on", "off", "unknown"]
+required = {}
+grace = "1d"
+
+[[control]]
+id = "local_log_retention_days"
+source = "company_policy"
+check = "builtin:local_log_retention_days@1"
+output = { integer = { min = 0, max = 2147483647 }, values = ["n/a"] }
+required = {}
+grace = "1d"
+
+[[control]]
+id = "process_audit"
+source = "company_policy"
+check = "builtin:process_audit@1"
+output = ["on", "off", "n/a", "unknown"]
+required = {}
+grace = "1d"
+
+[[control]]
+id = "powershell_logging"
+source = "company_policy"
+check = "builtin:powershell_logging@1"
+output = ["on", "off", "n/a", "unknown"]
+required = {}
+grace = "1d"
+
+[[control]]
+id = "log_cleared_hours"
+source = "company_policy"
+check = "builtin:log_cleared_hours@1"
+output = { integer = { min = 0, max = 8760 }, values = ["none", "n/a"] }
+required = {}
+grace = "1d"
+
 [log]
 # Demo only: this witness key comes from a public seed, so anyone can forge its cosignatures.
 # A real deployment lists witnesses run by someone other than the gateway operator.

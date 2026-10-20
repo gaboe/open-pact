@@ -20,8 +20,17 @@ pub fn run(program: &str, args: &[&str]) -> Option<String> {
 }
 
 pub fn run_status(program: &str, args: &[&str]) -> Option<Ran> {
+    run_status_with_timeout(program, args, TIMEOUT)
+}
+
+pub fn run_with_timeout(program: &str, args: &[&str], timeout: Duration) -> Option<String> {
+    run_status_with_timeout(program, args, timeout).map(|ran| ran.text)
+}
+
+fn run_status_with_timeout(program: &str, args: &[&str], timeout: Duration) -> Option<Ran> {
     let mut child = Command::new(program)
         .args(args)
+        .env("LC_ALL", "C")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -31,7 +40,7 @@ pub fn run_status(program: &str, args: &[&str]) -> Option<Ran> {
         child.stdout.take().map(drain),
         child.stderr.take().map(drain),
     ];
-    let deadline = Instant::now() + TIMEOUT;
+    let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -111,6 +120,17 @@ mod tests {
     fn hanging_program_is_killed() {
         let start = Instant::now();
         assert_eq!(run("sleep", &["30"]), None);
+        assert!(start.elapsed() < Duration::from_secs(6));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn explicit_timeout_kills_a_hanging_program() {
+        let start = Instant::now();
+        assert_eq!(
+            run_with_timeout("sleep", &["30"], Duration::from_millis(200)),
+            None
+        );
         assert!(start.elapsed() < Duration::from_secs(6));
     }
 }

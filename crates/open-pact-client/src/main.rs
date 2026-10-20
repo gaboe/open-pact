@@ -348,26 +348,24 @@ fn virtualized() -> Virtualized {
 }
 
 fn collect_results(manifest: &Manifest, os: Os) -> BTreeMap<String, open_pact_core::ControlValue> {
-    let required: Vec<&str> = manifest
+    let ids: Vec<&str> = manifest
         .body()
         .controls
         .iter()
-        .filter(|c| c.required.contains_key(&os))
         .map(|c| c.id.as_str())
         .collect();
-    disclosable(manifest, os, checks::run(os, &required))
+    disclosable(manifest, os, checks::run(os, &ids))
 }
 
 fn disclosable(
     manifest: &Manifest,
-    os: Os,
+    _os: Os,
     mut all: BTreeMap<String, open_pact_core::ControlValue>,
 ) -> BTreeMap<String, open_pact_core::ControlValue> {
     manifest
         .body()
         .controls
         .iter()
-        .filter(|c| c.required.contains_key(&os))
         .filter_map(|c| {
             let value = all.remove(&c.id)?;
             c.output.contains(&value).then(|| (c.id.clone(), value))
@@ -1429,7 +1427,7 @@ mod tests {
     }
 
     #[test]
-    fn sends_only_results_the_manifest_requires_on_this_os() {
+    fn sends_declared_results_even_without_an_os_requirement() {
         let toml = include_str!("../../../examples/manifest.toml").replace(
             r#"required = { macos = "on", windows = "on", linux = "on" }"#,
             r#"required = { macos = "on" }"#,
@@ -1452,9 +1450,22 @@ mod tests {
         };
         assert_eq!(
             ids(Os::Macos),
-            ["disk_encryption", "firewall", "screen_lock"]
+            [
+                "antimalware_active",
+                "disk_encryption",
+                "firewall",
+                "screen_lock"
+            ]
         );
-        assert_eq!(ids(Os::Linux), ["disk_encryption", "screen_lock"]);
+        assert_eq!(
+            ids(Os::Linux),
+            [
+                "antimalware_active",
+                "disk_encryption",
+                "firewall",
+                "screen_lock"
+            ]
+        );
     }
 
     #[test]
@@ -1569,7 +1580,16 @@ mod tests {
         let kept = DEMO_MANIFEST
             .find("[[control]]\nid = \"os_supported\"")
             .unwrap();
-        let toml = format!("{}{}", &DEMO_MANIFEST[..first], &DEMO_MANIFEST[kept..]);
+        let log = DEMO_MANIFEST.find("[log]").unwrap();
+        let end = DEMO_MANIFEST[kept + 1..log]
+            .find("[[control]]")
+            .map_or(log, |next| kept + 1 + next);
+        let toml = format!(
+            "{}{}{}",
+            &DEMO_MANIFEST[..first],
+            &DEMO_MANIFEST[kept..end],
+            &DEMO_MANIFEST[log..]
+        );
         let demo = toml
             .lines()
             .find(|l| l.starts_with("witnesses = "))

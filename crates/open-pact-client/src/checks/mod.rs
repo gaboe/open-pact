@@ -1,8 +1,11 @@
+mod browsers;
 mod buckets;
 mod exec;
 mod hints;
 mod linux;
+mod linux_v3;
 mod macos;
+mod macos_v3;
 mod windows;
 
 use std::collections::BTreeMap;
@@ -23,6 +26,16 @@ const BUILTINS: &[(&str, u32)] = &[
     ("auto_login", 1),
     ("secure_boot", 1),
     ("antimalware_active", 1),
+    ("preboot_auth", 1),
+    ("antimalware_signature_age_days", 1),
+    ("antimalware_full_scan_age_days", 1),
+    ("antimalware_detections_7d", 1),
+    ("antimalware_last_detection_hours", 1),
+    ("web_protection", 1),
+    ("local_log_retention_days", 1),
+    ("process_audit", 1),
+    ("powershell_logging", 1),
+    ("log_cleared_hours", 1),
 ];
 
 fn implements(control: &Control) -> bool {
@@ -63,6 +76,25 @@ const MACOS: Registry = &[
     ("auto_login", || macos::auto_login().into()),
     ("secure_boot", || windows::unknown().into()),
     ("antimalware_active", || macos::antimalware_active().into()),
+    ("preboot_auth", macos_v3::preboot_auth),
+    (
+        "antimalware_signature_age_days",
+        macos_v3::antimalware_signature_age_days,
+    ),
+    ("antimalware_full_scan_age_days", macos_v3::not_applicable),
+    (
+        "antimalware_detections_7d",
+        macos_v3::antimalware_detections_7d,
+    ),
+    (
+        "antimalware_last_detection_hours",
+        macos_v3::antimalware_last_detection_hours,
+    ),
+    ("web_protection", macos_v3::web_protection),
+    ("local_log_retention_days", macos_v3::not_applicable),
+    ("process_audit", macos_v3::not_applicable),
+    ("powershell_logging", macos_v3::not_applicable),
+    ("log_cleared_hours", macos_v3::not_applicable),
 ];
 
 const LINUX: Registry = &[
@@ -75,6 +107,22 @@ const LINUX: Registry = &[
     ("auto_login", || linux::auto_login().into()),
     ("secure_boot", || linux::secure_boot().into()),
     ("antimalware_active", || linux::antimalware_active().into()),
+    ("preboot_auth", linux_v3::preboot_auth),
+    (
+        "antimalware_signature_age_days",
+        linux_v3::antimalware_signature_age_days,
+    ),
+    ("antimalware_full_scan_age_days", macos_v3::unknown),
+    ("antimalware_detections_7d", macos_v3::unknown),
+    ("antimalware_last_detection_hours", macos_v3::unknown),
+    ("web_protection", macos_v3::unknown),
+    (
+        "local_log_retention_days",
+        linux_v3::local_log_retention_days,
+    ),
+    ("process_audit", macos_v3::not_applicable),
+    ("powershell_logging", macos_v3::not_applicable),
+    ("log_cleared_hours", macos_v3::not_applicable),
 ];
 
 const WINDOWS: Registry = &[
@@ -87,6 +135,22 @@ const WINDOWS: Registry = &[
     ("auto_login", || windows::unknown().into()),
     ("secure_boot", || windows::unknown().into()),
     ("antimalware_active", || windows::unknown().into()),
+    ("preboot_auth", || windows::unknown().into()),
+    ("antimalware_signature_age_days", || {
+        windows::unknown().into()
+    }),
+    ("antimalware_full_scan_age_days", || {
+        windows::unknown().into()
+    }),
+    ("antimalware_detections_7d", || windows::unknown().into()),
+    ("antimalware_last_detection_hours", || {
+        windows::unknown().into()
+    }),
+    ("web_protection", || windows::unknown().into()),
+    ("local_log_retention_days", || windows::unknown().into()),
+    ("process_audit", || windows::unknown().into()),
+    ("powershell_logging", || windows::unknown().into()),
+    ("log_cleared_hours", || windows::unknown().into()),
 ];
 
 fn registry(os: Os) -> Registry {
@@ -157,43 +221,26 @@ mod tests {
         let ids = |os| -> Vec<&str> { registry(os).iter().map(|(id, _)| *id).collect() };
         assert_eq!(ids(Os::Macos), ids(Os::Linux));
         assert_eq!(ids(Os::Macos), ids(Os::Windows));
-        assert_eq!(ids(Os::Macos).len(), 9);
+        assert_eq!(ids(Os::Macos).len(), BUILTINS.len());
     }
 
     #[test]
     fn windows_stubs_report_unknown() {
         let all = run_all(Os::Windows);
-        assert_eq!(all.len(), 9);
+        assert_eq!(all.len(), BUILTINS.len());
         assert!(all.values().all(|v| v == "unknown"));
     }
 
     #[test]
     fn values_are_enumerated_outputs() {
-        let allowed: &[(&str, &[&str])] = &[
-            ("disk_encryption", &["full", "partial", "none", "unknown"]),
-            ("firewall", &["on", "off", "unknown"]),
-            (
-                "screen_lock",
-                &["le_5min", "le_15min", "gt_15min", "none", "unknown"],
-            ),
-            ("os_supported", &["yes", "no", "unknown"]),
-            ("password_set", &["yes", "no", "unknown"]),
-            ("auto_login", &["off", "on", "unknown"]),
-            ("secure_boot", &["on", "off", "unknown"]),
-            ("antimalware_active", &["yes", "no", "unknown"]),
-        ];
+        let manifest =
+            Manifest::parse(include_bytes!("../../../../examples/manifest.toml")).unwrap();
         for os in Os::ALL {
-            let results = run_all(os);
-            assert!(
-                matches!(
-                    &results["os_patch_age_days"],
-                    ControlValue::Integer(0..=3650)
-                ) || results["os_patch_age_days"] == "unknown"
-            );
-            for (id, values) in allowed {
+            for (id, value) in run_all(os) {
+                let control = manifest.body().control(&id).unwrap();
                 assert!(
-                    values.contains(&results[*id].to_string().as_str()),
-                    "{os:?} {id}"
+                    value == "unknown" || control.output.contains(&value),
+                    "{os:?} {id} = {value}"
                 );
             }
         }
