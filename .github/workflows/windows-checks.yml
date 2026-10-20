@@ -34,6 +34,133 @@ jobs:
           $admin = ([Security.Principal.WindowsPrincipal]::new($identity)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
           Write-Output "runner_is_administrator=$admin"
 
+      - name: Verify native uninstall modes under administrator and standard-user tokens
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo build -p open-pact-client
+          if ($LASTEXITCODE -ne 0) { throw 'build failed' }
+          $root = Join-Path $env:PUBLIC ('open-pact-fictional-' + [Guid]::NewGuid().ToString('N'))
+          $env:OPEN_PACT_SCHEDULE_FIXTURE = $root
+          cargo test -p open-pact-client prepare_windows_schedule_homes -- --ignored
+          if ($LASTEXITCODE -ne 0) { throw 'fixture preparation failed' }
+          $client = Join-Path $root 'client.exe'
+          Copy-Item target/debug/open-pact-client.exe $client
+          $user = 'op_fixture_' + [Guid]::NewGuid().ToString('N').Substring(0,8)
+          $password = 'Op!7' + [Guid]::NewGuid().ToString('N')
+          $secure = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name $user -Password $secure -AccountNeverExpires | Out-Null
+          $sid = (Get-LocalUser $user).SID.Value
+          & icacls.exe $root /grant "*${sid}:(OI)(CI)M" /T | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'fixture ACL setup failed' }
+          function Invoke-Client($homePath, $arguments) {
+            & $client --home $homePath @arguments
+            return $LASTEXITCODE
+          }
+          function Install-System($homePath) {
+            $result = Invoke-Client $homePath @('schedule','install','--system','--collector','https://collector.example.org/status')
+            if ($result[-1] -ne 0) { throw "SYSTEM install failed: $result" }
+          }
+          function State-Path($homePath) {
+            $bytes = [Text.Encoding]::UTF8.GetBytes(('\\?\' + $homePath))
+            $hash = ([BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($bytes))).Replace('-','').ToLowerInvariant()
+            return Join-Path $env:ProgramData "open-pact/system/$hash"
+          }
+          function Task-Name($homePath) {
+            $hash = Split-Path (State-Path $homePath) -Leaf
+            return 'org.open-pact.report.' + $hash.Substring(0,16)
+          }
+          function Assert-Clean($homePath) {
+            if (Get-ScheduledTask -TaskName (Task-Name $homePath) -ErrorAction SilentlyContinue) { throw 'task remains' }
+            if (Test-Path (State-Path $homePath)) { throw 'SYSTEM state remains' }
+            if (Get-ChildItem "$env:ProgramFiles/open-pact/open-pact-client.exe*" -ErrorAction SilentlyContinue) { throw 'binary leftovers remain' }
+          }
+          function Remove-System($homePath) {
+            $result = Invoke-Client $homePath @('schedule','uninstall','--system')
+            if ($result[-1] -ne 0) {
+              Write-Output $result
+              $result = Invoke-Client $homePath @('schedule','uninstall','--system')
+            }
+            if ($result[-1] -ne 0) { throw "SYSTEM retry failed: $result" }
+            Assert-Clean $homePath
+          }
+          try {
+            $limited = (Resolve-Path (Join-Path $root 'limited')).Path
+            Install-System $limited
+            Unregister-ScheduledTask -TaskName (Task-Name $limited) -Confirm:$false
+            $state = State-Path $limited
+            $binary = "$env:ProgramFiles/open-pact/open-pact-client.exe"
+            $before = (Get-FileHash $binary).Hash
+            $worker = Join-Path $root 'standard-user.ps1'
+            @'
+          param($client,$homePath,$receipt)
+          $ErrorActionPreference = 'Stop'
+          try {
+            $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+            if ((New-Object Security.Principal.WindowsPrincipal($identity)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'worker token is elevated' }
+            & $client --home $homePath schedule install --collector https://collector.example.org/status
+            if ($LASTEXITCODE -ne 0) { throw 'limited install failed' }
+            foreach ($attempt in 1..2) {
+              & $client --home $homePath schedule uninstall
+              if ($LASTEXITCODE -ne 0) { throw 'limited uninstall failed with protected leftovers' }
+            }
+            if (Test-Path "$homePath/report-schedule.json") { throw 'limited configuration remains' }
+            & $client --home $homePath schedule uninstall --system
+            if ($LASTEXITCODE -eq 0) { throw 'standard token accepted SYSTEM cleanup' }
+            'standard_user_limited_install_and_repeated_uninstall_passed' | Set-Content $receipt
+            exit 0
+          } catch { $_ | Out-String | Set-Content $receipt; exit 1 }
+          '@ | Set-Content $worker
+            $receipt = Join-Path $root 'standard-user-result.txt'
+            $credential = New-Object PSCredential("$env:COMPUTERNAME\$user",$secure)
+            $arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$worker`" -client `"$client`" -homePath `"$limited`" -receipt `"$receipt`""
+            $process = Start-Process powershell.exe -Credential $credential -LoadUserProfile -ArgumentList $arguments -PassThru
+            if (-not $process.WaitForExit(120000)) { $process.Kill(); throw 'standard-user fixture timed out' }
+            Get-Content $receipt
+            if ($process.ExitCode -ne 0) { throw 'standard-user fixture failed' }
+            if (-not (Test-Path $state)) { throw 'limited uninstall removed protected state' }
+            if ((Get-FileHash $binary).Hash -ne $before) { throw 'limited uninstall changed protected binary' }
+            Remove-System $limited
+            $process = Start-Process powershell.exe -Credential $credential -LoadUserProfile -ArgumentList $arguments -PassThru
+            if (-not $process.WaitForExit(120000)) { $process.Kill(); throw 'standard-user clean fixture timed out' }
+            Get-Content $receipt
+            if ($process.ExitCode -ne 0) { throw 'standard-user uninstall without protected leftovers failed' }
+            foreach ($name in @('system','missing','retry')) {
+              $homePath = (Resolve-Path (Join-Path $root $name)).Path
+              Install-System $homePath
+              if ($name -eq 'system') { Remove-Item (State-Path $homePath) -Recurse -Force }
+              if ($name -eq 'missing') { Remove-Item $homePath -Recurse -Force }
+              if ($name -eq 'retry') {
+                $state = State-Path $homePath
+                $guard = [IO.File]::Open(($state + '.lock'),[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
+                try {
+                  $result = Invoke-Client $homePath @('schedule','uninstall','--system')
+                  if ($result[-1] -eq 0) { throw 'held state lock reported success' }
+                  if (-not (Get-ScheduledTask -TaskName (Task-Name $homePath) -ErrorAction SilentlyContinue)) { throw 'held state lock did not preserve task' }
+                  if (-not (Test-Path "$env:ProgramFiles/open-pact/open-pact-client.exe")) { throw 'held state lock did not preserve binary' }
+                } finally { $guard.Dispose() }
+                $held = [IO.File]::Open((Join-Path $state 'held-fixture'),[IO.FileMode]::Create,[IO.FileAccess]::ReadWrite,[IO.FileShare]::Read)
+                try {
+                  $result = Invoke-Client $homePath @('schedule','uninstall','--system')
+                  if ($result[-1] -eq 0 -or -not (Test-Path $state)) { throw 'injected deletion failure reported success' }
+                  Write-Output $result
+                } finally { $held.Dispose() }
+                $result = Invoke-Client $homePath @('schedule','install','--collector','https://collector.example.org/status')
+                if ($result[-1] -ne 0) { throw 'replacement limited install failed' }
+              }
+              Remove-System $homePath
+              if ($name -eq 'missing' -and (Test-Path $homePath)) { throw 'uninstall created missing home' }
+            }
+            $pending = "$env:ProgramFiles/open-pact/open-pact-client.exe.delete-fictional"
+            Set-Content $pending 'fictional leftover'
+            Remove-System $limited
+            Write-Output 'native_system_uninstall_retry_replacement_task_and_missing_home_passed'
+          } finally {
+            Get-ScheduledTask -TaskName 'org.open-pact.report.*' -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false
+            Remove-LocalUser -Name $user -ErrorAction SilentlyContinue
+            Remove-Item $root -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
       - name: Probe invariant batch values
         shell: powershell
         run: |
