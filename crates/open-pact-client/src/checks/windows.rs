@@ -7,11 +7,12 @@ use super::buckets;
 use super::exec::capture;
 use open_pact_core::ControlValue;
 const POWERSHELL: &str = include_str!("windows.ps1");
+const BATCH_TIMEOUT: Duration = Duration::from_secs(60);
 
 struct Batch {
     values: BTreeMap<String, String>,
-    #[cfg_attr(not(all(windows, test)), allow(dead_code))]
     diagnostics: String,
+    completed: bool,
 }
 
 static VALUES: OnceLock<Batch> = OnceLock::new();
@@ -285,40 +286,39 @@ fn batch() -> &'static Batch {
                 "-Command",
                 POWERSHELL,
             ],
-            Duration::from_secs(20),
+            BATCH_TIMEOUT,
         );
-        let (values, diagnostics) = match output {
+        let (values, diagnostics, completed) = match output {
             Ok(output) => {
                 let diagnostics = format!(
-                    "Windows batch: status={:?}, elapsed={:?}, timeout={}, stderr_head={:?}, stdout_bytes={}",
+                    "Windows batch: status={:?}, elapsed={:?}, timeout={}, timeout_limit={BATCH_TIMEOUT:?}, stderr_head={:?}, stdout_bytes={}",
                     output.status, output.elapsed, output.timed_out,
                     output.stderr.chars().take(1024).collect::<String>(), output.stdout.len(),
                 );
-                let values = if output.timed_out {
-                    BTreeMap::new()
-                } else {
-                    parse_values(&output.stdout)
-                };
-                if output.timed_out || !output.status.is_some_and(|status| status.success()) {
-                    eprintln!("warning: {diagnostics}");
-                }
-                (values, diagnostics)
+                let values = parse_values(&output.stdout);
+                let completed = !output.timed_out
+                    && output.status.is_some_and(|status| status.success());
+                (values, diagnostics, completed)
             }
             Err(error) => {
                 let diagnostics = format!(
                     "Windows batch: elapsed={:?}, process error={error}", start.elapsed()
                 );
-                eprintln!("warning: {diagnostics}");
-                (BTreeMap::new(), diagnostics)
+                (BTreeMap::new(), diagnostics, false)
             }
         };
-        Batch { values, diagnostics }
+        let batch = Batch { values, diagnostics, completed };
+        if !batch.completed {
+            eprintln!("warning: {}", batch.diagnostics);
+        }
+        batch
     })
 }
 
 fn parse_values(out: &str) -> BTreeMap<String, String> {
-    out.lines()
+    out.split_inclusive('\n')
         .filter_map(|line| {
+            let line = line.strip_suffix('\n')?.trim_end_matches('\r');
             let (key, value) = line.split_once('\t')?;
             Some((key.to_string(), value.to_string()))
         })
@@ -682,7 +682,13 @@ mod tests {
     fn native_batch_emits_every_metric() {
         let batch = batch();
         eprintln!("{}", batch.diagnostics);
+        assert!(batch.completed, "{}", batch.diagnostics);
         for key in [
+            "bitlocker",
+            "firewall",
+            "antimalware",
+            "secure_boot",
+            "autologin",
             "screen_savers",
             "lock_policy",
             "os",

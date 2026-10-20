@@ -141,9 +141,13 @@ mod tests {
     fn timeout_preserves_partial_stdout_and_stderr() {
         let output = capture(
             "sh",
-            &["-c", "printf 'bitlocker\t1\nsecure_boot\t1'; printf 'diagnostic' >&2; exec sleep 30"],
+            &[
+                "-c",
+                "printf 'bitlocker\t1\nsecure_boot\t1'; printf 'diagnostic' >&2; exec sleep 30",
+            ],
             Duration::from_millis(200),
-        ).unwrap();
+        )
+        .unwrap();
         assert!(output.timed_out, "{output:?}");
         assert!(!output.status.unwrap().success());
         assert_eq!(output.stdout, "bitlocker\t1\nsecure_boot\t1");
