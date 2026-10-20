@@ -1559,11 +1559,10 @@ mod tests {
 
     /// The demo manifest with only the cheap `os_supported` check and `witness` as its one witness.
     fn witnessed_manifest(witness: &Witness) -> String {
-        let first = DEMO_MANIFEST.find("[[control]]").unwrap();
-        let kept = DEMO_MANIFEST
-            .find("[[control]]\nid = \"os_supported\"")
-            .unwrap();
-        let toml = format!("{}{}", &DEMO_MANIFEST[..first], &DEMO_MANIFEST[kept..]);
+        let manifest = DEMO_MANIFEST.replace("\r\n", "\n");
+        let first = manifest.find("[[control]]").unwrap();
+        let kept = manifest.find("[[control]]\nid = \"os_supported\"").unwrap();
+        let toml = format!("{}{}", &manifest[..first], &manifest[kept..]);
         let demo = toml
             .lines()
             .find(|l| l.starts_with("witnesses = "))
