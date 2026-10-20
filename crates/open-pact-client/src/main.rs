@@ -152,6 +152,8 @@ struct Home(PathBuf);
 /// CA first.
 const VPN_DIR: &str = "vpn";
 const VPN_CURRENT: &str = "current";
+#[cfg(windows)]
+const VPN_FLAT_STALE: &str = "flat-copies-stale";
 const VPN_FILES: [&str; 2] = ["ca.pem", "vpn-cert.pem"];
 
 #[cfg(test)]
@@ -248,7 +250,7 @@ impl Home {
     /// Installs a VPN CA and certificate as one generation (R7-L2).
     /// Unix selects it through a symlink, with flat paths linked into that generation.
     /// Windows selects it through a pointer file, then copies the flat files one at a time.
-    /// Recovery restores the flat files from the selected complete generation.
+    /// Windows flat copies may lag after a failed replacement; recovery retries them.
     fn install_vpn_pair(&self, ca: &[u8], cert: &[u8]) -> Result<()> {
         #[cfg(not(any(unix, windows)))]
         {
@@ -428,16 +430,43 @@ impl Home {
 
     #[cfg(windows)]
     fn lock_vpn(&self) -> Result<VpnLock> {
+        let file = self.open_vpn_lock()?;
+        file.lock().context("lock VPN files")?;
+        Ok(VpnLock(file))
+    }
+
+    #[cfg(windows)]
+    fn try_lock_vpn(&self) -> Result<Option<VpnLock>> {
+        let file = self.open_vpn_lock()?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(VpnLock(file))),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(error)) => Err(error).context("lock VPN files"),
+        }
+    }
+
+    #[cfg(windows)]
+    fn open_vpn_lock(&self) -> Result<std::fs::File> {
         let vpn = self.file(VPN_DIR);
         std::fs::create_dir_all(&vpn)?;
-        let file = std::fs::OpenOptions::new()
+        Ok(std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
-            .open(vpn.join("write.lock"))?;
-        file.lock().context("lock VPN files")?;
-        Ok(VpnLock(file))
+            .open(vpn.join("write.lock"))?)
+    }
+
+    #[cfg(windows)]
+    fn recover_vpn_at_startup(&self) -> Result<bool> {
+        if !self.file(VPN_DIR).exists() {
+            return Ok(true);
+        }
+        let Some(_lock) = self.try_lock_vpn()? else {
+            return Ok(false);
+        };
+        self.recover_vpn_locked()?;
+        Ok(true)
     }
 
     #[cfg(windows)]
@@ -494,34 +523,30 @@ impl Home {
                     Self::replace_vpn_file(&path, &bytes)
                 })();
                 if let Err(error) = refresh {
-                    if let Some(previous) = &previous {
-                        // An earlier process may have stopped after replacing a flat file.
-                        for restored in VPN_FILES {
-                            let bytes = read_home_file(&vpn.join(previous).join(restored))?;
-                            let path = self.file(restored);
-                            if read_home_file(&path).ok().as_ref() != Some(&bytes) {
-                                Self::replace_vpn_file(&path, &bytes)
-                                    .context("restore previous VPN flat file")?;
-                            }
-                        }
-                        Self::replace_vpn_file(&vpn.join(VPN_CURRENT), previous.as_bytes())?;
-                    } else {
-                        for restored in VPN_FILES {
-                            let path = self.file(restored);
-                            if path.exists() {
-                                std::fs::remove_file(path)?;
-                            }
-                        }
-                        std::fs::remove_file(vpn.join(VPN_CURRENT))?;
-                    }
+                    let marker = vpn.join(VPN_FLAT_STALE);
+                    let marker_error = std::fs::write(&marker, b"stale").err();
                     return Err(error).with_context(|| {
-                        format!(
-                            "cannot replace {}; close the VPN client and run check again",
+                        let message = format!(
+                            "cannot replace {}; close the program that holds it and run check again",
                             path.display()
-                        )
+                        );
+                        match marker_error {
+                            Some(marker_error) => format!(
+                                "{message}; could not record stale flat copies at {}: {marker_error}",
+                                marker.display()
+                            ),
+                            None => message,
+                        }
                     });
                 }
             }
+            std::fs::remove_file(vpn.join(VPN_FLAT_STALE)).or_else(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    Ok(())
+                } else {
+                    Err(error)
+                }
+            })?;
         }
         for parent in [&self.0, &vpn] {
             let entries = match std::fs::read_dir(parent) {
@@ -1622,8 +1647,12 @@ async fn run(cli: Cli) -> Result<ExitCode> {
     }
     let home = Home::new(cli.home)?;
     #[cfg(windows)]
-    if let Err(error) = home.recover_vpn() {
-        eprintln!("warning: VPN recovery failed: {error:#}");
+    match home.recover_vpn_at_startup() {
+        Ok(true) => {}
+        Ok(false) => {
+            eprintln!("warning: VPN recovery skipped because another process holds the VPN lock")
+        }
+        Err(error) => eprintln!("warning: VPN recovery failed: {error:#}"),
     }
     match cli.command {
         Command::Join {
@@ -2741,7 +2770,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_vpn_sharing_violation_rolls_back_the_pair() {
+    fn windows_vpn_sharing_violation_keeps_new_generation_and_retries_flat_copies() {
         use std::os::windows::fs::OpenOptionsExt;
         for native in [false, true] {
             for baseline in [false, true] {
@@ -2773,7 +2802,7 @@ mod tests {
                 let message = format!("{error:#}");
                 assert!(message.contains("vpn-cert.pem"), "{message}");
                 assert!(
-                    message.contains("close the VPN client and run check again"),
+                    message.contains("close the program that holds it and run check again"),
                     "{message}"
                 );
                 assert!(
@@ -2790,15 +2819,18 @@ mod tests {
                         ),
                     "{message}"
                 );
-                assert_eq!(selected_windows_vpn_pair(&home), Some(old.clone()));
-                assert_eq!(
-                    VPN_FILES.map(|name| std::fs::read(home.file(name)).unwrap()),
-                    old
-                );
+                let new = [b"new CA".to_vec(), b"new certificate".to_vec()];
+                assert_eq!(selected_windows_vpn_pair(&home), Some(new.clone()));
+                assert_eq!(std::fs::read(home.file(VPN_FILES[0])).unwrap(), new[0]);
+                assert_eq!(std::fs::read(home.file(VPN_FILES[1])).unwrap(), old[1]);
+                assert!(home.file(VPN_DIR).join(VPN_FLAT_STALE).exists());
                 drop(held);
                 home.recover_vpn().unwrap();
-                home.install_vpn_pair(b"new CA", b"new certificate")
-                    .unwrap();
+                assert_eq!(
+                    VPN_FILES.map(|name| std::fs::read(home.file(name)).unwrap()),
+                    new
+                );
+                assert!(!home.file(VPN_DIR).join(VPN_FLAT_STALE).exists());
             }
         }
     }
@@ -2858,15 +2890,31 @@ mod tests {
             .unwrap();
         home.write(LOG_CHECKPOINT, b"fictional checkpoint").unwrap();
         home.write(VPN_FILES[0], b"interrupted flat copy").unwrap();
-        let cli = || {
+        let home_path = dir.path().to_path_buf();
+        let cli = move || {
             Cli::parse_from([
                 "open-pact-client",
                 "--home",
-                dir.path().to_str().unwrap(),
+                home_path.to_str().unwrap(),
                 "log",
                 "head",
             ])
         };
+        let lock = home.lock_vpn().unwrap();
+        assert!(!home.recover_vpn_at_startup().unwrap());
+        let handle = tokio::runtime::Handle::current();
+        let cli_for_task = cli.clone();
+        let run_while_locked =
+            tokio::task::spawn_blocking(move || handle.block_on(run(cli_for_task())));
+        let timely =
+            tokio::time::timeout(std::time::Duration::from_secs(1), run_while_locked).await;
+        drop(lock);
+        assert!(timely.is_ok(), "log command must not wait for the VPN lock");
+        assert_eq!(timely.unwrap().unwrap().unwrap(), ExitCode::SUCCESS);
+        assert_eq!(
+            std::fs::read(home.file(VPN_FILES[0])).unwrap(),
+            b"interrupted flat copy"
+        );
         assert_eq!(run(cli()).await.unwrap(), ExitCode::SUCCESS);
         assert_eq!(std::fs::read(home.file(VPN_FILES[0])).unwrap(), b"CA one");
         std::fs::write(home.file(VPN_DIR).join(VPN_CURRENT), b"../invalid").unwrap();
