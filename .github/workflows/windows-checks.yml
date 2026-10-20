@@ -35,6 +35,7 @@ jobs:
           Write-Output "runner_is_administrator=$admin"
 
       - name: Verify native uninstall modes under administrator and standard-user tokens
+        timeout-minutes: 8
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
@@ -114,15 +115,13 @@ jobs:
             $receipt = Join-Path $root 'standard-user-result.txt'
             $credential = New-Object PSCredential("$env:COMPUTERNAME\$user",$secure)
             $arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$worker`" -client `"$client`" -homePath `"$limited`" -receipt `"$receipt`""
-            $process = Start-Process powershell.exe -Credential $credential -LoadUserProfile -ArgumentList $arguments -PassThru
-            if (-not $process.WaitForExit(120000)) { $process.Kill(); throw 'standard-user fixture timed out' }
+            $process = Start-Process powershell.exe -Credential $credential -LoadUserProfile -ArgumentList $arguments -Wait -PassThru
             Get-Content $receipt
             if ($process.ExitCode -ne 0) { throw 'standard-user fixture failed' }
             if (-not (Test-Path $state)) { throw 'limited uninstall removed protected state' }
             if ((Get-FileHash $binary).Hash -ne $before) { throw 'limited uninstall changed protected binary' }
             Remove-System $limited
-            $process = Start-Process powershell.exe -Credential $credential -LoadUserProfile -ArgumentList $arguments -PassThru
-            if (-not $process.WaitForExit(120000)) { $process.Kill(); throw 'standard-user clean fixture timed out' }
+            $process = Start-Process powershell.exe -Credential $credential -LoadUserProfile -ArgumentList $arguments -Wait -PassThru
             Get-Content $receipt
             if ($process.ExitCode -ne 0) { throw 'standard-user uninstall without protected leftovers failed' }
             foreach ($name in @('system','missing','retry')) {
