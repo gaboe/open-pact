@@ -210,8 +210,12 @@ public static class PactAudit {
 }
 RunSection {
     $machine = PolicyValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging' 'EnableScriptBlockLogging'
-    $user = PolicyValue 'HKCU:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging' 'EnableScriptBlockLogging'
-    Emit 'powershell_logging' ($machine + '|' + $user)
+    try {
+        $users = @(foreach ($userRoot in ScreenUserRoots $identity.IsSystem) {
+            PolicyValue ($userRoot + '\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging') 'EnableScriptBlockLogging'
+        })
+        Emit 'powershell_logging' ($machine + '|' + ($users -join ';'))
+    } catch { Emit 'powershell_logging' ($machine + '|!') }
 }
 function ReadJson($path) {
     if (-not (Test-Path -LiteralPath $path -ErrorAction Stop)) { return [pscustomobject]@{} }

@@ -132,7 +132,7 @@ async fn run_with_probe(
 ) -> Result<bool> {
     let url = collector_url(collector)?;
     let enrolment = home.enrolment()?;
-    let manifest = Manifest::parse(&std::fs::read(home.file("manifest.toml"))?)?;
+    let manifest = Manifest::parse(&crate::read_home_file(&home.file("manifest.toml"))?)?;
     if manifest.hash() != &enrolment.manifest {
         bail!("manifest.toml no longer matches the hash you signed");
     }

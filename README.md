@@ -256,7 +256,7 @@ Windows collects the controls in one cached PowerShell batch. A missing source, 
 | `web_protection` | Explorer SmartScreen plus Chrome, Edge, Brave, and Firefox preferences and HKLM/HKCU policies | Registry and browser-profile read access |
 | `local_log_retention_days` | Shorter age of the oldest Security and System records | SYSTEM or elevated administrator |
 | `process_audit` | Native Process Creation audit-policy success flag and command-line policy | SYSTEM or elevated administrator |
-| `powershell_logging` | Windows PowerShell ScriptBlockLogging policy, machine before current user | Registry read access |
+| `powershell_logging` | Windows PowerShell ScriptBlockLogging policy, machine before interactive users, weakest user policy wins | Registry read access |
 | `log_cleared_hours` | Latest Security event 1102 or System event 104; `none` after both readable logs have no matching event | SYSTEM or elevated administrator |
 
 Defender metrics require Defender in Normal mode with its antivirus and service enabled. Other antivirus providers return `unknown` for these metrics. Detection values describe retained Defender history, not proof that a device has never had malware. Standard users get `unknown` for the controls that enforce elevation. Access failures also return `unknown`.
@@ -313,7 +313,7 @@ open-pact-client schedule uninstall
 
 Use the same `--home` for installation and removal. Keep the binary at its installed path. By default, the task runs under your OS user account. macOS uses a launchd LaunchAgent. Linux uses a systemd user timer and requires a running user manager. Windows uses Task Scheduler. These jobs run without a separate open-pact daemon. No job exists until you run `schedule install`.
 
-On Windows, run `schedule install --system --collector https://collector.internal.example.org/status` from an elevated prompt to create a SYSTEM task with the highest run level. The task keeps the selected user's absolute `--home` path. Use the same `--home` when you run `schedule uninstall`. Without `--system`, Windows keeps the current-user, limited task. Other operating systems reject `--system`.
+On Windows, run `schedule install --system --collector https://collector.internal.example.org/status` from an elevated prompt to create a SYSTEM task with the highest run level. The installer copies the client into `%ProgramFiles%\open-pact\open-pact-client.exe` and refuses a directory that non-administrators can write. SYSTEM reads configuration, enrolment, manifest, and device key from the selected user's absolute `--home` path. It refuses reparse-point files. SYSTEM keeps its lock and report state under `%ProgramData%\open-pact\system\<home hash>`, with access limited to SYSTEM and Administrators. Choose a Windows home path without `%`. Run `schedule uninstall` from an elevated prompt with the same `--home`. Removal keeps the shared binary while another open-pact task remains. Without `--system`, Windows keeps the current-user, limited task. Other operating systems reject `--system`.
 
 The collector must have an internal address that is reachable only through the VPN. VPN routing makes off-VPN sends impossible. A public collector cannot meet this requirement, even with a separate VPN probe. A probe can succeed just before the VPN disconnects.
 

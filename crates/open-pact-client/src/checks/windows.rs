@@ -216,11 +216,20 @@ fn parse_logging(text: &str) -> &'static str {
     let Some((machine, user)) = text.split_once('|') else {
         return "unknown";
     };
-    let effective = if machine.is_empty() { user } else { machine };
-    match effective {
-        "1" => "on",
-        "" | "0" => "off",
-        _ => "unknown",
+    if !machine.is_empty() {
+        return match machine {
+            "1" => "on",
+            "0" => "off",
+            _ => "unknown",
+        };
+    }
+    let users = user.split(';').collect::<Vec<_>>();
+    if users.iter().any(|value| matches!(*value, "" | "0")) {
+        "off"
+    } else if users.iter().all(|value| *value == "1") {
+        "on"
+    } else {
+        "unknown"
     }
 }
 
@@ -760,6 +769,10 @@ mod tests {
             ("1|0", "on"),
             ("0|1", "off"),
             ("|1", "on"),
+            ("|1;0", "off"),
+            ("|1;!", "unknown"),
+            ("|1;1", "on"),
+            ("1|!;0", "on"),
             ("|0", "off"),
             ("|", "off"),
             ("!|1", "unknown"),
