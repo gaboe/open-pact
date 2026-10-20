@@ -29,14 +29,78 @@ if [ -n "$out_dir" ]; then
 fi
 repo=${GH_REPO:-gaboe/open-pact}
 work=$(mktemp -d)
-stage=
-cleanup() {
-  rm -rf "$work"
-  if [ -n "$stage" ]; then
-    rm -rf "$stage"
+out_identity=
+out_created=0
+rollback=1
+published_files=()
+
+stat_identity() {
+  if stat -c '%d:%i' "$1" >/dev/null 2>&1; then
+    stat -c '%d:%i' "$1"
+  else
+    stat -f '%d:%i' "$1"
   fi
 }
+
+out_dir_is_same() {
+  [ "$out_created" -eq 1 ] && [ -n "$out_identity" ] &&
+    [ ! -L "$out_dir" ] && [ -d "$out_dir" ] &&
+    [ "$(stat_identity "$out_dir")" = "$out_identity" ]
+}
+
+out_dir_contains_only_published() {
+  local entry name published found
+  shopt -s dotglob nullglob
+  for entry in "$out_dir"/*; do
+    name=${entry##*/}
+    [ -f "$entry" ] && [ ! -L "$entry" ] || return 1
+    found=0
+    for published in "${published_files[@]:-}"; do
+      if [ "$name" = "$published" ]; then
+        found=1
+        break
+      fi
+    done
+    [ "$found" -eq 1 ] || return 1
+  done
+}
+
+cleanup() {
+  local file
+  if [ "$rollback" -eq 1 ]; then
+    for file in "${published_files[@]:-}"; do
+      if [ -f "$out_dir/$file" ] && [ ! -L "$out_dir/$file" ]; then
+        rm -f -- "$out_dir/$file"
+      fi
+    done
+    if out_dir_is_same && out_dir_contains_only_published; then
+      rmdir "$out_dir"
+    fi
+  fi
+  rm -rf "$work"
+}
 trap cleanup EXIT
+
+if [ -n "$out_dir" ]; then
+  if [ "$out_dir" = / ]; then
+    echo "out-dir must not be the filesystem root" >&2
+    exit 2
+  fi
+  out_name=$(basename "$out_dir")
+  if [ "$out_name" = . ] || [ "$out_name" = .. ]; then
+    echo "out-dir must name a directory" >&2
+    exit 2
+  fi
+  if ! mkdir "$out_dir" 2>/dev/null; then
+    echo "out-dir must not exist: $out_dir" >&2
+    exit 1
+  fi
+  out_created=1
+  out_identity=$(stat_identity "$out_dir") || {
+    echo "could not record out-dir identity: $out_dir" >&2
+    exit 1
+  }
+fi
 
 mkdir "$work/download"
 gh release download "$tag" --repo "$repo" --dir "$work/download"
@@ -74,33 +138,42 @@ if [ -z "$out_dir" ]; then
   exit 0
 fi
 
-if [ "$out_dir" = / ]; then
-  echo "out-dir must not be the filesystem root" >&2
-  exit 2
-fi
-out_parent=$(dirname "$out_dir")
-out_name=$(basename "$out_dir")
-if [ "$out_name" = . ] || [ "$out_name" = .. ]; then
-  echo "out-dir must name a directory" >&2
-  exit 2
-fi
-mkdir -p "$out_parent"
-if [ -L "$out_dir" ]; then
-  echo "out-dir must not be a symlink" >&2
+if ! out_dir_is_same || ! out_dir_contains_only_published; then
+  echo "out-dir changed before publication: $out_dir" >&2
   exit 1
 fi
-if [ -e "$out_dir" ] && [ -n "$(find "$out_dir" -mindepth 1 -print -quit)" ]; then
-  echo "out-dir must be empty: $out_dir" >&2
-  exit 1
-fi
-stage=$(mktemp -d "$out_parent/.${out_name}.verified.XXXXXX")
+
 for file in "${assets[@]}"; do
-  mv -- "$file" "$file.sigstore.json" "$stage/"
+  for published_file in "$file" "$file.sigstore.json"; do
+    target="$out_dir/$published_file"
+    published_path=$published_file
+    if [ -e "$target" ] || [ -L "$target" ]; then
+      echo "out-dir target already exists: $target" >&2
+      exit 1
+    fi
+    if mv -n -- "$published_file" "$target"; then
+      move_status=0
+    else
+      move_status=$?
+    fi
+    if [ -d "$target" ] && [ ! -L "$target" ] && [ -f "$target/$published_file" ]; then
+      published_path="$published_file/$published_file"
+    fi
+    if [ ! -e "$published_file" ] && [ -f "$out_dir/$published_path" ] &&
+      [ ! -L "$out_dir/$published_path" ]; then
+      published_files+=("$published_path")
+    fi
+    if [ "$move_status" -ne 0 ] || [ -e "$published_file" ] ||
+      [ "$published_path" != "$published_file" ] || [ ! -f "$target" ] || [ -L "$target" ]; then
+      echo "could not publish release file: $published_file" >&2
+      exit 1
+    fi
+    if ! out_dir_is_same || ! out_dir_contains_only_published; then
+      echo "out-dir changed during publication: $out_dir" >&2
+      exit 1
+    fi
+  done
 done
 
-if [ -d "$out_dir" ]; then
-  rmdir "$out_dir"
-fi
-mv -- "$stage" "$out_dir"
-stage=
+rollback=0
 echo "verified release files saved to $out_dir"

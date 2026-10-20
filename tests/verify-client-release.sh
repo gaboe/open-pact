@@ -6,6 +6,7 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 mock_bin="$tmp/bin"
 mkdir "$mock_bin"
+real_mv=$(command -v mv)
 cat > "$mock_bin/gh" <<'MOCK_GH'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -39,11 +40,13 @@ for file in "${assets[@]}"; do
 done
 (
   cd "$dest"
-  : > SHA256SUMS
-  for file in "${assets[@]}"; do
-    [ "$file" = SHA256SUMS ] && continue
-    [ -f "$file" ] && sha256sum "$file" >> SHA256SUMS
-  done
+  if [ "${MOCK_MISSING:-}" != SHA256SUMS ]; then
+    : > SHA256SUMS
+    for file in "${assets[@]}"; do
+      [ "$file" = SHA256SUMS ] && continue
+      [ -f "$file" ] && sha256sum "$file" >> SHA256SUMS
+    done
+  fi
 )
 if [ "${MOCK_BAD_CHECKSUM:-}" = 1 ]; then
   printf 'modified after checksum\n' >> "$dest/NOTICE"
@@ -65,7 +68,24 @@ if [ "${MOCK_COSIGN_FAIL:-}" = "$(basename "$last")" ]; then
   exit 9
 fi
 MOCK_COSIGN
+cat > "$mock_bin/mv" <<'MOCK_MV'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ -n "${MOCK_MV_RACE_KIND:-}" ] && mkdir "$MOCK_MV_RACE_MARKER" 2>/dev/null; then
+  case "$MOCK_MV_RACE_KIND" in
+    file) printf 'foreign file\n' > "$MOCK_MV_RACE_OUT/keep.txt" ;;
+    symlink)
+      rmdir "$MOCK_MV_RACE_OUT"
+      ln -s "$MOCK_MV_RACE_TARGET" "$MOCK_MV_RACE_OUT"
+      ;;
+    *) exit 94 ;;
+  esac
+fi
+exec "$REAL_MV" "$@"
+MOCK_MV
 chmod +x "$mock_bin/gh" "$mock_bin/cosign"
+chmod +x "$mock_bin/mv"
+export REAL_MV="$real_mv"
 export PATH="$mock_bin:$PATH"
 export GH_REPO=example/project
 
@@ -87,25 +107,57 @@ run_failure() {
   local name=$1
   shift
   local out="$tmp/$name"
-  mkdir "$out"
   if env "$@" "$script" v1.2.3 "$out" >/dev/null 2>&1; then
     fail "$name unexpectedly succeeded"
   fi
-  [ -z "$(find "$out" -mindepth 1 -print -quit)" ] || fail "$name left files in the output directory"
+  [ ! -e "$out" ] && [ ! -L "$out" ] || fail "$name left its output directory"
+}
+run_missing_asset() {
+  local file=$1
+  local out="$tmp/missing-$file"
+  local expected="$tmp/expected-diagnostic"
+  local actual="$tmp/actual-diagnostic"
+  printf 'missing release asset: %s\n' "$file" > "$expected"
+  if env "MOCK_MISSING=$file" "$script" v1.2.3 "$out" >/dev/null 2>"$actual"; then
+    fail "missing-$file unexpectedly succeeded"
+  fi
+  cmp -s "$expected" "$actual" || fail "missing-$file returned the wrong diagnostic"
+  [ ! -e "$out" ] && [ ! -L "$out" ] || fail "missing-$file left its output directory"
+}
+run_destination_race() {
+  local kind=$1
+  local out="$tmp/destination-race-$kind"
+  local target="$tmp/destination-race-target-$kind"
+  mkdir "$target"
+  if env \
+    "MOCK_MV_RACE_KIND=$kind" \
+    "MOCK_MV_RACE_OUT=$out" \
+    "MOCK_MV_RACE_TARGET=$target" \
+    "MOCK_MV_RACE_MARKER=$tmp/destination-race-$kind.injected" \
+    "$script" v1.2.3 "$out" >/dev/null 2>&1; then
+    fail "$kind destination change unexpectedly succeeded"
+  fi
+  if [ "$kind" = file ]; then
+    [ "$(cat "$out/keep.txt")" = "foreign file" ] || fail "file race changed its injected file"
+    [ "$(find "$out" -type f | wc -l | tr -d ' ')" -eq 1 ] || fail "file race published release files"
+  else
+    [ -L "$out" ] || fail "symlink race did not preserve the injected symlink"
+    [ -z "$(find "$target" -type f -print -quit)" ] || fail "symlink race published release files"
+  fi
 }
 
 run_success "$tmp/success"
-mkdir "$tmp/empty-existing"
-run_success "$tmp/empty-existing"
+mkdir "$tmp/existing-empty"
+if "$script" v1.2.3 "$tmp/existing-empty" >/dev/null 2>&1; then
+  fail "existing output directory unexpectedly succeeded"
+fi
+[ -d "$tmp/existing-empty" ] || fail "existing output directory was removed"
+if "$script" v1.2.3 "$tmp/missing-parent/output" >/dev/null 2>&1; then
+  fail "missing output parent unexpectedly succeeded"
+fi
 "$script" v1.2.3 >/dev/null
 run_success "$tmp/relative output"
 run_success "$tmp/trailing-slash/"
-mkdir "$tmp/non-empty"
-printf 'keep\n' > "$tmp/non-empty/keep.txt"
-if "$script" v1.2.3 "$tmp/non-empty" >/dev/null 2>&1; then
-  fail "non-empty output directory unexpectedly succeeded"
-fi
-[ "$(cat "$tmp/non-empty/keep.txt")" = keep ] || fail "non-empty output directory changed"
 if "$script" latest "$tmp/invalid-tag" >/dev/null 2>&1; then
   fail "invalid tag unexpectedly succeeded"
 fi
@@ -119,8 +171,10 @@ for file in \
   open-pact-client-x86_64-pc-windows-msvc.exe \
   NOTICE \
   SHA256SUMS; do
-  run_failure "missing-$file" "MOCK_MISSING=$file"
+  run_missing_asset "$file"
   run_failure "missing-bundle-$file" "MOCK_MISSING_BUNDLE=$file"
 done
+run_destination_race file
+run_destination_race symlink
 
 echo "mocked release verification passed"

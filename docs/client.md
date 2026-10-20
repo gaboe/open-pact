@@ -10,7 +10,7 @@ Run the verification script with an output directory:
 scripts/verify-client-release.sh v0.2.0 verified-client-release
 ```
 
-The script downloads the release assets to a temporary directory. It checks every checksum and Sigstore bundle before it writes to the output directory. On success, it moves the four client binaries, `NOTICE`, `SHA256SUMS`, and their bundles into that directory. The output directory must be empty or absent. The script adds no files to it if verification fails. A one-argument call verifies the release and removes the temporary files without saving them.
+The script creates the output directory. The directory must not exist before you run the script, and its parent directory must exist. The script downloads the release assets to a separate temporary directory. It checks every checksum and Sigstore bundle before it moves the four client binaries, `NOTICE`, `SHA256SUMS`, and their bundles into the output directory. If the output directory changes during publication, the script stops and removes the files it moved. A one-argument call verifies the release and removes the temporary files without saving them.
 
 Install the binary for your operating system and processor from the verified directory. For Apple Silicon macOS, run:
 
