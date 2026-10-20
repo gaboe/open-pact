@@ -919,6 +919,14 @@ mod tests {
     }
 
     #[test]
+    fn partial_batch_keeps_only_complete_metrics() {
+        let values = parse_values("bitlocker\t1\r\nsecure_boot\t1");
+        assert_eq!(values.get("bitlocker").map(String::as_str), Some("1"));
+        assert!(!values.contains_key("secure_boot"));
+        assert!(!values.contains_key("firewall"));
+    }
+
+    #[test]
     fn values_use_tagged_lines() {
         let out = "bitlocker\t1\r\nfirewall\tTrue False True\r\nwarning text\r\n";
         let values = parse_values(out);

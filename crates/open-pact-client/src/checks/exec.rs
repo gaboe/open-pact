@@ -137,6 +137,20 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn timeout_preserves_partial_stdout_and_stderr() {
+        let output = capture(
+            "sh",
+            &["-c", "printf 'bitlocker\t1\nsecure_boot\t1'; printf 'diagnostic' >&2; exec sleep 30"],
+            Duration::from_millis(200),
+        ).unwrap();
+        assert!(output.timed_out, "{output:?}");
+        assert!(!output.status.unwrap().success());
+        assert_eq!(output.stdout, "bitlocker\t1\nsecure_boot\t1");
+        assert_eq!(output.stderr, "diagnostic");
+    }
+
+    #[test]
     fn missing_program_is_none() {
         assert_eq!(run("open-pact-no-such-binary", &[]), None);
     }
