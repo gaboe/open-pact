@@ -1,12 +1,18 @@
 use chrono::{NaiveDate, Utc};
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use super::buckets;
-use super::exec::run;
+use super::exec::run_with_timeout;
 const POWERSHELL: &str = r#"
 $ErrorActionPreference = 'Stop'
 function Emit($key, $value) { if ($null -eq $value) { $value = '' }; [Console]::WriteLine("$key`t$value") }
+function Timed($name, [scriptblock]$work) {
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    & $work
+    if ($env:OPEN_PACT_WINDOWS_TIMINGS -eq '1') { [Console]::Error.WriteLine("timing.$name`t$($watch.Elapsed.TotalSeconds)") }
+}
 function RegValue($path, $name) {
     try {
         $item = Get-ItemProperty -LiteralPath $path -ErrorAction Stop
@@ -14,32 +20,63 @@ function RegValue($path, $name) {
         return [string]$item.$name
     } catch { return '!' }
 }
-try { $bitlocker = (New-Object -ComObject Shell.Application).NameSpace($env:SystemDrive).Self.ExtendedProperty('System.Volume.BitLockerProtection'); Emit 'bitlocker' $bitlocker } catch { Emit 'bitlocker' '' }
-try {
-    $profiles = @(Get-NetFirewallProfile -PolicyStore ActiveStore | Sort-Object Name)
-    if ($profiles.Count -eq 3) { Emit 'firewall' (($profiles | ForEach-Object { $_.Enabled.ToString() }) -join ' ') } else { Emit 'firewall' '' }
-} catch { Emit 'firewall' '' }
-try {
-    $products = @(Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntivirusProduct -ErrorAction Stop)
-    if ($products.Count -gt 0) { Emit 'antimalware' (($products | ForEach-Object { $_.productState }) -join ' ') }
-    else { throw 'No Security Center products' }
-} catch {
-    try {
-        $status = Get-MpComputerStatus -ErrorAction Stop
-        if ($null -ne $status.AntivirusEnabled -and $null -ne $status.RealTimeProtectionEnabled) {
-            if ($status.AMRunningMode -eq 'Normal' -and $status.AntivirusEnabled -and $status.RealTimeProtectionEnabled) { Emit 'antimalware' 'defender=yes' }
-            else { Emit 'antimalware' '' }
-        } else { Emit 'antimalware' '' }
-    } catch { Emit 'antimalware' '' }
+Timed 'bitlocker' {
+    try { $bitlocker = (New-Object -ComObject Shell.Application).NameSpace($env:SystemDrive).Self.ExtendedProperty('System.Volume.BitLockerProtection'); Emit 'bitlocker' $bitlocker } catch { Emit 'bitlocker' '' }
 }
-Emit 'secure_boot' (RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\State' 'UEFISecureBootEnabled')
-Emit 'lock_policy' (RegValue 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' 'InactivityTimeoutSecs')
-Emit 'screen_active' (RegValue 'HKCU:\Control Panel\Desktop' 'ScreenSaveActive')
-Emit 'screen_secure' (RegValue 'HKCU:\Control Panel\Desktop' 'ScreenSaverIsSecure')
-Emit 'screen_timeout' (RegValue 'HKCU:\Control Panel\Desktop' 'ScreenSaveTimeOut')
-$current = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
-Emit 'os' (@($current.CurrentBuild, $current.DisplayVersion, $current.EditionID, $current.InstallationType) -join '|')
-Emit 'autologin' (RegValue 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' 'AutoAdminLogon')
+Timed 'firewall' {
+    try {
+        $profiles = @(Get-NetFirewallProfile -PolicyStore ActiveStore | Sort-Object Name)
+        if ($profiles.Count -eq 3) { Emit 'firewall' (($profiles | ForEach-Object { $_.Enabled.ToString() }) -join ' ') } else { Emit 'firewall' '' }
+    } catch { Emit 'firewall' '' }
+}
+Timed 'antimalware' {
+    try {
+        $products = @(Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntivirusProduct -ErrorAction Stop)
+        if ($products.Count -gt 0) { Emit 'antimalware' (($products | ForEach-Object { $_.productState }) -join ' ') }
+        else { throw 'No Security Center products' }
+    } catch {
+        try {
+            $status = Get-MpComputerStatus -ErrorAction Stop
+            if ($null -ne $status.AntivirusEnabled -and $null -ne $status.RealTimeProtectionEnabled) {
+                if ($status.AMRunningMode -eq 'Normal' -and $status.AntivirusEnabled -and $status.RealTimeProtectionEnabled) { Emit 'antimalware' 'defender=yes' }
+                else { Emit 'antimalware' '' }
+            } else { Emit 'antimalware' '' }
+        } catch { Emit 'antimalware' '' }
+    }
+}
+Timed 'registry' {
+    Emit 'secure_boot' (RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\State' 'UEFISecureBootEnabled')
+    Emit 'lock_policy' (RegValue 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' 'InactivityTimeoutSecs')
+    Emit 'screen_active' (RegValue 'HKCU:\Control Panel\Desktop' 'ScreenSaveActive')
+    Emit 'screen_secure' (RegValue 'HKCU:\Control Panel\Desktop' 'ScreenSaverIsSecure')
+    Emit 'screen_timeout' (RegValue 'HKCU:\Control Panel\Desktop' 'ScreenSaveTimeOut')
+    Emit 'autologin' (RegValue 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' 'AutoAdminLogon')
+}
+Timed 'os' {
+    $current = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+    Emit 'os' (@($current.CurrentBuild, $current.DisplayVersion, $current.EditionID, $current.InstallationType) -join '|')
+}
+Timed 'wua' {
+    try {
+        $session = New-Object -ComObject Microsoft.Update.Session
+        $searcher = $session.CreateUpdateSearcher()
+        $history = @($searcher.QueryHistory(0, 100) | Where-Object { $_.ResultCode -eq 2 -and $_.Operation -eq 1 } | Sort-Object Date -Descending)
+        $rollupId = '28BC880E-0592-4CBF-8F95-C79B17911D5F'
+        $selected = $null
+        foreach ($entry in $history) {
+            $updateId = $entry.UpdateIdentity.UpdateID
+            $search = $searcher.Search("UpdateID='$updateId'")
+            if ($search.Updates.Count -eq 0) { continue }
+            $update = $search.Updates.Item(0)
+            $categories = @($update.Categories | ForEach-Object { $_.CategoryID })
+            $kbIds = @($update.KBArticleIDs)
+            if ($env:OPEN_PACT_WINDOWS_TIMINGS -eq '1') { [Console]::Error.WriteLine("wua.candidate`t$($entry.Date.ToString('yyyy-MM-dd'))|$($kbIds -join ',')|$($categories -join ',')") }
+            if ($categories -contains $rollupId -or $kbIds -contains '5126646') { $selected = $entry.Date; break }
+        }
+        if ($null -ne $selected) { Emit 'patch_date' $selected.ToString('yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture) }
+        else { Emit 'patch_date' '' }
+    } catch { Emit 'patch_date' '' }
+}
 "#;
 
 static VALUES: OnceLock<BTreeMap<String, String>> = OnceLock::new();
@@ -77,8 +114,11 @@ pub fn os_supported() -> &'static str {
 }
 
 pub fn os_patch_age() -> &'static str {
-    // Get-HotFix omits the Windows Update-supplied cumulative updates needed for this check.
-    "unknown"
+    value("patch_date")
+        .and_then(parse_last_update)
+        .map_or("unknown", |date| {
+            buckets::patch_age(date, Utc::now().date_naive())
+        })
 }
 
 pub fn auto_login() -> &'static str {
@@ -108,7 +148,7 @@ pub fn antimalware_active() -> &'static str {
 
 fn value(name: &str) -> Option<&'static str> {
     let values = VALUES.get_or_init(|| {
-        let out = run(
+        let out = run_with_timeout(
             "powershell.exe",
             &[
                 "-NoLogo",
@@ -117,6 +157,7 @@ fn value(name: &str) -> Option<&'static str> {
                 "-Command",
                 POWERSHELL,
             ],
+            Duration::from_secs(20),
         )
         .unwrap_or_default();
         parse_values(&out)
@@ -139,6 +180,10 @@ pub fn parse_dword(value: &str) -> Option<u32> {
         .strip_prefix("0x")
         .and_then(|hex| u32::from_str_radix(hex, 16).ok())
         .or_else(|| value.parse().ok())
+}
+
+pub fn parse_last_update(value: &str) -> Option<NaiveDate> {
+    NaiveDate::parse_from_str(value.trim(), "%Y-%m-%d").ok()
 }
 
 /// The Shell property has no official value table, so unrecognized values stay unknown.
@@ -168,7 +213,7 @@ pub fn parse_screen_saver(
     timeout: Option<&str>,
 ) -> &'static str {
     match (active, secure) {
-        (Some("0"), _) | (Some("1"), Some("0")) => "off",
+        (Some("0"), _) | (Some("1"), Some("0")) => "none",
         (Some("1"), Some("1")) => timeout
             .and_then(|t| t.trim().parse::<u64>().ok())
             .map_or("unknown", buckets::lock_delay),
@@ -338,8 +383,14 @@ mod tests {
         assert_eq!(saver("300"), "le_5min");
         assert_eq!(saver("900"), "le_15min");
         assert_eq!(saver("1200"), "gt_15min");
-        assert_eq!(parse_screen_saver(Some("1"), Some("0"), Some("300")), "off");
-        assert_eq!(parse_screen_saver(Some("0"), Some("1"), Some("300")), "off");
+        assert_eq!(
+            parse_screen_saver(Some("1"), Some("0"), Some("300")),
+            "none"
+        );
+        assert_eq!(
+            parse_screen_saver(Some("0"), Some("1"), Some("300")),
+            "none"
+        );
         assert_eq!(parse_screen_saver(None, None, None), "unknown");
     }
 
@@ -378,6 +429,11 @@ mod tests {
 
     #[test]
     fn patch_age_is_unknown_without_lcu_evidence() {
+        assert_eq!(
+            parse_last_update("2026-10-13\r\n"),
+            NaiveDate::from_ymd_opt(2026, 10, 13)
+        );
+        assert_eq!(parse_last_update("October 13, 2026"), None);
         assert_eq!(os_patch_age(), "unknown");
     }
 
