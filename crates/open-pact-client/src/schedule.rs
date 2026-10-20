@@ -21,6 +21,9 @@ pub(crate) enum Command {
         collector: String,
         #[arg(long)]
         vpn_probe: Option<String>,
+        /// Run Windows checks as SYSTEM to read machine-wide settings
+        #[arg(long)]
+        system: bool,
     },
     /// Remove the report job, its configuration and report state
     Uninstall,
@@ -268,6 +271,24 @@ struct Job {
     argv: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TaskRunAs {
+    CurrentUser,
+    System,
+}
+
+#[derive(Clone, Copy)]
+enum RegistrationAction {
+    Install(TaskRunAs),
+    Uninstall,
+}
+
+impl RegistrationAction {
+    fn installs(self) -> bool {
+        matches!(self, Self::Install(_))
+    }
+}
+
 impl Job {
     fn new(executable: &Path, home: &Path) -> Result<Self> {
         let id = format!(
@@ -334,8 +355,8 @@ impl Job {
         )
     }
 
-    fn schtasks_install(&self) -> Vec<String> {
-        vec![
+    fn schtasks_install(&self, run_as: TaskRunAs) -> Vec<String> {
+        let mut args = vec![
             "/Create".into(),
             "/TN".into(),
             self.id.clone(),
@@ -349,10 +370,22 @@ impl Job {
                 .map(|arg| windows_arg(arg))
                 .collect::<Vec<_>>()
                 .join(" "),
-            "/RL".into(),
-            "LIMITED".into(),
-            "/F".into(),
-        ]
+        ];
+        match run_as {
+            TaskRunAs::CurrentUser => args.extend(["/RL".into(), "LIMITED".into()]),
+            TaskRunAs::System => args.extend([
+                "/RU".into(),
+                "SYSTEM".into(),
+                "/RL".into(),
+                "HIGHEST".into(),
+            ]),
+        }
+        args.push("/F".into());
+        args
+    }
+
+    fn schtasks_uninstall(&self) -> Vec<String> {
+        vec!["/Delete".into(), "/TN".into(), self.id.clone(), "/F".into()]
     }
 }
 
@@ -362,10 +395,16 @@ fn execute(program: &str, args: &[&str]) -> Result<()> {
         .output()
         .with_context(|| format!("start {program}"))?;
     if !output.status.success() {
-        bail!(
-            "{program} failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        let diagnostic = format!("{stderr}\n{stdout}");
+        if program == "schtasks.exe"
+            && (output.status.code() == Some(5)
+                || diagnostic.to_ascii_lowercase().contains("access is denied"))
+        {
+            bail!("schtasks.exe was denied access; run from an elevated prompt");
+        }
+        bail!("{program} failed: {}", stderr);
     }
     Ok(())
 }
@@ -404,7 +443,7 @@ fn remove_if_exists(path: &Path) -> Result<()> {
     }
 }
 
-fn register(job: &Job, install: bool) -> Result<()> {
+fn register(job: &Job, action: RegistrationAction) -> Result<()> {
     match crate::current_os()? {
         open_pact_core::Os::Macos => {
             let path = user_home()?
@@ -420,7 +459,7 @@ fn register(job: &Job, install: bool) -> Result<()> {
             if loaded {
                 execute("launchctl", &["bootout", &target])?;
             }
-            if install {
+            if action.installs() {
                 std::fs::create_dir_all(path.parent().context("LaunchAgents directory")?)?;
                 std::fs::write(&path, job.plist())?;
                 execute("launchctl", &["bootstrap", &domain, text(&path)?])?;
@@ -433,7 +472,7 @@ fn register(job: &Job, install: bool) -> Result<()> {
             let service = dir.join(format!("{}.service", job.id));
             let timer = dir.join(format!("{}.timer", job.id));
             let timer_name = format!("{}.timer", job.id);
-            if install {
+            if action.installs() {
                 std::fs::create_dir_all(&dir)?;
                 std::fs::write(&service, job.service())?;
                 std::fs::write(&timer, job.timer())?;
@@ -450,29 +489,46 @@ fn register(job: &Job, install: bool) -> Result<()> {
                 execute("systemctl", &["--user", "daemon-reload"])?;
             }
         }
-        open_pact_core::Os::Windows => {
-            if install {
-                let args = job.schtasks_install();
+        open_pact_core::Os::Windows => match action {
+            RegistrationAction::Install(run_as) => {
+                let args = job.schtasks_install(run_as);
                 execute(
                     "schtasks.exe",
                     &args.iter().map(String::as_str).collect::<Vec<_>>(),
                 )?;
-            } else {
+            }
+            RegistrationAction::Uninstall => {
                 let exists = std::process::Command::new("schtasks.exe")
                     .args(["/Query", "/TN", &job.id])
                     .output()?
                     .status
                     .success();
                 if exists {
-                    execute("schtasks.exe", &["/Delete", "/TN", &job.id, "/F"])?;
+                    let args = job.schtasks_uninstall();
+                    execute(
+                        "schtasks.exe",
+                        &args.iter().map(String::as_str).collect::<Vec<_>>(),
+                    )?;
                 }
             }
-        }
+        },
+    }
+    Ok(())
+}
+
+fn validate_system_install(system: bool, os: open_pact_core::Os) -> Result<()> {
+    if system && os != open_pact_core::Os::Windows {
+        bail!("schedule install --system is available only on Windows");
     }
     Ok(())
 }
 
 pub(crate) async fn run(home: &Home, command: Command) -> Result<()> {
+    if let Command::Install { system, .. } = &command
+        && *system
+    {
+        validate_system_install(true, crate::current_os()?)?;
+    }
     let _lock = lock(home)?;
     let absolute = std::fs::canonicalize(&home.0)?;
     let home = Home(absolute);
@@ -499,6 +555,7 @@ pub(crate) async fn run(home: &Home, command: Command) -> Result<()> {
         Command::Install {
             collector,
             vpn_probe,
+            system,
         } => {
             let config = Config::new(collector, vpn_probe)?;
             home.enrolment()?;
@@ -506,7 +563,12 @@ pub(crate) async fn run(home: &Home, command: Command) -> Result<()> {
             let job = Job::new(&std::env::current_exe()?, &home.0)?;
             save(&home, CONFIG, &config)?;
             save(&home, STATE, &State::default())?;
-            register(&job, true)?;
+            let run_as = if system {
+                TaskRunAs::System
+            } else {
+                TaskRunAs::CurrentUser
+            };
+            register(&job, RegistrationAction::Install(run_as))?;
             println!(
                 "Installed {}. The OS checks VPN connectivity every five minutes.",
                 job.id
@@ -514,7 +576,7 @@ pub(crate) async fn run(home: &Home, command: Command) -> Result<()> {
         }
         Command::Uninstall => {
             let job = Job::new(&std::env::current_exe()?, &home.0)?;
-            register(&job, false)?;
+            register(&job, RegistrationAction::Uninstall)?;
             for name in [
                 CONFIG,
                 STATE,
@@ -819,22 +881,83 @@ mod tests {
     }
 
     #[test]
-    fn windows_task_runs_every_five_minutes_with_separate_arguments() {
+    fn windows_task_runs_every_five_minutes_as_the_current_user() {
         let job = Job::new(
             Path::new(r"C:\Example App\open-pact-client.exe"),
             Path::new(r"C:\Example User\pact"),
         )
         .unwrap();
-        let args = job.schtasks_install();
-        assert!(args.windows(4).any(|a| a == ["/SC", "MINUTE", "/MO", "5"]));
-        let tr = args.iter().position(|arg| arg == "/TR").unwrap();
         assert_eq!(
-            args[tr + 1],
-            r#""C:\Example App\open-pact-client.exe" "--home" "C:\Example User\pact" "schedule" "run""#
+            job.schtasks_install(TaskRunAs::CurrentUser),
+            vec![
+                "/Create",
+                "/TN",
+                job.id.as_str(),
+                "/SC",
+                "MINUTE",
+                "/MO",
+                "5",
+                "/TR",
+                r#""C:\Example App\open-pact-client.exe" "--home" "C:\Example User\pact" "schedule" "run""#,
+                "/RL",
+                "LIMITED",
+                "/F",
+            ]
         );
         assert_eq!(windows_arg("a\\"), "\"a\\\\\"");
         assert_eq!(windows_arg("a\"b"), "\"a\\\"b\"");
         assert!(Job::new(Path::new("/bin/client\nother"), Path::new("/home/example")).is_err());
+    }
+
+    #[test]
+    fn windows_system_task_runs_every_five_minutes_with_explicit_user_home() {
+        let job = Job::new(
+            Path::new(r"C:\Example App\open-pact-client.exe"),
+            Path::new(r"C:\Example User\pact"),
+        )
+        .unwrap();
+        assert_eq!(
+            job.schtasks_install(TaskRunAs::System),
+            vec![
+                "/Create",
+                "/TN",
+                job.id.as_str(),
+                "/SC",
+                "MINUTE",
+                "/MO",
+                "5",
+                "/TR",
+                r#""C:\Example App\open-pact-client.exe" "--home" "C:\Example User\pact" "schedule" "run""#,
+                "/RU",
+                "SYSTEM",
+                "/RL",
+                "HIGHEST",
+                "/F",
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_system_task_uninstall_uses_the_shared_task_name() {
+        let job = Job::new(
+            Path::new(r"C:\Example App\open-pact-client.exe"),
+            Path::new(r"C:\Example User\pact"),
+        )
+        .unwrap();
+        assert_eq!(
+            job.schtasks_uninstall(),
+            vec!["/Delete", "/TN", job.id.as_str(), "/F"]
+        );
+    }
+
+    #[test]
+    fn system_task_install_is_refused_on_non_windows() {
+        for os in [open_pact_core::Os::Macos, open_pact_core::Os::Linux] {
+            let error = validate_system_install(true, os).unwrap_err();
+            assert!(error.to_string().contains("available only on Windows"));
+            validate_system_install(false, os).unwrap();
+        }
+        validate_system_install(true, open_pact_core::Os::Windows).unwrap();
     }
 
     #[test]

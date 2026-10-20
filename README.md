@@ -261,6 +261,8 @@ Windows collects the controls in one cached PowerShell batch. A missing source, 
 
 Defender metrics require Defender in Normal mode with its antivirus and service enabled. Other antivirus providers return `unknown` for these metrics. Detection values describe retained Defender history, not proof that a device has never had malware. Standard users get `unknown` for the controls that enforce elevation. Access failures also return `unknown`.
 
+On Windows, `preboot_auth`, `local_log_retention_days`, `process_audit`, and `log_cleared_hours` need SYSTEM or an elevated administrator. The `web_protection` check also needs SYSTEM to read browser settings for other user profiles. Install the report task with `schedule install --system` to run these checks as SYSTEM. The task reads Windows settings and reports their values. It does not change those settings.
+
 Windows `screen_lock` uses a machine inactivity limit first. Otherwise it reads the effective screen-saver policy before local desktop settings. It requires a positive timer, secure mode, and an existing `.scr` file. As SYSTEM, it reads the HKU hives of interactive users. The weakest readable user setting decides. Missing users, unloaded hives, and unreadable evidence return `unknown`.
 
 Windows `os_supported` uses an edition-aware lifecycle table for client, IoT Enterprise, LTSC/LTSB, and Server releases. Older systems use `ReleaseId` when `DisplayVersion` is absent. Missing lifecycle entries and unverified Windows 10 ESU status return `unknown`.
@@ -302,14 +304,16 @@ The collector receives the compact JWS as `application/jose`. It must verify ES2
 
 ## Schedule reports while the VPN is connected
 
-Install a user job with an internal collector address reachable only through your VPN:
+Install a report job with an internal collector address reachable only through your VPN:
 
 ```sh
 open-pact-client schedule install --collector https://collector.internal.example.org/status
 open-pact-client schedule uninstall
 ```
 
-Use the same `--home` for installation and removal. Keep the binary at its installed path. The scheduler runs under your OS user account. macOS uses a launchd LaunchAgent. Linux uses a systemd user timer and requires a running user manager. Windows uses Task Scheduler. These jobs run without a separate open-pact daemon. No job exists until you run `schedule install`.
+Use the same `--home` for installation and removal. Keep the binary at its installed path. By default, the task runs under your OS user account. macOS uses a launchd LaunchAgent. Linux uses a systemd user timer and requires a running user manager. Windows uses Task Scheduler. These jobs run without a separate open-pact daemon. No job exists until you run `schedule install`.
+
+On Windows, run `schedule install --system --collector https://collector.internal.example.org/status` from an elevated prompt to create a SYSTEM task with the highest run level. The task keeps the selected user's absolute `--home` path. Use the same `--home` when you run `schedule uninstall`. Without `--system`, Windows keeps the current-user, limited task. Other operating systems reject `--system`.
 
 The collector must have an internal address that is reachable only through the VPN. VPN routing makes off-VPN sends impossible. A public collector cannot meet this requirement, even with a separate VPN probe. A probe can succeed just before the VPN disconnects.
 
