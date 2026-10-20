@@ -156,6 +156,9 @@ pub fn fix_hint(check: &str, value: &str, os: Os) -> Option<&'static str> {
         ("log_cleared_hours", Os::Windows) => Some(
             "Review Security event 1102 and System event 104 in Event Viewer. Investigate why the logs were cleared.",
         ),
+        ("web_protection", Os::Windows) => Some(
+            "Turn on Check apps and files in Windows Security > App & browser control. Enable SmartScreen or Safe Browsing in Chrome, Edge, Brave, and Firefox. Check managed browser policies too.",
+        ),
         ("web_protection", _) => Some(
             "Enable fraudulent website warnings or Safe Browsing in every installed browser. Check managed policies too.",
         ),

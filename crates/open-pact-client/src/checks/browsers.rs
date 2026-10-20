@@ -387,10 +387,138 @@ pub fn macos() -> &'static str {
     web_protection(&states)
 }
 
+fn smartscreen(text: &str) -> Protection {
+    let Some((policy, local)) = text.split_once('|') else {
+        return Protection::Unknown;
+    };
+    match policy {
+        "0" => Protection::Off,
+        "1" => Protection::On,
+        "" => match local {
+            "Off" => Protection::Off,
+            "Warn" | "RequireAdmin" => Protection::On,
+            _ => Protection::Unknown,
+        },
+        _ => Protection::Unknown,
+    }
+}
+
+fn windows_browser(browser: &Value) -> Protection {
+    if browser.get("unreadable").is_some() {
+        return Protection::Unknown;
+    }
+    let Some(policy) = browser.get("policy").filter(|v| v.is_object()) else {
+        return Protection::Unknown;
+    };
+    match browser.get("kind").and_then(Value::as_str) {
+        Some("firefox") => {
+            let Some(text) = browser.get("prefs").and_then(Value::as_str) else {
+                return Protection::Unknown;
+            };
+            firefox_prefs(text).map_or(Protection::Unknown, |prefs| firefox_state(&prefs, policy))
+        }
+        Some(kind @ ("chrome" | "brave" | "edge")) => {
+            let Some(prefs) = browser.get("prefs").filter(|v| v.is_object()) else {
+                return Protection::Unknown;
+            };
+            let Some(recommended) = browser.get("recommended").filter(|v| v.is_object()) else {
+                return Protection::Unknown;
+            };
+            let edge = kind == "edge";
+            let (key, pointer) = if edge {
+                ("SmartScreenEnabled", "/edge/smartscreen/enabled")
+            } else {
+                ("SafeBrowsingEnabled", "/safebrowsing/enabled")
+            };
+            if policy.get(key).is_none()
+                && (edge || policy.get("SafeBrowsingProtectionLevel").is_none())
+                && prefs.pointer(pointer).is_none()
+                && (edge || recommended.get("SafeBrowsingProtectionLevel").is_none())
+                && let Some(value) = recommended.get(key)
+            {
+                return flag(Some(value));
+            }
+            chromium(prefs, policy, recommended, edge)
+        }
+        _ => Protection::Unknown,
+    }
+}
+
+pub fn windows(screen: &str, text: &str) -> &'static str {
+    let mut states = vec![smartscreen(screen)];
+    match serde_json::from_str::<Value>(text) {
+        Ok(Value::Array(browsers)) => {
+            states.extend(browsers.iter().map(windows_browser));
+        }
+        _ => states.push(Protection::Unknown),
+    }
+    match merge(&states) {
+        Protection::On => "on",
+        Protection::Off => "off",
+        Protection::Unknown => "unknown",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn windows_always_requires_smartscreen_and_every_browser() {
+        let on = json!({"kind":"chrome","policy":{},"recommended":{},"prefs":{}});
+        let off = json!({"kind":"edge","policy":{},"recommended":{},"prefs":{"edge":{"smartscreen":{"enabled":false}}}});
+        let unreadable = json!({"kind":"firefox","unreadable":true});
+        for (screen, browsers, expected) in [
+            ("|Warn", json!([]), "on"),
+            ("|Off", json!([]), "off"),
+            ("|", json!([]), "unknown"),
+            ("1|Off", json!([on.clone()]), "on"),
+            ("0|Warn", json!([on.clone()]), "off"),
+            ("|RequireAdmin", json!([on.clone()]), "on"),
+            ("|Warn", json!([on.clone(), off.clone()]), "off"),
+            ("|Warn", json!([on.clone(), unreadable.clone()]), "unknown"),
+            ("|Warn", json!([off.clone(), unreadable.clone()]), "off"),
+            ("!|Warn", json!([on.clone()]), "unknown"),
+            ("|Warn", json!([{"kind":"unsupported"}]), "unknown"),
+        ] {
+            assert_eq!(windows(screen, &browsers.to_string()), expected);
+        }
+        assert_eq!(windows("|Warn", "invalid"), "unknown");
+        assert_eq!(windows("|Off", "invalid"), "off");
+        assert_eq!(windows("|Warn", "{}"), "unknown");
+        assert_eq!(windows("2|Warn", "[]"), "unknown");
+    }
+
+    #[test]
+    fn windows_browser_policies_and_user_overrides() {
+        for kind in ["chrome", "brave"] {
+            let mut item = json!({"kind":kind,"policy":{"SafeBrowsingProtectionLevel":0},"recommended":{},"prefs":{}});
+            assert_eq!(windows_browser(&item), Protection::Off);
+            item["policy"] = json!({});
+            item["recommended"] = json!({"SafeBrowsingProtectionLevel":0});
+            assert_eq!(windows_browser(&item), Protection::Off);
+            item["prefs"] = json!({"safebrowsing":{"enabled":true}});
+            assert_eq!(windows_browser(&item), Protection::On);
+            item["policy"] = json!({"SafeBrowsingEnabled":false});
+            assert_eq!(windows_browser(&item), Protection::Off);
+        }
+        let mut edge = json!({"kind":"edge","policy":{},"recommended":{"SmartScreenEnabled":false},"prefs":{}});
+        assert_eq!(windows_browser(&edge), Protection::Off);
+        edge["prefs"] = json!({"edge":{"smartscreen":{"enabled":true}}});
+        assert_eq!(windows_browser(&edge), Protection::On);
+        edge["policy"] = json!({"SmartScreenEnabled":false});
+        assert_eq!(windows_browser(&edge), Protection::Off);
+        let mut firefox = json!({"kind":"firefox","policy":{},"prefs":"user_pref(\"browser.safebrowsing.phishing.enabled\", false);"});
+        assert_eq!(windows_browser(&firefox), Protection::Off);
+        firefox["policy"] = json!({"policies":{"Preferences":{"browser.safebrowsing.phishing.enabled":{"Value":1,"Status":"locked"}}}});
+        assert_eq!(windows_browser(&firefox), Protection::On);
+        firefox["policy"]["policies"]["Preferences"]["browser.safebrowsing.phishing.enabled"]["Status"] =
+            json!("user");
+        assert_eq!(windows_browser(&firefox), Protection::Off);
+        firefox["prefs"] = json!("user_pref(\"browser.safebrowsing.phishing.enabled\", bad);");
+        assert_eq!(windows_browser(&firefox), Protection::Unknown);
+    }
+
     #[test]
     fn chromium_defaults_and_policy_precedence() {
         assert_eq!(

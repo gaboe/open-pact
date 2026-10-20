@@ -19,6 +19,10 @@ jobs:
       - name: Test Windows client
         run: cargo test -p open-pact-client
 
+      - name: Verify Windows browser source fixtures
+        shell: powershell
+        run: ./crates/open-pact-client/src/checks/windows_browser_tests.ps1
+
       - name: Record runner privilege
         shell: pwsh
         run: |
@@ -30,7 +34,10 @@ jobs:
         shell: powershell
         run: |
           $timer = [Diagnostics.Stopwatch]::StartNew()
-          & ([scriptblock]::Create((Get-Content -Raw crates/open-pact-client/src/checks/windows.ps1)))
+          & ([scriptblock]::Create((Get-Content -Raw crates/open-pact-client/src/checks/windows.ps1))) | ForEach-Object {
+            if ($_ -like "browsers`t*") { Write-Output "browser_settings=collected" }
+            else { Write-Output $_ }
+          }
           $timer.Stop()
           Write-Output ("batch_elapsed_seconds=" + $timer.Elapsed.TotalSeconds.ToString([Globalization.CultureInfo]::InvariantCulture))
 

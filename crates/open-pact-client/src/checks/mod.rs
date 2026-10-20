@@ -152,7 +152,7 @@ const WINDOWS: Registry = &[
         "antimalware_last_detection_hours",
         windows::antimalware_last_detection_hours,
     ),
-    ("web_protection", macos_v3::unknown),
+    ("web_protection", windows::web_protection),
     (
         "local_log_retention_days",
         windows::local_log_retention_days,

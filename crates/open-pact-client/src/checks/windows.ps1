@@ -180,3 +180,167 @@ RunSection {
     $user = PolicyValue 'HKCU:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging' 'EnableScriptBlockLogging'
     Emit 'powershell_logging' ($machine + '|' + $user)
 }
+function ReadJson($path) {
+    if (-not (Test-Path -LiteralPath $path -ErrorAction Stop)) { return [pscustomobject]@{} }
+    $json = Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    if ($null -eq $json -or $json -isnot [pscustomobject]) { throw 'Invalid JSON object' }
+    return $json
+}
+function BrowserPolicy($machinePath, $userPath, $names) {
+    $result = @{}
+    foreach ($name in $names) {
+        $machine = PolicyValue $machinePath $name
+        $user = PolicyValue $userPath $name
+        if ($machine -eq '!' -or $user -eq '!') { throw 'Unreadable policy' }
+        $value = $machine
+        if ($value -eq '') { $value = $user }
+        if ($value -ne '') {
+            if ($name -eq 'SafeBrowsingProtectionLevel') {
+                if ($value -notmatch '^[012]$') { throw 'Invalid protection level' }
+                $result[$name] = [int]$value
+            } else {
+                if ($value -notmatch '^[01]$') { throw 'Invalid policy flag' }
+                $result[$name] = ($value -eq '1')
+            }
+        }
+    }
+    return $result
+}
+function ChromiumPrefs($path, $edge) {
+    $prefs = ReadJson $path
+    $projected = @{}
+    if ($edge) {
+        if ($null -ne $prefs.PSObject.Properties['edge']) {
+            if ($prefs.edge -isnot [pscustomobject]) { throw 'Invalid Edge preferences' }
+            if ($null -ne $prefs.edge.PSObject.Properties['smartscreen']) {
+                if ($prefs.edge.smartscreen -isnot [pscustomobject]) { throw 'Invalid SmartScreen preferences' }
+                if ($null -ne $prefs.edge.smartscreen.PSObject.Properties['enabled']) { $projected.edge = @{smartscreen=@{enabled=$prefs.edge.smartscreen.enabled}} }
+            }
+        }
+    } elseif ($null -ne $prefs.PSObject.Properties['safebrowsing']) {
+        if ($prefs.safebrowsing -isnot [pscustomobject]) { throw 'Invalid Safe Browsing preferences' }
+        if ($null -ne $prefs.safebrowsing.PSObject.Properties['enabled']) { $projected.safebrowsing = @{enabled=$prefs.safebrowsing.enabled} }
+    }
+    return $projected
+}
+function BrowserDirs($root, $firefox) {
+    if (-not (Test-Path -LiteralPath $root -ErrorAction Stop)) { return }
+    if (((Get-Item -LiteralPath $root -ErrorAction Stop).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'External profile root' }
+    foreach ($dir in Get-ChildItem -LiteralPath $root -Directory -ErrorAction Stop) {
+        $isProfile = $firefox -or $dir.Name -eq 'Default' -or $dir.Name -like 'Profile *' -or $dir.Name -eq 'Guest Profile'
+        $preferences = Test-Path -LiteralPath (Join-Path $dir.FullName 'Preferences') -ErrorAction Stop
+        if ($isProfile -or $preferences) {
+            if (($dir.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'External profile' }
+            $dir.FullName
+        }
+    }
+}
+function FirefoxRegistry($root) {
+    $path = $root + '\SOFTWARE\Policies\Mozilla\Firefox'
+    $result = @{}
+    if (-not (Test-Path -LiteralPath $path -ErrorAction Stop)) { return $result }
+    $key = Get-Item -LiteralPath $path -ErrorAction Stop
+    $raw = $key.GetValue('Preferences', $null)
+    if ($null -ne $raw) {
+        $parsed = ($raw -join "`n") | ConvertFrom-Json -ErrorAction Stop
+        if ($parsed -isnot [pscustomobject]) { throw 'Invalid Firefox policy' }
+        foreach ($name in @('browser.safebrowsing.malware.enabled', 'browser.safebrowsing.phishing.enabled')) {
+            if ($null -ne $parsed.PSObject.Properties[$name]) { $result[$name] = $parsed.$name }
+        }
+    }
+    foreach ($name in @('browser.safebrowsing.malware.enabled', 'browser.safebrowsing.phishing.enabled')) {
+        $old = PolicyValue ($path + '\Preferences') $name
+        if ($old -eq '!') { throw 'Unreadable Firefox policy' }
+        if ($old -ne '') {
+            if ($result.ContainsKey($name)) { throw 'Conflicting Firefox policy formats' }
+            if ($old -notmatch '^[01]$') { throw 'Invalid Firefox policy' }
+            $result[$name] = [int]$old
+        }
+    }
+    return $result
+}
+function FirefoxBrowser($homePath, $app, $userRoot) {
+    $root = Join-Path $homePath 'AppData\Roaming\Mozilla\Firefox'
+    $ini = Join-Path $root 'profiles.ini'
+    if (Test-Path -LiteralPath $ini -ErrorAction Stop) {
+        foreach ($line in Get-Content -LiteralPath $ini -ErrorAction Stop) {
+            if ($line.Trim() -match '^Path=(.*)$') {
+                $relative = $Matches[1].Replace('\', '/')
+                if (-not $relative.StartsWith('Profiles/') -or $relative.Split('/') -contains '..') { throw 'External Firefox profile' }
+            }
+            if ($line.Trim() -eq 'IsRelative=0') { throw 'Absolute Firefox profile' }
+        }
+    }
+    $machine = FirefoxRegistry 'HKLM:'
+    $user = FirefoxRegistry $userRoot
+    foreach ($name in $user.Keys) { if (-not $machine.ContainsKey($name)) { $machine[$name] = $user[$name] } }
+    $policyFile = ReadJson (Join-Path (Split-Path $app) 'distribution\policies.json')
+    if ($machine.Count -gt 0 -and $null -ne $policyFile.PSObject.Properties['policies']) { throw 'Conflicting Firefox policy providers' }
+    $policy = $policyFile
+    if ($machine.Count -gt 0) { $policy = @{policies=@{Preferences=$machine}} }
+    $dirs = @(BrowserDirs (Join-Path $root 'Profiles') $true)
+    if ($dirs.Count -eq 0) { return @{kind='firefox'; policy=$policy; prefs=''} }
+    foreach ($dir in $dirs) {
+        $lines = @()
+        foreach ($file in @('prefs.js', 'user.js')) {
+            $path = Join-Path $dir $file
+            if (Test-Path -LiteralPath $path -ErrorAction Stop) {
+                $lines += @(Get-Content -LiteralPath $path -ErrorAction Stop | Where-Object { $_ -match 'browser\.safebrowsing\.(malware|phishing)\.enabled' })
+            }
+        }
+        @{kind='firefox'; policy=$policy; prefs=($lines -join "`n")}
+    }
+}
+RunSection {
+    try {
+        $screenPolicy = PolicyValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' 'EnableSmartScreen'
+        $screenLocal = PolicyValue 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer' 'SmartScreenEnabled'
+        Emit 'smartscreen' ($screenPolicy + '|' + $screenLocal)
+        $items = @()
+        $users = @(@{Home=$env:USERPROFILE; Root='HKCU:'})
+        if ($identity.IsSystem) {
+            $users = @(Get-CimInstance Win32_UserProfile -ErrorAction Stop | Where-Object { -not $_.Special } | ForEach-Object {
+                @{Home=$_.LocalPath; Root=('Registry::HKEY_USERS\' + $_.SID)}
+            })
+            if ($users.Count -eq 0) { throw 'No user profiles' }
+        }
+        foreach ($userInfo in $users) {
+            $homePath = $userInfo.Home
+            $userRoot = $userInfo.Root
+            $local = Join-Path $homePath 'AppData\Local'
+            foreach ($browser in @(
+                @{Kind='chrome'; Exe='Google\Chrome\Application\chrome.exe'; Data='Google\Chrome\User Data'; Policy='Google\Chrome'},
+                @{Kind='edge'; Exe='Microsoft\Edge\Application\msedge.exe'; Data='Microsoft\Edge\User Data'; Policy='Microsoft\Edge'},
+                @{Kind='brave'; Exe='BraveSoftware\Brave-Browser\Application\brave.exe'; Data='BraveSoftware\Brave-Browser\User Data'; Policy='BraveSoftware\Brave'},
+                @{Kind='firefox'; Exe='Mozilla Firefox\firefox.exe'; Data=''; Policy='Mozilla\Firefox'}
+            )) {
+                try {
+                    $apps = @(foreach ($installRoot in @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $local)) {
+                        if ($installRoot) {
+                            $candidate = Join-Path $installRoot $browser.Exe
+                            if (Test-Path -LiteralPath $candidate -ErrorAction Stop) { $candidate }
+                        }
+                    })
+                    if ($apps.Count -eq 0) { continue }
+                    if (-not (Test-Path -LiteralPath $userRoot -ErrorAction Stop)) { throw 'Unloaded user policy hive' }
+                    if ($browser.Kind -eq 'firefox') {
+                        foreach ($app in $apps) { $items += @(FirefoxBrowser $homePath $app $userRoot) }
+                    } else {
+                        $suffix = '\SOFTWARE\Policies\' + $browser.Policy
+                        $names = @('SafeBrowsingEnabled', 'SafeBrowsingProtectionLevel')
+                        if ($browser.Kind -eq 'edge') { $names = @('SmartScreenEnabled') }
+                        $policy = BrowserPolicy ('HKLM:' + $suffix) ($userRoot + $suffix) $names
+                        $recommended = BrowserPolicy ('HKLM:' + $suffix + '\Recommended') ($userRoot + $suffix + '\Recommended') $names
+                        $dirs = @(BrowserDirs (Join-Path $local $browser.Data) $false)
+                        if ($dirs.Count -eq 0) { $items += @{kind=$browser.Kind; policy=$policy; recommended=$recommended; prefs=@{}} }
+                        foreach ($dir in $dirs) {
+                            $prefs = ChromiumPrefs (Join-Path $dir 'Preferences') ($browser.Kind -eq 'edge')
+                            $items += @{kind=$browser.Kind; policy=$policy; recommended=$recommended; prefs=$prefs}
+                        }
+                    }
+                } catch { $items += @{kind=$browser.Kind; unreadable=$true} }
+            }
+        }
+        Emit 'browsers' (ConvertTo-Json -InputObject @($items) -Depth 15 -Compress)
+    } catch { Emit 'browsers' 'unknown' }
+}

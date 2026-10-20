@@ -94,6 +94,14 @@ pub fn antimalware_active() -> ControlValue {
         .into()
 }
 
+pub fn web_protection() -> ControlValue {
+    super::browsers::windows(
+        value("smartscreen").unwrap_or_default(),
+        value("browsers").unwrap_or_default(),
+    )
+    .into()
+}
+
 pub fn preboot_auth() -> ControlValue {
     parse_preboot(value("preboot").unwrap_or_default()).into()
 }
@@ -409,7 +417,7 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
-    fn native_batch_emits_every_non_browser_metric() {
+    fn native_batch_emits_every_metric() {
         for key in [
             "preboot",
             "signature_days",
@@ -420,6 +428,8 @@ mod tests {
             "log_cleared",
             "process_audit",
             "powershell_logging",
+            "smartscreen",
+            "browsers",
         ] {
             assert!(value(key).is_some(), "batch did not emit {key}");
         }
