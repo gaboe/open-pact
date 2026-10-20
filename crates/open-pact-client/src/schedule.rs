@@ -7,7 +7,7 @@ use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{Home, report};
+use crate::{Home, checks, report};
 
 const CONFIG: &str = "report-schedule.json";
 const STATE: &str = "report-state.json";
@@ -63,6 +63,8 @@ struct State {
     #[serde(default)]
     reconnect_pending: bool,
     last_success: Option<i64>,
+    #[serde(default)]
+    last_events: Option<checks::EventMarkers>,
 }
 
 impl State {
@@ -81,9 +83,28 @@ impl State {
                     .is_none_or(|last| now < last || now.saturating_sub(last) >= 55 * 60))
     }
 
-    fn acknowledged(&mut self, now: i64) {
+    fn should_send_events(&self, current: Option<checks::EventMarkers>) -> bool {
+        self.vpn_up
+            && current.is_some_and(|current| {
+                self.last_events
+                    .is_some_and(|previous| current.has_newer_than(&previous))
+            })
+    }
+
+    fn acknowledged(&mut self, now: i64, events: Option<checks::EventMarkers>) {
         self.last_success = Some(now);
         self.reconnect_pending = false;
+        if let Some(events) = events {
+            self.last_events = Some(events);
+        }
+    }
+
+    fn sent(&mut self, acknowledged: bool, now: i64, events: Option<checks::EventMarkers>) {
+        if acknowledged {
+            self.acknowledged(now, events);
+        } else {
+            self.observe(false);
+        }
     }
 }
 
@@ -487,12 +508,17 @@ pub(crate) async fn run(home: &Home, command: Command) -> Result<()> {
             let mut state: State = home.read_json(STATE)?.unwrap_or_default();
             state.observe(vpn_up(&config.vpn_probe).await);
             save(&home, STATE, &state)?;
-            if state.should_send(chrono::Utc::now().timestamp()) {
-                if report::run_scheduled(&home, &config.collector, &config.vpn_probe).await? {
-                    state.acknowledged(chrono::Utc::now().timestamp());
-                } else {
-                    state.observe(false);
-                }
+            let events = state.vpn_up.then(checks::event_markers).flatten();
+            let now = chrono::Utc::now().timestamp();
+            if state.should_send(now) || state.should_send_events(events) {
+                let acknowledged =
+                    report::run_scheduled(&home, &config.collector, &config.vpn_probe).await?;
+                state.sent(acknowledged, chrono::Utc::now().timestamp(), events);
+                save(&home, STATE, &state)?;
+            } else if state.last_events.is_none()
+                && let Some(events) = events
+            {
+                state.last_events = Some(events);
                 save(&home, STATE, &state)?;
             }
         }
@@ -697,7 +723,7 @@ mod tests {
     fn clock_rollback_recovers_within_an_hour() {
         let mut state = State::default();
         state.observe(true);
-        state.acknowledged(100_000);
+        state.acknowledged(100_000, None);
         assert!(state.should_send(100_000 - 86_400 + 2 * 3600));
     }
 
@@ -765,6 +791,7 @@ mod tests {
                 vpn_up: up,
                 reconnect_pending: pending,
                 last_success: Some(now - minutes * 60),
+                last_events: None,
             };
             assert_eq!(state.should_send(now), expected);
         }
@@ -772,7 +799,7 @@ mod tests {
         assert!(!state.should_send(now));
         state.observe(true);
         assert!(state.should_send(now));
-        state.acknowledged(now);
+        state.acknowledged(now, None);
         assert!(!state.should_send(now + 54 * 60));
         assert!(state.should_send(now + 55 * 60));
         state.observe(false);
@@ -780,12 +807,115 @@ mod tests {
         assert!(state.should_send(now + 60));
         state.observe(true);
         assert!(state.should_send(now + 120), "failed first send must retry");
-        state.acknowledged(now + 120);
+        state.acknowledged(now + 120, None);
         assert!(!state.should_send(now + 121));
         assert!(
             state.should_send(now - 1),
             "clock rollback retries instead of suppressing reports"
         );
+    }
+
+    #[test]
+    fn event_markers_send_only_for_new_events_while_vpn_is_up() {
+        let previous = checks::EventMarkers {
+            security_log_cleared: Some(100),
+            antimalware_detection: Some(200),
+        };
+        let state = State {
+            vpn_up: true,
+            last_success: Some(500),
+            last_events: Some(previous),
+            ..State::default()
+        };
+        for (current, expected) in [
+            (
+                Some(checks::EventMarkers {
+                    security_log_cleared: Some(101),
+                    antimalware_detection: Some(200),
+                }),
+                true,
+            ),
+            (
+                Some(checks::EventMarkers {
+                    security_log_cleared: Some(100),
+                    antimalware_detection: Some(201),
+                }),
+                true,
+            ),
+            (
+                Some(checks::EventMarkers {
+                    security_log_cleared: Some(100),
+                    antimalware_detection: Some(200),
+                }),
+                false,
+            ),
+            (
+                Some(checks::EventMarkers {
+                    security_log_cleared: Some(99),
+                    antimalware_detection: Some(199),
+                }),
+                false,
+            ),
+            (None, false),
+        ] {
+            assert_eq!(state.should_send_events(current), expected);
+        }
+
+        let mut uninitialized = State {
+            vpn_up: true,
+            ..State::default()
+        };
+        let existing_event = checks::EventMarkers {
+            security_log_cleared: Some(100),
+            antimalware_detection: None,
+        };
+        assert!(!uninitialized.should_send_events(Some(existing_event)));
+        uninitialized.last_events = Some(checks::EventMarkers::default());
+        assert!(uninitialized.should_send_events(Some(existing_event)));
+
+        let offline = State {
+            vpn_up: false,
+            ..state
+        };
+        assert!(!offline.should_send_events(Some(checks::EventMarkers {
+            security_log_cleared: Some(101),
+            antimalware_detection: Some(200),
+        })));
+        assert!(!offline.should_send(600));
+    }
+
+    #[test]
+    fn failed_send_keeps_event_markers_for_retry() {
+        let previous = checks::EventMarkers {
+            security_log_cleared: Some(100),
+            antimalware_detection: None,
+        };
+        let current = checks::EventMarkers {
+            security_log_cleared: Some(101),
+            antimalware_detection: None,
+        };
+        let mut state = State {
+            vpn_up: true,
+            last_success: Some(500),
+            last_events: Some(previous),
+            ..State::default()
+        };
+
+        state.sent(false, 600, Some(current));
+
+        assert_eq!(state.last_events, Some(previous));
+        assert_eq!(state.last_success, Some(500));
+        state.observe(true);
+        assert!(state.should_send_events(Some(current)));
+    }
+
+    #[test]
+    fn old_state_without_event_markers_loads() {
+        let state: State =
+            serde_json::from_str(r#"{"vpn_up":true,"reconnect_pending":false,"last_success":123}"#)
+                .unwrap();
+        assert_eq!(state.last_success, Some(123));
+        assert_eq!(state.last_events, None);
     }
 
     fn job() -> Job {
@@ -891,6 +1021,7 @@ mod tests {
                 vpn_up: false,
                 reconnect_pending: false,
                 last_success: Some(chrono::Utc::now().timestamp()),
+                last_events: None,
             },
         )
         .unwrap();
@@ -994,7 +1125,7 @@ mod tests {
         assert!(lock(&home).is_err());
         let mut state = State::default();
         state.observe(true);
-        state.acknowledged(123);
+        state.acknowledged(123, None);
         save(&home, STATE, &state).unwrap();
         let stored: State = home.read_json(STATE).unwrap().unwrap();
         assert!(stored.vpn_up);
