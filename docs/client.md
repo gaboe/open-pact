@@ -72,7 +72,7 @@ After the operator approves the device, check it:
 open-pact-client check
 ```
 
-The client runs the checks in the signed manifest and sends one signed claim. It verifies the response and log checkpoint. On macOS and Linux, it installs the VPN certificate and CA when the gateway accepts the claim. Windows does not install the VPN certificate or CA yet. A Windows check can receive an accepted response, then exit with an error during certificate installation. A denied check returns the gateway's reason. A log verification failure raises an alarm and exits with status 2.
+The client runs the checks in the signed manifest and sends one signed claim. It verifies the response and log checkpoint. It installs the VPN certificate and CA when the gateway accepts the claim. On Windows, read the consistent pair through `vpn\current`. The README section on the client home describes this pointer. A denied check returns the gateway's reason. A log verification failure raises an alarm and exits with status 2.
 
 Run `open-pact-client log head` to show the last verified checkpoint. Run `open-pact-client log prove` to verify the inclusion proof for this device's enrolment. Run `open-pact-client log show` to print the local record of claims and gateway responses.
 

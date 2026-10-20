@@ -23,7 +23,7 @@ This page lists the built-in controls in `crates/open-pact-client/src/checks/mod
 | `process_audit` | `n/a` | `on`, `off`, or `unknown` | `n/a` | Windows needs administrator or SYSTEM access. |
 | `powershell_logging` | `n/a` | `on`, `off`, or `unknown` | `n/a` | Run as the device user with registry read access. |
 | `log_cleared_hours` | `n/a` | Integer hours, `none`, or `unknown` from Security and System logs | `n/a` | Windows needs administrator or SYSTEM access to read both logs. |
-| VPN certificate installation | Supported | Not supported yet | Supported | Device user. |
+| VPN certificate installation | Supported | Supported; `vpn\current` pointer, flat copies can lag while another program holds them open | Supported | Device user. |
 | Device key protection | `secure_enclave` or `os_permissions` | `os_permissions` | `os_permissions` | Device user. |
 | Report scheduler | launchd LaunchAgent, every five minutes | Task Scheduler, every five minutes; limited user or SYSTEM | systemd user timer, every five minutes | Windows SYSTEM install and uninstall need an elevated prompt. Linux needs a running user manager. |
 
