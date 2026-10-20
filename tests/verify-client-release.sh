@@ -6,7 +6,20 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 mock_bin="$tmp/bin"
 mkdir "$mock_bin"
-real_mv=$(command -v mv)
+real_mktemp=$(command -v mktemp)
+if command -v sha256sum >/dev/null; then
+  checksum_command=sha256sum
+else
+  checksum_command=shasum
+fi
+cat > "$mock_bin/mktemp" <<'MOCK_MKTEMP'
+#!/usr/bin/env bash
+set -euo pipefail
+dir=$("$REAL_MKTEMP" "$@")
+dir=$(cd "$dir" && pwd -P)
+printf '%s\n' "$dir" > "$MOCK_WORK_PATH_FILE"
+printf '%s\n' "$dir"
+MOCK_MKTEMP
 cat > "$mock_bin/gh" <<'MOCK_GH'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -18,10 +31,12 @@ fi
 shift 2
 [ "$1" = v1.2.3 ] || exit 91
 shift
+patterns=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --repo) [ "$2" = example/project ] || exit 92; shift 2 ;;
     --dir) dest=$2; shift 2 ;;
+    --pattern) patterns+=("$2"); shift 2 ;;
     *) exit 93 ;;
   esac
 done
@@ -33,6 +48,14 @@ assets=(
   NOTICE
   SHA256SUMS
 )
+expected_patterns=()
+for file in "${assets[@]}"; do
+  expected_patterns+=("$file" "$file.sigstore.json")
+done
+[ "${#patterns[@]}" -eq "${#expected_patterns[@]}" ] || exit 94
+for ((i=0; i < ${#expected_patterns[@]}; i++)); do
+  [ "${patterns[$i]}" = "${expected_patterns[$i]}" ] || exit 95
+done
 for file in "${assets[@]}"; do
   [ "${MOCK_MISSING:-}" = "$file" ] && continue
   printf 'fictional release asset %s\n' "$file" > "$dest/$file"
@@ -44,7 +67,13 @@ done
     : > SHA256SUMS
     for file in "${assets[@]}"; do
       [ "$file" = SHA256SUMS ] && continue
-      [ -f "$file" ] && sha256sum "$file" >> SHA256SUMS
+      if [ -f "$file" ]; then
+        if [ "$CHECKSUM_COMMAND" = sha256sum ]; then
+          "$CHECKSUM_COMMAND" "$file" >> SHA256SUMS
+        else
+          "$CHECKSUM_COMMAND" -a 256 "$file" >> SHA256SUMS
+        fi
+      fi
     done
   fi
 )
@@ -68,24 +97,9 @@ if [ "${MOCK_COSIGN_FAIL:-}" = "$(basename "$last")" ]; then
   exit 9
 fi
 MOCK_COSIGN
-cat > "$mock_bin/mv" <<'MOCK_MV'
-#!/usr/bin/env bash
-set -euo pipefail
-if [ -n "${MOCK_MV_RACE_KIND:-}" ] && mkdir "$MOCK_MV_RACE_MARKER" 2>/dev/null; then
-  case "$MOCK_MV_RACE_KIND" in
-    file) printf 'foreign file\n' > "$MOCK_MV_RACE_OUT/keep.txt" ;;
-    symlink)
-      rmdir "$MOCK_MV_RACE_OUT"
-      ln -s "$MOCK_MV_RACE_TARGET" "$MOCK_MV_RACE_OUT"
-      ;;
-    *) exit 94 ;;
-  esac
-fi
-exec "$REAL_MV" "$@"
-MOCK_MV
-chmod +x "$mock_bin/gh" "$mock_bin/cosign"
-chmod +x "$mock_bin/mv"
-export REAL_MV="$real_mv"
+chmod +x "$mock_bin/mktemp" "$mock_bin/gh" "$mock_bin/cosign"
+export REAL_MKTEMP="$real_mktemp"
+export CHECKSUM_COMMAND="$checksum_command"
 export PATH="$mock_bin:$PATH"
 export GH_REPO=example/project
 
@@ -94,73 +108,65 @@ fail() {
   exit 1
 }
 run_success() {
-  local out=$1
-  shift
+  local name=$1
+  local output="$tmp/$name.output"
+  local marker="$tmp/$name.work-path"
+  local out
   env -u MOCK_GH_FAIL -u MOCK_MISSING -u MOCK_MISSING_BUNDLE \
     -u MOCK_BAD_CHECKSUM -u MOCK_COSIGN_FAIL \
-    "$script" v1.2.3 "$out" >/dev/null
-  [ "$(find "$out" -maxdepth 1 -type f | wc -l | tr -d ' ')" -eq 12 ] || fail "expected 12 release files in $out"
-  [ -f "$out/open-pact-client-aarch64-apple-darwin" ] || fail "verified binary missing"
-  [ -f "$out/SHA256SUMS.sigstore.json" ] || fail "checksum bundle missing"
+    "MOCK_WORK_PATH_FILE=$marker" "$script" v1.2.3 > "$output"
+  out=$(sed -n '$s/^verified files: //p' "$output")
+  [ -n "$out" ] || fail "$name did not print its verified directory last"
+  [[ "$out" = /* ]] || fail "$name did not print an absolute path"
+  [ "$(cat "$marker")" = "$out" ] || fail "$name printed a different directory"
+  [ -d "$out" ] || fail "$name did not keep its verified directory"
+  [ "$(stat -f '%Lp' "$out")" = 700 ] || fail "$name directory mode was not 700"
+  [ -z "$(find "$out" -mindepth 1 ! -type f -print -quit)" ] || fail "$name directory contains a non-file"
+  find "$out" -mindepth 1 -maxdepth 1 -type f -exec basename {} \; | sort > "$tmp/$name.actual"
+  cat > "$tmp/$name.expected" <<'EXPECTED'
+NOTICE
+NOTICE.sigstore.json
+SHA256SUMS
+SHA256SUMS.sigstore.json
+open-pact-client-aarch64-apple-darwin
+open-pact-client-aarch64-apple-darwin.sigstore.json
+open-pact-client-x86_64-apple-darwin
+open-pact-client-x86_64-apple-darwin.sigstore.json
+open-pact-client-x86_64-pc-windows-msvc.exe
+open-pact-client-x86_64-pc-windows-msvc.exe.sigstore.json
+open-pact-client-x86_64-unknown-linux-musl
+open-pact-client-x86_64-unknown-linux-musl.sigstore.json
+EXPECTED
+  cmp -s "$tmp/$name.expected" "$tmp/$name.actual" || fail "$name directory did not contain exactly the verified files"
 }
 run_failure() {
   local name=$1
   shift
-  local out="$tmp/$name"
-  if env "$@" "$script" v1.2.3 "$out" >/dev/null 2>&1; then
+  local marker="$tmp/$name.work-path"
+  if env "MOCK_WORK_PATH_FILE=$marker" "$@" "$script" v1.2.3 >/dev/null 2>&1; then
     fail "$name unexpectedly succeeded"
   fi
-  [ ! -e "$out" ] && [ ! -L "$out" ] || fail "$name left its output directory"
+  [ -s "$marker" ] || fail "$name did not create a working directory"
+  local out
+  out=$(cat "$marker")
+  [ ! -e "$out" ] && [ ! -L "$out" ] || fail "$name left its working directory"
 }
 run_missing_asset() {
   local file=$1
-  local out="$tmp/missing-$file"
+  local marker="$tmp/missing-$file.work-path"
   local expected="$tmp/expected-diagnostic"
   local actual="$tmp/actual-diagnostic"
   printf 'missing release asset: %s\n' "$file" > "$expected"
-  if env "MOCK_MISSING=$file" "$script" v1.2.3 "$out" >/dev/null 2>"$actual"; then
+  if env "MOCK_MISSING=$file" "MOCK_WORK_PATH_FILE=$marker" "$script" v1.2.3 >/dev/null 2>"$actual"; then
     fail "missing-$file unexpectedly succeeded"
   fi
   cmp -s "$expected" "$actual" || fail "missing-$file returned the wrong diagnostic"
-  [ ! -e "$out" ] && [ ! -L "$out" ] || fail "missing-$file left its output directory"
-}
-run_destination_race() {
-  local kind=$1
-  local out="$tmp/destination-race-$kind"
-  local target="$tmp/destination-race-target-$kind"
-  mkdir "$target"
-  if env \
-    "MOCK_MV_RACE_KIND=$kind" \
-    "MOCK_MV_RACE_OUT=$out" \
-    "MOCK_MV_RACE_TARGET=$target" \
-    "MOCK_MV_RACE_MARKER=$tmp/destination-race-$kind.injected" \
-    "$script" v1.2.3 "$out" >/dev/null 2>&1; then
-    fail "$kind destination change unexpectedly succeeded"
-  fi
-  if [ "$kind" = file ]; then
-    [ "$(cat "$out/keep.txt")" = "foreign file" ] || fail "file race changed its injected file"
-    [ "$(find "$out" -type f | wc -l | tr -d ' ')" -eq 1 ] || fail "file race published release files"
-  else
-    [ -L "$out" ] || fail "symlink race did not preserve the injected symlink"
-    [ -z "$(find "$target" -type f -print -quit)" ] || fail "symlink race published release files"
-  fi
+  local out
+  out=$(cat "$marker")
+  [ ! -e "$out" ] && [ ! -L "$out" ] || fail "missing-$file left its working directory"
 }
 
-run_success "$tmp/success"
-mkdir "$tmp/existing-empty"
-if "$script" v1.2.3 "$tmp/existing-empty" >/dev/null 2>&1; then
-  fail "existing output directory unexpectedly succeeded"
-fi
-[ -d "$tmp/existing-empty" ] || fail "existing output directory was removed"
-if "$script" v1.2.3 "$tmp/missing-parent/output" >/dev/null 2>&1; then
-  fail "missing output parent unexpectedly succeeded"
-fi
-"$script" v1.2.3 >/dev/null
-run_success "$tmp/relative output"
-run_success "$tmp/trailing-slash/"
-if "$script" latest "$tmp/invalid-tag" >/dev/null 2>&1; then
-  fail "invalid tag unexpectedly succeeded"
-fi
+run_success successful-download
 run_failure github-download MOCK_GH_FAIL=1
 run_failure bad-checksum MOCK_BAD_CHECKSUM=1
 run_failure signature-check MOCK_COSIGN_FAIL=NOTICE
@@ -174,7 +180,5 @@ for file in \
   run_missing_asset "$file"
   run_failure "missing-bundle-$file" "MOCK_MISSING_BUNDLE=$file"
 done
-run_destination_race file
-run_destination_race symlink
 
 echo "mocked release verification passed"

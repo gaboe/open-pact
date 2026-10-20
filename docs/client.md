@@ -4,26 +4,50 @@ The client sends results only for controls and outputs that the signed manifest 
 
 ## Verify a release
 
-Run the verification script with an output directory:
+Run the verification script with a release tag:
 
 ```sh
-scripts/verify-client-release.sh v0.2.0 verified-client-release
+scripts/verify-client-release.sh v0.2.0
 ```
 
-The script creates the output directory. The directory must not exist before you run the script, and its parent directory must exist. The script downloads the release assets to a separate temporary directory. It checks every checksum and Sigstore bundle before it moves the four client binaries, `NOTICE`, `SHA256SUMS`, and their bundles into the output directory. If the output directory changes during publication, the script stops and removes the files it moved. A one-argument call verifies the release and removes the temporary files without saving them.
+The script checks every checksum and Sigstore bundle. It keeps the verified files in a private temporary directory when verification succeeds. It removes the directory if verification fails. It prints the directory path on the last line. Copy that path for the install command.
 
-Install the binary for your operating system and processor from the verified directory. For Apple Silicon macOS, run:
+Set `verified_dir` to the printed path:
+
+```sh
+verified_dir="/path/printed/by/script"
+```
+
+For Apple Silicon macOS, run:
 
 ```sh
 mkdir -p "$HOME/.local/bin"
-install -m 0755 verified-client-release/open-pact-client-aarch64-apple-darwin "$HOME/.local/bin/open-pact-client"
+install -m 0755 "$verified_dir/open-pact-client-aarch64-apple-darwin" "$HOME/.local/bin/open-pact-client"
 ```
 
-For Intel macOS, use `open-pact-client-x86_64-apple-darwin`. For Linux x86-64, use `open-pact-client-x86_64-unknown-linux-musl`. For Windows x86-64, run this PowerShell command:
+For Intel macOS, install this binary:
+
+```sh
+install -m 0755 "$verified_dir/open-pact-client-x86_64-apple-darwin" "$HOME/.local/bin/open-pact-client"
+```
+
+For Linux x86-64, install this binary:
+
+```sh
+install -m 0755 "$verified_dir/open-pact-client-x86_64-unknown-linux-musl" "$HOME/.local/bin/open-pact-client"
+```
+
+Set `$verifiedDir` to the printed path in PowerShell:
+
+```powershell
+$verifiedDir = 'C:\path\printed\by\script'
+```
+
+For Windows x86-64, run:
 
 ```powershell
 New-Item -ItemType Directory -Force "$env:USERPROFILE\bin" | Out-Null
-Copy-Item .\verified-client-release\open-pact-client-x86_64-pc-windows-msvc.exe "$env:USERPROFILE\bin\open-pact-client.exe"
+Copy-Item "$verifiedDir\open-pact-client-x86_64-pc-windows-msvc.exe" "$env:USERPROFILE\bin\open-pact-client.exe"
 ```
 
 The script needs GitHub CLI, Cosign, and `sha256sum` or `shasum`. Set `GH_REPO` when you verify a release from a fork.
@@ -120,7 +144,7 @@ The VPN certificate request travels beside the signed claim. It contains the VPN
 
 | Symptom | Check |
 | --- | --- |
-| Release verification fails | Get `scripts/verify-client-release.sh` from the matching repository tag or its source archive. Check that GitHub CLI and Cosign are installed. Run the script with an empty output directory. Install the matching binary from that directory only after the script succeeds. |
+| Release verification fails | Get `scripts/verify-client-release.sh` from the matching repository tag or its source archive. Check that GitHub CLI and Cosign are installed. Run the script with a release tag. Install the matching binary from the printed directory after the script succeeds. |
 | `join` refuses the gateway | Confirm the invitation URL, company key fingerprint, HTTPS certificate, and pinned log key with the gateway operator. |
 | `check` reports a manifest hash mismatch | Get a new invitation for the current manifest. Run `join` with that invitation. Review the manifest. Sign its hash during `join`. Ask the gateway operator to approve the device again for the current manifest. `join` reuses the existing device key, so the device code stays the same. |
 | `check` says the device is pending | Give the device code to the gateway operator. Wait for approval. |
