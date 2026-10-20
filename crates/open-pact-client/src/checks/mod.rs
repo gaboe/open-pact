@@ -11,6 +11,10 @@ use open_pact_core::{Control, Manifest, Os};
 
 pub use hints::fix_hint;
 
+fn unknown() -> &'static str {
+    "unknown"
+}
+
 /// The builtins compiled into this client, by control id and version. A manifest control runs only if
 /// its `check` is exactly `builtin:<id>@<version>` from this table.
 const BUILTINS: &[(&str, u32)] = &[
@@ -59,9 +63,9 @@ const MACOS: Registry = &[
     ("screen_lock", macos::screen_lock),
     ("os_supported", macos::os_supported),
     ("os_patch_age", macos::os_patch_age),
-    ("password_set", windows::unknown),
+    ("password_set", unknown),
     ("auto_login", macos::auto_login),
-    ("secure_boot", windows::unknown),
+    ("secure_boot", unknown),
     ("antimalware_active", macos::antimalware_active),
 ];
 
@@ -71,22 +75,22 @@ const LINUX: Registry = &[
     ("screen_lock", linux::screen_lock),
     ("os_supported", linux::os_supported),
     ("os_patch_age", linux::os_patch_age),
-    ("password_set", windows::unknown),
+    ("password_set", unknown),
     ("auto_login", linux::auto_login),
     ("secure_boot", linux::secure_boot),
     ("antimalware_active", linux::antimalware_active),
 ];
 
 const WINDOWS: Registry = &[
-    ("disk_encryption", windows::unknown),
-    ("firewall", windows::unknown),
-    ("screen_lock", windows::unknown),
-    ("os_supported", windows::unknown),
-    ("os_patch_age", windows::unknown),
-    ("password_set", windows::unknown),
-    ("auto_login", windows::unknown),
-    ("secure_boot", windows::unknown),
-    ("antimalware_active", windows::unknown),
+    ("disk_encryption", windows::disk_encryption),
+    ("firewall", windows::firewall),
+    ("screen_lock", windows::screen_lock),
+    ("os_supported", windows::os_supported),
+    ("os_patch_age", windows::os_patch_age),
+    ("password_set", unknown),
+    ("auto_login", windows::auto_login),
+    ("secure_boot", windows::secure_boot),
+    ("antimalware_active", windows::antimalware_active),
 ];
 
 fn registry(os: Os) -> Registry {
@@ -160,8 +164,9 @@ mod tests {
         assert_eq!(ids(Os::Macos).len(), 9);
     }
 
+    #[cfg(not(windows))]
     #[test]
-    fn windows_stubs_report_unknown() {
+    fn windows_checks_report_unknown_off_windows() {
         let all = run_all(Os::Windows);
         assert_eq!(all.len(), 9);
         assert!(all.values().all(|v| v == "unknown"));

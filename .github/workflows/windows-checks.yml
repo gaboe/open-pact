@@ -1,0 +1,23 @@
+name: windows-checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  client:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Test Windows client
+        run: cargo test -p open-pact-client
+
+      - name: Print checks on this Windows runner
+        run: cargo test -p open-pact-client -- --ignored print_run_all_on_this_machine --nocapture
