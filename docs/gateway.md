@@ -6,7 +6,9 @@ This guide covers the gateway, PostgreSQL, manifest rollout, witness, and SIEM e
 
 Use a PostgreSQL database, a stable HTTPS URL, and persistent storage. Keep PostgreSQL credentials and the key-encryption key outside the database. The gateway needs one 32-byte base64 key in `GATEWAY_KEK`. It encrypts the company signing key, log signing key, CA key, and stored claims in PostgreSQL. Keep a protected backup of the KEK outside the database backups. A wrong KEK prevents startup. KEK rotation is not supported.
 
-Create a key with OpenSSL and store it in a secret manager:
+Create a key with OpenSSL:
+
+Store the output in a secret manager:
 
 ```sh
 openssl rand -base64 32
@@ -45,7 +47,7 @@ Compose uses `DEV_INSECURE_KEK=1`, a local HTTP URL, and a public demo witness s
 
 Write the manifest as TOML. Include the check IDs and output types that the client supports. Declare the required values, grace periods, `claim_retention`, `claim_recipients`, `data_controller`, and `disclosed_metadata`. The gateway signs and publishes the manifest. During `join`, the owner reviews it and signs its hash.
 
-The gateway publishes the enforced manifest and appends its hash to the transparency log. A changed manifest has a new hash. Enrol the device again with a new invitation, and approve it again. Approval applies to one manifest hash.
+The gateway publishes the enforced manifest and appends its hash to the transparency log. A changed manifest has a new hash. Enrol the device again with a new invitation. Approve the device again. Approval applies to one manifest hash.
 
 The core library can validate whether a manifest change is a narrowing under the old owner signature. The current client and gateway do not apply that capability when they check an enrolled device. Every changed manifest needs a new join, a new owner signature, and operator approval. The owner signs the new manifest hash during the join.
 
@@ -110,7 +112,7 @@ The gateway exports one event after each committed claim evaluation from an enro
 
 TLS output uses RFC 5424 syslog with RFC 5425 octet counting. File output is one JSON object per line. The queue holds at most 1024 events. It drops the oldest event on overflow and logs a change in the drop count once per minute. Check gateway logs for drop warnings. No metrics endpoint exposes the drop count. The queue is in memory, so a restart loses queued events. Retries can create duplicate events. A successful TLS write does not confirm SIEM ingestion.
 
-The sample Wazuh files are in [`deploy/wazuh`](../deploy/wazuh/README.md). For TLS syslog, install the rsyslog GnuTLS module. Place the receiver CA, certificate, and private key at the paths in [`rsyslog.conf`](../deploy/wazuh/rsyslog.conf). The sample authenticates the receiver to the gateway. It does not require a client certificate from the gateway. Restrict port 6514 to the gateway. Validate the receiver config with `rsyslogd -N1`. Give the JSON output file to a Wazuh agent with [`agent-localfile.xml`](../deploy/wazuh/agent-localfile.xml). For a direct file sink, set `GATEWAY_SIEM_FILE` on the gateway host and grant the Wazuh agent group read access. Do not send both sinks to the same file.
+The sample Wazuh files are in [`deploy/wazuh`](../deploy/wazuh/README.md). For TLS syslog, install the rsyslog GnuTLS module. Place the receiver CA, certificate, and private key at the paths in [`rsyslog.conf`](../deploy/wazuh/rsyslog.conf). The sample authenticates the receiver to the gateway. It does not require a client certificate from the gateway. Restrict port 6514 to the gateway. Validate the receiver config with `rsyslogd -N1`. Give the JSON output file to a Wazuh agent with [`agent-localfile.xml`](../deploy/wazuh/agent-localfile.xml). For a direct file sink, set `GATEWAY_SIEM_FILE` on the gateway host. Grant the Wazuh agent group read access to the file. Do not send both sinks to the same file.
 
 Install [`rules.xml`](../deploy/wazuh/rules.xml) in the Wazuh manager's local rules directory. Reserve rule IDs 100500 through 100505 or change them to avoid conflicts. The optional [`decoder.xml`](../deploy/wazuh/decoder.xml) shows a JSON decoder for a custom decoder chain. The rules use numeric control values. They do not match bucketed strings such as `gt_30d`. Test the rules with `/var/ossec/bin/wazuh-logtest` on the target manager. Test the receiver with `rsyslogd -N1`. The samples have not been tested against a live manager.
 
@@ -120,7 +122,7 @@ Set SIEM retention at least as short as `claim_retention`. `GATEWAY_SIEM_RETENTI
 
 Back up PostgreSQL, the KEK, the gateway deployment configuration, the manifest, and each witness state file. Restrict backup access as you restrict access to the live data. A PostgreSQL backup without the KEK cannot decrypt gateway secrets or claims. A backup with the KEK can expose claims until the backup expires.
 
-Before an upgrade, check the release notes and back up the database, KEK, and witness state. Keep the KEK unchanged. The gateway migrates existing key rows to encrypted form when it first starts with a KEK. A wrong KEK stops startup. Do not start two witness processes with the same key and state. When upgrading an old witness that used a `.lock` file, stop it before starting the new version.
+Read the release notes before an upgrade. Back up the database, KEK, and witness state. Keep the KEK unchanged. The gateway migrates existing key rows to encrypted form when it first starts with a KEK. A wrong KEK stops startup. Do not start two witness processes with the same key and state. When upgrading an old witness that used a `.lock` file, stop it before starting the new version.
 
 Upgrade the Helm release with the same release name and values file. Keep the KEK and database Secret names in that file:
 
@@ -128,7 +130,7 @@ Upgrade the Helm release with the same release name and values file. Keep the KE
 helm upgrade --install pact deploy/helm/open-pact -f gateway-values.yaml
 ```
 
-The chart restarts the gateway when the manifest changes. Confirm that the gateway is ready, then check the transparency checkpoint and SIEM delivery logs.
+The chart restarts the gateway when the manifest changes. Confirm that the gateway is ready. Check the transparency checkpoint and SIEM delivery logs.
 
 ## Troubleshoot common failures
 
@@ -137,10 +139,10 @@ The chart restarts the gateway when the manifest changes. Confirm that the gatew
 | Gateway will not start without a KEK | Set `GATEWAY_KEK` from the protected Secret. Do not enable `DEV_INSECURE_KEK` outside the local demo. |
 | Gateway rejects the KEK | Restore the exact KEK that encrypted the database rows. The gateway does not replace unreadable keys. |
 | Helm render fails | Set `gateway.kekSecret.name` and either `postgres.password` or `postgres.existingSecret`. |
-| Client invitation uses the wrong URL | Set Helm `publicUrl` to the public HTTPS URL, then create a new invitation. |
+| Client invitation uses the wrong URL | Set Helm `publicUrl` to the public HTTPS URL. Create a new invitation. |
 | Device claim is denied while pending | Approve its device code with `open-pact-gateway devices approve`. |
-| Device approval no longer applies | Enrol and approve the device against the current manifest hash. |
+| Device approval no longer applies | Enrol the device against the current manifest hash. Approve the device. |
 | Witness rejects a checkpoint | Check the manifest witness key, quorum, witness state, and gateway `log.witnessUrls`. Keep one process per witness state. |
-| SIEM export is disabled | Check gateway logs for invalid sink configuration. Configure one sink and verify the CA or file path. |
+| SIEM export is disabled | Check gateway logs for invalid sink configuration. Configure one sink. Verify the CA or file path. |
 | SIEM drop count increases | Restore receiver access. Inspect queue overflow. The in-memory queue cannot recover dropped events after restart. |
 | Wazuh cannot read file events | Set `GATEWAY_SIEM_FILE_MODE=0640` before the gateway creates the file. Grant the Wazuh group access to the parent directory. Add the gateway process to that group. Add the Wazuh agent to that group. |

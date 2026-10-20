@@ -4,13 +4,27 @@ The client sends results only for controls and outputs that the signed manifest 
 
 ## Verify a release
 
-Run the verification script for the release tag:
+Run the verification script with an output directory:
 
 ```sh
-scripts/verify-client-release.sh v0.2.0
+scripts/verify-client-release.sh v0.2.0 verified-client-release
 ```
 
-The script downloads the release assets to a temporary directory. It checks their hashes and Sigstore signatures against the tagged release workflow. It deletes that directory when it exits. The script does not verify a binary that you downloaded separately, and it does not leave a verified binary to install. Do not treat a separate download as verified by this command. A script change is advisable so it can verify a local file or keep its verified binary.
+The script downloads the release assets to a temporary directory. It checks every checksum and Sigstore bundle before it writes to the output directory. On success, it moves the four client binaries, `NOTICE`, `SHA256SUMS`, and their bundles into that directory. The output directory must be empty or absent. The script adds no files to it if verification fails. A one-argument call verifies the release and removes the temporary files without saving them.
+
+Install the binary for your operating system and processor from the verified directory. For Apple Silicon macOS, run:
+
+```sh
+mkdir -p "$HOME/.local/bin"
+install -m 0755 verified-client-release/open-pact-client-aarch64-apple-darwin "$HOME/.local/bin/open-pact-client"
+```
+
+For Intel macOS, use `open-pact-client-x86_64-apple-darwin`. For Linux x86-64, use `open-pact-client-x86_64-unknown-linux-musl`. For Windows x86-64, run this PowerShell command:
+
+```powershell
+New-Item -ItemType Directory -Force "$env:USERPROFILE\bin" | Out-Null
+Copy-Item .\verified-client-release\open-pact-client-x86_64-pc-windows-msvc.exe "$env:USERPROFILE\bin\open-pact-client.exe"
+```
 
 The script needs GitHub CLI, Cosign, and `sha256sum` or `shasum`. Set `GH_REPO` when you verify a release from a fork.
 
@@ -26,7 +40,7 @@ open-pact-client join 'opi1:replace-with-your-invitation'
 
 The client checks the gateway keys and transparency checkpoint before it displays the manifest. Read the manifest before you approve the signature prompt. The owner key signs the manifest hash and the device enrolment statement. The gateway leaves the device pending until an operator approves its device code.
 
-On macOS, `join` stores the device key in the Secure Enclave when one is available. Pass `--software-key` to use a software key instead. Windows and Linux use software keys. The owner key and the VPN certificate key are software keys on every platform.
+On macOS, `join` reuses an existing device key. It creates a Secure Enclave key only when no key exists and creation succeeds. If creation fails, the client warns and uses a software key. Pass `--software-key` to select a software key for a new device. Windows and Linux use software keys. The owner key and the VPN certificate key are software keys on every platform.
 
 After the operator approves the device, check it:
 
@@ -106,9 +120,9 @@ The VPN certificate request travels beside the signed claim. It contains the VPN
 
 | Symptom | Check |
 | --- | --- |
-| Release verification fails | Get `scripts/verify-client-release.sh` from the matching repository tag or its source archive. Check that GitHub CLI and Cosign are installed. The script deletes the release copy that it verifies, so it does not verify a separate binary download. |
+| Release verification fails | Get `scripts/verify-client-release.sh` from the matching repository tag or its source archive. Check that GitHub CLI and Cosign are installed. Run the script with an empty output directory. Install the matching binary from that directory only after the script succeeds. |
 | `join` refuses the gateway | Confirm the invitation URL, company key fingerprint, HTTPS certificate, and pinned log key with the gateway operator. |
-| `join` rejects a changed manifest | Join again with the changed manifest. The owner must sign its new hash, and an operator must approve the new device code. |
+| `check` reports a manifest hash mismatch | Get a new invitation for the current manifest. Run `join` with that invitation. Review the manifest. Sign its hash during `join`. Ask the gateway operator to approve the device again for the current manifest. `join` reuses the existing device key, so the device code stays the same. |
 | `check` says the device is pending | Give the device code to the gateway operator. Wait for approval. |
 | A check returns `unknown` on Windows | Run the task as an elevated administrator or install it with `schedule install --system` when the control needs machine-wide access. |
 | Windows event reports do not trigger | Check Event Log Readers access for the limited task user. Check that Defender history can be read. |
