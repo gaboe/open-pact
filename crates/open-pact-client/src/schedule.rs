@@ -1000,13 +1000,24 @@ function New-Object {
 
     #[cfg(windows)]
     #[test]
-    fn current_user_uninstall_does_not_touch_the_protected_directory() {
+    fn current_user_uninstall_ignores_an_admin_only_program_directory() {
         let job = Job::new(Path::new("client.exe"), Path::new("fixture-home")).unwrap();
         let action = windows_uninstall_script(&job, false);
         let setup = r#"
 $script:deleted = $false
-function ProgramFilesPath { throw 'current-user uninstall read Program Files' }
-function AssertProtected($path) { throw 'current-user uninstall checked a protected path' }
+$script:program = Join-Path $env:TEMP ('open-pact-fictional-program-' + [Guid]::NewGuid().ToString('N'))
+$install = Join-Path $script:program 'open-pact'
+$acl = [Security.AccessControl.DirectorySecurity]::new()
+$acl.SetAccessRuleProtection($true,$false)
+$acl.SetOwner([Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'))
+foreach ($sid in @('S-1-5-18','S-1-5-32-544')) {
+    $identity = [Security.Principal.SecurityIdentifier]::new($sid)
+    $rule = [Security.AccessControl.FileSystemAccessRule]::new($identity,'FullControl','ContainerInherit,ObjectInherit','None','Allow')
+    [void]$acl.AddAccessRule($rule)
+}
+[IO.Directory]::CreateDirectory($install,$acl) | Out-Null
+function ProgramFilesPath { return $script:program }
+function AssertProtected($path) { throw 'current-user uninstall checked an admin-only path' }
 function New-Object {
     param([string]$ComObject)
     if ($ComObject -ne 'Schedule.Service') { throw 'unexpected COM creation' }
