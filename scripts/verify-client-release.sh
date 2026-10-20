@@ -20,23 +20,34 @@ fi
 tag=$1
 repo=${GH_REPO:-gaboe/open-pact}
 work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
+work=$(cd "$work" && pwd -P)
+keep_work=0
+cleanup() {
+  if [ "$keep_work" -eq 0 ]; then
+    rm -rf "$work"
+  fi
+}
+trap cleanup EXIT
 
-gh release download "$tag" --repo "$repo" --dir "$work"
+assets=(
+  open-pact-client-aarch64-apple-darwin
+  open-pact-client-x86_64-apple-darwin
+  open-pact-client-x86_64-unknown-linux-musl
+  open-pact-client-x86_64-pc-windows-msvc.exe
+  NOTICE
+  SHA256SUMS
+)
+download_patterns=()
+for file in "${assets[@]}"; do
+  download_patterns+=(--pattern "$file" --pattern "$file.sigstore.json")
+done
+gh release download "$tag" --repo "$repo" --dir "$work" "${download_patterns[@]}"
 cd "$work"
 
-for file in \
-  open-pact-client-aarch64-apple-darwin \
-  open-pact-client-x86_64-apple-darwin \
-  open-pact-client-x86_64-unknown-linux-musl \
-  open-pact-client-x86_64-pc-windows-msvc.exe; do
+for file in "${assets[@]}"; do
   [ -f "$file" ] || { echo "missing release asset: $file" >&2; exit 1; }
   [ -f "$file.sigstore.json" ] || { echo "missing signature bundle: $file.sigstore.json" >&2; exit 1; }
 done
-[ -f NOTICE ] || { echo "missing NOTICE" >&2; exit 1; }
-[ -f NOTICE.sigstore.json ] || { echo "missing signature bundle: NOTICE.sigstore.json" >&2; exit 1; }
-[ -f SHA256SUMS ] || { echo "missing SHA256SUMS" >&2; exit 1; }
-[ -f SHA256SUMS.sigstore.json ] || { echo "missing signature bundle: SHA256SUMS.sigstore.json" >&2; exit 1; }
 
 if [ "$checksum_tool" = sha256sum ]; then
   sha256sum --check --strict SHA256SUMS
@@ -45,16 +56,14 @@ else
 fi
 
 identity="https://github.com/$repo/.github/workflows/client-release.yml@refs/tags/$tag"
-for file in \
-  open-pact-client-aarch64-apple-darwin \
-  open-pact-client-x86_64-apple-darwin \
-  open-pact-client-x86_64-unknown-linux-musl \
-  open-pact-client-x86_64-pc-windows-msvc.exe \
-  NOTICE \
-  SHA256SUMS; do
+for file in "${assets[@]}"; do
   cosign verify-blob \
     --bundle "$file.sigstore.json" \
     --certificate-identity "$identity" \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
     "$file"
 done
+
+verified_dir=$(pwd -P)
+printf 'verified files: %s\n' "$verified_dir"
+keep_work=1

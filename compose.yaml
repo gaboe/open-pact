@@ -26,7 +26,7 @@ services:
       # Every new checkpoint goes here; the manifest's [log] section names the witness keys.
       WITNESS_URLS: http://witness:8080
     ports:
-      - "${GATEWAY_PORT:-8080}:8080"
+      - "127.0.0.1:${GATEWAY_PORT:-8080}:8080"
     depends_on:
       db:
         condition: service_healthy
