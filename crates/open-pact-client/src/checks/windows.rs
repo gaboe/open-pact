@@ -408,6 +408,24 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(windows)]
+    fn native_batch_emits_every_non_browser_metric() {
+        for key in [
+            "preboot",
+            "signature_days",
+            "full_scan_days",
+            "detections_7d",
+            "last_detection_hours",
+            "log_retention",
+            "log_cleared",
+            "process_audit",
+            "powershell_logging",
+        ] {
+            assert!(value(key).is_some(), "batch did not emit {key}");
+        }
+    }
+
+    #[test]
     fn preboot_protectors_exclude_recovery_and_weak_unlock_paths() {
         for (raw, expected) in [
             ("0|", "none"),

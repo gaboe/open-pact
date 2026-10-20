@@ -134,9 +134,7 @@ const WINDOWS: Registry = &[
     ("password_set", macos_v3::unknown),
     ("auto_login", windows::auto_login),
     ("secure_boot", windows::secure_boot),
-    ("antimalware_active", || {
-        windows::antimalware_active().into()
-    }),
+    ("antimalware_active", windows::antimalware_active),
     ("preboot_auth", windows::preboot_auth),
     (
         "antimalware_signature_age_days",

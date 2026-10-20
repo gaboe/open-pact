@@ -26,5 +26,13 @@ jobs:
           $admin = ([Security.Principal.WindowsPrincipal]::new($identity)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
           Write-Output "runner_is_administrator=$admin"
 
+      - name: Probe invariant batch values
+        shell: powershell
+        run: |
+          $timer = [Diagnostics.Stopwatch]::StartNew()
+          & ([scriptblock]::Create((Get-Content -Raw crates/open-pact-client/src/checks/windows.ps1)))
+          $timer.Stop()
+          Write-Output ("batch_elapsed_seconds=" + $timer.Elapsed.TotalSeconds.ToString([Globalization.CultureInfo]::InvariantCulture))
+
       - name: Print checks on this Windows runner
         run: cargo test -p open-pact-client -- --ignored print_run_all_on_this_machine --nocapture

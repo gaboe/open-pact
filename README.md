@@ -204,7 +204,7 @@ TEST_DATABASE_URL=postgres://postgres:test@localhost:55432/postgres cargo test -
 
 ## Bounded integer controls
 
-`os_patch_age_days` replaces the bucket-based patch-age control. This is a breaking manifest and claim change. Owners sign the new manifest again. Clients report whole days as a JSON integer, or `"unknown"` when they cannot establish an age within 0 to 3650 days. Windows reports `"unknown"` until its check is implemented.
+`os_patch_age_days` replaces the bucket-based patch-age control. This is a breaking manifest and claim change. Owners sign the new manifest again. Clients report whole days as a JSON integer, or `"unknown"` when they cannot establish an age within 0 to 3650 days. Windows uses the date of a successful cumulative-update installation from Windows Update Agent history. Missing qualifying history returns `"unknown"`.
 
 ```toml
 [[control]]
@@ -224,7 +224,7 @@ The screen-lock output `"none"` means no screen lock. It replaces `"off"` in thi
 
 ## Additional security checks
 
-All checks run read-only as the device owner. Each external command has a three-second timeout, except the seven-day XProtect log query, which has a twenty-second timeout. Command output uses the C locale. Unsupported sources return `unknown`.
+All checks are read-only. macOS and Linux checks run as the device owner. Windows checks support a SYSTEM scheduled task or an elevated administrator. Each external command has a three-second timeout, except the XProtect log query and the single Windows PowerShell batch, which each have a twenty-second timeout. Command output uses the C locale. Unsupported sources return `unknown`.
 
 | Control | macOS | Linux |
 | --- | --- | --- |
@@ -239,7 +239,20 @@ All checks run read-only as the device owner. Each external command has a three-
 | `process_audit`, `powershell_logging` | `n/a` | `n/a` |
 | `log_cleared_hours` | `n/a` | `n/a` |
 
-Windows registers these additional controls with `unknown` helpers pending its implementation. A missing source, command failure, timeout or unrecognized output returns `unknown`.
+Windows collects the controls in one cached PowerShell batch. A missing source, command failure, timeout or unrecognized output returns `unknown`.
+
+| Windows control | Source | Privilege |
+| --- | --- | --- |
+| `preboot_auth` | OS-volume BitLocker protection and numeric key-protector types; recovery passwords do not establish the startup method | SYSTEM or elevated administrator |
+| `antimalware_signature_age_days` | Defender `AntivirusSignatureLastUpdated` | Defender status read access |
+| `antimalware_full_scan_age_days` | Defender `FullScanEndTime`; absent date means `unknown` | Defender status read access |
+| `antimalware_detections_7d`, `antimalware_last_detection_hours` | Defender retained detections and initial detection timestamps; empty history gives `0` and `none` | Defender threat-history read access |
+| `local_log_retention_days` | Shorter age of the oldest Security and System records | SYSTEM or elevated administrator |
+| `process_audit` | Native Process Creation audit-policy success flag and command-line policy | SYSTEM or elevated administrator |
+| `powershell_logging` | Windows PowerShell ScriptBlockLogging policy, machine before current user | Registry read access |
+| `log_cleared_hours` | Latest Security event 1102 or System event 104; `none` after both readable logs have no matching event | SYSTEM or elevated administrator |
+
+Defender metrics require Defender in Normal mode with its antivirus and service enabled. Other antivirus providers return `unknown` for these metrics. Detection values describe retained Defender history, not proof that a device has never had malware. Standard users get `unknown` for the controls that enforce elevation. Access failures also return `unknown`.
 
 `antimalware_active` now checks XProtect instead of Gatekeeper. This is a breaking mechanism change. [Apple describes XProtect as macOS antivirus technology](https://support.apple.com/guide/security/protecting-against-malware-sec469d47bd8/web). The signature-age reader matches `CFBundleShortVersionString` with an `XProtectPlistConfigData` receipt in `InstallHistory.plist`. It uses the matching receipt date because a bundle build date or file modification date does not establish when definitions were installed.
 
