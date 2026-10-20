@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use super::buckets;
 use super::exec::run_with_timeout;
+use open_pact_core::ControlValue;
 const POWERSHELL: &str = r#"
 $ErrorActionPreference = 'Stop'
 function Emit($key, $value) { if ($null -eq $value) { $value = '' }; [Console]::WriteLine("$key`t$value") }
@@ -109,12 +110,20 @@ pub fn os_supported() -> &'static str {
     })
 }
 
-pub fn os_patch_age() -> &'static str {
-    value("patch_date")
-        .and_then(parse_last_update)
-        .map_or("unknown", |date| {
-            buckets::patch_age(date, Utc::now().date_naive())
+pub fn os_patch_age_days() -> ControlValue {
+    parse_patch_age(
+        value("patch_date").unwrap_or_default(),
+        Utc::now().date_naive(),
+    )
+}
+
+fn parse_patch_age(text: &str, today: NaiveDate) -> ControlValue {
+    parse_last_update(text)
+        .and_then(|date| {
+            let days = today.signed_duration_since(date).num_days();
+            (days >= 0).then_some(ControlValue::Integer(days))
         })
+        .unwrap_or_else(|| "unknown".into())
 }
 
 pub fn auto_login() -> &'static str {
@@ -430,7 +439,10 @@ mod tests {
             NaiveDate::from_ymd_opt(2026, 10, 13)
         );
         assert_eq!(parse_last_update("October 13, 2026"), None);
-        assert_eq!(os_patch_age(), "unknown");
+        assert_eq!(
+            parse_patch_age("", NaiveDate::from_ymd_opt(2026, 10, 20).unwrap()),
+            "unknown"
+        );
     }
 
     #[test]

@@ -134,18 +134,14 @@ const WINDOWS: Registry = &[
     ("password_set", || unknown().into()),
     ("auto_login", || windows::auto_login().into()),
     ("secure_boot", || windows::secure_boot().into()),
-    ("antimalware_active", || windows::antimalware_active().into()),
+    ("antimalware_active", || {
+        windows::antimalware_active().into()
+    }),
     ("preboot_auth", || unknown().into()),
-    ("antimalware_signature_age_days", || {
-        unknown().into()
-    }),
-    ("antimalware_full_scan_age_days", || {
-        unknown().into()
-    }),
+    ("antimalware_signature_age_days", || unknown().into()),
+    ("antimalware_full_scan_age_days", || unknown().into()),
     ("antimalware_detections_7d", || unknown().into()),
-    ("antimalware_last_detection_hours", || {
-        unknown().into()
-    }),
+    ("antimalware_last_detection_hours", || unknown().into()),
     ("web_protection", || unknown().into()),
     ("local_log_retention_days", || unknown().into()),
     ("process_audit", || unknown().into()),
@@ -225,7 +221,7 @@ mod tests {
     }
 
     #[test]
-    fn windows_stubs_report_unknown() {
+    fn windows_checks_report_unknown_off_windows() {
         let all = run_all(Os::Windows);
         assert_eq!(all.len(), BUILTINS.len());
         assert!(all.values().all(|v| v == "unknown"));
