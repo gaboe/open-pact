@@ -73,7 +73,29 @@ fn chromium(prefs: &Value, policy: &Value, recommended: &Value, edge: bool) -> P
     if !edge && let Some(level) = recommended.get("SafeBrowsingProtectionLevel") {
         return protection_level(level);
     }
-    Protection::On
+    recommended
+        .get(key)
+        .map_or(Protection::On, |v| flag(Some(v)))
+}
+
+fn chromium_with_recommendation(
+    prefs: &Value,
+    policy: &Value,
+    recommended: Option<&Value>,
+    edge: bool,
+) -> Protection {
+    let (key, pointer) = if edge {
+        ("SmartScreenEnabled", "/edge/smartscreen/enabled")
+    } else {
+        ("SafeBrowsingEnabled", "/safebrowsing/enabled")
+    };
+    if policy.get(key).is_some()
+        || (!edge && policy.get("SafeBrowsingProtectionLevel").is_some())
+        || prefs.pointer(pointer).is_some()
+    {
+        return chromium(prefs, policy, &Value::Object(Map::new()), edge);
+    }
+    recommended.map_or(Protection::Unknown, |v| chromium(prefs, policy, v, edge))
 }
 
 fn protection_level(value: &Value) -> Protection {
@@ -173,20 +195,31 @@ fn chromium_browser(home: &Path, data: &str, domain: &str, edge: bool) -> Protec
     let Ok(policy) = managed(domain, home) else {
         return Protection::Unknown;
     };
-    let Ok(recommended) = recommended(domain, home) else {
-        return Protection::Unknown;
-    };
+    let empty = Value::Object(Map::new());
+    let mandatory = chromium_with_recommendation(&empty, &policy, None, edge);
+    if policy
+        .get(if edge {
+            "SmartScreenEnabled"
+        } else {
+            "SafeBrowsingEnabled"
+        })
+        .is_some()
+        || (!edge && policy.get("SafeBrowsingProtectionLevel").is_some())
+    {
+        return mandatory;
+    }
+    let recommended = recommended(domain, home);
     let Ok(dirs) = profiles(&home.join("Library/Application Support").join(data), false) else {
         return Protection::Unknown;
     };
     if dirs.is_empty() {
-        return chromium(&Value::Object(Map::new()), &policy, &recommended, edge);
+        return chromium_with_recommendation(&empty, &policy, recommended.as_ref().ok(), edge);
     }
     let states: Vec<_> = dirs
         .iter()
         .map(|dir| {
             optional_json(&dir.join("Preferences"), false).map_or(Protection::Unknown, |v| {
-                chromium(&v, &policy, &recommended, edge)
+                chromium_with_recommendation(&v, &policy, recommended.as_ref().ok(), edge)
             })
         })
         .collect();
@@ -428,24 +461,8 @@ fn windows_browser(browser: &Value) -> Protection {
             let Some(prefs) = browser.get("prefs").filter(|v| v.is_object()) else {
                 return Protection::Unknown;
             };
-            let Some(recommended) = browser.get("recommended").filter(|v| v.is_object()) else {
-                return Protection::Unknown;
-            };
-            let edge = kind == "edge";
-            let (key, pointer) = if edge {
-                ("SmartScreenEnabled", "/edge/smartscreen/enabled")
-            } else {
-                ("SafeBrowsingEnabled", "/safebrowsing/enabled")
-            };
-            if policy.get(key).is_none()
-                && (edge || policy.get("SafeBrowsingProtectionLevel").is_none())
-                && prefs.pointer(pointer).is_none()
-                && (edge || recommended.get("SafeBrowsingProtectionLevel").is_none())
-                && let Some(value) = recommended.get(key)
-            {
-                return flag(Some(value));
-            }
-            chromium(prefs, policy, recommended, edge)
+            let recommended = browser.get("recommended").filter(|v| v.is_object());
+            chromium_with_recommendation(prefs, policy, recommended, kind == "edge")
         }
         _ => Protection::Unknown,
     }
@@ -470,6 +487,44 @@ pub fn windows(screen: &str, text: &str) -> &'static str {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn steer_003_macos_mandatory_policy_survives_malformed_recommendation() {
+        let home = tempfile::tempdir().unwrap();
+        for folder in ["Library/Managed Preferences", "Library/Preferences"] {
+            fs::create_dir_all(home.path().join(folder)).unwrap();
+        }
+        fs::write(home.path().join("Library/Managed Preferences/org.openpact.fictional-precedence.plist"),
+            "<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>SafeBrowsingProtectionLevel</key><integer>0</integer></dict></plist>").unwrap();
+        fs::write(
+            home.path()
+                .join("Library/Preferences/org.openpact.fictional-precedence.plist"),
+            "malformed plist",
+        )
+        .unwrap();
+        assert_eq!(
+            chromium_browser(
+                home.path(),
+                "FictionalBrowser",
+                "org.openpact.fictional-precedence",
+                false
+            ),
+            Protection::Off
+        );
+    }
+
+    #[test]
+    fn steer_003_mandatory_policy_survives_unreadable_recommendation() {
+        let mandatory_off = json!({"kind":"chrome","policy":{"SafeBrowsingProtectionLevel":0},"recommended":null,"prefs":{}});
+        assert_eq!(windows_browser(&mandatory_off), Protection::Off);
+        let mandatory_on = json!({"kind":"edge","policy":{"SmartScreenEnabled":true},"recommended":null,"prefs":{}});
+        assert_eq!(windows_browser(&mandatory_on), Protection::On);
+        let explicit_off = json!({"kind":"chrome","policy":{},"recommended":null,"prefs":{"safebrowsing":{"enabled":false}}});
+        assert_eq!(windows_browser(&explicit_off), Protection::Off);
+        let absent = json!({"kind":"brave","policy":{},"recommended":null,"prefs":{}});
+        assert_eq!(windows_browser(&absent), Protection::Unknown);
+    }
+
     #[test]
     fn windows_always_requires_smartscreen_and_every_browser() {
         let on = json!({"kind":"chrome","policy":{},"recommended":{},"prefs":{}});

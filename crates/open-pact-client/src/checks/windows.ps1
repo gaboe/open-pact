@@ -190,10 +190,10 @@ function BrowserPolicy($machinePath, $userPath, $names) {
     $result = @{}
     foreach ($name in $names) {
         $machine = PolicyValue $machinePath $name
-        $user = PolicyValue $userPath $name
-        if ($machine -eq '!' -or $user -eq '!') { throw 'Unreadable policy' }
+        if ($machine -eq '!') { throw 'Unreadable policy' }
         $value = $machine
-        if ($value -eq '') { $value = $user }
+        if ($value -eq '') { $value = PolicyValue $userPath $name }
+        if ($value -eq '!') { throw 'Unreadable policy' }
         if ($value -ne '') {
             if ($name -eq 'SafeBrowsingProtectionLevel') {
                 if ($value -notmatch '^[012]$') { throw 'Invalid protection level' }
@@ -330,7 +330,8 @@ RunSection {
                         $names = @('SafeBrowsingEnabled', 'SafeBrowsingProtectionLevel')
                         if ($browser.Kind -eq 'edge') { $names = @('SmartScreenEnabled') }
                         $policy = BrowserPolicy ('HKLM:' + $suffix) ($userRoot + $suffix) $names
-                        $recommended = BrowserPolicy ('HKLM:' + $suffix + '\Recommended') ($userRoot + $suffix + '\Recommended') $names
+                        $recommended = $null
+                        try { $recommended = BrowserPolicy ('HKLM:' + $suffix + '\Recommended') ($userRoot + $suffix + '\Recommended') $names } catch {}
                         $dirs = @(BrowserDirs (Join-Path $local $browser.Data) $false)
                         if ($dirs.Count -eq 0) { $items += @{kind=$browser.Kind; policy=$policy; recommended=$recommended; prefs=@{}} }
                         foreach ($dir in $dirs) {

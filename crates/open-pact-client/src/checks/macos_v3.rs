@@ -137,7 +137,13 @@ fn parse_signature_age(history: &str, installed_version: &str, now: DateTime<Utc
     }
     last.map_or_else(
         || "unknown".into(),
-        |date| bounded_age((now - date).num_days(), 3650),
+        |date| {
+            if date > now {
+                "unknown".into()
+            } else {
+                bounded_age((now - date).num_days(), 3650)
+            }
+        },
     )
 }
 
@@ -279,6 +285,15 @@ mod tests {
             ControlValue::Integer(0)
         );
     }
+    #[test]
+    fn steer_003_future_signature_receipt_is_unknown() {
+        let history = "[\n 0 => {\n \"date\" => 2026-10-21 00:01:00 +0000\n \"displayName\" => \"XProtectPlistConfigData\"\n \"displayVersion\" => \"5367\"\n }\n]";
+        let now = DateTime::parse_from_rfc3339("2026-10-20T23:59:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(parse_signature_age(history, "5367", now), "unknown");
+    }
+
     #[test]
     fn log_absence_and_unverified_events_never_mean_zero() {
         for out in [

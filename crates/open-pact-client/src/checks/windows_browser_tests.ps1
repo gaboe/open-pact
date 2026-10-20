@@ -3,6 +3,9 @@ $ErrorActionPreference = 'Stop'
 function Assert($condition, $message) { if (-not $condition) { throw $message } }
 $root = Join-Path ([IO.Path]::GetTempPath()) ([Guid]::NewGuid().ToString())
 try {
+    Assert ((Age ($now.AddMinutes(2)) 'days') -eq 'unknown') 'Future Defender day age accepted'
+    Assert ((Age ($now.AddMinutes(2)) 'hours') -eq 'unknown') 'Future Defender hour age accepted'
+    Assert ((Age ($now.AddMinutes(-2)) 'days') -eq '0') 'Completed-day age changed'
     $profilePath = Join-Path $root 'UserData\Default'
     New-Item -ItemType Directory -Path $profilePath -Force | Out-Null
     $prefsPath = Join-Path $profilePath 'Preferences'
@@ -31,7 +34,11 @@ try {
     $registry['user|SafeBrowsingProtectionLevel'] = '!'
     $failed = $false
     try { BrowserPolicy 'machine' 'user' @('SafeBrowsingProtectionLevel') | Out-Null } catch { $failed = $true }
-    Assert $failed 'Unreadable user policy accepted'
+    Assert (-not $failed) 'Lower-priority user policy hid known machine policy'
+    $registry.Remove('machine|SafeBrowsingProtectionLevel')
+    $failed = $false
+    try { BrowserPolicy 'machine' 'user' @('SafeBrowsingProtectionLevel') | Out-Null } catch { $failed = $true }
+    Assert $failed 'Unreadable effective user policy accepted'
     $registry.Clear()
     $firefoxRoot = Join-Path $root 'AppData\Roaming\Mozilla\Firefox'
     $firefoxProfile = Join-Path $firefoxRoot 'Profiles\fictional.default'
