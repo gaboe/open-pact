@@ -495,7 +495,7 @@ const LIFECYCLES: &[Lifecycle] = &[
         version: "26H2",
         editions: CONSUMER,
         server: false,
-        end: (2028, 10, 9),
+        end: (2028, 10, 10),
     },
     Lifecycle {
         build: 26300,
@@ -866,6 +866,45 @@ mod tests {
             ("unknown", "unknown"),
         ] {
             assert_eq!(parse_screen_savers(data), expected, "{data}");
+        }
+    }
+
+    #[test]
+    fn lifecycle_dates_match_published_release_dates() {
+        for (raw, end) in [
+            ("10240|1507|EnterpriseS|Client", "2025-10-14"),
+            ("14393|1607|IoTEnterpriseS|Client", "2026-10-13"),
+            ("17763|1809|EnterpriseS|Client", "2029-01-09"),
+            ("19044|21H2|EnterpriseS|Client", "2027-01-12"),
+            ("19044|21H2|IoTEnterpriseS|Client", "2032-01-13"),
+            ("26100|24H2|EnterpriseS|Client", "2029-10-09"),
+            ("26100|24H2|IoTEnterpriseS|Client", "2034-10-10"),
+            ("22000|21H2|Professional|Client", "2023-10-10"),
+            ("22000|21H2|IoTEnterprise|Client", "2024-10-08"),
+            ("22621|22H2|Professional|Client", "2024-10-08"),
+            ("22621|22H2|IoTEnterprise|Client", "2025-10-14"),
+            ("22631|23H2|Professional|Client", "2025-11-11"),
+            ("22631|23H2|IoTEnterprise|Client", "2026-11-10"),
+            ("26100|24H2|Professional|Client", "2026-10-13"),
+            ("26100|24H2|IoTEnterprise|Client", "2027-10-12"),
+            ("26200|25H2|Professional|Client", "2027-10-12"),
+            ("26200|25H2|IoTEnterprise|Client", "2028-10-10"),
+            ("26300|26H2|Professional|Client", "2028-10-10"),
+            ("26300|26H2|IoTEnterprise|Client", "2029-10-09"),
+            ("28000|26H1|Professional|Client", "2028-03-14"),
+            ("28000|26H1|Enterprise|Client", "2029-03-13"),
+            ("14393|1607|ServerStandard|Server", "2027-01-12"),
+            ("17763|1809|ServerStandard|Server", "2029-01-09"),
+            ("20348|21H2|ServerStandard|Server", "2031-10-14"),
+            ("26100|24H2|ServerStandard|Server", "2034-11-14"),
+        ] {
+            let end = NaiveDate::parse_from_str(end, "%Y-%m-%d").unwrap();
+            assert_eq!(parse_os_supported(raw, end), "yes", "{raw}");
+            assert_eq!(
+                parse_os_supported(raw, end.succ_opt().unwrap()),
+                "no",
+                "{raw}"
+            );
         }
     }
 
