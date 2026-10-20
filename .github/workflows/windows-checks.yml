@@ -19,6 +19,15 @@ jobs:
       - name: Test Windows client
         run: cargo test -p open-pact-client
 
+      - name: Verify Windows VPN pair recovery and accepted responses
+        run: |
+          cargo test -p open-pact-client windows_vpn_
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test -p open-pact-client check_keeps_the_installed_pair_if_the_new_one_is_invalid
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test -p open-pact-client check_installs_the_certificate_of_a_verified_response_checkpoint
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Verify Windows browser source fixtures
         shell: powershell
         run: ./crates/open-pact-client/src/checks/windows_browser_tests.ps1
