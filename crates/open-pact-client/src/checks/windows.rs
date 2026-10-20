@@ -4,11 +4,17 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use super::buckets;
-use super::exec::run_with_timeout;
+use super::exec::capture;
 use open_pact_core::ControlValue;
 const POWERSHELL: &str = include_str!("windows.ps1");
 
-static VALUES: OnceLock<BTreeMap<String, String>> = OnceLock::new();
+struct Batch {
+    values: BTreeMap<String, String>,
+    #[cfg_attr(not(all(windows, test)), allow(dead_code))]
+    diagnostics: String,
+}
+
+static VALUES: OnceLock<Batch> = OnceLock::new();
 
 pub fn disk_encryption() -> ControlValue {
     value("bitlocker").map_or("unknown", parse_bitlocker).into()
@@ -264,8 +270,13 @@ fn parse_logging(text: &str) -> &'static str {
 }
 
 fn value(name: &str) -> Option<&'static str> {
-    let values = VALUES.get_or_init(|| {
-        let out = run_with_timeout(
+    batch().values.get(name).map(String::as_str)
+}
+
+fn batch() -> &'static Batch {
+    VALUES.get_or_init(|| {
+        let start = std::time::Instant::now();
+        let output = capture(
             "powershell.exe",
             &[
                 "-NoLogo",
@@ -275,11 +286,34 @@ fn value(name: &str) -> Option<&'static str> {
                 POWERSHELL,
             ],
             Duration::from_secs(20),
-        )
-        .unwrap_or_default();
-        parse_values(&out)
-    });
-    values.get(name).map(String::as_str)
+        );
+        let (values, diagnostics) = match output {
+            Ok(output) => {
+                let diagnostics = format!(
+                    "Windows batch: status={:?}, elapsed={:?}, timeout={}, stderr_head={:?}, stdout_bytes={}",
+                    output.status, output.elapsed, output.timed_out,
+                    output.stderr.chars().take(1024).collect::<String>(), output.stdout.len(),
+                );
+                let values = if output.timed_out {
+                    BTreeMap::new()
+                } else {
+                    parse_values(&output.stdout)
+                };
+                if output.timed_out || !output.status.is_some_and(|status| status.success()) {
+                    eprintln!("warning: {diagnostics}");
+                }
+                (values, diagnostics)
+            }
+            Err(error) => {
+                let diagnostics = format!(
+                    "Windows batch: elapsed={:?}, process error={error}", start.elapsed()
+                );
+                eprintln!("warning: {diagnostics}");
+                (BTreeMap::new(), diagnostics)
+            }
+        };
+        Batch { values, diagnostics }
+    })
 }
 
 fn parse_values(out: &str) -> BTreeMap<String, String> {
@@ -646,6 +680,8 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn native_batch_emits_every_metric() {
+        let batch = batch();
+        eprintln!("{}", batch.diagnostics);
         for key in [
             "screen_savers",
             "lock_policy",
@@ -665,7 +701,12 @@ mod tests {
             "smartscreen",
             "browsers",
         ] {
-            assert!(value(key).is_some(), "batch did not emit {key}");
+            assert!(
+                batch.values.contains_key(key),
+                "batch did not emit {key}; {}; emitted keys={:?}",
+                batch.diagnostics,
+                batch.values.keys().collect::<Vec<_>>()
+            );
         }
     }
 

@@ -17,7 +17,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Test Windows client
-        run: cargo test -p open-pact-client
+        run: cargo test -p open-pact-client -- --show-output
 
       - name: Verify Windows VPN pair recovery and accepted responses
         run: |
