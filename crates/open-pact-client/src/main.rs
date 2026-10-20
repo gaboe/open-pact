@@ -3,6 +3,8 @@ mod device_key;
 #[cfg(test)]
 mod fake_gateway;
 mod locallog;
+mod report;
+mod schedule;
 #[cfg(target_os = "macos")]
 mod secure_enclave;
 
@@ -56,12 +58,24 @@ enum Command {
     },
     /// Run the manifest's checks, send a signed claim and fetch a VPN certificate
     Check,
+    /// Send a signed status report to an HTTPS collector
+    Report {
+        #[arg(long)]
+        collector: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Install or remove periodic status reports
+    Schedule {
+        #[command(subcommand)]
+        command: schedule::Command,
+    },
     /// Transparency log and local claim log
     Log {
         #[command(subcommand)]
         command: LogCommand,
     },
-    /// Nothing runs in the background; uninstall = delete the binary and ~/.config/open-pact
+    /// Show how to stop scheduled reports and remove the client
     Stop,
 }
 
@@ -1349,6 +1363,13 @@ fn log_show(path: &Path) -> Result<()> {
 }
 
 async fn run(cli: Cli) -> Result<ExitCode> {
+    if let Command::Schedule {
+        command: schedule::Command::Probe { address },
+    } = &cli.command
+    {
+        schedule::probe_blocking(address)?;
+        return Ok(ExitCode::SUCCESS);
+    }
     let home = Home::new(cli.home)?;
     match cli.command {
         Command::Join {
@@ -1357,6 +1378,14 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             software_key,
         } => join(&home, &invitation, yes, software_key, cli.insecure_dev).await,
         Command::Check => check(&home, cli.insecure_dev).await,
+        Command::Report { collector, dry_run } => {
+            report::run(&home, &collector, dry_run).await?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Schedule { command } => {
+            schedule::run(&home, command).await?;
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Log {
             command: LogCommand::Head,
         } => log_head(&home).map(|()| ExitCode::SUCCESS),
@@ -1367,7 +1396,10 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             command: LogCommand::Show,
         } => log_show(&home.file("claims.jsonl")).map(|()| ExitCode::SUCCESS),
         Command::Stop => {
-            println!("Nothing runs in the background: the client runs only when you start it.");
+            println!(
+                "Run `{}` to stop scheduled reports.",
+                schedule::uninstall_command(&home.0)
+            );
             println!("To uninstall, delete the binary and {}.", home.0.display());
             Ok(ExitCode::SUCCESS)
         }

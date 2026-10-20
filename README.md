@@ -52,7 +52,7 @@ The client keeps its files in `~/.config/open-pact/`, or in the directory given 
 
 A VPN client that reads the certificate and the CA as two files gets one consistent pair from `vpn/current/`. The two top-level links can straddle a replacement between two reads.
 
-Nothing runs in the background. To uninstall, delete the binary and the directory.
+No job runs in the background unless you install a report schedule. Before you delete the binary and the directory, run `open-pact-client schedule uninstall`.
 
 ## Verify a release
 
@@ -274,3 +274,35 @@ required = { macos = "n/a", linux = { max = 7 } }
 The added controls in the fictional example use `required = {}` to report values without changing its access baseline. The client runs and discloses every listed control. The gateway checks disclosure bounds but applies no access requirement when the OS has no entry in `required`. A policy can require signature freshness with `required = { macos = { max = 3 } }`. Detection counts have no zero-detection requirement.
 
 The ClamAV parser uses the [documented database header](https://docs.clamav.net/manual/Signatures.html). The journal reader uses [journalctl oldest-entry selection](https://freedesktop.org/software/systemd/man/latest/journalctl.html).
+
+## Send a signed status report
+
+After `join`, send the manifest's check results to an HTTPS collector:
+
+```sh
+open-pact-client report --collector https://collector.example.org/status --dry-run
+open-pact-client report --collector https://collector.example.org/status
+```
+
+`--dry-run` prints the JSON payload and its compact ES256 JWS. It sends nothing. The report uses the existing device key and pseudonym. The client checks the local manifest against the enrolled hash and runs the same checks as `check`.
+
+The JSON carries `spec_version`, `device_id`, a random UUIDv4 `report_id`, UTC `time`, `solution`, `os`, `os_version`, `key_protection`, and `results`. `solution` is `open-pact <version>`. `os_version` is the macOS product version, Linux kernel release, or Windows version. `key_protection` is `secure_enclave` for a Secure Enclave key and `os_permissions` for a software key. Text results stay JSON strings. Integer results stay JSON numbers.
+
+The collector receives the compact JWS as `application/jose`. It must verify ES256 with the public device key obtained through enrolment. A report carries no public key. Only an HTTP 2xx response acknowledges a report. The client ignores the response body, refuses redirects, and uses rustls with TLS 1.2 or later. This one-way report does not fetch a VPN certificate or contact the gateway. A collector receives the additional report metadata listed above.
+
+## Schedule reports while the VPN is connected
+
+Install a user job with an internal collector address reachable only through your VPN:
+
+```sh
+open-pact-client schedule install --collector https://collector.internal.example.org/status
+open-pact-client schedule uninstall
+```
+
+Use the same `--home` for installation and removal. Keep the binary at its installed path. The scheduler runs under your OS user account. macOS uses a launchd LaunchAgent. Linux uses a systemd user timer and requires a running user manager. Windows uses Task Scheduler. These jobs run without a separate open-pact daemon. No job exists until you run `schedule install`.
+
+The collector must have an internal address that is reachable only through the VPN. VPN routing makes off-VPN sends impossible. A public collector cannot meet this requirement, even with a separate VPN probe. A probe can succeed just before the VPN disconnects.
+
+Every five minutes, the job tries a TCP connection to the collector host and port, with a two-second timeout that includes name resolution. HTTPS uses port 443 unless the collector URL gives another port. Use `--vpn-probe host:port` to override this target. Choose a probe address that is unavailable outside the VPN. A successful connection records connectivity for this check. The job sends on the first observed connection and then when at least 55 minutes have passed since the last acknowledgement. The job checks the probe again after it prepares the report and before it starts the collector request. It sends nothing if either probe fails. DNS runs in a child process that the parent kills at the two-second deadline. A disconnect and reconnect entirely between two probes is not observed. A failed send retries on a later run. A lost acknowledgement can cause a duplicate report on retry. If the clock moves behind the last acknowledgement time, the next connected run retries and resets that time.
+
+The client home holds `report-schedule.json`, `report-state.json`, and `report-schedule.lock`. The state records the last observed VPN state, a pending reconnect report, and the last acknowledged report time. A lock prevents overlapping runs. Reinstallation replaces this home's job and resets its report state. Each home has a separate job name. `schedule uninstall` removes the OS job, its generated files, its configuration, and its report state. The reusable lock file remains. `stop` prints the removal command with the home path quoted for POSIX shells, or PowerShell on Windows. On Unix, new scheduler homes have mode `0700`. Configuration and state files have mode `0600`, or keep stricter owner permissions on replacement. Collector request errors omit the URL so query tokens do not enter the error log.
