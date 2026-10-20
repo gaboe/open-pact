@@ -519,13 +519,15 @@ fn powershell_literal(value: &str) -> String {
 }
 
 fn windows_powershell(script: &str) -> Result<String> {
+    let script =
+        format!("[Console]::OutputEncoding = New-Object Text.UTF8Encoding($false);\n{script}");
     let output = std::process::Command::new("powershell.exe")
         .args([
             "-NoLogo",
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            script,
+            &script,
         ])
         .output()
         .context("start Windows scheduler helper")?;
