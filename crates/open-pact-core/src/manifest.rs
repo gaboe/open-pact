@@ -250,16 +250,37 @@ impl fmt::Display for ControlValue {
     }
 }
 
+// Serde struct visitors also accept positional sequences. Numeric policy fields must
+// name the operation and bounds, so untagged variants require a map before decoding.
+fn named_fields<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct Named<T>(std::marker::PhantomData<T>);
+    impl<'de, T: Deserialize<'de>> serde::de::Visitor<'de> for Named<T> {
+        type Value = T;
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a map with named numeric fields")
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<T, A::Error> {
+            T::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+        }
+    }
+    deserializer.deserialize_map(Named(std::marker::PhantomData))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Output {
     Enumerated(Vec<String>),
-    Integer(IntegerOutput),
+    Integer(#[serde(deserialize_with = "named_fields")] IntegerOutput),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IntegerOutput {
+    #[serde(deserialize_with = "named_fields")]
     pub integer: IntegerRange,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub values: Vec<String>,
@@ -337,8 +358,8 @@ impl fmt::Display for Output {
 #[serde(untagged)]
 pub enum Accepted {
     Values(AcceptedValues),
-    Max(Maximum),
-    Min(Minimum),
+    Max(#[serde(deserialize_with = "named_fields")] Maximum),
+    Min(#[serde(deserialize_with = "named_fields")] Minimum),
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

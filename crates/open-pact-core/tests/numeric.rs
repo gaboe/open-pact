@@ -206,6 +206,27 @@ fn screen_lock_none_replaces_off() {
 }
 
 #[test]
+fn numeric_shapes_require_named_fields() {
+    for (from, to) in [
+        (
+            "output = { integer = { min = 0, max = 3650 } }",
+            "output = [[0, 3650]]",
+        ),
+        (
+            "output = { integer = { min = 0, max = 3650 } }",
+            "output = { integer = [0, 3650] }",
+        ),
+        ("{ max = 30 }", "[30]"),
+    ] {
+        assert!(DEMO.contains(from));
+        assert!(
+            Manifest::parse(DEMO.replacen(from, to, 1).as_bytes()).is_err(),
+            "{to}"
+        );
+    }
+}
+
+#[test]
 fn reported_only_values_are_disclosed_without_access_requirements() {
     let m = manifest(DEMO);
     assert!(

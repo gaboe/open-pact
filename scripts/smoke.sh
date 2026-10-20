@@ -253,7 +253,7 @@ expect "undisclosed key" 403 'installed_apps is not in the manifest' \
   "$("$dev_claim" "$device" "$manifest" "$(nonce)" linux "${passing[@]}" installed_apps=slack)"
 
 expect "wrong manifest" 403 'claim is for manifest' \
-  "$("$dev_claim" "$device" "sha256:$(printf '0%.0s' {1..64})" "$(nonce)" linux "${passing[@]}")"
+  "$("$dev_claim" "$device" "sha256:$(printf '0%.0s' {1..64})" "$(nonce)" linux disk_encryption=s:full firewall=s:on screen_lock=s:le_5min os_supported=s:yes os_patch_age_days=i:14)"
 
 tampered="$("$dev_claim" "$device" "$manifest" "$(nonce)" linux "${passing[@]}" | awk -F. '{print $1"."$2"."substr($3,1,10)"AAAA"substr($3,15)}')"
 expect "tampered signature" 403 'signature does not verify' "$tampered"
