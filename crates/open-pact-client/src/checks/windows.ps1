@@ -116,6 +116,10 @@ function Age($date, $unit) {
     if ($unit -eq 'days') { return [Math]::Floor($span.TotalDays).ToString([Globalization.CultureInfo]::InvariantCulture) }
     return [Math]::Floor($span.TotalHours).ToString([Globalization.CultureInfo]::InvariantCulture)
 }
+function EventEpoch($date) {
+    if ($null -eq $date) { return 'none' }
+    return [DateTimeOffset]::new($date.ToUniversalTime()).ToUnixTimeSeconds().ToString([Globalization.CultureInfo]::InvariantCulture)
+}
 RunSection {
     try {
         if (-not $admin) { throw 'Privilege required' }
@@ -151,10 +155,11 @@ RunSection {
             Emit 'detections_7d' ([string]@($dates | Where-Object { $_ -ge $now.AddDays(-7) }).Count)
             if ($dates.Count -eq 0) { Emit 'last_detection_hours' 'none' }
             else { Emit 'last_detection_hours' (Age ($dates | Sort-Object -Descending | Select-Object -First 1) 'hours') }
-        } catch { Emit 'detections_7d' 'unknown'; Emit 'last_detection_hours' 'unknown' }
+            Emit 'antimalware_detection_epoch' (EventEpoch ($dates | Sort-Object -Descending | Select-Object -First 1))
+        } catch { Emit 'detections_7d' 'unknown'; Emit 'last_detection_hours' 'unknown'; Emit 'antimalware_detection_epoch' 'unknown' }
     } catch {
         Emit 'signature_days' 'unknown'; Emit 'full_scan_days' 'unknown'
-        Emit 'detections_7d' 'unknown'; Emit 'last_detection_hours' 'unknown'
+        Emit 'detections_7d' 'unknown'; Emit 'last_detection_hours' 'unknown'; Emit 'antimalware_detection_epoch' 'unknown'
     }
 }
 function EventDate($log, $xpath, $newest) {
@@ -168,6 +173,10 @@ function EventDate($log, $xpath, $newest) {
     } finally { $reader.Dispose() }
 }
 RunSection {
+    try { Emit 'security_log_cleared_epoch' (EventEpoch (EventDate 'Security' '*[System[EventID=1102]]' $true)) }
+    catch { Emit 'security_log_cleared_epoch' 'unknown' }
+}
+RunSection {
     try {
         if (-not $admin) { throw 'Privilege required' }
         $security = Age (EventDate 'Security' '*' $false) 'days'
@@ -176,7 +185,8 @@ RunSection {
     } catch { Emit 'log_retention' 'unknown' }
     try {
         if (-not $admin) { throw 'Privilege required' }
-        $clears = @(EventDate 'Security' '*[System[EventID=1102]]' $true; EventDate 'System' '*[System[EventID=104]]' $true) | Where-Object { $null -ne $_ }
+        $securityClear = EventDate 'Security' '*[System[EventID=1102]]' $true
+        $clears = @($securityClear; EventDate 'System' '*[System[EventID=104]]' $true) | Where-Object { $null -ne $_ }
         if (@($clears).Count -eq 0) { Emit 'log_cleared' 'none' }
         else { Emit 'log_cleared' (Age ($clears | Sort-Object -Descending | Select-Object -First 1) 'hours') }
     } catch { Emit 'log_cleared' 'unknown' }

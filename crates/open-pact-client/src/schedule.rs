@@ -7,7 +7,7 @@ use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{Home, report};
+use crate::{Home, checks, report};
 
 const CONFIG: &str = "report-schedule.json";
 const STATE: &str = "report-state.json";
@@ -63,6 +63,16 @@ struct State {
     #[serde(default)]
     reconnect_pending: bool,
     last_success: Option<i64>,
+    #[serde(default)]
+    last_events: Option<checks::EventMarkers>,
+    #[serde(default)]
+    event_baseline: Option<EventBaseline>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+struct EventBaseline {
+    security_log_cleared: bool,
+    antimalware_detection: bool,
 }
 
 impl State {
@@ -81,10 +91,87 @@ impl State {
                     .is_none_or(|last| now < last || now.saturating_sub(last) >= 55 * 60))
     }
 
-    fn acknowledged(&mut self, now: i64) {
+    fn should_send_events(&self, current: checks::EventMarkerReads) -> bool {
+        if !self.vpn_up {
+            return false;
+        }
+        let baseline = self.baseline();
+        let previous = self.last_events.unwrap_or_default();
+        newer(
+            current.security_log_cleared,
+            baseline.security_log_cleared,
+            previous.security_log_cleared,
+        ) || newer(
+            current.antimalware_detection,
+            baseline.antimalware_detection,
+            previous.antimalware_detection,
+        )
+    }
+
+    fn acknowledged(&mut self, now: i64, events: checks::EventMarkerReads) {
         self.last_success = Some(now);
         self.reconnect_pending = false;
+        self.merge_events(events);
     }
+
+    fn sent(&mut self, acknowledged: bool, now: i64, events: checks::EventMarkerReads) {
+        if acknowledged {
+            self.acknowledged(now, events);
+        } else {
+            self.observe(false);
+        }
+    }
+
+    fn baseline(&self) -> EventBaseline {
+        self.event_baseline.unwrap_or(EventBaseline {
+            security_log_cleared: self.last_events.is_some(),
+            antimalware_detection: self.last_events.is_some(),
+        })
+    }
+
+    fn establish_baseline(&mut self, events: checks::EventMarkerReads) {
+        let mut markers = self.last_events.unwrap_or_default();
+        let mut baseline = self.baseline();
+        if !baseline.security_log_cleared
+            && let checks::EventMarkerRead::Read(timestamp) = events.security_log_cleared
+        {
+            markers.security_log_cleared = timestamp;
+            baseline.security_log_cleared = true;
+        }
+        if !baseline.antimalware_detection
+            && let checks::EventMarkerRead::Read(timestamp) = events.antimalware_detection
+        {
+            markers.antimalware_detection = timestamp;
+            baseline.antimalware_detection = true;
+        }
+        if baseline.security_log_cleared || baseline.antimalware_detection {
+            self.last_events = Some(markers);
+            self.event_baseline = Some(baseline);
+        }
+    }
+
+    fn merge_events(&mut self, events: checks::EventMarkerReads) {
+        let mut markers = self.last_events.unwrap_or_default();
+        let mut baseline = self.baseline();
+        if let checks::EventMarkerRead::Read(timestamp) = events.security_log_cleared {
+            markers.security_log_cleared = timestamp;
+            baseline.security_log_cleared = true;
+        }
+        if let checks::EventMarkerRead::Read(timestamp) = events.antimalware_detection {
+            markers.antimalware_detection = timestamp;
+            baseline.antimalware_detection = true;
+        }
+        if baseline.security_log_cleared || baseline.antimalware_detection {
+            self.last_events = Some(markers);
+            self.event_baseline = Some(baseline);
+        }
+    }
+}
+
+fn newer(current: checks::EventMarkerRead, initialized: bool, previous: Option<i64>) -> bool {
+    initialized
+        && matches!(current, checks::EventMarkerRead::Read(Some(current))
+            if previous.is_none_or(|previous| current > previous))
 }
 
 fn probe_address(raw: &str) -> Result<()> {
@@ -487,12 +574,21 @@ pub(crate) async fn run(home: &Home, command: Command) -> Result<()> {
             let mut state: State = home.read_json(STATE)?.unwrap_or_default();
             state.observe(vpn_up(&config.vpn_probe).await);
             save(&home, STATE, &state)?;
-            if state.should_send(chrono::Utc::now().timestamp()) {
-                if report::run_scheduled(&home, &config.collector, &config.vpn_probe).await? {
-                    state.acknowledged(chrono::Utc::now().timestamp());
-                } else {
-                    state.observe(false);
-                }
+            let events = if state.vpn_up {
+                checks::event_markers()
+            } else {
+                checks::EventMarkerReads::default()
+            };
+            let now = chrono::Utc::now().timestamp();
+            if state.should_send(now) || state.should_send_events(events) {
+                let acknowledged =
+                    report::run_scheduled(&home, &config.collector, &config.vpn_probe).await?;
+                state.sent(acknowledged, chrono::Utc::now().timestamp(), events);
+                save(&home, STATE, &state)?;
+            } else if !state.baseline().security_log_cleared
+                || !state.baseline().antimalware_detection
+            {
+                state.establish_baseline(events);
                 save(&home, STATE, &state)?;
             }
         }
@@ -697,7 +793,7 @@ mod tests {
     fn clock_rollback_recovers_within_an_hour() {
         let mut state = State::default();
         state.observe(true);
-        state.acknowledged(100_000);
+        state.acknowledged(100_000, checks::EventMarkerReads::default());
         assert!(state.should_send(100_000 - 86_400 + 2 * 3600));
     }
 
@@ -765,6 +861,8 @@ mod tests {
                 vpn_up: up,
                 reconnect_pending: pending,
                 last_success: Some(now - minutes * 60),
+                last_events: None,
+                event_baseline: None,
             };
             assert_eq!(state.should_send(now), expected);
         }
@@ -772,7 +870,7 @@ mod tests {
         assert!(!state.should_send(now));
         state.observe(true);
         assert!(state.should_send(now));
-        state.acknowledged(now);
+        state.acknowledged(now, checks::EventMarkerReads::default());
         assert!(!state.should_send(now + 54 * 60));
         assert!(state.should_send(now + 55 * 60));
         state.observe(false);
@@ -780,11 +878,135 @@ mod tests {
         assert!(state.should_send(now + 60));
         state.observe(true);
         assert!(state.should_send(now + 120), "failed first send must retry");
-        state.acknowledged(now + 120);
+        state.acknowledged(now + 120, checks::EventMarkerReads::default());
         assert!(!state.should_send(now + 121));
         assert!(
             state.should_send(now - 1),
             "clock rollback retries instead of suppressing reports"
+        );
+    }
+
+    #[test]
+    fn event_markers_send_only_for_new_events_while_vpn_is_up() {
+        use checks::EventMarkerRead::{Read, Unknown};
+
+        let reads = |security_log_cleared, antimalware_detection| checks::EventMarkerReads {
+            security_log_cleared,
+            antimalware_detection,
+        };
+        let previous = checks::EventMarkers {
+            security_log_cleared: Some(100),
+            antimalware_detection: Some(200),
+        };
+        let state = State {
+            vpn_up: true,
+            last_success: Some(500),
+            last_events: Some(previous),
+            ..State::default()
+        };
+        for (current, expected) in [
+            (reads(Read(Some(101)), Read(Some(200))), true),
+            (reads(Read(Some(100)), Read(Some(201))), true),
+            (reads(Read(Some(100)), Read(Some(200))), false),
+            (reads(Read(Some(99)), Read(Some(199))), false),
+            (reads(Unknown, Unknown), false),
+        ] {
+            assert_eq!(state.should_send_events(current), expected);
+        }
+
+        let security_only = reads(Read(Some(101)), Unknown);
+        assert!(state.should_send_events(security_only));
+        let defender_only = reads(Unknown, Read(Some(201)));
+        assert!(state.should_send_events(defender_only));
+
+        let mut uninitialized = State {
+            vpn_up: true,
+            ..State::default()
+        };
+        let first_read = reads(Read(Some(100)), Unknown);
+        assert!(!uninitialized.should_send_events(first_read));
+        uninitialized.establish_baseline(first_read);
+        assert_eq!(
+            uninitialized.last_events.unwrap().security_log_cleared,
+            Some(100)
+        );
+        assert_eq!(
+            uninitialized.event_baseline,
+            Some(EventBaseline {
+                security_log_cleared: true,
+                antimalware_detection: false,
+            })
+        );
+        assert!(!uninitialized.should_send_events(reads(Unknown, Read(Some(200)))));
+        uninitialized.establish_baseline(reads(Unknown, Read(Some(200))));
+        assert!(!uninitialized.should_send_events(reads(Unknown, Read(Some(200)))));
+
+        let offline = State {
+            vpn_up: false,
+            ..state
+        };
+        assert!(!offline.should_send_events(reads(Read(Some(101)), Read(Some(200)))));
+        assert!(!offline.should_send(600));
+    }
+
+    #[test]
+    fn failed_send_keeps_event_markers_for_retry() {
+        use checks::EventMarkerRead::{Read, Unknown};
+
+        let previous = checks::EventMarkers {
+            security_log_cleared: Some(100),
+            antimalware_detection: Some(200),
+        };
+        let current = checks::EventMarkerReads {
+            security_log_cleared: Read(Some(101)),
+            antimalware_detection: Unknown,
+        };
+        let mut state = State {
+            vpn_up: true,
+            last_success: Some(500),
+            last_events: Some(previous),
+            ..State::default()
+        };
+
+        state.sent(false, 600, current);
+
+        assert_eq!(state.last_events, Some(previous));
+        assert_eq!(state.last_success, Some(500));
+        state.observe(true);
+        assert!(state.should_send_events(current));
+        state.acknowledged(700, current);
+        assert_eq!(
+            state.last_events,
+            Some(checks::EventMarkers {
+                security_log_cleared: Some(101),
+                antimalware_detection: Some(200),
+            }),
+            "an unknown source keeps its acknowledged marker"
+        );
+        assert_eq!(state.last_success, Some(700));
+    }
+
+    #[test]
+    fn old_state_without_event_markers_loads() {
+        let state: State =
+            serde_json::from_str(r#"{"vpn_up":true,"reconnect_pending":false,"last_success":123}"#)
+                .unwrap();
+        assert_eq!(state.last_success, Some(123));
+        assert_eq!(state.last_events, None);
+    }
+
+    #[test]
+    fn old_event_baseline_marks_both_sources_initialized() {
+        let state: State = serde_json::from_str(
+            r#"{"vpn_up":true,"last_events":{"security_log_cleared":100,"antimalware_detection":null}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            state.baseline(),
+            EventBaseline {
+                security_log_cleared: true,
+                antimalware_detection: true,
+            }
         );
     }
 
@@ -891,6 +1113,8 @@ mod tests {
                 vpn_up: false,
                 reconnect_pending: false,
                 last_success: Some(chrono::Utc::now().timestamp()),
+                last_events: None,
+                event_baseline: None,
             },
         )
         .unwrap();
@@ -903,6 +1127,15 @@ mod tests {
         assert!(connected.reconnect_pending);
         assert!(connected.should_send(chrono::Utc::now().timestamp()));
         drop(listener);
+        save(
+            &home,
+            CONFIG,
+            &Config {
+                collector: "https://collector.example.org/status".into(),
+                vpn_probe: "127.0.0.1:1".into(),
+            },
+        )
+        .unwrap();
         run(&home, Command::Run).await.unwrap();
         let disconnected: State = home.read_json(STATE).unwrap().unwrap();
         assert!(!disconnected.vpn_up);
@@ -994,7 +1227,7 @@ mod tests {
         assert!(lock(&home).is_err());
         let mut state = State::default();
         state.observe(true);
-        state.acknowledged(123);
+        state.acknowledged(123, checks::EventMarkerReads::default());
         save(&home, STATE, &state).unwrap();
         let stored: State = home.read_json(STATE).unwrap().unwrap();
         assert!(stored.vpn_up);

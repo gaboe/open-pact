@@ -133,6 +133,36 @@ pub fn log_cleared_hours() -> ControlValue {
     number("log_cleared", 8760, true)
 }
 
+#[cfg(target_os = "windows")]
+pub(super) fn event_markers() -> super::EventMarkerReads {
+    super::EventMarkerReads {
+        security_log_cleared: event_marker_read("security_log_cleared_epoch"),
+        antimalware_detection: event_marker_read("antimalware_detection_epoch"),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn event_marker_read(key: &str) -> super::EventMarkerRead {
+    parse_event_marker_read(value(key))
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn parse_event_marker_read(value: Option<&str>) -> super::EventMarkerRead {
+    value
+        .and_then(parse_event_marker)
+        .map(super::EventMarkerRead::Read)
+        .unwrap_or_default()
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn parse_event_marker(value: &str) -> Option<Option<i64>> {
+    if value == "none" {
+        Some(None)
+    } else {
+        value.parse().ok().map(Some)
+    }
+}
+
 fn number(key: &str, max: i32, none: bool) -> ControlValue {
     parse_number(value(key).unwrap_or_default(), max, none)
 }
@@ -602,6 +632,7 @@ pub fn parse_antimalware(out: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checks::{EventMarkerRead, EventMarkerReads};
 
     #[test]
     #[cfg(windows)]
@@ -616,6 +647,8 @@ mod tests {
             "full_scan_days",
             "detections_7d",
             "last_detection_hours",
+            "security_log_cleared_epoch",
+            "antimalware_detection_epoch",
             "log_retention",
             "log_cleared",
             "process_audit",
@@ -635,6 +668,8 @@ mod tests {
             "full_scan_days\tunknown\r\n",
             "detections_7d\t0\r\n",
             "last_detection_hours\tnone\r\n",
+            "security_log_cleared_epoch\t1792500000\r\n",
+            "antimalware_detection_epoch\tnone\r\n",
             "log_retention\t12|12\r\n",
             "log_cleared\t296\r\n",
             "process_audit\t1|\r\n",
@@ -658,6 +693,15 @@ mod tests {
             "none"
         );
         assert_eq!(
+            parse_event_marker(&values["security_log_cleared_epoch"]),
+            Some(Some(1_792_500_000))
+        );
+        assert_eq!(
+            parse_event_marker(&values["antimalware_detection_epoch"]),
+            Some(None)
+        );
+        assert_eq!(parse_event_marker("unknown"), None);
+        assert_eq!(
             parse_retention(&values["log_retention"]),
             ControlValue::Integer(12)
         );
@@ -667,6 +711,32 @@ mod tests {
         );
         assert_eq!(parse_process_audit(&values["process_audit"]), "off");
         assert_eq!(parse_logging(&values["powershell_logging"]), "off");
+    }
+
+    #[test]
+    fn event_marker_reads_keep_sources_independent() {
+        assert_eq!(
+            parse_event_marker_read(Some("1792500000")),
+            EventMarkerRead::Read(Some(1_792_500_000))
+        );
+        assert_eq!(
+            parse_event_marker_read(Some("none")),
+            EventMarkerRead::Read(None)
+        );
+        assert_eq!(
+            parse_event_marker_read(Some("unknown")),
+            EventMarkerRead::Unknown
+        );
+        assert_eq!(parse_event_marker_read(None), EventMarkerRead::Unknown);
+        let reads = EventMarkerReads {
+            security_log_cleared: parse_event_marker_read(Some("1792500000")),
+            antimalware_detection: parse_event_marker_read(Some("unknown")),
+        };
+        assert_eq!(
+            reads.security_log_cleared,
+            EventMarkerRead::Read(Some(1_792_500_000))
+        );
+        assert_eq!(reads.antimalware_detection, EventMarkerRead::Unknown);
     }
 
     #[test]

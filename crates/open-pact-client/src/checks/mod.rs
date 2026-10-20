@@ -11,8 +11,40 @@ mod windows;
 use std::collections::BTreeMap;
 
 use open_pact_core::{Control, ControlValue, Manifest, Os};
+use serde::{Deserialize, Serialize};
 
 pub use hints::fix_hint;
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct EventMarkers {
+    pub(crate) security_log_cleared: Option<i64>,
+    pub(crate) antimalware_detection: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) enum EventMarkerRead {
+    #[default]
+    Unknown,
+    Read(Option<i64>),
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct EventMarkerReads {
+    pub(crate) security_log_cleared: EventMarkerRead,
+    pub(crate) antimalware_detection: EventMarkerRead,
+}
+
+pub(crate) fn event_markers() -> EventMarkerReads {
+    #[cfg(target_os = "windows")]
+    {
+        windows::event_markers()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        EventMarkerReads::default()
+    }
+}
 
 /// The builtins compiled into this client, by control id and version. A manifest control runs only if
 /// its `check` is exactly `builtin:<id>@<version>` from this table.
