@@ -74,7 +74,7 @@ jobs:
           function Assert-Clean($homePath) {
             if (Get-ScheduledTask -TaskName (Task-Name $homePath) -ErrorAction SilentlyContinue) { throw 'task remains' }
             if (Test-Path (State-Path $homePath)) { throw 'SYSTEM state remains' }
-            if (Get-ChildItem "$env:ProgramFiles/open-pact/open-pact-client.exe*" -ErrorAction SilentlyContinue) { throw 'binary leftovers remain' }
+            if (Get-ChildItem "$env:ProgramFiles/open-pact/open-pact-client.exe*" -Force -ErrorAction SilentlyContinue) { throw 'binary leftovers remain' }
           }
           function Remove-System($homePath) {
             $result = Invoke-Client $homePath @('schedule','uninstall','--system')
@@ -152,6 +152,7 @@ jobs:
             }
             $pending = "$env:ProgramFiles/open-pact/open-pact-client.exe.delete-fictional"
             Set-Content $pending 'fictional leftover'
+            [IO.File]::SetAttributes($pending,[IO.FileAttributes]::Hidden)
             Remove-System $limited
             Write-Output 'native_system_uninstall_retry_replacement_task_and_missing_home_passed'
           } finally {

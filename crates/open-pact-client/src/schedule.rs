@@ -690,7 +690,7 @@ function RemovePendingDeletes($path, $strict = $false) {
     if (-not [IO.Directory]::Exists($path)) { return }
     $failed = [Collections.Generic.List[string]]::new()
     $errorMode = if ($strict) { 'Stop' } else { 'SilentlyContinue' }
-    Get-ChildItem -LiteralPath $path -Filter 'open-pact-client.exe.delete-*' -File -ErrorAction $errorMode | ForEach-Object {
+    Get-ChildItem -LiteralPath $path -Filter 'open-pact-client.exe.delete-*' -File -Force -ErrorAction $errorMode | ForEach-Object {
         try { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop } catch { [void]$failed.Add($_.FullName) }
     }
     if ($strict -and $failed.Count -gt 0) { throw "could not remove SYSTEM binary leftovers: $($failed -join ', ')" }
@@ -871,7 +871,7 @@ try {{
         Write-Output 'The SYSTEM client binary is queued for removal at the next reboot.'
     }}
 }} catch {{ $failure = $_.Exception.Message }}
-$leftovers = @(Get-ChildItem -LiteralPath $install -Filter 'open-pact-client.exe*' -File -ErrorAction Stop)
+$leftovers = @(Get-ChildItem -LiteralPath $install -Filter 'open-pact-client.exe*' -File -Force -ErrorAction Stop)
 if ($leftovers.Count -gt 0) {{
     throw "SYSTEM files remain: $($leftovers.FullName -join ', '). $failure Retry schedule uninstall --system, or reboot for queued files."
 }}
@@ -1774,6 +1774,12 @@ Write-Output 'refused'
         assert!(connected.reconnect_pending);
         assert!(connected.should_send(chrono::Utc::now().timestamp()));
         drop(listener);
+        let reserved = tokio::net::TcpSocket::new_v4().unwrap();
+        reserved.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let refused = reserved.local_addr().unwrap().to_string();
+        let mut config: Config = home.read_json(CONFIG).unwrap().unwrap();
+        config.vpn_probe = refused;
+        save(&home, CONFIG, &config).unwrap();
         run(&home, Command::Run { system: false }).await.unwrap();
         let disconnected: State = home.read_json(STATE).unwrap().unwrap();
         assert!(!disconnected.vpn_up);
