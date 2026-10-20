@@ -488,6 +488,46 @@ mod tests {
     use super::*;
     use serde_json::json;
     #[test]
+    fn windows_mandatory_policy_survives_profile_read_failure() {
+        for (kind, policy, expected) in [
+            (
+                "chrome",
+                json!({"SafeBrowsingProtectionLevel":0}),
+                Protection::Off,
+            ),
+            (
+                "chrome",
+                json!({"SafeBrowsingProtectionLevel":2}),
+                Protection::On,
+            ),
+            ("edge", json!({"SmartScreenEnabled":true}), Protection::On),
+            (
+                "firefox",
+                json!({"policies":{"Preferences":{"browser.safebrowsing.malware.enabled":0}}}),
+                Protection::Off,
+            ),
+            (
+                "firefox",
+                json!({"policies":{"Preferences":{"browser.safebrowsing.malware.enabled":1,"browser.safebrowsing.phishing.enabled":1}}}),
+                Protection::On,
+            ),
+        ] {
+            let browser = json!({"kind":kind,"policy":policy,"unreadable":true});
+            assert_eq!(windows_browser(&browser), expected, "{browser}");
+        }
+        assert_eq!(
+            windows_browser(&json!({"kind":"chrome","policy":{},"unreadable":true})),
+            Protection::Unknown
+        );
+        assert_eq!(
+            windows_browser(
+                &json!({"kind":"firefox","policy":{"policies":{"Preferences":{"browser.safebrowsing.malware.enabled":1}}},"unreadable":true})
+            ),
+            Protection::Unknown
+        );
+    }
+
+    #[test]
     #[cfg(target_os = "macos")]
     fn steer_003_macos_mandatory_policy_survives_malformed_recommendation() {
         let home = tempfile::tempdir().unwrap();

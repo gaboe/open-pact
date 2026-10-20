@@ -657,6 +657,44 @@ mod tests {
     }
 
     #[test]
+    fn disabled_screen_saver_timer_is_not_a_lock() {
+        assert_eq!(parse_screen_saver(Some("1"), Some("1"), Some("0")), "none");
+    }
+
+    #[test]
+    fn windows_iot_releases_have_their_own_lifecycle() {
+        let today = NaiveDate::from_ymd_opt(2026, 10, 20).unwrap();
+        for data in [
+            "22631|23H2|IoTEnterprise|Client",
+            "26100|24H2|IoTEnterprise|Client",
+            "26200|25H2|IoTEnterprise|Client",
+        ] {
+            assert_eq!(parse_os_supported(data, today), "yes", "{data}");
+        }
+        assert_eq!(
+            parse_os_supported("14393|1607|IoTEnterpriseS|Client", today),
+            "no"
+        );
+    }
+
+    #[test]
+    fn supported_servers_use_server_lifecycle() {
+        let today = NaiveDate::from_ymd_opt(2026, 10, 20).unwrap();
+        for data in [
+            "14393|1607|ServerStandard|Server",
+            "17763|1809|ServerDatacenter|Server Core",
+            "20348|21H2|ServerStandard|Server",
+            "26100|24H2|ServerDatacenter|Server",
+        ] {
+            assert_eq!(parse_os_supported(data, today), "yes", "{data}");
+        }
+        assert_eq!(
+            parse_os_supported("99999|future|ServerStandard|Server", today),
+            "unknown"
+        );
+    }
+
+    #[test]
     fn os_supported() {
         let today = NaiveDate::from_ymd_opt(2026, 10, 20).unwrap();
         assert_eq!(
