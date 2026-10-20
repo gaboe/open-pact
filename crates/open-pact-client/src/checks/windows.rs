@@ -61,8 +61,10 @@ Timed 'wua' {
         $session = New-Object -ComObject Microsoft.Update.Session
         $searcher = $session.CreateUpdateSearcher()
         $history = @($searcher.QueryHistory(0, 100) | Where-Object { $_.ResultCode -eq 2 -and $_.Operation -eq 1 } | Sort-Object Date -Descending)
+        if ($env:OPEN_PACT_WINDOWS_TIMINGS -eq '1') { Emit 'wua.history_count' $history.Count }
         $rollupId = '28BC880E-0592-4CBF-8F95-C79B17911D5F'
         $selected = $null
+        $candidateIndex = 0
         foreach ($entry in $history) {
             $updateId = $entry.UpdateIdentity.UpdateID
             $search = $searcher.Search("UpdateID='$updateId'")
@@ -70,12 +72,16 @@ Timed 'wua' {
             $update = $search.Updates.Item(0)
             $categories = @($update.Categories | ForEach-Object { $_.CategoryID })
             $kbIds = @($update.KBArticleIDs)
-            if ($env:OPEN_PACT_WINDOWS_TIMINGS -eq '1') { [Console]::Error.WriteLine("wua.candidate`t$($entry.Date.ToString('yyyy-MM-dd'))|$($kbIds -join ',')|$($categories -join ',')") }
+            if ($env:OPEN_PACT_WINDOWS_TIMINGS -eq '1') { Emit "wua.candidate.$candidateIndex" "$($entry.Date.ToString('yyyy-MM-dd'))|$($kbIds -join ',')|$($categories -join ',')" }
+            $candidateIndex++
             if ($categories -contains $rollupId -or $kbIds -contains '5126646') { $selected = $entry.Date; break }
         }
         if ($null -ne $selected) { Emit 'patch_date' $selected.ToString('yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture) }
         else { Emit 'patch_date' '' }
-    } catch { Emit 'patch_date' '' }
+    } catch {
+        Emit 'patch_date' ''
+        if ($env:OPEN_PACT_WINDOWS_TIMINGS -eq '1') { Emit 'wua.error' $_.Exception.GetType().FullName }
+    }
 }
 "#;
 
@@ -163,6 +169,17 @@ fn value(name: &str) -> Option<&'static str> {
         parse_values(&out)
     });
     values.get(name).map(String::as_str)
+}
+
+#[cfg(windows)]
+pub fn diagnostics() -> Vec<(String, String)> {
+    VALUES
+        .get()
+        .into_iter()
+        .flat_map(|values| values.iter())
+        .filter(|(key, _)| key.starts_with("timing.") || key.starts_with("wua."))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
 }
 
 fn parse_values(out: &str) -> BTreeMap<String, String> {

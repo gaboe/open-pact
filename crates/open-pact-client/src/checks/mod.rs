@@ -208,6 +208,10 @@ mod tests {
         for (id, value) in run_all(os) {
             println!("{id} = {value}");
         }
+        #[cfg(windows)]
+        for (key, value) in windows::diagnostics() {
+            println!("{key} = {value}");
+        }
         println!("elapsed {:?}", started.elapsed());
     }
 }
