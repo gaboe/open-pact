@@ -1,5 +1,5 @@
 use std::fs::{File, OpenOptions};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -176,8 +176,13 @@ fn lock_path(path: &Path) -> Result<ScheduleLock> {
         .read(true)
         .write(true)
         .open(path)?;
-    file.try_lock()
-        .context("another schedule command is running")?;
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            bail!("another schedule command is running");
+        }
+        Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+    }
     Ok(ScheduleLock(file))
 }
 
@@ -199,7 +204,16 @@ fn lock_system_state(home: &Home) -> Result<ScheduleLock> {
     directory.recursive(true);
     directory.create(parent)?;
     let lock = home.0.with_extension("lock");
-    lock_path(&lock).context("SYSTEM report state is in use; retry this command")
+    match lock_path(&lock) {
+        Ok(lock) => Ok(lock),
+        Err(error) if error.to_string().contains("another schedule command is running") => {
+            Err(error).context("SYSTEM report state is in use; retry this command")
+        }
+        Err(error) => Err(error).context(format!(
+            "SYSTEM report state remains at {}; client binary cleanup has not run. Run from an elevated prompt",
+            home.0.display()
+        )),
+    }
 }
 
 fn save<T: Serialize>(home: &Home, name: &str, value: &T) -> Result<()> {
@@ -430,6 +444,56 @@ fn user_home() -> Result<PathBuf> {
         .context("HOME is not set")
 }
 
+fn schedule_home(path: &Path, allow_missing: bool) -> Result<PathBuf> {
+    match std::fs::canonicalize(path) {
+        Ok(path) => Ok(path),
+        Err(error) if allow_missing && error.kind() == std::io::ErrorKind::NotFound => {
+            let absolute = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                std::env::current_dir()?.join(path)
+            };
+            let absolute = normalize_absolute_path(&absolute);
+            let mut existing = absolute.clone();
+            let mut missing = Vec::new();
+            let canonical = loop {
+                match std::fs::canonicalize(&existing) {
+                    Ok(path) => break path,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        if let Some(name) = existing.file_name() {
+                            missing.push(name.to_os_string());
+                            existing.pop();
+                        } else {
+                            return Err(error).context("resolve schedule home");
+                        }
+                    }
+                    Err(error) => return Err(error).context("resolve schedule home"),
+                }
+            };
+            let mut normalized = canonical;
+            for component in missing.iter().rev() {
+                normalized.push(component);
+            }
+            Ok(normalized)
+        }
+        Err(error) => Err(error).context("resolve schedule home"),
+    }
+}
+
+fn normalize_absolute_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            component => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
 fn systemd_dir() -> Result<PathBuf> {
     Ok(match std::env::var_os("XDG_CONFIG_HOME") {
         Some(path) => PathBuf::from(path),
@@ -513,7 +577,7 @@ fn register(job: &Job, action: RegistrationAction) -> Result<()> {
                 )?;
             }
             RegistrationAction::Uninstall => {
-                windows_uninstall(job, false)?;
+                windows_uninstall(job, false, None)?;
             }
         },
     }
@@ -552,6 +616,34 @@ fn windows_powershell(script: &str) -> Result<String> {
         );
     }
     Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+}
+
+#[cfg(test)]
+#[cfg(any(windows, target_os = "macos"))]
+fn run_windows_fixture(script: &str) -> Result<String> {
+    #[cfg(windows)]
+    return windows_powershell(script);
+    #[cfg(not(windows))]
+    {
+        let output = std::process::Command::new("pwsh")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                script,
+            ])
+            .output()
+            .context("start PowerShell fixture")?;
+        if !output.status.success() {
+            bail!(
+                "PowerShell fixture failed with code {:?}: {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+    }
 }
 
 const PROTECTED_DIRECTORY: &str = r#"
@@ -615,9 +707,11 @@ function ResetSystemStateDirectory($path) {
 }
 function RemovePendingDeletes($path) {
     if (-not [IO.Directory]::Exists($path)) { return }
-    Get-ChildItem -LiteralPath $path -Filter 'open-pact-client.exe.delete-*' -File -ErrorAction SilentlyContinue | ForEach-Object {
-        try { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop } catch {}
+    $failed = [Collections.Generic.List[string]]::new()
+    Get-ChildItem -LiteralPath $path -Filter 'open-pact-client.exe.delete-*' -File -ErrorAction Stop | ForEach-Object {
+        try { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop } catch { [void]$failed.Add($_.FullName) }
     }
+    if ($failed.Count -gt 0) { throw "could not remove SYSTEM binary leftovers: $($failed -join ', ')" }
 }
 function IsSystemTask($task) {
     $user = $task.Definition.Principal.UserId
@@ -702,13 +796,19 @@ try {{ $task = $folder.GetTask({id}) }} catch {{
     if (($failure.HResult -band 0xffff) -ne 2) {{ throw }}
     $task = $null
 }}
-if ($null -ne $task -and (IsSystemTask $task)) {{ Write-Output 'system' }} else {{ Write-Output 'user-or-missing' }}
+if ($null -eq $task) {{ Write-Output 'missing' }}
+elseif (IsSystemTask $task) {{ Write-Output 'system' }}
+else {{ Write-Output 'user' }}
 "#,
         id = powershell_literal(&job.id)
     )
 }
 
-fn windows_uninstall_script(job: &Job, expected_system: bool) -> String {
+fn windows_uninstall_script(
+    job: &Job,
+    expected_system: bool,
+    cleanup_state: Option<&Path>,
+) -> String {
     format!(
         r#"{PROTECTED_DIRECTORY}
 $service = New-Object -ComObject 'Schedule.Service'
@@ -722,15 +822,17 @@ try {{ $task = $folder.GetTask({id}) }} catch {{
 }}
 $wasSystem = $null -ne $task -and (IsSystemTask $task)
 if ($wasSystem -ne {expected_system}) {{ throw 'scheduled task changed during uninstall; retry schedule uninstall' }}
-if ($wasSystem) {{
+$cleanupSystem = $wasSystem -or {retry_cleanup}
+if ($cleanupSystem) {{
+    ResetSystemStateDirectory {state}
     $program = ProgramFilesPath
     AssertProtected $program
     $install = Join-Path $program 'open-pact'
     if (Test-Path -LiteralPath $install) {{ AssertProtected $install; RemovePendingDeletes $install }}
 }}
 if ($null -ne $task) {{ $folder.DeleteTask({id},0); Write-Output '__OPEN_PACT_TASK_REMOVED__' }}
-if ($wasSystem) {{
-    Write-Output '__OPEN_PACT_REMOVED_SYSTEM__'
+if ($cleanupSystem) {{
+    if ($wasSystem) {{ Write-Output '__OPEN_PACT_REMOVED_SYSTEM__' }}
     try {{
         $remaining = @($folder.GetTasks(1) | Where-Object {{ $_.Name.StartsWith('org.open-pact.report.') -and (IsSystemTask $_) }})
         if ($remaining.Count -eq 0) {{
@@ -743,36 +845,94 @@ if ($wasSystem) {{
         }} else {{ Write-Output 'Kept the shared SYSTEM binary because another SYSTEM task remains.' }}
     }} catch {{
         Write-Output '__OPEN_PACT_BINARY_REMOVAL_FAILED__'
-        Write-Output "SYSTEM task removal succeeded, but client binary cleanup failed: $($_.Exception.Message)"
+        $leftovers = @()
+        if ([IO.Directory]::Exists($install)) {{ $leftovers = @(Get-ChildItem -LiteralPath $install -Filter 'open-pact-client.exe*' -File -ErrorAction SilentlyContinue | ForEach-Object {{ $_.FullName }}) }}
+        Write-Output "SYSTEM cleanup remains pending at {state}; protected directory is $install; files remain: $($leftovers -join ', '): $($_.Exception.Message)"
     }}
 }} elseif ($null -ne $task) {{
     Write-Output '__OPEN_PACT_REMOVED_USER__'
 }}
 "#,
         id = powershell_literal(&job.id),
-        expected_system = if expected_system { "$true" } else { "$false" }
+        expected_system = if expected_system { "$true" } else { "$false" },
+        retry_cleanup = if cleanup_state.is_some() {
+            "$true"
+        } else {
+            "$false"
+        },
+        state = cleanup_state
+            .map(|path| powershell_literal(&path.to_string_lossy()))
+            .unwrap_or_else(|| "''".to_owned()),
     )
 }
 
-fn windows_task_is_system(job: &Job) -> Result<bool> {
-    Ok(windows_powershell(&windows_task_kind_script(job))? == "system")
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WindowsTaskIdentity {
+    System,
+    User,
+    Missing,
 }
 
-fn windows_uninstall(job: &Job, expected_system: bool) -> Result<(bool, bool, bool)> {
-    let output = windows_powershell(&windows_uninstall_script(job, expected_system))?;
-    let mut removed = false;
+fn windows_task_identity(job: &Job) -> Result<WindowsTaskIdentity> {
+    match windows_powershell(&windows_task_kind_script(job))?.as_str() {
+        "system" => Ok(WindowsTaskIdentity::System),
+        "user" => Ok(WindowsTaskIdentity::User),
+        "missing" => Ok(WindowsTaskIdentity::Missing),
+        _ => bail!("unexpected Windows task identity"),
+    }
+}
+
+fn windows_existing_system_state(home: &Path) -> Result<Option<PathBuf>> {
+    let absolute = schedule_home(home, true)?;
+    validate_windows_home(&absolute)?;
+    let hash = hex::encode(Sha256::digest(text(&absolute)?.as_bytes()));
+    let script = format!(
+        r#"{PROTECTED_DIRECTORY}
+$data = Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'open-pact'
+$system = Join-Path $data 'system'
+$state = Join-Path $system '{hash}'
+try {{
+    if ([IO.Directory]::Exists($data)) {{ AssertProtected $data }}
+    if ([IO.Directory]::Exists($system)) {{ AssertProtected $system }}
+    $attributes = [IO.File]::GetAttributes($state)
+    if (-not ($attributes -band [IO.FileAttributes]::Directory)) {{ throw 'SYSTEM report state path is not a directory' }}
+    AssertProtected $state
+    Write-Output $state
+}} catch {{
+    if (($_.Exception.HResult -band 0xffff) -in @(2,3)) {{ Write-Output '__OPEN_PACT_STATE_MISSING__' }} else {{ throw "SYSTEM report state may remain at ${{state}}: $($_.Exception.Message)" }}
+}}
+"#
+    );
+    let output = windows_powershell(&script)?;
+    if output == "__OPEN_PACT_STATE_MISSING__" {
+        Ok(None)
+    } else {
+        Ok(Some(PathBuf::from(output)))
+    }
+}
+
+fn windows_uninstall(
+    job: &Job,
+    expected_system: bool,
+    cleanup_state: Option<&Path>,
+) -> Result<(bool, bool)> {
+    let output = windows_powershell(&windows_uninstall_script(
+        job,
+        expected_system,
+        cleanup_state,
+    ))?;
     let mut removed_system = false;
     let mut binary_cleanup_failed = false;
     for line in output.lines() {
         match line {
-            "__OPEN_PACT_TASK_REMOVED__" => removed = true,
+            "__OPEN_PACT_TASK_REMOVED__" => {}
             "__OPEN_PACT_REMOVED_SYSTEM__" => removed_system = true,
             "__OPEN_PACT_BINARY_REMOVAL_FAILED__" => binary_cleanup_failed = true,
             "__OPEN_PACT_REMOVED_USER__" => {}
             message => println!("{message}"),
         }
     }
-    Ok((removed, removed_system, binary_cleanup_failed))
+    Ok((removed_system, binary_cleanup_failed))
 }
 
 fn validate_system_install(system: bool, os: open_pact_core::Os) -> Result<()> {
@@ -793,7 +953,8 @@ pub(crate) async fn run(home: &Home, command: Command) -> Result<()> {
     if system_run {
         validate_system_install(true, os)?;
     }
-    let absolute = std::fs::canonicalize(&home.0)?;
+    let uninstall = matches!(&command, Command::Uninstall);
+    let absolute = schedule_home(&home.0, uninstall)?;
     let home = Home(absolute);
     let system_install = matches!(&command, Command::Install { system: true, .. });
     if let Command::Install {
@@ -813,11 +974,17 @@ pub(crate) async fn run(home: &Home, command: Command) -> Result<()> {
         } else {
             None
         };
-    let system_uninstall = uninstall_job
+    let task_identity = uninstall_job
         .as_ref()
-        .map(windows_task_is_system)
+        .map(windows_task_identity)
         .transpose()?
-        .unwrap_or(false);
+        .unwrap_or(WindowsTaskIdentity::User);
+    let system_uninstall = task_identity == WindowsTaskIdentity::System;
+    let retry_state = if task_identity == WindowsTaskIdentity::Missing {
+        windows_existing_system_state(&home.0)?
+    } else {
+        None
+    };
     let protected_paths = if os == open_pact_core::Os::Windows
         && (system_run || system_install || system_uninstall)
     {
@@ -825,19 +992,27 @@ pub(crate) async fn run(home: &Home, command: Command) -> Result<()> {
     } else {
         None
     };
+    let cleanup_state = protected_paths
+        .as_ref()
+        .map(|(_, state)| state.as_path())
+        .or(retry_state.as_deref());
     let state_home = protected_paths
         .as_ref()
         .map(|(_, state)| Home(state.clone()))
+        .or_else(|| retry_state.as_ref().map(|state| Home(state.clone())))
         .unwrap_or_else(|| Home(home.0.clone()));
-    let _home_lock = if system_install || system_uninstall {
+    let home_exists = home.0.exists();
+    let _home_lock = if system_install || system_uninstall && home_exists {
         Some(lock(&Home(home.0.clone()))?)
     } else {
         None
     };
-    let _lock = if system_run || system_install || system_uninstall {
-        lock_system_state(&state_home)?
+    let _lock = if system_run || system_install || system_uninstall || retry_state.is_some() {
+        Some(lock_system_state(&state_home)?)
+    } else if !uninstall || home_exists {
+        Some(lock(&state_home)?)
     } else {
-        lock(&state_home)?
+        None
     };
     match command {
         Command::Probe { .. } => unreachable!(),
@@ -901,28 +1076,37 @@ pub(crate) async fn run(home: &Home, command: Command) -> Result<()> {
         Command::Uninstall => {
             let job = uninstall_job.unwrap_or(Job::new(&std::env::current_exe()?, &home.0)?);
             if os == open_pact_core::Os::Windows {
-                let (removed, removed_system, binary_cleanup_failed) =
-                    windows_uninstall(&job, system_uninstall)?;
-                if removed && removed_system {
-                    std::fs::remove_dir_all(&state_home.0).context(
-                        "SYSTEM task was removed, but SYSTEM report state cleanup failed",
-                    )?;
-                }
+                let (removed_system, binary_cleanup_failed) =
+                    windows_uninstall(&job, system_uninstall, cleanup_state)?;
                 if binary_cleanup_failed {
-                    bail!("SYSTEM task and state were removed, but client binary cleanup failed");
+                    let state_path = cleanup_state
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| "SYSTEM state".to_owned());
+                    bail!("SYSTEM cleanup failed; report state remains at {state_path}");
+                }
+                if cleanup_state.is_some() && (removed_system || retry_state.is_some()) {
+                    std::fs::remove_dir_all(&state_home.0).context(
+                        "SYSTEM task cleanup completed, but SYSTEM report state remains",
+                    )?;
                 }
             } else {
                 register(&job, RegistrationAction::Uninstall)?;
             }
-            for name in [
-                CONFIG,
-                STATE,
-                "report-state.json.tmp",
-                "report-schedule.json.tmp",
-            ] {
-                remove_if_exists(&home.file(name))?;
+            if home_exists {
+                for name in [
+                    CONFIG,
+                    STATE,
+                    "report-state.json.tmp",
+                    "report-schedule.json.tmp",
+                ] {
+                    remove_if_exists(&home.file(name))?;
+                }
             }
-            println!("Removed {} and its report configuration and state.", job.id);
+            if home_exists {
+                println!("Removed {} and its report configuration and state.", job.id);
+            } else {
+                println!("Removed {}. The home directory does not exist.", job.id);
+            }
         }
     }
     Ok(())
@@ -931,6 +1115,43 @@ pub(crate) async fn run(home: &Home, command: Command) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_home_keeps_the_install_task_identifier() {
+        let dir = tempfile::tempdir().unwrap();
+        let home_path = dir.path().join("fictional-home");
+        std::fs::create_dir(&home_path).unwrap();
+        let install_home = schedule_home(&home_path, false).unwrap();
+        let install_job = Job::new(Path::new("client"), &install_home).unwrap();
+        std::fs::remove_dir(&home_path).unwrap();
+        let uninstall_home = schedule_home(&home_path, true).unwrap();
+        let uninstall_job = Job::new(Path::new("client"), &uninstall_home).unwrap();
+        assert_eq!(install_home, uninstall_home);
+        assert_eq!(install_job.id, uninstall_job.id);
+        assert!(!home_path.exists());
+    }
+
+    #[test]
+    fn launchd_label_uses_the_install_task_identifier() {
+        let job = Job::new(Path::new("client"), Path::new("/fictional/home")).unwrap();
+        assert!(
+            job.plist()
+                .contains(&format!("<string>{}</string>", job.id))
+        );
+    }
+
+    #[test]
+    fn systemd_names_use_the_install_task_identifier() {
+        let job = Job::new(Path::new("client"), Path::new("/fictional/home")).unwrap();
+        assert!(job.timer().contains(&format!("Unit={}.service", job.id)));
+    }
+
+    #[test]
+    fn schtasks_name_uses_the_install_task_identifier() {
+        let job = Job::new(Path::new("client"), Path::new("C:\\Fictional\\home")).unwrap();
+        let args = job.schtasks_install(TaskRunAs::CurrentUser);
+        assert_eq!(args[2], job.id);
+    }
 
     #[test]
     fn windows_home_keeps_literal_percent_out_of_task_actions() {
@@ -954,7 +1175,7 @@ mod tests {
     #[test]
     fn uninstall_distinguishes_denied_missing_and_existing_tasks() {
         let job = Job::new(Path::new("client.exe"), Path::new("fixture-home")).unwrap();
-        let action = windows_uninstall_script(&job, false);
+        let action = windows_uninstall_script(&job, false, None);
         let setup = r#"
 $script:deleted = $false
 $script:failure = 5
@@ -1002,7 +1223,7 @@ function New-Object {
     #[test]
     fn current_user_uninstall_ignores_an_admin_only_program_directory() {
         let job = Job::new(Path::new("client.exe"), Path::new("fixture-home")).unwrap();
-        let action = windows_uninstall_script(&job, false);
+        let action = windows_uninstall_script(&job, false, None);
         let setup = r#"
 $script:deleted = $false
 $script:program = Join-Path $env:TEMP ('open-pact-fictional-program-' + [Guid]::NewGuid().ToString('N'))
@@ -1039,6 +1260,79 @@ Write-Output 'limited_uninstall_removed_task_without_protected_access'
         assert_eq!(
             windows_powershell(&script).unwrap(),
             "limited_uninstall_removed_task_without_protected_access"
+        );
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn system_uninstall_retries_binary_and_state_cleanup_from_persisted_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("fictional-system-state");
+        std::fs::create_dir(&state).unwrap();
+        let job = Job::new(Path::new("client.exe"), Path::new("C:\\Fictional\\home")).unwrap();
+        let program = dir.path().join("fictional-program-files");
+        let install = program.join("open-pact");
+        std::fs::create_dir_all(&install).unwrap();
+        let binary = install.join("open-pact-client.exe");
+        std::fs::write(&binary, "fictional client binary").unwrap();
+        let setup = format!(
+            r#"
+$script:program = {}
+$script:queueFails = $true
+function New-Object {{
+    param([string]$ComObject)
+    if ($ComObject -ne 'Schedule.Service') {{ throw 'unexpected COM creation' }}
+    $folder = [pscustomobject]@{{}}
+    $folder | Add-Member ScriptMethod GetTask {{ param($id); throw [Runtime.InteropServices.COMException]::new('missing task', 0x80070002) }}
+    $folder | Add-Member ScriptMethod DeleteTask {{ param($id,$flags); throw 'missing task must not be deleted' }}
+    $folder | Add-Member ScriptMethod GetTasks {{ param($flags); return ,@() }}
+    $service = [pscustomobject]@{{ Folder = $folder }}
+    $service | Add-Member ScriptMethod Connect {{}}
+    $service | Add-Member ScriptMethod GetFolder {{ param($path); return $this.Folder }}
+    return $service
+}}
+"#,
+            powershell_literal(&program.to_string_lossy()),
+        );
+        let hooks = format!(
+            r#"
+function ProgramFilesPath {{ return $script:program }}
+function AssertProtected($path) {{}}
+function ResetSystemStateDirectory($path) {{ if ($path -ne {}) {{ throw 'unexpected SYSTEM state path' }} }}
+function RemovePendingDeletes($path) {{}}
+function QueueBinaryRemoval($path) {{ if ($script:queueFails) {{ throw 'fictional queue failure' }}; Remove-Item -LiteralPath $path -Force }}
+"#,
+            powershell_literal(&state.to_string_lossy()),
+        );
+        let action = windows_uninstall_script(&job, false, Some(&state)).replacen(
+            "$service = New-Object -ComObject 'Schedule.Service'",
+            &format!("{hooks}\n$service = New-Object -ComObject 'Schedule.Service'"),
+            1,
+        );
+        let checks = r#"
+$first = @(& $action)
+if ($first -notcontains '__OPEN_PACT_BINARY_REMOVAL_FAILED__') { throw 'failed queue did not retain retry status' }
+if (-not (Test-Path -LiteralPath $state)) { throw 'SYSTEM state did not remain after queue failure' }
+$script:queueFails = $false
+$second = @(& $action)
+if (Test-Path -LiteralPath $binary) { throw 'retry left the SYSTEM binary behind' }
+if (-not (Test-Path -LiteralPath $state)) { throw 'retry marker disappeared before Rust cleanup' }
+$third = @(& $action)
+if ($third -contains '__OPEN_PACT_BINARY_REMOVAL_FAILED__') { throw 'state cleanup retry failed' }
+if (-not (Test-Path -LiteralPath $state)) { throw 'state marker disappeared before Rust cleanup retry' }
+Write-Output 'retry_used_persisted_state_after_binary_and_state_cleanup_failures'
+"#;
+        let script = format!(
+            "{}\n$state = {}\n$binary = {}\n$action = {{\n{}\n}}\n{}",
+            setup,
+            powershell_literal(&state.to_string_lossy()),
+            powershell_literal(&binary.to_string_lossy()),
+            action,
+            checks,
+        );
+        assert_eq!(
+            run_windows_fixture(&script).unwrap(),
+            "retry_used_persisted_state_after_binary_and_state_cleanup_failures"
         );
     }
 
@@ -1662,7 +1956,7 @@ Write-Output 'refused'
     #[test]
     fn windows_uninstall_limits_protected_cleanup_to_a_system_task() {
         let job = Job::new(Path::new("client.exe"), Path::new("fixture-home")).unwrap();
-        let script = windows_uninstall_script(&job, true);
+        let script = windows_uninstall_script(&job, true, Some(Path::new("C:\\Fictional\\state")));
         let program_files = script.find("$program = ProgramFilesPath").unwrap();
         let system_guard = script
             .find("$wasSystem = $null -ne $task -and (IsSystemTask $task)")
