@@ -173,6 +173,10 @@ function EventDate($log, $xpath, $newest) {
     } finally { $reader.Dispose() }
 }
 RunSection {
+    try { Emit 'security_log_cleared_epoch' (EventEpoch (EventDate 'Security' '*[System[EventID=1102]]' $true)) }
+    catch { Emit 'security_log_cleared_epoch' 'unknown' }
+}
+RunSection {
     try {
         if (-not $admin) { throw 'Privilege required' }
         $security = Age (EventDate 'Security' '*' $false) 'days'
@@ -185,8 +189,7 @@ RunSection {
         $clears = @($securityClear; EventDate 'System' '*[System[EventID=104]]' $true) | Where-Object { $null -ne $_ }
         if (@($clears).Count -eq 0) { Emit 'log_cleared' 'none' }
         else { Emit 'log_cleared' (Age ($clears | Sort-Object -Descending | Select-Object -First 1) 'hours') }
-        Emit 'security_log_cleared_epoch' (EventEpoch $securityClear)
-    } catch { Emit 'log_cleared' 'unknown'; Emit 'security_log_cleared_epoch' 'unknown' }
+    } catch { Emit 'log_cleared' 'unknown' }
 }
 RunSection {
     try {

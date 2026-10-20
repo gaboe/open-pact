@@ -21,25 +21,28 @@ pub(crate) struct EventMarkers {
     pub(crate) antimalware_detection: Option<i64>,
 }
 
-impl EventMarkers {
-    pub(crate) fn has_newer_than(&self, previous: &Self) -> bool {
-        newer(self.security_log_cleared, previous.security_log_cleared)
-            || newer(self.antimalware_detection, previous.antimalware_detection)
-    }
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) enum EventMarkerRead {
+    #[default]
+    Unknown,
+    Read(Option<i64>),
 }
 
-fn newer(current: Option<i64>, previous: Option<i64>) -> bool {
-    current.is_some_and(|current| previous.is_none_or(|previous| current > previous))
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct EventMarkerReads {
+    pub(crate) security_log_cleared: EventMarkerRead,
+    pub(crate) antimalware_detection: EventMarkerRead,
 }
 
-pub(crate) fn event_markers() -> Option<EventMarkers> {
+pub(crate) fn event_markers() -> EventMarkerReads {
     #[cfg(target_os = "windows")]
     {
         windows::event_markers()
     }
     #[cfg(not(target_os = "windows"))]
     {
-        None
+        EventMarkerReads::default()
     }
 }
 
