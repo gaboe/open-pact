@@ -305,6 +305,7 @@ impl WindowsKey {
             }
             check(status)?;
             let key = Handle(raw);
+            Self::export_public(&key)?;
             check(unsafe { NCryptDeleteKey(key.0, NCRYPT_SILENT_FLAG) })?;
             std::mem::forget(key);
             super::remove_if_present(&marker)
