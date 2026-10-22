@@ -150,7 +150,8 @@ impl WindowsKey {
                 0,
                 FLAGS,
             )
-        })?;
+        })
+        .context("create machine-scope CNG key")?;
         let key = Handle(raw);
         let result = (|| {
             check(unsafe {
@@ -161,7 +162,8 @@ impl WindowsKey {
                     4,
                     0,
                 )
-            })?;
+            })
+            .context("set CNG key export policy")?;
             check(unsafe {
                 NCryptSetProperty(
                     key.0,
@@ -170,8 +172,10 @@ impl WindowsKey {
                     4,
                     0,
                 )
-            })?;
-            check(unsafe { NCryptFinalizeKey(key.0, NCRYPT_SILENT_FLAG) })?;
+            })
+            .context("set CNG key signing usage")?;
+            check(unsafe { NCryptFinalizeKey(key.0, NCRYPT_SILENT_FLAG) })
+                .context("finalize machine-scope CNG key")?;
             grant_user_and_system(&key)?;
             let public = Self::export_public(&key)?;
             // The marker contains no key material. A failed marker write must not orphan a key.
