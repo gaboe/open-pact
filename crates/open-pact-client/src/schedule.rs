@@ -81,6 +81,8 @@ struct State {
     #[serde(default)]
     last_compliance: Option<BTreeMap<String, bool>>,
     #[serde(default)]
+    last_observed_compliance: Option<BTreeMap<String, bool>>,
+    #[serde(default)]
     event_pending: bool,
 }
 
@@ -121,13 +123,17 @@ impl State {
     }
 
     fn observe_compliance(&mut self, current: &BTreeMap<String, bool>) {
-        if let Some(previous) = &self.last_compliance
+        if let Some(previous) = self
+            .last_observed_compliance
+            .as_ref()
+            .or(self.last_compliance.as_ref())
             && current
                 .iter()
                 .any(|(id, compliant)| !compliant && previous.get(id) == Some(&true))
         {
             self.event_pending = true;
         }
+        self.last_observed_compliance = Some(current.clone());
     }
 
     fn report_type(&self, now: i64) -> Option<report::ReportType> {
@@ -1951,26 +1957,21 @@ Write-Output 'refused'
 
         state.observe_compliance(&map(false));
         assert_eq!(state.report_type(101), Some(report::ReportType::Event));
-        state.sent(
-            true,
-            101,
-            checks::EventMarkerReads::default(),
-            map(false),
-        );
+        state.sent(true, 101, checks::EventMarkerReads::default(), map(false));
         assert!(!state.event_pending);
 
         state.observe_compliance(&map(true));
         assert_eq!(state.report_type(102), None);
+        state = serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
         state.observe_compliance(&map(false));
         assert_eq!(state.report_type(103), Some(report::ReportType::Event));
     }
 
     #[test]
     fn first_observed_compliance_sample_seeds_upgrade_baseline() {
-        let mut state: State = serde_json::from_str(
-            r#"{"vpn_up":true,"reconnect_pending":false,"last_success":100}"#,
-        )
-        .unwrap();
+        let mut state: State =
+            serde_json::from_str(r#"{"vpn_up":true,"reconnect_pending":false,"last_success":100}"#)
+                .unwrap();
         let compliant = BTreeMap::from([("required_control".into(), true)]);
         let failing = BTreeMap::from([("required_control".into(), false)]);
 
@@ -2032,6 +2033,7 @@ Write-Output 'refused'
                 .unwrap();
         assert_eq!(state.last_success, Some(123));
         assert_eq!(state.last_events, None);
+        assert_eq!(state.last_observed_compliance, None);
     }
 
     #[test]
