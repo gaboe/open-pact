@@ -24,7 +24,7 @@ This page lists the built-in controls in `crates/open-pact-client/src/checks/mod
 | `powershell_logging` | `n/a` | `on`, `off`, or `unknown` | `n/a` | Run as the device user with registry read access. |
 | `log_cleared_hours` | `n/a` | Integer hours, `none`, or `unknown` from Security and System logs | `n/a` | Windows needs administrator or SYSTEM access to read both logs. |
 | VPN certificate installation | Supported | Supported; `vpn\current` pointer, flat copies can lag while another program holds them open | Supported | Device user. |
-| Device key protection | `secure_enclave` or `os_permissions` | `os_permissions` | `os_permissions` | Device user. |
+| Device key protection | `secure_enclave` or `os_permissions` | `tpm` or `os_permissions` | `os_permissions` | Joining user and SYSTEM on Windows. |
 | Report scheduler | launchd LaunchAgent, every five minutes | Task Scheduler, every five minutes; limited user or SYSTEM | systemd user timer, every five minutes | Windows SYSTEM install and uninstall need an elevated prompt. Linux needs a running user manager. |
 
 When a control returns `n/a`, the client sends `n/a` only if the manifest allows that value. Otherwise, it sends `unknown` when the manifest allows `unknown`. If neither value is allowed, the client omits the result. An omitted required result can cause the gateway to deny the claim.
@@ -41,7 +41,23 @@ Defender controls require Microsoft Defender Antivirus in Normal mode with the s
 
 On macOS, `join` uses an existing software key if one is present. Otherwise, it tries to create the device key in the Secure Enclave unless you pass `--software-key`. If Secure Enclave creation fails, the client warns and creates a software key. The client stores a wrapped key file in its home directory when it uses the Secure Enclave. That key cannot leave the Mac. The gateway records every claim as verified trust level `L0`.
 
-On Windows and Linux, and on macOS with `--software-key`, the device key is a software key protected by operating-system file permissions. These keys report protection `os_permissions` and trust level `L0`. The owner signing key and VPN certificate key are software keys on every platform.
+On Linux, and on Windows or macOS with `--software-key`, the device key is a software key protected by operating-system file permissions. These keys report protection `os_permissions` and trust level `L0`. The owner signing key and VPN certificate key are software keys on every platform.
+
+On Windows, a new join tries the Microsoft Platform Crypto Provider for a persisted,
+non-exportable ECDSA P-256 TPM key. Only its public key leaves the provider.
+The home holds a key-name marker in `device-tpm.key`, not private key material.
+The machine-scope key ACL grants access to the joining user and SYSTEM.
+Both limited user tasks and SYSTEM tasks can sign for that home. Other users do not receive access.
+Machine-key creation may require elevation. If creation or ACL setup fails, the client warns
+and creates an `os_permissions` software key. `--software-key` forces software for a new home.
+An existing software key stays in use. To rotate to TPM, join again with a new home and
+replace the old enrolment and scheduler registration. Copying the marker to another machine
+cannot move the private key. Losing the marker or clearing the TPM requires a new join.
+TPM claims request `L1`, like Secure Enclave claims. The gateway still records verified `L0`
+because a key-protection label does not prove hardware attestation.
+Windows CI tests the same CNG operations with the Microsoft Software Key Storage Provider,
+including private-export refusal and signing under a standard user and SYSTEM.
+Real TPM signing remains unverified until `windows_tpm_roundtrip` runs on a TPM machine.
 
 ## Schedule support
 

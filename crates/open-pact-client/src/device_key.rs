@@ -10,11 +10,18 @@ use open_pact_core::{
 #[cfg(target_os = "macos")]
 use crate::secure_enclave::SecureEnclaveKey;
 
+#[cfg(windows)]
+#[path = "windows_key.rs"]
+mod windows_key;
+
+const TPM_FILE: &str = "device-tpm.key";
 const SOFTWARE_FILE: &str = "device-dev.pem";
 const SECURE_ENCLAVE_FILE: &str = "device-se.key";
 
 pub enum DeviceKey {
     Software(SigningKey),
+    #[cfg(windows)]
+    Tpm(windows_key::WindowsKey),
     #[cfg(target_os = "macos")]
     SecureEnclave(SecureEnclaveKey),
 }
@@ -22,6 +29,12 @@ pub enum DeviceKey {
 impl DeviceKey {
     /// The key `join` created. Never creates one.
     pub fn load(home: &Path) -> Result<Self> {
+        if home.join(TPM_FILE).exists() {
+            #[cfg(windows)]
+            return Ok(Self::Tpm(windows_key::WindowsKey::load(home)?));
+            #[cfg(not(windows))]
+            bail!("{} needs the Windows TPM key store", home.display());
+        }
         let blob_path = home.join(SECURE_ENCLAVE_FILE);
         if blob_path.exists() {
             #[cfg(target_os = "macos")]
@@ -36,8 +49,16 @@ impl DeviceKey {
         Ok(Self::Software(dev_key::from_pem(pem)?))
     }
 
-    /// Reuses the key on disk. A new key goes into the Secure Enclave when there is one, unless `software`.
+    /// Reuses the existing key. Tries platform hardware for a new key unless `software`.
     pub fn load_or_create(home: &Path, software: bool) -> Result<Self> {
+        if home.join(TPM_FILE).exists() {
+            if software {
+                bail!(
+                    "this home already holds a TPM device key; use a new --home for a software key"
+                );
+            }
+            return Self::load(home);
+        }
         if home.join(SECURE_ENCLAVE_FILE).exists() {
             if software {
                 bail!(
@@ -48,6 +69,13 @@ impl DeviceKey {
             return Self::load(home);
         }
         let pem = home.join(SOFTWARE_FILE);
+        #[cfg(windows)]
+        if !software && !pem.exists() {
+            match windows_key::WindowsKey::create(home) {
+                Ok(key) => return Ok(Self::Tpm(key)),
+                Err(e) => eprintln!("No TPM key ({e:#}); using a software device key."),
+            }
+        }
         #[cfg(target_os = "macos")]
         if !software && !pem.exists() {
             match SecureEnclaveKey::create() {
@@ -64,6 +92,8 @@ impl DeviceKey {
     pub fn public_key(&self) -> PublicKey {
         match self {
             Self::Software(key) => PublicKey::from(key),
+            #[cfg(windows)]
+            Self::Tpm(key) => key.public_key().clone(),
             #[cfg(target_os = "macos")]
             Self::SecureEnclave(key) => key.public_key().clone(),
         }
@@ -72,14 +102,28 @@ impl DeviceKey {
     pub fn trust_level(&self) -> TrustLevel {
         match self {
             Self::Software(_) => TrustLevel::L0,
+            #[cfg(windows)]
+            Self::Tpm(_) => TrustLevel::L1,
             #[cfg(target_os = "macos")]
             Self::SecureEnclave(_) => TrustLevel::L1,
+        }
+    }
+
+    pub fn protection(&self) -> &'static str {
+        match self {
+            Self::Software(_) => "os_permissions",
+            #[cfg(windows)]
+            Self::Tpm(_) => "tpm",
+            #[cfg(target_os = "macos")]
+            Self::SecureEnclave(_) => "secure_enclave",
         }
     }
 
     pub fn describe(&self) -> &'static str {
         match self {
             Self::Software(_) => "software key file",
+            #[cfg(windows)]
+            Self::Tpm(_) => "TPM",
             #[cfg(target_os = "macos")]
             Self::SecureEnclave(_) => "Secure Enclave",
         }
@@ -88,6 +132,8 @@ impl DeviceKey {
     pub fn sign(&self, message: &[u8]) -> Result<Signature> {
         match self {
             Self::Software(key) => Ok(Signature::sign(key, message)),
+            #[cfg(windows)]
+            Self::Tpm(key) => key.sign(message),
             #[cfg(target_os = "macos")]
             Self::SecureEnclave(key) => key.sign(message),
         }
@@ -109,7 +155,7 @@ mod tests {
 
     use super::*;
 
-    fn claim_for(key: &DeviceKey, nonce: usize) -> Claim {
+    pub(super) fn claim_for(key: &DeviceKey, nonce: usize) -> Claim {
         let device_key = key.public_key();
         Claim {
             manifest: ManifestHash::of(b"manifest_version = 1\n"),
@@ -127,7 +173,7 @@ mod tests {
         }
     }
 
-    fn enrol(key: &DeviceKey) -> EnrolRequest {
+    pub(super) fn enrol(key: &DeviceKey) -> EnrolRequest {
         let toml = include_str!("../../../examples/manifest.toml");
         let hash = ManifestHash::of(toml.as_bytes());
         let owner = dev_key::generate();
@@ -184,6 +230,16 @@ mod tests {
     fn software_flag_refuses_a_home_with_a_secure_enclave_key() {
         let home = tempfile::tempdir().unwrap();
         std::fs::write(home.path().join(SECURE_ENCLAVE_FILE), b"blob").unwrap();
+        assert!(DeviceKey::load_or_create(home.path(), true).is_err());
+        assert!(!home.path().join(SOFTWARE_FILE).exists());
+    }
+
+    #[test]
+    fn tpm_marker_never_silently_becomes_a_software_key() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join(TPM_FILE), b"invalid-key-name").unwrap();
+        assert!(DeviceKey::load(home.path()).is_err());
+        assert!(DeviceKey::load_or_create(home.path(), false).is_err());
         assert!(DeviceKey::load_or_create(home.path(), true).is_err());
         assert!(!home.path().join(SOFTWARE_FILE).exists());
     }

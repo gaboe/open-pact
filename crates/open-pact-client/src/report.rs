@@ -61,11 +61,7 @@ impl Report {
             solution: format!("open-pact {}", env!("CARGO_PKG_VERSION")),
             os,
             os_version,
-            key_protection: match key {
-                DeviceKey::Software(_) => "os_permissions",
-                #[cfg(target_os = "macos")]
-                DeviceKey::SecureEnclave(_) => "secure_enclave",
-            },
+            key_protection: key.protection(),
             results: result_values(results)?,
         })
     }
