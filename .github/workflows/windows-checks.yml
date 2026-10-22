@@ -77,7 +77,7 @@ jobs:
             $arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$worker`" -root `"$root`" -action create -identity elevated"
             $principal = New-ScheduledTaskPrincipal -UserId $credential.UserName -LogonType Password -RunLevel Highest
             $command = New-ScheduledTaskAction -Execute powershell.exe -Argument $arguments
-            Register-ScheduledTask -TaskName $task -Action $command -Principal $principal -User $credential.UserName -Password $credential.GetNetworkCredential().Password | Out-Null
+            Register-ScheduledTask -TaskName $task -InputObject (New-ScheduledTask -Action $command -Principal $principal) -User $credential.UserName -Password ($credential.GetNetworkCredential().Password) | Out-Null
             Start-ScheduledTask -TaskName $task
             $deadline = (Get-Date).AddMinutes(2)
             while (-not (Test-Path (Join-Path $root 'elevated-create.ok')) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 1 }
