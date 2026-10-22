@@ -10,6 +10,7 @@ use windows_sys::Win32::{
     Security::{
         Authorization::{
             ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+            GetNamedSecurityInfoW, SE_FILE_OBJECT,
         },
         Cryptography::*,
         *,
