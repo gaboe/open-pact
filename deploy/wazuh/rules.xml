@@ -20,12 +20,12 @@
   </rule>
   <rule id="100504" level="10">
     <if_sid>100500</if_sid>
-    <field name="open_pact.result_antimalware_detections_7d" type="pcre2">^[1-9][0-9]*$</field>
-    <description>open-pact antimalware detected threats in the last 7 days</description>
+    <field name="open_pact.result_antimalware_active_threats" type="pcre2">^[1-9][0-9]*$</field>
+    <description>open-pact antimalware has active threats</description>
   </rule>
   <rule id="100505" level="10">
     <if_sid>100500</if_sid>
-    <field name="open_pact.result_log_cleared_hours" type="pcre2">^(?!(?:none|n/a)$).+$</field>
+    <field name="open_pact.result_log_cleared" type="pcre2">^[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt ][0-9]{2}:[0-9]{2}:[0-9]{2}</field>
     <description>open-pact reports cleared logs</description>
   </rule>
 </group>

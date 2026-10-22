@@ -148,7 +148,7 @@ Sample files are in [deploy/wazuh](deploy/wazuh). Terminate TLS with the sample 
 
 Install [rules.xml](deploy/wazuh/rules.xml) in the manager's local rules directory. Reserve IDs 100500 through 100505 or change them to avoid local conflicts. Wazuh's [JSON decoder](https://documentation.wazuh.com/current/user-manual/ruleset/decoders/json-decoder.html) reads these events and exposes dynamic fields. An optional [decoder.xml](deploy/wazuh/decoder.xml) shows the same JSON plugin for a receiver with a custom decoder chain. Rules match fields, so either JSON decoder can supply them. See the official [decoder syntax](https://documentation.wazuh.com/current/user-manual/ruleset/ruleset-xml-syntax/decoders.html).
 
-The rules alert on deny, numeric `os_patch_age_days > 30`, numeric `antimalware_signature_age_days > 3`, numeric `antimalware_detections_7d > 0`, and a present `log_cleared_hours` other than `none` or `n/a`. These are control IDs, not check names. The manifest must declare these exact IDs and numeric outputs for the numeric rules. The export does not turn bucketed results such as `gt_30d` into numbers. Wazuh can select one matching child rule for an event with several failures; inspect the event's complete fields and reasons.
+The rules alert on deny, numeric `os_patch_age_days > 30`, numeric `antimalware_signature_age_days > 3`, numeric `antimalware_active_threats > 0`, and a present `log_cleared` other than null or `n/a`. These are control IDs, not check names. The manifest must declare these exact IDs and numeric outputs for the numeric rules. The export does not turn bucketed results such as `gt_30d` into numbers. Wazuh can select one matching child rule for an event with several failures; inspect the event's complete fields and reasons.
 
 A missing event cannot trigger these event-driven rules. On the SIEM side, maintain an expected-device list and a last-ingestion time per `open_pact.device_pseudonym`. Run a scheduled check every few minutes and emit a separate alert when an expected device has no event for more than two hours. Use receiver ingestion time, not the signed claim time. Include devices that never sent a first report, and remove devices that no longer need reports. A two-hour silence policy also requires an agreed claim schedule. The optional collector report schedule sends reports to a separate collector endpoint, not claims to this gateway.
 
@@ -300,38 +300,45 @@ The screen-lock output `"none"` means no screen lock. It replaces `"off"` in thi
 
 ## Additional security checks
 
-All checks are read-only. macOS and Linux checks run as the device owner. Windows checks support a SYSTEM scheduled task or an elevated administrator. Each external command has a three-second timeout, except the single Windows PowerShell batch, which has a twenty-second timeout. Command output uses the C locale. Unsupported sources return `unknown`.
+All checks are read-only. macOS and Linux checks run as the device owner. Windows checks support a SYSTEM scheduled task or an elevated administrator. Each external command has a three-second timeout, except the single Windows PowerShell batch, which has a 60-second timeout. Command output uses the C locale. Unsupported sources return `unknown`.
 
 | Control | macOS | Linux |
 | --- | --- | --- |
+| `os_auto_updates` | `ConfigDataInstall` and `CriticalUpdateInstall` both enabled | Enabled and active apt or dnf timer with automatic installation configured |
+| `antimalware_realtime` | XProtect present, registered and enabled | Running `clamonacc` process |
+| `antimalware_active_threats` | `n/a` | `unknown` |
+| `work_account` | Current account membership in `admin` | Current account membership in `sudo` or `wheel` |
+| `uptime_days` | Whole days since `kern.boottime` | Whole days from `/proc/uptime` |
 | `preboot_auth` | FileVault on means `user_secret`, off means `none` | No encryption means `none`; an unverified LUKS unlock method means `unknown` |
 | `antimalware_active` | XProtect bundle and Remediator executable present, scan service registered and enabled | Existing ClamAV service check |
 | `antimalware_signature_age_days` | Whole days since the receipt for the installed XProtect definitions version | Age of the daily ClamAV CVD or CLD embedded timestamp in standard database directories |
 | `antimalware_full_scan_age_days` | `n/a` | `unknown`, no reliable clamscan full-scan record |
-| `antimalware_detections_7d` | `n/a`, Apple has no stable XProtect detection format and the seven-day log query takes over twenty seconds | `unknown` |
-| `antimalware_last_detection_hours` | `n/a`, Apple has no stable XProtect detection format and the seven-day log query takes over twenty seconds | `unknown` |
 | `web_protection` | Chrome, Edge, Brave and Firefox profiles and readable managed policies. Safari is not checked because its settings need Full Disk Access. | `unknown` |
-| `local_log_retention_days` | `n/a`, unified log retention is size-based | Age of the oldest readable system journal entry; permission warnings mean `unknown` |
+| `log_oldest_record_days` | `n/a`, unified log retention is size-based | Age of the oldest readable system journal entry; permission warnings mean `unknown` |
 | `process_audit`, `powershell_logging` | `n/a` | `n/a` |
-| `log_cleared_hours` | `n/a` | `n/a` |
+| `log_cleared` | `n/a` | `n/a` |
 
 Windows collects the controls in one cached PowerShell batch. A missing source, command failure, timeout or unrecognized output returns `unknown`.
 
 | Windows control | Source | Privilege |
 | --- | --- | --- |
+| `os_auto_updates` | Windows Update automatic updates enabled and no unexpired pause | Update settings and registry read access |
+| `antimalware_realtime` | Defender `RealTimeProtectionEnabled` in Normal mode | Defender status read access |
+| `antimalware_active_threats` | Count of `Get-MpThreat` results with `IsActive` | Defender threat read access |
+| `work_account` | Administrators SID in token groups, including UAC deny-only groups. SYSTEM uses the active console user token | Own token, or SYSTEM for the console token |
+| `uptime_days` | Whole days since `Win32_OperatingSystem.LastBootUpTime` | CIM read access |
 | `preboot_auth` | OS-volume BitLocker protection and numeric key-protector types; recovery passwords do not establish the startup method | SYSTEM or elevated administrator |
 | `antimalware_signature_age_days` | Defender `AntivirusSignatureLastUpdated` | Defender status read access |
 | `antimalware_full_scan_age_days` | Defender `FullScanEndTime`; absent date means `unknown` | Defender status read access |
-| `antimalware_detections_7d`, `antimalware_last_detection_hours` | Defender retained detections and initial detection timestamps; empty history gives `0` and `none` | Defender threat-history read access |
 | `web_protection` | Explorer SmartScreen plus Chrome, Edge, Brave, and Firefox preferences and HKLM/HKCU policies | Registry and browser-profile read access |
-| `local_log_retention_days` | Shorter age of the oldest Security and System records | SYSTEM or elevated administrator |
+| `log_oldest_record_days` | Shorter age of the oldest Security and System records | SYSTEM or elevated administrator |
 | `process_audit` | Native Process Creation audit-policy success flag and command-line policy | SYSTEM or elevated administrator |
 | `powershell_logging` | Windows PowerShell ScriptBlockLogging policy, machine before interactive users, weakest user policy wins | Registry read access |
-| `log_cleared_hours` | Latest Security event 1102 or System event 104; `none` after both readable logs have no matching event | SYSTEM or elevated administrator |
+| `log_cleared` | Latest Security event 1102 or System event 104; JSON null after both readable logs have no matching event | SYSTEM or elevated administrator |
 
-Defender metrics require Defender in Normal mode with its antivirus and service enabled. Other antivirus providers return `unknown` for these metrics. Detection values describe retained Defender history, not proof that a device has never had malware. Standard users get `unknown` for the controls that enforce elevation. Access failures also return `unknown`.
+Defender metrics require Defender in Normal mode with its antivirus and service enabled. Other antivirus providers return `unknown` for these metrics. Active threat counts describe Defender threats that are still active. Standard users get `unknown` for the controls that enforce elevation. Access failures also return `unknown`.
 
-On Windows, `preboot_auth`, `local_log_retention_days`, `process_audit`, and `log_cleared_hours` need SYSTEM or an elevated administrator. The `web_protection` check also needs SYSTEM to read browser settings for other user profiles. Install the report task with `schedule install --system` to run these checks as SYSTEM. The task reads Windows settings and reports their values. It does not change those settings.
+On Windows, `preboot_auth`, `log_oldest_record_days`, `process_audit`, and `log_cleared` need SYSTEM or an elevated administrator. The `web_protection` check also needs SYSTEM to read browser settings for other user profiles. Install the report task with `schedule install --system` to run these checks as SYSTEM. The task reads Windows settings and reports their values. It does not change those settings.
 
 Windows `screen_lock` uses a machine inactivity limit first. Otherwise it reads the effective screen-saver policy before local desktop settings. It requires a positive timer, secure mode, and an existing `.scr` file. As SYSTEM, it reads the HKU hives of interactive users. The weakest readable user setting decides. Missing users, unloaded hives, and unreadable evidence return `unknown`.
 
@@ -353,7 +360,7 @@ output = { integer = { min = 0, max = 3650 }, values = ["n/a"] }
 required = { macos = "n/a", linux = { max = 7 } }
 ```
 
-The added controls in the fictional example use `required = {}` to report values without changing its access baseline. The client runs and discloses every listed control. The gateway checks disclosure bounds but applies no access requirement when the OS has no entry in `required`. A policy can require signature freshness with `required = { macos = { max = 3 } }`. Detection counts have no zero-detection requirement.
+The fictional example sets an illustrative V3.1 baseline. `antimalware_full_scan_age_days`, `web_protection`, `work_account`, and `uptime_days` use `required = {}` to report values only. The client runs and discloses every listed control. The gateway checks disclosure bounds but applies no access requirement when the OS has no entry in `required`. A policy can require signature freshness with `required = { macos = { max = 3 } }`. Windows requires zero active threats. It requires at least 90 days of Security and System history and no retained clearing event.
 
 The ClamAV parser uses the [documented database header](https://docs.clamav.net/manual/Signatures.html). The journal reader uses [journalctl oldest-entry selection](https://freedesktop.org/software/systemd/man/latest/journalctl.html).
 
@@ -369,6 +376,7 @@ open-pact-client report --collector https://collector.example.org/status
 `--dry-run` prints the JSON payload and its compact ES256 JWS. It sends nothing. The report uses the existing device key and pseudonym. The client checks the local manifest against the enrolled hash and runs the same checks as `check`.
 
 The JSON carries `spec_version`, `device_id`, a random UUIDv4 `report_id`, UTC `time`, `solution`, `os`, `os_version`, `key_protection`, and `results`. `solution` is `open-pact <version>`. `os_version` is the macOS product version, Linux kernel release, or Windows version. `key_protection` is `tpm` for a Windows TPM key, `secure_enclave` for a Secure Enclave key, and `os_permissions` for a software key. Text results stay JSON strings. Integer results stay JSON numbers.
+The JSON carries `spec_version`, `device_id`, a random UUIDv4 `report_id`, UTC `time`, `report_type`, `solution`, `os`, `os_version`, `key_protection`, and `results`. `spec_version` is `1.1`. `solution` is `open-pact-client <version>`. `device_id` is the enrolled device pseudonym, `pseudonym:` followed by the SHA-256 hash of its uncompressed SEC1 public key. This is the identifier stored by the gateway. `report_type` is `connect` for a detected connection, `event` for an extra event report, or `periodic` for other reports, including manual reports. Connection reports take precedence when an event is pending. `os_version` is the macOS product version, Linux kernel release, or Windows version. `key_protection` is `secure_enclave` for a Secure Enclave key and `os_permissions` for a software key. Text results stay JSON strings. Integer results stay JSON numbers. Null results stay JSON null.
 
 The collector receives the compact JWS as `application/jose`. It must verify ES256 with the public device key obtained through enrolment. A report carries no public key. Only an HTTP 2xx response acknowledges a report. The client ignores the response body, refuses redirects, and uses rustls with TLS 1.2 or later. This one-way report does not fetch a VPN certificate or contact the gateway. A collector receives the additional report metadata listed above.
 
@@ -389,9 +397,13 @@ The collector must have an internal address that is reachable only through the V
 
 Every five minutes, the job tries a TCP connection to the collector host and port, with a two-second timeout that includes name resolution. HTTPS uses port 443 unless the collector URL gives another port. Use `--vpn-probe host:port` to override this target. Choose a probe address that is unavailable outside the VPN. A successful connection records connectivity for this check. The job sends on the first observed connection and then when at least 55 minutes have passed since the last acknowledgement. The job checks the probe again after it prepares the report and before it starts the collector request. It sends nothing if either probe fails. DNS runs in a child process that the parent kills at the two-second deadline. A disconnect and reconnect entirely between two probes is not observed. A failed send retries on a later run. A lost acknowledgement can cause a duplicate report on retry. If the clock moves behind the last acknowledgement time, the next connected run retries and resets that time.
 
-On Windows, the job also sends after Security event 1102 clears the Security log or Microsoft Defender records a new detection. The task user must belong to the built-in `Event Log Readers` group to read the Security log. A SYSTEM task can also read it. Without either access, only the antimalware trigger works. The first successful read of each event source after install, upgrade, or when that source becomes readable sets its baseline and sends no event report. Later event updates are saved only after the collector acknowledges the report. The job sends at most one extra report per five-minute run. macOS and Linux keep their current schedule.
+Every run evaluates the collected results against this OS's requirements in the signed manifest. A required control that changes from compliant to non-compliant triggers an extra report. Missing results and `unknown` count as non-compliant, regardless of grace. Controls with no requirement for this OS never trigger. The first acknowledged report sets the compliance baseline. Later acknowledgments replace that baseline with the results sent.
 
-The client home holds `report-schedule.json`. Limited jobs also keep `report-state.json` and `report-schedule.lock` there. SYSTEM jobs keep `report-state.json` in their protected state directory and use a sibling `<home hash>.lock` file. The state records the last observed VPN state, a pending reconnect report, the last acknowledged report time, and Windows event times. A lock prevents overlapping runs. Reinstallation replaces this home's job and resets its report state. Each home has a separate job name. `schedule uninstall` removes the limited OS job, its generated files, and its user-home configuration and report state. On Windows, this mode never accesses protected ProgramData or Program Files paths. It refuses a SYSTEM task or a denied task query and asks you to run `schedule uninstall --system` from an elevated prompt.
+On Windows, Security event 1102 and any new Defender detection also trigger an extra report, even if the threat is already resolved. The task user needs `Event Log Readers` access or SYSTEM access to read the Security log. The first successful read of each event source sets its baseline. Later marker advances are saved only after acknowledgment.
+
+The job sends at most one report per five-minute run and sends nothing off VPN. It holds detected events and compliance failures while the VPN is down, even if the control recovers before reconnecting. The next detected connection sends a `connect` report with current results. Only acknowledgment clears the pending event. Events before the first successful baseline read are part of that baseline.
+
+The client home holds `report-schedule.json`. Limited jobs also keep `report-state.json` and `report-schedule.lock` there. SYSTEM jobs keep `report-state.json` in their protected state directory and use a sibling `<home hash>.lock` file. The state records the last observed VPN state, a pending reconnect report, the last acknowledged report time, Windows event times, the last acknowledged per-control compliance, and a pending event flag. A lock prevents overlapping runs. Reinstallation replaces this home's job and resets its report state. Each home has a separate job name. `schedule uninstall` removes the limited OS job, its generated files, and its user-home configuration and report state. On Windows, this mode never accesses protected ProgramData or Program Files paths. It refuses a SYSTEM task or a denied task query and asks you to run `schedule uninstall --system` from an elevated prompt.
 
 Windows `schedule uninstall --system` requires elevation. It removes this home's task, whether SYSTEM or limited, and its protected state directory under the state lock. A held state lock leaves the task in place and asks you to retry. Cleanup uses the files that remain, so it also works after a failed removal, a replacement limited task, or a missing home. When no SYSTEM task remains, it removes pending binary leftovers and renames the shared binary for deletion at the next reboot. It lists remaining files and returns an error while cleanup remains incomplete, including queued files that still exist. Retry from an elevated prompt after the binary stops or after reboot. Lock files remain. `stop` prints the removal command with the home path quoted for POSIX shells, or PowerShell on Windows. On Unix, new scheduler homes have mode `0700`. Configuration and state files have mode `0600`, or keep stricter owner permissions on replacement. Collector request errors omit the URL so query tokens do not enter the error log.
 
@@ -409,3 +421,12 @@ The home stores only the TPM key name in `device-tpm.key`. Keep this marker with
 TPM claims request `L1`, like Secure Enclave claims. The gateway verifies them as `L0`
 until hardware attestation is supported. Real TPM signing is unverified on hosted CI.
 See [platform support](docs/platform-support.md#key-protection) for the test limits.
+## Log-clearing output
+
+`log_cleared` uses `output = { timestamp = true, nullable = true, values = ["n/a"] }`.
+A successful read returns the last clearing time as an RFC 3339 UTC string ending in `Z`.
+JSON null means both Windows logs were readable and contain no retained clearing event.
+The string `"unknown"` means the read failed. The string `"n/a"` means the check does not apply.
+A TOML requirement uses `windows = "null"` to accept JSON null. It does not accept the string `"null"`.
+Any timestamp fails that requirement. Claims retain actual JSON null through serialization.
+These results describe retained log history. They cannot prove that a log was never cleared.

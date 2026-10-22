@@ -214,6 +214,7 @@ impl fmt::Display for Span {
 pub enum ControlValue {
     Text(String),
     Integer(i32),
+    Null,
 }
 
 impl From<&str> for ControlValue {
@@ -246,6 +247,7 @@ impl fmt::Display for ControlValue {
         match self {
             Self::Text(text) => f.write_str(text),
             Self::Integer(n) => n.fmt(f),
+            Self::Null => f.write_str("null"),
         }
     }
 }
@@ -274,7 +276,22 @@ where
 #[serde(untagged)]
 pub enum Output {
     Enumerated(Vec<String>),
+    Timestamp(#[serde(deserialize_with = "named_fields")] TimestampOutput),
     Integer(#[serde(deserialize_with = "named_fields")] IntegerOutput),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TimestampOutput {
+    pub timestamp: bool,
+    #[serde(default)]
+    pub nullable: bool,
+    #[serde(default)]
+    pub values: Vec<String>,
+}
+
+fn utc_timestamp(text: &str) -> bool {
+    text.ends_with('Z') && chrono::DateTime::parse_from_rfc3339(text).is_ok()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -296,6 +313,10 @@ pub struct IntegerRange {
 impl Output {
     pub fn contains(&self, value: &ControlValue) -> bool {
         match (self, value) {
+            (Self::Timestamp(domain), ControlValue::Text(text)) => {
+                text == "unknown" || domain.values.contains(text) || utc_timestamp(text)
+            }
+            (Self::Timestamp(domain), ControlValue::Null) => domain.nullable,
             (Self::Enumerated(values), ControlValue::Text(text)) => values.contains(text),
             (Self::Integer(bounds), ControlValue::Integer(n)) => {
                 (bounds.integer.min..=bounds.integer.max).contains(n)
@@ -311,6 +332,9 @@ impl Output {
             (Self::Enumerated(values), Self::Enumerated(old)) => {
                 values.iter().all(|v| old.contains(v))
             }
+            (Self::Timestamp(now), Self::Timestamp(old)) => {
+                (!now.nullable || old.nullable) && now.values.iter().all(|v| old.values.contains(v))
+            }
             (Self::Integer(now), Self::Integer(old)) => {
                 now.integer.min >= old.integer.min
                     && now.integer.max <= old.integer.max
@@ -321,6 +345,11 @@ impl Output {
     }
     fn validate(&self) -> bool {
         match self {
+            Self::Timestamp(domain) => {
+                domain.timestamp
+                    && domain.values.iter().all(|v| v == "n/a")
+                    && domain.values.iter().collect::<BTreeSet<_>>().len() == domain.values.len()
+            }
             Self::Enumerated(values) => {
                 !values.is_empty() && values.iter().collect::<BTreeSet<_>>().len() == values.len()
             }
@@ -338,6 +367,16 @@ impl Output {
 impl fmt::Display for Output {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Timestamp(domain) => write!(
+                f,
+                "RFC 3339 UTC, unknown{}{}",
+                if domain.nullable { ", null" } else { "" },
+                if domain.values.is_empty() {
+                    String::new()
+                } else {
+                    format!(", {}", domain.values.join(", "))
+                }
+            ),
             Self::Enumerated(values) => f.write_str(&values.join(", ")),
             Self::Integer(bounds) => write!(
                 f,
@@ -393,6 +432,7 @@ impl From<OneOrMany> for AcceptedValues {
 impl Accepted {
     pub fn contains(&self, value: &ControlValue) -> bool {
         match (self, value) {
+            (Self::Values(values), ControlValue::Null) => values.0.contains("null"),
             (Self::Values(values), ControlValue::Text(text)) => values.0.contains(text),
             (Self::Max(limit), ControlValue::Integer(n)) => *n <= limit.max,
             (Self::Min(limit), ControlValue::Integer(n)) => *n >= limit.min,
@@ -411,6 +451,14 @@ impl Accepted {
         match (self, output) {
             (Self::Values(values), Output::Enumerated(outputs)) => {
                 !values.0.is_empty() && values.0.iter().all(|v| outputs.contains(v))
+            }
+            (Self::Values(values), Output::Timestamp(domain)) => {
+                !values.0.is_empty()
+                    && values.0.iter().all(|v| {
+                        domain.values.contains(v)
+                            || utc_timestamp(v)
+                            || (v == "null" && domain.nullable)
+                    })
             }
             (Self::Values(values), Output::Integer(bounds)) => {
                 !values.0.is_empty() && values.0.iter().all(|v| bounds.values.contains(v))
@@ -578,7 +626,7 @@ impl ManifestBody {
             }
             if !c.output.validate() {
                 return Err(format!(
-                    "{}: output must be a non-empty unique enumeration or an ordered integer range",
+                    "{}: output must be a non-empty unique enumeration, an ordered integer range, or a UTC timestamp domain",
                     c.id
                 ));
             }

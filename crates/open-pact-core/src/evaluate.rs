@@ -3,7 +3,9 @@ use std::fmt;
 
 use chrono::{DateTime, NaiveDate, TimeDelta, Utc};
 
-use crate::{Accepted, Claim, Manifest, ManifestHash, Metadata, Os, Span, TrustLevel};
+use crate::{
+    Accepted, Claim, ControlValue, Manifest, ManifestHash, Metadata, Os, Span, TrustLevel,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
@@ -154,6 +156,27 @@ fn is_client_version(client: &str) -> bool {
         && parts
             .iter()
             .all(|p| p.parse::<u32>().is_ok_and(|n| n.to_string() == *p))
+}
+
+/// Evaluate required controls without grace. Missing and unknown values fail.
+/// Controls without a requirement for this OS are absent from the result.
+pub fn control_compliance(
+    manifest: &Manifest,
+    os: Os,
+    results: &BTreeMap<String, ControlValue>,
+) -> BTreeMap<String, bool> {
+    manifest
+        .body()
+        .controls
+        .iter()
+        .filter_map(|control| {
+            let required = control.required.get(&os)?;
+            let compliant = results.get(&control.id).is_some_and(|value| {
+                value != "unknown" && control.output.contains(value) && required.contains(value)
+            });
+            Some((control.id.clone(), compliant))
+        })
+        .collect()
 }
 
 /// Grace is measured from the first failure the gateway saw, in `first_failures`. A failure keeps
@@ -316,9 +339,22 @@ mod tests {
             os: Os::Macos,
             trust_level: TrustLevel::L0,
             virtualized: Some(Virtualized::No),
-            results: std::iter::once(("os_patch_age_days".into(), 14.into()))
-                .chain(results.iter().map(|(k, v)| (k.to_string(), (*v).into())))
-                .collect::<BTreeMap<_, _>>(),
+            results: [
+                ("os_patch_age_days".into(), 14.into()),
+                ("antimalware_signature_age_days".into(), 0.into()),
+                ("antimalware_active".into(), "yes".into()),
+                ("preboot_auth".into(), "user_secret".into()),
+                ("os_auto_updates".into(), "on".into()),
+                ("antimalware_realtime".into(), "on".into()),
+                ("antimalware_active_threats".into(), "n/a".into()),
+                ("log_oldest_record_days".into(), "n/a".into()),
+                ("process_audit".into(), "n/a".into()),
+                ("powershell_logging".into(), "n/a".into()),
+                ("log_cleared".into(), "n/a".into()),
+            ]
+            .into_iter()
+            .chain(results.iter().map(|(k, v)| (k.to_string(), (*v).into())))
+            .collect::<BTreeMap<_, _>>(),
             csr_sha256: None,
             log_checkpoint: None,
         }
@@ -408,6 +444,32 @@ mod tests {
             ["log_checkpoint is not in disclosed_metadata"]
         );
         assert!(reasons[0].breaks_disclosure_contract());
+    }
+
+    #[test]
+    fn control_compliance_uses_os_requirements_and_numeric_limits_without_grace() {
+        let m = manifest();
+        let mut results = with(&[]).results;
+        assert!(
+            control_compliance(&m, Os::Macos, &results)
+                .values()
+                .all(|v| *v)
+        );
+        for value in ["off", "unknown", "not_an_output"] {
+            results.insert("firewall".into(), value.into());
+            assert!(!control_compliance(&m, Os::Macos, &results)["firewall"]);
+        }
+        results.remove("firewall");
+        assert!(!control_compliance(&m, Os::Macos, &results)["firewall"]);
+        results.insert("os_patch_age_days".into(), 3650.into());
+        assert!(!control_compliance(&m, Os::Macos, &results)["os_patch_age_days"]);
+        let toml = DEMO.replace(
+            r#"required = { macos = "on", windows = "on", linux = "on" }"#,
+            "required = { windows = \"on\" }",
+        );
+        let other = Manifest::parse(toml.as_bytes()).unwrap();
+        assert!(!control_compliance(&other, Os::Macos, &results).contains_key("firewall"));
+        assert!(!control_compliance(&other, Os::Windows, &results)["firewall"]);
     }
 
     #[test]

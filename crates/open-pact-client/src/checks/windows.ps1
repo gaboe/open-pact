@@ -152,14 +152,11 @@ RunSection {
                 if ($null -eq $date -or $date -isnot [DateTime] -or $date.Year -lt 2000 -or $date.ToUniversalTime() -gt $now) { throw 'Invalid detection date' }
                 $date.ToUniversalTime()
             })
-            Emit 'detections_7d' ([string]@($dates | Where-Object { $_ -ge $now.AddDays(-7) }).Count)
-            if ($dates.Count -eq 0) { Emit 'last_detection_hours' 'none' }
-            else { Emit 'last_detection_hours' (Age ($dates | Sort-Object -Descending | Select-Object -First 1) 'hours') }
             Emit 'antimalware_detection_epoch' (EventEpoch ($dates | Sort-Object -Descending | Select-Object -First 1))
-        } catch { Emit 'detections_7d' 'unknown'; Emit 'last_detection_hours' 'unknown'; Emit 'antimalware_detection_epoch' 'unknown' }
+        } catch { Emit 'antimalware_detection_epoch' 'unknown' }
     } catch {
         Emit 'signature_days' 'unknown'; Emit 'full_scan_days' 'unknown'
-        Emit 'detections_7d' 'unknown'; Emit 'last_detection_hours' 'unknown'; Emit 'antimalware_detection_epoch' 'unknown'
+        Emit 'antimalware_detection_epoch' 'unknown'
     }
 }
 function EventDate($log, $xpath, $newest) {
@@ -187,8 +184,8 @@ RunSection {
         if (-not $admin) { throw 'Privilege required' }
         $securityClear = EventDate 'Security' '*[System[EventID=1102]]' $true
         $clears = @($securityClear; EventDate 'System' '*[System[EventID=104]]' $true) | Where-Object { $null -ne $_ }
-        if (@($clears).Count -eq 0) { Emit 'log_cleared' 'none' }
-        else { Emit 'log_cleared' (Age ($clears | Sort-Object -Descending | Select-Object -First 1) 'hours') }
+        if (@($clears).Count -eq 0) { Emit 'log_cleared' 'null' }
+        else { Emit 'log_cleared' (($clears | Sort-Object -Descending | Select-Object -First 1).ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [Globalization.CultureInfo]::InvariantCulture)) }
     } catch { Emit 'log_cleared' 'unknown' }
 }
 RunSection {
@@ -227,6 +224,101 @@ RunSection {
         Emit 'powershell_logging' ($machine + '|' + ($users -join ';'))
     } catch { Emit 'powershell_logging' ($machine + '|!') }
 }
+RunSection {
+    try {
+        $au = New-Object -ComObject Microsoft.Update.AutoUpdate
+        $settings = $au.Settings
+        $disabled = PolicyValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU' 'NoAutoUpdate'
+        if ($disabled -eq '!') { throw 'Unreadable automatic update policy' }
+        if ($disabled -notin @('', '0', '1')) { throw 'Invalid automatic update policy' }
+        $paused = $false
+        $now = [DateTime]::UtcNow
+        $expiry = PolicyValue 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings' 'PauseUpdatesExpiryTime'
+        if ($expiry -eq '!') { throw 'Unreadable update pause' }
+        foreach ($kind in @('Feature', 'Quality')) {
+            $status = PolicyValue 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UpdatePolicy\Settings' ('Paused' + $kind + 'Status')
+            if ($status -notin @('', '0', '1', '2')) { throw 'Unreadable effective update pause' }
+            $policyPaused = $false
+            $undatedPause = $false
+            foreach ($root in @('HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate', 'HKLM:\SOFTWARE\Microsoft\PolicyManager\current\device\Update', 'HKLM:\SOFTWARE\Microsoft\PolicyManager\default\Update')) {
+                $flagName = 'Pause' + $kind + 'Updates'
+                $startName = $flagName + 'StartTime'
+                if ($root.EndsWith('default\Update')) {
+                    $flag = PolicyValue ($root + '\' + $flagName) 'value'
+                    $start = PolicyValue ($root + '\' + $startName) 'value'
+                } else {
+                    $flag = PolicyValue $root $flagName
+                    $start = PolicyValue $root $startName
+                }
+                if ($flag -notin @('', '0', '1') -or $start -eq '!') { throw 'Unreadable update pause policy' }
+                if ($start -ne '') {
+                    $date = [DateTimeOffset]::Parse($start, [Globalization.CultureInfo]::InvariantCulture).UtcDateTime
+                    if ($date -le $now -and $date.AddDays(35) -gt $now) { $policyPaused = $true }
+                } elseif ($flag -eq '1') { $undatedPause = $true }
+            }
+            $end = PolicyValue 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings' ('Pause' + $kind + 'UpdatesEndTime')
+            if ($end -eq '!') { throw 'Unreadable update pause' }
+            if ($status -eq '1') { $paused = $true }
+            elseif ($status -eq '') {
+                if ($undatedPause) { throw 'Unknown update pause age' }
+                if ($policyPaused) { $paused = $true }
+                foreach ($until in @($expiry, $end)) {
+                    if ($until -ne '' -and [DateTimeOffset]::Parse($until, [Globalization.CultureInfo]::InvariantCulture).UtcDateTime -gt $now) { $paused = $true }
+                }
+            }
+        }
+        if ($disabled -eq '1' -or $paused -or $settings.NotificationLevel -eq 1) { Emit 'os_auto_updates' 'off' }
+        elseif ($settings.NotificationLevel -in @(2,3,4)) { Emit 'os_auto_updates' 'on' }
+        else { Emit 'os_auto_updates' 'unknown' }
+    } catch { Emit 'os_auto_updates' 'unknown' }
+}
+RunSection {
+    try {
+        $status = Get-MpComputerStatus -ErrorAction Stop
+        if ($status.AMRunningMode -ne 'Normal' -or $null -eq $status.RealTimeProtectionEnabled) { throw 'Defender unavailable' }
+        if ($status.RealTimeProtectionEnabled) { Emit 'antimalware_realtime' 'on' }
+        else { Emit 'antimalware_realtime' 'off' }
+    } catch { Emit 'antimalware_realtime' 'unknown' }
+    try {
+        $status = Get-MpComputerStatus -ErrorAction Stop
+        if ($status.AMRunningMode -ne 'Normal' -or -not $status.AMServiceEnabled) { throw 'Defender unavailable' }
+        $threats = @(Get-MpThreat -ErrorAction Stop)
+        foreach ($threat in $threats) { if ($null -eq $threat.IsActive) { throw 'Missing threat state' } }
+        Emit 'antimalware_active_threats' ([string]@($threats | Where-Object { $_.IsActive }).Count)
+    } catch { Emit 'antimalware_active_threats' 'unknown' }
+}
+RunSection {
+    try {
+        $boot = (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime
+        Emit 'uptime_days' (Age $boot 'days')
+    } catch { Emit 'uptime_days' 'unknown' }
+}
+RunSection {
+    try {
+        $account = $identity
+        if ($identity.IsSystem) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class PactConsoleToken {
+    [DllImport("kernel32.dll")] public static extern uint WTSGetActiveConsoleSessionId();
+    [DllImport("wtsapi32.dll", SetLastError=true)] public static extern bool WTSQueryUserToken(uint session, out IntPtr token);
+    [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr token);
+}
+'@ -ErrorAction Stop
+            $token = [IntPtr]::Zero
+            if (-not [PactConsoleToken]::WTSQueryUserToken([PactConsoleToken]::WTSGetActiveConsoleSessionId(), [ref]$token)) { throw 'No console user token' }
+            try { $account = [Security.Principal.WindowsIdentity]::new($token) }
+            finally { [PactConsoleToken]::CloseHandle($token) | Out-Null }
+        }
+        try {
+            if ($null -eq $account.Groups) { throw 'No token groups' }
+            if (@($account.Groups | Where-Object { $_.Value -eq 'S-1-5-32-544' }).Count -gt 0) { Emit 'work_account' 'admin' }
+            else { Emit 'work_account' 'standard' }
+        } finally { if ($identity.IsSystem) { $account.Dispose() } }
+    } catch { Emit 'work_account' 'unknown' }
+}
+
 function ReadJson($path) {
     if (-not (Test-Path -LiteralPath $path -ErrorAction Stop)) { return [pscustomobject]@{} }
     $json = Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop

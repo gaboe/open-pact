@@ -49,44 +49,18 @@ grace = "1d"
 id = "os_supported"
 source = "standard"
 check = "builtin:os_supported@1"
-output = ["yes", "no"]
+output = ["yes", "no", "unknown"]
 required = { macos = "yes", windows = "yes", linux = "yes" }
 grace = "14d"
 
-# These additional checks report values without an access requirement in this demo.
-# For signature freshness, a policy can set required = { macos = { max = 3 } }.
-# A detection count is evidence, not a requirement that must equal zero.
-
-[[control]]
-id = "password_set"
-source = "company_policy"
-check = "builtin:password_set@1"
-output = ["yes", "no", "unknown"]
-required = {}
-grace = "1d"
-
-[[control]]
-id = "auto_login"
-source = "company_policy"
-check = "builtin:auto_login@1"
-output = ["off", "on", "unknown"]
-required = {}
-grace = "1d"
-
-[[control]]
-id = "secure_boot"
-source = "company_policy"
-check = "builtin:secure_boot@1"
-output = ["on", "off", "unknown"]
-required = {}
-grace = "1d"
+# Illustrative V3.1 baseline. The empty requirements below report values only.
 
 [[control]]
 id = "antimalware_active"
 source = "company_policy"
 check = "builtin:antimalware_active@1"
 output = ["yes", "no", "unknown"]
-required = {}
+required = { macos = "yes", windows = "yes", linux = "yes" }
 grace = "1d"
 
 [[control]]
@@ -94,7 +68,7 @@ id = "preboot_auth"
 source = "company_policy"
 check = "builtin:preboot_auth@1"
 output = ["user_secret", "hardware_only", "none", "unknown"]
-required = {}
+required = { macos = "user_secret", windows = "user_secret", linux = "user_secret" }
 grace = "1d"
 
 [[control]]
@@ -102,7 +76,7 @@ id = "antimalware_signature_age_days"
 source = "company_policy"
 check = "builtin:antimalware_signature_age_days@1"
 output = { integer = { min = 0, max = 3650 } }
-required = {}
+required = { macos = { max = 3 }, windows = { max = 3 }, linux = { max = 3 } }
 grace = "1d"
 
 [[control]]
@@ -110,22 +84,6 @@ id = "antimalware_full_scan_age_days"
 source = "company_policy"
 check = "builtin:antimalware_full_scan_age_days@1"
 output = { integer = { min = 0, max = 3650 }, values = ["n/a"] }
-required = {}
-grace = "1d"
-
-[[control]]
-id = "antimalware_detections_7d"
-source = "company_policy"
-check = "builtin:antimalware_detections_7d@1"
-output = { integer = { min = 0, max = 10000 }, values = ["n/a"] }
-required = {}
-grace = "1d"
-
-[[control]]
-id = "antimalware_last_detection_hours"
-source = "company_policy"
-check = "builtin:antimalware_last_detection_hours@1"
-output = { integer = { min = 0, max = 8760 }, values = ["none", "n/a"] }
 required = {}
 grace = "1d"
 
@@ -138,11 +96,11 @@ required = {}
 grace = "1d"
 
 [[control]]
-id = "local_log_retention_days"
+id = "log_oldest_record_days"
 source = "company_policy"
-check = "builtin:local_log_retention_days@1"
+check = "builtin:log_oldest_record_days@1"
 output = { integer = { min = 0, max = 2147483647 }, values = ["n/a"] }
-required = {}
+required = { windows = { min = 90 }, macos = "n/a" }
 grace = "1d"
 
 [[control]]
@@ -150,7 +108,7 @@ id = "process_audit"
 source = "company_policy"
 check = "builtin:process_audit@1"
 output = ["on", "off", "n/a", "unknown"]
-required = {}
+required = { windows = "on", macos = "n/a", linux = "n/a" }
 grace = "1d"
 
 [[control]]
@@ -158,14 +116,54 @@ id = "powershell_logging"
 source = "company_policy"
 check = "builtin:powershell_logging@1"
 output = ["on", "off", "n/a", "unknown"]
+required = { windows = "on", macos = "n/a", linux = "n/a" }
+grace = "1d"
+
+[[control]]
+id = "log_cleared"
+source = "company_policy"
+check = "builtin:log_cleared@1"
+output = { timestamp = true, nullable = true, values = ["n/a"] }
+required = { windows = "null", macos = "n/a", linux = "n/a" }
+grace = "1d"
+
+[[control]]
+id = "os_auto_updates"
+source = "company_policy"
+check = "builtin:os_auto_updates@1"
+output = ["on", "off", "unknown"]
+required = { macos = "on", windows = "on", linux = "on" }
+grace = "1d"
+
+[[control]]
+id = "antimalware_realtime"
+source = "company_policy"
+check = "builtin:antimalware_realtime@1"
+output = ["on", "off", "unknown"]
+required = { macos = "on", windows = "on", linux = "on" }
+grace = "1d"
+
+[[control]]
+id = "antimalware_active_threats"
+source = "company_policy"
+check = "builtin:antimalware_active_threats@1"
+output = { integer = { min = 0, max = 2147483647 }, values = ["n/a"] }
+required = { windows = { max = 0 }, macos = "n/a" }
+grace = "1d"
+
+[[control]]
+id = "work_account"
+source = "company_policy"
+check = "builtin:work_account@1"
+output = ["standard", "admin", "unknown"]
 required = {}
 grace = "1d"
 
 [[control]]
-id = "log_cleared_hours"
+id = "uptime_days"
 source = "company_policy"
-check = "builtin:log_cleared_hours@1"
-output = { integer = { min = 0, max = 8760 }, values = ["none", "n/a"] }
+check = "builtin:uptime_days@1"
+output = { integer = { min = 0, max = 2147483647 } }
 required = {}
 grace = "1d"
 

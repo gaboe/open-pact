@@ -33,6 +33,9 @@ fn result_value(
 ) -> Result<ControlValue, Box<dyn std::error::Error>> {
     if let Some(manifest) = manifest {
         return match manifest.body().control(id).map(|c| &c.output) {
+            Some(Output::Timestamp(domain)) if domain.nullable && value == "null" => {
+                Ok(ControlValue::Null)
+            }
             Some(Output::Integer(_)) if value != "unknown" && value != "n/a" && value != "none" => {
                 Ok(value.parse::<i32>()?.into())
             }
@@ -113,6 +116,14 @@ mod tests {
         assert_eq!(
             result_value(Some(&manifest), "os_patch_age_days", "14").unwrap(),
             ControlValue::Integer(14)
+        );
+    }
+    #[test]
+    fn timestamp_null_uses_a_json_null() {
+        let manifest = Manifest::parse(include_bytes!("../../../examples/manifest.toml")).unwrap();
+        assert_eq!(
+            result_value(Some(&manifest), "log_cleared", "null").unwrap(),
+            ControlValue::Null
         );
     }
     #[test]

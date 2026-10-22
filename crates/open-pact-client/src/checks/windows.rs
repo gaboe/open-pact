@@ -17,6 +17,42 @@ struct Batch {
 
 static VALUES: OnceLock<Batch> = OnceLock::new();
 
+pub fn os_auto_updates() -> ControlValue {
+    metric("os_auto_updates", &["on", "off"])
+}
+pub fn antimalware_realtime() -> ControlValue {
+    metric("antimalware_realtime", &["on", "off"])
+}
+pub fn work_account() -> ControlValue {
+    metric("work_account", &["admin", "standard"])
+}
+pub fn uptime_days() -> ControlValue {
+    number("uptime_days", i32::MAX, false)
+}
+pub fn antimalware_active_threats() -> ControlValue {
+    number("antimalware_active_threats", i32::MAX, false)
+}
+fn metric(key: &str, allowed: &[&str]) -> ControlValue {
+    parse_metric(value(key).unwrap_or_default(), allowed)
+}
+fn parse_metric(text: &str, allowed: &[&str]) -> ControlValue {
+    if allowed.contains(&text) {
+        text.into()
+    } else {
+        "unknown".into()
+    }
+}
+fn parse_log_cleared(text: &str) -> ControlValue {
+    if text == "null" {
+        return ControlValue::Null;
+    }
+    if text.ends_with('Z') && chrono::DateTime::parse_from_rfc3339(text).is_ok() {
+        text.into()
+    } else {
+        "unknown".into()
+    }
+}
+
 pub fn disk_encryption() -> ControlValue {
     value("bitlocker").map_or("unknown", parse_bitlocker).into()
 }
@@ -116,15 +152,7 @@ pub fn antimalware_full_scan_age_days() -> ControlValue {
     number("full_scan_days", 3650, false)
 }
 
-pub fn antimalware_detections_7d() -> ControlValue {
-    number("detections_7d", 10000, false)
-}
-
-pub fn antimalware_last_detection_hours() -> ControlValue {
-    number("last_detection_hours", 8760, true)
-}
-
-pub fn local_log_retention_days() -> ControlValue {
+pub fn log_oldest_record_days() -> ControlValue {
     parse_retention(value("log_retention").unwrap_or_default())
 }
 
@@ -136,8 +164,8 @@ pub fn powershell_logging() -> ControlValue {
     parse_logging(value("powershell_logging").unwrap_or_default()).into()
 }
 
-pub fn log_cleared_hours() -> ControlValue {
-    number("log_cleared", 8760, true)
+pub fn log_cleared() -> ControlValue {
+    parse_log_cleared(value("log_cleared").unwrap_or_default())
 }
 
 #[cfg(target_os = "windows")]
@@ -679,6 +707,24 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
+    fn automatic_update_pause_source_fixtures() {
+        let output = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/checks/windows_update_tests.ps1"
+            ))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    #[test]
+    #[cfg(windows)]
     fn native_batch_emits_every_metric() {
         let batch = batch();
         eprintln!("{}", batch.diagnostics);
@@ -696,8 +742,11 @@ mod tests {
             "preboot",
             "signature_days",
             "full_scan_days",
-            "detections_7d",
-            "last_detection_hours",
+            "os_auto_updates",
+            "antimalware_realtime",
+            "antimalware_active_threats",
+            "work_account",
+            "uptime_days",
             "security_log_cleared_epoch",
             "antimalware_detection_epoch",
             "log_retention",
@@ -722,12 +771,10 @@ mod tests {
             "preboot\t0|\r\n",
             "signature_days\t0\r\n",
             "full_scan_days\tunknown\r\n",
-            "detections_7d\t0\r\n",
-            "last_detection_hours\tnone\r\n",
             "security_log_cleared_epoch\t1792500000\r\n",
             "antimalware_detection_epoch\tnone\r\n",
             "log_retention\t12|12\r\n",
-            "log_cleared\t296\r\n",
+            "log_cleared\t2026-10-14T08:00:00Z\r\n",
             "process_audit\t1|\r\n",
             "powershell_logging\t|\r\n",
         ));
@@ -739,14 +786,6 @@ mod tests {
         assert_eq!(
             parse_number(&values["full_scan_days"], 3650, false),
             "unknown"
-        );
-        assert_eq!(
-            parse_number(&values["detections_7d"], 10000, false),
-            ControlValue::Integer(0)
-        );
-        assert_eq!(
-            parse_number(&values["last_detection_hours"], 8760, true),
-            "none"
         );
         assert_eq!(
             parse_event_marker(&values["security_log_cleared_epoch"]),
@@ -762,8 +801,8 @@ mod tests {
             ControlValue::Integer(12)
         );
         assert_eq!(
-            parse_number(&values["log_cleared"], 8760, true),
-            ControlValue::Integer(296)
+            parse_log_cleared(&values["log_cleared"]),
+            "2026-10-14T08:00:00Z"
         );
         assert_eq!(parse_process_audit(&values["process_audit"]), "off");
         assert_eq!(parse_logging(&values["powershell_logging"]), "off");
@@ -1180,5 +1219,76 @@ mod tests {
         assert_eq!(parse_antimalware("393472\r\n397568\r\n"), "yes");
         assert_eq!(parse_antimalware(""), "unknown");
         assert_eq!(parse_antimalware("defender=yes"), "yes");
+    }
+}
+
+#[cfg(test)]
+mod v31_tests {
+    use super::*;
+    #[test]
+    fn batch_fixtures_parse_new_controls() {
+        for (fixture, toggle, account, threats, uptime) in [
+            (
+                "os_auto_updates\ton\nantimalware_realtime\ton\nwork_account\tadmin\nantimalware_active_threats\t2\nuptime_days\t10\n",
+                "on",
+                "admin",
+                "2",
+                "10",
+            ),
+            (
+                "os_auto_updates\toff\nantimalware_realtime\toff\nwork_account\tstandard\nantimalware_active_threats\t0\nuptime_days\t0\n",
+                "off",
+                "standard",
+                "0",
+                "0",
+            ),
+            (
+                "os_auto_updates\tunknown\nantimalware_realtime\t!\nwork_account\tunknown\nantimalware_active_threats\tunknown\nuptime_days\tunknown\n",
+                "unknown",
+                "unknown",
+                "unknown",
+                "unknown",
+            ),
+        ] {
+            let values = parse_values(fixture);
+            for key in ["os_auto_updates", "antimalware_realtime"] {
+                assert_eq!(parse_metric(&values[key], &["on", "off"]), toggle);
+            }
+            assert_eq!(
+                parse_metric(&values["work_account"], &["admin", "standard"]),
+                account
+            );
+            for (key, expected) in [
+                ("antimalware_active_threats", threats),
+                ("uptime_days", uptime),
+            ] {
+                assert_eq!(
+                    parse_number(&values[key], i32::MAX, false).to_string(),
+                    expected
+                );
+            }
+        }
+    }
+    #[test]
+    fn clearing_timestamp_is_distinct_from_no_event_and_failed_read() {
+        assert_eq!(parse_log_cleared("null"), ControlValue::Null);
+        assert_eq!(
+            serde_json::to_string(&parse_log_cleared("null")).unwrap(),
+            "null"
+        );
+        assert_eq!(
+            parse_log_cleared("2026-10-22T10:00:00Z"),
+            "2026-10-22T10:00:00Z"
+        );
+        for text in [
+            "unknown",
+            "none",
+            "0",
+            "!",
+            "2026-10-22T10:00:00+02:00",
+            "2026-99-99T00:00:00Z",
+        ] {
+            assert_eq!(parse_log_cleared(text), "unknown");
+        }
     }
 }
