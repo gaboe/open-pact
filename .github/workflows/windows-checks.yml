@@ -80,15 +80,16 @@ jobs:
             if ($process.ExitCode -ne 0) { throw 'elevated create failed' }
             $runner = [Security.Principal.WindowsIdentity]::GetCurrent().Name
             $arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$worker`" -root `"$root`" -action sign -identity limited"
-            $principal = New-ScheduledTaskPrincipal -UserId $runner -LogonType Interactive -RunLevel Limited
+            $principal = New-ScheduledTaskPrincipal -UserId $runner -LogonType S4U -RunLevel Limited
             $command = New-ScheduledTaskAction -Execute powershell.exe -Argument $arguments
             Register-ScheduledTask -TaskName $task -Action $command -Principal $principal | Out-Null
             Start-ScheduledTask -TaskName $task
             $deadline = (Get-Date).AddMinutes(2)
             while (-not (Test-Path (Join-Path $root 'limited-sign.exitcode')) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 1 }
-            Get-Content (Join-Path $root 'limited-sign.log')
-            Get-Content (Join-Path $root 'limited-sign.stderr.log')
-            Write-Output "same user limited sign client exit code: $(Get-Content (Join-Path $root 'limited-sign.exitcode'))"
+            Get-ScheduledTaskInfo -TaskName $task | Format-List
+            Get-Content (Join-Path $root 'limited-sign.log') -ErrorAction SilentlyContinue
+            Get-Content (Join-Path $root 'limited-sign.stderr.log') -ErrorAction SilentlyContinue
+            Write-Output "same user limited sign client exit code: $(Get-Content (Join-Path $root 'limited-sign.exitcode') -ErrorAction SilentlyContinue)"
             if (-not (Test-Path (Join-Path $root 'limited-sign.ok'))) { throw 'same user limited sign failed' }
             Unregister-ScheduledTask -TaskName $task -Confirm:$false
             foreach ($action in @('sign','delete')) {
