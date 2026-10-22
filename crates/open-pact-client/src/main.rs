@@ -77,6 +77,8 @@ enum Command {
     },
     /// Show how to stop scheduled reports and remove the client
     Stop,
+    /// Destroy the device key before full uninstall or rotation
+    DeleteDeviceKey,
 }
 
 #[derive(Subcommand)]
@@ -1678,12 +1680,19 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Command::Log {
             command: LogCommand::Show,
         } => log_show(&home.file("claims.jsonl")).map(|()| ExitCode::SUCCESS),
+        Command::DeleteDeviceKey => {
+            DeviceKey::delete(&home.0)?;
+            println!("Device key deleted.");
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Stop => {
             println!(
                 "Run `{}` to stop scheduled reports.",
                 schedule::uninstall_command(&home.0)
             );
-            println!("To uninstall, delete the binary and {}.", home.0.display());
+            println!(
+                "Before deleting the home or binary, run `open-pact-client delete-device-key` with the same --home."
+            );
             Ok(ExitCode::SUCCESS)
         }
     }

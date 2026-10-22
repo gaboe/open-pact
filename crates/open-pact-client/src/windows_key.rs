@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use open_pact_core::{PublicKey, Signature, dev_key};
+use open_pact_core::{PublicKey, Signature};
 use sha2::{Digest, Sha256};
 use std::{path::Path, ptr};
 use windows_sys::Win32::{
@@ -158,7 +158,7 @@ impl WindowsKey {
 
     fn create_with_provider(home: &Path, name: &str) -> Result<Self> {
         ensure!(is_elevated()?, "TPM protection requires an elevated join");
-        let provider = provider(name)?;
+        let provider = provider(name).map_err(|error| error.context(super::ProviderUnavailable))?;
         let home_name = std::fs::canonicalize(home)?;
         let id = format!(
             "open-pact-{}-{}",
@@ -204,18 +204,37 @@ impl WindowsKey {
             grant_user_and_system(&key)?;
             let public = Self::export_public(&key)?;
             // The marker contains no key material. A failed marker write must not orphan a key.
-            dev_key::write_new(&home.join(super::TPM_FILE), id.as_bytes())?;
+            super::write_marker(&home.join(super::TPM_FILE), id.as_bytes())?;
             Ok(public)
         })();
         match result {
             Ok(public) => Ok(Self { key, public }),
             Err(error) => {
-                if unsafe { NCryptDeleteKey(key.0, NCRYPT_SILENT_FLAG) } == 0 {
-                    std::mem::forget(key);
+                check(unsafe { NCryptDeleteKey(key.0, NCRYPT_SILENT_FLAG) })
+                    .with_context(|| format!("clean up failed CNG creation after {error:#}"))?;
+                std::mem::forget(key);
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::AlreadyExists)
+                {
+                    return Self::load_with_provider(home, name)
+                        .context("load the competing device identity");
                 }
                 Err(error)
             }
         }
+    }
+
+    pub fn delete(home: &Path) -> Result<()> {
+        Self::delete_with_provider(home, PLATFORM)
+    }
+
+    fn delete_with_provider(home: &Path, name: &str) -> Result<()> {
+        let key = Self::load_with_provider(home, name)?;
+        check(unsafe { NCryptDeleteKey(key.key.0, NCRYPT_SILENT_FLAG) })
+            .context("delete persisted device key; use the creating user or SYSTEM")?;
+        std::mem::forget(key.key);
+        super::remove_if_present(&home.join(super::TPM_FILE))
     }
 
     pub fn load(home: &Path) -> Result<Self> {
@@ -297,6 +316,9 @@ mod tests {
     fn roundtrip(name: &str) {
         let home = tempfile::tempdir().unwrap();
         let key = WindowsKey::create_with_provider(home.path(), name).unwrap();
+        let competing = WindowsKey::create_with_provider(home.path(), name).unwrap();
+        assert_eq!(key.public_key(), competing.public_key());
+        drop(competing);
         let loaded = WindowsKey::load_with_provider(home.path(), name).unwrap();
         assert_eq!(key.public_key(), loaded.public_key());
         let device = super::super::DeviceKey::Tpm(loaded);
@@ -348,6 +370,11 @@ mod tests {
                 super::super::tests::enrol(&key).verify().unwrap();
                 return;
             }
+            "deny-delete" => {
+                assert!(WindowsKey::delete_with_provider(&home, SOFTWARE).is_err());
+                assert!(home.join(super::super::TPM_FILE).exists());
+                return;
+            }
             "create" => WindowsKey::create_with_provider(&home, SOFTWARE).unwrap(),
             "sign" | "delete" => WindowsKey::load_with_provider(&home, SOFTWARE).unwrap(),
             _ => panic!("unknown fixture action"),
@@ -358,12 +385,15 @@ mod tests {
             let super::super::DeviceKey::Tpm(key) = device else {
                 unreachable!()
             };
-            check(unsafe { NCryptDeleteKey(key.key.0, NCRYPT_SILENT_FLAG) }).unwrap();
-            std::mem::forget(key.key);
+            drop(key);
+            WindowsKey::delete_with_provider(&home, SOFTWARE).unwrap();
+            assert!(!home.join(super::super::TPM_FILE).exists());
+            assert!(WindowsKey::load_with_provider(&home, SOFTWARE).is_err());
         }
     }
 
     #[test]
+    #[ignore = "requires elevation; Windows CI invokes explicitly"]
     fn windows_cng_software_provider_roundtrip() {
         roundtrip(SOFTWARE);
     }

@@ -19,7 +19,10 @@ jobs:
       - name: Test Windows client
         run: cargo test -p open-pact-client -- --show-output
 
-      - name: Verify CNG signing as a standard user and SYSTEM
+      - name: Verify elevated CNG roundtrip
+        run: cargo test -p open-pact-client windows_cng_software_provider_roundtrip -- --ignored --nocapture
+
+      - name: Verify CNG signing and deletion as creator, administrator, and SYSTEM
         timeout-minutes: 8
         shell: powershell
         run: |
@@ -94,6 +97,31 @@ jobs:
             Get-Content (Join-Path $root 'limited-sign.stderr.log')
             Write-Output "same user limited sign client exit code: $(Get-Content (Join-Path $root 'limited-sign.exitcode'))"
             if ($process.ExitCode -ne 0 -or -not (Test-Path (Join-Path $root 'limited-sign.ok'))) { throw 'same user limited sign failed' }
+            $env:OPEN_PACT_CNG_HOME = $root
+            $env:OPEN_PACT_CNG_ACTION = 'deny-delete'
+            & (Join-Path $root 'cng-tests.exe') windows_cng_shared_fixture --ignored --nocapture
+            if ($LASTEXITCODE -ne 0) { throw 'unrelated administrator deletion was not denied' }
+            $arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$worker`" -root `"$root`" -action delete -identity limited"
+            $process = Start-Process powershell.exe -Credential $credential -LoadUserProfile -ArgumentList $arguments -Wait -PassThru
+            Get-Content (Join-Path $root 'limited-delete.log')
+            Get-Content (Join-Path $root 'limited-delete.stderr.log')
+            if ($process.ExitCode -ne 0 -or -not (Test-Path (Join-Path $root 'limited-delete.ok'))) { throw 'creator deletion failed' }
+            Add-LocalGroupMember -Group $admins -Member $user
+            Remove-Item (Join-Path $root 'elevated-create.ok')
+            $arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$worker`" -root `"$root`" -action create -identity elevated"
+            $principal = New-ScheduledTaskPrincipal -UserId $credential.UserName -LogonType Password -RunLevel Highest
+            $command = New-ScheduledTaskAction -Execute powershell.exe -Argument $arguments
+            Register-ScheduledTask -TaskName $task -InputObject (New-ScheduledTask -Action $command -Principal $principal) -User $credential.UserName -Password ($credential.GetNetworkCredential().Password) | Out-Null
+            Start-ScheduledTask -TaskName $task
+            $deadline = (Get-Date).AddMinutes(2)
+            while (-not (Test-Path (Join-Path $root 'elevated-create.ok')) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 1 }
+            Get-ScheduledTaskInfo -TaskName $task | Format-List
+            Get-Content (Join-Path $root 'elevated-create.log') -ErrorAction SilentlyContinue
+            Get-Content (Join-Path $root 'elevated-create.stderr.log') -ErrorAction SilentlyContinue
+            Write-Output "elevated create client exit code: $(Get-Content (Join-Path $root 'elevated-create.exitcode') -ErrorAction SilentlyContinue)"
+            if (-not (Test-Path (Join-Path $root 'elevated-create.ok'))) { throw 'elevated create failed' }
+            Unregister-ScheduledTask -TaskName $task -Confirm:$false
+            Remove-LocalGroupMember -Group $admins -Member $user
             foreach ($action in @('sign','delete')) {
               $arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$worker`" -root `"$root`" -action $action -identity system"
               $principal = New-ScheduledTaskPrincipal -UserId SYSTEM -LogonType ServiceAccount -RunLevel Highest

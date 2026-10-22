@@ -64,7 +64,7 @@ open-pact-client join 'opi1:replace-with-your-invitation'
 
 The client checks the gateway keys and transparency checkpoint before it displays the manifest. Read the manifest before you approve the signature prompt. The owner key signs the manifest hash and the device enrolment statement. The gateway leaves the device pending until an operator approves its device code.
 
-On macOS, `join` reuses an existing device key. It creates a Secure Enclave key only when no key exists and creation succeeds. If creation fails, the client warns and uses a software key. Pass `--software-key` to select a software key for a new device. Windows and Linux use software keys. The owner key and the VPN certificate key are software keys on every platform.
+On macOS, `join` reuses an existing device key. It creates a Secure Enclave key only when no key exists and creation succeeds. If creation fails, the client warns and uses a software key. Pass `--software-key` to select a software key for a new device. On Windows, an elevated administrator join tries a TPM key. A non-elevated join or an unavailable provider uses a software key. Marker write and key ACL failures stop join. Linux uses software keys. The owner key and the VPN certificate key are software keys on every platform.
 
 After the operator approves the device, check it:
 
@@ -158,4 +158,10 @@ The VPN certificate request travels beside the signed claim. It contains the VPN
 | Schedule does not send | Check that the collector uses HTTPS, the VPN probe is reachable only through the VPN, and the binary remains at its installed path. |
 | `schedule uninstall` cannot find the job | Use the same absolute `--home` path that you used to install it. |
 
-On Windows, TPM protection requires an elevated administrator join. A non-elevated join creates a software key and reports `key_protection = os_permissions`. Existing keys stay in use.
+
+## Remove the device key
+
+For full uninstall or rotation, remove the schedule first. Then run `open-pact-client --home <home> delete-device-key` before deleting the home or binary.
+This command destroys the device credential. Schedule removal alone keeps the key.
+On Windows, use the creating user or SYSTEM. A different administrator has no explicit access to the CNG key.
+Windows CI tests these deletion permissions with the software CNG provider. Real TPM deletion remains unverified on hosted runners.
