@@ -78,7 +78,11 @@ jobs:
             Get-Content (Join-Path $root 'elevated-create.stderr.log')
             Write-Output "elevated create client exit code: $(Get-Content (Join-Path $root 'elevated-create.exitcode'))"
             if ($process.ExitCode -ne 0) { throw 'elevated create failed' }
-            $runner = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+            $runnerIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+            $runner = $runnerIdentity.Name
+            $runnerSid = $runnerIdentity.User.Value
+            & icacls.exe $root /grant "*${runnerSid}:(OI)(CI)M" /T | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'limited runner receipt ACL failed' }
             $arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$worker`" -root `"$root`" -action sign -identity limited"
             $principal = New-ScheduledTaskPrincipal -UserId $runner -LogonType S4U -RunLevel Limited
             $command = New-ScheduledTaskAction -Execute powershell.exe -Argument $arguments
