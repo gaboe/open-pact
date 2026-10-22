@@ -46,8 +46,9 @@ jobs:
           }
           $env:OPEN_PACT_CNG_HOME = $root
           $env:OPEN_PACT_CNG_ACTION = $action
-          & (Join-Path $root 'cng-tests.exe') windows_cng_shared_fixture --ignored --nocapture *> (Join-Path $root "$identity-$action.log")
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $process = Start-Process (Join-Path $root 'cng-tests.exe') -ArgumentList @('windows_cng_shared_fixture','--ignored','--nocapture') -RedirectStandardOutput (Join-Path $root "$identity-$action.log") -RedirectStandardError (Join-Path $root "$identity-$action.stderr.log") -Wait -PassThru -NoNewWindow
+          Set-Content (Join-Path $root "$identity-$action.exitcode") $process.ExitCode
+          if ($process.ExitCode -ne 0) { exit $process.ExitCode }
           Set-Content (Join-Path $root "$identity-$action.ok") 'passed'
           '@ | Set-Content $worker
           try {
@@ -60,6 +61,8 @@ jobs:
               $arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$worker`" -root `"$root`" -action $action -identity limited"
               $process = Start-Process powershell.exe -Credential $credential -LoadUserProfile -ArgumentList $arguments -Wait -PassThru
               Get-Content (Join-Path $root "limited-$action.log")
+              Get-Content (Join-Path $root "limited-$action.stderr.log")
+              Write-Output "limited $action client exit code: $(Get-Content (Join-Path $root "limited-$action.exitcode"))"
               if ($process.ExitCode -ne 0 -or -not (Test-Path (Join-Path $root "limited-$action.ok"))) { throw "limited CNG $action failed" }
             }
             foreach ($action in @('sign','delete')) {
@@ -71,6 +74,8 @@ jobs:
               $deadline = (Get-Date).AddMinutes(2)
               while (-not (Test-Path (Join-Path $root "system-$action.ok")) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 1 }
               Get-Content (Join-Path $root "system-$action.log") -ErrorAction SilentlyContinue
+              Get-Content (Join-Path $root "system-$action.stderr.log") -ErrorAction SilentlyContinue
+              Write-Output "SYSTEM $action client exit code: $(Get-Content (Join-Path $root "system-$action.exitcode") -ErrorAction SilentlyContinue)"
               if (-not (Test-Path (Join-Path $root "system-$action.ok"))) { throw "SYSTEM CNG $action failed" }
               Unregister-ScheduledTask -TaskName $task -Confirm:$false
             }
