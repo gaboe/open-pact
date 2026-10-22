@@ -4,11 +4,9 @@ use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use open_pact_core::{PublicKey, Signature};
 use sha2::{Digest, Sha256};
-use std::{path::Path, ptr};
+use std::{os::windows::ffi::OsStrExt, path::Path, ptr};
 use windows_sys::Win32::{
-    Foundation::{
-        CloseHandle, LocalFree, NTE_BAD_KEYSET, NTE_NO_MORE_ITEMS, NTE_NOT_FOUND, NTE_PERM,
-    },
+    Foundation::{CloseHandle, LocalFree, NTE_BAD_KEYSET, NTE_NOT_FOUND, NTE_PERM},
     Security::{
         Authorization::{
             ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -27,15 +25,6 @@ impl Drop for Handle {
     fn drop(&mut self) {
         unsafe {
             NCryptFreeObject(self.0);
-        }
-    }
-}
-
-struct Buffer(*mut std::ffi::c_void);
-impl Drop for Buffer {
-    fn drop(&mut self) {
-        unsafe {
-            NCryptFreeBuffer(self.0);
         }
     }
 }
@@ -59,49 +48,45 @@ fn provider(name: &str) -> Result<Handle> {
     Ok(Handle(handle))
 }
 
-fn key_exists(provider: &Handle, id: &str) -> Result<bool> {
-    let mut state = ptr::null_mut();
-    loop {
-        let mut raw_name = ptr::null_mut();
-        let status =
-            unsafe { NCryptEnumKeys(provider.0, ptr::null(), &mut raw_name, &mut state, FLAGS) };
-        if status == NTE_NO_MORE_ITEMS {
-            if !state.is_null() {
-                unsafe { NCryptFreeBuffer(state) };
-            }
-            return Ok(false);
-        }
-        if status != 0 {
-            if !raw_name.is_null() {
-                unsafe { NCryptFreeBuffer(raw_name.cast()) };
-            }
-            if !state.is_null() {
-                unsafe { NCryptFreeBuffer(state) };
-            }
-            check(status)?;
-        }
-        ensure!(!raw_name.is_null(), "CNG key enumeration returned no name");
-        let name_buffer = Buffer(raw_name.cast());
-        let name = unsafe { &*raw_name };
+fn file_owner_sid(path: &Path) -> Result<String> {
+    let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut owner = ptr::null_mut();
+    let mut descriptor = ptr::null_mut();
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            path.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    ensure!(status == 0, "read device key marker owner");
+    let result = (|| {
+        let mut text = ptr::null_mut();
         ensure!(
-            !name.pszName.is_null(),
-            "CNG key enumeration returned no name"
+            unsafe { ConvertSidToStringSidW(owner, &mut text) } != 0,
+            "format device key marker owner"
         );
         let mut len = 0;
         unsafe {
-            while *name.pszName.add(len) != 0 {
+            while *text.add(len) != 0 {
                 len += 1;
             }
         }
-        let name = String::from_utf16(unsafe { std::slice::from_raw_parts(name.pszName, len) })?;
-        drop(name_buffer);
-        if name == id {
-            if !state.is_null() {
-                unsafe { NCryptFreeBuffer(state) };
-            }
-            return Ok(true);
+        let sid = String::from_utf16(unsafe { std::slice::from_raw_parts(text, len) });
+        unsafe {
+            LocalFree(text.cast());
         }
+        Ok(sid?)
+    })();
+    unsafe {
+        LocalFree(descriptor.cast());
     }
+    result
 }
 
 pub(super) fn is_elevated() -> Result<bool> {
@@ -298,10 +283,11 @@ impl WindowsKey {
             let status =
                 unsafe { NCryptOpenKey(provider.0, &mut raw, wide(&id).as_ptr(), 0, FLAGS) };
             if status == NTE_BAD_KEYSET || status == NTE_NOT_FOUND {
-                if !key_exists(&provider, &id)? {
-                    return super::remove_if_present(&marker);
+                let sid = current_sid()?;
+                if sid != "S-1-5-18" && sid != file_owner_sid(&marker)? {
+                    check(NTE_PERM)?;
                 }
-                check(NTE_PERM)?;
+                return super::remove_if_present(&marker);
             }
             check(status)?;
             let key = Handle(raw);
@@ -457,22 +443,6 @@ mod tests {
                 return;
             }
             "deny-delete" => {
-                let id = String::from_utf8(
-                    crate::read_home_file(&home.join(super::super::TPM_FILE)).unwrap(),
-                )
-                .unwrap();
-                let provider = provider(SOFTWARE).unwrap();
-                let mut raw = 0;
-                let status =
-                    unsafe { NCryptOpenKey(provider.0, &mut raw, wide(&id).as_ptr(), 0, FLAGS) };
-                eprintln!("denial probe open status 0x{:08x}", status as u32);
-                if status == 0 {
-                    drop(Handle(raw));
-                }
-                eprintln!(
-                    "denial probe key listed: {}",
-                    key_exists(&provider, &id).unwrap()
-                );
                 let error = match WindowsKey::delete_with_provider(&home, SOFTWARE) {
                     Ok(()) => panic!("unrelated administrator deleted the device key"),
                     Err(error) => error,

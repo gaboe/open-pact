@@ -101,11 +101,11 @@ jobs:
             $env:OPEN_PACT_CNG_ACTION = 'deny-delete'
             & (Join-Path $root 'cng-tests.exe') windows_cng_shared_fixture --ignored --nocapture
             if ($LASTEXITCODE -ne 0) { throw 'unrelated administrator deletion was not denied' }
-            $arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$worker`" -root `"$root`" -action delete -identity limited"
+            $arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$worker`" -root `"$root`" -action retry-delete -identity limited"
             $process = Start-Process powershell.exe -Credential $credential -LoadUserProfile -ArgumentList $arguments -Wait -PassThru
-            Get-Content (Join-Path $root 'limited-delete.log')
-            Get-Content (Join-Path $root 'limited-delete.stderr.log')
-            if ($process.ExitCode -ne 0 -or -not (Test-Path (Join-Path $root 'limited-delete.ok'))) { throw 'creator deletion failed' }
+            Get-Content (Join-Path $root 'limited-retry-delete.log')
+            Get-Content (Join-Path $root 'limited-retry-delete.stderr.log')
+            if ($process.ExitCode -ne 0 -or -not (Test-Path (Join-Path $root 'limited-retry-delete.ok'))) { throw 'creator retry deletion failed' }
             Add-LocalGroupMember -Group $admins -Member $user
             Remove-Item (Join-Path $root 'elevated-create.ok')
             $arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$worker`" -root `"$root`" -action create -identity elevated"
@@ -122,7 +122,7 @@ jobs:
             if (-not (Test-Path (Join-Path $root 'elevated-create.ok'))) { throw 'elevated create failed' }
             Unregister-ScheduledTask -TaskName $task -Confirm:$false
             Remove-LocalGroupMember -Group $admins -Member $user
-            foreach ($action in @('sign','retry-delete')) {
+            foreach ($action in @('sign','delete')) {
               $arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$worker`" -root `"$root`" -action $action -identity system"
               $principal = New-ScheduledTaskPrincipal -UserId SYSTEM -LogonType ServiceAccount -RunLevel Highest
               $command = New-ScheduledTaskAction -Execute powershell.exe -Argument $arguments
