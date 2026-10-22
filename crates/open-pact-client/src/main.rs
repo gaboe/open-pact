@@ -1885,7 +1885,7 @@ mod tests {
 
     #[test]
     fn keeps_na_when_declared_and_omits_na_when_unknown_is_not_declared() {
-        let template = include_str!("../../../examples/manifest.toml");
+        let template = include_str!("../../../examples/manifest.toml").replace("\r\n", "\n");
         let manifest = Manifest::parse(template.as_bytes()).unwrap();
         let all = BTreeMap::from([
             ("antimalware_active_threats".into(), "n/a".into()),
