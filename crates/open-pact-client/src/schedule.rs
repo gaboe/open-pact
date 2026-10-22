@@ -1940,6 +1940,47 @@ Write-Output 'refused'
     }
 
     #[test]
+    fn compliance_flip_after_acknowledged_failure_uses_recovery_observation() {
+        let map = |value| BTreeMap::from([("required_control".into(), value)]);
+        let mut state = State {
+            vpn_up: true,
+            last_success: Some(100),
+            last_compliance: Some(map(true)),
+            ..State::default()
+        };
+
+        state.observe_compliance(&map(false));
+        assert_eq!(state.report_type(101), Some(report::ReportType::Event));
+        state.sent(
+            true,
+            101,
+            checks::EventMarkerReads::default(),
+            map(false),
+        );
+        assert!(!state.event_pending);
+
+        state.observe_compliance(&map(true));
+        assert_eq!(state.report_type(102), None);
+        state.observe_compliance(&map(false));
+        assert_eq!(state.report_type(103), Some(report::ReportType::Event));
+    }
+
+    #[test]
+    fn first_observed_compliance_sample_seeds_upgrade_baseline() {
+        let mut state: State = serde_json::from_str(
+            r#"{"vpn_up":true,"reconnect_pending":false,"last_success":100}"#,
+        )
+        .unwrap();
+        let compliant = BTreeMap::from([("required_control".into(), true)]);
+        let failing = BTreeMap::from([("required_control".into(), false)]);
+
+        state.observe_compliance(&compliant);
+        assert_eq!(state.report_type(101), None);
+        state.observe_compliance(&failing);
+        assert_eq!(state.report_type(102), Some(report::ReportType::Event));
+    }
+
+    #[test]
     fn offline_events_survive_recovery_and_state_reload_until_connect_ack() {
         let mut state = State {
             last_success: Some(100),
