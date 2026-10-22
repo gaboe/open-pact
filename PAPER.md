@@ -413,11 +413,10 @@ source = "law"
 source_ref = "Decree 410/2025 § 9(1)(b), binds the company if registered and the device is in scope"
 check = "builtin:antimalware_active@1"   # Windows: Security Center; macOS: XProtect bundle + enabled Remediator scan service; Linux: ClamAV or similar
 # Additional implemented ids: preboot_auth, antimalware_signature_age_days,
-# antimalware_full_scan_age_days, antimalware_detections_7d,
-# antimalware_last_detection_hours, web_protection, local_log_retention_days,
-# process_audit, powershell_logging, log_cleared_hours. See README for sources.
-# macOS reports n/a for both detection metrics because Apple has no stable
-# XProtect detection format and the seven-day query takes over twenty seconds.
+# os_auto_updates, antimalware_realtime, antimalware_active_threats,
+# work_account, uptime_days, antimalware_full_scan_age_days, web_protection, log_oldest_record_days,
+# process_audit, powershell_logging, log_cleared. See README for sources.
+# macOS reports n/a for active threat counts and full-scan age.
 output = ["yes", "no", "unknown"]
 required = { macos = "yes", windows = "yes" }   # omitted on Linux
 grace = "3d"

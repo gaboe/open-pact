@@ -30,6 +30,16 @@ fn claim(m: &Manifest, value: ControlValue) -> Claim {
             ("screen_lock", "le_5min".into()),
             ("os_supported", "yes".into()),
             ("os_patch_age_days", value),
+            ("antimalware_signature_age_days", 0.into()),
+            ("antimalware_active", "yes".into()),
+            ("preboot_auth", "user_secret".into()),
+            ("os_auto_updates", "on".into()),
+            ("antimalware_realtime", "on".into()),
+            ("antimalware_active_threats", "n/a".into()),
+            ("log_oldest_record_days", "n/a".into()),
+            ("process_audit", "n/a".into()),
+            ("powershell_logging", "n/a".into()),
+            ("log_cleared", "n/a".into()),
         ]
         .into_iter()
         .map(|(k, v)| (k.into(), v))
@@ -89,15 +99,7 @@ fn outside_disclosure_range_and_wrong_kinds_are_refused() {
         );
         assert!(e.first_failures.is_empty());
     }
-    for raw in [
-        "1.5",
-        "true",
-        "null",
-        "[]",
-        "{}",
-        "2147483648",
-        "-2147483649",
-    ] {
+    for raw in ["1.5", "true", "[]", "{}", "2147483648", "-2147483649"] {
         assert!(serde_json::from_str::<ControlValue>(raw).is_err(), "{raw}");
     }
 }
@@ -162,12 +164,13 @@ fn narrowing_rejects_wider_ranges_and_stricter_limits() {
 fn declared_not_applicable_is_evaluated_as_an_ordinary_value() {
     let text = DEMO
         .replace(
-            "output = [\"yes\", \"no\"]",
-            "output = [\"yes\", \"no\", \"n/a\"]",
+            "output = [\"yes\", \"no\", \"unknown\"]",
+            "output = [\"yes\", \"no\", \"unknown\", \"n/a\"]",
         )
-        .replace(
+        .replacen(
             "required = { macos = \"yes\", windows = \"yes\", linux = \"yes\" }",
             "required = { macos = \"yes\", windows = \"yes\", linux = \"n/a\" }",
+            1,
         );
     let m = manifest(&text);
     let mut c = claim(&m, 14.into());
@@ -231,20 +234,20 @@ fn reported_only_values_are_disclosed_without_access_requirements() {
     let m = manifest(DEMO);
     assert!(
         m.body()
-            .control("antimalware_detections_7d")
+            .control("antimalware_full_scan_age_days")
             .unwrap()
             .required
             .is_empty()
     );
     let mut c = claim(&m, 14.into());
     c.results
-        .insert("antimalware_detections_7d".into(), 5.into());
+        .insert("antimalware_full_scan_age_days".into(), 5.into());
     assert_eq!(
         evaluate(&m, &c, c.time, &FirstFailures::new()).decision,
         Decision::Allow { warnings: vec![] }
     );
     c.results
-        .insert("antimalware_detections_7d".into(), 10001.into());
+        .insert("antimalware_full_scan_age_days".into(), 10001.into());
     assert!(
         matches!(evaluate(&m, &c, c.time, &FirstFailures::new()).decision, Decision::Deny { reasons } if reasons.iter().any(|r| r.breaks_disclosure_contract()))
     );

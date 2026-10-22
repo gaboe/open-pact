@@ -1216,10 +1216,20 @@ mod tests {
                 ("firewall", "on"),
                 ("screen_lock", "le_5min"),
                 ("os_supported", "yes"),
+                ("antimalware_active", "yes"),
+                ("preboot_auth", "user_secret"),
+                ("os_auto_updates", "on"),
+                ("antimalware_realtime", "on"),
+                ("process_audit", "n/a"),
+                ("powershell_logging", "n/a"),
+                ("log_cleared", "n/a"),
             ]
             .into_iter()
             .map(|(k, v)| (k.to_string(), v.into()))
-            .chain(std::iter::once(("os_patch_age_days".into(), 14.into())))
+            .chain([
+                ("os_patch_age_days".into(), 14.into()),
+                ("antimalware_signature_age_days".into(), 0.into()),
+            ])
             .collect(),
             csr_sha256: None,
             log_checkpoint: None,

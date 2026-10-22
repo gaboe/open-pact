@@ -339,9 +339,22 @@ mod tests {
             os: Os::Macos,
             trust_level: TrustLevel::L0,
             virtualized: Some(Virtualized::No),
-            results: std::iter::once(("os_patch_age_days".into(), 14.into()))
-                .chain(results.iter().map(|(k, v)| (k.to_string(), (*v).into())))
-                .collect::<BTreeMap<_, _>>(),
+            results: [
+                ("os_patch_age_days".into(), 14.into()),
+                ("antimalware_signature_age_days".into(), 0.into()),
+                ("antimalware_active".into(), "yes".into()),
+                ("preboot_auth".into(), "user_secret".into()),
+                ("os_auto_updates".into(), "on".into()),
+                ("antimalware_realtime".into(), "on".into()),
+                ("antimalware_active_threats".into(), "n/a".into()),
+                ("log_oldest_record_days".into(), "n/a".into()),
+                ("process_audit".into(), "n/a".into()),
+                ("powershell_logging".into(), "n/a".into()),
+                ("log_cleared".into(), "n/a".into()),
+            ]
+            .into_iter()
+            .chain(results.iter().map(|(k, v)| (k.to_string(), (*v).into())))
+            .collect::<BTreeMap<_, _>>(),
             csr_sha256: None,
             log_checkpoint: None,
         }
