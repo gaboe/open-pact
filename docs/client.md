@@ -86,7 +86,7 @@ open-pact-client report --collector https://collector.example.org/status --dry-r
 
 The command prints the JSON report and its compact ES256 JWS. It sends nothing. The HTTPS collector must verify the JWS with the enrolled device's public key. A non-dry-run report sends the JWS to that collector. The collector must return an HTTP 2xx response.
 
-A report includes `spec_version`, the device pseudonym in `device_id`, a random `report_id`, UTC time, client version in `solution`, OS name, and OS version. It also includes the key protection type and the results of the manifest checks. It does not include the public key. The gateway does not receive this report. It is a separate endpoint from the gateway claim API.
+A report includes `spec_version` set to `1.1`, the device pseudonym in `device_id`, a random `report_id`, UTC time, client version in `solution`, OS name, and OS version. `device_id` is the enrolled device pseudonym, `pseudonym:` followed by the SHA-256 hash of its uncompressed SEC1 public key. The gateway stores this identifier. `solution` is `open-pact-client <version>`. `report_type` is `connect`, `event`, or `periodic`. Manual reports use `periodic`. A connection report takes precedence over a pending event. It also includes the key protection type and the results of the manifest checks. It does not include the public key. The gateway does not receive this report. It is a separate endpoint from the gateway claim API.
 
 ## Schedule reports while the VPN is connected
 
@@ -98,7 +98,11 @@ open-pact-client schedule install --collector https://collector.internal.example
 
 The scheduler checks a TCP connection to the collector host every five minutes. It sends the first report after it detects a VPN connection. A transition from disconnected to connected also triggers a report. Otherwise, it sends again after at least 55 minutes have passed since the last acknowledged report. It checks the VPN probe before preparing the report and again before sending it. Set `--vpn-probe host:port` if the collector host is not a suitable probe. A failed send retries on a later run. A lost acknowledgement can cause a duplicate report.
 
-On Windows, the task also sends an extra report after it detects a new Security event 1102 or a new Defender detection. The next task run occurs within five minutes. The first successful read of each event source sets its baseline and does not send an event report. Later events trigger at most one extra report per five-minute run. The task saves the first event baseline even when no report is due. It saves later event marker advances only after the collector acknowledges a report.
+Every task run evaluates results against the signed manifest's requirements for this OS. A change from compliant to non-compliant triggers an extra report within the next five-minute run. Missing results and `unknown` count as non-compliant, without grace. Reported-only controls never trigger. The first acknowledged report sets a compliance baseline. The task replaces that baseline only after the collector acknowledges the results sent.
+
+On Windows, a new Security event 1102 or any new Defender detection also triggers an extra report. A resolved detection still triggers. The first successful read of each event source sets its baseline. Later event marker advances are saved only after acknowledgment. The task sends at most one report per run.
+
+The task evaluates locally while the VPN is down and holds detected events until the next connection. A compliance failure stays pending even if the control recovers before that connection. The connection report sends current results. A failed send keeps the event pending. Only acknowledgment clears it. Events before the first successful baseline read are part of that baseline.
 
 For a limited Windows task, add the task user to the built-in `Event Log Readers` group to read Security event 1102. A SYSTEM task can read the Security log without that group. Without either access, the Security log clear trigger is unavailable. The Defender detection trigger still works when Defender history is readable.
 
