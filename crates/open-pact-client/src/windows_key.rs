@@ -10,7 +10,7 @@ use windows_sys::Win32::{
     Security::{
         Authorization::{
             ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-            GetNamedSecurityInfoW, SE_FILE_OBJECT,
+            ConvertStringSidToSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT, SetNamedSecurityInfoW,
         },
         Cryptography::*,
         *,
@@ -88,6 +88,32 @@ fn file_owner_sid(path: &Path) -> Result<String> {
         LocalFree(descriptor.cast());
     }
     result
+}
+
+fn set_file_owner(path: &Path, sid: &str) -> Result<()> {
+    let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let sid = wide(sid);
+    let mut owner = ptr::null_mut();
+    ensure!(
+        unsafe { ConvertStringSidToSidW(sid.as_ptr(), &mut owner) } != 0,
+        "format device key creator SID"
+    );
+    let status = unsafe {
+        SetNamedSecurityInfoW(
+            path.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            owner,
+            ptr::null_mut(),
+            ptr::null(),
+            ptr::null(),
+        )
+    };
+    unsafe {
+        LocalFree(owner.cast());
+    }
+    ensure!(status == 0, "set device key marker owner");
+    Ok(())
 }
 
 pub(super) fn is_elevated() -> Result<bool> {
@@ -220,6 +246,7 @@ impl WindowsKey {
         })
         .context("create machine-scope CNG key")?;
         let key = Handle(raw);
+        let mut marker_created = false;
         let result: Result<PublicKey> = (|| {
             check(unsafe {
                 NCryptSetProperty(
@@ -246,12 +273,18 @@ impl WindowsKey {
             grant_user_and_system(&key)?;
             let public = Self::export_public(&key)?;
             // The marker contains no key material. A failed marker write must not orphan a key.
-            super::write_marker(&home.join(super::TPM_FILE), id.as_bytes())?;
+            let marker = home.join(super::TPM_FILE);
+            super::write_marker(&marker, id.as_bytes())?;
+            marker_created = true;
+            set_file_owner(&marker, &current_sid()?)?;
             Ok(public)
         })();
         match result {
             Ok(public) => Ok(Self { key, public }),
             Err(error) => {
+                if marker_created {
+                    super::remove_if_present(&home.join(super::TPM_FILE))?;
+                }
                 check(unsafe { NCryptDeleteKey(key.0, NCRYPT_SILENT_FLAG) })
                     .with_context(|| format!("clean up failed CNG creation after {error:#}"))?;
                 std::mem::forget(key);
@@ -456,7 +489,14 @@ mod tests {
                 assert!(home.join(super::super::TPM_FILE).exists());
                 return;
             }
-            "create" => WindowsKey::create_with_provider(&home, SOFTWARE).unwrap(),
+            "create" => {
+                let key = WindowsKey::create_with_provider(&home, SOFTWARE).unwrap();
+                assert_eq!(
+                    file_owner_sid(&home.join(super::super::TPM_FILE)).unwrap(),
+                    current_sid().unwrap()
+                );
+                key
+            }
             "sign" | "delete" => WindowsKey::load_with_provider(&home, SOFTWARE).unwrap(),
             _ => panic!("unknown fixture action"),
         };
