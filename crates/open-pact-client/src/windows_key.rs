@@ -361,6 +361,16 @@ mod tests {
     fn windows_cng_shared_fixture() {
         let home = std::path::PathBuf::from(std::env::var_os("OPEN_PACT_CNG_HOME").unwrap());
         let action = std::env::var("OPEN_PACT_CNG_ACTION").unwrap();
+        if action == "retry-delete" {
+            let key = WindowsKey::load_with_provider(&home, SOFTWARE).unwrap();
+            check(unsafe { NCryptDeleteKey(key.key.0, NCRYPT_SILENT_FLAG) }).unwrap();
+            std::mem::forget(key.key);
+            assert!(home.join(super::super::TPM_FILE).exists());
+            WindowsKey::delete_with_provider(&home, SOFTWARE).unwrap();
+            assert!(!home.join(super::super::TPM_FILE).exists());
+            assert!(WindowsKey::load_with_provider(&home, SOFTWARE).is_err());
+            return;
+        }
         let key = match action.as_str() {
             "software" => {
                 assert!(!is_elevated().unwrap());
@@ -371,7 +381,15 @@ mod tests {
                 return;
             }
             "deny-delete" => {
-                assert!(WindowsKey::delete_with_provider(&home, SOFTWARE).is_err());
+                let error = match WindowsKey::delete_with_provider(&home, SOFTWARE) {
+                    Ok(()) => panic!("unrelated administrator deleted the device key"),
+                    Err(error) => error,
+                };
+                assert!(
+                    error
+                        .to_string()
+                        .contains("use the creating user or SYSTEM")
+                );
                 assert!(home.join(super::super::TPM_FILE).exists());
                 return;
             }

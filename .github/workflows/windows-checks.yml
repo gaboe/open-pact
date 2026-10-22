@@ -122,7 +122,7 @@ jobs:
             if (-not (Test-Path (Join-Path $root 'elevated-create.ok'))) { throw 'elevated create failed' }
             Unregister-ScheduledTask -TaskName $task -Confirm:$false
             Remove-LocalGroupMember -Group $admins -Member $user
-            foreach ($action in @('sign','delete')) {
+            foreach ($action in @('sign','retry-delete')) {
               $arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$worker`" -root `"$root`" -action $action -identity system"
               $principal = New-ScheduledTaskPrincipal -UserId SYSTEM -LogonType ServiceAccount -RunLevel Highest
               $command = New-ScheduledTaskAction -Execute powershell.exe -Argument $arguments
