@@ -457,6 +457,22 @@ mod tests {
                 return;
             }
             "deny-delete" => {
+                let id = String::from_utf8(
+                    crate::read_home_file(&home.join(super::super::TPM_FILE)).unwrap(),
+                )
+                .unwrap();
+                let provider = provider(SOFTWARE).unwrap();
+                let mut raw = 0;
+                let status =
+                    unsafe { NCryptOpenKey(provider.0, &mut raw, wide(&id).as_ptr(), 0, FLAGS) };
+                eprintln!("denial probe open status 0x{:08x}", status as u32);
+                if status == 0 {
+                    drop(Handle(raw));
+                }
+                eprintln!(
+                    "denial probe key listed: {}",
+                    key_exists(&provider, &id).unwrap()
+                );
                 let error = match WindowsKey::delete_with_provider(&home, SOFTWARE) {
                     Ok(()) => panic!("unrelated administrator deleted the device key"),
                     Err(error) => error,
