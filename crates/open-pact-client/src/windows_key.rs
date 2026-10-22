@@ -6,7 +6,7 @@ use open_pact_core::{PublicKey, Signature};
 use sha2::{Digest, Sha256};
 use std::{path::Path, ptr};
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, LocalFree},
+    Foundation::{CloseHandle, LocalFree, NTE_BAD_KEYSET, NTE_NOT_FOUND},
     Security::{
         Authorization::{
             ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -230,11 +230,27 @@ impl WindowsKey {
     }
 
     fn delete_with_provider(home: &Path, name: &str) -> Result<()> {
-        let key = Self::load_with_provider(home, name)?;
-        check(unsafe { NCryptDeleteKey(key.key.0, NCRYPT_SILENT_FLAG) })
-            .context("delete persisted device key; use the creating user or SYSTEM")?;
-        std::mem::forget(key.key);
-        super::remove_if_present(&home.join(super::TPM_FILE))
+        let result = (|| {
+            let marker = home.join(super::TPM_FILE);
+            let id = String::from_utf8(crate::read_home_file(&marker)?)?;
+            ensure!(
+                !id.contains('\0') && id.starts_with("open-pact-"),
+                "invalid TPM key name"
+            );
+            let provider = provider(name)?;
+            let mut raw = 0;
+            let status =
+                unsafe { NCryptOpenKey(provider.0, &mut raw, wide(&id).as_ptr(), 0, FLAGS) };
+            if status == NTE_BAD_KEYSET || status == NTE_NOT_FOUND {
+                return super::remove_if_present(&marker);
+            }
+            check(status)?;
+            let key = Handle(raw);
+            check(unsafe { NCryptDeleteKey(key.0, NCRYPT_SILENT_FLAG) })?;
+            std::mem::forget(key);
+            super::remove_if_present(&marker)
+        })();
+        result.context("delete persisted device key; use the creating user or SYSTEM")
     }
 
     pub fn load(home: &Path) -> Result<Self> {

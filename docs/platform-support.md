@@ -53,8 +53,9 @@ non-exportable ECDSA P-256 TPM key. Only its public key leaves the provider.
 The home holds a key-name marker in `device-tpm.key`, not private key material.
 The machine-scope key ACL grants access to the joining user and SYSTEM.
 Both limited user tasks and SYSTEM tasks can sign for that home. Other users do not receive access.
-Machine-key creation requires elevation. If creation or ACL setup fails, the client warns
-and creates an `os_permissions` software key. `--software-key` forces software for a new home.
+Machine-key creation requires elevation. If the provider is unavailable, the client warns
+and creates an `os_permissions` software key. A non-elevated join also creates a software key.
+ACL and marker errors stop join. `--software-key` forces software for a new home.
 An existing software key stays in use. To rotate to TPM, join again with a new home and
 replace the old enrolment and scheduler registration. Copying the marker to another machine
 cannot move the private key. Losing the marker or clearing the TPM requires a new join.
