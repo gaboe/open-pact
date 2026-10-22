@@ -178,7 +178,7 @@ impl WindowsKey {
         })
         .context("create machine-scope CNG key")?;
         let key = Handle(raw);
-        let result = (|| {
+        let result: Result<PublicKey> = (|| {
             check(unsafe {
                 NCryptSetProperty(
                     key.0,
