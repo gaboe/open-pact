@@ -46,12 +46,14 @@ On macOS, `join` uses an existing software key if one is present. Otherwise, it 
 
 On Linux, and on Windows or macOS with `--software-key`, the device key is a software key protected by operating-system file permissions. These keys report protection `os_permissions` and trust level `L0`. The owner signing key and VPN certificate key are software keys on every platform.
 
+On Windows, TPM protection requires an elevated administrator join. A non-elevated join creates a software key and reports `key_protection = os_permissions`. Existing keys stay in use.
+
 On Windows, a new join tries the Microsoft Platform Crypto Provider for a persisted,
 non-exportable ECDSA P-256 TPM key. Only its public key leaves the provider.
 The home holds a key-name marker in `device-tpm.key`, not private key material.
 The machine-scope key ACL grants access to the joining user and SYSTEM.
 Both limited user tasks and SYSTEM tasks can sign for that home. Other users do not receive access.
-Machine-key creation may require elevation. If creation or ACL setup fails, the client warns
+Machine-key creation requires elevation. If creation or ACL setup fails, the client warns
 and creates an `os_permissions` software key. `--software-key` forces software for a new home.
 An existing software key stays in use. To rotate to TPM, join again with a new home and
 replace the old enrolment and scheduler registration. Copying the marker to another machine

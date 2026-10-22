@@ -157,3 +157,5 @@ The VPN certificate request travels beside the signed claim. It contains the VPN
 | Linux schedule install cannot reach systemd | Start the user systemd manager. Run `schedule install` again. |
 | Schedule does not send | Check that the collector uses HTTPS, the VPN probe is reachable only through the VPN, and the binary remains at its installed path. |
 | `schedule uninstall` cannot find the job | Use the same absolute `--home` path that you used to install it. |
+
+On Windows, TPM protection requires an elevated administrator join. A non-elevated join creates a software key and reports `key_protection = os_permissions`. Existing keys stay in use.

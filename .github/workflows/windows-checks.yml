@@ -41,10 +41,16 @@ jobs:
           $current = [Security.Principal.WindowsIdentity]::GetCurrent()
           if ($identity -eq 'system') {
             if ($current.User.Value -ne 'S-1-5-18') { throw 'fixture is not SYSTEM' }
+          } elseif ($identity -eq 'elevated') {
+            if (-not (New-Object Security.Principal.WindowsPrincipal($current)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'fixture is not elevated' }
           } else {
             if ((New-Object Security.Principal.WindowsPrincipal($current)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'fixture is elevated' }
           }
           $env:OPEN_PACT_CNG_HOME = $root
+          if ($action -eq 'software') {
+            $env:OPEN_PACT_CNG_HOME = Join-Path $root 'software'
+            New-Item -ItemType Directory $env:OPEN_PACT_CNG_HOME -Force | Out-Null
+          }
           $env:OPEN_PACT_CNG_ACTION = $action
           $process = Start-Process (Join-Path $root 'cng-tests.exe') -ArgumentList @('windows_cng_shared_fixture','--ignored','--nocapture') -RedirectStandardOutput (Join-Path $root "$identity-$action.log") -RedirectStandardError (Join-Path $root "$identity-$action.stderr.log") -Wait -PassThru -NoNewWindow
           Set-Content (Join-Path $root "$identity-$action.exitcode") $process.ExitCode
@@ -57,7 +63,7 @@ jobs:
             & icacls.exe $root /grant "*${sid}:(OI)(CI)M" /T | Out-Null
             if ($LASTEXITCODE -ne 0) { throw 'CNG fixture ACL failed' }
             $credential = New-Object PSCredential("$env:COMPUTERNAME\$user", $password)
-            foreach ($action in @('create','sign')) {
+            foreach ($action in @('software')) {
               $arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$worker`" -root `"$root`" -action $action -identity limited"
               $process = Start-Process powershell.exe -Credential $credential -LoadUserProfile -ArgumentList $arguments -Wait -PassThru
               Get-Content (Join-Path $root "limited-$action.log")
@@ -65,6 +71,26 @@ jobs:
               Write-Output "limited $action client exit code: $(Get-Content (Join-Path $root "limited-$action.exitcode"))"
               if ($process.ExitCode -ne 0 -or -not (Test-Path (Join-Path $root "limited-$action.ok"))) { throw "limited CNG $action failed" }
             }
+            # Create as the elevated runner, then sign as the SAME user with a limited token.
+            $arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$worker`" -root `"$root`" -action create -identity elevated"
+            $process = Start-Process powershell.exe -ArgumentList $arguments -Wait -PassThru
+            Get-Content (Join-Path $root 'elevated-create.log')
+            Get-Content (Join-Path $root 'elevated-create.stderr.log')
+            Write-Output "elevated create client exit code: $(Get-Content (Join-Path $root 'elevated-create.exitcode'))"
+            if ($process.ExitCode -ne 0) { throw 'elevated create failed' }
+            $runner = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+            $arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$worker`" -root `"$root`" -action sign -identity limited"
+            $principal = New-ScheduledTaskPrincipal -UserId $runner -LogonType Interactive -RunLevel Limited
+            $command = New-ScheduledTaskAction -Execute powershell.exe -Argument $arguments
+            Register-ScheduledTask -TaskName $task -Action $command -Principal $principal | Out-Null
+            Start-ScheduledTask -TaskName $task
+            $deadline = (Get-Date).AddMinutes(2)
+            while (-not (Test-Path (Join-Path $root 'limited-sign.exitcode')) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 1 }
+            Get-Content (Join-Path $root 'limited-sign.log')
+            Get-Content (Join-Path $root 'limited-sign.stderr.log')
+            Write-Output "same user limited sign client exit code: $(Get-Content (Join-Path $root 'limited-sign.exitcode'))"
+            if (-not (Test-Path (Join-Path $root 'limited-sign.ok'))) { throw 'same user limited sign failed' }
+            Unregister-ScheduledTask -TaskName $task -Confirm:$false
             foreach ($action in @('sign','delete')) {
               $arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$worker`" -root `"$root`" -action $action -identity system"
               $principal = New-ScheduledTaskPrincipal -UserId SYSTEM -LogonType ServiceAccount -RunLevel Highest

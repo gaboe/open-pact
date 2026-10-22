@@ -71,9 +71,13 @@ impl DeviceKey {
         let pem = home.join(SOFTWARE_FILE);
         #[cfg(windows)]
         if !software && !pem.exists() {
-            match windows_key::WindowsKey::create(home) {
-                Ok(key) => return Ok(Self::Tpm(key)),
-                Err(e) => eprintln!("No TPM key ({e:#}); using a software device key."),
+            if windows_key::is_elevated()? {
+                match windows_key::WindowsKey::create(home) {
+                    Ok(key) => return Ok(Self::Tpm(key)),
+                    Err(e) => eprintln!("No TPM key ({e:#}); using a software device key."),
+                }
+            } else {
+                eprintln!("TPM protection requires an elevated join; using a software device key.");
             }
         }
         #[cfg(target_os = "macos")]

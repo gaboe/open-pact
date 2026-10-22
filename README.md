@@ -2,7 +2,7 @@
 
 Verifiable security checks on personally owned devices, without blanket monitoring. The owner signs the company's manifest once. Each time the device connects, the client sends one small signed claim to the company gateway, and a compliant device gets a short-lived VPN client certificate. Read [PAPER.md](PAPER.md) for the design.
 
-Status: proof of concept, not for production. On macOS, `join` tries a Secure Enclave device key. On Windows, it tries a TPM device key. These keys report trust level L1. If hardware key creation fails, on Linux, or with `join --software-key`, the device key is a software key with trust level L0. The gateway has no attestation, so it counts every claim as L0 whatever the client reports. The gateway enforces [examples/manifest.toml](examples/manifest.toml), or the file in `MANIFEST_PATH`.
+Status: proof of concept, not for production. On macOS, `join` tries a Secure Enclave device key. On Windows, an elevated administrator join tries a TPM device key. These keys report trust level L1. If hardware key creation fails, on Linux, or with `join --software-key`, the device key is a software key with trust level L0. The gateway has no attestation, so it counts every claim as L0 whatever the client reports. The gateway enforces [examples/manifest.toml](examples/manifest.toml), or the file in `MANIFEST_PATH`.
 
 ## Layout
 
@@ -409,11 +409,13 @@ Windows `schedule uninstall --system` requires elevation. It removes this home's
 
 ### Windows device keys
 
-A new Windows join tries a non-exportable ECDSA P-256 key in the TPM through the
+On Windows, TPM protection requires an elevated administrator join. A non-elevated join creates a software key and reports `key_protection = os_permissions`. Existing keys stay in use.
+
+An elevated administrator Windows join tries a non-exportable ECDSA P-256 key in the TPM through the
 Microsoft Platform Crypto Provider. The private key does not leave the TPM.
 The machine-scope key grants use to the joining user and SYSTEM, so either scheduler
 mode can sign reports. Other users do not receive key access.
-Creation may need an elevated prompt. If the provider, TPM, or key ACL setup is unavailable,
+Creation requires an elevated administrator prompt. If the provider, TPM, or key ACL setup is unavailable,
 the client warns and uses a software key. `--software-key` forces software on a new home.
 Existing software keys stay in use. To rotate to TPM, use a new `--home`, join again,
 and replace the old enrolment and scheduler registration.

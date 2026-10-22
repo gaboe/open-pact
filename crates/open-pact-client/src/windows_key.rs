@@ -48,6 +48,30 @@ fn provider(name: &str) -> Result<Handle> {
     Ok(Handle(handle))
 }
 
+pub(super) fn is_elevated() -> Result<bool> {
+    let mut token = ptr::null_mut();
+    ensure!(
+        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } != 0,
+        "open process token"
+    );
+    let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+    let mut size = 0;
+    let success = unsafe {
+        GetTokenInformation(
+            token,
+            TokenElevation,
+            (&mut elevation as *mut TOKEN_ELEVATION).cast(),
+            size_of::<TOKEN_ELEVATION>() as u32,
+            &mut size,
+        )
+    };
+    unsafe {
+        CloseHandle(token);
+    }
+    ensure!(success != 0, "read process token elevation");
+    Ok(elevation.TokenIsElevated != 0)
+}
+
 fn current_sid() -> Result<String> {
     let mut token = ptr::null_mut();
     ensure!(
@@ -133,6 +157,7 @@ impl WindowsKey {
     }
 
     fn create_with_provider(home: &Path, name: &str) -> Result<Self> {
+        ensure!(is_elevated()?, "TPM protection requires an elevated join");
         let provider = provider(name)?;
         let home_name = std::fs::canonicalize(home)?;
         let id = format!(
@@ -315,6 +340,14 @@ mod tests {
         let home = std::path::PathBuf::from(std::env::var_os("OPEN_PACT_CNG_HOME").unwrap());
         let action = std::env::var("OPEN_PACT_CNG_ACTION").unwrap();
         let key = match action.as_str() {
+            "software" => {
+                assert!(!is_elevated().unwrap());
+                let key = super::super::DeviceKey::load_or_create(&home, false).unwrap();
+                assert_eq!(key.protection(), "os_permissions");
+                assert!(!home.join(super::super::TPM_FILE).exists());
+                super::super::tests::enrol(&key).verify().unwrap();
+                return;
+            }
             "create" => WindowsKey::create_with_provider(&home, SOFTWARE).unwrap(),
             "sign" | "delete" => WindowsKey::load_with_provider(&home, SOFTWARE).unwrap(),
             _ => panic!("unknown fixture action"),
