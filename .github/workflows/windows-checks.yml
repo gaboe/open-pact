@@ -71,31 +71,29 @@ jobs:
               Write-Output "limited $action client exit code: $(Get-Content (Join-Path $root "limited-$action.exitcode"))"
               if ($process.ExitCode -ne 0 -or -not (Test-Path (Join-Path $root "limited-$action.ok"))) { throw "limited CNG $action failed" }
             }
-            # Create as the elevated runner, then sign as the SAME user with a limited token.
+            # Use one fixture SID for elevated creation and a fresh standard-user logon.
+            $admins = Get-LocalGroup -SID 'S-1-5-32-544'
+            Add-LocalGroupMember -Group $admins -Member $user
             $arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$worker`" -root `"$root`" -action create -identity elevated"
-            $process = Start-Process powershell.exe -ArgumentList $arguments -Wait -PassThru
-            Get-Content (Join-Path $root 'elevated-create.log')
-            Get-Content (Join-Path $root 'elevated-create.stderr.log')
-            Write-Output "elevated create client exit code: $(Get-Content (Join-Path $root 'elevated-create.exitcode'))"
-            if ($process.ExitCode -ne 0) { throw 'elevated create failed' }
-            $runnerIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
-            $runner = $runnerIdentity.Name
-            $runnerSid = $runnerIdentity.User.Value
-            & icacls.exe $root /grant "*${runnerSid}:(OI)(CI)M" /T | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw 'limited runner receipt ACL failed' }
-            $arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$worker`" -root `"$root`" -action sign -identity limited"
-            $principal = New-ScheduledTaskPrincipal -UserId $runner -LogonType S4U -RunLevel Limited
+            $principal = New-ScheduledTaskPrincipal -UserId $credential.UserName -LogonType Password -RunLevel Highest
             $command = New-ScheduledTaskAction -Execute powershell.exe -Argument $arguments
-            Register-ScheduledTask -TaskName $task -Action $command -Principal $principal | Out-Null
+            Register-ScheduledTask -TaskName $task -Action $command -Principal $principal -User $credential.UserName -Password $credential.GetNetworkCredential().Password | Out-Null
             Start-ScheduledTask -TaskName $task
             $deadline = (Get-Date).AddMinutes(2)
-            while (-not (Test-Path (Join-Path $root 'limited-sign.exitcode')) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 1 }
+            while (-not (Test-Path (Join-Path $root 'elevated-create.ok')) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 1 }
             Get-ScheduledTaskInfo -TaskName $task | Format-List
-            Get-Content (Join-Path $root 'limited-sign.log') -ErrorAction SilentlyContinue
-            Get-Content (Join-Path $root 'limited-sign.stderr.log') -ErrorAction SilentlyContinue
-            Write-Output "same user limited sign client exit code: $(Get-Content (Join-Path $root 'limited-sign.exitcode') -ErrorAction SilentlyContinue)"
-            if (-not (Test-Path (Join-Path $root 'limited-sign.ok'))) { throw 'same user limited sign failed' }
+            Get-Content (Join-Path $root 'elevated-create.log') -ErrorAction SilentlyContinue
+            Get-Content (Join-Path $root 'elevated-create.stderr.log') -ErrorAction SilentlyContinue
+            Write-Output "elevated create client exit code: $(Get-Content (Join-Path $root 'elevated-create.exitcode') -ErrorAction SilentlyContinue)"
+            if (-not (Test-Path (Join-Path $root 'elevated-create.ok'))) { throw 'elevated create failed' }
             Unregister-ScheduledTask -TaskName $task -Confirm:$false
+            Remove-LocalGroupMember -Group $admins -Member $user
+            $arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$worker`" -root `"$root`" -action sign -identity limited"
+            $process = Start-Process powershell.exe -Credential $credential -LoadUserProfile -ArgumentList $arguments -Wait -PassThru
+            Get-Content (Join-Path $root 'limited-sign.log')
+            Get-Content (Join-Path $root 'limited-sign.stderr.log')
+            Write-Output "same user limited sign client exit code: $(Get-Content (Join-Path $root 'limited-sign.exitcode'))"
+            if ($process.ExitCode -ne 0 -or -not (Test-Path (Join-Path $root 'limited-sign.ok'))) { throw 'same user limited sign failed' }
             foreach ($action in @('sign','delete')) {
               $arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$worker`" -root `"$root`" -action $action -identity system"
               $principal = New-ScheduledTaskPrincipal -UserId SYSTEM -LogonType ServiceAccount -RunLevel Highest
