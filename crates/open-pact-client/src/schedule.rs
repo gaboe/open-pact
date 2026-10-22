@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
@@ -77,6 +78,10 @@ struct State {
     last_events: Option<checks::EventMarkers>,
     #[serde(default)]
     event_baseline: Option<EventBaseline>,
+    #[serde(default)]
+    last_compliance: Option<BTreeMap<String, bool>>,
+    #[serde(default)]
+    event_pending: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -101,10 +106,7 @@ impl State {
                     .is_none_or(|last| now < last || now.saturating_sub(last) >= 55 * 60))
     }
 
-    fn should_send_events(&self, current: checks::EventMarkerReads) -> bool {
-        if !self.vpn_up {
-            return false;
-        }
+    fn new_events(&self, current: checks::EventMarkerReads) -> bool {
         let baseline = self.baseline();
         let previous = self.last_events.unwrap_or_default();
         newer(
@@ -118,15 +120,47 @@ impl State {
         )
     }
 
+    fn observe_compliance(&mut self, current: &BTreeMap<String, bool>) {
+        if let Some(previous) = &self.last_compliance
+            && current
+                .iter()
+                .any(|(id, compliant)| !compliant && previous.get(id) == Some(&true))
+        {
+            self.event_pending = true;
+        }
+    }
+
+    fn report_type(&self, now: i64) -> Option<report::ReportType> {
+        if !self.vpn_up {
+            None
+        } else if self.reconnect_pending {
+            Some(report::ReportType::Connect)
+        } else if self.event_pending {
+            Some(report::ReportType::Event)
+        } else if self.should_send(now) {
+            Some(report::ReportType::Periodic)
+        } else {
+            None
+        }
+    }
+
     fn acknowledged(&mut self, now: i64, events: checks::EventMarkerReads) {
         self.last_success = Some(now);
         self.reconnect_pending = false;
         self.merge_events(events);
     }
 
-    fn sent(&mut self, acknowledged: bool, now: i64, events: checks::EventMarkerReads) {
+    fn sent(
+        &mut self,
+        acknowledged: bool,
+        now: i64,
+        events: checks::EventMarkerReads,
+        compliance: BTreeMap<String, bool>,
+    ) {
         if acknowledged {
             self.acknowledged(now, events);
+            self.last_compliance = Some(compliance);
+            self.event_pending = false;
         } else {
             self.observe(false);
         }
@@ -1015,21 +1049,31 @@ async fn run_report(
     let mut state: State = state_home.read_json(STATE)?.unwrap_or_default();
     state.observe(vpn_up(&config.vpn_probe).await);
     save(state_home, STATE, &state)?;
-    let events = if state.vpn_up {
-        read_events()
-    } else {
-        checks::EventMarkerReads::default()
-    };
+    let events = read_events();
+    let (snapshot, compliance) = report::prepare(home)?;
+    state.observe_compliance(&compliance);
+    state.event_pending |= state.new_events(events);
     let now = chrono::Utc::now().timestamp();
-    if state.should_send(now) || state.should_send_events(events) {
-        let acknowledged =
-            report::run_scheduled(home, &config.collector, &config.vpn_probe).await?;
-        state.sent(acknowledged, chrono::Utc::now().timestamp(), events);
+    if let Some(report_type) = state.report_type(now) {
         save(state_home, STATE, &state)?;
+        let acknowledged = report::run_scheduled(
+            home,
+            &config.collector,
+            &config.vpn_probe,
+            snapshot,
+            report_type,
+        )
+        .await?;
+        state.sent(
+            acknowledged,
+            chrono::Utc::now().timestamp(),
+            events,
+            compliance,
+        );
     } else if !state.baseline().security_log_cleared || !state.baseline().antimalware_detection {
         state.establish_baseline(events);
-        save(state_home, STATE, &state)?;
     }
+    save(state_home, STATE, &state)?;
     Ok(())
 }
 
@@ -1694,6 +1738,7 @@ Write-Output 'refused'
                 last_success: Some(now - minutes * 60),
                 last_events: None,
                 event_baseline: None,
+                ..State::default()
             };
             assert_eq!(state.should_send(now), expected);
         }
@@ -1742,20 +1787,20 @@ Write-Output 'refused'
             (reads(Read(Some(99)), Read(Some(199))), false),
             (reads(Unknown, Unknown), false),
         ] {
-            assert_eq!(state.should_send_events(current), expected);
+            assert_eq!(state.new_events(current), expected);
         }
 
         let security_only = reads(Read(Some(101)), Unknown);
-        assert!(state.should_send_events(security_only));
+        assert!(state.new_events(security_only));
         let defender_only = reads(Unknown, Read(Some(201)));
-        assert!(state.should_send_events(defender_only));
+        assert!(state.new_events(defender_only));
 
         let mut uninitialized = State {
             vpn_up: true,
             ..State::default()
         };
         let first_read = reads(Read(Some(100)), Unknown);
-        assert!(!uninitialized.should_send_events(first_read));
+        assert!(!uninitialized.new_events(first_read));
         uninitialized.establish_baseline(first_read);
         assert_eq!(
             uninitialized.last_events.unwrap().security_log_cleared,
@@ -1768,15 +1813,16 @@ Write-Output 'refused'
                 antimalware_detection: false,
             })
         );
-        assert!(!uninitialized.should_send_events(reads(Unknown, Read(Some(200)))));
+        assert!(!uninitialized.new_events(reads(Unknown, Read(Some(200)))));
         uninitialized.establish_baseline(reads(Unknown, Read(Some(200))));
-        assert!(!uninitialized.should_send_events(reads(Unknown, Read(Some(200)))));
+        assert!(!uninitialized.new_events(reads(Unknown, Read(Some(200)))));
 
         let offline = State {
             vpn_up: false,
             ..state
         };
-        assert!(!offline.should_send_events(reads(Read(Some(101)), Read(Some(200)))));
+        assert!(offline.new_events(reads(Read(Some(101)), Read(Some(200)))));
+        assert_eq!(offline.report_type(600), None);
         assert!(!offline.should_send(600));
     }
 
@@ -1799,12 +1845,12 @@ Write-Output 'refused'
             ..State::default()
         };
 
-        state.sent(false, 600, current);
+        state.sent(false, 600, current, BTreeMap::new());
 
         assert_eq!(state.last_events, Some(previous));
         assert_eq!(state.last_success, Some(500));
         state.observe(true);
-        assert!(state.should_send_events(current));
+        assert!(state.new_events(current));
         state.acknowledged(700, current);
         assert_eq!(
             state.last_events,
@@ -1815,6 +1861,127 @@ Write-Output 'refused'
             "an unknown source keeps its acknowledged marker"
         );
         assert_eq!(state.last_success, Some(700));
+    }
+
+    #[test]
+    fn report_type_decision_table() {
+        for (up, reconnect, event, last, expected) in [
+            (false, true, true, None, None),
+            (
+                true,
+                true,
+                true,
+                Some(100),
+                Some(report::ReportType::Connect),
+            ),
+            (
+                true,
+                false,
+                true,
+                Some(100),
+                Some(report::ReportType::Event),
+            ),
+            (true, false, false, None, Some(report::ReportType::Periodic)),
+            (true, false, false, Some(100), None),
+            (
+                true,
+                false,
+                false,
+                Some(0),
+                Some(report::ReportType::Periodic),
+            ),
+        ] {
+            let state = State {
+                vpn_up: up,
+                reconnect_pending: reconnect,
+                event_pending: event,
+                last_success: last,
+                ..State::default()
+            };
+            assert_eq!(state.report_type(3300), expected);
+        }
+    }
+
+    #[test]
+    fn compliance_trigger_decision_table_and_acknowledgment() {
+        let map = |value| BTreeMap::from([("required_control".into(), value)]);
+        for (previous, current, expected) in [
+            (None, false, false),
+            (Some(true), true, false),
+            (Some(true), false, true),
+            (Some(false), false, false),
+            (Some(false), true, false),
+        ] {
+            let mut state = State {
+                vpn_up: true,
+                last_success: Some(100),
+                last_compliance: previous.map(map),
+                ..State::default()
+            };
+            state.observe_compliance(&map(current));
+            assert_eq!(state.event_pending, expected);
+            assert_eq!(
+                state.report_type(101),
+                expected.then_some(report::ReportType::Event)
+            );
+            state.sent(
+                false,
+                101,
+                checks::EventMarkerReads::default(),
+                map(current),
+            );
+            state.observe(true);
+            assert_eq!(state.last_compliance, previous.map(map));
+            assert_eq!(state.event_pending, expected);
+            state.sent(true, 102, checks::EventMarkerReads::default(), map(current));
+            assert_eq!(state.last_compliance, Some(map(current)));
+            assert!(!state.event_pending);
+        }
+    }
+
+    #[test]
+    fn offline_events_survive_recovery_and_state_reload_until_connect_ack() {
+        let mut state = State {
+            last_success: Some(100),
+            last_compliance: Some(BTreeMap::from([("control".into(), true)])),
+            ..State::default()
+        };
+        state.establish_baseline(checks::EventMarkerReads {
+            security_log_cleared: checks::EventMarkerRead::Read(Some(10)),
+            antimalware_detection: checks::EventMarkerRead::Read(Some(20)),
+        });
+        for events in [
+            checks::EventMarkerReads {
+                security_log_cleared: checks::EventMarkerRead::Read(Some(11)),
+                antimalware_detection: checks::EventMarkerRead::Unknown,
+            },
+            checks::EventMarkerReads {
+                security_log_cleared: checks::EventMarkerRead::Unknown,
+                antimalware_detection: checks::EventMarkerRead::Read(Some(21)),
+            },
+        ] {
+            let mut pending: State =
+                serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+            pending.event_pending |= pending.new_events(events);
+            assert!(pending.event_pending);
+            assert_eq!(pending.report_type(101), None);
+            pending.observe(true);
+            assert_eq!(pending.report_type(102), Some(report::ReportType::Connect));
+            pending.sent(false, 102, events, BTreeMap::new());
+            assert!(pending.event_pending);
+            assert_eq!(pending.last_events, state.last_events);
+            pending.observe(true);
+            pending.sent(true, 103, events, BTreeMap::new());
+            assert!(!pending.event_pending);
+        }
+        state.observe_compliance(&BTreeMap::from([("control".into(), false)]));
+        state.observe_compliance(&BTreeMap::from([("control".into(), true)]));
+        assert!(state.event_pending);
+        let mut restored: State =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        assert_eq!(restored.report_type(101), None);
+        restored.observe(true);
+        assert_eq!(restored.report_type(102), Some(report::ReportType::Connect));
     }
 
     #[test]
@@ -1973,7 +2140,9 @@ Write-Output 'refused'
     #[tokio::test]
     async fn event_trigger_uses_system_state_home() {
         let dir = tempfile::tempdir().unwrap();
-        let home = Home(dir.path().join("user-home"));
+        let home_path = dir.path().join("user-home");
+        std::fs::create_dir_all(&home_path).unwrap();
+        let home = enrolled_home(&home_path);
         let state_home = Home(
             dir.path()
                 .join("ProgramData/open-pact/system/fictional-home"),
@@ -1981,8 +2150,10 @@ Write-Output 'refused'
         std::fs::create_dir_all(&home.0).unwrap();
         std::fs::create_dir_all(&state_home.0).unwrap();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let refused = tokio::net::TcpSocket::new_v4().unwrap();
+        refused.bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let config = Config {
-            collector: "https://collector.example.org/status".into(),
+            collector: format!("https://{}/status", refused.local_addr().unwrap()),
             vpn_probe: listener.local_addr().unwrap().to_string(),
         };
         save(
@@ -2007,14 +2178,18 @@ Write-Output 'refused'
             baseline.last_events.unwrap().security_log_cleared,
             Some(100)
         );
-        assert!(!baseline.should_send(chrono::Utc::now().timestamp()));
         let error = run_report(&home, &state_home, &config, || events(101))
             .await
             .unwrap_err();
-        assert!(format!("{error:#}").contains("enrol"), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("send report to collector"),
+            "{error:#}"
+        );
         let pending: State = state_home.read_json(STATE).unwrap().unwrap();
         assert_eq!(pending.last_events, baseline.last_events);
-        assert!(pending.should_send_events(events(101)));
+        assert_eq!(pending.last_compliance, baseline.last_compliance);
+        assert!(pending.event_pending);
+        assert!(pending.new_events(events(101)));
         assert!(home.read_json::<State>(STATE).unwrap().is_none());
     }
 
@@ -2042,6 +2217,7 @@ Write-Output 'refused'
                 last_success: Some(chrono::Utc::now().timestamp()),
                 last_events: None,
                 event_baseline: None,
+                ..State::default()
             },
         )
         .unwrap();
@@ -2060,7 +2236,10 @@ Write-Output 'refused'
         let mut config: Config = home.read_json(CONFIG).unwrap().unwrap();
         config.vpn_probe = refused;
         save(&home, CONFIG, &config).unwrap();
-        run(&home, Command::Run { system: false }).await.unwrap();
+        assert!(
+            run(&home, Command::Run { system: false }).await.is_err(),
+            "no enrolment for local evaluation"
+        );
         let disconnected: State = home.read_json(STATE).unwrap().unwrap();
         assert!(!disconnected.vpn_up);
         assert_eq!(disconnected.last_success, connected.last_success);

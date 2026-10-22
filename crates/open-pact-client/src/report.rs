@@ -9,12 +9,23 @@ use serde_json::Value;
 
 use crate::{DeviceKey, Home, checks, collect_results, current_os};
 
+pub(crate) const SPEC_VERSION: &str = "1.1";
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ReportType {
+    Periodic,
+    Connect,
+    Event,
+}
+
 #[derive(Debug, Serialize)]
-struct Report {
+pub(crate) struct Report {
     spec_version: &'static str,
     device_id: Pseudonym,
     report_id: String,
     time: String,
+    report_type: ReportType,
     solution: String,
     os: Os,
     os_version: String,
@@ -38,8 +49,8 @@ fn result_values<T: Serialize>(results: BTreeMap<String, T>) -> Result<BTreeMap<
         .into_iter()
         .map(|(id, value)| {
             let value = serde_json::to_value(value)?;
-            if !value.is_string() && !value.is_i64() && !value.is_u64() {
-                bail!("control {id} did not return text or an integer");
+            if !value.is_string() && !value.is_i64() && !value.is_u64() && !value.is_null() {
+                bail!("control {id} did not return text, an integer, or null");
             }
             Ok((id, value))
         })
@@ -54,11 +65,12 @@ impl Report {
         results: BTreeMap<String, T>,
     ) -> Result<Self> {
         Ok(Self {
-            spec_version: "1.0",
+            spec_version: SPEC_VERSION,
             device_id: Pseudonym::of(&key.public_key()),
             report_id: uuid::Uuid::new_v4().to_string(),
             time: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            solution: format!("open-pact {}", env!("CARGO_PKG_VERSION")),
+            report_type: ReportType::Periodic,
+            solution: format!("open-pact-client {}", env!("CARGO_PKG_VERSION")),
             os,
             os_version,
             key_protection: match key {
@@ -114,23 +126,7 @@ fn os_version(os: Os) -> Result<String> {
     Ok(version)
 }
 
-pub(crate) async fn run(home: &Home, collector: &str, dry_run: bool) -> Result<()> {
-    run_with_probe(home, collector, dry_run, None)
-        .await
-        .map(|_| ())
-}
-
-pub(crate) async fn run_scheduled(home: &Home, collector: &str, probe: &str) -> Result<bool> {
-    run_with_probe(home, collector, false, Some(probe)).await
-}
-
-async fn run_with_probe(
-    home: &Home,
-    collector: &str,
-    dry_run: bool,
-    probe: Option<&str>,
-) -> Result<bool> {
-    let url = collector_url(collector)?;
+pub(crate) fn prepare(home: &Home) -> Result<(Report, BTreeMap<String, bool>)> {
     let enrolment = home.enrolment()?;
     let manifest = Manifest::parse(&crate::read_home_file(&home.file("manifest.toml"))?)?;
     if manifest.hash() != &enrolment.manifest {
@@ -142,7 +138,39 @@ async fn run_with_probe(
         bail!("device key does not match enrolment");
     }
     let os = current_os()?;
-    let report = Report::new(&key, os, os_version(os)?, collect_results(&manifest, os))?;
+    let results = collect_results(&manifest, os);
+    let compliance = open_pact_core::control_compliance(&manifest, os, &results);
+    Ok((Report::new(&key, os, os_version(os)?, results)?, compliance))
+}
+
+pub(crate) async fn run(home: &Home, collector: &str, dry_run: bool) -> Result<()> {
+    collector_url(collector)?;
+    let (report, _) = prepare(home)?;
+    send(home, collector, report, dry_run, None)
+        .await
+        .map(|_| ())
+}
+
+pub(crate) async fn run_scheduled(
+    home: &Home,
+    collector: &str,
+    probe: &str,
+    mut report: Report,
+    report_type: ReportType,
+) -> Result<bool> {
+    report.report_type = report_type;
+    send(home, collector, report, false, Some(probe)).await
+}
+
+async fn send(
+    home: &Home,
+    collector: &str,
+    report: Report,
+    dry_run: bool,
+    probe: Option<&str>,
+) -> Result<bool> {
+    let url = collector_url(collector)?;
+    let key = DeviceKey::load(&home.0)?;
     let jws = report.sign(&key)?;
     if dry_run {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -210,24 +238,26 @@ mod tests {
                 "os",
                 "os_version",
                 "report_id",
+                "report_type",
                 "results",
                 "solution",
                 "spec_version",
                 "time"
             ]
         );
-        assert_eq!(value["spec_version"], "1.0");
+        assert_eq!(value["spec_version"], "1.1");
         assert_eq!(
             value["device_id"],
             Pseudonym::of(&key.public_key()).to_string()
         );
         assert_eq!(value["results"]["firewall"], "on");
+        assert_eq!(value["report_type"], "periodic");
         assert_eq!(value["os"], "linux");
         assert_eq!(value["os_version"], "6.0");
         assert_eq!(value["key_protection"], "os_permissions");
         assert_eq!(
             value["solution"],
-            format!("open-pact {}", env!("CARGO_PKG_VERSION"))
+            format!("open-pact-client {}", env!("CARGO_PKG_VERSION"))
         );
         assert_eq!(
             uuid::Uuid::parse_str(&report.report_id)
@@ -268,6 +298,50 @@ mod tests {
     }
 
     #[test]
+    fn all_report_types_are_signed_and_preserve_json_types() {
+        let key = DeviceKey::Software(dev_key::generate());
+        for (report_type, name) in [
+            (ReportType::Periodic, "periodic"),
+            (ReportType::Connect, "connect"),
+            (ReportType::Event, "event"),
+        ] {
+            let mut report = Report::new(
+                &key,
+                Os::Windows,
+                "10.0".into(),
+                BTreeMap::from([("age".into(), 42)]),
+            )
+            .unwrap();
+            report.report_type = report_type;
+            let jws = report.sign(&key).unwrap();
+            let parts: Vec<_> = jws.split('.').collect();
+            let value: Value = serde_json::from_slice(&B64.decode(parts[1]).unwrap()).unwrap();
+            assert_eq!(value["report_type"], name);
+            assert_eq!(value["results"]["age"], 42);
+            for field in [
+                "spec_version",
+                "device_id",
+                "report_id",
+                "time",
+                "report_type",
+                "solution",
+                "os",
+                "os_version",
+                "key_protection",
+            ] {
+                assert!(value[field].is_string(), "{field}");
+            }
+            assert!(value["results"].is_object());
+            let signature = Signature::from_slice(&B64.decode(parts[2]).unwrap()).unwrap();
+            let verifier =
+                VerifyingKey::from_sec1_bytes(&key.public_key().sec1_uncompressed()).unwrap();
+            verifier
+                .verify(format!("{}.{}", parts[0], parts[1]).as_bytes(), &signature)
+                .unwrap();
+        }
+    }
+
+    #[test]
     fn adapter_preserves_numbers_without_converting_numeric_text() {
         assert_eq!(
             result_values(BTreeMap::from([("age".into(), 42)])).unwrap()["age"],
@@ -278,6 +352,7 @@ mod tests {
             "42"
         );
         assert!(result_values(BTreeMap::from([("age".into(), true)])).is_err());
+        assert!(result_values(BTreeMap::from([("last_event".into(), None::<String>)])).unwrap()["last_event"].is_null());
     }
 
     #[test]

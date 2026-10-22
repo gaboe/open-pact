@@ -18,7 +18,8 @@ pub use crypto::{
 };
 pub use enrol::{EnrolRequest, enrol_statement};
 pub use evaluate::{
-    Decision, Evaluation, FirstFailures, Grace, Reason, evaluate, verified_trust_level,
+    Decision, Evaluation, FirstFailures, Grace, Reason, control_compliance, evaluate,
+    verified_trust_level,
 };
 pub use invitation::{InvalidInvitation, Invitation, InvitationCode, InvitationHash};
 pub use log::{

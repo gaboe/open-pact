@@ -3,7 +3,9 @@ use std::fmt;
 
 use chrono::{DateTime, NaiveDate, TimeDelta, Utc};
 
-use crate::{Accepted, Claim, Manifest, ManifestHash, Metadata, Os, Span, TrustLevel};
+use crate::{
+    Accepted, Claim, ControlValue, Manifest, ManifestHash, Metadata, Os, Span, TrustLevel,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
@@ -154,6 +156,27 @@ fn is_client_version(client: &str) -> bool {
         && parts
             .iter()
             .all(|p| p.parse::<u32>().is_ok_and(|n| n.to_string() == *p))
+}
+
+/// Evaluate required controls without grace. Missing and unknown values fail.
+/// Controls without a requirement for this OS are absent from the result.
+pub fn control_compliance(
+    manifest: &Manifest,
+    os: Os,
+    results: &BTreeMap<String, ControlValue>,
+) -> BTreeMap<String, bool> {
+    manifest
+        .body()
+        .controls
+        .iter()
+        .filter_map(|control| {
+            let required = control.required.get(&os)?;
+            let compliant = results.get(&control.id).is_some_and(|value| {
+                value != "unknown" && control.output.contains(value) && required.contains(value)
+            });
+            Some((control.id.clone(), compliant))
+        })
+        .collect()
 }
 
 /// Grace is measured from the first failure the gateway saw, in `first_failures`. A failure keeps
@@ -408,6 +431,32 @@ mod tests {
             ["log_checkpoint is not in disclosed_metadata"]
         );
         assert!(reasons[0].breaks_disclosure_contract());
+    }
+
+    #[test]
+    fn control_compliance_uses_os_requirements_and_numeric_limits_without_grace() {
+        let m = manifest();
+        let mut results = with(&[]).results;
+        assert!(
+            control_compliance(&m, Os::Macos, &results)
+                .values()
+                .all(|v| *v)
+        );
+        for value in ["off", "unknown", "not_an_output"] {
+            results.insert("firewall".into(), value.into());
+            assert!(!control_compliance(&m, Os::Macos, &results)["firewall"]);
+        }
+        results.remove("firewall");
+        assert!(!control_compliance(&m, Os::Macos, &results)["firewall"]);
+        results.insert("os_patch_age_days".into(), 3650.into());
+        assert!(!control_compliance(&m, Os::Macos, &results)["os_patch_age_days"]);
+        let toml = DEMO.replace(
+            r#"required = { macos = "on", windows = "on", linux = "on" }"#,
+            "required = { windows = \"on\" }",
+        );
+        let other = Manifest::parse(toml.as_bytes()).unwrap();
+        assert!(!control_compliance(&other, Os::Macos, &results).contains_key("firewall"));
+        assert!(!control_compliance(&other, Os::Windows, &results)["firewall"]);
     }
 
     #[test]
