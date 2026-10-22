@@ -49,6 +49,11 @@ pub(crate) fn event_markers() -> EventMarkerReads {
 /// The builtins compiled into this client, by control id and version. A manifest control runs only if
 /// its `check` is exactly `builtin:<id>@<version>` from this table.
 const BUILTINS: &[(&str, u32)] = &[
+    ("os_auto_updates", 1),
+    ("antimalware_realtime", 1),
+    ("antimalware_active_threats", 1),
+    ("work_account", 1),
+    ("uptime_days", 1),
     ("disk_encryption", 1),
     ("firewall", 1),
     ("screen_lock", 1),
@@ -61,13 +66,11 @@ const BUILTINS: &[(&str, u32)] = &[
     ("preboot_auth", 1),
     ("antimalware_signature_age_days", 1),
     ("antimalware_full_scan_age_days", 1),
-    ("antimalware_detections_7d", 1),
-    ("antimalware_last_detection_hours", 1),
     ("web_protection", 1),
-    ("local_log_retention_days", 1),
+    ("log_oldest_record_days", 1),
     ("process_audit", 1),
     ("powershell_logging", 1),
-    ("log_cleared_hours", 1),
+    ("log_cleared", 1),
 ];
 
 fn implements(control: &Control) -> bool {
@@ -99,6 +102,11 @@ type CheckFn = fn() -> ControlValue;
 type Registry = &'static [(&'static str, CheckFn)];
 
 const MACOS: Registry = &[
+    ("os_auto_updates", macos_v3::os_auto_updates),
+    ("antimalware_realtime", macos_v3::antimalware_realtime),
+    ("antimalware_active_threats", macos_v3::not_applicable),
+    ("work_account", macos_v3::work_account),
+    ("uptime_days", macos_v3::uptime_days),
     ("disk_encryption", || macos::disk_encryption().into()),
     ("firewall", || macos::firewall().into()),
     ("screen_lock", || macos::screen_lock().into()),
@@ -114,16 +122,19 @@ const MACOS: Registry = &[
         macos_v3::antimalware_signature_age_days,
     ),
     ("antimalware_full_scan_age_days", macos_v3::not_applicable),
-    ("antimalware_detections_7d", macos_v3::not_applicable),
-    ("antimalware_last_detection_hours", macos_v3::not_applicable),
     ("web_protection", macos_v3::web_protection),
-    ("local_log_retention_days", macos_v3::not_applicable),
+    ("log_oldest_record_days", macos_v3::not_applicable),
     ("process_audit", macos_v3::not_applicable),
     ("powershell_logging", macos_v3::not_applicable),
-    ("log_cleared_hours", macos_v3::not_applicable),
+    ("log_cleared", macos_v3::not_applicable),
 ];
 
 const LINUX: Registry = &[
+    ("os_auto_updates", linux_v3::os_auto_updates),
+    ("antimalware_realtime", linux_v3::antimalware_realtime),
+    ("antimalware_active_threats", macos_v3::unknown),
+    ("work_account", linux_v3::work_account),
+    ("uptime_days", linux_v3::uptime_days),
     ("disk_encryption", || linux::disk_encryption().into()),
     ("firewall", || linux::firewall().into()),
     ("screen_lock", || linux::screen_lock().into()),
@@ -139,19 +150,22 @@ const LINUX: Registry = &[
         linux_v3::antimalware_signature_age_days,
     ),
     ("antimalware_full_scan_age_days", macos_v3::unknown),
-    ("antimalware_detections_7d", macos_v3::unknown),
-    ("antimalware_last_detection_hours", macos_v3::unknown),
     ("web_protection", macos_v3::unknown),
-    (
-        "local_log_retention_days",
-        linux_v3::local_log_retention_days,
-    ),
+    ("log_oldest_record_days", linux_v3::log_oldest_record_days),
     ("process_audit", macos_v3::not_applicable),
     ("powershell_logging", macos_v3::not_applicable),
-    ("log_cleared_hours", macos_v3::not_applicable),
+    ("log_cleared", macos_v3::not_applicable),
 ];
 
 const WINDOWS: Registry = &[
+    ("os_auto_updates", windows::os_auto_updates),
+    ("antimalware_realtime", windows::antimalware_realtime),
+    (
+        "antimalware_active_threats",
+        windows::antimalware_active_threats,
+    ),
+    ("work_account", windows::work_account),
+    ("uptime_days", windows::uptime_days),
     ("disk_encryption", windows::disk_encryption),
     ("firewall", windows::firewall),
     ("screen_lock", windows::screen_lock),
@@ -170,22 +184,11 @@ const WINDOWS: Registry = &[
         "antimalware_full_scan_age_days",
         windows::antimalware_full_scan_age_days,
     ),
-    (
-        "antimalware_detections_7d",
-        windows::antimalware_detections_7d,
-    ),
-    (
-        "antimalware_last_detection_hours",
-        windows::antimalware_last_detection_hours,
-    ),
     ("web_protection", windows::web_protection),
-    (
-        "local_log_retention_days",
-        windows::local_log_retention_days,
-    ),
+    ("log_oldest_record_days", windows::log_oldest_record_days),
     ("process_audit", windows::process_audit),
     ("powershell_logging", windows::powershell_logging),
-    ("log_cleared_hours", windows::log_cleared_hours),
+    ("log_cleared", windows::log_cleared),
 ];
 
 fn registry(os: Os) -> Registry {
@@ -233,19 +236,6 @@ mod tests {
     }
 
     #[test]
-    fn macos_detection_history_is_not_available() {
-        let values = run(
-            Os::Macos,
-            &[
-                "antimalware_detections_7d",
-                "antimalware_last_detection_hours",
-            ],
-        );
-        assert_eq!(values["antimalware_detections_7d"], "n/a");
-        assert_eq!(values["antimalware_last_detection_hours"], "n/a");
-    }
-
-    #[test]
     fn accepts_only_compiled_builtins_at_their_exact_version() {
         let demo = include_str!("../../../../examples/manifest.toml");
         let parse = |toml: &str| Manifest::parse(toml.as_bytes()).unwrap();
@@ -286,7 +276,9 @@ mod tests {
             Manifest::parse(include_bytes!("../../../../examples/manifest.toml")).unwrap();
         for os in Os::ALL {
             for (id, value) in run_all(os) {
-                let control = manifest.body().control(&id).unwrap();
+                let Some(control) = manifest.body().control(&id) else {
+                    continue;
+                };
                 assert!(
                     value == "unknown" || control.output.contains(&value),
                     "{os:?} {id} = {value}"

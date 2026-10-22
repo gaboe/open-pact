@@ -18,6 +18,70 @@ fn command(program: &str, args: &[&str]) -> Option<String> {
         .map(|r| r.text)
 }
 
+pub fn os_auto_updates() -> ControlValue {
+    let values = ["ConfigDataInstall", "CriticalUpdateInstall"].map(|key| {
+        command(
+            "/usr/bin/defaults",
+            &["read", "/Library/Preferences/com.apple.SoftwareUpdate", key],
+        )
+    });
+    parse_update_flags(values[0].as_deref(), values[1].as_deref())
+}
+fn parse_update_flags(data: Option<&str>, critical: Option<&str>) -> ControlValue {
+    match (data.map(str::trim), critical.map(str::trim)) {
+        (Some("0"), _) | (_, Some("0")) => "off".into(),
+        (Some("1"), Some("1")) => "on".into(),
+        _ => "unknown".into(),
+    }
+}
+pub fn antimalware_realtime() -> ControlValue {
+    parse_realtime(antimalware_active())
+}
+fn parse_realtime(active: &str) -> ControlValue {
+    match active {
+        "yes" => "on",
+        "no" => "off",
+        _ => "unknown",
+    }
+    .into()
+}
+pub fn work_account() -> ControlValue {
+    command("/usr/bin/id", &["-Gn"])
+        .map_or_else(|| "unknown".into(), |s| parse_groups(&s, &["admin"]))
+}
+pub(super) fn parse_groups(text: &str, admins: &[&str]) -> ControlValue {
+    let groups: Vec<_> = text.split_whitespace().collect();
+    if groups.is_empty()
+        || groups.iter().any(|g| {
+            !g.bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"_.-".contains(&c))
+        })
+    {
+        "unknown".into()
+    } else if groups.iter().any(|g| admins.contains(g)) {
+        "admin".into()
+    } else {
+        "standard".into()
+    }
+}
+pub fn uptime_days() -> ControlValue {
+    command("/usr/sbin/sysctl", &["-n", "kern.boottime"]).map_or_else(
+        || "unknown".into(),
+        |s| parse_boot_time(&s, Utc::now().timestamp()),
+    )
+}
+fn parse_boot_time(text: &str, now: i64) -> ControlValue {
+    text.trim()
+        .strip_prefix("{ sec = ")
+        .and_then(|s| s.split_once(','))
+        .and_then(|(s, _)| s.trim().parse::<i64>().ok())
+        .filter(|boot| *boot > 0 && *boot <= now)
+        .map_or_else(
+            || "unknown".into(),
+            |boot| bounded_age((now - boot) / 86400, i32::MAX),
+        )
+}
+
 pub fn preboot_auth() -> ControlValue {
     command("/usr/bin/fdesetup", &["status"])
         .map_or("unknown", |s| parse_preboot(&s))
@@ -264,5 +328,48 @@ mod tests {
     #[test]
     fn explicit_platform_sentinels() {
         assert_eq!(not_applicable(), "n/a");
+    }
+}
+
+#[cfg(test)]
+mod v31_tests {
+    use super::*;
+    #[test]
+    fn update_flags_need_both_security_data_settings() {
+        for (data, critical, expected) in [
+            (Some("1\n"), Some("1"), "on"),
+            (Some("0"), Some("1"), "off"),
+            (Some("1"), Some("0"), "off"),
+            (None, Some("1"), "unknown"),
+            (Some("true"), Some("1"), "unknown"),
+        ] {
+            assert_eq!(parse_update_flags(data, critical), expected);
+        }
+    }
+    #[test]
+    fn xprotect_realtime_fixtures() {
+        for (active, expected) in [("yes", "on"), ("no", "off"), ("unknown", "unknown")] {
+            assert_eq!(parse_realtime(active), expected);
+        }
+    }
+    #[test]
+    fn current_account_group_fixtures() {
+        assert_eq!(
+            parse_groups("staff admin com.example.access\n", &["admin"]),
+            "admin"
+        );
+        assert_eq!(parse_groups("staff everyone\n", &["admin"]), "standard");
+        assert_eq!(parse_groups("", &["admin"]), "unknown");
+        assert_eq!(parse_groups("id: permission denied", &["admin"]), "unknown");
+    }
+    #[test]
+    fn boot_time_fixtures() {
+        assert_eq!(
+            parse_boot_time("{ sec = 172800, usec = 0 } Mon Jan 3", 345600),
+            ControlValue::Integer(2)
+        );
+        for text in ["", "permission denied", "{ sec = 400000, usec = 0 }"] {
+            assert_eq!(parse_boot_time(text, 345600), "unknown");
+        }
     }
 }

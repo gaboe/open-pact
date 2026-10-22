@@ -78,7 +78,7 @@ echo
 
 step "A device that never enrolled is refused, even with perfect results"
 nonce="$(curl -fsS -X POST "$url/v1/nonce" | sed -E 's/.*"nonce":"([^"]+)".*/\1/')"
-jws="$("$dev_claim" "$tmp/stranger.pem" "$home/manifest.toml" "$nonce" linux disk_encryption=full firewall=on screen_lock=le_5min os_supported=yes os_patch_age_days=14)"
+jws="$("$dev_claim" "$tmp/stranger.pem" "$home/manifest.toml" "$nonce" linux disk_encryption=full firewall=on screen_lock=le_5min os_supported=yes os_patch_age_days=14 antimalware_active=yes preboot_auth=user_secret os_auto_updates=on antimalware_realtime=on antimalware_signature_age_days=0 process_audit=n/a powershell_logging=n/a log_cleared=n/a)"
 curl -sS -X POST -H 'content-type: application/json' -d "{\"jws\":\"$jws\"}" "$url/v1/claim"
 echo
 

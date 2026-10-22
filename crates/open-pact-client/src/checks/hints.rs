@@ -1,6 +1,9 @@
 use open_pact_core::Os;
 
 const COMPLIANT: &[(&str, &[&str])] = &[
+    ("os_auto_updates", &["on"]),
+    ("antimalware_realtime", &["on"]),
+    ("antimalware_active_threats", &["0", "n/a"]),
     ("disk_encryption", &["full"]),
     ("firewall", &["on"]),
     ("screen_lock", &["le_5min"]),
@@ -13,13 +16,11 @@ const COMPLIANT: &[(&str, &[&str])] = &[
     ("preboot_auth", &["user_secret"]),
     ("antimalware_signature_age_days", &[]),
     ("antimalware_full_scan_age_days", &["n/a"]),
-    ("antimalware_detections_7d", &["n/a"]),
-    ("antimalware_last_detection_hours", &["none", "n/a"]),
     ("web_protection", &["on", "n/a"]),
-    ("local_log_retention_days", &["n/a"]),
+    ("log_oldest_record_days", &["n/a"]),
     ("process_audit", &["on", "n/a"]),
     ("powershell_logging", &["on", "n/a"]),
-    ("log_cleared_hours", &["none", "n/a"]),
+    ("log_cleared", &["null", "n/a"]),
 ];
 
 pub fn fix_hint(check: &str, value: &str, os: Os) -> Option<&'static str> {
@@ -32,11 +33,10 @@ pub fn fix_hint(check: &str, value: &str, os: Os) -> Option<&'static str> {
         && matches!(
             check,
             "preboot_auth"
-                | "antimalware_detections_7d"
-                | "antimalware_last_detection_hours"
-                | "local_log_retention_days"
+                | "antimalware_active_threats"
+                | "log_oldest_record_days"
                 | "process_audit"
-                | "log_cleared_hours"
+                | "log_cleared"
         )
     {
         return Some(
@@ -49,6 +49,15 @@ pub fn fix_hint(check: &str, value: &str, os: Os) -> Option<&'static str> {
         );
     }
     match (check, os) {
+        ("os_auto_updates", _) => {
+            Some("Enable automatic security updates in the operating system update settings.")
+        }
+        ("antimalware_realtime", _) => Some(
+            "Enable real-time or on-access protection in the operating system antivirus settings.",
+        ),
+        ("antimalware_active_threats", _) => {
+            Some("Review antivirus threats and complete their remediation.")
+        }
         ("disk_encryption", Os::Macos) => {
             Some("Enable FileVault: System Settings > Privacy & Security > FileVault.")
         }
@@ -144,7 +153,7 @@ pub fn fix_hint(check: &str, value: &str, os: Os) -> Option<&'static str> {
         ("antimalware_full_scan_age_days", Os::Windows) => Some(
             "Run a Microsoft Defender full scan in Windows Security > Virus & threat protection > Scan options.",
         ),
-        ("local_log_retention_days", Os::Windows) => Some(
+        ("log_oldest_record_days", Os::Windows) => Some(
             "Increase the Security and System event log sizes in Event Viewer. Keep enough history for the required number of days.",
         ),
         ("process_audit", Os::Windows) => Some(
@@ -153,7 +162,7 @@ pub fn fix_hint(check: &str, value: &str, os: Os) -> Option<&'static str> {
         ("powershell_logging", Os::Windows) => Some(
             "Enable Turn on PowerShell Script Block Logging in Group Policy > Windows Components > Windows PowerShell.",
         ),
-        ("log_cleared_hours", Os::Windows) => Some(
+        ("log_cleared", Os::Windows) => Some(
             "Review Security event 1102 and System event 104 in Event Viewer. Investigate why the logs were cleared.",
         ),
         ("web_protection", Os::Windows) => Some(
@@ -162,19 +171,16 @@ pub fn fix_hint(check: &str, value: &str, os: Os) -> Option<&'static str> {
         ("web_protection", _) => Some(
             "Enable fraudulent website warnings or Safe Browsing in every installed browser. Check managed policies too.",
         ),
-        ("local_log_retention_days", Os::Linux) => {
+        ("log_oldest_record_days", Os::Linux) => {
             Some("Review journald storage limits and access to the system journal.")
         }
         ("antimalware_full_scan_age_days", _) => {
             Some("Review the antivirus scan history. XProtect has no user-requested full scan.")
         }
-        ("antimalware_detections_7d" | "antimalware_last_detection_hours", _) => {
-            Some("Review detections in the antivirus history and resolve active threats.")
-        }
-        ("process_audit" | "powershell_logging" | "log_cleared_hours", _) => {
+        ("process_audit" | "powershell_logging" | "log_cleared", _) => {
             Some("Review Windows audit and PowerShell logging policy and event history.")
         }
-        ("local_log_retention_days", _) => {
+        ("log_oldest_record_days", _) => {
             Some("Review the system log storage policy. macOS unified log retention is size-based.")
         }
         _ => None,
@@ -189,16 +195,6 @@ mod tests {
     fn compliant_values_need_no_hint() {
         assert_eq!(fix_hint("disk_encryption", "full", Os::Macos), None);
         assert_eq!(fix_hint("auto_login", "off", Os::Linux), None);
-    }
-
-    #[test]
-    fn unavailable_detection_history_needs_no_hint() {
-        for check in [
-            "antimalware_detections_7d",
-            "antimalware_last_detection_hours",
-        ] {
-            assert_eq!(fix_hint(check, "n/a", Os::Macos), None);
-        }
     }
 
     #[test]

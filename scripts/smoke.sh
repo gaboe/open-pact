@@ -224,7 +224,7 @@ expect() {
 
 manifest="$home/manifest.toml"
 device="$home/device-dev.pem"
-passing=(disk_encryption=full firewall=on screen_lock=le_5min os_supported=yes os_patch_age_days=14)
+passing=(disk_encryption=full firewall=on screen_lock=le_5min os_supported=yes os_patch_age_days=14 antimalware_active=yes preboot_auth=user_secret os_auto_updates=on antimalware_realtime=on antimalware_signature_age_days=0 process_audit=n/a powershell_logging=n/a log_cleared=n/a)
 
 jws="$("$dev_claim" "$device" "$manifest" "$(nonce)" linux "${passing[@]}")"
 expect "compliant" 200 '"accepted"' "$jws"
