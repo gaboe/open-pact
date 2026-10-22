@@ -32,7 +32,13 @@ pub fn os_auto_updates() -> ControlValue {
     let installation = [
         run_status(
             "apt-config",
-            &["shell", "AUTO", "APT::Periodic::Unattended-Upgrade"],
+            &[
+                "shell",
+                "AUTO",
+                "APT::Periodic::Unattended-Upgrade",
+                "ENABLE",
+                "APT::Periodic::Enable",
+            ],
         )
         .filter(|r| r.success)
         .map(|r| parse_apt_auto(&r.text)),
@@ -56,20 +62,39 @@ pub fn os_auto_updates() -> ControlValue {
     parse_update_units(&effective)
 }
 fn parse_apt_auto(text: &str) -> ControlValue {
-    match text.trim() {
-        "AUTO='0'" | "" => "off".into(),
-        value
-            if value
-                .strip_prefix("AUTO='")
-                .and_then(|s| s.strip_suffix('\''))
-                .and_then(|s| s.parse::<u32>().ok())
-                .is_some_and(|n| n > 0) =>
-        {
-            "on".into()
+    let mut interval = "0";
+    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let Some((key, value)) = line.split_once('=') else {
+            return "unknown".into();
+        };
+        let Some(value) = value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')) else {
+            return "unknown".into();
+        };
+        match key {
+            "ENABLE" if value == "0" => return "off".into(),
+            "ENABLE" => {
+                if value.parse::<u32>().is_err() {
+                    return "unknown".into();
+                }
+            }
+            "AUTO" => interval = value,
+            _ => return "unknown".into(),
         }
-        _ => "unknown".into(),
     }
+    if interval == "always" {
+        return "on".into();
+    }
+    let number = interval
+        .strip_suffix(['s', 'm', 'h', 'd'])
+        .unwrap_or(interval);
+    match number.parse::<u32>() {
+        Ok(0) => "off",
+        Ok(_) => "on",
+        Err(_) => "unknown",
+    }
+    .into()
 }
+
 fn parse_dnf_auto(text: &str) -> ControlValue {
     let mut commands = false;
     let mut value = None;
@@ -84,10 +109,10 @@ fn parse_dnf_auto(text: &str) -> ControlValue {
             && let Some((key, v)) = line.split_once('=')
             && key.trim() == "apply_updates"
         {
-            value = Some(v.trim());
+            value = Some(v.trim().to_ascii_lowercase());
         }
     }
-    match value {
+    match value.as_deref() {
         Some("yes" | "true" | "1") => "on",
         Some("no" | "false" | "0") | None => "off",
         _ => "unknown",
@@ -145,13 +170,39 @@ fn parse_on_access(code: Option<i32>, text: &str) -> ControlValue {
     .into()
 }
 pub fn work_account() -> ControlValue {
-    run_status("id", &["-Gn"])
-        .filter(|r| r.success)
-        .map_or_else(
-            || "unknown".into(),
-            |r| super::macos_v3::parse_groups(&r.text, &["sudo", "wheel", "root"]),
-        )
+    let Ok(output) = super::exec::capture(
+        "getent",
+        &["group", "sudo", "wheel", "root"],
+        super::exec::TIMEOUT,
+    ) else {
+        return "unknown".into();
+    };
+    if output.timed_out
+        || !output.stderr.is_empty()
+        || !matches!(output.status.and_then(|s| s.code()), Some(0 | 2))
+    {
+        return "unknown".into();
+    }
+    let Some(admins) = parse_admin_gids(&output.stdout) else {
+        return "unknown".into();
+    };
+    run_status("id", &["-G"]).filter(|r| r.success).map_or_else(
+        || "unknown".into(),
+        |r| super::macos_v3::parse_groups(&r.text, &admins),
+    )
 }
+fn parse_admin_gids(text: &str) -> Option<Vec<u32>> {
+    text.lines()
+        .map(|line| {
+            let fields: Vec<_> = line.split(':').collect();
+            if fields.len() != 4 || !["sudo", "wheel", "root"].contains(&fields[0]) {
+                return None;
+            }
+            fields[2].parse().ok()
+        })
+        .collect()
+}
+
 pub fn uptime_days() -> ControlValue {
     std::fs::read_to_string("/proc/uptime")
         .ok()
@@ -343,6 +394,62 @@ mod v31_tests {
         assert_eq!(parse_dnf_auto("[commands]\napply_updates = bad"), "unknown");
     }
     #[test]
+    fn apt_global_switch_and_supported_intervals() {
+        for interval in ["1", "always", "12h", "30m", "1d", "60s"] {
+            assert_eq!(
+                parse_apt_auto(&format!("AUTO='{interval}'\nENABLE='0'")),
+                "off"
+            );
+            assert_eq!(
+                parse_apt_auto(&format!("AUTO='{interval}'\nENABLE='1'")),
+                "on"
+            );
+        }
+        assert_eq!(parse_apt_auto("ENABLE='0'\nAUTO='1'"), "off");
+        for interval in ["0", "0h"] {
+            assert_eq!(parse_apt_auto(&format!("AUTO='{interval}'")), "off");
+        }
+        for interval in ["bad", "12x", "-1h", "h"] {
+            assert_eq!(parse_apt_auto(&format!("AUTO='{interval}'")), "unknown");
+        }
+        let installation = parse_apt_auto("AUTO='1'\nENABLE='0'");
+        assert_eq!(
+            parse_update_units(&[Some(format!(
+                "LoadState=loaded\nUnitFileState=enabled\nActiveState=active\nInstallUpdates={installation}"
+            ))]),
+            "off"
+        );
+    }
+    #[test]
+    fn dnf_documented_boolean_spellings() {
+        for (values, expected) in [
+            (["True", "TRUE", "yes", "YeS", "1"], "on"),
+            (["False", "FALSE", "no", "No", "0"], "off"),
+        ] {
+            for value in values {
+                assert_eq!(
+                    parse_dnf_auto(&format!("[commands]\napply_updates = {value}")),
+                    expected
+                );
+            }
+        }
+    }
+    #[test]
+    fn account_uses_group_ids_not_display_names() {
+        let admins = parse_admin_gids("sudo:x:27:\nwheel:x:10:\nroot:x:0:\n").unwrap();
+        // These IDs belong to nogroup and the unrelated group named project sudo.
+        assert_eq!(
+            super::super::macos_v3::parse_groups("65534 12345", &admins),
+            "standard"
+        );
+        assert_eq!(
+            super::super::macos_v3::parse_groups("1000 27 12345", &admins),
+            "admin"
+        );
+        assert!(parse_admin_gids("project sudo:x:12345:").is_none());
+        assert!(parse_admin_gids("sudo:x:bad:").is_none());
+    }
+    #[test]
     fn on_access_process_fixtures() {
         assert_eq!(parse_on_access(Some(0), "123\n"), "on");
         assert_eq!(parse_on_access(Some(1), ""), "off");
@@ -353,13 +460,13 @@ mod v31_tests {
     #[test]
     fn account_and_uptime_fixtures() {
         for (groups, expected) in [
-            ("users sudo", "admin"),
-            ("users wheel", "admin"),
-            ("users", "standard"),
+            ("1000 27", "admin"),
+            ("1000 10", "admin"),
+            ("1000 12345", "standard"),
             ("", "unknown"),
         ] {
             assert_eq!(
-                super::super::macos_v3::parse_groups(groups, &["sudo", "wheel"]),
+                super::super::macos_v3::parse_groups(groups, &[27, 10]),
                 expected
             );
         }

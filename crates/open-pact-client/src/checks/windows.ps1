@@ -232,23 +232,40 @@ RunSection {
         if ($disabled -eq '!') { throw 'Unreadable automatic update policy' }
         if ($disabled -notin @('', '0', '1')) { throw 'Invalid automatic update policy' }
         $paused = $false
-        foreach ($name in @('PauseFeatureUpdates','PauseQualityUpdates')) {
-            $flag = PolicyValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate' $name
-            if ($flag -notin @('', '0', '1')) { throw 'Unreadable update pause policy' }
-            if ($flag -eq '1') { $paused = $true }
-        }
-        foreach ($name in @('PauseFeatureUpdatesStartTime','PauseQualityUpdatesStartTime')) {
-            $start = PolicyValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate' $name
-            if ($start -eq '!') { throw 'Unreadable update pause policy' }
-            if ($start -ne '') {
-                $date = [DateTimeOffset]::Parse($start, [Globalization.CultureInfo]::InvariantCulture).UtcDateTime
-                if ($date -le [DateTime]::UtcNow -and $date.AddDays(35) -gt [DateTime]::UtcNow) { $paused = $true }
+        $now = [DateTime]::UtcNow
+        $expiry = PolicyValue 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings' 'PauseUpdatesExpiryTime'
+        if ($expiry -eq '!') { throw 'Unreadable update pause' }
+        foreach ($kind in @('Feature', 'Quality')) {
+            $status = PolicyValue 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UpdatePolicy\Settings' ('Paused' + $kind + 'Status')
+            if ($status -notin @('', '0', '1', '2')) { throw 'Unreadable effective update pause' }
+            $policyPaused = $false
+            $undatedPause = $false
+            foreach ($root in @('HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate', 'HKLM:\SOFTWARE\Microsoft\PolicyManager\current\device\Update', 'HKLM:\SOFTWARE\Microsoft\PolicyManager\default\Update')) {
+                $flagName = 'Pause' + $kind + 'Updates'
+                $startName = $flagName + 'StartTime'
+                if ($root.EndsWith('default\Update')) {
+                    $flag = PolicyValue ($root + '\' + $flagName) 'value'
+                    $start = PolicyValue ($root + '\' + $startName) 'value'
+                } else {
+                    $flag = PolicyValue $root $flagName
+                    $start = PolicyValue $root $startName
+                }
+                if ($flag -notin @('', '0', '1') -or $start -eq '!') { throw 'Unreadable update pause policy' }
+                if ($start -ne '') {
+                    $date = [DateTimeOffset]::Parse($start, [Globalization.CultureInfo]::InvariantCulture).UtcDateTime
+                    if ($date -le $now -and $date.AddDays(35) -gt $now) { $policyPaused = $true }
+                } elseif ($flag -eq '1') { $undatedPause = $true }
             }
-        }
-        foreach ($name in @('PauseUpdatesExpiryTime','PauseFeatureUpdatesEndTime','PauseQualityUpdatesEndTime')) {
-            $expiry = PolicyValue 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings' $name
-            if ($expiry -eq '!') { throw 'Unreadable update pause' }
-            if ($expiry -ne '' -and [DateTimeOffset]::Parse($expiry, [Globalization.CultureInfo]::InvariantCulture).UtcDateTime -gt [DateTime]::UtcNow) { $paused = $true }
+            $end = PolicyValue 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings' ('Pause' + $kind + 'UpdatesEndTime')
+            if ($end -eq '!') { throw 'Unreadable update pause' }
+            if ($status -eq '1') { $paused = $true }
+            elseif ($status -eq '') {
+                if ($undatedPause) { throw 'Unknown update pause age' }
+                if ($policyPaused) { $paused = $true }
+                foreach ($until in @($expiry, $end)) {
+                    if ($until -ne '' -and [DateTimeOffset]::Parse($until, [Globalization.CultureInfo]::InvariantCulture).UtcDateTime -gt $now) { $paused = $true }
+                }
+            }
         }
         if ($disabled -eq '1' -or $paused -or $settings.NotificationLevel -eq 1) { Emit 'os_auto_updates' 'off' }
         elseif ($settings.NotificationLevel -in @(2,3,4)) { Emit 'os_auto_updates' 'on' }

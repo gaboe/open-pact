@@ -707,6 +707,24 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
+    fn automatic_update_pause_source_fixtures() {
+        let output = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/checks/windows_update_tests.ps1"
+            ))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    #[test]
+    #[cfg(windows)]
     fn native_batch_emits_every_metric() {
         let batch = batch();
         eprintln!("{}", batch.diagnostics);

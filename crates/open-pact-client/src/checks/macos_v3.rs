@@ -46,24 +46,36 @@ fn parse_realtime(active: &str) -> ControlValue {
     .into()
 }
 pub fn work_account() -> ControlValue {
-    command("/usr/bin/id", &["-Gn"])
-        .map_or_else(|| "unknown".into(), |s| parse_groups(&s, &["admin"]))
+    let Some(group) = command(
+        "/usr/bin/dscl",
+        &[".", "-read", "/Groups/admin", "PrimaryGroupID"],
+    ) else {
+        return "unknown".into();
+    };
+    let Some(gid) = group
+        .trim()
+        .strip_prefix("PrimaryGroupID:")
+        .and_then(|s| s.trim().parse::<u32>().ok())
+    else {
+        return "unknown".into();
+    };
+    command("/usr/bin/id", &["-G"]).map_or_else(|| "unknown".into(), |s| parse_groups(&s, &[gid]))
 }
-pub(super) fn parse_groups(text: &str, admins: &[&str]) -> ControlValue {
-    let groups: Vec<_> = text.split_whitespace().collect();
-    if groups.is_empty()
-        || groups.iter().any(|g| {
-            !g.bytes()
-                .all(|c| c.is_ascii_alphanumeric() || b"_.-".contains(&c))
-        })
-    {
-        "unknown".into()
-    } else if groups.iter().any(|g| admins.contains(g)) {
-        "admin".into()
-    } else {
-        "standard".into()
+pub(super) fn parse_groups(text: &str, admins: &[u32]) -> ControlValue {
+    let groups: Result<Vec<u32>, _> = text.split_whitespace().map(str::parse).collect();
+    match groups {
+        Ok(groups) if !groups.is_empty() => {
+            if groups.iter().any(|g| admins.contains(g)) {
+                "admin"
+            } else {
+                "standard"
+            }
+        }
+        _ => "unknown",
     }
+    .into()
 }
+
 pub fn uptime_days() -> ControlValue {
     command("/usr/sbin/sysctl", &["-n", "kern.boottime"]).map_or_else(
         || "unknown".into(),
@@ -354,13 +366,13 @@ mod v31_tests {
     }
     #[test]
     fn current_account_group_fixtures() {
-        assert_eq!(
-            parse_groups("staff admin com.example.access\n", &["admin"]),
-            "admin"
-        );
-        assert_eq!(parse_groups("staff everyone\n", &["admin"]), "standard");
-        assert_eq!(parse_groups("", &["admin"]), "unknown");
-        assert_eq!(parse_groups("id: permission denied", &["admin"]), "unknown");
+        assert_eq!(parse_groups("20 80 12345\n", &[80]), "admin");
+        assert_eq!(parse_groups("20 12\n", &[80]), "standard");
+        // The unrelated GID can have a space or Unicode in its display name.
+        assert_eq!(parse_groups("20 80 12345", &[80]), "admin");
+        assert_eq!(parse_groups("20 12345", &[80]), "standard");
+        assert_eq!(parse_groups("", &[80]), "unknown");
+        assert_eq!(parse_groups("id: permission denied", &[80]), "unknown");
     }
     #[test]
     fn boot_time_fixtures() {
