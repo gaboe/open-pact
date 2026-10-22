@@ -6,7 +6,9 @@ use open_pact_core::{PublicKey, Signature};
 use sha2::{Digest, Sha256};
 use std::{path::Path, ptr};
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, LocalFree, NTE_BAD_KEYSET, NTE_NOT_FOUND},
+    Foundation::{
+        CloseHandle, LocalFree, NTE_BAD_KEYSET, NTE_NO_MORE_ITEMS, NTE_NOT_FOUND, NTE_PERM,
+    },
     Security::{
         Authorization::{
             ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -29,6 +31,15 @@ impl Drop for Handle {
     }
 }
 
+struct Buffer(*mut std::ffi::c_void);
+impl Drop for Buffer {
+    fn drop(&mut self) {
+        unsafe {
+            NCryptFreeBuffer(self.0);
+        }
+    }
+}
+
 pub struct WindowsKey {
     key: Handle,
     public: PublicKey,
@@ -46,6 +57,51 @@ fn provider(name: &str) -> Result<Handle> {
     let mut handle = 0;
     check(unsafe { NCryptOpenStorageProvider(&mut handle, wide(name).as_ptr(), 0) })?;
     Ok(Handle(handle))
+}
+
+fn key_exists(provider: &Handle, id: &str) -> Result<bool> {
+    let mut state = ptr::null_mut();
+    loop {
+        let mut raw_name = ptr::null_mut();
+        let status =
+            unsafe { NCryptEnumKeys(provider.0, ptr::null(), &mut raw_name, &mut state, FLAGS) };
+        if status == NTE_NO_MORE_ITEMS {
+            if !state.is_null() {
+                unsafe { NCryptFreeBuffer(state) };
+            }
+            return Ok(false);
+        }
+        if status != 0 {
+            if !raw_name.is_null() {
+                unsafe { NCryptFreeBuffer(raw_name.cast()) };
+            }
+            if !state.is_null() {
+                unsafe { NCryptFreeBuffer(state) };
+            }
+            check(status)?;
+        }
+        ensure!(!raw_name.is_null(), "CNG key enumeration returned no name");
+        let name_buffer = Buffer(raw_name.cast());
+        let name = unsafe { &*raw_name };
+        ensure!(
+            !name.pszName.is_null(),
+            "CNG key enumeration returned no name"
+        );
+        let mut len = 0;
+        unsafe {
+            while *name.pszName.add(len) != 0 {
+                len += 1;
+            }
+        }
+        let name = String::from_utf16(unsafe { std::slice::from_raw_parts(name.pszName, len) })?;
+        drop(name_buffer);
+        if name == id {
+            if !state.is_null() {
+                unsafe { NCryptFreeBuffer(state) };
+            }
+            return Ok(true);
+        }
+    }
 }
 
 pub(super) fn is_elevated() -> Result<bool> {
@@ -242,7 +298,10 @@ impl WindowsKey {
             let status =
                 unsafe { NCryptOpenKey(provider.0, &mut raw, wide(&id).as_ptr(), 0, FLAGS) };
             if status == NTE_BAD_KEYSET || status == NTE_NOT_FOUND {
-                return super::remove_if_present(&marker);
+                if !key_exists(&provider, &id)? {
+                    return super::remove_if_present(&marker);
+                }
+                check(NTE_PERM)?;
             }
             check(status)?;
             let key = Handle(raw);
