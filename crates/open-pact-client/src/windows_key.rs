@@ -282,11 +282,15 @@ impl WindowsKey {
         match result {
             Ok(public) => Ok(Self { key, public }),
             Err(error) => {
+                check(unsafe { NCryptDeleteKey(key.0, NCRYPT_SILENT_FLAG) })
+                    .with_context(|| {
+                        format!(
+                            "clean up failed CNG creation after {error:#}; retry with delete-device-key"
+                        )
+                    })?;
                 if marker_created {
                     super::remove_if_present(&home.join(super::TPM_FILE))?;
                 }
-                check(unsafe { NCryptDeleteKey(key.0, NCRYPT_SILENT_FLAG) })
-                    .with_context(|| format!("clean up failed CNG creation after {error:#}"))?;
                 std::mem::forget(key);
                 if error
                     .downcast_ref::<std::io::Error>()
