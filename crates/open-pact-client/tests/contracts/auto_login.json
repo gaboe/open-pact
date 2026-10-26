@@ -8,8 +8,9 @@
         "fictional-user"
       ],
       "now": "2026-10-26T12:00:00Z",
-      "expected": "on",
-      "known_diff": null
+      "expected": "unknown",
+      "known_diff": "internal/jobs/review-contracts/report.md#auto_login-m-and-i",
+      "unrepresentable_input": "The macOS adapter accepts only the username setting and cannot consume override evidence."
     },
     {
       "name": "macos-2",
@@ -39,8 +40,9 @@
       ],
       "code": 0,
       "now": "2026-10-26T12:00:00Z",
-      "expected": "on",
-      "known_diff": null
+      "expected": "unknown",
+      "known_diff": "internal/jobs/review-contracts/report.md#auto_login-m-and-i",
+      "unrepresentable_input": "The Windows adapter accepts AutoAdminLogon only and cannot consume inhibition evidence."
     },
     {
       "name": "windows-5",
@@ -108,6 +110,16 @@
     }
   ],
   "uncovered": [
+    {
+      "os": "macos",
+      "result": "on",
+      "reason": "The macOS adapter reads the username setting only. It cannot consume effective login or override evidence."
+    },
+    {
+      "os": "windows",
+      "result": "on",
+      "reason": "The Windows adapter reads AutoAdminLogon only. It cannot consume effective inhibition evidence."
+    },
     {
       "os": "linux",
       "result": "on",
