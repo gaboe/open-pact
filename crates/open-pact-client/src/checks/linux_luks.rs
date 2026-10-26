@@ -748,84 +748,44 @@ mod crypttab_tests {
     }
 
     #[test]
-    fn path_entries_bind_kernel_options_by_block_device_uuid() {
-        let uuid = "11111111-1111-1111-1111-111111111111";
-        let tree = serde_json::json!({"blockdevices":[{
-            "name":"/dev/mapper/root", "type":"crypt", "fstype":"ext4", "mountpoints":["/"],
-            "children":[{"name":"/dev/fictional", "type":"part", "fstype":"crypto_LUKS", "uuid":uuid, "mountpoints":[null]}]
-        }]}).to_string();
-        let uuids = device_uuids(&tree);
-        assert_eq!(uuids.get("root").map(String::as_str), Some(uuid));
-        let cmdline =
-            format!("rd.luks.options={uuid}=tpm2-device=auto,tpm2-pin=true,try-empty-password=on");
-        let config = BootConfig::parse_bound(
-            "root /dev/fictional - tpm2-device=auto,tpm2-pin=yes",
-            &cmdline,
-            |mapping| uuids.get(mapping).map(String::as_str),
-        );
-        assert_eq!(config.key("root"), BootKey::Unknown);
-    }
-
-    #[test]
-    fn kernel_unlock_options_keep_uuid_and_pin_bindings() {
+    fn kernel_unlock_parameters_make_boot_auth_unknown() {
         let root_uuid = "11111111-1111-1111-1111-111111111111";
         let swap_uuid = "22222222-2222-2222-2222-222222222222";
         let crypttab = format!(
             "root UUID={root_uuid} - tpm2-device=auto\nswap UUID={swap_uuid} - tpm2-device=auto"
         );
-        for prefix in ["luks", "rd.luks"] {
-            for value in ["1", "yes", "y", "true", "t", "on", "TRUE"] {
-                let cmdline = format!(
-                    "{prefix}.options={root_uuid}=fido2-cid=ZmljdGlvbmFs,fido2-pin={value} {prefix}.options={swap_uuid}=tpm2-device=auto,fido2-pin={value}"
-                );
-                let config = BootConfig::parse(&crypttab, &cmdline);
-                assert_eq!(config.key("root").unlock(None), Unlock::Secret);
-                assert_eq!(config.key("swap").unlock(None), Unlock::Hardware);
-                let cmdline = format!(
-                    "{prefix}.options={root_uuid}=tpm2-device=auto,tpm2-pin={value},try-empty-password={value}"
-                );
-                assert_eq!(
-                    BootConfig::parse(&crypttab, &cmdline).key("root"),
-                    BootKey::Unknown
-                );
-            }
-            let cmdline = format!(
-                "{prefix}.uuid={root_uuid} {prefix}.options=fido2-cid=ZmljdGlvbmFs,fido2-pin=on"
+        for cmdline in [
+            format!("luks.options={root_uuid}=tpm2-device=auto,tpm2-pin=yes"),
+            format!("rd.luks.options={swap_uuid}=tpm2-device=auto,tpm2-pin=yes"),
+            format!("luks.name={root_uuid}=renamed"),
+            format!("luks.key={root_uuid}=/fictional/missing-key"),
+            "luks=off luks=on".to_owned(),
+            "rd.luks=FALSE".to_owned(),
+            "luks.options=quiet".to_owned(),
+        ] {
+            assert_eq!(
+                BootConfig::parse(&crypttab, &cmdline).key("root").unlock(None),
+                Unlock::Unknown
             );
             assert_eq!(
-                BootConfig::parse("", &cmdline).key(&format!("luks-{root_uuid}")),
-                BootKey::Secret
+                BootConfig::parse(&crypttab, &cmdline).key("swap").unlock(None),
+                Unlock::Unknown
             );
-            assert_eq!(
-                BootConfig::parse(&crypttab, &cmdline).key("root"),
-                BootKey::Hardware
-            );
-            let cmdline = format!(
-                "{prefix}.name={root_uuid}=root {prefix}.options={swap_uuid}=tpm2-device=auto,tpm2-pin=yes"
-            );
-            assert_eq!(
-                BootConfig::parse("", &cmdline).key("root"),
-                BootKey::Unknown
-            );
-            let cmdline = format!(
-                "{prefix}.name={root_uuid}=root {prefix}.options={root_uuid}=tpm2-device=auto,tpm2-pin=on"
-            );
-            assert_eq!(BootConfig::parse("", &cmdline).key("root"), BootKey::Secret);
         }
-        let quoted = format!(
-            "rd.luks.options=\"{root_uuid}=tpm2-device=auto,tpm2-pin=on,try-empty-password=TRUE\""
-        );
-        assert_eq!(
-            BootConfig::parse(&crypttab, &quoted).key("root"),
-            BootKey::Unknown
-        );
-        let bad = "root UUID=fictional - tpm2-device=auto,tpm2-pin=invalid";
-        assert_eq!(BootConfig::parse(bad, "").key("root"), BootKey::Unknown);
-        for cmdline in ["luks=off", "rd.luks=FALSE", "rd.luks.crypttab=no"] {
-            assert_eq!(
-                BootConfig::parse(&crypttab, cmdline).key("root"),
-                BootKey::Unknown
-            );
+    }
+
+    #[test]
+    fn unrelated_kernel_words_do_not_change_crypttab_results() {
+        let crypttab = "root UUID=fictional - tpm2-device=auto,tpm2-pin=yes\nswap UUID=other - clevis";
+        let baseline = BootConfig::parse(crypttab, "");
+        for cmdline in [
+            "quiet splash root=UUID=fictional",
+            "BOOT_IMAGE=/fictional/kernel ro console=ttyS0",
+        ] {
+            let config = BootConfig::parse(crypttab, cmdline);
+            for mapping in ["root", "swap"] {
+                assert_eq!(config.key(mapping), baseline.key(mapping), "{cmdline}");
+            }
         }
     }
 
