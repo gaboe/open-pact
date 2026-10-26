@@ -75,7 +75,28 @@ try:
         return int(match.group(1))
 
     def detection(message):
-        code = "import ctypes; ctypes.CDLL(None).prctl(15,b'clamonacc',0,0,0); lib=ctypes.CDLL('libsystemd.so.0'); assert lib.sd_journal_send(" + repr(("MESSAGE=/fictional/" + message + ": Fictional.Test FOUND").encode()) + ",None)==0"
+        code = f"""
+import ctypes
+import json
+import os
+import subprocess
+import time
+
+message = {("/fictional/" + message + ": Fictional.Test FOUND")!r}
+ctypes.CDLL(None).prctl(15, b'clamonacc', 0, 0, 0)
+lib = ctypes.CDLL('libsystemd.so.0')
+assert lib.sd_journal_send(('MESSAGE=' + message).encode(), None) == 0
+# Journald reads trusted process identity while the sender is still alive.
+deadline = time.monotonic() + 5
+while time.monotonic() < deadline:
+    result = subprocess.run(['journalctl', '--no-pager', '--output=json', '_PID=' + str(os.getpid())], text=True, capture_output=True, check=True)
+    entries = [json.loads(line) for line in result.stdout.splitlines()]
+    if any(entry.get('MESSAGE') == message and entry.get('_COMM') == 'clamonacc' for entry in entries):
+        break
+    time.sleep(0.05)
+else:
+    raise AssertionError('Journal did not receive trusted fixture record')
+"""
         execute("python3", "-c", code)
 
     initial = execute("open-pact-checks", "print_linux_detection_marker", "--ignored", "--nocapture").stdout
