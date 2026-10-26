@@ -48,8 +48,41 @@ pub struct CapturedOutput {
     pub stderr: String,
 }
 
+#[cfg(unix)]
+fn resolve_program(
+    program: &str,
+    path: Option<&std::ffi::OsStr>,
+) -> std::io::Result<std::path::PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+
+    let executable = |candidate: &Path| {
+        std::fs::metadata(candidate)
+            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    };
+    let resolved = if program.contains('/') {
+        let candidate = PathBuf::from(program);
+        executable(&candidate).then_some(candidate)
+    } else {
+        path.and_then(|path| {
+            std::env::split_paths(path)
+                .map(|entry| {
+                    if entry.as_os_str().is_empty() {
+                        Path::new(".").join(program)
+                    } else {
+                        entry.join(program)
+                    }
+                })
+                .find(|candidate| executable(candidate))
+        })
+    };
+    resolved.ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))
+}
+
 pub fn capture(program: &str, args: &[&str], timeout: Duration) -> std::io::Result<CapturedOutput> {
     let start = Instant::now();
+    #[cfg(unix)]
+    let program = resolve_program(program, std::env::var_os("PATH").as_deref())?;
     let mut child = Command::new(program)
         .args(args)
         .env("LC_ALL", "C")
@@ -200,5 +233,109 @@ mod tests {
         );
         assert!(start.elapsed() >= timeout);
         assert!(start.elapsed() < Duration::from_secs(2));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod unix_resolution_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+
+    fn write_program(path: &Path, executable: bool, output: &str) {
+        std::fs::write(path, format!("#!/bin/sh\nprintf '{output}'\n")).unwrap();
+        std::fs::set_permissions(
+            path,
+            std::fs::Permissions::from_mode(if executable { 0o700 } else { 0o600 }),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn missing_bare_program_returns_not_found() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolve_program("fictional-missing", Some(root.path().as_os_str()))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            resolve_program("fictional-missing", None)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn missing_absolute_program_returns_not_found_without_spawning() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("fictional-missing");
+        assert_eq!(
+            capture(missing.to_str().unwrap(), &[], TIMEOUT)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn non_executable_file_and_directory_are_not_programs() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("fictional-program");
+        write_program(&file, false, "fictional");
+        for path in [file.as_path(), root.path()] {
+            assert_eq!(
+                capture(path.to_str().unwrap(), &[], TIMEOUT)
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::NotFound
+            );
+        }
+    }
+
+    #[test]
+    fn fictional_path_skips_non_executable_files_and_uses_the_first_executable() {
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        write_program(&first.join("fictional-program"), false, "first");
+        write_program(&second.join("fictional-program"), true, "second");
+        let path = std::env::join_paths([&first, &second]).unwrap();
+        let resolved = resolve_program("fictional-program", Some(&path)).unwrap();
+        assert_eq!(resolved, second.join("fictional-program"));
+        assert_eq!(
+            capture(resolved.to_str().unwrap(), &[], TIMEOUT)
+                .unwrap()
+                .stdout,
+            "second"
+        );
+        write_program(&first.join("fictional-program"), true, "first");
+        assert_eq!(
+            resolve_program("fictional-program", Some(&path)).unwrap(),
+            first.join("fictional-program")
+        );
+    }
+
+    #[test]
+    fn empty_path_entry_searches_the_current_directory() {
+        let file = tempfile::Builder::new()
+            .prefix(".fictional-exec-")
+            .tempfile_in(".")
+            .unwrap()
+            .into_temp_path();
+        write_program(&file, true, "fictional-current");
+        let name = file.file_name().unwrap().to_str().unwrap();
+        let resolved = resolve_program(name, Some(std::ffi::OsStr::new(""))).unwrap();
+        assert_eq!(resolved, Path::new(".").join(name));
+        assert_eq!(
+            capture(resolved.to_str().unwrap(), &[], TIMEOUT)
+                .unwrap()
+                .stdout,
+            "fictional-current"
+        );
     }
 }

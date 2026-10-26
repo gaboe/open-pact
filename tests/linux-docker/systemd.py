@@ -1,4 +1,4 @@
-import json
+import platform as host_platform
 import re
 import subprocess
 import sys
@@ -6,7 +6,11 @@ import time
 
 
 def run(*args, check=True):
-    return subprocess.run(args, text=True, capture_output=True, check=check)
+    result = subprocess.run(args, text=True, capture_output=True)
+    if check and result.returncode:
+        print(result.stdout + result.stderr, flush=True)
+        result.check_returncode()
+    return result
 
 
 image, platform = sys.argv[1:]
@@ -39,6 +43,15 @@ try:
         state = run("docker", "inspect", "--format", "{{json .State}}", container, check=False)
         print("SKIP systemd manager unavailable: " + logs.stdout + logs.stderr + state.stdout, flush=True)
         sys.exit(0)
+    if platform == "linux/amd64" and host_platform.machine().lower() in ("arm64", "aarch64"):
+        # The emulator needs writable executable memory in these test-container services.
+        for service in ["systemd-logind.service", "systemd-journald.service"]:
+            code = "from pathlib import Path; p=Path('/etc/systemd/system/" + service + ".d/fictional-emulation.conf'); p.parent.mkdir(parents=True, exist_ok=True); p.write_text('[Service]\\nMemoryDenyWriteExecute=no\\n')"
+            execute("python3", "-c", code)
+        execute("systemctl", "daemon-reload")
+        execute("systemctl", "reset-failed", "systemd-logind.service", "systemd-journald.service")
+        execute("systemctl", "restart", "systemd-journald.service", "systemd-logind.service")
+        print("Test container: MemoryDenyWriteExecute=no for logind and journald under x86-on-ARM emulation", flush=True)
     execute("useradd", "--create-home", "fictional-timer")
     uid = execute("id", "-u", "fictional-timer").stdout.strip()
     execute("loginctl", "enable-linger", "fictional-timer")

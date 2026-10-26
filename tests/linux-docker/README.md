@@ -11,3 +11,5 @@ A `systemctl` fixture supplies timer state after the initial no-manager case. Th
 All runtime containers use `--rm`. Build cache and test images remain available for another run. No existing Docker container is changed.
 
 The Ubuntu run also attempts a privileged systemd container with a private cgroup namespace. When the Docker host supports it, the test installs and removes the client's real user timer, runs its service with a closed local VPN probe, and injects two fictional detections through the native journal API. The detection marker must advance. A host that cannot start the systemd manager prints the observed reason as `SKIP`. Set `SYSTEMD=0` to omit this optional scenario.
+
+For x86_64 containers on an ARM host, the systemd scenario sets `MemoryDenyWriteExecute=no` for the container's `systemd-logind` and `systemd-journald` services. Those services trap under the local emulator with that restriction enabled. The native timer and journal checks pass after this override. The override exists only in the temporary test container. Native x86_64 and aarch64 runs retain the service defaults.
