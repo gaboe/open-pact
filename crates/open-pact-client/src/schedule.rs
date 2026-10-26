@@ -1101,6 +1101,32 @@ struct Observed {
     system: bool,
     leftovers: bool,
     protected_leftovers: bool,
+    windows_task: Option<WindowsTaskState>,
+}
+
+#[derive(Debug, Default)]
+struct WindowsTaskState {
+    trigger_enabled: bool,
+    trigger_type: Option<i32>,
+    protected_binary: Option<ProtectedBinaryState>,
+}
+
+#[derive(Debug)]
+struct ProtectedBinaryState {
+    exists: bool,
+    matches_source: bool,
+}
+
+impl WindowsTaskState {
+    fn matches_desired(&self, system: bool) -> bool {
+        self.trigger_enabled
+            && self.trigger_type == Some(1)
+            && (!system
+                || self
+                    .protected_binary
+                    .as_ref()
+                    .is_some_and(|binary| binary.exists && binary.matches_source))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1114,7 +1140,16 @@ enum Change {
 fn reconcile(desired: Option<&Applied>, applied: Option<&Applied>, observed: &Observed) -> Change {
     match desired {
         Some(_) if !observed.exists => Change::Install,
-        Some(desired) if Some(desired) != applied || !observed.matches => Change::Update,
+        Some(desired)
+            if Some(desired) != applied
+                || !observed.matches
+                || observed
+                    .windows_task
+                    .as_ref()
+                    .is_some_and(|task| !task.matches_desired(desired.run_as == RunAs::System)) =>
+        {
+            Change::Update
+        }
         Some(_) => Change::None,
         None if observed.exists || observed.leftovers || applied.is_some() => Change::Remove,
         None => Change::None,
@@ -1130,6 +1165,9 @@ fn read_text_if_exists(path: &Path) -> Result<Option<String>> {
 }
 
 fn observe(home: &Home, desired: Option<&Applied>, inspect_protected: bool) -> Result<Observed> {
+    let source_executable = desired
+        .map(|settings| settings.executable.clone())
+        .unwrap_or(std::env::current_exe()?);
     let executable = desired
         .map(|settings| settings.executable.clone())
         .unwrap_or(std::env::current_exe()?);
@@ -1165,6 +1203,7 @@ fn observe(home: &Home, desired: Option<&Applied>, inspect_protected: bool) -> R
                 leftovers,
                 system: false,
                 protected_leftovers: false,
+                windows_task: None,
             }
         }
         open_pact_core::Os::Linux => {
@@ -1183,6 +1222,7 @@ fn observe(home: &Home, desired: Option<&Applied>, inspect_protected: bool) -> R
                 leftovers,
                 system: false,
                 protected_leftovers: false,
+                windows_task: None,
             }
         }
         open_pact_core::Os::Windows => {
@@ -1200,12 +1240,41 @@ if ($null -eq $task) {{ Write-Output 'missing'; return }}
 if (IsSystemTask $task) {{ Write-Output 'system' }} else {{ Write-Output 'user' }}
 $action = @($task.Definition.Actions)
 $triggers = @($task.Definition.Triggers)
-if ($action.Count -eq 1 -and $action[0].Path -eq {binary} -and $action[0].Arguments -eq {args} -and $task.Enabled -and $triggers.Count -eq 1 -and $triggers[0].Repetition.Interval -eq 'PT5M') {{ Write-Output 'matches' }}
+if ($triggers.Count -eq 1) {{
+    Write-Output ("trigger_enabled=" + [int]$triggers[0].Enabled)
+    Write-Output ("trigger_type=" + $triggers[0].Type)
+}}
+if (IsSystemTask $task) {{
+    $protected = Join-Path (Join-Path (ProgramFilesPath) 'open-pact') 'open-pact-client.exe'
+    $protectedExists = Test-Path -LiteralPath $protected -PathType Leaf
+    Write-Output ("protected_exists=" + [int]$protectedExists)
+    $protectedMatches = $protectedExists -and (Get-FileHash -LiteralPath $protected -Algorithm SHA256).Hash -eq (Get-FileHash -LiteralPath {source} -Algorithm SHA256).Hash
+    Write-Output ("protected_matches=" + [int]$protectedMatches)
+}}
+if ($action.Count -eq 1 -and $action[0].Path -eq {binary} -and $action[0].Arguments -eq {args} -and $task.Enabled -and $triggers.Count -eq 1 -and $triggers[0].Enabled -and $triggers[0].Type -eq 1 -and $triggers[0].Repetition.Interval -eq 'PT5M') {{ Write-Output 'matches' }}
 "#,
                 binary = powershell_literal(text(&executable)?),
-                args = powershell_literal(&expected_args)
+                args = powershell_literal(&expected_args),
+                source = powershell_literal(text(&source_executable)?)
             ))?;
             let system = output.lines().any(|line| line == "system");
+            let field = |name: &str| {
+                output
+                    .lines()
+                    .find_map(|line| line.strip_prefix(name))
+                    .and_then(|value| value.parse::<i32>().ok())
+            };
+            let windows_task = output
+                .lines()
+                .any(|line| line.starts_with("trigger_enabled="))
+                .then(|| WindowsTaskState {
+                    trigger_enabled: field("trigger_enabled=") == Some(1),
+                    trigger_type: field("trigger_type="),
+                    protected_binary: system.then(|| ProtectedBinaryState {
+                        exists: field("protected_exists=") == Some(1),
+                        matches_source: field("protected_matches=") == Some(1),
+                    }),
+                });
             let protected_leftovers = inspect_protected
                 && (windows_existing_system_state(&home.0)?.is_some()
                     || windows_orphaned_binary(&job)?);
@@ -1216,6 +1285,7 @@ if ($action.Count -eq 1 -and $action[0].Path -eq {binary} -and $action[0].Argume
                 system,
                 leftovers: leftovers || protected_leftovers,
                 protected_leftovers,
+                windows_task,
             }
         }
     })
@@ -1565,6 +1635,7 @@ mod tests {
         assert!(!needs_system_cleanup(false, true, &Observed::default()));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     #[ignore = "requires a built OPEN_PACT_CLIENT_BIN; all scheduler commands use a fixture mock"]
     fn declarative_cli_with_mock_scheduler() {
@@ -1787,6 +1858,78 @@ esac
             ),
             Change::Update
         );
+    }
+
+    #[test]
+    fn windows_reconcile_repairs_disabled_or_wrong_triggers() {
+        let settings = Applied {
+            report: Config::new("https://collector.example.org/status".into(), None).unwrap(),
+            run_as: RunAs::User,
+            executable: PathBuf::from("C:\\Program Files\\open-pact\\open-pact-client.exe"),
+        };
+        let applied = Some(&settings);
+        let disabled = Observed {
+            exists: true,
+            matches: true,
+            windows_task: Some(WindowsTaskState {
+                trigger_enabled: false,
+                trigger_type: Some(1),
+                protected_binary: None,
+            }),
+            ..Observed::default()
+        };
+        assert_eq!(
+            reconcile(Some(&settings), applied, &disabled),
+            Change::Update
+        );
+        let wrong_type = Observed {
+            windows_task: Some(WindowsTaskState {
+                trigger_enabled: true,
+                trigger_type: Some(7),
+                protected_binary: None,
+            }),
+            ..disabled
+        };
+        assert_eq!(
+            reconcile(Some(&settings), applied, &wrong_type),
+            Change::Update
+        );
+    }
+
+    #[test]
+    fn windows_reconcile_repairs_missing_or_stale_system_binary() {
+        let settings = Applied {
+            report: Config::new("https://collector.example.org/status".into(), None).unwrap(),
+            run_as: RunAs::System,
+            executable: PathBuf::from("C:\\example\\open-pact-client.exe"),
+        };
+        let applied = Some(&settings);
+        for protected_binary in [
+            ProtectedBinaryState {
+                exists: false,
+                matches_source: false,
+            },
+            ProtectedBinaryState {
+                exists: true,
+                matches_source: false,
+            },
+        ] {
+            let observed = Observed {
+                exists: true,
+                matches: true,
+                system: true,
+                windows_task: Some(WindowsTaskState {
+                    trigger_enabled: true,
+                    trigger_type: Some(1),
+                    protected_binary: Some(protected_binary),
+                }),
+                ..Observed::default()
+            };
+            assert_eq!(
+                reconcile(Some(&settings), applied, &observed),
+                Change::Update
+            );
+        }
     }
 
     #[test]
