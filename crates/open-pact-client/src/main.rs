@@ -1,4 +1,5 @@
 mod checks;
+mod device_config;
 mod device_key;
 #[cfg(test)]
 mod fake_gateway;
@@ -644,13 +645,11 @@ fn virtualized() -> Virtualized {
 }
 
 fn collect_results(manifest: &Manifest, os: Os) -> BTreeMap<String, open_pact_core::ControlValue> {
-    let ids: Vec<&str> = manifest
-        .body()
-        .controls
-        .iter()
-        .map(|c| c.id.as_str())
-        .collect();
-    disclosable(manifest, os, checks::run(os, &ids))
+    disclosable(
+        manifest,
+        os,
+        checks::run(os, &manifest.body().controls, None),
+    )
 }
 
 fn disclosable(
