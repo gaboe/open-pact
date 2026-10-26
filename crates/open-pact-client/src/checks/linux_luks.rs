@@ -43,18 +43,18 @@ impl Unlock {
 }
 
 pub fn preboot_auth() -> ControlValue {
-    let Ok(cmdline) = std::fs::read_to_string("/proc/cmdline") else {
+    let Ok(cmdline) = std::fs::read("/proc/cmdline") else {
         return Unlock::Unknown.value();
     };
+    if kernel_cmdline_result(&cmdline).is_some() {
+        return Unlock::Unknown.value();
+    }
     let crypttab = match std::fs::read_to_string("/etc/crypttab") {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
         Ok(crypttab) => crypttab,
         Err(_) => return Unlock::Unknown.value(),
     };
-    let config = BootConfig::parse(&crypttab, &cmdline);
-    if config.has_kernel_unlock_parameter {
-        return Unlock::Unknown.value();
-    }
+    let config = BootConfig::parse(&crypttab);
     let Some(output) = run_status(
         "lsblk",
         &[
@@ -254,11 +254,10 @@ struct BootDevice<'a> {
 
 struct BootConfig<'a> {
     devices: Vec<BootDevice<'a>>,
-    has_kernel_unlock_parameter: bool,
 }
 
 impl<'a> BootConfig<'a> {
-    fn parse(crypttab: &'a str, cmdline: &str) -> Self {
+    fn parse(crypttab: &'a str) -> Self {
         let mut devices = Vec::new();
         for line in crypttab.lines() {
             let fields: Vec<_> = line
@@ -286,18 +285,10 @@ impl<'a> BootConfig<'a> {
                 },
             });
         }
-        Self {
-            devices,
-            has_kernel_unlock_parameter: kernel_cmdline_words(cmdline)
-                .iter()
-                .any(|word| is_luks_unlock_parameter(word)),
-        }
+        Self { devices }
     }
 
     fn key(&self, mapping: &str) -> BootKey<'a> {
-        if self.has_kernel_unlock_parameter {
-            return BootKey::Unknown;
-        }
         let mut devices = self
             .devices
             .iter()
@@ -315,37 +306,16 @@ impl<'a> BootConfig<'a> {
     }
 }
 
-fn is_luks_unlock_parameter(word: &str) -> bool {
-    let name = word.split_once('=').map_or(word, |(name, _)| name);
-    let name = name.strip_prefix("rd.").unwrap_or(name);
-    name == "luks" || name.starts_with("luks.")
-}
-
-fn kernel_cmdline_words(cmdline: &str) -> Vec<String> {
-    let mut words = Vec::new();
-    let mut word = String::new();
-    let mut quote = None;
-    for character in cmdline.chars() {
-        match (quote, character) {
-            (Some(open), close) if open == close => quote = None,
-            (None, '\'' | '"') => quote = Some(character),
-            (None, character) if character.is_whitespace() => {
-                if !word.is_empty() {
-                    words.push(std::mem::take(&mut word));
-                }
-            }
-            _ => word.push(character),
-        }
-    }
-    if !word.is_empty() {
-        words.push(word);
-    }
-    words
+fn kernel_cmdline_result(cmdline: &[u8]) -> Option<Unlock> {
+    cmdline
+        .windows(b"luks".len())
+        .any(|sequence| sequence == b"luks")
+        .then_some(Unlock::Unknown)
 }
 
 #[cfg(test)]
 fn parse_crypttab<'a>(text: &'a str, mapping: &str) -> BootKey<'a> {
-    BootConfig::parse(text, "").key(mapping)
+    BootConfig::parse(text).key(mapping)
 }
 
 fn keyfile_unlock(path: &str) -> Unlock {
@@ -604,13 +574,10 @@ mod crypttab_tests {
     #[test]
     fn kernel_unlock_parameters_make_boot_auth_unknown() {
         let root_uuid = "11111111-1111-1111-1111-111111111111";
-        let swap_uuid = "22222222-2222-2222-2222-222222222222";
-        let crypttab = format!(
-            "root UUID={root_uuid} - tpm2-device=auto\nswap UUID={swap_uuid} - tpm2-device=auto"
-        );
+        let crypttab = format!("root UUID={root_uuid} - tpm2-device=auto,tpm2-pin=yes");
         for cmdline in [
             format!("luks.options={root_uuid}=tpm2-device=auto,tpm2-pin=yes"),
-            format!("rd.luks.options={swap_uuid}=tpm2-device=auto,tpm2-pin=yes"),
+            format!("rd.luks.options={root_uuid}=tpm2-device=auto,tpm2-pin=yes"),
             format!("luks.name={root_uuid}=renamed"),
             format!("luks.uuid={root_uuid}"),
             format!("luks.key={root_uuid}=/fictional/missing-key"),
@@ -622,41 +589,41 @@ mod crypttab_tests {
             "luks.options=quiet".to_owned(),
         ] {
             assert_eq!(
-                BootConfig::parse(&crypttab, &cmdline)
-                    .key("root")
-                    .unlock(None),
-                Unlock::Unknown
+                kernel_cmdline_result(cmdline.as_bytes()).map(Unlock::value),
+                Some("unknown".into()),
+                "{cmdline}"
             );
             assert_eq!(
-                BootConfig::parse(&crypttab, &cmdline)
-                    .key("swap")
-                    .unlock(None),
-                Unlock::Unknown
+                parse_crypttab(&crypttab, "root").unlock(None),
+                Unlock::Secret
             );
         }
     }
 
     #[test]
-    fn quoted_kernel_words_match_complete_parameter_names() {
+    fn any_raw_luks_bytes_make_the_control_result_unknown() {
         let crypttab =
             "root UUID=11111111-1111-1111-1111-111111111111 - tpm2-device=auto,tpm2-pin=yes";
         for cmdline in [
             "\"luks\"=on",
             "\"rd.luks\"=on",
             "\"luks\".options=11111111-1111-1111-1111-111111111111=tpm2-device=auto",
+            "note=\"hello luks.options=ignored\"",
+            "note='hello luks=off",
+            "note='hello luks=off'",
+            "'luks'=off",
+            "note=x\u{2003}luks=off",
+            "note=x\u{2028}luks=off",
+            "note=x\u{0120}luks=off",
         ] {
             assert_eq!(
-                BootConfig::parse(crypttab, cmdline)
-                    .key("root")
-                    .unlock(None),
-                Unlock::Unknown,
+                kernel_cmdline_result(cmdline.as_bytes()).map(Unlock::value),
+                Some("unknown".into()),
                 "{cmdline}"
             );
         }
         assert_eq!(
-            BootConfig::parse(crypttab, "note=\"hello luks.options=ignored\"")
-                .key("root")
-                .unlock(None),
+            parse_crypttab(crypttab, "root").unlock(None),
             Unlock::Secret
         );
     }
@@ -665,15 +632,21 @@ mod crypttab_tests {
     fn unrelated_kernel_words_do_not_change_crypttab_results() {
         let crypttab =
             "root UUID=fictional - tpm2-device=auto,tpm2-pin=yes\nswap UUID=other - clevis";
-        let baseline = BootConfig::parse(crypttab, "");
+        let baseline = BootConfig::parse(crypttab);
         for cmdline in [
             "quiet splash root=UUID=fictional",
             "BOOT_IMAGE=/fictional/kernel ro console=ttyS0",
-            "notluks.options=ignored root=luks",
+            "root=UUID=fictional ro console=ttyS0",
+            "lu'ks'=off",
         ] {
-            let config = BootConfig::parse(crypttab, cmdline);
+            assert_eq!(kernel_cmdline_result(cmdline.as_bytes()), None);
+            let config = BootConfig::parse(crypttab);
             for mapping in ["root", "swap"] {
-                assert_eq!(config.key(mapping), baseline.key(mapping), "{cmdline}");
+                assert_eq!(
+                    config.key(mapping).unlock(None),
+                    baseline.key(mapping).unlock(None),
+                    "{cmdline}"
+                );
             }
         }
     }
