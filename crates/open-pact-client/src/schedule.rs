@@ -8,6 +8,7 @@ use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::device_config::{DeviceConfig, RunAs};
 use crate::{Home, checks, report};
 
 const CONFIG: &str = "report-schedule.json";
@@ -44,7 +45,7 @@ pub(crate) enum Command {
     },
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct Config {
     collector: String,
     vpn_probe: String,
@@ -1083,7 +1084,275 @@ async fn run_report(
     Ok(())
 }
 
+const APPLIED: &str = "schedule-applied.json";
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct Applied {
+    report: Config,
+    run_as: RunAs,
+    executable: PathBuf,
+}
+
+#[derive(Debug, Default)]
+struct Observed {
+    exists: bool,
+    matches: bool,
+    system: bool,
+    leftovers: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Change {
+    Install,
+    Update,
+    Remove,
+    None,
+}
+
+fn reconcile(desired: Option<&Applied>, applied: Option<&Applied>, observed: &Observed) -> Change {
+    match desired {
+        Some(_) if !observed.exists => Change::Install,
+        Some(desired) if Some(desired) != applied || !observed.matches => Change::Update,
+        Some(_) => Change::None,
+        None if observed.exists || observed.leftovers || applied.is_some() => Change::Remove,
+        None => Change::None,
+    }
+}
+
+fn read_text_if_exists(path: &Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
+    }
+}
+
+fn observe(home: &Home, desired: Option<&Applied>) -> Result<Observed> {
+    let executable = desired
+        .map(|settings| settings.executable.clone())
+        .unwrap_or(std::env::current_exe()?);
+    let mut job = Job::new(&executable, &home.0)?;
+    if desired.is_some_and(|settings| settings.run_as == RunAs::System) {
+        job.argv.push("--system".into());
+    }
+    let leftovers = home.file(CONFIG).exists() || home.file(STATE).exists();
+    Ok(match crate::current_os()? {
+        open_pact_core::Os::Macos => {
+            let path = user_home()?
+                .join("Library/LaunchAgents")
+                .join(format!("{}.plist", job.id));
+            let stored = read_text_if_exists(&path)?;
+            let target = format!("{}/{}", launch_domain()?, job.id);
+            let loaded = std::process::Command::new("launchctl")
+                .args(["print", &target])
+                .output()?
+                .status
+                .success();
+            Observed {
+                exists: stored.is_some() || loaded,
+                matches: stored.as_deref() == Some(job.plist().as_str()) && loaded,
+                leftovers,
+                system: false,
+            }
+        }
+        open_pact_core::Os::Linux => {
+            let dir = systemd_dir()?;
+            let service = read_text_if_exists(&dir.join(format!("{}.service", job.id)))?;
+            let timer = read_text_if_exists(&dir.join(format!("{}.timer", job.id)))?;
+            let timer_name = format!("{}.timer", job.id);
+            let active = std::process::Command::new("systemctl")
+                .args(["--user", "is-active", &timer_name])
+                .output()?
+                .status
+                .success();
+            let enabled = std::process::Command::new("systemctl")
+                .args(["--user", "is-enabled", &timer_name])
+                .output()?
+                .status
+                .success();
+            Observed {
+                exists: service.is_some() || timer.is_some() || active || enabled,
+                matches: service.as_deref() == Some(job.service().as_str())
+                    && timer.as_deref() == Some(job.timer().as_str())
+                    && active
+                    && enabled,
+                leftovers,
+                system: false,
+            }
+        }
+        open_pact_core::Os::Windows => {
+            let query = windows_task_query_script(&job);
+            let expected_args = job
+                .argv
+                .iter()
+                .skip(1)
+                .map(|arg| windows_arg(arg))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let output = windows_powershell(&format!(
+                r#"{query}
+if ($null -eq $task) {{ Write-Output 'missing'; return }}
+if (IsSystemTask $task) {{ Write-Output 'system' }} else {{ Write-Output 'user' }}
+$action = @($task.Definition.Actions)
+$triggers = @($task.Definition.Triggers)
+if ($action.Count -eq 1 -and $action[0].Path -eq {binary} -and $action[0].Arguments -eq {args} -and $task.Enabled -and $triggers.Count -eq 1 -and $triggers[0].Repetition.Interval -eq 'PT5M') {{ Write-Output 'matches' }}
+"#,
+                binary = powershell_literal(text(&executable)?),
+                args = powershell_literal(&expected_args)
+            ))?;
+            let system = output.lines().any(|line| line == "system");
+            let system_state = windows_existing_system_state(&home.0)?.is_some();
+            Observed {
+                exists: output.lines().next() != Some("missing"),
+                matches: output.lines().any(|line| line == "matches")
+                    && system == desired.is_some_and(|settings| settings.run_as == RunAs::System),
+                system,
+                leftovers: leftovers || system_state,
+            }
+        }
+    })
+}
+
+pub(crate) fn migration_example(home: &Home) -> Result<bool> {
+    if home.file(crate::device_config::FILE).exists() {
+        return Ok(false);
+    }
+    let Some(config) = home.read_json::<Config>(CONFIG)? else {
+        return Ok(false);
+    };
+    let system = if crate::current_os()? == open_pact_core::Os::Windows {
+        observe(home, None)?.system
+    } else {
+        false
+    };
+    let example = DeviceConfig {
+        report: Some(crate::device_config::Report {
+            collector: config.collector,
+            vpn_probe: Some(config.vpn_probe),
+        }),
+        schedule: Some(crate::device_config::Schedule {
+            enabled: true,
+            run_as: if system { RunAs::System } else { RunAs::User },
+        }),
+        managed_repos: None,
+    };
+    println!(
+        "Create {} with this content to preserve the existing job. No changes were made.\n{}",
+        home.file(crate::device_config::FILE).display(),
+        toml::to_string_pretty(&example)?
+    );
+    Ok(true)
+}
+
+fn apply_command(home: &Path) -> String {
+    #[cfg(windows)]
+    {
+        format!(
+            "& {} --home {} apply",
+            powershell_literal(
+                &std::env::current_exe()
+                    .unwrap_or_else(|_| PathBuf::from("open-pact-client.exe"))
+                    .to_string_lossy()
+            ),
+            powershell_literal(&home.to_string_lossy())
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        format!(
+            "open-pact-client --home '{}' apply",
+            home.to_string_lossy().replace('\'', "'\"'\"'")
+        )
+    }
+}
+
+pub(crate) async fn apply(home: &Home, dry_run: bool) -> Result<()> {
+    if migration_example(home)? {
+        return Ok(());
+    }
+    let config = DeviceConfig::load(home)?.with_context(|| {
+        format!(
+            "Create {}. Use `open-pact-client config example` for a template.",
+            home.file(crate::device_config::FILE).display()
+        )
+    })?;
+    let home = Home(schedule_home(&home.0, true)?);
+    let desired = if let Some(schedule) = config.schedule.filter(|schedule| schedule.enabled) {
+        let report = config.report.context(
+            "open-pact.toml [report].collector is required when [schedule].enabled = true",
+        )?;
+        Some(Applied {
+            report: Config::new(report.collector, report.vpn_probe)?,
+            run_as: schedule.run_as,
+            executable: std::env::current_exe()?,
+        })
+    } else {
+        None
+    };
+    let observed = observe(&home, desired.as_ref())?;
+    let system = observed.system
+        || desired
+            .as_ref()
+            .is_some_and(|settings| settings.run_as == RunAs::System)
+        || (crate::current_os()? == open_pact_core::Os::Windows
+            && windows_existing_system_state(&home.0)?.is_some());
+    if system && windows_require_elevation().is_err() {
+        println!(
+            "Run this exact command from an elevated PowerShell prompt:\n{}",
+            apply_command(&home.0)
+        );
+        return Ok(());
+    }
+    let _lock = if dry_run { None } else { Some(lock(&home)?) };
+    let observed = if dry_run {
+        observed
+    } else {
+        observe(&home, desired.as_ref())?
+    };
+    let applied = home.read_json::<Applied>(APPLIED)?;
+    let change = reconcile(desired.as_ref(), applied.as_ref(), &observed);
+    match change {
+        Change::None => println!("no changes"),
+        Change::Install => println!("schedule: install"),
+        Change::Update => println!("schedule: update"),
+        Change::Remove => println!("schedule: remove"),
+    }
+    if dry_run {
+        return Ok(());
+    }
+    match change {
+        Change::Install | Change::Update => {
+            let desired = desired.as_ref().unwrap();
+            if observed.system && desired.run_as == RunAs::User {
+                operate(&home, Command::Uninstall { system: true }, true).await?;
+            }
+            operate(
+                &home,
+                Command::Install {
+                    collector: desired.report.collector.clone(),
+                    vpn_probe: Some(desired.report.vpn_probe.clone()),
+                    system: desired.run_as == RunAs::System,
+                },
+                true,
+            )
+            .await?;
+            save(&home, APPLIED, desired)?;
+        }
+        Change::Remove => {
+            operate(&home, Command::Uninstall { system }, true).await?;
+            remove_if_exists(&home.file(APPLIED))?;
+        }
+        Change::None => {}
+    }
+    remove_if_exists(&home.file(CONFIG))?;
+    Ok(())
+}
+
 pub(crate) async fn run(home: &Home, command: Command) -> Result<()> {
+    operate(home, command, false).await
+}
+
+async fn operate(home: &Home, command: Command, home_locked: bool) -> Result<()> {
     let os = crate::current_os()?;
     if let Command::Install { system, .. } = &command
         && *system
@@ -1124,14 +1393,14 @@ pub(crate) async fn run(home: &Home, command: Command) -> Result<()> {
         .map(|(_, state)| Home(state.clone()))
         .unwrap_or_else(|| Home(home.0.clone()));
     let home_exists = home.0.exists();
-    let _home_lock = if system_install {
+    let _home_lock = if system_install && !home_locked {
         Some(lock(&home)?)
     } else {
         None
     };
     let _lock = if system_run || system_install {
         Some(lock_system_state(&state_home)?)
-    } else if !uninstall || home_exists {
+    } else if (!uninstall || home_exists) && !home_locked {
         Some(lock(&state_home)?)
     } else {
         None
@@ -1222,6 +1491,69 @@ pub(crate) async fn run(home: &Home, command: Command) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schedule_reconcile_covers_install_update_remove_and_retry() {
+        let settings = Applied {
+            report: Config::new("https://collector.example.org/status".into(), None).unwrap(),
+            run_as: RunAs::User,
+            executable: PathBuf::from("/opt/example/client"),
+        };
+        let missing = Observed::default();
+        let matching = Observed {
+            exists: true,
+            matches: true,
+            ..Observed::default()
+        };
+        assert_eq!(reconcile(Some(&settings), None, &missing), Change::Install);
+        assert_eq!(
+            reconcile(Some(&settings), Some(&settings), &matching),
+            Change::None
+        );
+        assert_eq!(
+            reconcile(Some(&settings), Some(&settings), &missing),
+            Change::Install
+        );
+        assert_eq!(reconcile(None, Some(&settings), &matching), Change::Remove);
+        assert_eq!(reconcile(None, None, &missing), Change::None);
+        assert_eq!(
+            reconcile(
+                None,
+                None,
+                &Observed {
+                    leftovers: true,
+                    ..Observed::default()
+                }
+            ),
+            Change::Remove
+        );
+        for changed in [
+            Applied {
+                report: Config::new("https://other.example.org/status".into(), None).unwrap(),
+                ..settings.clone()
+            },
+            Applied {
+                run_as: RunAs::System,
+                ..settings.clone()
+            },
+        ] {
+            assert_eq!(
+                reconcile(Some(&changed), Some(&settings), &matching),
+                Change::Update
+            );
+        }
+        assert_eq!(
+            reconcile(
+                Some(&settings),
+                Some(&settings),
+                &Observed {
+                    matches: false,
+                    ..matching
+                }
+            ),
+            Change::Update
+        );
+    }
 
     #[test]
     fn missing_home_keeps_the_install_task_identifier() {

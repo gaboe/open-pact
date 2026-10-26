@@ -66,6 +66,11 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Reconcile the scheduled report job with open-pact.toml
+    Apply {
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Install or remove periodic status reports
     Schedule {
         #[command(subcommand)]
@@ -1665,6 +1670,10 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Command::Check => check(&home, cli.insecure_dev).await,
         Command::Report { collector, dry_run } => {
             report::run(&home, &collector, dry_run).await?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Apply { dry_run } => {
+            schedule::apply(&home, dry_run).await?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Schedule { command } => {
