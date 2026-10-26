@@ -210,28 +210,15 @@
       "name": "macos-os-install-disabled",
       "os": "macos",
       "input": [
-        "0",
-        "0",
-        "AutomaticallyInstallMacOSUpdates=0"
-      ],
-      "code": 0,
-      "now": "2026-10-26T12:00:00Z",
-      "expected": "off",
-      "known_diff": null
-    },
-    {
-      "name": "os-install-disabled",
-      "os": "macos",
-      "input": [
         "AutomaticallyInstallMacOSUpdates=0",
         null
       ],
       "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "off",
+      "known_diff": null,
       "observed": "unknown",
-      "difference": "The parser does not read the effective OS-install setting; study: internal/jobs/review-contracts/report.md#os_auto_updates-i-only",
-      "known_diff": null
+      "difference": "The parser does not read the effective OS-install setting; study: internal/jobs/review-contracts/report.md#os_auto_updates-i-only"
     }
   ]
 }
