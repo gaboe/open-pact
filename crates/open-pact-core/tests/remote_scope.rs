@@ -1,4 +1,4 @@
-use open_pact_core::{Manifest, Violation, is_narrowing};
+use open_pact_core::{Control, Manifest, Violation, is_narrowing};
 
 const DEMO: &str = include_str!("../../../examples/manifest.toml");
 const FIREWALL_CHECK: &str = r#"check = "builtin:firewall@1""#;
@@ -45,6 +45,58 @@ fn rejects_invalid_remote_patterns() {
         let result = managed_manifest_result(pattern);
         assert!(result.is_err(), "accepted {pattern:?}");
     }
+}
+
+#[test]
+fn remote_patterns_round_trip_without_changing_scope() {
+    let manifest = managed_manifest(
+        "builtin:managed_repos_outside@1",
+        &["github.com/example-org/"],
+    );
+    let control = manifest.body().control("firewall").unwrap();
+    let serialized = serde_json::to_value(control).unwrap();
+    let parsed: Control = serde_json::from_value(serialized).unwrap();
+
+    assert_eq!(parsed, *control);
+    for ambiguous in ["github.com/example-org.git.git/", "github.com/.git.git/"] {
+        assert!(
+            managed_manifest_result(ambiguous).is_err(),
+            "accepted ambiguous suffix {ambiguous:?}"
+        );
+    }
+}
+
+#[test]
+fn rejects_invalid_dns_hosts_and_control_characters() {
+    for pattern in [
+        "#example.org/example-org/",
+        "github\\.com/example-org/",
+        "github..com/example-org/",
+        "-github.com/example-org/",
+        "github-.com/example-org/",
+        "BÜCHER.example/example-org/",
+        "github.com/example-org\\u0000/",
+        "github.com/example-org\\u0008/",
+        "github.com/example-org\\u001b/",
+    ] {
+        assert!(
+            managed_manifest_result(pattern).is_err(),
+            "accepted invalid host or control character in {pattern:?}"
+        );
+    }
+}
+
+#[test]
+fn accepts_ascii_dns_hosts_with_valid_labels() {
+    let manifest = managed_manifest(
+        "builtin:managed_repos_outside@1",
+        &["GITHUB.COM/example-org/"],
+    );
+
+    assert_eq!(
+        manifest.body().control("firewall").unwrap().remotes[0].as_str(),
+        "github.com/example-org/"
+    );
 }
 
 fn managed_manifest_result(pattern: &str) -> Result<Manifest, open_pact_core::Error> {
