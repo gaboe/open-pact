@@ -276,6 +276,105 @@ fn registry(os: Os) -> Registry {
     }
 }
 
+#[cfg(test)]
+type LegacyRegistry = &'static [(&'static str, fn() -> ControlValue)];
+
+#[cfg(test)]
+fn legacy_registry(os: Os) -> LegacyRegistry {
+    const MACOS: LegacyRegistry = &[
+        ("os_auto_updates", macos_v3::os_auto_updates),
+        ("antimalware_realtime", macos_v3::antimalware_realtime),
+        ("antimalware_active_threats", macos_v3::not_applicable),
+        ("work_account", macos_v3::work_account),
+        ("uptime_days", macos_v3::uptime_days),
+        ("disk_encryption", || macos::disk_encryption().into()),
+        ("firewall", || macos::firewall().into()),
+        ("screen_lock", || macos::screen_lock().into()),
+        ("os_supported", || macos::os_supported().into()),
+        ("os_patch_age_days", macos::os_patch_age_days),
+        ("password_set", macos_v3::unknown),
+        ("auto_login", || macos::auto_login().into()),
+        ("secure_boot", macos_v3::unknown),
+        ("antimalware_active", || macos::antimalware_active().into()),
+        ("preboot_auth", macos_v3::preboot_auth),
+        (
+            "antimalware_signature_age_days",
+            macos_v3::antimalware_signature_age_days,
+        ),
+        ("antimalware_full_scan_age_days", macos_v3::not_applicable),
+        ("web_protection", macos_v3::web_protection),
+        ("log_oldest_record_days", macos_v3::not_applicable),
+        ("process_audit", macos_v3::not_applicable),
+        ("powershell_logging", macos_v3::not_applicable),
+        ("log_cleared", macos_v3::not_applicable),
+    ];
+    const LINUX: LegacyRegistry = &[
+        ("os_auto_updates", linux_v3::os_auto_updates),
+        ("antimalware_realtime", linux_v3::antimalware_realtime),
+        ("antimalware_active_threats", macos_v3::unknown),
+        ("work_account", linux_v3::work_account),
+        ("uptime_days", linux_v3::uptime_days),
+        ("disk_encryption", || linux::disk_encryption().into()),
+        ("firewall", || linux::firewall().into()),
+        ("screen_lock", || linux::screen_lock().into()),
+        ("os_supported", || linux::os_supported().into()),
+        ("os_patch_age_days", linux::os_patch_age_days),
+        ("password_set", macos_v3::unknown),
+        ("auto_login", || linux::auto_login().into()),
+        ("secure_boot", || linux::secure_boot().into()),
+        ("antimalware_active", || linux::antimalware_active().into()),
+        ("preboot_auth", linux_v3::preboot_auth),
+        (
+            "antimalware_signature_age_days",
+            linux_v3::antimalware_signature_age_days,
+        ),
+        ("antimalware_full_scan_age_days", macos_v3::unknown),
+        ("web_protection", macos_v3::unknown),
+        ("log_oldest_record_days", linux_v3::log_oldest_record_days),
+        ("process_audit", macos_v3::not_applicable),
+        ("powershell_logging", macos_v3::not_applicable),
+        ("log_cleared", macos_v3::not_applicable),
+    ];
+    const WINDOWS: LegacyRegistry = &[
+        ("os_auto_updates", windows::os_auto_updates),
+        ("antimalware_realtime", windows::antimalware_realtime),
+        (
+            "antimalware_active_threats",
+            windows::antimalware_active_threats,
+        ),
+        ("work_account", windows::work_account),
+        ("uptime_days", windows::uptime_days),
+        ("disk_encryption", windows::disk_encryption),
+        ("firewall", windows::firewall),
+        ("screen_lock", windows::screen_lock),
+        ("os_supported", windows::os_supported),
+        ("os_patch_age_days", windows::os_patch_age_days),
+        ("password_set", macos_v3::unknown),
+        ("auto_login", windows::auto_login),
+        ("secure_boot", windows::secure_boot),
+        ("antimalware_active", windows::antimalware_active),
+        ("preboot_auth", windows::preboot_auth),
+        (
+            "antimalware_signature_age_days",
+            windows::antimalware_signature_age_days,
+        ),
+        (
+            "antimalware_full_scan_age_days",
+            windows::antimalware_full_scan_age_days,
+        ),
+        ("web_protection", windows::web_protection),
+        ("log_oldest_record_days", windows::log_oldest_record_days),
+        ("process_audit", windows::process_audit),
+        ("powershell_logging", windows::powershell_logging),
+        ("log_cleared", windows::log_cleared),
+    ];
+    match os {
+        Os::Macos => MACOS,
+        Os::Linux => LINUX,
+        Os::Windows => WINDOWS,
+    }
+}
+
 /// Runs the registered checks whose id is in `ids`, and no other.
 pub fn run(
     os: Os,
@@ -338,15 +437,48 @@ mod tests {
     }
 
     #[test]
-    fn registries_ignore_check_input_for_the_same_control_ids() {
+    fn registry_values_match_the_pre_refactor_checks_for_every_control() {
         let manifest =
             Manifest::parse(include_bytes!("../../../../examples/manifest.toml")).unwrap();
+        let mut controls = manifest.body().controls.clone();
+        for (id, _) in BUILTINS {
+            if !controls.iter().any(|control| control.id == *id) {
+                let mut control = controls[0].clone();
+                control.id = (*id).to_string();
+                controls.push(control);
+            }
+        }
         let folders = ManagedFolders::default();
         for os in Os::ALL {
-            let controls = &manifest.body().controls;
-            let first = run(os, controls, &folders);
-            let second = run(os, controls, &folders);
-            assert_eq!(first, second, "{os}");
+            let expected = legacy_registry(os)
+                .iter()
+                .filter(|(id, _)| controls.iter().any(|control| control.id == *id))
+                .map(|(id, check)| {
+                    (
+                        (*id).to_string(),
+                        std::panic::catch_unwind(*check).unwrap_or_else(|_| "unknown".into()),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            assert_eq!(run(os, &controls, &folders), expected, "{os}");
+
+            let changed_controls = controls
+                .iter()
+                .cloned()
+                .map(|mut control| {
+                    control.rationale = Some("changed input rationale".into());
+                    control
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(run(os, &changed_controls, &folders), expected, "{os}");
+
+            let temp = tempfile::tempdir().unwrap();
+            let managed_path = temp.path().join("managed");
+            std::fs::create_dir(&managed_path).unwrap();
+            let home = crate::Home(temp.path().join("home"));
+            ManagedFolders::add(&home, &managed_path).unwrap();
+            let folders_with_path = ManagedFolders::load(&home).unwrap();
+            assert_eq!(run(os, &controls, &folders_with_path), expected, "{os}");
         }
     }
 

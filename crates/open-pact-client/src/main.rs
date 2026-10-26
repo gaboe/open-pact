@@ -1691,20 +1691,17 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         } => join(&home, &invitation, yes, software_key, cli.insecure_dev).await,
         Command::Check => check(&home, cli.insecure_dev).await,
         Command::Folders { command } => {
-            let mut managed = folders::ManagedFolders::load(&home)?;
             match command {
                 FoldersCommand::Add { path } => {
-                    let registered = managed.add(&path)?;
-                    managed.save(&home)?;
+                    let registered = folders::ManagedFolders::add(&home, &path)?;
                     println!("registered {}", registered.display());
                 }
                 FoldersCommand::Remove { path } => {
-                    let removed = managed.remove(&path)?;
-                    managed.save(&home)?;
+                    let removed = folders::ManagedFolders::remove(&home, &path)?;
                     println!("removed {}", removed.display());
                 }
                 FoldersCommand::List => {
-                    for path in managed.list() {
+                    for path in folders::ManagedFolders::list(&home)? {
                         println!("{}", path.display());
                     }
                 }
