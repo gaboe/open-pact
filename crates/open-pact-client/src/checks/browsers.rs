@@ -691,6 +691,65 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn chromium_skips_symlink_loop_and_uses_readable_profile() {
+        use std::os::unix::fs::symlink;
+
+        let home = tempfile::tempdir().unwrap();
+        let domain = "org.openpact.fictional-symlink-loop";
+        let root = home
+            .path()
+            .join("Library/Application Support/FictionalBrowser");
+        let default = root.join("Default");
+        fs::create_dir_all(&default).unwrap();
+        fs::write(default.join("Preferences"), "{}").unwrap();
+        symlink(root.join("SingletonCookie"), root.join("SingletonCookie")).unwrap();
+
+        assert_eq!(
+            chromium_browser(home.path(), "FictionalBrowser", domain, false),
+            Protection::On
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chromium_skips_profile_named_symlink_to_file() {
+        use std::os::unix::fs::symlink;
+
+        let home = tempfile::tempdir().unwrap();
+        let domain = "org.openpact.fictional-profile-symlink-file";
+        let root = home
+            .path()
+            .join("Library/Application Support/FictionalBrowser");
+        let default = root.join("Default");
+        fs::create_dir_all(&default).unwrap();
+        fs::write(default.join("Preferences"), "{}").unwrap();
+        let file = root.join("ordinary-file");
+        fs::write(&file, "not a profile directory").unwrap();
+        symlink(file, root.join("Profile 9")).unwrap();
+
+        assert_eq!(
+            chromium_browser(home.path(), "FictionalBrowser", domain, false),
+            Protection::On
+        );
+    }
+
+    #[test]
+    fn chromium_profile_with_missing_preferences_is_unknown() {
+        let home = tempfile::tempdir().unwrap();
+        let domain = "org.openpact.fictional-missing-preferences";
+        let profile = home
+            .path()
+            .join("Library/Application Support/FictionalBrowser/Default");
+        fs::create_dir_all(&profile).unwrap();
+
+        assert_eq!(
+            chromium_browser(home.path(), "FictionalBrowser", domain, false),
+            Protection::Unknown
+        );
+    }
+
     #[test]
     fn chromium_recommendation_is_used_only_when_no_profiles_exist() {
         let empty = json!({});
