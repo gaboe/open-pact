@@ -4,7 +4,6 @@
     {
       "name": "macos-1",
       "os": "macos",
-      "seam": "macos_v3",
       "input": [
         "20 80",
         "relevant user identified; complete effective policy: administrative capability enabled"
@@ -12,12 +11,11 @@
       "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "admin",
-      "known_diff": "Group membership does not establish effective privilege of relevant user; study: internal/jobs/review-contracts/report.md#work_account-i-only"
+      "known_diff": null
     },
     {
       "name": "macos-2",
       "os": "macos",
-      "seam": "macos_v3",
       "input": [
         "20 12",
         "relevant user identified; complete effective policy: no administrative capability"
@@ -25,12 +23,11 @@
       "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "standard",
-      "known_diff": "Group membership does not establish effective privilege of relevant user; study: internal/jobs/review-contracts/report.md#work_account-i-only"
+      "known_diff": null
     },
     {
       "name": "macos-3",
       "os": "macos",
-      "seam": "macos_v3",
       "input": [
         ""
       ],
@@ -42,35 +39,32 @@
     {
       "name": "linux-4",
       "os": "linux",
-      "seam": "linux_v3",
       "input": [
         "1000 27",
         "sudo:x:27:\nwheel:x:10:\nroot:x:0:",
-        "relevant user identified; complete effective policy: administrative capability enabled"
+        ""
       ],
       "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "admin",
-      "known_diff": "Group membership does not establish effective privilege of relevant user; study: internal/jobs/review-contracts/report.md#work_account-i-only"
+      "known_diff": null
     },
     {
       "name": "linux-5",
       "os": "linux",
-      "seam": "linux_v3",
       "input": [
         "1000 100",
         "sudo:x:27:\nwheel:x:10:\nroot:x:0:",
-        "relevant user identified; complete effective policy: no administrative capability"
+        ""
       ],
       "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "standard",
-      "known_diff": "Group membership does not establish effective privilege of relevant user; study: internal/jobs/review-contracts/report.md#work_account-i-only"
+      "known_diff": null
     },
     {
       "name": "linux-6",
       "os": "linux",
-      "seam": "linux_v3",
       "input": [
         "",
         "sudo:x:27:\nwheel:x:10:\nroot:x:0:"
@@ -83,7 +77,6 @@
     {
       "name": "windows-7",
       "os": "windows",
-      "seam": "windows",
       "input": [
         "admin",
         "relevant user identified; complete effective policy: administrative capability enabled"
@@ -91,12 +84,11 @@
       "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "admin",
-      "known_diff": "Group membership does not establish effective privilege of relevant user; study: internal/jobs/review-contracts/report.md#work_account-i-only"
+      "known_diff": null
     },
     {
       "name": "windows-8",
       "os": "windows",
-      "seam": "windows",
       "input": [
         "standard",
         "relevant user identified; complete effective policy: no administrative capability"
@@ -104,12 +96,11 @@
       "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "standard",
-      "known_diff": "Group membership does not establish effective privilege of relevant user; study: internal/jobs/review-contracts/report.md#work_account-i-only"
+      "known_diff": null
     },
     {
       "name": "windows-9",
       "os": "windows",
-      "seam": "windows",
       "input": [
         ""
       ],
@@ -117,6 +108,46 @@
       "now": "2026-10-26T12:00:00Z",
       "expected": "unknown",
       "known_diff": null
+    },
+    {
+      "name": "linux-individual-sudoers-grant",
+      "os": "linux",
+      "input": [
+        "1000 100",
+        "sudo:x:27:\nwheel:x:10:\nroot:x:0:",
+        "fictional-user ALL=(ALL) ALL"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "standard",
+      "known_diff": null
+    },
+    {
+      "name": "linux-admin-group-member",
+      "os": "linux",
+      "input": [
+        "1000 115",
+        "admin:x:115:\nsudo:x:27:\nwheel:x:10:\nroot:x:0:"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "admin",
+      "observed": "unknown",
+      "difference": "The parser does not accept the admin group; study: internal/jobs/review-contracts/report.md#work_account-i-only",
+      "known_diff": null
+    },
+    {
+      "name": "windows-filtered-token-member",
+      "os": "windows",
+      "input": [
+        "admin",
+        "Administrators member with a filtered UAC token"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "admin",
+      "known_diff": "The Windows batch reports effective IsInRole state, not group membership; study: internal/jobs/review-contracts/report.md#work_account-i-only",
+      "unrepresentable_input": "The Windows contract adapter accepts an emitted result, not token group attributes."
     }
   ]
 }

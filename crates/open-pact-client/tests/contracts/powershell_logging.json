@@ -4,7 +4,6 @@
     {
       "name": "provider-not-applicable",
       "os": "macos",
-      "seam": "registry",
       "input": [],
       "code": 0,
       "now": "2026-10-26T12:00:00Z",
@@ -14,7 +13,6 @@
     {
       "name": "windows-policy-only",
       "os": "linux",
-      "seam": "registry",
       "input": [],
       "code": 0,
       "now": "2026-10-26T12:00:00Z",
@@ -24,7 +22,6 @@
     {
       "name": "windows-3",
       "os": "windows",
-      "seam": "windows",
       "input": [
         "1|!"
       ],
@@ -36,7 +33,6 @@
     {
       "name": "windows-4",
       "os": "windows",
-      "seam": "windows",
       "input": [
         "0|1"
       ],
@@ -48,7 +44,6 @@
     {
       "name": "windows-5",
       "os": "windows",
-      "seam": "windows",
       "input": [
         "|1;1"
       ],
@@ -60,7 +55,6 @@
     {
       "name": "windows-6",
       "os": "windows",
-      "seam": "windows",
       "input": [
         "|1;0"
       ],
@@ -72,7 +66,6 @@
     {
       "name": "windows-7",
       "os": "windows",
-      "seam": "windows",
       "input": [
         "|!"
       ],
@@ -84,7 +77,6 @@
     {
       "name": "windows-8",
       "os": "windows",
-      "seam": "windows",
       "input": [
         ""
       ],

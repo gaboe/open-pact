@@ -5,7 +5,14 @@ use open_pact_core::ControlValue;
 pub(crate) fn run(id: &str, case: &Case) -> ControlValue {
     let text = case.text(0);
     match id {
-        "os_auto_updates" => parse_update_units(&case.input),
+        "os_auto_updates" => {
+            assert_eq!(
+                case.input.len(),
+                5,
+                "Linux update input needs three timer states and two configs"
+            );
+            parse_update_sources(&case.input[..3], case.optional(3), case.optional(4))
+        }
         "antimalware_realtime" => parse_on_access(case.code, text),
         "work_account" => {
             let Some(admins) = parse_admin_gids(case.text(1)) else {
@@ -17,7 +24,7 @@ pub(crate) fn run(id: &str, case: &Case) -> ControlValue {
         "preboot_auth" => parse_preboot(text).into(),
         "antimalware_signature_age_days" => parse_cvd_header(text.as_bytes()).map_or_else(
             || "unknown".into(),
-            |date| bounded_age((case.now() - date).num_days(), 3650),
+            |date| super::super::buckets::elapsed_age_days(date, case.now(), 3650),
         ),
         "log_oldest_record_days" => {
             if case.code == Some(0) {

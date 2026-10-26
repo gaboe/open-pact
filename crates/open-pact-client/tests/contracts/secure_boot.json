@@ -4,7 +4,6 @@
     {
       "name": "no-approved-firmware-reader",
       "os": "macos",
-      "seam": "registry",
       "input": [],
       "code": 0,
       "now": "2026-10-26T12:00:00Z",
@@ -14,7 +13,6 @@
     {
       "name": "linux-2",
       "os": "linux",
-      "seam": "linux",
       "input": [
         "SecureBoot enabled"
       ],
@@ -26,7 +24,6 @@
     {
       "name": "linux-3",
       "os": "linux",
-      "seam": "linux",
       "input": [
         "SecureBoot disabled"
       ],
@@ -38,7 +35,6 @@
     {
       "name": "linux-4",
       "os": "linux",
-      "seam": "linux",
       "input": [
         "EFI variables are not supported"
       ],
@@ -50,7 +46,6 @@
     {
       "name": "linux-5",
       "os": "linux",
-      "seam": "linux",
       "input": [
         ""
       ],
@@ -62,7 +57,6 @@
     {
       "name": "windows-6",
       "os": "windows",
-      "seam": "windows",
       "input": [
         "1"
       ],
@@ -74,7 +68,6 @@
     {
       "name": "windows-7",
       "os": "windows",
-      "seam": "windows",
       "input": [
         "0"
       ],
@@ -86,7 +79,6 @@
     {
       "name": "windows-8",
       "os": "windows",
-      "seam": "windows",
       "input": [
         "!"
       ],
@@ -98,7 +90,6 @@
     {
       "name": "windows-9",
       "os": "windows",
-      "seam": "windows",
       "input": [
         "2"
       ],

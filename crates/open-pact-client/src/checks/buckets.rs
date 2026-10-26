@@ -1,4 +1,17 @@
-use chrono::NaiveDate;
+use chrono::{DateTime, NaiveDate, Utc};
+
+pub fn elapsed_age_days(
+    last: DateTime<Utc>,
+    now: DateTime<Utc>,
+    max: i32,
+) -> open_pact_core::ControlValue {
+    let days = (now - last).num_days();
+    if (0..=i64::from(max)).contains(&days) {
+        (days as i32).into()
+    } else {
+        "unknown".into()
+    }
+}
 
 pub fn patch_age(last: NaiveDate, today: NaiveDate) -> open_pact_core::ControlValue {
     match (today - last).num_days() {

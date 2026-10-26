@@ -56,7 +56,10 @@ pub(super) fn batch() -> Option<&'static Batch> {
                     contract
                         .cases
                         .into_iter()
-                        .filter(|case| case.seam == "windows" && case.known_diff.is_none())
+                        .filter(|case| {
+                            case.os == open_pact_core::Os::Windows
+                                && case.unrepresentable_input.is_none()
+                        })
                         .map(move |case| {
                             let batch = fixture(&contract.id, &case);
                             ((contract.id.clone(), case.name), batch)
@@ -68,6 +71,11 @@ pub(super) fn batch() -> Option<&'static Batch> {
 }
 
 pub(crate) fn run(id: &str, case: &Case) -> ControlValue {
+    if id == "os_patch_age_days"
+        && let Ok(last) = chrono::DateTime::parse_from_rfc3339(case.text(0))
+    {
+        return contract_patch_age(last.with_timezone(&chrono::Utc), case.now());
+    }
     CURRENT.with(|current| *current.borrow_mut() = Some((id.into(), case.name.clone())));
     let check = crate::checks::WINDOWS
         .iter()

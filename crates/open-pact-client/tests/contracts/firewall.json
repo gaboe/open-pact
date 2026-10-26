@@ -4,7 +4,6 @@
     {
       "name": "macos-1",
       "os": "macos",
-      "seam": "macos",
       "input": [
         "Firewall is enabled."
       ],
@@ -16,7 +15,6 @@
     {
       "name": "macos-2",
       "os": "macos",
-      "seam": "macos",
       "input": [
         "Firewall is disabled."
       ],
@@ -28,7 +26,6 @@
     {
       "name": "macos-3",
       "os": "macos",
-      "seam": "macos",
       "input": [
         ""
       ],
@@ -40,7 +37,6 @@
     {
       "name": "windows-4",
       "os": "windows",
-      "seam": "windows",
       "input": [
         "True True True"
       ],
@@ -52,7 +48,6 @@
     {
       "name": "windows-5",
       "os": "windows",
-      "seam": "windows",
       "input": [
         "True False True"
       ],
@@ -64,7 +59,6 @@
     {
       "name": "windows-6",
       "os": "windows",
-      "seam": "windows",
       "input": [
         "True True"
       ],
@@ -76,7 +70,6 @@
     {
       "name": "windows-7",
       "os": "windows",
-      "seam": "windows",
       "input": [
         ""
       ],
@@ -88,7 +81,6 @@
     {
       "name": "linux-8",
       "os": "linux",
-      "seam": "linux",
       "input": [
         "running",
         "ENABLED=yes",
@@ -102,7 +94,6 @@
     {
       "name": "linux-9",
       "os": "linux",
-      "seam": "linux",
       "input": [
         "not running",
         "ENABLED=no",
@@ -116,7 +107,6 @@
     {
       "name": "linux-10",
       "os": "linux",
-      "seam": "linux",
       "input": [
         "",
         null,
@@ -130,7 +120,6 @@
     {
       "name": "one-manager-unreadable",
       "os": "linux",
-      "seam": "linux",
       "input": [
         "not running",
         null,
@@ -139,7 +128,9 @@
       "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "unknown",
-      "known_diff": "One inactive manager masks an unknown manager; study: internal/jobs/review-contracts/report.md#firewall-m-and-i"
+      "known_diff": null,
+      "observed": "off",
+      "difference": "One inactive manager masks an unknown manager; study: internal/jobs/review-contracts/report.md#firewall-m-and-i"
     }
   ]
 }

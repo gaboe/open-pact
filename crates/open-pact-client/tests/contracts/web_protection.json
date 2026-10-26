@@ -4,7 +4,6 @@
     {
       "name": "no-approved-reader",
       "os": "linux",
-      "seam": "registry",
       "input": [],
       "code": 0,
       "now": "2026-10-26T12:00:00Z",
@@ -14,7 +13,6 @@
     {
       "name": "windows-2",
       "os": "windows",
-      "seam": "windows",
       "input": [
         "1|",
         "[{\"kind\": \"chrome\", \"policy\": {}, \"recommended\": {}, \"prefs\": {}}]"
@@ -27,7 +25,6 @@
     {
       "name": "windows-3",
       "os": "windows",
-      "seam": "windows",
       "input": [
         "0|",
         "[{\"kind\": \"chrome\", \"policy\": {}, \"recommended\": {}, \"prefs\": {}}]"
@@ -40,7 +37,6 @@
     {
       "name": "windows-4",
       "os": "windows",
-      "seam": "windows",
       "input": [
         "1|",
         "[{\"kind\": \"chrome\", \"policy\": {\"SafeBrowsingProtectionLevel\": 0}, \"recommended\": {}, \"prefs\": {}}]"
@@ -53,7 +49,6 @@
     {
       "name": "windows-5",
       "os": "windows",
-      "seam": "windows",
       "input": [
         "",
         ""
@@ -66,7 +61,6 @@
     {
       "name": "macos-6",
       "os": "macos",
-      "seam": "browsers",
       "input": [
         "{\"kind\": \"chrome\", \"policy\": {}, \"recommended\": {}, \"prefs\": {}}"
       ],
@@ -78,7 +72,6 @@
     {
       "name": "macos-7",
       "os": "macos",
-      "seam": "browsers",
       "input": [
         "{\"kind\": \"chrome\", \"policy\": {\"SafeBrowsingProtectionLevel\": 0}, \"recommended\": {}, \"prefs\": {}}"
       ],
@@ -90,7 +83,6 @@
     {
       "name": "macos-8",
       "os": "macos",
-      "seam": "browsers",
       "input": [
         null
       ],
@@ -102,7 +94,6 @@
     {
       "name": "macos-9",
       "os": "macos",
-      "seam": "browsers",
       "input": [],
       "code": 0,
       "now": "2026-10-26T12:00:00Z",
@@ -112,7 +103,6 @@
     {
       "name": "non-directory-lock-symlink",
       "os": "macos",
-      "seam": "browsers",
       "input": [
         "{\"kind\": \"chrome\", \"policy\": {\"SafeBrowsingProtectionLevel\": 0}, \"recommended\": {}, \"prefs\": {}}",
         "SingletonCookie -> fictional-cookie"
@@ -120,32 +110,30 @@
       "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "off",
-      "known_diff": "pending integration"
+      "known_diff": "pending integration",
+      "unrepresentable_input": "The browser adapter accepts policy JSON, not profile entry types."
     },
     {
       "name": "missing-Preferences",
       "os": "macos",
-      "seam": "browsers",
       "input": [
-        null,
-        "Default/Preferences missing"
+        null
       ],
       "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "unknown",
-      "known_diff": "pending integration"
+      "known_diff": null
     },
     {
       "name": "edge-Smartscreen",
       "os": "macos",
-      "seam": "browsers",
       "input": [
         "{\"kind\": \"edge\", \"policy\": {\"SmartScreenEnabled\": false}, \"recommended\": {}, \"prefs\": {}}"
       ],
       "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "off",
-      "known_diff": "pending integration"
+      "known_diff": null
     }
   ]
 }

@@ -102,6 +102,14 @@ fn parse_patch_age(text: &str, today: NaiveDate) -> ControlValue {
         .unwrap_or_else(|| "unknown".into())
 }
 
+#[cfg(test)]
+pub(super) fn contract_patch_age(
+    last: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> ControlValue {
+    buckets::elapsed_age_days(last, now, 3650)
+}
+
 pub fn auto_login() -> ControlValue {
     value("autologin")
         .map_or("unknown", |value| {

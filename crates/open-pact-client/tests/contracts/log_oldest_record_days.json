@@ -4,7 +4,6 @@
     {
       "name": "provider-not-applicable",
       "os": "macos",
-      "seam": "registry",
       "input": [],
       "code": 0,
       "now": "2026-10-26T12:00:00Z",
@@ -14,7 +13,6 @@
     {
       "name": "linux-2",
       "os": "linux",
-      "seam": "linux_v3",
       "input": [
         "{\"__REALTIME_TIMESTAMP\":\"1792152000000000\"}"
       ],
@@ -26,7 +24,6 @@
     {
       "name": "linux-3",
       "os": "linux",
-      "seam": "linux_v3",
       "input": [
         ""
       ],
@@ -38,7 +35,6 @@
     {
       "name": "partial-visibility",
       "os": "linux",
-      "seam": "linux_v3",
       "input": [
         "{\"__REALTIME_TIMESTAMP\":\"1792152000000000\"}\nHint: permission denied"
       ],
@@ -50,7 +46,6 @@
     {
       "name": "nonzero-exit",
       "os": "linux",
-      "seam": "linux_v3",
       "input": [
         "{\"__REALTIME_TIMESTAMP\":\"1792152000000000\"}"
       ],
@@ -62,7 +57,6 @@
     {
       "name": "windows-6",
       "os": "windows",
-      "seam": "windows",
       "input": [
         "10|20"
       ],
@@ -74,7 +68,6 @@
     {
       "name": "windows-7",
       "os": "windows",
-      "seam": "windows",
       "input": [
         ""
       ],
@@ -86,7 +79,6 @@
     {
       "name": "one-log-denied",
       "os": "windows",
-      "seam": "windows",
       "input": [
         "10|!"
       ],
