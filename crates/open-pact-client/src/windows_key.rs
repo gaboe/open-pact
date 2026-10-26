@@ -288,10 +288,11 @@ impl WindowsKey {
                             "clean up failed CNG creation after {error:#}; retry with delete-device-key"
                         )
                     })?;
+                // NCryptDeleteKey freed the handle, so the destructor must not free it again.
+                std::mem::forget(key);
                 if marker_created {
                     super::remove_if_present(&home.join(super::TPM_FILE))?;
                 }
-                std::mem::forget(key);
                 if error
                     .downcast_ref::<std::io::Error>()
                     .is_some_and(|error| error.kind() == std::io::ErrorKind::AlreadyExists)
