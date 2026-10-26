@@ -224,7 +224,7 @@ fn newer(current: checks::EventMarkerRead, initialized: bool, previous: Option<i
             if previous.is_none_or(|previous| current > previous))
 }
 
-fn probe_address(raw: &str) -> Result<()> {
+pub(crate) fn probe_address(raw: &str) -> Result<()> {
     let url =
         reqwest::Url::parse(&format!("tcp://{raw}")).context("VPN probe must be host:port")?;
     if url.host_str().is_none()

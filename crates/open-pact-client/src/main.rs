@@ -1408,6 +1408,9 @@ fn print_hints(
 }
 
 async fn check(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
+    if let Err(error) = device_config::DeviceConfig::load(home) {
+        eprintln!("{error:#}");
+    }
     let mut enrolment = home.enrolment()?;
     check_scheme(&enrolment.gateway, insecure_dev)?;
     home.recover_vpn()?;
