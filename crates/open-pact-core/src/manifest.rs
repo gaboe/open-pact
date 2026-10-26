@@ -212,7 +212,9 @@ impl TryFrom<String> for RemotePattern {
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
         let invalid = || format!("remote pattern {value:?} must be a host/path-prefix/ pattern");
-        if value.chars().any(char::is_whitespace)
+        if value
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
             || value.contains(['*', '?', '@', ':'])
             || !value.ends_with('/')
         {
@@ -224,12 +226,28 @@ impl TryFrom<String> for RemotePattern {
             return Err(invalid());
         }
 
+        let valid_host = |host: &str| {
+            host.len() <= 253
+                && host.split('.').all(|label| {
+                    !label.is_empty()
+                        && label.len() <= 63
+                        && label.as_bytes()[0].is_ascii_alphanumeric()
+                        && label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
+                        && label
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                })
+        };
+        if !valid_host(segments[0]) {
+            return Err(invalid());
+        }
+
         let host = segments[0].to_ascii_lowercase();
         let last = segments.len() - 1;
         let path_end = segments[last]
             .strip_suffix(".git")
             .unwrap_or(segments[last]);
-        if path_end.is_empty() {
+        if path_end.is_empty() || path_end.ends_with(".git") {
             return Err(invalid());
         }
         segments[last] = path_end;
