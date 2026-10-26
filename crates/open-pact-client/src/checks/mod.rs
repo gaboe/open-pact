@@ -117,6 +117,9 @@ fn managed_repo_value(input: &CheckInput<'_>, outside: bool) -> ControlValue {
     let Some(scan) = input.repo_scan else {
         return "unknown".into();
     };
+    if scan.partial {
+        return "unknown".into();
+    }
     if outside {
         scan.managed_repos_outside.into()
     } else {
