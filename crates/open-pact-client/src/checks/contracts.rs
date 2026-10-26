@@ -205,18 +205,17 @@ fn registered_contract_coverage() {
                     contract.id,
                     case.name
                 );
-                assert!(case
-                    .difference
-                    .as_ref()
-                    .is_some_and(|difference| !difference.trim().is_empty()));
+                assert!(
+                    case.difference
+                        .as_ref()
+                        .is_some_and(|difference| !difference.trim().is_empty())
+                );
             }
         }
         for os in Os::ALL {
             let matching: Vec<_> = rows
                 .iter()
-                .filter(|row| {
-                    row[1] == format!("`{}`", contract.id) && row[2] == os.to_string()
-                })
+                .filter(|row| row[1] == format!("`{}`", contract.id) && row[2] == os.to_string())
                 .collect();
             assert_eq!(
                 matching.len(),
@@ -233,8 +232,7 @@ fn registered_contract_coverage() {
                 .iter()
                 .filter(|case| {
                     case.os == os
-                        && !(case.known_diff.is_some()
-                            && case.unrepresentable_input.is_some())
+                        && !(case.known_diff.is_some() && case.unrepresentable_input.is_some())
                 })
                 .map(|case| kind(&case.expected))
                 .collect();
