@@ -288,7 +288,9 @@ impl<'a> BootConfig<'a> {
         }
         Self {
             devices,
-            has_kernel_unlock_parameter: cmdline.split_whitespace().any(is_luks_unlock_parameter),
+            has_kernel_unlock_parameter: kernel_cmdline_words(cmdline)
+                .iter()
+                .any(|word| is_luks_unlock_parameter(word)),
         }
     }
 
@@ -314,10 +316,31 @@ impl<'a> BootConfig<'a> {
 }
 
 fn is_luks_unlock_parameter(word: &str) -> bool {
-    let word = word.trim_matches(['"', '\'']);
     let name = word.split_once('=').map_or(word, |(name, _)| name);
     let name = name.strip_prefix("rd.").unwrap_or(name);
     name == "luks" || name.starts_with("luks.")
+}
+
+fn kernel_cmdline_words(cmdline: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quote = None;
+    for character in cmdline.chars() {
+        match (quote, character) {
+            (Some(open), close) if open == close => quote = None,
+            (None, '\'' | '"') => quote = Some(character),
+            (None, character) if character.is_whitespace() => {
+                if !word.is_empty() {
+                    words.push(std::mem::take(&mut word));
+                }
+            }
+            _ => word.push(character),
+        }
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    words
 }
 
 #[cfg(test)]
@@ -615,14 +638,17 @@ mod crypttab_tests {
 
     #[test]
     fn quoted_kernel_words_match_complete_parameter_names() {
-        let crypttab = "root UUID=11111111-1111-1111-1111-111111111111 - tpm2-device=auto,tpm2-pin=yes";
+        let crypttab =
+            "root UUID=11111111-1111-1111-1111-111111111111 - tpm2-device=auto,tpm2-pin=yes";
         for cmdline in [
             "\"luks\"=on",
             "\"rd.luks\"=on",
             "\"luks\".options=11111111-1111-1111-1111-111111111111=tpm2-device=auto",
         ] {
             assert_eq!(
-                BootConfig::parse(crypttab, cmdline).key("root").unlock(None),
+                BootConfig::parse(crypttab, cmdline)
+                    .key("root")
+                    .unlock(None),
                 Unlock::Unknown,
                 "{cmdline}"
             );
