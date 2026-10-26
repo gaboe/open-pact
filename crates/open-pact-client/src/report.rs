@@ -139,7 +139,8 @@ pub(crate) fn prepare(home: &Home) -> Result<(Report, BTreeMap<String, bool>)> {
     }
     let os = current_os()?;
     let config = crate::device_config::DeviceConfig::load(home)?;
-    let results = collect_results(&manifest, os, config.as_ref());
+    let repo_scan = crate::stored_repo_scan(home)?;
+    let results = collect_results(&manifest, os, config.as_ref(), repo_scan.as_ref());
     let compliance = open_pact_core::control_compliance(&manifest, os, &results);
     Ok((Report::new(&key, os, os_version(os)?, results)?, compliance))
 }

@@ -53,6 +53,9 @@ The client keeps its files in `~/.config/open-pact/`, or in the directory given 
 | `company-key.txt`, `log-key.txt` | the company key fingerprint and the log key, pinned from the invitation at `join` |
 | `log-checkpoint.txt` | the last verified, gateway-signed log checkpoint |
 | `claims.jsonl` | every claim sent and every response, byte for byte |
+| `repo-scan.json` | the local scan time, counts, and paths of matching repositories outside registered folders |
+
+Managed-repository reports send only the counts. Outside paths stay in `repo-scan.json` and appear only in local `check` output. See [client controls](docs/controls.md) for scan depth, skipped folders, and limits.
 
 On Unix, `vpn/current/` is a directory link. The two top-level links can straddle a replacement between two reads.
 

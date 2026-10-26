@@ -120,6 +120,26 @@ required = { windows = "on", macos = "n/a", linux = "n/a" }
 grace = "1d"
 
 [[control]]
+id = "managed_repos_outside"
+source = "company_policy"
+rationale = "Keep managed repositories inside the folders declared on this device."
+check = "builtin:managed_repos_outside@1"
+remotes = ["github.com/example-org/"]
+output = { integer = { min = 0, max = 2147483647 } }
+required = { macos = { max = 0 }, windows = { max = 0 }, linux = { max = 0 } }
+grace = "0d"
+
+[[control]]
+id = "managed_repos_total"
+source = "company_policy"
+rationale = "Count all managed repositories with a matching remote."
+check = "builtin:managed_repos_total@1"
+remotes = ["github.com/example-org/"]
+output = { integer = { min = 0, max = 2147483647 } }
+required = {}
+grace = "1d"
+
+[[control]]
 id = "log_cleared"
 source = "company_policy"
 check = "builtin:log_cleared@1"

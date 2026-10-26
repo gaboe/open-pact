@@ -662,12 +662,40 @@ fn collect_results(
     manifest: &Manifest,
     os: Os,
     device_config: Option<&device_config::DeviceConfig>,
+    repo_scan: Option<&checks::repos::RepoScan>,
 ) -> BTreeMap<String, open_pact_core::ControlValue> {
     disclosable(
         manifest,
         os,
-        checks::run(os, &manifest.body().controls, device_config),
+        checks::run(os, &manifest.body().controls, device_config, repo_scan),
     )
+}
+
+fn scan_repositories(
+    home: &Home,
+    manifest: &Manifest,
+    config: Option<&device_config::DeviceConfig>,
+) -> Result<checks::repos::RepoScan> {
+    #[cfg(test)]
+    let root = home.0.clone();
+    #[cfg(not(test))]
+    let root = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+        .map(PathBuf::from)
+        .context("user home is not set")?;
+    let folders = config
+        .and_then(|config| config.managed_repos.as_ref())
+        .map_or(&[][..], |repos| repos.folders.as_slice());
+    let patterns = manifest
+        .body()
+        .controls
+        .iter()
+        .flat_map(|control| control.remotes.iter().map(ToString::to_string))
+        .collect::<Vec<_>>();
+    checks::repos::scan_and_store(&home.0, &root, folders, &patterns)
+}
+
+fn stored_repo_scan(home: &Home) -> Result<Option<checks::repos::RepoScan>> {
+    checks::repos::load(&home.0, chrono::Utc::now().timestamp())
 }
 
 fn disclosable(
@@ -794,6 +822,14 @@ fn print_summary(manifest: &Manifest, company: &PublicKey, os: Os) {
             .get(&os)
             .map_or("not required".to_string(), |r| format!("required {r}"));
         println!("  {:<20} {required}, grace {}", c.id, c.grace);
+        if matches!(
+            c.id.as_str(),
+            "managed_repos_outside" | "managed_repos_total"
+        ) {
+            for pattern in &c.remotes {
+                println!("  {:<20} counts repositories from {}", "", pattern);
+            }
+        }
         if let Some(why) = &c.rationale {
             println!("  {:<20} why: {why}", "");
         }
@@ -1216,6 +1252,8 @@ async fn join(
         println!("Not signed. Nothing was sent.");
         return Ok(ExitCode::FAILURE);
     }
+    let config = device_config::DeviceConfig::load(home)?;
+    scan_repositories(home, &manifest, config.as_ref())?;
     let owner = dev_key::load_or_create(&home.file("owner-dev.pem"))?;
     let device = DeviceKey::load_or_create(&home.0, software_key)?;
     let signed = SignedManifest {
@@ -1427,6 +1465,7 @@ fn print_hints(
 
 async fn check(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
     let migrating = schedule::migration_example(home)?;
+    let mut can_scan_repositories = true;
     let device_config = match device_config::DeviceConfig::load(home) {
         Ok(Some(config)) => Some(config),
         Ok(None) => {
@@ -1437,6 +1476,7 @@ async fn check(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
             None
         }
         Err(error) => {
+            can_scan_repositories = false;
             eprintln!(
                 "{error:#}\nCorrect this section and key in open-pact.toml. Other controls will still run."
             );
@@ -1456,14 +1496,27 @@ async fn check(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
     }
     checks::check_supported(&manifest)
         .map_err(|e| anyhow::anyhow!("{e}; nothing was run or sent"))?;
+    let scan = if can_scan_repositories {
+        Some(scan_repositories(home, &manifest, device_config.as_ref())?)
+    } else {
+        None
+    };
     let device = DeviceKey::load(&home.0)?;
     let os = current_os()?;
 
     if device_config.is_none() && !migrating {
         print!("{}", device_config::example(&manifest, os));
     }
-    let results = collect_results(&manifest, os, device_config.as_ref());
+    let results = collect_results(&manifest, os, device_config.as_ref(), scan.as_ref());
     device_config::print_table(&manifest, os, device_config.as_ref(), &results);
+    if let Some(scan) = &scan {
+        for path in &scan.outside_paths {
+            println!(
+                "  outside repository: {}. Move it into a registered folder.",
+                path.display()
+            );
+        }
+    }
     let http = http_client()?;
     let (mut verified, own) = match sync_log(&http, home, &manifest, &mut enrolment).await? {
         LogSync::Verified(cp, own) => (cp, own),
@@ -2095,11 +2148,10 @@ mod tests {
         let code = check(&home, false).await;
 
         assert_eq!(gateway.posts(), Vec::<String>::new(), "no nonce, no claim");
-        assert_eq!(
-            snapshot(dir.path()),
-            before,
-            "no CA, certificate, key or log written"
-        );
+        let mut after = snapshot(dir.path());
+        after.remove("repo-scan.json");
+        assert_eq!(after, before, "no CA, certificate, key or log written");
+        assert!(home.file("repo-scan.json").is_file());
         assert_eq!(code.unwrap(), ExitCode::from(2));
     }
 
