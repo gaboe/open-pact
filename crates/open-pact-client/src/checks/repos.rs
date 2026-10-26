@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
@@ -35,6 +36,8 @@ pub(crate) struct RepoScan {
     pub(crate) outside_paths: Vec<PathBuf>,
     #[serde(default)]
     pub(crate) partial: bool,
+    #[serde(default)]
+    pub(crate) access_denied: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -48,6 +51,10 @@ pub(crate) fn fresh(scan: &RepoScan, now: i64) -> bool {
 }
 
 pub(crate) fn load(home: &Path, now: i64) -> Result<Option<RepoScan>> {
+    Ok(load_attempt(home)?.filter(|scan| fresh(scan, now)))
+}
+
+pub(crate) fn load_attempt(home: &Path) -> Result<Option<RepoScan>> {
     let path = home.join(FILE);
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
@@ -57,7 +64,7 @@ pub(crate) fn load(home: &Path, now: i64) -> Result<Option<RepoScan>> {
     let Ok(scan) = serde_json::from_slice::<RepoScan>(&bytes) else {
         return Ok(None);
     };
-    Ok(fresh(&scan, now).then_some(scan))
+    Ok(Some(scan))
 }
 
 pub(crate) fn scan_and_store(
@@ -77,17 +84,43 @@ pub(crate) fn scan_and_store(
     let mut counts = (0_i32, 0_i32);
     let mut outside_paths = Vec::new();
     let mut partial = false;
-    walk(root, 0, &mut repos, &mut partial, &mut |repo| {
-        if !repo_matches(repo, &ssh_hosts, patterns) {
-            return;
-        }
-        counts.1 += 1;
-        let repo_path = fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
-        if !folders.iter().any(|folder| repo_path.starts_with(folder)) {
-            counts.0 += 1;
-            outside_paths.push(repo_path);
-        }
-    })?;
+    let mut access_denied = false;
+    let repo_partial = Cell::new(false);
+    let repo_access_denied = Cell::new(false);
+    walk(
+        root,
+        0,
+        &mut repos,
+        &mut partial,
+        &mut access_denied,
+        &mut |repo| {
+            let urls = match read_remote_urls(repo) {
+                Ok(urls) => urls,
+                Err(error) => {
+                    repo_partial.set(true);
+                    repo_access_denied.set(
+                        repo_access_denied.get()
+                            || error.kind() == std::io::ErrorKind::PermissionDenied,
+                    );
+                    return;
+                }
+            };
+            if !urls
+                .iter()
+                .any(|url| remote_matches(url, &ssh_hosts, patterns))
+            {
+                return;
+            }
+            counts.1 += 1;
+            let repo_path = fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
+            if !folders.iter().any(|folder| repo_path.starts_with(folder)) {
+                counts.0 += 1;
+                outside_paths.push(repo_path);
+            }
+        },
+    )?;
+    partial |= repo_partial.get();
+    access_denied |= repo_access_denied.get();
     outside_paths.sort();
     let scan = RepoScan {
         scanned_at: chrono::Utc::now().timestamp(),
@@ -95,6 +128,7 @@ pub(crate) fn scan_and_store(
         managed_repos_total: counts.1,
         outside_paths,
         partial,
+        access_denied,
     };
     fs::create_dir_all(home)?;
     let path = home.join(FILE);
@@ -130,6 +164,7 @@ fn walk(
     depth: usize,
     seen: &mut HashSet<PathBuf>,
     partial: &mut bool,
+    access_denied: &mut bool,
     visit: &mut impl FnMut(&Path),
 ) -> Result<()> {
     if depth > MAX_DEPTH {
@@ -139,16 +174,18 @@ fn walk(
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => return Ok(()),
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(_) => {
+        Err(error) => {
             *partial = true;
+            *access_denied |= error.kind() == std::io::ErrorKind::PermissionDenied;
             return Ok(());
         }
     }
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(_) => {
+        Err(error) => {
             *partial = true;
+            *access_denied |= error.kind() == std::io::ErrorKind::PermissionDenied;
             return Ok(());
         }
     };
@@ -157,8 +194,9 @@ fn walk(
     for entry in entries {
         let entry = match entry {
             Ok(entry) => entry,
-            Err(_) => {
+            Err(error) => {
                 *partial = true;
+                *access_denied |= error.kind() == std::io::ErrorKind::PermissionDenied;
                 continue;
             }
         };
@@ -166,8 +204,9 @@ fn walk(
         let kind = match fs::symlink_metadata(&path) {
             Ok(meta) => meta.file_type(),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => {
+            Err(error) => {
                 *partial = true;
+                *access_denied |= error.kind() == std::io::ErrorKind::PermissionDenied;
                 continue;
             }
         };
@@ -192,48 +231,49 @@ fn walk(
     }
     if depth < MAX_DEPTH {
         for child in children {
-            walk(&child, depth + 1, seen, partial, visit)?;
+            walk(&child, depth + 1, seen, partial, access_denied, visit)?;
         }
     }
     Ok(())
 }
 
-fn repo_matches(repo: &Path, ssh_hosts: &SshConfig, patterns: &[String]) -> bool {
-    read_remote_urls(repo)
-        .iter()
-        .any(|url| remote_matches(url, ssh_hosts, patterns))
-}
-
-fn read_remote_urls(repo: &Path) -> Vec<String> {
+fn read_remote_urls(repo: &Path) -> std::io::Result<Vec<String>> {
     let git = repo.join(".git");
     let git_dir = match fs::symlink_metadata(&git) {
         Ok(metadata) if metadata.is_dir() => git,
-        Ok(metadata) if metadata.file_type().is_symlink() => return Vec::new(),
+        Ok(metadata) if metadata.file_type().is_symlink() => return Ok(Vec::new()),
         Ok(_) => {
-            let Ok(text) = fs::read_to_string(&git) else {
-                return Vec::new();
-            };
+            let text = fs::read_to_string(&git)?;
             let Some(path) = text.trim().strip_prefix("gitdir:") else {
-                return Vec::new();
+                return Ok(Vec::new());
             };
             let path = repo.join(path.trim());
             fs::canonicalize(&path).unwrap_or(path)
         }
-        Err(_) => return Vec::new(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
     };
-    let common = fs::read_to_string(git_dir.join("commondir"))
-        .ok()
-        .map(|text| {
+    fs::read_dir(&git_dir)?.count();
+    let commondir = match fs::read_to_string(git_dir.join("commondir")) {
+        Ok(text) => Some(text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    let common = commondir.map_or_else(
+        || git_dir.clone(),
+        |text| {
             let path = git_dir.join(text.trim());
             fs::canonicalize(&path).unwrap_or(path)
-        })
-        .unwrap_or(git_dir);
+        },
+    );
     parse_config(&common.join("config"))
 }
 
-fn parse_config(path: &Path) -> Vec<String> {
-    let Ok(text) = fs::read_to_string(path) else {
-        return Vec::new();
+fn parse_config(path: &Path) -> std::io::Result<Vec<String>> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
     };
     let mut section = String::new();
     let mut urls = Vec::new();
@@ -254,7 +294,7 @@ fn parse_config(path: &Path) -> Vec<String> {
             urls.push(value.to_string());
         }
     }
-    urls
+    Ok(urls)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -455,8 +495,13 @@ mod tests {
         let hosts = parse_ssh_hosts(
             "Host *\n HostName other.invalid\nHost alias\n HostName matching.invalid\n",
         );
-        let patterns = [pattern("github.com/example-org/")];
+        let patterns = [pattern("other.invalid/example-org/")];
         assert!(!remote_matches(
+            "git@alias:example-org/app",
+            &hosts,
+            &[pattern("matching.invalid/example-org/")]
+        ));
+        assert!(remote_matches(
             "git@alias:example-org/app",
             &hosts,
             &patterns
@@ -510,6 +555,7 @@ mod tests {
             managed_repos_total: 1,
             outside_paths: vec![PathBuf::from("/device/private/repo")],
             partial: false,
+            access_denied: false,
         };
         assert!(fresh(&scan, 100 + MAX_AGE_SECS));
         assert!(!fresh(&scan, 101 + MAX_AGE_SECS));
@@ -521,6 +567,41 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         fs::write(temp.path().join(FILE), b"{not json").unwrap();
         assert!(load(temp.path(), 100).unwrap().is_none());
+    }
+
+    #[test]
+    fn partial_attempt_keeps_its_timestamp_for_scheduled_cadence() {
+        let temp = tempfile::tempdir().unwrap();
+        let scan = RepoScan {
+            scanned_at: 1_000,
+            managed_repos_outside: 0,
+            managed_repos_total: 0,
+            outside_paths: Vec::new(),
+            partial: true,
+            access_denied: false,
+        };
+        fs::write(temp.path().join(FILE), serde_json::to_vec(&scan).unwrap()).unwrap();
+        assert_eq!(
+            load_attempt(temp.path()).unwrap().unwrap().scanned_at,
+            1_000
+        );
+        assert!(load(temp.path(), 1_000).unwrap().is_none());
+    }
+
+    #[test]
+    fn readable_git_directory_without_config_is_a_normal_repository() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("user");
+        fs::create_dir_all(root.join("app/.git")).unwrap();
+        let scan = scan_and_store(
+            &temp.path().join("client"),
+            &root,
+            &[],
+            &[pattern("github.com/example-org/")],
+        )
+        .unwrap();
+        assert!(!scan.partial);
+        assert_eq!(scan.managed_repos_total, 0);
     }
 
     #[test]
@@ -687,6 +768,7 @@ mod tests {
             managed_repos_total: 2,
             outside_paths: vec![PathBuf::from("/device/private/repo")],
             partial: false,
+            access_denied: false,
         };
         let values = super::super::run(open_pact_core::Os::Linux, &controls, None, Some(&scan));
         assert_eq!(
@@ -702,6 +784,7 @@ mod tests {
 
         let partial = RepoScan {
             partial: true,
+            access_denied: false,
             ..scan
         };
         let values = super::super::run(open_pact_core::Os::Linux, &controls, None, Some(&partial));
@@ -765,6 +848,7 @@ mod tests {
             managed_repos_total: 1,
             outside_paths: vec![PathBuf::from("/device/private/repo")],
             partial: false,
+            access_denied: false,
         };
         fs::create_dir_all(temp.path()).unwrap();
         fs::write(temp.path().join(FILE), serde_json::to_vec(&scan).unwrap()).unwrap();
@@ -774,29 +858,49 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn unreadable_directory_marks_scan_partial() {
+    fn unreadable_git_directory_marks_scan_partial_when_permissions_are_effective() {
         use std::os::unix::fs::PermissionsExt;
 
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("user");
-        let unreadable = root.join("private");
-        fs::create_dir_all(&unreadable).unwrap();
-        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o0)).unwrap();
-        if fs::read_dir(&unreadable).is_ok() {
-            fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o700)).unwrap();
+        // Root bypasses mode bits, so this probe cannot prove unreadability there.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped permission probe because root bypasses mode bits");
             return;
         }
 
-        let scan = scan_and_store(
-            &temp.path().join("client"),
-            &root,
-            &[],
-            &[pattern("github.com/example-org/")],
-        )
-        .unwrap();
-        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(scan.partial);
-        assert!(!fresh(&scan, scan.scanned_at));
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("user");
+        for (name, deny_config) in [("git-dir", false), ("git-config", true)] {
+            let repo = root.join(name);
+            let git = repo.join(".git");
+            fs::create_dir_all(&git).unwrap();
+            let config = git.join("config");
+            fs::write(
+                &config,
+                "[remote \"origin\"]\n url = git@github.com:example-org/app.git\n",
+            )
+            .unwrap();
+            let denied = if deny_config { &config } else { &git };
+            fs::set_permissions(denied, fs::Permissions::from_mode(0o0)).unwrap();
+            if fs::read_dir(&git).is_ok() || (deny_config && fs::read_to_string(&config).is_ok()) {
+                fs::set_permissions(denied, fs::Permissions::from_mode(0o700)).unwrap();
+                eprintln!(
+                    "skipped permission probe because this platform does not enforce mode bits"
+                );
+                return;
+            }
+            let scan = scan_and_store(
+                &temp.path().join(format!("client-{name}")),
+                &root,
+                &[],
+                &[pattern("github.com/example-org/")],
+            )
+            .unwrap();
+            fs::set_permissions(&git, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+            assert!(scan.partial);
+            assert!(scan.access_denied);
+            assert!(!fresh(&scan, scan.scanned_at));
+        }
     }
 
     #[test]

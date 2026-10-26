@@ -1510,6 +1510,13 @@ async fn check(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
     let results = collect_results(&manifest, os, device_config.as_ref(), scan.as_ref());
     device_config::print_table(&manifest, os, device_config.as_ref(), &results);
     if let Some(scan) = &scan {
+        if scan.partial && scan.access_denied {
+            let binary = std::env::current_exe().unwrap_or_default();
+            println!(
+                "Repository values are unknown because the client lacks access to some folders. On macOS, grant Full Disk Access to this client binary: {}",
+                binary.display()
+            );
+        }
         for path in &scan.outside_paths {
             println!(
                 "  outside repository: {}. Move it into a registered folder.",

@@ -57,6 +57,8 @@ The client keeps its files in `~/.config/open-pact/`, or in the directory given 
 
 Managed-repository reports send only the counts. Outside paths stay in `repo-scan.json` and appear only in local `check` output. See [client controls](docs/controls.md) for scan depth, skipped folders, and limits.
 
+On macOS, grant Full Disk Access to the client binary in System Settings before you use repository counts. If `check` reports unknown repository values, add the printed client binary under Privacy & Security, then Full Disk Access. The client does not print denied folder paths.
+
 On Unix, `vpn/current/` is a directory link. The two top-level links can straddle a replacement between two reads.
 
 On Windows, `vpn/current` is a text pointer, not a directory. A pair reader reads its generation name, reads both files from `vpn/<generation>/`, then reads `vpn/current` again. If the name changed or a file is missing, the reader discards both files and retries. The client keeps the current and previous generations. A home-wide OS file lock serializes Windows installation and recovery.

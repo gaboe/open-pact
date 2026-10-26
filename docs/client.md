@@ -100,6 +100,8 @@ Run `check` to see one row per manifest control. Each row shows the requirement 
 
 The client scans for repositories that match the signed `remotes` patterns. It counts each matching repository inside the registered folders in `managed_repos_total`. It counts each matching repository outside those folders in both `managed_repos_total` and `managed_repos_outside`. The client stores paths locally and reports only counts. See [client controls](controls.md) for the scan rules and limits.
 
+On macOS, grant Full Disk Access to the client binary in System Settings before you use repository counts. Open Privacy & Security, select Full Disk Access, and add the client binary. If a scan still cannot read some folders, `check` reports `unknown` and prints the client binary path. It does not print denied folder paths.
+
 ## Send a report
 
 Declare `[report].collector`, then inspect the signed payload:

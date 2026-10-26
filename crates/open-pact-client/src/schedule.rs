@@ -1079,7 +1079,7 @@ async fn run_report(
     state.observe(vpn_up(&config.vpn_probe).await);
     save(state_home, STATE, &state)?;
     let now = chrono::Utc::now().timestamp();
-    let due = checks::repos::load(&home.0, now)?
+    let due = checks::repos::load_attempt(&home.0)?
         .is_none_or(|scan| now.saturating_sub(scan.scanned_at) >= 24 * 60 * 60);
     if due {
         checks::repos::lower_process_priority();
