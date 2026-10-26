@@ -17,22 +17,6 @@ const LOCK: &str = "report-schedule.lock";
 
 #[derive(Subcommand)]
 pub(crate) enum Command {
-    /// Register a report job that checks VPN connectivity every five minutes
-    Install {
-        #[arg(long)]
-        collector: String,
-        #[arg(long)]
-        vpn_probe: Option<String>,
-        /// Run Windows checks as SYSTEM to read machine-wide settings
-        #[arg(long)]
-        system: bool,
-    },
-    /// Remove the report job, its configuration and report state
-    Uninstall {
-        /// Remove Windows SYSTEM state and the shared protected binary
-        #[arg(long)]
-        system: bool,
-    },
     #[command(hide = true)]
     Run {
         #[arg(long)]
@@ -42,6 +26,20 @@ pub(crate) enum Command {
     Probe {
         #[arg(long)]
         address: String,
+    },
+}
+
+enum Operation {
+    Install {
+        collector: String,
+        vpn_probe: Option<String>,
+        system: bool,
+    },
+    Uninstall {
+        system: bool,
+    },
+    Run {
+        system: bool,
     },
 }
 
@@ -386,7 +384,7 @@ pub(crate) fn uninstall_command(home: &Path) -> String {
     let quoted = format!("'{}'", raw.replace('\'', "''"));
     #[cfg(not(windows))]
     let quoted = format!("'{}'", raw.replace('\'', "'\"'\"'"));
-    format!("open-pact-client --home {quoted} schedule uninstall")
+    format!("open-pact-client --home {quoted} apply")
 }
 
 fn text(path: &Path) -> Result<&str> {
@@ -917,7 +915,7 @@ fn windows_require_elevation() -> Result<()> {
         r#"$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = New-Object Security.Principal.WindowsPrincipal($identity)
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    throw 'run `schedule uninstall --system` from an elevated prompt'
+    throw 'run `apply` from an elevated prompt'
 }"#,
     )?;
     Ok(())
@@ -928,7 +926,7 @@ fn windows_uninstall_script(job: &Job, system: bool) -> String {
     format!(
         r#"{query}
 if (-not {system} -and $null -ne $task -and (IsSystemTask $task)) {{
-    throw 'run `schedule uninstall --system` from an elevated prompt'
+    throw 'run `apply` from an elevated prompt'
 }}
 if ($null -ne $task) {{ $folder.DeleteTask({id},0) }}
 try {{
@@ -949,7 +947,7 @@ throw 'scheduled task remains: {name}'
 
 fn windows_uninstall(job: &Job, system: bool) -> Result<()> {
     windows_powershell(&windows_uninstall_script(job, system))
-        .context("run `schedule uninstall --system` from an elevated prompt")?;
+        .context("run `apply` from an elevated prompt")?;
     Ok(())
 }
 
@@ -1001,7 +999,7 @@ try {{
 }} catch {{ $failure = $_.Exception.Message }}
 $leftovers = @(Get-ChildItem -LiteralPath $install -Filter 'open-pact-client.exe*' -File -Force -ErrorAction Stop)
 if ($leftovers.Count -gt 0) {{
-    throw "SYSTEM files remain: $($leftovers.FullName -join ', '). $failure Retry schedule uninstall --system, or reboot for queued files."
+    throw "SYSTEM files remain: $($leftovers.FullName -join ', '). $failure Retry apply, or reboot for queued files."
 }}
 if ($null -ne $failure) {{ throw $failure }}
 "#
@@ -1042,7 +1040,7 @@ fn windows_system_uninstall(job: &Job, home: &Home) -> Result<()> {
 
 fn validate_system_install(system: bool, os: open_pact_core::Os) -> Result<()> {
     if system && os != open_pact_core::Os::Windows {
-        bail!("schedule install --system is available only on Windows");
+        bail!("[schedule].run_as = system is available only on Windows");
     }
     Ok(())
 }
@@ -1131,6 +1129,15 @@ fn observe(home: &Home, desired: Option<&Applied>) -> Result<Observed> {
     let executable = desired
         .map(|settings| settings.executable.clone())
         .unwrap_or(std::env::current_exe()?);
+    let executable = if crate::current_os()? == open_pact_core::Os::Windows
+        && desired.is_some_and(|settings| settings.run_as == RunAs::System)
+    {
+        PathBuf::from(windows_powershell(&format!(
+            "{PROTECTED_DIRECTORY}\nWrite-Output (Join-Path (ProgramFilesPath) 'open-pact\\open-pact-client.exe')"
+        ))?)
+    } else {
+        executable
+    };
     let mut job = Job::new(&executable, &home.0)?;
     if desired.is_some_and(|settings| settings.run_as == RunAs::System) {
         job.argv.push("--system".into());
@@ -1324,11 +1331,11 @@ pub(crate) async fn apply(home: &Home, dry_run: bool) -> Result<()> {
         Change::Install | Change::Update => {
             let desired = desired.as_ref().unwrap();
             if observed.system && desired.run_as == RunAs::User {
-                operate(&home, Command::Uninstall { system: true }, true).await?;
+                operate(&home, Operation::Uninstall { system: true }, true).await?;
             }
             operate(
                 &home,
-                Command::Install {
+                Operation::Install {
                     collector: desired.report.collector.clone(),
                     vpn_probe: Some(desired.report.vpn_probe.clone()),
                     system: desired.run_as == RunAs::System,
@@ -1339,7 +1346,7 @@ pub(crate) async fn apply(home: &Home, dry_run: bool) -> Result<()> {
             save(&home, APPLIED, desired)?;
         }
         Change::Remove => {
-            operate(&home, Command::Uninstall { system }, true).await?;
+            operate(&home, Operation::Uninstall { system }, true).await?;
             remove_if_exists(&home.file(APPLIED))?;
         }
         Change::None => {}
@@ -1349,25 +1356,28 @@ pub(crate) async fn apply(home: &Home, dry_run: bool) -> Result<()> {
 }
 
 pub(crate) async fn run(home: &Home, command: Command) -> Result<()> {
-    operate(home, command, false).await
+    match command {
+        Command::Run { system } => operate(home, Operation::Run { system }, false).await,
+        Command::Probe { address } => probe_blocking(&address),
+    }
 }
 
-async fn operate(home: &Home, command: Command, home_locked: bool) -> Result<()> {
+async fn operate(home: &Home, command: Operation, home_locked: bool) -> Result<()> {
     let os = crate::current_os()?;
-    if let Command::Install { system, .. } = &command
+    if let Operation::Install { system, .. } = &command
         && *system
     {
         validate_system_install(true, os)?;
     }
-    let system_run = matches!(&command, Command::Run { system: true });
+    let system_run = matches!(&command, Operation::Run { system: true });
     if system_run {
         validate_system_install(true, os)?;
     }
-    let uninstall = matches!(&command, Command::Uninstall { .. });
+    let uninstall = matches!(&command, Operation::Uninstall { .. });
     let absolute = schedule_home(&home.0, uninstall)?;
     let home = Home(absolute);
-    let system_install = matches!(&command, Command::Install { system: true, .. });
-    if let Command::Install {
+    let system_install = matches!(&command, Operation::Install { system: true, .. });
+    if let Operation::Install {
         collector,
         vpn_probe,
         system: true,
@@ -1378,7 +1388,7 @@ async fn operate(home: &Home, command: Command, home_locked: bool) -> Result<()>
         crate::DeviceKey::load(&home.0)?;
         validate_windows_home(&home.0)?;
     }
-    let system_uninstall = matches!(&command, Command::Uninstall { system: true });
+    let system_uninstall = matches!(&command, Operation::Uninstall { system: true });
     if system_uninstall {
         validate_system_install(true, os)?;
         windows_require_elevation()?;
@@ -1406,21 +1416,28 @@ async fn operate(home: &Home, command: Command, home_locked: bool) -> Result<()>
         None
     };
     match command {
-        Command::Probe { .. } => unreachable!(),
-        Command::Run { .. } => {
-            let config: Config = home
-                .read_json(CONFIG)?
-                .context("report schedule is not installed")?;
-            report::collector_url(&config.collector)?;
-            probe_address(&config.vpn_probe)?;
+        Operation::Run { .. } => {
+            let config = DeviceConfig::load(&home)?
+                .context("open-pact.toml is missing; run `config example`")?;
+            if !config
+                .schedule
+                .as_ref()
+                .is_some_and(|schedule| schedule.enabled)
+            {
+                return Ok(());
+            }
+            let report = config
+                .report
+                .context("open-pact.toml [report].collector is required")?;
+            let config = Config::new(report.collector, report.vpn_probe)?;
             run_report(&home, &state_home, &config, checks::event_markers).await?;
         }
-        Command::Install {
+        Operation::Install {
             collector,
             vpn_probe,
             system,
         } => {
-            let config = Config::new(collector, vpn_probe)?;
+            Config::new(collector, vpn_probe)?;
             home.enrolment()?;
             crate::DeviceKey::load(&home.0)?;
             if os == open_pact_core::Os::Windows {
@@ -1441,7 +1458,6 @@ async fn operate(home: &Home, command: Command, home_locked: bool) -> Result<()>
             if system {
                 job.argv.push("--system".into());
             }
-            save(&home, CONFIG, &config)?;
             save(&install_state, STATE, &State::default())?;
             let run_as = if system {
                 TaskRunAs::System
@@ -1454,7 +1470,7 @@ async fn operate(home: &Home, command: Command, home_locked: bool) -> Result<()>
                 job.id
             );
         }
-        Command::Uninstall { system } => {
+        Operation::Uninstall { system } => {
             let job = Job::new(&std::env::current_exe()?, &home.0)?;
             if os == open_pact_core::Os::Windows {
                 if system {
@@ -1462,7 +1478,7 @@ async fn operate(home: &Home, command: Command, home_locked: bool) -> Result<()>
                 } else {
                     windows_uninstall(&job, false)?;
                     println!(
-                        "SYSTEM leftovers, if any, are removed with schedule uninstall --system from an elevated prompt."
+                        "SYSTEM leftovers, if any, are removed with apply from an elevated prompt."
                     );
                 }
             } else {
@@ -1491,6 +1507,25 @@ async fn operate(home: &Home, command: Command, home_locked: bool) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn imperative_setup_commands_are_removed() {
+        use clap::Parser;
+        for args in [
+            vec![
+                "client",
+                "schedule",
+                "install",
+                "--collector",
+                "https://example.org",
+            ],
+            vec!["client", "schedule", "uninstall"],
+            vec!["client", "report", "--collector", "https://example.org"],
+        ] {
+            assert!(crate::Cli::try_parse_from(args).is_err());
+        }
+        assert!(crate::Cli::try_parse_from(["client", "report", "--dry-run"]).is_ok());
+    }
 
     #[test]
     fn schedule_reconcile_covers_install_update_remove_and_retry() {
@@ -1665,7 +1700,7 @@ function New-Object {
         let checks = r#"$script:failure = 0
 $script:userId = 'SYSTEM'
 $caught = $false
-try { & $action | Out-Null } catch { $caught = $_.Exception.Message -like '*schedule uninstall --system*' }
+try { & $action | Out-Null } catch { $caught = $_.Exception.Message -like '*apply*' }
 if (-not $caught -or $script:deleted) { throw 'limited uninstall did not refuse SYSTEM task' }
 $script:userId = 'EXAMPLE\user'
 foreach ($code in @(5,2,0)) {
@@ -1914,15 +1949,7 @@ Write-Output 'refused'
             drop(probe);
             observed.store(true, Ordering::SeqCst);
         });
-        save(
-            &home,
-            CONFIG,
-            &Config {
-                collector,
-                vpn_probe: probe_address.clone(),
-            },
-        )
-        .unwrap();
+        std::fs::write(home.file(crate::device_config::FILE), format!("[report]\ncollector = '{collector}'\nvpn_probe = '{probe_address}'\n[schedule]\nenabled = true\nrun_as = 'user'\n")).unwrap();
         let result = run(&home, Command::Run { system: false }).await;
         close.join().unwrap();
         assert!(went_down.load(Ordering::SeqCst));
@@ -1942,9 +1969,7 @@ Write-Output 'refused'
         let output = std::process::Command::new("sh")
             .args([
                 "-c",
-                &format!(
-                    "set -- {command}; printf '%s\\n' \"$#\" \"$1\" \"$2\" \"$3\" \"$4\" \"$5\""
-                ),
+                &format!("set -- {command}; printf '%s\\n' \"$#\" \"$1\" \"$2\" \"$3\" \"$4\""),
             ])
             .output()
             .unwrap();
@@ -1955,12 +1980,11 @@ Write-Output 'refused'
                 .lines()
                 .collect::<Vec<_>>(),
             [
-                "5",
+                "4",
                 "open-pact-client",
                 "--home",
                 home.to_str().unwrap(),
-                "schedule",
-                "uninstall"
+                "apply"
             ]
         );
     }
@@ -2574,15 +2598,10 @@ Write-Output 'refused'
         let home = Home(dir.path().to_path_buf());
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let probe = listener.local_addr().unwrap().to_string();
-        save(
-            &home,
-            CONFIG,
-            &Config {
-                collector: "https://collector.example.org/status".into(),
-                vpn_probe: probe,
-            },
-        )
-        .unwrap();
+        let write_config = |probe: &str| {
+            std::fs::write(home.file(crate::device_config::FILE), format!("[report]\ncollector = 'https://collector.example.org/status'\nvpn_probe = '{probe}'\n[schedule]\nenabled = true\nrun_as = 'user'\n")).unwrap();
+        };
+        write_config(&probe);
         save(
             &home,
             STATE,
@@ -2608,9 +2627,7 @@ Write-Output 'refused'
         let reserved = tokio::net::TcpSocket::new_v4().unwrap();
         reserved.bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let refused = reserved.local_addr().unwrap().to_string();
-        let mut config: Config = home.read_json(CONFIG).unwrap().unwrap();
-        config.vpn_probe = refused;
-        save(&home, CONFIG, &config).unwrap();
+        write_config(&refused);
         assert!(
             run(&home, Command::Run { system: false }).await.is_err(),
             "no enrolment for local evaluation"
@@ -2725,7 +2742,7 @@ Write-Output 'refused'
         ] {
             assert!(!script.contains(forbidden), "{forbidden}");
         }
-        assert!(script.contains("schedule uninstall --system"));
+        assert!(script.contains("apply"));
     }
 
     #[test]

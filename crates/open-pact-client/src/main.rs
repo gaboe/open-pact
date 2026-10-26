@@ -62,8 +62,6 @@ enum Command {
     /// Send a signed status report to an HTTPS collector
     Report {
         #[arg(long)]
-        collector: String,
-        #[arg(long)]
         dry_run: bool,
     },
     /// Reconcile the scheduled report job with open-pact.toml
@@ -1668,8 +1666,13 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             software_key,
         } => join(&home, &invitation, yes, software_key, cli.insecure_dev).await,
         Command::Check => check(&home, cli.insecure_dev).await,
-        Command::Report { collector, dry_run } => {
-            report::run(&home, &collector, dry_run).await?;
+        Command::Report { dry_run } => {
+            let config = device_config::DeviceConfig::load(&home)?
+                .context("open-pact.toml is missing; run `config example`")?;
+            let report = config
+                .report
+                .context("open-pact.toml [report].collector is required")?;
+            report::run(&home, &report.collector, dry_run).await?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Apply { dry_run } => {
@@ -1691,7 +1694,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         } => log_show(&home.file("claims.jsonl")).map(|()| ExitCode::SUCCESS),
         Command::Stop => {
             println!(
-                "Run `{}` to stop scheduled reports.",
+                "Set [schedule].enabled = false in open-pact.toml, then run `{}` to stop scheduled reports.",
                 schedule::uninstall_command(&home.0)
             );
             println!("To uninstall, delete the binary and {}.", home.0.display());

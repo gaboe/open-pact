@@ -58,11 +58,13 @@ pub(crate) struct ManagedRepos {
 impl DeviceConfig {
     pub(crate) fn load(home: &Home) -> Result<Option<Self>> {
         let path = home.file(FILE);
-        let text = match std::fs::read_to_string(&path) {
+        let text = match crate::read_home_file(&path) {
             Ok(text) => text,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
         };
+        let text =
+            String::from_utf8(text).with_context(|| format!("{} must be UTF-8", path.display()))?;
         let user_home =
             std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from);
         Self::parse(&text, user_home.as_deref())
