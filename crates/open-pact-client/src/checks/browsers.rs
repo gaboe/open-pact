@@ -23,6 +23,11 @@ fn merge(states: &[Protection]) -> Protection {
     }
 }
 
+fn parse_json(text: &str) -> Result<Value, ()> {
+    let json: Value = serde_json::from_str(text).map_err(|_| ())?;
+    if json.is_object() { Ok(json) } else { Err(()) }
+}
+
 fn optional_json(path: &Path, plist: bool) -> Result<Value, ()> {
     match fs::metadata(path) {
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Value::Object(Map::new())),
@@ -38,8 +43,11 @@ fn optional_json(path: &Path, plist: bool) -> Result<Value, ()> {
     } else {
         fs::read_to_string(path).map_err(|_| ())?
     };
-    let json: Value = serde_json::from_str(&text).map_err(|_| ())?;
-    if json.is_object() { Ok(json) } else { Err(()) }
+    parse_json(&text)
+}
+
+fn required_json(path: &Path) -> Result<Value, ()> {
+    parse_json(&fs::read_to_string(path).map_err(|_| ())?)
 }
 
 fn flag(value: Option<&Value>) -> Protection {
@@ -149,21 +157,21 @@ fn profiles(root: &Path, firefox: bool) -> Result<Vec<PathBuf>, ()> {
         let kind = entry.file_type().map_err(|_| ())?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        let profile =
-            firefox || name == "Default" || name.starts_with("Profile ") || name == "Guest Profile";
         if kind.is_symlink() {
-            if profile {
-                return Err(());
-            }
             let path = entry.path();
-            let has_preferences = match path.join("Preferences").try_exists() {
-                Ok(has_preferences) => has_preferences,
-                Err(error) if error.kind() == ErrorKind::NotADirectory => false,
-                Err(_) => return Err(()),
+            let Ok(target) = fs::metadata(&path) else {
+                continue;
             };
-            if has_preferences {
+            if !target.is_dir() {
+                continue;
+            }
+            let profile = firefox
+                || name == "Default"
+                || name.starts_with("Profile ")
+                || name == "Guest Profile";
+            if profile || path.join("Preferences").try_exists().map_err(|_| ())? {
                 let target = path.canonicalize().map_err(|_| ())?;
-                if !target.starts_with(&canonical_root) || !target.is_dir() {
+                if !target.starts_with(&canonical_root) {
                     return Err(());
                 }
                 found.push(path);
@@ -173,6 +181,8 @@ fn profiles(root: &Path, firefox: bool) -> Result<Vec<PathBuf>, ()> {
         if !kind.is_dir() {
             continue;
         }
+        let profile =
+            firefox || name == "Default" || name.starts_with("Profile ") || name == "Guest Profile";
         if profile
             || entry
                 .path()
@@ -245,7 +255,7 @@ fn chromium_browser(home: &Path, data: &str, domain: &str, edge: bool) -> Protec
     let states: Vec<_> = dirs
         .iter()
         .map(|dir| {
-            optional_json(&dir.join("Preferences"), false).map_or(Protection::Unknown, |v| {
+            required_json(&dir.join("Preferences")).map_or(Protection::Unknown, |v| {
                 chromium_with_recommendation(&v, &policy, recommended.as_ref().ok(), edge)
             })
         })
@@ -1011,21 +1021,40 @@ mod tests {
     }
     #[test]
     #[cfg(unix)]
-    fn chrome_lock_symlinks_are_not_profiles() {
-        let root = tempfile::tempdir().unwrap();
-        fs::write(root.path().join("fictional-cookie"), "fixture").unwrap();
-        std::os::unix::fs::symlink("fictional-cookie", root.path().join("SingletonCookie"))
-            .unwrap();
-        let profile = root.path().join("Default");
+    fn chrome_lock_symlink_does_not_hide_a_profile() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home
+            .path()
+            .join("Library/Application Support/FictionalBrowser");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("fictional-cookie"), "fixture").unwrap();
+        std::os::unix::fs::symlink("fictional-cookie", root.join("SingletonCookie")).unwrap();
+        let profile = root.join("Default");
         fs::create_dir(&profile).unwrap();
         fs::write(
             profile.join("Preferences"),
             r#"{"safebrowsing":{"enabled":false}}"#,
         )
         .unwrap();
-        assert_eq!(profiles(root.path(), false).unwrap(), vec![profile.clone()]);
-        std::os::unix::fs::symlink(&profile, root.path().join("Profile 1")).unwrap();
-        assert!(profiles(root.path(), false).is_err());
+        assert_eq!(
+            chromium_browser(
+                home.path(),
+                "FictionalBrowser",
+                "org.openpact.fictional-lock-links",
+                false
+            ),
+            Protection::Off
+        );
+        std::os::unix::fs::symlink(&profile, root.join("Profile 1")).unwrap();
+        assert_eq!(
+            chromium_browser(
+                home.path(),
+                "FictionalBrowser",
+                "org.openpact.fictional-lock-links",
+                false
+            ),
+            Protection::Off
+        );
     }
 
     #[test]
