@@ -869,6 +869,26 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("user");
+        struct RestorePermissions {
+            git: PathBuf,
+            git_permissions: fs::Permissions,
+            config: PathBuf,
+            config_permissions: fs::Permissions,
+        }
+
+        impl RestorePermissions {
+            fn restore(&self) -> std::io::Result<()> {
+                fs::set_permissions(&self.git, self.git_permissions.clone())?;
+                fs::set_permissions(&self.config, self.config_permissions.clone())
+            }
+        }
+
+        impl Drop for RestorePermissions {
+            fn drop(&mut self) {
+                let _ = self.restore();
+            }
+        }
+
         for (name, deny_config) in [("git-dir", false), ("git-config", true)] {
             let repo = root.join(name);
             let git = repo.join(".git");
@@ -879,15 +899,27 @@ mod tests {
                 "[remote \"origin\"]\n url = git@github.com:example-org/app.git\n",
             )
             .unwrap();
+            let restore_permissions = RestorePermissions {
+                git_permissions: fs::metadata(&git).unwrap().permissions(),
+                config_permissions: fs::metadata(&config).unwrap().permissions(),
+                git: git.clone(),
+                config: config.clone(),
+            };
             let denied = if deny_config { &config } else { &git };
             fs::set_permissions(denied, fs::Permissions::from_mode(0o0)).unwrap();
-            if fs::read_dir(&git).is_ok() || (deny_config && fs::read_to_string(&config).is_ok()) {
-                fs::set_permissions(denied, fs::Permissions::from_mode(0o700)).unwrap();
+            let denied_is_readable = if deny_config {
+                fs::read_to_string(&config).is_ok()
+            } else {
+                fs::read_dir(&git).is_ok()
+            };
+            if denied_is_readable {
+                restore_permissions.restore().unwrap();
                 eprintln!(
                     "skipped permission probe because this platform does not enforce mode bits"
                 );
                 return;
             }
+            eprintln!("running permission probe for {name}");
             let scan = scan_and_store(
                 &temp.path().join(format!("client-{name}")),
                 &root,
@@ -895,8 +927,7 @@ mod tests {
                 &[pattern("github.com/example-org/")],
             )
             .unwrap();
-            fs::set_permissions(&git, fs::Permissions::from_mode(0o700)).unwrap();
-            fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+            restore_permissions.restore().unwrap();
             assert!(scan.partial);
             assert!(scan.access_denied);
             assert!(!fresh(&scan, scan.scanned_at));
