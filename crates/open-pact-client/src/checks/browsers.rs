@@ -371,6 +371,166 @@ fn web_protection(states: &[Protection]) -> &'static str {
     }
 }
 
+fn linux_policy(root: &Path) -> Result<Value, ()> {
+    let files = match fs::read_dir(root) {
+        Ok(files) => files,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Value::Object(Map::new())),
+        Err(_) => return Err(()),
+    };
+    let mut policy = Map::new();
+    for file in files {
+        let path = file.map_err(|_| ())?.path();
+        if path.extension().is_none_or(|e| e != "json") {
+            continue;
+        }
+        let value = optional_json(&path, false)?;
+        for (key, value) in value.as_object().ok_or(())? {
+            if policy.get(key).is_some_and(|previous| previous != value) {
+                return Err(());
+            }
+            policy.insert(key.clone(), value.clone());
+        }
+    }
+    Ok(Value::Object(policy))
+}
+
+fn linux_chromium(data: &Path, policy_root: &Path) -> Protection {
+    let Ok(policy) = linux_policy(&policy_root.join("managed")) else {
+        return Protection::Unknown;
+    };
+    let recommendation = linux_policy(&policy_root.join("recommended"));
+    let Ok(dirs) = profiles(data, false) else {
+        return Protection::Unknown;
+    };
+    let mut states = Vec::new();
+    for dir in dirs {
+        let Ok(prefs) = optional_json(&dir.join("Preferences"), false) else {
+            return Protection::Unknown;
+        };
+        states.push(chromium_with_recommendation(
+            &prefs,
+            &policy,
+            recommendation.as_ref().ok(),
+            false,
+        ));
+    }
+    if states.is_empty() {
+        return chromium_with_recommendation(
+            &Value::Object(Map::new()),
+            &policy,
+            recommendation.as_ref().ok(),
+            false,
+        );
+    }
+    merge(&states)
+}
+
+fn linux_firefox(root: &Path, app: &Path) -> Protection {
+    let Ok(system) = optional_json(Path::new("/etc/firefox/policies/policies.json"), false) else {
+        return Protection::Unknown;
+    };
+    let Ok(local) = optional_json(&app.join("distribution/policies.json"), false) else {
+        return Protection::Unknown;
+    };
+    if system.get("policies").is_some() && local.get("policies").is_some() {
+        return Protection::Unknown;
+    }
+    let policy = if system.get("policies").is_some() {
+        system
+    } else {
+        local
+    };
+    let ini = match fs::read_to_string(root.join("profiles.ini")) {
+        Ok(ini) => ini,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Protection::Unknown,
+        Err(_) => return Protection::Unknown,
+    };
+    if ini.lines().any(|line| line.trim() == "IsRelative=0") {
+        return Protection::Unknown;
+    }
+    let mut states = Vec::new();
+    for path in ini
+        .lines()
+        .map(str::trim)
+        .filter_map(|l| l.strip_prefix("Path="))
+    {
+        let relative = Path::new(path);
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            return Protection::Unknown;
+        }
+        let mut prefs = Map::new();
+        for name in ["prefs.js", "user.js"] {
+            match fs::read_to_string(root.join(relative).join(name)) {
+                Ok(text) => match firefox_prefs(&text) {
+                    Ok(values) => prefs.extend(values),
+                    Err(_) => return Protection::Unknown,
+                },
+                Err(e) if e.kind() == ErrorKind::NotFound => (),
+                Err(_) => return Protection::Unknown,
+            }
+        }
+        states.push(firefox_state(&prefs, &policy));
+    }
+    merge(&states)
+}
+
+pub fn linux() -> &'static str {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return "unknown";
+    };
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"));
+    if !config.is_absolute() {
+        return "unknown";
+    }
+    let mut states = Vec::new();
+    for (binary, data, policy) in [
+        (
+            "/opt/google/chrome/chrome",
+            "google-chrome",
+            "/etc/opt/chrome/policies",
+        ),
+        (
+            "/usr/lib/chromium/chromium",
+            "chromium",
+            "/etc/chromium/policies",
+        ),
+    ] {
+        match Path::new(binary).try_exists() {
+            Ok(true) => states.push(linux_chromium(&config.join(data), Path::new(policy))),
+            Ok(false) => (),
+            Err(_) => states.push(Protection::Unknown),
+        }
+    }
+    for app in ["/usr/lib/firefox", "/usr/lib/firefox-esr"] {
+        match Path::new(app).join("firefox").try_exists() {
+            Ok(true) => states.push(linux_firefox(
+                &home.join(".mozilla/firefox"),
+                Path::new(app),
+            )),
+            Ok(false) => (),
+            Err(_) => states.push(Protection::Unknown),
+        }
+    }
+    // Sandboxed packages use separate policy and profile locations.
+    if home.join(".var/app").exists()
+        || Path::new("/snap/firefox").exists()
+        || Path::new("/snap/chromium").exists()
+    {
+        states.push(Protection::Unknown);
+    }
+    if states.is_empty() {
+        "unknown"
+    } else {
+        web_protection(&states)
+    }
+}
+
 pub fn macos() -> &'static str {
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
         return "unknown";
@@ -908,5 +1068,47 @@ mod tests {
             ),
             Protection::On
         );
+    }
+}
+
+#[cfg(test)]
+mod linux_tests {
+    use super::*;
+    #[test]
+    fn linux_mandatory_policy_overrides_profile_and_conflicts_are_unknown() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("data/Default");
+        let managed = root.path().join("policy/managed");
+        fs::create_dir_all(&data).unwrap();
+        fs::create_dir_all(&managed).unwrap();
+        fs::write(
+            data.join("Preferences"),
+            r#"{"safebrowsing":{"enabled":false}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            linux_chromium(&root.path().join("data"), &root.path().join("policy")),
+            Protection::Off
+        );
+        fs::write(
+            managed.join("fictional.json"),
+            r#"{"SafeBrowsingProtectionLevel":1}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            linux_chromium(&root.path().join("data"), &root.path().join("policy")),
+            Protection::On
+        );
+        fs::write(
+            managed.join("conflict.json"),
+            r#"{"SafeBrowsingProtectionLevel":0}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            linux_chromium(&root.path().join("data"), &root.path().join("policy")),
+            Protection::Unknown
+        );
+        fs::write(managed.join("conflict.json"), "{broken").unwrap();
+        assert!(linux_policy(&managed).is_err());
     }
 }
