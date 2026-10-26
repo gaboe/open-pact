@@ -157,3 +157,13 @@ The VPN certificate request travels beside the signed claim. It contains the VPN
 | Linux schedule install cannot reach systemd | Start the user systemd manager. Run `schedule install` again. |
 | Schedule does not send | Check that the collector uses HTTPS, the VPN probe is reachable only through the VPN, and the binary remains at its installed path. |
 | `schedule uninstall` cannot find the job | Use the same absolute `--home` path that you used to install it. |
+
+## Linux checks and detection reports
+
+Run the client as the account that uses the device. `work_account` reports `admin` for membership in `sudo`, `wheel`, or `root`. The systemd user timer needs a running user manager. A container without that manager cannot install or exercise the user timer.
+
+To use the Linux ClamAV detection trigger, route `clamonacc` or `clamd` detection output to the system journal. Give the client account read access to that journal. The client reads trusted process names and `FOUND` records. The report timer checks every five minutes while the VPN is connected. File-only logs do not supply this trigger. A denied journal read preserves the saved detection baseline.
+
+The boot authentication check reads root and active swap mappings from `lsblk` and `/etc/crypttab`. A passphrase prompt reports `user_secret`. A configured TPM2, FIDO2, or Clevis unlock reports `hardware_only`. A keyfile on a verified unencrypted filesystem reports `none`. Missing evidence reports `unknown`. See [Linux source limits](platform-support.md#linux-sources-and-limits) for policy locations and controls that remain unknown.
+
+To run the Linux container scenarios, use `tests/linux-docker/run.sh`. Set `DISTROS=ubuntu` to run Ubuntu only. Set `PLATFORM=linux/amd64` or `PLATFORM=linux/arm64` to choose the target. The Docker build runs format verification, Clippy, and workspace tests before the scenarios. It builds the client and its check printer inside Linux. The test containers are removed after each run.
