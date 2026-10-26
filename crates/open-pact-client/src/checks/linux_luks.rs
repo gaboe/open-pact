@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use open_pact_core::ControlValue;
 use serde::Deserialize;
@@ -17,7 +17,6 @@ struct BlockDevice {
     #[serde(rename = "type")]
     kind: String,
     fstype: Option<String>,
-    uuid: Option<String>,
     mountpoints: Vec<Option<String>>,
     #[serde(default)]
     children: Vec<BlockDevice>,
@@ -44,6 +43,18 @@ impl Unlock {
 }
 
 pub fn preboot_auth() -> ControlValue {
+    let Ok(cmdline) = std::fs::read_to_string("/proc/cmdline") else {
+        return Unlock::Unknown.value();
+    };
+    let crypttab = match std::fs::read_to_string("/etc/crypttab") {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Ok(crypttab) => crypttab,
+        Err(_) => return Unlock::Unknown.value(),
+    };
+    let config = BootConfig::parse(&crypttab, &cmdline);
+    if config.has_kernel_unlock_parameter {
+        return Unlock::Unknown.value();
+    }
     let Some(output) = run_status(
         "lsblk",
         &[
@@ -51,32 +62,13 @@ pub fn preboot_auth() -> ControlValue {
             "--inverse",
             "--paths",
             "--output",
-            "NAME,TYPE,FSTYPE,UUID,MOUNTPOINTS",
+            "NAME,TYPE,FSTYPE,MOUNTPOINTS",
         ],
     )
     .filter(|r| r.success) else {
         return Unlock::Unknown.value();
     };
-    let crypttab = match std::fs::read_to_string("/etc/crypttab") {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
-        result => result,
-    };
-    let cmdline = std::fs::read_to_string("/proc/cmdline");
-    let uuids = device_uuids(&output.text);
-    let config =
-        crypttab
-            .as_deref()
-            .ok()
-            .zip(cmdline.as_deref().ok())
-            .map(|(crypttab, cmdline)| {
-                BootConfig::parse_bound(crypttab, cmdline, |mapping| {
-                    uuids.get(mapping).map(String::as_str)
-                })
-            });
     inspect_tree(&output.text, |device, mapping| {
-        let Some(config) = &config else {
-            return Unlock::Unknown;
-        };
         let boot = config.key(mapping);
         let metadata = run_status("cryptsetup", &["luksDump", "--dump-json-metadata", device])
             .filter(|r| r.success)
@@ -84,31 +76,6 @@ pub fn preboot_auth() -> ControlValue {
         boot.unlock(metadata)
     })
     .value()
-}
-
-fn device_uuids(text: &str) -> BTreeMap<String, String> {
-    fn collect(device: &BlockDevice, mapping: Option<&str>, uuids: &mut BTreeMap<String, String>) {
-        let mapping = if device.kind == "crypt" {
-            device.name.rsplit('/').next()
-        } else {
-            mapping
-        };
-        if device.fstype.as_deref() == Some("crypto_LUKS")
-            && let (Some(mapping), Some(uuid)) = (mapping, device.uuid.as_ref())
-        {
-            uuids.insert(mapping.to_owned(), uuid.clone());
-        }
-        for child in &device.children {
-            collect(child, mapping, uuids);
-        }
-    }
-    let mut uuids = BTreeMap::new();
-    if let Ok(tree) = serde_json::from_str::<BlockTree>(text) {
-        for device in &tree.blockdevices {
-            collect(device, None, &mut uuids);
-        }
-    }
-    uuids
 }
 
 fn inspect_tree(text: &str, mut inspect: impl FnMut(&str, &str) -> Unlock) -> Unlock {
@@ -274,71 +241,26 @@ impl UnlockOptions {
 
 struct BootEntry<'a> {
     mapping: String,
-    uuid: Option<&'a str>,
     keyfile: &'a str,
     options: &'a str,
     valid: bool,
-    from_crypttab: bool,
 }
 
 struct BootDevice<'a> {
     mapping: String,
-    uuid: Option<&'a str>,
     keyfile: &'a str,
     options: Option<UnlockOptions>,
 }
 
 struct BootConfig<'a> {
     devices: Vec<BootDevice<'a>>,
+    has_kernel_unlock_parameter: bool,
 }
 
 impl<'a> BootConfig<'a> {
-    #[cfg(test)]
-    fn parse(crypttab: &'a str, cmdline: &'a str) -> Self {
-        Self::parse_bound(crypttab, cmdline, |_| None)
-    }
-
-    fn parse_bound(
-        crypttab: &'a str,
-        cmdline: &'a str,
-        uuid: impl Fn(&str) -> Option<&'a str>,
-    ) -> Self {
-        if cmdline.split_whitespace().any(|word| {
-            word.contains("luks")
-                && (word.matches('"').count() % 2 != 0 || word.matches('\'').count() % 2 != 0)
-        }) {
-            return Self {
-                devices: Vec::new(),
-            };
-        }
-        let parameters: Vec<_> = cmdline
-            .split_whitespace()
-            .filter_map(|word| {
-                let word = word.trim_matches(['"', '\'']);
-                let word = word.strip_prefix("rd.").unwrap_or(word);
-                let (name, value) = word.split_once('=')?;
-                let name = if name == "luks" {
-                    ""
-                } else {
-                    name.strip_prefix("luks.")?
-                };
-                Some((name, value.trim_matches(['"', '\''])))
-            })
-            .collect();
-        if parameters
-            .iter()
-            .any(|(name, value)| name.is_empty() && systemd_bool(value) != Some(true))
-        {
-            return Self {
-                devices: Vec::new(),
-            };
-        }
-        let use_crypttab = parameters
-            .iter()
-            .rfind(|(name, _)| *name == "crypttab")
-            .is_none_or(|(_, value)| systemd_bool(value) == Some(true));
-        let mut entries = Vec::new();
-        for line in crypttab.lines().filter(|_| use_crypttab) {
+    fn parse(crypttab: &'a str, cmdline: &str) -> Self {
+        let mut devices = Vec::new();
+        for line in crypttab.lines() {
             let fields: Vec<_> = line
                 .split('#')
                 .next()
@@ -348,123 +270,36 @@ impl<'a> BootConfig<'a> {
             if fields.is_empty() {
                 continue;
             }
-            entries.push(BootEntry {
+            let entry = BootEntry {
                 mapping: fields[0].to_owned(),
-                uuid: fields
-                    .get(1)
-                    .and_then(|s| s.strip_prefix("UUID="))
-                    .or_else(|| uuid(fields[0])),
                 keyfile: fields.get(2).copied().unwrap_or("none"),
                 options: fields.get(3).copied().unwrap_or(""),
                 valid: (2..=4).contains(&fields.len()),
-                from_crypttab: true,
+            };
+            devices.push(BootDevice {
+                mapping: entry.mapping,
+                keyfile: entry.keyfile,
+                options: if entry.valid {
+                    UnlockOptions::parse(entry.options)
+                } else {
+                    None
+                },
             });
         }
-        for (name, value) in &parameters {
-            let binding = match *name {
-                "uuid" => Some((*value, None)),
-                "name" => value
-                    .split_once('=')
-                    .map(|(uuid, mapping)| (uuid, Some(mapping))),
-                _ => None,
-            };
-            if let Some((uuid, mapping)) = binding {
-                if let Some(entry) = entries.iter_mut().find(|entry| {
-                    entry
-                        .uuid
-                        .is_some_and(|bound| bound.eq_ignore_ascii_case(uuid))
-                }) {
-                    if let Some(mapping) = mapping {
-                        entry.mapping = mapping.to_owned();
-                    }
-                } else {
-                    entries.push(BootEntry {
-                        mapping: mapping
-                            .map(str::to_owned)
-                            .unwrap_or_else(|| format!("luks-{uuid}")),
-                        uuid: Some(uuid),
-                        keyfile: "none",
-                        options: "",
-                        valid: true,
-                        from_crypttab: false,
-                    });
-                }
-            }
+        Self {
+            devices,
+            has_kernel_unlock_parameter: cmdline.split_whitespace().any(is_luks_unlock_parameter),
         }
-        let devices = entries
-            .into_iter()
-            .map(
-                |BootEntry {
-                     mapping,
-                     uuid,
-                     mut keyfile,
-                     mut options,
-                     valid,
-                     from_crypttab,
-                 }| {
-                    for name in ["options", "key"] {
-                        let bound = parameters
-                            .iter()
-                            .filter(|(n, _)| *n == name)
-                            .filter_map(|(_, value)| {
-                                let (binding, value) = value.split_once('=')?;
-                                uuid.filter(|uuid| uuid.eq_ignore_ascii_case(binding))
-                                    .map(|_| value)
-                            })
-                            .next_back();
-                        let default = parameters
-                            .iter()
-                            .filter(|(n, _)| *n == name)
-                            .map(|(_, value)| *value)
-                            .rfind(|value| {
-                                !value
-                                    .split_once('=')
-                                    .is_some_and(|(prefix, _)| is_uuid(prefix))
-                            });
-                        if let Some(value) = bound.or(if name == "key" || !from_crypttab {
-                            default
-                        } else {
-                            None
-                        }) {
-                            if name == "options" {
-                                options = value;
-                            } else {
-                                keyfile = value;
-                            }
-                        }
-                    }
-                    let binding_known = uuid.is_some()
-                        || !parameters.iter().any(|(name, value)| {
-                            matches!(*name, "key" | "options")
-                                && value
-                                    .split_once('=')
-                                    .is_some_and(|(prefix, _)| is_uuid(prefix))
-                        });
-                    BootDevice {
-                        mapping,
-                        uuid,
-                        keyfile,
-                        options: if valid && binding_known {
-                            UnlockOptions::parse(options)
-                        } else {
-                            None
-                        },
-                    }
-                },
-            )
-            .collect();
-        Self { devices }
     }
 
     fn key(&self, mapping: &str) -> BootKey<'a> {
-        let mut devices = self.devices.iter().filter(|device| {
-            device.mapping == mapping
-                || device.uuid.is_some_and(|uuid| {
-                    mapping
-                        .strip_prefix("luks-")
-                        .is_some_and(|bound| bound.eq_ignore_ascii_case(uuid))
-                })
-        });
+        if self.has_kernel_unlock_parameter {
+            return BootKey::Unknown;
+        }
+        let mut devices = self
+            .devices
+            .iter()
+            .filter(|device| device.mapping == mapping);
         let Some(device) = devices.next() else {
             return BootKey::Unknown;
         };
@@ -478,15 +313,11 @@ impl<'a> BootConfig<'a> {
     }
 }
 
-fn is_uuid(value: &str) -> bool {
-    value.len() == 36
-        && value.bytes().enumerate().all(|(i, byte)| {
-            if matches!(i, 8 | 13 | 18 | 23) {
-                byte == b'-'
-            } else {
-                byte.is_ascii_hexdigit()
-            }
-        })
+fn is_luks_unlock_parameter(word: &str) -> bool {
+    let word = word.trim_matches(['"', '\'']);
+    let name = word.split_once('=').map_or(word, |(name, _)| name);
+    let name = name.strip_prefix("rd.").unwrap_or(name);
+    name == "luks" || name.starts_with("luks.")
 }
 
 #[cfg(test)]
@@ -758,17 +589,25 @@ mod crypttab_tests {
             format!("luks.options={root_uuid}=tpm2-device=auto,tpm2-pin=yes"),
             format!("rd.luks.options={swap_uuid}=tpm2-device=auto,tpm2-pin=yes"),
             format!("luks.name={root_uuid}=renamed"),
+            format!("luks.uuid={root_uuid}"),
             format!("luks.key={root_uuid}=/fictional/missing-key"),
+            format!("rd.luks.key={root_uuid}=/fictional/missing-key"),
+            "luks=".to_owned(),
+            "rd.luks=".to_owned(),
             "luks=off luks=on".to_owned(),
             "rd.luks=FALSE".to_owned(),
             "luks.options=quiet".to_owned(),
         ] {
             assert_eq!(
-                BootConfig::parse(&crypttab, &cmdline).key("root").unlock(None),
+                BootConfig::parse(&crypttab, &cmdline)
+                    .key("root")
+                    .unlock(None),
                 Unlock::Unknown
             );
             assert_eq!(
-                BootConfig::parse(&crypttab, &cmdline).key("swap").unlock(None),
+                BootConfig::parse(&crypttab, &cmdline)
+                    .key("swap")
+                    .unlock(None),
                 Unlock::Unknown
             );
         }
@@ -776,11 +615,13 @@ mod crypttab_tests {
 
     #[test]
     fn unrelated_kernel_words_do_not_change_crypttab_results() {
-        let crypttab = "root UUID=fictional - tpm2-device=auto,tpm2-pin=yes\nswap UUID=other - clevis";
+        let crypttab =
+            "root UUID=fictional - tpm2-device=auto,tpm2-pin=yes\nswap UUID=other - clevis";
         let baseline = BootConfig::parse(crypttab, "");
         for cmdline in [
             "quiet splash root=UUID=fictional",
             "BOOT_IMAGE=/fictional/kernel ro console=ttyS0",
+            "notluks.options=ignored root=luks",
         ] {
             let config = BootConfig::parse(crypttab, cmdline);
             for mapping in ["root", "swap"] {
