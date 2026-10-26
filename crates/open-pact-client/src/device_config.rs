@@ -103,9 +103,93 @@ impl DeviceConfig {
     }
 }
 
+pub(crate) fn example(manifest: &open_pact_core::Manifest, os: open_pact_core::Os) -> String {
+    let mut output = String::from(
+        "# Save the sections you need as open-pact.toml next to manifest.toml.\n# The client reads this file and never writes it.\n",
+    );
+    for control in &manifest.body().controls {
+        let requirement = control
+            .required
+            .get(&os)
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "report only".into());
+        for line in format!("{} requires {} on {}", control.id, requirement, os).lines() {
+            output.push_str(&format!("# {line}\n"));
+        }
+    }
+    output.push_str(
+        r#"
+[report]
+collector = "https://collector.example.org/status"
+# vpn_probe defaults to the collector host and port.
+# vpn_probe = "vpn.example.org:443"
+
+[schedule]
+# Set enabled to true, then run open-pact-client apply.
+enabled = false
+# Use system only on Windows, from an elevated PowerShell prompt.
+run_as = "user"
+
+[managed_repos]
+# Use absolute paths or ~/ paths. Paths stay on this device.
+# Managed repository checks arrive in DS3.
+folders = []
+"#,
+    );
+    output
+}
+
+pub(crate) fn print_table(
+    manifest: &open_pact_core::Manifest,
+    os: open_pact_core::Os,
+    config: Option<&DeviceConfig>,
+    results: &std::collections::BTreeMap<String, open_pact_core::ControlValue>,
+) {
+    println!("control | manifest requirement | device setting | result");
+    for control in &manifest.body().controls {
+        let requirement = control
+            .required
+            .get(&os)
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "report only".into());
+        let setting = if matches!(
+            control.id.as_str(),
+            "managed_repos_outside" | "managed_repos_total"
+        ) {
+            config
+                .and_then(|config| config.managed_repos.as_ref())
+                .map(|repos| format!("managed_repos.folders = {:?}", repos.folders))
+                .unwrap_or_else(|| "-".into())
+        } else {
+            "-".into()
+        };
+        let result = results
+            .get(&control.id)
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "-".into());
+        println!("{} | {requirement} | {setting} | {result}", control.id);
+    }
+    if let Some(repos) = config.and_then(|config| config.managed_repos.as_ref()) {
+        println!("managed_repos.folders = {:?}", repos.folders);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_config_example_is_valid_and_names_every_manifest_control() {
+        let manifest =
+            open_pact_core::Manifest::parse(include_bytes!("../../../examples/manifest.toml"))
+                .unwrap();
+        let text = example(&manifest, open_pact_core::Os::Macos);
+        let config = DeviceConfig::parse(&text, Some(Path::new("/home/example"))).unwrap();
+        assert!(!config.schedule.unwrap().enabled);
+        for control in &manifest.body().controls {
+            assert!(text.contains(&format!("# {} requires ", control.id)));
+        }
+    }
 
     #[test]
     fn device_config_sections_and_expansion_need_no_filesystem() {

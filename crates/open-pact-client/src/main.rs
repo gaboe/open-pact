@@ -69,7 +69,12 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Install or remove periodic status reports
+    /// Print a device configuration template
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
+    /// Internal scheduled report commands
     Schedule {
         #[command(subcommand)]
         command: schedule::Command,
@@ -81,6 +86,12 @@ enum Command {
     },
     /// Show how to stop scheduled reports and remove the client
     Stop,
+}
+
+#[derive(Subcommand)]
+enum ConfigCommand {
+    /// Print a commented open-pact.toml template for the enrolled manifest
+    Example,
 }
 
 #[derive(Subcommand)]
@@ -647,11 +658,15 @@ fn virtualized() -> Virtualized {
     }
 }
 
-fn collect_results(manifest: &Manifest, os: Os) -> BTreeMap<String, open_pact_core::ControlValue> {
+fn collect_results(
+    manifest: &Manifest,
+    os: Os,
+    device_config: Option<&device_config::DeviceConfig>,
+) -> BTreeMap<String, open_pact_core::ControlValue> {
     disclosable(
         manifest,
         os,
-        checks::run(os, &manifest.body().controls, None),
+        checks::run(os, &manifest.body().controls, device_config),
     )
 }
 
@@ -1411,9 +1426,23 @@ fn print_hints(
 }
 
 async fn check(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
-    if let Err(error) = device_config::DeviceConfig::load(home) {
-        eprintln!("{error:#}");
-    }
+    schedule::migration_example(home)?;
+    let device_config = match device_config::DeviceConfig::load(home) {
+        Ok(Some(config)) => Some(config),
+        Ok(None) => {
+            eprintln!(
+                "Create {}. Run `open-pact-client config example` and copy the sections you need.",
+                home.file(device_config::FILE).display()
+            );
+            None
+        }
+        Err(error) => {
+            eprintln!(
+                "{error:#}\nCorrect this section and key in open-pact.toml. Other controls will still run."
+            );
+            None
+        }
+    };
     let mut enrolment = home.enrolment()?;
     check_scheme(&enrolment.gateway, insecure_dev)?;
     home.recover_vpn()?;
@@ -1430,6 +1459,8 @@ async fn check(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
     let device = DeviceKey::load(&home.0)?;
     let os = current_os()?;
 
+    let results = collect_results(&manifest, os, device_config.as_ref());
+    device_config::print_table(&manifest, os, device_config.as_ref(), &results);
     let http = http_client()?;
     let (mut verified, own) = match sync_log(&http, home, &manifest, &mut enrolment).await? {
         LogSync::Verified(cp, own) => (cp, own),
@@ -1438,7 +1469,6 @@ async fn check(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
             return Ok(ExitCode::from(2));
         }
     };
-    let results = collect_results(&manifest, os);
     let gateway = base(&enrolment.gateway);
     let log_checkpoint = disclosable_checkpoint(&manifest, home.checkpoint()?);
     let nonce: Nonce = http
@@ -1673,6 +1703,17 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 .report
                 .context("open-pact.toml [report].collector is required")?;
             report::run(&home, &report.collector, dry_run).await?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Config {
+            command: ConfigCommand::Example,
+        } => {
+            let enrolment = home.enrolment()?;
+            let manifest = Manifest::parse(&read_home_file(&home.file("manifest.toml"))?)?;
+            if manifest.hash() != &enrolment.manifest {
+                bail!("manifest.toml no longer matches the hash you signed");
+            }
+            print!("{}", device_config::example(&manifest, current_os()?));
             Ok(ExitCode::SUCCESS)
         }
         Command::Apply { dry_run } => {
