@@ -405,6 +405,51 @@ mod crypttab_tests {
     }
 
     #[test]
+    fn boolean_aliases_and_pin_sources_are_device_specific() {
+        for value in ["1", "yes", "y", "true", "t", "on", "TRUE", "Y"] {
+            for source in [
+                "tpm2-device=auto,tpm2-pin",
+                "fido2-cid=ZmljdGlvbmFs,fido2-pin",
+            ] {
+                let line = format!("root UUID=fictional /fictional/salt {source}={value}");
+                assert_eq!(
+                    parse_crypttab(&line, "root").unlock(None),
+                    Unlock::Secret,
+                    "{line}"
+                );
+                let automatic = format!("{line},try-empty-password={value}");
+                assert_eq!(
+                    parse_crypttab(&automatic, "root").unlock(None),
+                    Unlock::Unknown,
+                    "{automatic}"
+                );
+            }
+        }
+        for value in ["0", "no", "n", "false", "f", "off", "FALSE", "N"] {
+            let line = format!(
+                "root UUID=fictional - tpm2-device=auto,tpm2-pin={value},try-empty-password={value}"
+            );
+            assert_eq!(
+                parse_crypttab(&line, "root").unlock(None),
+                Unlock::Hardware,
+                "{line}"
+            );
+        }
+        for options in [
+            "tpm2-device=auto,fido2-pin=yes",
+            "fido2-cid=ZmljdGlvbmFs,tpm2-pin=yes",
+            "fido2-device=auto,fido2-pin=yes",
+        ] {
+            let line = format!("root UUID=fictional - {options}");
+            assert_eq!(
+                parse_crypttab(&line, "root").unlock(None),
+                Unlock::Hardware,
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
     fn manual_hardware_pin_is_a_secret() {
         for options in [
             "tpm2-device=auto,tpm2-pin=yes",
