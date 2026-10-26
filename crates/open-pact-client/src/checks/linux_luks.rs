@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use open_pact_core::ControlValue;
 use serde::Deserialize;
@@ -17,6 +17,7 @@ struct BlockDevice {
     #[serde(rename = "type")]
     kind: String,
     fstype: Option<String>,
+    uuid: Option<String>,
     mountpoints: Vec<Option<String>>,
     #[serde(default)]
     children: Vec<BlockDevice>,
@@ -50,24 +51,64 @@ pub fn preboot_auth() -> ControlValue {
             "--inverse",
             "--paths",
             "--output",
-            "NAME,TYPE,FSTYPE,MOUNTPOINTS",
+            "NAME,TYPE,FSTYPE,UUID,MOUNTPOINTS",
         ],
     )
     .filter(|r| r.success) else {
         return Unlock::Unknown.value();
     };
-    let crypttab = std::fs::read_to_string("/etc/crypttab").ok();
+    let crypttab = match std::fs::read_to_string("/etc/crypttab") {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        result => result,
+    };
+    let cmdline = std::fs::read_to_string("/proc/cmdline");
+    let uuids = device_uuids(&output.text);
+    let config =
+        crypttab
+            .as_deref()
+            .ok()
+            .zip(cmdline.as_deref().ok())
+            .map(|(crypttab, cmdline)| {
+                BootConfig::parse_bound(crypttab, cmdline, |mapping| {
+                    uuids.get(mapping).map(String::as_str)
+                })
+            });
     inspect_tree(&output.text, |device, mapping| {
-        let Some(crypttab) = crypttab.as_deref() else {
+        let Some(config) = &config else {
             return Unlock::Unknown;
         };
-        let boot = parse_crypttab(crypttab, mapping);
+        let boot = config.key(mapping);
         let metadata = run_status("cryptsetup", &["luksDump", "--dump-json-metadata", device])
             .filter(|r| r.success)
             .and_then(|r| metadata_unlock(&r.text));
         boot.unlock(metadata)
     })
     .value()
+}
+
+fn device_uuids(text: &str) -> BTreeMap<String, String> {
+    fn collect(device: &BlockDevice, mapping: Option<&str>, uuids: &mut BTreeMap<String, String>) {
+        let mapping = if device.kind == "crypt" {
+            device.name.rsplit('/').next()
+        } else {
+            mapping
+        };
+        if device.fstype.as_deref() == Some("crypto_LUKS")
+            && let (Some(mapping), Some(uuid)) = (mapping, device.uuid.as_ref())
+        {
+            uuids.insert(mapping.to_owned(), uuid.clone());
+        }
+        for child in &device.children {
+            collect(child, mapping, uuids);
+        }
+    }
+    let mut uuids = BTreeMap::new();
+    if let Ok(tree) = serde_json::from_str::<BlockTree>(text) {
+        for device in &tree.blockdevices {
+            collect(device, None, &mut uuids);
+        }
+    }
+    uuids
 }
 
 fn inspect_tree(text: &str, mut inspect: impl FnMut(&str, &str) -> Unlock) -> Unlock {
@@ -153,47 +194,304 @@ impl BootKey<'_> {
     }
 }
 
-fn parse_crypttab<'a>(text: &'a str, mapping: &str) -> BootKey<'a> {
-    let mut entries = text
-        .lines()
-        .map(|line| {
-            line.split('#')
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HardwareSource {
+    Tpm2,
+    Fido2,
+    Clevis,
+}
+
+#[derive(Debug)]
+struct HardwareKey {
+    source: HardwareSource,
+    pin: bool,
+}
+
+#[derive(Debug)]
+struct UnlockOptions {
+    hardware: Vec<HardwareKey>,
+    try_empty_password: bool,
+}
+
+fn systemd_bool(value: &str) -> Option<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "yes" | "y" | "true" | "t" | "on" => Some(true),
+        "0" | "no" | "n" | "false" | "f" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+impl UnlockOptions {
+    fn parse(text: &str) -> Option<Self> {
+        let (mut tpm2, mut fido2, mut cid, mut clevis) = (false, false, false, false);
+        let (mut tpm2_pin, mut fido2_pin, mut try_empty_password) = (false, false, false);
+        for option in text.split(',') {
+            let (name, value) = option.split_once('=').unwrap_or((option, ""));
+            match name {
+                "tpm2-device" => tpm2 = !value.is_empty(),
+                "fido2-device" => fido2 = !value.is_empty(),
+                "fido2-cid" => cid = !value.is_empty(),
+                "clevis" => clevis = true,
+                "tpm2-pin" => tpm2_pin = systemd_bool(value)?,
+                "fido2-pin" => fido2_pin = systemd_bool(value)?,
+                "try-empty-password" => try_empty_password = systemd_bool(value)?,
+                _ => (),
+            }
+        }
+        let hardware = [
+            (HardwareSource::Tpm2, tpm2, tpm2_pin),
+            (HardwareSource::Fido2, fido2 || cid, cid && fido2_pin),
+            (HardwareSource::Clevis, clevis, false),
+        ]
+        .into_iter()
+        .filter_map(|(source, enabled, pin)| enabled.then_some(HardwareKey { source, pin }))
+        .collect();
+        Some(Self {
+            hardware,
+            try_empty_password,
+        })
+    }
+
+    fn key<'a>(&self, keyfile: &'a str) -> BootKey<'a> {
+        if self.try_empty_password {
+            BootKey::Unknown
+        } else if !self.hardware.is_empty() {
+            if self.hardware.iter().all(|key| match key.source {
+                HardwareSource::Tpm2 | HardwareSource::Fido2 => key.pin,
+                HardwareSource::Clevis => false,
+            }) {
+                BootKey::Secret
+            } else {
+                BootKey::Hardware
+            }
+        } else if keyfile.starts_with('/') && !keyfile.contains('\\') {
+            BootKey::File(keyfile)
+        } else {
+            BootKey::Unknown
+        }
+    }
+}
+
+struct BootEntry<'a> {
+    mapping: String,
+    uuid: Option<&'a str>,
+    keyfile: &'a str,
+    options: &'a str,
+    valid: bool,
+    from_crypttab: bool,
+}
+
+struct BootDevice<'a> {
+    mapping: String,
+    uuid: Option<&'a str>,
+    keyfile: &'a str,
+    options: Option<UnlockOptions>,
+}
+
+struct BootConfig<'a> {
+    devices: Vec<BootDevice<'a>>,
+}
+
+impl<'a> BootConfig<'a> {
+    #[cfg(test)]
+    fn parse(crypttab: &'a str, cmdline: &'a str) -> Self {
+        Self::parse_bound(crypttab, cmdline, |_| None)
+    }
+
+    fn parse_bound(
+        crypttab: &'a str,
+        cmdline: &'a str,
+        uuid: impl Fn(&str) -> Option<&'a str>,
+    ) -> Self {
+        if cmdline.split_whitespace().any(|word| {
+            word.contains("luks")
+                && (word.matches('"').count() % 2 != 0 || word.matches('\'').count() % 2 != 0)
+        }) {
+            return Self {
+                devices: Vec::new(),
+            };
+        }
+        let parameters: Vec<_> = cmdline
+            .split_whitespace()
+            .filter_map(|word| {
+                let word = word.trim_matches(['"', '\'']);
+                let word = word.strip_prefix("rd.").unwrap_or(word);
+                let (name, value) = word.split_once('=')?;
+                let name = if name == "luks" {
+                    ""
+                } else {
+                    name.strip_prefix("luks.")?
+                };
+                Some((name, value.trim_matches(['"', '\''])))
+            })
+            .collect();
+        if parameters
+            .iter()
+            .any(|(name, value)| name.is_empty() && systemd_bool(value) != Some(true))
+        {
+            return Self {
+                devices: Vec::new(),
+            };
+        }
+        let use_crypttab = parameters
+            .iter()
+            .rfind(|(name, _)| *name == "crypttab")
+            .is_none_or(|(_, value)| systemd_bool(value) == Some(true));
+        let mut entries = Vec::new();
+        for line in crypttab.lines().filter(|_| use_crypttab) {
+            let fields: Vec<_> = line
+                .split('#')
                 .next()
                 .unwrap_or("")
                 .split_whitespace()
-                .collect::<Vec<_>>()
-        })
-        .filter(|fields| fields.first() == Some(&mapping));
-    let Some(fields) = entries.next() else {
-        return BootKey::Unknown;
-    };
-    if entries.next().is_some() || fields.len() < 2 || fields.len() > 4 {
-        return BootKey::Unknown;
-    }
-    let key = fields.get(2).copied().unwrap_or("none");
-    let options = fields.get(3).copied().unwrap_or("");
-    if options.split(',').any(|o| o == "try-empty-password=yes") {
-        return BootKey::Unknown;
-    }
-    let pin = options
-        .split(',')
-        .any(|o| matches!(o, "tpm2-pin=yes" | "fido2-pin=yes"));
-    if options
-        .split(',')
-        .any(|o| o.starts_with("tpm2-device=") || o.starts_with("fido2-device=") || o == "clevis")
-    {
-        if pin {
-            BootKey::Secret
-        } else {
-            BootKey::Hardware
+                .collect();
+            if fields.is_empty() {
+                continue;
+            }
+            entries.push(BootEntry {
+                mapping: fields[0].to_owned(),
+                uuid: fields
+                    .get(1)
+                    .and_then(|s| s.strip_prefix("UUID="))
+                    .or_else(|| uuid(fields[0])),
+                keyfile: fields.get(2).copied().unwrap_or("none"),
+                options: fields.get(3).copied().unwrap_or(""),
+                valid: (2..=4).contains(&fields.len()),
+                from_crypttab: true,
+            });
         }
-    } else if matches!(key, "none" | "-") {
-        BootKey::Unknown
-    } else if key.starts_with('/') && !key.contains('\\') {
-        BootKey::File(key)
-    } else {
-        BootKey::Unknown
+        for (name, value) in &parameters {
+            let binding = match *name {
+                "uuid" => Some((*value, None)),
+                "name" => value
+                    .split_once('=')
+                    .map(|(uuid, mapping)| (uuid, Some(mapping))),
+                _ => None,
+            };
+            if let Some((uuid, mapping)) = binding {
+                if let Some(entry) = entries.iter_mut().find(|entry| {
+                    entry
+                        .uuid
+                        .is_some_and(|bound| bound.eq_ignore_ascii_case(uuid))
+                }) {
+                    if let Some(mapping) = mapping {
+                        entry.mapping = mapping.to_owned();
+                    }
+                } else {
+                    entries.push(BootEntry {
+                        mapping: mapping
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| format!("luks-{uuid}")),
+                        uuid: Some(uuid),
+                        keyfile: "none",
+                        options: "",
+                        valid: true,
+                        from_crypttab: false,
+                    });
+                }
+            }
+        }
+        let devices = entries
+            .into_iter()
+            .map(
+                |BootEntry {
+                     mapping,
+                     uuid,
+                     mut keyfile,
+                     mut options,
+                     valid,
+                     from_crypttab,
+                 }| {
+                    for name in ["options", "key"] {
+                        let bound = parameters
+                            .iter()
+                            .filter(|(n, _)| *n == name)
+                            .filter_map(|(_, value)| {
+                                let (binding, value) = value.split_once('=')?;
+                                uuid.filter(|uuid| uuid.eq_ignore_ascii_case(binding))
+                                    .map(|_| value)
+                            })
+                            .next_back();
+                        let default = parameters
+                            .iter()
+                            .filter(|(n, _)| *n == name)
+                            .map(|(_, value)| *value)
+                            .rfind(|value| {
+                                !value
+                                    .split_once('=')
+                                    .is_some_and(|(prefix, _)| is_uuid(prefix))
+                            });
+                        if let Some(value) = bound.or(if name == "key" || !from_crypttab {
+                            default
+                        } else {
+                            None
+                        }) {
+                            if name == "options" {
+                                options = value;
+                            } else {
+                                keyfile = value;
+                            }
+                        }
+                    }
+                    let binding_known = uuid.is_some()
+                        || !parameters.iter().any(|(name, value)| {
+                            matches!(*name, "key" | "options")
+                                && value
+                                    .split_once('=')
+                                    .is_some_and(|(prefix, _)| is_uuid(prefix))
+                        });
+                    BootDevice {
+                        mapping,
+                        uuid,
+                        keyfile,
+                        options: if valid && binding_known {
+                            UnlockOptions::parse(options)
+                        } else {
+                            None
+                        },
+                    }
+                },
+            )
+            .collect();
+        Self { devices }
     }
+
+    fn key(&self, mapping: &str) -> BootKey<'a> {
+        let mut devices = self.devices.iter().filter(|device| {
+            device.mapping == mapping
+                || device.uuid.is_some_and(|uuid| {
+                    mapping
+                        .strip_prefix("luks-")
+                        .is_some_and(|bound| bound.eq_ignore_ascii_case(uuid))
+                })
+        });
+        let Some(device) = devices.next() else {
+            return BootKey::Unknown;
+        };
+        if devices.next().is_some() {
+            return BootKey::Unknown;
+        }
+        device
+            .options
+            .as_ref()
+            .map_or(BootKey::Unknown, |options| options.key(device.keyfile))
+    }
+}
+
+fn is_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(i, byte)| {
+            if matches!(i, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
+#[cfg(test)]
+fn parse_crypttab<'a>(text: &'a str, mapping: &str) -> BootKey<'a> {
+    BootConfig::parse(text, "").key(mapping)
 }
 
 fn keyfile_unlock(path: &str) -> Unlock {
@@ -445,6 +743,88 @@ mod crypttab_tests {
                 parse_crypttab(&line, "root").unlock(None),
                 Unlock::Hardware,
                 "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn path_entries_bind_kernel_options_by_block_device_uuid() {
+        let uuid = "11111111-1111-1111-1111-111111111111";
+        let tree = serde_json::json!({"blockdevices":[{
+            "name":"/dev/mapper/root", "type":"crypt", "fstype":"ext4", "mountpoints":["/"],
+            "children":[{"name":"/dev/fictional", "type":"part", "fstype":"crypto_LUKS", "uuid":uuid, "mountpoints":[null]}]
+        }]}).to_string();
+        let uuids = device_uuids(&tree);
+        assert_eq!(uuids.get("root").map(String::as_str), Some(uuid));
+        let cmdline =
+            format!("rd.luks.options={uuid}=tpm2-device=auto,tpm2-pin=true,try-empty-password=on");
+        let config = BootConfig::parse_bound(
+            "root /dev/fictional - tpm2-device=auto,tpm2-pin=yes",
+            &cmdline,
+            |mapping| uuids.get(mapping).map(String::as_str),
+        );
+        assert_eq!(config.key("root"), BootKey::Unknown);
+    }
+
+    #[test]
+    fn kernel_unlock_options_keep_uuid_and_pin_bindings() {
+        let root_uuid = "11111111-1111-1111-1111-111111111111";
+        let swap_uuid = "22222222-2222-2222-2222-222222222222";
+        let crypttab = format!(
+            "root UUID={root_uuid} - tpm2-device=auto\nswap UUID={swap_uuid} - tpm2-device=auto"
+        );
+        for prefix in ["luks", "rd.luks"] {
+            for value in ["1", "yes", "y", "true", "t", "on", "TRUE"] {
+                let cmdline = format!(
+                    "{prefix}.options={root_uuid}=fido2-cid=ZmljdGlvbmFs,fido2-pin={value} {prefix}.options={swap_uuid}=tpm2-device=auto,fido2-pin={value}"
+                );
+                let config = BootConfig::parse(&crypttab, &cmdline);
+                assert_eq!(config.key("root").unlock(None), Unlock::Secret);
+                assert_eq!(config.key("swap").unlock(None), Unlock::Hardware);
+                let cmdline = format!(
+                    "{prefix}.options={root_uuid}=tpm2-device=auto,tpm2-pin={value},try-empty-password={value}"
+                );
+                assert_eq!(
+                    BootConfig::parse(&crypttab, &cmdline).key("root"),
+                    BootKey::Unknown
+                );
+            }
+            let cmdline = format!(
+                "{prefix}.uuid={root_uuid} {prefix}.options=fido2-cid=ZmljdGlvbmFs,fido2-pin=on"
+            );
+            assert_eq!(
+                BootConfig::parse("", &cmdline).key(&format!("luks-{root_uuid}")),
+                BootKey::Secret
+            );
+            assert_eq!(
+                BootConfig::parse(&crypttab, &cmdline).key("root"),
+                BootKey::Hardware
+            );
+            let cmdline = format!(
+                "{prefix}.name={root_uuid}=root {prefix}.options={swap_uuid}=tpm2-device=auto,tpm2-pin=yes"
+            );
+            assert_eq!(
+                BootConfig::parse("", &cmdline).key("root"),
+                BootKey::Unknown
+            );
+            let cmdline = format!(
+                "{prefix}.name={root_uuid}=root {prefix}.options={root_uuid}=tpm2-device=auto,tpm2-pin=on"
+            );
+            assert_eq!(BootConfig::parse("", &cmdline).key("root"), BootKey::Secret);
+        }
+        let quoted = format!(
+            "rd.luks.options=\"{root_uuid}=tpm2-device=auto,tpm2-pin=on,try-empty-password=TRUE\""
+        );
+        assert_eq!(
+            BootConfig::parse(&crypttab, &quoted).key("root"),
+            BootKey::Unknown
+        );
+        let bad = "root UUID=fictional - tpm2-device=auto,tpm2-pin=invalid";
+        assert_eq!(BootConfig::parse(bad, "").key("root"), BootKey::Unknown);
+        for cmdline in ["luks=off", "rd.luks=FALSE", "rd.luks.crypttab=no"] {
+            assert_eq!(
+                BootConfig::parse(&crypttab, cmdline).key("root"),
+                BootKey::Unknown
             );
         }
     }

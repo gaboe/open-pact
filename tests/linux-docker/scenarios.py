@@ -42,7 +42,7 @@ unknown = {key: "unknown" for key in ["password_set", "antimalware_active_threat
 check("container without systemd manager", {"os_auto_updates": "unknown", "antimalware_realtime": "off", **unknown})
 command("useradd", "-m", "fictional-standard")
 command("useradd", "-m", "fictional-admin")
-command("runuser", "-u", "fictional-standard", "--", "open-pact-checks", "search_continues_after_denied_or_missing_interpreter", "--nocapture")
+command("runuser", "-u", "fictional-standard", "--", "open-pact-checks", "original_name_preserves_platform_lookup_for_all_script_formats", "--nocapture")
 print("PASS unprivileged PATH permission and interpreter fallback", flush=True)
 group = "sudo" if Path("/etc/debian_version").exists() else "wheel"
 command("usermod", "-aG", group, "fictional-admin")
@@ -116,6 +116,22 @@ shim("lsblk", "cat <<'TREE'\n" + json.dumps(root) + "\nTREE")
 for options in ["tpm2-device=auto,tpm2-pin=yes", "fido2-device=auto,fido2-cid=fictional,fido2-pin=yes"]:
     Path("/etc/crypttab").write_text(f"fictional-root UUID=fictional - {options}\n")
     check("manual hardware PIN", {"preboot_auth": "user_secret"})
+for value in ["1", "yes", "y", "true", "t", "on", "TRUE", "Y"]:
+    for options in [f"tpm2-device=auto,tpm2-pin={value}", f"fido2-cid=ZmljdGlvbmFs,fido2-pin={value}"]:
+        Path("/etc/crypttab").write_text(f"fictional-root UUID=fictional - {options}\n")
+        check(f"manual PIN spelling {options}", {"preboot_auth": "user_secret"})
+        Path("/etc/crypttab").write_text(f"fictional-root UUID=fictional - {options},try-empty-password={value}\n")
+        check(f"automatic empty-password spelling {value}", {"preboot_auth": "unknown"})
+for options in ["tpm2-device=auto,fido2-pin=yes", "fido2-cid=ZmljdGlvbmFs,tpm2-pin=yes"]:
+    Path("/etc/crypttab").write_text(f"fictional-root UUID=fictional - {options}\n")
+    check("PIN for another unlock source", {"preboot_auth": "hardware_only"})
+salt = Path("/tmp/fictional-fido2-salt")
+salt.write_bytes(b"fictional-salt-data-for-fido2-test")
+shim("findmnt", "echo /dev/fictional-plain")
+root_json = json.dumps(root)
+shim("lsblk", "case \"$*\" in *--json*) cat <<'TREE'\n" + root_json + "\nTREE\n;; *) echo \"part ext4\";; esac")
+Path("/etc/crypttab").write_text(f"fictional-root UUID=fictional {salt} fido2-cid=ZmljdGlvbmFs,fido2-pin=yes\n")
+check("implied FIDO2 device with salt on plain filesystem", {"preboot_auth": "user_secret"})
 root["blockdevices"].append({"name": "/dev/zram0", "type": "disk", "fstype": "swap", "mountpoints": ["[SWAP]"]})
 shim("lsblk", "cat <<'TREE'\n" + json.dumps(root) + "\nTREE")
 check("RAM-only swap preserves required hardware PIN", {"preboot_auth": "user_secret"})

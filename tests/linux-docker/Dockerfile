@@ -6,7 +6,7 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock PAPER.md ./
 COPY crates crates
 COPY examples examples
-RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/src/target \
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && \
     cargo test --workspace && cargo test -p open-pact-client --no-run 2>/tmp/client-test.log && \
     binary=$(sed -n 's/.*Executable unittests src\/main.rs (\(.*\)).*/\1/p' /tmp/client-test.log) && \

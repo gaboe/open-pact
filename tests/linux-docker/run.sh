@@ -5,6 +5,7 @@ platform=${PLATFORM:-linux/arm64}
 if [[ -z ${PLATFORM:-} && $(uname -m) != arm64 && $(uname -m) != aarch64 ]]; then
     platform=linux/amd64
 fi
+PLATFORM="$platform" python3 tests/linux-docker/cache-regression.py
 for distro in ${DISTROS:-ubuntu fedora}; do
     image="open-pact-linux-v31-$distro"
     docker build --platform "$platform" --target "$distro" -f tests/linux-docker/Dockerfile -t "$image" .
