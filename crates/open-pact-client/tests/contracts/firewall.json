@@ -1,0 +1,145 @@
+{
+  "id": "firewall",
+  "cases": [
+    {
+      "name": "macos-1",
+      "os": "macos",
+      "seam": "macos",
+      "input": [
+        "Firewall is enabled."
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "on",
+      "known_diff": null
+    },
+    {
+      "name": "macos-2",
+      "os": "macos",
+      "seam": "macos",
+      "input": [
+        "Firewall is disabled."
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "off",
+      "known_diff": null
+    },
+    {
+      "name": "macos-3",
+      "os": "macos",
+      "seam": "macos",
+      "input": [
+        ""
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "windows-4",
+      "os": "windows",
+      "seam": "windows",
+      "input": [
+        "True True True"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "on",
+      "known_diff": null
+    },
+    {
+      "name": "windows-5",
+      "os": "windows",
+      "seam": "windows",
+      "input": [
+        "True False True"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "off",
+      "known_diff": null
+    },
+    {
+      "name": "windows-6",
+      "os": "windows",
+      "seam": "windows",
+      "input": [
+        "True True"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "windows-7",
+      "os": "windows",
+      "seam": "windows",
+      "input": [
+        ""
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "linux-8",
+      "os": "linux",
+      "seam": "linux",
+      "input": [
+        "running",
+        "ENABLED=yes",
+        "active"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "on",
+      "known_diff": null
+    },
+    {
+      "name": "linux-9",
+      "os": "linux",
+      "seam": "linux",
+      "input": [
+        "not running",
+        "ENABLED=no",
+        "inactive"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "off",
+      "known_diff": null
+    },
+    {
+      "name": "linux-10",
+      "os": "linux",
+      "seam": "linux",
+      "input": [
+        "",
+        null,
+        null
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "one-manager-unreadable",
+      "os": "linux",
+      "seam": "linux",
+      "input": [
+        "not running",
+        null,
+        null
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": "One inactive manager masks an unknown manager; study: internal/jobs/review-contracts/report.md#firewall-m-and-i"
+    }
+  ]
+}

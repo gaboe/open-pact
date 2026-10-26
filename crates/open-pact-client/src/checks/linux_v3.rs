@@ -480,3 +480,7 @@ mod v31_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/contracts/adapters/linux_v3.rs"]
+pub(super) mod contract_adapter;

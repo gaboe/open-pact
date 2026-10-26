@@ -1,0 +1,85 @@
+{
+  "id": "log_cleared",
+  "cases": [
+    {
+      "name": "provider-not-applicable",
+      "os": "macos",
+      "seam": "registry",
+      "input": [],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "n/a",
+      "known_diff": null
+    },
+    {
+      "name": "windows-policy-only",
+      "os": "linux",
+      "seam": "registry",
+      "input": [],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "n/a",
+      "known_diff": null
+    },
+    {
+      "name": "windows-3",
+      "os": "windows",
+      "seam": "windows",
+      "input": [
+        "2026-10-16T12:00:00Z"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "2026-10-16T12:00:00Z",
+      "known_diff": null
+    },
+    {
+      "name": "windows-4",
+      "os": "windows",
+      "seam": "windows",
+      "input": [
+        "null"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": null,
+      "known_diff": null
+    },
+    {
+      "name": "windows-5",
+      "os": "windows",
+      "seam": "windows",
+      "input": [
+        ""
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "windows-6",
+      "os": "windows",
+      "seam": "windows",
+      "input": [
+        "malformed"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "future-record",
+      "os": "windows",
+      "seam": "windows",
+      "input": [
+        "2099-01-01T00:00:00Z"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": "Parser does not reject future event timestamps; study: internal/jobs/review-contracts/report.md#log_cleared-i-only"
+    }
+  ]
+}

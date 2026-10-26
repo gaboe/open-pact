@@ -1,0 +1,251 @@
+{
+  "id": "preboot_auth",
+  "cases": [
+    {
+      "name": "windows-1",
+      "os": "windows",
+      "seam": "windows",
+      "input": [
+        "0|"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "none",
+      "known_diff": null
+    },
+    {
+      "name": "windows-2",
+      "os": "windows",
+      "seam": "windows",
+      "input": [
+        "1|1,3"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "hardware_only",
+      "known_diff": null
+    },
+    {
+      "name": "windows-3",
+      "os": "windows",
+      "seam": "windows",
+      "input": [
+        "1|4,3"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "user_secret",
+      "known_diff": null
+    },
+    {
+      "name": "windows-4",
+      "os": "windows",
+      "seam": "windows",
+      "input": [
+        "1|3"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "windows-5",
+      "os": "windows",
+      "seam": "windows",
+      "input": [
+        "1|1,4"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "hardware_only",
+      "known_diff": null
+    },
+    {
+      "name": "windows-6",
+      "os": "windows",
+      "seam": "windows",
+      "input": [
+        "1|999"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "windows-7",
+      "os": "windows",
+      "seam": "windows",
+      "input": [
+        ""
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "linux-8",
+      "os": "linux",
+      "seam": "linux_v3",
+      "input": [
+        "cryptroot crypt 0 0 ext4 /\n sda2 part 0 0 crypto_LUKS\n sda disk 0 0\n"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "linux-9",
+      "os": "linux",
+      "seam": "linux_v3",
+      "input": [
+        ""
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "plain-root-no-luks",
+      "os": "linux",
+      "seam": "linux_v3",
+      "input": [
+        "{\"blockdevices\": [{\"name\": \"/dev/fictional0\", \"type\": \"part\", \"fstype\": \"ext4\", \"mountpoints\": [\"/\"]}]}",
+        "",
+        ""
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "none",
+      "known_diff": "pending integration"
+    },
+    {
+      "name": "kernel-luks-word-is-not-unlock-evidence",
+      "os": "linux",
+      "seam": "linux_v3",
+      "input": [
+        "{\"blockdevices\": [{\"name\": \"/dev/fictional0\", \"type\": \"part\", \"fstype\": \"ext4\", \"mountpoints\": [\"/\"]}]}",
+        "rd.luks.uuid=fictional",
+        ""
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": "pending integration"
+    },
+    {
+      "name": "macos-12",
+      "os": "macos",
+      "seam": "macos_v3",
+      "input": [
+        "FileVault is On."
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "user_secret",
+      "known_diff": null
+    },
+    {
+      "name": "macos-13",
+      "os": "macos",
+      "seam": "macos_v3",
+      "input": [
+        ""
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "filevault-off-Apple-silicon",
+      "os": "macos",
+      "seam": "macos_v3",
+      "input": [
+        "FileVault is Off.",
+        "Apple silicon"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "hardware_only",
+      "known_diff": "FileVault-off response does not distinguish hardware key protection; study: internal/jobs/review-contracts/report.md#preboot_auth-m-and-i"
+    },
+    {
+      "name": "filevault-off-Intel-without-T2",
+      "os": "macos",
+      "seam": "macos_v3",
+      "input": [
+        "FileVault is Off.",
+        "Intel without T2"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "none",
+      "known_diff": "FileVault-off response does not distinguish hardware key protection; study: internal/jobs/review-contracts/report.md#preboot_auth-m-and-i"
+    },
+    {
+      "os": "linux",
+      "seam": "linux_v3",
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "known_diff": "pending integration",
+      "name": "crypttab-password",
+      "input": [
+        "{\"blockdevices\": [{\"name\": \"/dev/mapper/fictional-root\", \"type\": \"crypt\", \"fstype\": \"ext4\", \"mountpoints\": [\"/\"], \"children\": [{\"name\": \"/dev/fictional1\", \"type\": \"part\", \"fstype\": \"crypto_LUKS\", \"mountpoints\": [null]}]}]}",
+        "",
+        "fictional-root /dev/fictional1 none luks",
+        "{\"keyslots\": {\"0\": {}}, \"tokens\": {}}"
+      ],
+      "expected": "user_secret"
+    },
+    {
+      "os": "linux",
+      "seam": "linux_v3",
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "known_diff": "pending integration",
+      "name": "crypttab-tpm",
+      "input": [
+        "{\"blockdevices\": [{\"name\": \"/dev/mapper/fictional-root\", \"type\": \"crypt\", \"fstype\": \"ext4\", \"mountpoints\": [\"/\"], \"children\": [{\"name\": \"/dev/fictional1\", \"type\": \"part\", \"fstype\": \"crypto_LUKS\", \"mountpoints\": [null]}]}]}",
+        "",
+        "fictional-root /dev/fictional1 none tpm2-device=auto",
+        "{\"keyslots\": {\"0\": {}}, \"tokens\": {\"0\": {\"type\": \"systemd-tpm2\", \"keyslots\": [\"0\"], \"tpm2-pin\": false}}}"
+      ],
+      "expected": "hardware_only"
+    },
+    {
+      "os": "linux",
+      "seam": "linux_v3",
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "known_diff": "pending integration",
+      "name": "crypttab-tpm-pin",
+      "input": [
+        "{\"blockdevices\": [{\"name\": \"/dev/mapper/fictional-root\", \"type\": \"crypt\", \"fstype\": \"ext4\", \"mountpoints\": [\"/\"], \"children\": [{\"name\": \"/dev/fictional1\", \"type\": \"part\", \"fstype\": \"crypto_LUKS\", \"mountpoints\": [null]}]}]}",
+        "",
+        "fictional-root /dev/fictional1 none tpm2-device=auto,tpm2-pin=yes",
+        "{\"keyslots\": {\"0\": {}}, \"tokens\": {\"0\": {\"type\": \"systemd-tpm2\", \"keyslots\": [\"0\"], \"tpm2-pin\": true}}}"
+      ],
+      "expected": "user_secret"
+    },
+    {
+      "os": "linux",
+      "seam": "linux_v3",
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "known_diff": "pending integration",
+      "name": "luks-without-unlock-evidence",
+      "input": [
+        "{\"blockdevices\": [{\"name\": \"/dev/mapper/fictional-root\", \"type\": \"crypt\", \"fstype\": \"ext4\", \"mountpoints\": [\"/\"], \"children\": [{\"name\": \"/dev/fictional1\", \"type\": \"part\", \"fstype\": \"crypto_LUKS\", \"mountpoints\": [null]}]}]}",
+        "",
+        "",
+        "{}"
+      ],
+      "expected": "unknown"
+    }
+  ]
+}

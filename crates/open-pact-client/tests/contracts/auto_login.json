@@ -1,0 +1,123 @@
+{
+  "id": "auto_login",
+  "cases": [
+    {
+      "name": "macos-1",
+      "os": "macos",
+      "seam": "macos",
+      "input": [
+        "fictional-user"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "on",
+      "known_diff": null
+    },
+    {
+      "name": "macos-2",
+      "os": "macos",
+      "seam": "macos",
+      "input": [
+        "The domain/default pair does not exist"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "off",
+      "known_diff": null
+    },
+    {
+      "name": "macos-3",
+      "os": "macos",
+      "seam": "macos",
+      "input": [
+        ""
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "windows-4",
+      "os": "windows",
+      "seam": "windows",
+      "input": [
+        "1"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "on",
+      "known_diff": null
+    },
+    {
+      "name": "windows-5",
+      "os": "windows",
+      "seam": "windows",
+      "input": [
+        "0"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "off",
+      "known_diff": null
+    },
+    {
+      "name": "windows-6",
+      "os": "windows",
+      "seam": "windows",
+      "input": [
+        "!"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "linux-7",
+      "os": "linux",
+      "seam": "linux",
+      "input": [],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "linux-8",
+      "os": "linux",
+      "seam": "linux",
+      "input": [
+        "[daemon]\nAutomaticLoginEnable=true\nAutomaticLogin=fictional-user"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "on",
+      "known_diff": "Collector does not bind readable files to active display manager or complete overrides; study: internal/jobs/review-contracts/report.md#auto_login-m-and-i"
+    },
+    {
+      "name": "linux-9",
+      "os": "linux",
+      "seam": "linux",
+      "input": [
+        "[daemon]\nAutomaticLoginEnable=false"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "off",
+      "known_diff": "Collector does not bind readable files to active display manager or complete overrides; study: internal/jobs/review-contracts/report.md#auto_login-m-and-i"
+    },
+    {
+      "name": "enabled-without-account",
+      "os": "linux",
+      "seam": "linux",
+      "input": [
+        "[daemon]\nAutomaticLoginEnable=true"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": "Enabled flag alone establishes on without a target account; study: internal/jobs/review-contracts/report.md#auto_login-m-and-i"
+    }
+  ]
+}

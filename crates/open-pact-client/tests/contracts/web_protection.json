@@ -1,0 +1,151 @@
+{
+  "id": "web_protection",
+  "cases": [
+    {
+      "name": "no-approved-reader",
+      "os": "linux",
+      "seam": "registry",
+      "input": [],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "windows-2",
+      "os": "windows",
+      "seam": "windows",
+      "input": [
+        "1|",
+        "[{\"kind\": \"chrome\", \"policy\": {}, \"recommended\": {}, \"prefs\": {}}]"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "on",
+      "known_diff": null
+    },
+    {
+      "name": "windows-3",
+      "os": "windows",
+      "seam": "windows",
+      "input": [
+        "0|",
+        "[{\"kind\": \"chrome\", \"policy\": {}, \"recommended\": {}, \"prefs\": {}}]"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "off",
+      "known_diff": null
+    },
+    {
+      "name": "windows-4",
+      "os": "windows",
+      "seam": "windows",
+      "input": [
+        "1|",
+        "[{\"kind\": \"chrome\", \"policy\": {\"SafeBrowsingProtectionLevel\": 0}, \"recommended\": {}, \"prefs\": {}}]"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "off",
+      "known_diff": null
+    },
+    {
+      "name": "windows-5",
+      "os": "windows",
+      "seam": "windows",
+      "input": [
+        "",
+        ""
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "macos-6",
+      "os": "macos",
+      "seam": "browsers",
+      "input": [
+        "{\"kind\": \"chrome\", \"policy\": {}, \"recommended\": {}, \"prefs\": {}}"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "on",
+      "known_diff": null
+    },
+    {
+      "name": "macos-7",
+      "os": "macos",
+      "seam": "browsers",
+      "input": [
+        "{\"kind\": \"chrome\", \"policy\": {\"SafeBrowsingProtectionLevel\": 0}, \"recommended\": {}, \"prefs\": {}}"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "off",
+      "known_diff": null
+    },
+    {
+      "name": "macos-8",
+      "os": "macos",
+      "seam": "browsers",
+      "input": [
+        null
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "macos-9",
+      "os": "macos",
+      "seam": "browsers",
+      "input": [],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "n/a",
+      "known_diff": null
+    },
+    {
+      "name": "non-directory-lock-symlink",
+      "os": "macos",
+      "seam": "browsers",
+      "input": [
+        "{\"kind\": \"chrome\", \"policy\": {\"SafeBrowsingProtectionLevel\": 0}, \"recommended\": {}, \"prefs\": {}}",
+        "SingletonCookie -> fictional-cookie"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "off",
+      "known_diff": "pending integration"
+    },
+    {
+      "name": "missing-Preferences",
+      "os": "macos",
+      "seam": "browsers",
+      "input": [
+        null,
+        "Default/Preferences missing"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": "pending integration"
+    },
+    {
+      "name": "edge-Smartscreen",
+      "os": "macos",
+      "seam": "browsers",
+      "input": [
+        "{\"kind\": \"edge\", \"policy\": {\"SmartScreenEnabled\": false}, \"recommended\": {}, \"prefs\": {}}"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "off",
+      "known_diff": "pending integration"
+    }
+  ]
+}

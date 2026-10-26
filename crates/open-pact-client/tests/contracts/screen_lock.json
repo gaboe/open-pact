@@ -1,0 +1,341 @@
+{
+  "id": "screen_lock",
+  "cases": [
+    {
+      "name": "seconds-299",
+      "os": "windows",
+      "seam": "windows",
+      "input": [
+        "299",
+        ""
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "le_5min",
+      "known_diff": null
+    },
+    {
+      "name": "seconds-300",
+      "os": "windows",
+      "seam": "windows",
+      "input": [
+        "300",
+        ""
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "le_5min",
+      "known_diff": null
+    },
+    {
+      "name": "seconds-301",
+      "os": "windows",
+      "seam": "windows",
+      "input": [
+        "301",
+        ""
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "le_15min",
+      "known_diff": null
+    },
+    {
+      "name": "seconds-899",
+      "os": "windows",
+      "seam": "windows",
+      "input": [
+        "899",
+        ""
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "le_15min",
+      "known_diff": null
+    },
+    {
+      "name": "seconds-900",
+      "os": "windows",
+      "seam": "windows",
+      "input": [
+        "900",
+        ""
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "le_15min",
+      "known_diff": null
+    },
+    {
+      "name": "seconds-901",
+      "os": "windows",
+      "seam": "windows",
+      "input": [
+        "901",
+        ""
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "gt_15min",
+      "known_diff": null
+    },
+    {
+      "name": "seconds-299",
+      "os": "linux",
+      "seam": "linux",
+      "input": [
+        "true",
+        "uint32 299",
+        "uint32 0"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "le_5min",
+      "known_diff": null
+    },
+    {
+      "name": "seconds-300",
+      "os": "linux",
+      "seam": "linux",
+      "input": [
+        "true",
+        "uint32 300",
+        "uint32 0"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "le_5min",
+      "known_diff": null
+    },
+    {
+      "name": "seconds-301",
+      "os": "linux",
+      "seam": "linux",
+      "input": [
+        "true",
+        "uint32 301",
+        "uint32 0"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "le_15min",
+      "known_diff": null
+    },
+    {
+      "name": "seconds-899",
+      "os": "linux",
+      "seam": "linux",
+      "input": [
+        "true",
+        "uint32 899",
+        "uint32 0"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "le_15min",
+      "known_diff": null
+    },
+    {
+      "name": "seconds-900",
+      "os": "linux",
+      "seam": "linux",
+      "input": [
+        "true",
+        "uint32 900",
+        "uint32 0"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "le_15min",
+      "known_diff": null
+    },
+    {
+      "name": "seconds-901",
+      "os": "linux",
+      "seam": "linux",
+      "input": [
+        "true",
+        "uint32 901",
+        "uint32 0"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "gt_15min",
+      "known_diff": null
+    },
+    {
+      "name": "windows-13",
+      "os": "windows",
+      "seam": "windows",
+      "input": [
+        "0|1|300|valid"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "none",
+      "known_diff": null
+    },
+    {
+      "name": "windows-14",
+      "os": "windows",
+      "seam": "windows",
+      "input": [
+        "1|1|300|missing"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "none",
+      "known_diff": null
+    },
+    {
+      "name": "windows-15",
+      "os": "windows",
+      "seam": "windows",
+      "input": [
+        ""
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "windows-16",
+      "os": "windows",
+      "seam": "windows",
+      "input": [
+        "1|1|300|valid;1|1|901|valid"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "gt_15min",
+      "known_diff": null
+    },
+    {
+      "name": "linux-17",
+      "os": "linux",
+      "seam": "linux",
+      "input": [
+        "false",
+        "uint32 300",
+        "uint32 0"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "none",
+      "known_diff": null
+    },
+    {
+      "name": "linux-18",
+      "os": "linux",
+      "seam": "linux",
+      "input": [
+        "true",
+        "uint32 0",
+        "uint32 0"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "none",
+      "known_diff": null
+    },
+    {
+      "name": "linux-19",
+      "os": "linux",
+      "seam": "linux",
+      "input": [
+        "",
+        "",
+        ""
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "kde-password-disabled",
+      "os": "linux",
+      "seam": "linux",
+      "input": [
+        "[Daemon]\nAutolock=true\nLock=false\nRequirePassword=false\nTimeout=5\nLockGrace=10"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "none",
+      "known_diff": "KDE Lock RequirePassword and LockGrace are ignored; study: internal/jobs/review-contracts/report.md#screen_lock-m-and-i"
+    },
+    {
+      "name": "macos-21",
+      "os": "macos",
+      "seam": "macos",
+      "input": [
+        "screenLock is off"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "none",
+      "known_diff": null
+    },
+    {
+      "name": "macos-22",
+      "os": "macos",
+      "seam": "macos",
+      "input": [
+        ""
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "total-delay-300",
+      "os": "macos",
+      "seam": "macos",
+      "input": [
+        "idle trigger = 0\ndelay is 300 seconds"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "le_5min",
+      "known_diff": "Collector does not establish idle trigger plus password grace; study: internal/jobs/review-contracts/report.md#screen_lock-m-and-i"
+    },
+    {
+      "name": "total-delay-301",
+      "os": "macos",
+      "seam": "macos",
+      "input": [
+        "idle trigger = 0\ndelay is 301 seconds"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "le_15min",
+      "known_diff": "Collector does not establish idle trigger plus password grace; study: internal/jobs/review-contracts/report.md#screen_lock-m-and-i"
+    },
+    {
+      "name": "total-delay-901",
+      "os": "macos",
+      "seam": "macos",
+      "input": [
+        "idle trigger = 0\ndelay is 901 seconds"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "gt_15min",
+      "known_diff": "Collector does not establish idle trigger plus password grace; study: internal/jobs/review-contracts/report.md#screen_lock-m-and-i"
+    },
+    {
+      "name": "grace-without-idle-trigger",
+      "os": "macos",
+      "seam": "macos",
+      "input": [
+        "delay is 300 seconds"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": "Password grace alone is not total inactivity delay; study: internal/jobs/review-contracts/report.md#screen_lock-m-and-i"
+    }
+  ]
+}

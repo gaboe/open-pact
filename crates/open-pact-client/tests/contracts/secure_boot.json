@@ -1,0 +1,111 @@
+{
+  "id": "secure_boot",
+  "cases": [
+    {
+      "name": "no-approved-firmware-reader",
+      "os": "macos",
+      "seam": "registry",
+      "input": [],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "linux-2",
+      "os": "linux",
+      "seam": "linux",
+      "input": [
+        "SecureBoot enabled"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "on",
+      "known_diff": null
+    },
+    {
+      "name": "linux-3",
+      "os": "linux",
+      "seam": "linux",
+      "input": [
+        "SecureBoot disabled"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "off",
+      "known_diff": null
+    },
+    {
+      "name": "linux-4",
+      "os": "linux",
+      "seam": "linux",
+      "input": [
+        "EFI variables are not supported"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "linux-5",
+      "os": "linux",
+      "seam": "linux",
+      "input": [
+        ""
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "windows-6",
+      "os": "windows",
+      "seam": "windows",
+      "input": [
+        "1"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "on",
+      "known_diff": null
+    },
+    {
+      "name": "windows-7",
+      "os": "windows",
+      "seam": "windows",
+      "input": [
+        "0"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "off",
+      "known_diff": null
+    },
+    {
+      "name": "windows-8",
+      "os": "windows",
+      "seam": "windows",
+      "input": [
+        "!"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "windows-9",
+      "os": "windows",
+      "seam": "windows",
+      "input": [
+        "2"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    }
+  ]
+}

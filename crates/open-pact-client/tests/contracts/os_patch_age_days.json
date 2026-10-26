@@ -1,0 +1,166 @@
+{
+  "id": "os_patch_age_days",
+  "cases": [
+    {
+      "name": "ten-complete-days",
+      "os": "macos",
+      "seam": "macos",
+      "input": [
+        "\"date\" => 2026-10-16 12:00:00 +0000\n\"displayName\" => \"macOS 26.0.1\""
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": 10,
+      "known_diff": null
+    },
+    {
+      "name": "missing-receipt",
+      "os": "macos",
+      "seam": "macos",
+      "input": [
+        ""
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "same-day",
+      "os": "macos",
+      "seam": "macos",
+      "input": [
+        "\"date\" => 2026-10-26 11:59:00 +0000\n\"displayName\" => \"macOS 26.0.1\""
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": 0,
+      "known_diff": null
+    },
+    {
+      "name": "midnight-is-not-full-day",
+      "os": "macos",
+      "seam": "macos",
+      "input": [
+        "\"date\" => 2026-10-25 23:59:00 +0000\n\"displayName\" => \"macOS 26.0.1\""
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": 0,
+      "known_diff": "Calendar-day counting discards installation time; study: internal/jobs/review-contracts/report.md#os_patch_age_days-m-and-i"
+    },
+    {
+      "name": "ten-complete-days",
+      "os": "windows",
+      "seam": "windows",
+      "input": [
+        "2026-10-16"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": 10,
+      "known_diff": null
+    },
+    {
+      "name": "missing-receipt",
+      "os": "windows",
+      "seam": "windows",
+      "input": [
+        ""
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "same-day",
+      "os": "windows",
+      "seam": "windows",
+      "input": [
+        "2026-10-26"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": 0,
+      "known_diff": null
+    },
+    {
+      "name": "midnight-is-not-full-day",
+      "os": "windows",
+      "seam": "windows",
+      "input": [
+        "2026-10-25",
+        "InstallTime=2026-10-25T23:59:00Z"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": 0,
+      "known_diff": "Calendar-day counting discards installation time; study: internal/jobs/review-contracts/report.md#os_patch_age_days-m-and-i"
+    },
+    {
+      "name": "linux-9",
+      "os": "linux",
+      "seam": "linux",
+      "input": [
+        "1 | upgrade | 2026-10-16 12:00 | I, U | 12",
+        ""
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": 10,
+      "known_diff": null
+    },
+    {
+      "name": "linux-10",
+      "os": "linux",
+      "seam": "linux",
+      "input": [
+        null,
+        null
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "linux-11",
+      "os": "linux",
+      "seam": "linux",
+      "input": [
+        "1 | upgrade | 2026-10-16 12:00 | I, U | 12",
+        "FEDORA-2026-fictional Important/Sec. fictional-1.x86_64"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "linux-midnight-is-not-full-day",
+      "os": "linux",
+      "seam": "linux",
+      "input": [
+        "1 | upgrade | 2026-10-25 23:59 | I, U | 12",
+        ""
+      ],
+      "code": 0,
+      "now": "2026-10-26T00:01:00Z",
+      "expected": 0,
+      "known_diff": "Calendar-day counting discards transaction time; study: internal/jobs/review-contracts/report.md#os_patch_age_days-m-and-i"
+    },
+    {
+      "name": "macos-unrelated-product-receipt",
+      "os": "macos",
+      "seam": "macos",
+      "input": [
+        "\"date\" => 2026-10-16 12:00:00 +0000\n\"displayName\" => \"macOS FictionalTool 1.0\""
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": "Display-name heuristic does not bind a receipt to the running OS; study: internal/jobs/review-contracts/report.md#os_patch_age_days-m-and-i"
+    }
+  ]
+}

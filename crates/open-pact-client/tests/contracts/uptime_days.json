@@ -1,0 +1,209 @@
+{
+  "id": "uptime_days",
+  "cases": [
+    {
+      "name": "linux-1",
+      "os": "linux",
+      "seam": "linux_v3",
+      "input": [
+        "172800.5 10"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": 2,
+      "known_diff": null
+    },
+    {
+      "name": "linux-2",
+      "os": "linux",
+      "seam": "linux_v3",
+      "input": [
+        "0.5 0"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": 0,
+      "known_diff": null
+    },
+    {
+      "name": "linux-3",
+      "os": "linux",
+      "seam": "linux_v3",
+      "input": [
+        "-1"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "linux-4",
+      "os": "linux",
+      "seam": "linux_v3",
+      "input": [
+        "NaN"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "linux-5",
+      "os": "linux",
+      "seam": "linux_v3",
+      "input": [
+        "inf"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "linux-6",
+      "os": "linux",
+      "seam": "linux_v3",
+      "input": [
+        ""
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "macos-7",
+      "os": "macos",
+      "seam": "macos_v3",
+      "input": [
+        "{ sec = 1792843200, usec = 0 }"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": 2,
+      "known_diff": null
+    },
+    {
+      "name": "macos-8",
+      "os": "macos",
+      "seam": "macos_v3",
+      "input": [
+        "{ sec = 1793016000, usec = 0 }"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": 0,
+      "known_diff": null
+    },
+    {
+      "name": "macos-9",
+      "os": "macos",
+      "seam": "macos_v3",
+      "input": [
+        "{ sec = 9999999999, usec = 0 }"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "macos-10",
+      "os": "macos",
+      "seam": "macos_v3",
+      "input": [
+        ""
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "windows-11",
+      "os": "windows",
+      "seam": "windows",
+      "input": [
+        "0"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": 0,
+      "known_diff": null
+    },
+    {
+      "name": "windows-12",
+      "os": "windows",
+      "seam": "windows",
+      "input": [
+        "10"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": 10,
+      "known_diff": null
+    },
+    {
+      "name": "windows-13",
+      "os": "windows",
+      "seam": "windows",
+      "input": [
+        "2147483647"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": 2147483647,
+      "known_diff": null
+    },
+    {
+      "name": "windows-14",
+      "os": "windows",
+      "seam": "windows",
+      "input": [
+        "2147483648"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "windows-15",
+      "os": "windows",
+      "seam": "windows",
+      "input": [
+        "-1"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "windows-16",
+      "os": "windows",
+      "seam": "windows",
+      "input": [
+        ""
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "windows-17",
+      "os": "windows",
+      "seam": "windows",
+      "input": [
+        "null"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    }
+  ]
+}

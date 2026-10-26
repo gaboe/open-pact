@@ -303,6 +303,10 @@ fn value(name: &str) -> Option<&'static str> {
 }
 
 fn batch() -> &'static Batch {
+    #[cfg(test)]
+    if let Some(batch) = contract_adapter::batch() {
+        return batch;
+    }
     VALUES.get_or_init(|| {
         let start = std::time::Instant::now();
         let output = capture(
@@ -1292,3 +1296,7 @@ mod v31_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/contracts/adapters/windows.rs"]
+pub(super) mod contract_adapter;
