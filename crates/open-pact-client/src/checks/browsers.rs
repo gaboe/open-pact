@@ -50,18 +50,27 @@ fn flag(value: Option<&Value>) -> Protection {
     }
 }
 
-fn chromium(prefs: &Value, policy: &Value, recommended: &Value, edge: bool) -> Protection {
+fn chromium_policy(policy: &Value, edge: bool) -> Option<Protection> {
+    if !edge && let Some(level) = policy.get("SafeBrowsingProtectionLevel") {
+        return Some(protection_level(level));
+    }
     let key = if edge {
         "SmartScreenEnabled"
     } else {
         "SafeBrowsingEnabled"
     };
-    if !edge && let Some(level) = policy.get("SafeBrowsingProtectionLevel") {
-        return protection_level(level);
+    policy.get(key).map(|value| flag(Some(value)))
+}
+
+fn chromium(prefs: &Value, policy: &Value, recommended: &Value, edge: bool) -> Protection {
+    if let Some(state) = chromium_policy(policy, edge) {
+        return state;
     }
-    if let Some(value) = policy.get(key) {
-        return flag(Some(value));
-    }
+    let key = if edge {
+        "SmartScreenEnabled"
+    } else {
+        "SafeBrowsingEnabled"
+    };
     let pointer = if edge {
         "/edge/smartscreen/enabled"
     } else {
@@ -84,18 +93,39 @@ fn chromium_with_recommendation(
     recommended: Option<&Value>,
     edge: bool,
 ) -> Protection {
-    let (key, pointer) = if edge {
-        ("SmartScreenEnabled", "/edge/smartscreen/enabled")
+    let empty = Value::Object(Map::new());
+    chromium(prefs, policy, recommended.unwrap_or(&empty), edge)
+}
+
+fn merge_chromium_profiles(states: &[Protection]) -> Protection {
+    if states.contains(&Protection::Off) {
+        Protection::Off
+    } else if states.contains(&Protection::On) {
+        Protection::On
     } else {
-        ("SafeBrowsingEnabled", "/safebrowsing/enabled")
-    };
-    if policy.get(key).is_some()
-        || (!edge && policy.get("SafeBrowsingProtectionLevel").is_some())
-        || prefs.pointer(pointer).is_some()
-    {
-        return chromium(prefs, policy, &Value::Object(Map::new()), edge);
+        Protection::Unknown
     }
-    recommended.map_or(Protection::Unknown, |v| chromium(prefs, policy, v, edge))
+}
+
+fn chromium_without_profiles(
+    policy: &Value,
+    recommended: Option<&Value>,
+    edge: bool,
+) -> Protection {
+    let Some(recommended) = recommended else {
+        return Protection::Unknown;
+    };
+    let has_setting = if edge {
+        recommended.get("SmartScreenEnabled").is_some()
+    } else {
+        recommended.get("SafeBrowsingEnabled").is_some()
+            || recommended.get("SafeBrowsingProtectionLevel").is_some()
+    };
+    if has_setting {
+        chromium(&Value::Object(Map::new()), policy, recommended, edge)
+    } else {
+        Protection::Unknown
+    }
 }
 
 fn protection_level(value: &Value) -> Protection {
@@ -126,7 +156,12 @@ fn profiles(root: &Path, firefox: bool) -> Result<Vec<PathBuf>, ()> {
                 return Err(());
             }
             let path = entry.path();
-            if path.join("Preferences").try_exists().map_err(|_| ())? {
+            let has_preferences = match path.join("Preferences").try_exists() {
+                Ok(has_preferences) => has_preferences,
+                Err(error) if error.kind() == ErrorKind::NotADirectory => false,
+                Err(_) => return Err(()),
+            };
+            if has_preferences {
                 let target = path.canonicalize().map_err(|_| ())?;
                 if !target.starts_with(&canonical_root) || !target.is_dir() {
                     return Err(());
@@ -197,15 +232,7 @@ fn chromium_browser(home: &Path, data: &str, domain: &str, edge: bool) -> Protec
     };
     let empty = Value::Object(Map::new());
     let mandatory = chromium_with_recommendation(&empty, &policy, None, edge);
-    if policy
-        .get(if edge {
-            "SmartScreenEnabled"
-        } else {
-            "SafeBrowsingEnabled"
-        })
-        .is_some()
-        || (!edge && policy.get("SafeBrowsingProtectionLevel").is_some())
-    {
+    if chromium_policy(&policy, edge).is_some() {
         return mandatory;
     }
     let recommended = recommended(domain, home);
@@ -213,7 +240,7 @@ fn chromium_browser(home: &Path, data: &str, domain: &str, edge: bool) -> Protec
         return Protection::Unknown;
     };
     if dirs.is_empty() {
-        return chromium_with_recommendation(&empty, &policy, recommended.as_ref().ok(), edge);
+        return chromium_without_profiles(&policy, recommended.as_ref().ok(), edge);
     }
     let states: Vec<_> = dirs
         .iter()
@@ -223,7 +250,7 @@ fn chromium_browser(home: &Path, data: &str, domain: &str, edge: bool) -> Protec
             })
         })
         .collect();
-    merge(&states)
+    merge_chromium_profiles(&states)
 }
 
 const FIREFOX_KEYS: &[&str] = &[
@@ -449,12 +476,9 @@ fn windows_browser(browser: &Value) -> Protection {
                 }
                 firefox_state(&missing, policy)
             }
-            Some(kind @ ("chrome" | "brave" | "edge")) => chromium_with_recommendation(
-                &Value::Object(Map::new()),
-                policy,
-                None,
-                kind == "edge",
-            ),
+            Some(kind @ ("chrome" | "brave" | "edge")) => {
+                chromium_policy(policy, kind == "edge").unwrap_or(Protection::Unknown)
+            }
             _ => Protection::Unknown,
         };
     }
@@ -611,7 +635,98 @@ mod tests {
         let explicit_off = json!({"kind":"chrome","policy":{},"recommended":null,"prefs":{"safebrowsing":{"enabled":false}}});
         assert_eq!(windows_browser(&explicit_off), Protection::Off);
         let absent = json!({"kind":"brave","policy":{},"recommended":null,"prefs":{}});
-        assert_eq!(windows_browser(&absent), Protection::Unknown);
+        assert_eq!(windows_browser(&absent), Protection::On);
+        let edge_default = json!({"kind":"edge","policy":{},"recommended":null,"prefs":{}});
+        assert_eq!(windows_browser(&edge_default), Protection::On);
+        let unreadable = json!({"kind":"chrome","policy":{},"unreadable":true});
+        assert_eq!(windows_browser(&unreadable), Protection::Unknown);
+        let malformed = json!({"kind":"chrome","policy":{},"prefs":"invalid JSON"});
+        assert_eq!(windows_browser(&malformed), Protection::Unknown);
+    }
+
+    #[test]
+    fn chromium_profiles_use_defaults_and_ignore_unreadable_profiles_when_possible() {
+        let home = tempfile::tempdir().unwrap();
+        let domain = "org.openpact.fictional-profile-default";
+        let recommended = home
+            .path()
+            .join("Library/Preferences")
+            .join(format!("{domain}.plist"));
+        fs::create_dir_all(recommended.parent().unwrap()).unwrap();
+        fs::write(&recommended, "malformed plist").unwrap();
+        let root = home
+            .path()
+            .join("Library/Application Support/FictionalBrowser");
+        let default = root.join("Default");
+        fs::create_dir_all(&default).unwrap();
+        fs::write(default.join("Preferences"), "{}").unwrap();
+        assert_eq!(
+            chromium_browser(home.path(), "FictionalBrowser", domain, false),
+            Protection::On
+        );
+
+        let second = root.join("Profile 1");
+        fs::create_dir_all(&second).unwrap();
+        fs::write(second.join("Preferences"), "invalid JSON").unwrap();
+        assert_eq!(
+            chromium_browser(home.path(), "FictionalBrowser", domain, false),
+            Protection::On
+        );
+
+        fs::write(
+            second.join("Preferences"),
+            r#"{"safebrowsing":{"enabled":false}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            chromium_browser(home.path(), "FictionalBrowser", domain, false),
+            Protection::Off
+        );
+
+        fs::write(default.join("Preferences"), "invalid JSON").unwrap();
+        fs::write(second.join("Preferences"), "invalid JSON").unwrap();
+        assert_eq!(
+            chromium_browser(home.path(), "FictionalBrowser", domain, false),
+            Protection::Unknown
+        );
+    }
+
+    #[test]
+    fn chromium_recommendation_is_used_only_when_no_profiles_exist() {
+        let empty = json!({});
+        assert_eq!(
+            chromium_without_profiles(&empty, None, false),
+            Protection::Unknown
+        );
+        assert_eq!(
+            chromium_without_profiles(&empty, Some(&json!({})), false),
+            Protection::Unknown
+        );
+        assert_eq!(
+            chromium_without_profiles(&empty, Some(&json!({"SafeBrowsingEnabled":false})), false),
+            Protection::Off
+        );
+        assert_eq!(
+            chromium_without_profiles(&empty, Some(&json!({"SafeBrowsingEnabled":true})), false),
+            Protection::On
+        );
+        assert_eq!(
+            chromium_without_profiles(&empty, Some(&json!({"SmartScreenEnabled":false})), true),
+            Protection::Off
+        );
+        assert_eq!(
+            chromium_with_recommendation(&empty, &empty, None, false),
+            Protection::On
+        );
+        assert_eq!(
+            chromium_with_recommendation(
+                &json!({"safebrowsing":{"enabled":true}}),
+                &json!({"SafeBrowsingEnabled":false}),
+                None,
+                false,
+            ),
+            Protection::Off
+        );
     }
 
     #[test]
@@ -839,6 +954,7 @@ mod tests {
     #[cfg(unix)]
     fn chrome_lock_symlinks_are_not_profiles() {
         let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("fictional-cookie"), "fixture").unwrap();
         std::os::unix::fs::symlink("fictional-cookie", root.path().join("SingletonCookie"))
             .unwrap();
         let profile = root.path().join("Default");
