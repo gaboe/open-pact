@@ -1100,6 +1100,7 @@ struct Observed {
     matches: bool,
     system: bool,
     leftovers: bool,
+    protected_leftovers: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1128,7 +1129,7 @@ fn read_text_if_exists(path: &Path) -> Result<Option<String>> {
     }
 }
 
-fn observe(home: &Home, desired: Option<&Applied>) -> Result<Observed> {
+fn observe(home: &Home, desired: Option<&Applied>, inspect_protected: bool) -> Result<Observed> {
     let executable = desired
         .map(|settings| settings.executable.clone())
         .unwrap_or(std::env::current_exe()?);
@@ -1163,6 +1164,7 @@ fn observe(home: &Home, desired: Option<&Applied>) -> Result<Observed> {
                 matches: stored.as_deref() == Some(job.plist().as_str()) && loaded,
                 leftovers,
                 system: false,
+                protected_leftovers: false,
             }
         }
         open_pact_core::Os::Linux => {
@@ -1180,6 +1182,7 @@ fn observe(home: &Home, desired: Option<&Applied>) -> Result<Observed> {
                     && enabled,
                 leftovers,
                 system: false,
+                protected_leftovers: false,
             }
         }
         open_pact_core::Os::Windows => {
@@ -1203,13 +1206,16 @@ if ($action.Count -eq 1 -and $action[0].Path -eq {binary} -and $action[0].Argume
                 args = powershell_literal(&expected_args)
             ))?;
             let system = output.lines().any(|line| line == "system");
-            let system_state = windows_existing_system_state(&home.0)?.is_some();
+            let protected_leftovers = inspect_protected
+                && (windows_existing_system_state(&home.0)?.is_some()
+                    || windows_orphaned_binary(&job)?);
             Observed {
                 exists: output.lines().next() != Some("missing"),
                 matches: output.lines().any(|line| line == "matches")
                     && system == desired.is_some_and(|settings| settings.run_as == RunAs::System),
                 system,
-                leftovers: leftovers || system_state,
+                leftovers: leftovers || protected_leftovers,
+                protected_leftovers,
             }
         }
     })
@@ -1223,7 +1229,7 @@ pub(crate) fn migration_example(home: &Home) -> Result<bool> {
         return Ok(false);
     };
     let system = if crate::current_os()? == open_pact_core::Os::Windows {
-        observe(home, None)?.system
+        observe(home, None, false)?.system
     } else {
         false
     };
@@ -1268,16 +1274,44 @@ pub(crate) fn apply_command(home: &Path) -> String {
     }
 }
 
+fn needs_system_cleanup(requested_system: bool, removing: bool, observed: &Observed) -> bool {
+    requested_system || observed.system || (removing && observed.protected_leftovers)
+}
+
+fn windows_orphaned_binary(job: &Job) -> Result<bool> {
+    let query = windows_task_query_script(job);
+    let output = windows_powershell(&format!(
+        r#"{PROTECTED_DIRECTORY}
+{query}
+$remaining = @($folder.GetTasks(1) | Where-Object {{ $_.Name.StartsWith('org.open-pact.report.') -and (IsSystemTask $_) }})
+if ($remaining.Count -gt 0) {{ return }}
+$install = Join-Path (ProgramFilesPath) 'open-pact'
+if (Test-Path -LiteralPath $install) {{
+    AssertProtected $install
+    if (@(Get-ChildItem -LiteralPath $install -Filter 'open-pact-client.exe*' -File -Force -ErrorAction Stop).Count -gt 0) {{ Write-Output 'leftovers' }}
+}}
+"#
+    ))?;
+    Ok(output == "leftovers")
+}
+
 pub(crate) async fn apply(home: &Home, dry_run: bool) -> Result<()> {
     if migration_example(home)? {
         return Ok(());
     }
-    let config = DeviceConfig::load(home)?.with_context(|| {
-        format!(
+    let home_exists = home.0.try_exists()?;
+    let config = match DeviceConfig::load(home)? {
+        Some(config) => config,
+        None if !home_exists => DeviceConfig::default(),
+        None => bail!(
             "Create {}. Use `open-pact-client config example` for a template.",
             home.file(crate::device_config::FILE).display()
-        )
-    })?;
+        ),
+    };
+    let requested_system = config
+        .schedule
+        .as_ref()
+        .is_some_and(|schedule| schedule.run_as == RunAs::System);
     let home = Home(schedule_home(&home.0, true)?);
     let desired = if let Some(schedule) = config.schedule.filter(|schedule| schedule.enabled) {
         let report = config.report.context(
@@ -1291,36 +1325,32 @@ pub(crate) async fn apply(home: &Home, dry_run: bool) -> Result<()> {
     } else {
         None
     };
-    if desired
-        .as_ref()
-        .is_some_and(|settings| settings.run_as == RunAs::System)
-        && windows_require_elevation().is_err()
-    {
-        println!(
+    let elevated =
+        crate::current_os()? == open_pact_core::Os::Windows && windows_require_elevation().is_ok();
+    if requested_system && !elevated {
+        bail!(
             "Run this exact command from an elevated PowerShell prompt:\n{}",
             apply_command(&home.0)
         );
-        return Ok(());
     }
-    let observed = observe(&home, desired.as_ref())?;
-    let system = observed.system
-        || desired
-            .as_ref()
-            .is_some_and(|settings| settings.run_as == RunAs::System)
-        || (crate::current_os()? == open_pact_core::Os::Windows
-            && windows_existing_system_state(&home.0)?.is_some());
-    if system && windows_require_elevation().is_err() {
-        println!(
+    let observed = observe(&home, desired.as_ref(), elevated)
+        .with_context(|| format!("Cannot inspect the scheduled job. If access is denied, run this exact command from an elevated prompt:\n{}", apply_command(&home.0)))?;
+    let system = needs_system_cleanup(requested_system, desired.is_none(), &observed);
+    if system && !elevated {
+        bail!(
             "Run this exact command from an elevated PowerShell prompt:\n{}",
             apply_command(&home.0)
         );
-        return Ok(());
     }
-    let _lock = if dry_run { None } else { Some(lock(&home)?) };
+    let _lock = if dry_run || !home_exists {
+        None
+    } else {
+        Some(lock(&home)?)
+    };
     let observed = if dry_run {
         observed
     } else {
-        observe(&home, desired.as_ref())?
+        observe(&home, desired.as_ref(), elevated)?
     };
     let applied = home.read_json::<Applied>(APPLIED)?;
     let change = reconcile(desired.as_ref(), applied.as_ref(), &observed);
@@ -1516,6 +1546,26 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn limited_operations_leave_protected_cleanup_for_elevated_removal() {
+        let protected = Observed {
+            protected_leftovers: true,
+            ..Observed::default()
+        };
+        assert!(!needs_system_cleanup(false, false, &protected));
+        assert!(needs_system_cleanup(false, true, &protected));
+        assert!(needs_system_cleanup(true, true, &Observed::default()));
+        assert!(needs_system_cleanup(
+            false,
+            false,
+            &Observed {
+                system: true,
+                ..Observed::default()
+            }
+        ));
+        assert!(!needs_system_cleanup(false, true, &Observed::default()));
+    }
+
+    #[test]
     #[ignore = "requires a built OPEN_PACT_CLIENT_BIN; all scheduler commands use a fixture mock"]
     fn declarative_cli_with_mock_scheduler() {
         use std::os::unix::fs::PermissionsExt;
@@ -1597,6 +1647,12 @@ esac
         let changes = std::fs::read(root.path().join("changes")).unwrap();
         run(&["apply"], true, "no changes");
         assert_eq!(std::fs::read(root.path().join("changes")).unwrap(), changes);
+        let configuration = std::fs::read(home.file(crate::device_config::FILE)).unwrap();
+        std::fs::remove_file(home.file(crate::device_config::FILE)).unwrap();
+        run(&["apply"], false, "Create ");
+        assert!(root.path().join("loaded").exists());
+        assert_eq!(std::fs::read(root.path().join("changes")).unwrap(), changes);
+        std::fs::write(home.file(crate::device_config::FILE), configuration).unwrap();
         write("https://other.example.org/status", enabled);
         run(&["apply"], true, "schedule: update");
         run(&["apply"], true, "no changes");
@@ -1639,6 +1695,12 @@ esac
         assert_eq!(std::fs::read(home.file(CONFIG)).unwrap(), legacy);
         run(&["check"], false, "https://legacy.example.org/status");
         assert_eq!(std::fs::read(root.path().join("changes")).unwrap(), changes);
+        std::fs::remove_file(home.file(CONFIG)).unwrap();
+        write("https://collector.example.org/status", enabled);
+        run(&["apply"], true, "schedule: install");
+        std::fs::remove_dir_all(&path).unwrap();
+        run(&["apply"], true, "schedule: remove");
+        assert!(!path.exists(), "apply recreated the missing client home");
         println!("{transcript}");
         if let Some(output) = std::env::var_os("OPEN_PACT_CLI_TRANSCRIPT") {
             std::fs::write(output, transcript).unwrap();

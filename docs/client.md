@@ -130,7 +130,7 @@ On Windows, a new Security event 1102 or Defender detection also triggers an eve
 
 macOS uses a launchd LaunchAgent. Linux uses a systemd user timer and needs a running user manager. Windows uses a limited Task Scheduler task when `run_as = "user"`.
 
-If an old job exists without `open-pact.toml`, `check` and `apply` print the content that reproduces it. Create that file before applying. Until then, apply changes nothing. Successful apply removes the old `report-schedule.json`. The imperative schedule install and uninstall commands and the report collector flag are removed.
+If an old job exists without `open-pact.toml`, `check` and `apply` print the content that reproduces it. Create that file before applying. Until then, apply changes nothing. Successful apply removes the old `report-schedule.json`. Setup uses only the configuration file and apply.
 
 ### Use Windows SYSTEM checks
 
@@ -144,9 +144,9 @@ Without elevation, apply prints the exact elevated command and changes nothing. 
 
 ### Stop reports and remove the client
 
-Set `[schedule].enabled = false` or remove the schedule section. Run `apply` with the same absolute `--home` before deleting the binary or client home. Apply removes the job, the applied-settings receipt, and report state. It keeps `open-pact.toml`. Run `stop` to print these instructions.
+Set `[schedule].enabled = false` or remove the schedule section. Run `apply` with the same absolute `--home` before deleting the binary or client home. Apply removes the job, the applied-settings receipt, and report state. It keeps `open-pact.toml`. If the entire client home is already missing, apply removes the remaining job without recreating it. Run `stop` to print these instructions.
 
-SYSTEM removal needs elevation and uses the existing protected state lock. A held lock stops task removal and asks you to retry. Removal cleans up the shared binary only when no SYSTEM task uses it. If cleanup fails, retry apply after the client stops or Windows restarts. Keep the configuration file until cleanup succeeds.
+Limited Windows operations leave orphaned protected state and the shared binary unchanged. To remove those leftovers, set `run_as = "system"` with `enabled = false` and run apply elevated. SYSTEM removal needs elevation and uses the existing protected state lock. A held lock stops task removal and asks you to retry. Removal cleans up the shared binary only when no SYSTEM task uses it. If cleanup fails, retry apply after the client stops or Windows restarts. Keep the configuration file until cleanup succeeds.
 
 ## Understand what leaves the device
 

@@ -79,8 +79,19 @@ jobs:
             & $client --home $homePath @arguments
             return $LASTEXITCODE
           }
+          function Set-DeviceConfig($homePath, $enabled, $runAs) {
+            $enabledToml = if ($enabled) { 'true' } else { 'false' }
+            @(
+              '[report]',
+              'collector = "https://collector.example.org/status"',
+              '[schedule]',
+              "enabled = $enabledToml",
+              "run_as = `"$runAs`""
+            ) | Set-Content -Encoding UTF8 (Join-Path $homePath 'open-pact.toml')
+          }
           function Install-System($homePath) {
-            $result = Invoke-Client $homePath @('schedule','install','--system','--collector','https://collector.example.org/status')
+            Set-DeviceConfig $homePath $true 'system'
+            $result = Invoke-Client $homePath @('apply')
             if ($result[-1] -ne 0) { throw "SYSTEM install failed: $result" }
           }
           function State-Path($homePath) {
@@ -98,10 +109,11 @@ jobs:
             if (Get-ChildItem "$env:ProgramFiles/open-pact/open-pact-client.exe*" -Force -ErrorAction SilentlyContinue) { throw 'binary leftovers remain' }
           }
           function Remove-System($homePath) {
-            $result = Invoke-Client $homePath @('schedule','uninstall','--system')
+            if (Test-Path $homePath) { Set-DeviceConfig $homePath $false 'system' }
+            $result = Invoke-Client $homePath @('apply')
             if ($result[-1] -ne 0) {
               Write-Output $result
-              $result = Invoke-Client $homePath @('schedule','uninstall','--system')
+              $result = Invoke-Client $homePath @('apply')
             }
             if ($result[-1] -ne 0) { throw "SYSTEM retry failed: $result" }
             Assert-Clean $homePath
@@ -115,19 +127,26 @@ jobs:
             $before = (Get-FileHash $binary).Hash
             $worker = Join-Path $root 'standard-user.ps1'
             @'
-          param($client,$homePath,$receipt)
+          param($client,$homePath,$receipt,$taskName)
           $ErrorActionPreference = 'Stop'
           try {
             $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
             if ((New-Object Security.Principal.WindowsPrincipal($identity)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'worker token is elevated' }
-            & $client --home $homePath schedule install --collector https://collector.example.org/status
+            @('[report]', 'collector = "https://collector.example.org/status"', '[schedule]', 'enabled = true', 'run_as = "user"') | Set-Content -Encoding UTF8 "$homePath/open-pact.toml"
+            & $client --home $homePath apply
             if ($LASTEXITCODE -ne 0) { throw 'limited install failed' }
+            if (-not (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue)) { throw 'limited task was not installed' }
+            @('[schedule]', 'enabled = false', 'run_as = "user"') | Set-Content -Encoding UTF8 "$homePath/open-pact.toml"
             foreach ($attempt in 1..2) {
-              & $client --home $homePath schedule uninstall
+              & $client --home $homePath apply
               if ($LASTEXITCODE -ne 0) { throw 'limited uninstall failed with protected leftovers' }
+              if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) { throw 'limited task remains' }
             }
             if (Test-Path "$homePath/report-schedule.json") { throw 'limited configuration remains' }
-            & $client --home $homePath schedule uninstall --system
+            if (Test-Path "$homePath/schedule-applied.json") { throw 'limited applied receipt remains' }
+            if (Test-Path "$homePath/report-state.json") { throw 'limited report state remains' }
+            @('[schedule]', 'enabled = false', 'run_as = "system"') | Set-Content -Encoding UTF8 "$homePath/open-pact.toml"
+            & $client --home $homePath apply
             if ($LASTEXITCODE -eq 0) { throw 'standard token accepted SYSTEM cleanup' }
             'standard_user_limited_install_and_repeated_uninstall_passed' | Set-Content $receipt
             exit 0
@@ -135,7 +154,7 @@ jobs:
           '@ | Set-Content $worker
             $receipt = Join-Path $root 'standard-user-result.txt'
             $credential = New-Object PSCredential("$env:COMPUTERNAME\$user",$secure)
-            $arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$worker`" -client `"$client`" -homePath `"$limited`" -receipt `"$receipt`""
+            $arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$worker`" -client `"$client`" -homePath `"$limited`" -receipt `"$receipt`" -taskName `"$(Task-Name $limited)`""
             $process = Start-Process powershell.exe -Credential $credential -LoadUserProfile -ArgumentList $arguments -Wait -PassThru
             Get-Content $receipt
             if ($process.ExitCode -ne 0) { throw 'standard-user fixture failed' }
@@ -154,18 +173,21 @@ jobs:
                 $state = State-Path $homePath
                 $guard = [IO.File]::Open(($state + '.lock'),[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
                 try {
-                  $result = Invoke-Client $homePath @('schedule','uninstall','--system')
+                  Set-DeviceConfig $homePath $false 'system'
+                  $result = Invoke-Client $homePath @('apply')
                   if ($result[-1] -eq 0) { throw 'held state lock reported success' }
                   if (-not (Get-ScheduledTask -TaskName (Task-Name $homePath) -ErrorAction SilentlyContinue)) { throw 'held state lock did not preserve task' }
                   if (-not (Test-Path "$env:ProgramFiles/open-pact/open-pact-client.exe")) { throw 'held state lock did not preserve binary' }
                 } finally { $guard.Dispose() }
                 $held = [IO.File]::Open((Join-Path $state 'held-fixture'),[IO.FileMode]::Create,[IO.FileAccess]::ReadWrite,[IO.FileShare]::Read)
                 try {
-                  $result = Invoke-Client $homePath @('schedule','uninstall','--system')
+                  Set-DeviceConfig $homePath $false 'system'
+                  $result = Invoke-Client $homePath @('apply')
                   if ($result[-1] -eq 0 -or -not (Test-Path $state)) { throw 'injected deletion failure reported success' }
                   Write-Output $result
                 } finally { $held.Dispose() }
-                $result = Invoke-Client $homePath @('schedule','install','--collector','https://collector.example.org/status')
+                Set-DeviceConfig $homePath $true 'user'
+                $result = Invoke-Client $homePath @('apply')
                 if ($result[-1] -ne 0) { throw 'replacement limited install failed' }
               }
               Remove-System $homePath
