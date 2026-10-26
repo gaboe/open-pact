@@ -14,7 +14,7 @@ def run(*args, check=True):
 
 
 image, platform = sys.argv[1:]
-started = run("docker", "run", "--detach", "--tty", "--env", "container=docker", "--privileged", "--cgroupns=private", "--platform", platform,
+started = run("docker", "run", "--rm", "--detach", "--tty", "--env", "container=docker", "--privileged", "--cgroupns=private", "--platform", platform,
               "--tmpfs", "/run", "--tmpfs", "/run/lock", image, "/sbin/init", check=False)
 if started.returncode:
     print("SKIP systemd container start: " + started.stderr, flush=True)

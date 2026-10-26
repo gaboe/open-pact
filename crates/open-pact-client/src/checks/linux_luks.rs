@@ -65,12 +65,7 @@ pub fn preboot_auth() -> ControlValue {
         let metadata = run_status("cryptsetup", &["luksDump", "--dump-json-metadata", device])
             .filter(|r| r.success)
             .and_then(|r| metadata_unlock(&r.text));
-        match boot {
-            BootKey::Prompt => metadata.unwrap_or(Unlock::Secret),
-            BootKey::Hardware => metadata.unwrap_or(Unlock::Hardware),
-            BootKey::File(path) => keyfile_unlock(path),
-            BootKey::Unknown => Unlock::Unknown,
-        }
+        boot.unlock(metadata)
     })
     .value()
 }
@@ -87,7 +82,7 @@ fn inspect_tree(text: &str, mut inspect: impl FnMut(&str, &str) -> Unlock) -> Un
             .mountpoints
             .iter()
             .any(|m| m.as_deref() == Some("[SWAP]"));
-        if !is_root && !is_swap {
+        if !is_root && (!is_swap || device.name.starts_with("/dev/zram")) {
             continue;
         }
         root |= is_root;
@@ -141,10 +136,21 @@ fn inspect_device(
 
 #[derive(Debug, Eq, PartialEq)]
 enum BootKey<'a> {
-    Prompt,
+    Secret,
     Hardware,
     File(&'a str),
     Unknown,
+}
+
+impl BootKey<'_> {
+    fn unlock(self, metadata: Option<Unlock>) -> Unlock {
+        match self {
+            Self::Unknown => Unlock::Unknown,
+            Self::Secret => metadata.unwrap_or(Unlock::Secret),
+            Self::Hardware => metadata.unwrap_or(Unlock::Hardware),
+            Self::File(path) => keyfile_unlock(path),
+        }
+    }
 }
 
 fn parse_crypttab<'a>(text: &'a str, mapping: &str) -> BootKey<'a> {
@@ -166,13 +172,23 @@ fn parse_crypttab<'a>(text: &'a str, mapping: &str) -> BootKey<'a> {
     }
     let key = fields.get(2).copied().unwrap_or("none");
     let options = fields.get(3).copied().unwrap_or("");
+    if options.split(',').any(|o| o == "try-empty-password=yes") {
+        return BootKey::Unknown;
+    }
+    let pin = options
+        .split(',')
+        .any(|o| matches!(o, "tpm2-pin=yes" | "fido2-pin=yes"));
     if options
         .split(',')
         .any(|o| o.starts_with("tpm2-device=") || o.starts_with("fido2-device=") || o == "clevis")
     {
-        BootKey::Hardware
+        if pin {
+            BootKey::Secret
+        } else {
+            BootKey::Hardware
+        }
     } else if matches!(key, "none" | "-") {
-        BootKey::Prompt
+        BootKey::Unknown
     } else if key.starts_with('/') && !key.contains('\\') {
         BootKey::File(key)
     } else {
@@ -334,6 +350,14 @@ mod tests {
     fn root_and_swap_follow_only_their_inverse_block_branches() {
         let disk = json!({"name":"/dev/fictional","type":"part","fstype":"crypto_LUKS","mountpoints":[null]});
         let root = json!({"name":"/dev/mapper/root","type":"crypt","fstype":"ext4","mountpoints":["/"],"children":[disk]});
+        let zram =
+            json!({"name":"/dev/zram0","type":"disk","fstype":"swap","mountpoints":["[SWAP]"]});
+        assert_eq!(
+            inspect_tree(&json!({"blockdevices":[root,zram]}).to_string(), |_, _| {
+                Unlock::Secret
+            }),
+            Unlock::Secret
+        );
         let plain_swap = json!({"name":"/dev/fictional-swap","type":"part","fstype":"swap","mountpoints":["[SWAP]"]});
         assert_eq!(
             inspect_tree(&json!({"blockdevices":[root]}).to_string(), |_, _| {
@@ -365,11 +389,45 @@ mod tests {
 mod crypttab_tests {
     use super::*;
     #[test]
+    fn automatic_sources_do_not_establish_a_required_secret() {
+        assert_eq!(
+            parse_crypttab("root UUID=fictional none try-empty-password=yes", "root"),
+            BootKey::Unknown
+        );
+        assert_eq!(
+            parse_crypttab("root UUID=fictional none luks", "root"),
+            BootKey::Unknown
+        );
+        assert_eq!(
+            parse_crypttab("root UUID=fictional none luks", "root").unlock(None),
+            Unlock::Unknown
+        );
+    }
+
+    #[test]
+    fn manual_hardware_pin_is_a_secret() {
+        for options in [
+            "tpm2-device=auto,tpm2-pin=yes",
+            "fido2-device=auto,fido2-cid=fictional,fido2-pin=yes",
+        ] {
+            assert_eq!(
+                parse_crypttab(&format!("root UUID=fictional - {options}"), "root"),
+                BootKey::Secret
+            );
+            assert_eq!(
+                parse_crypttab(&format!("root UUID=fictional - {options}"), "root")
+                    .unlock(metadata_unlock(r#"{"keyslots":{"0":{}},"tokens":{}}"#)),
+                Unlock::Secret
+            );
+        }
+    }
+
+    #[test]
     fn boot_mapping_distinguishes_prompts_hardware_and_keyfiles() {
         for (line, expected) in [
-            ("root UUID=fictional none luks", BootKey::Prompt),
-            ("root UUID=fictional - luks", BootKey::Prompt),
-            ("root UUID=fictional", BootKey::Prompt),
+            ("root UUID=fictional none luks", BootKey::Unknown),
+            ("root UUID=fictional - luks", BootKey::Unknown),
+            ("root UUID=fictional", BootKey::Unknown),
             (
                 "root UUID=fictional none tpm2-device=auto",
                 BootKey::Hardware,

@@ -425,8 +425,8 @@ fn linux_chromium(data: &Path, policy_root: &Path) -> Protection {
     merge(&states)
 }
 
-fn linux_firefox(root: &Path, app: &Path) -> Protection {
-    let Ok(system) = optional_json(Path::new("/etc/firefox/policies/policies.json"), false) else {
+fn linux_firefox(root: &Path, app: &Path, system_policy: &Path) -> Protection {
+    let Ok(system) = optional_json(system_policy, false) else {
         return Protection::Unknown;
     };
     let Ok(local) = optional_json(&app.join("distribution/policies.json"), false) else {
@@ -488,6 +488,10 @@ pub fn linux() -> &'static str {
     if !config.is_absolute() {
         return "unknown";
     }
+    linux_at(&home, &config, Path::new("/"))
+}
+
+fn linux_at(home: &Path, config: &Path, root: &Path) -> &'static str {
     let mut states = Vec::new();
     for (binary, data, policy) in [
         (
@@ -500,18 +504,33 @@ pub fn linux() -> &'static str {
             "chromium",
             "/etc/chromium/policies",
         ),
+        (
+            "/usr/lib64/chromium-browser/chromium-browser",
+            "chromium",
+            "/etc/chromium/policies",
+        ),
     ] {
-        match Path::new(binary).try_exists() {
-            Ok(true) => states.push(linux_chromium(&config.join(data), Path::new(policy))),
+        match root.join(binary.trim_start_matches('/')).try_exists() {
+            Ok(true) => states.push(linux_chromium(
+                &config.join(data),
+                &root.join(policy.trim_start_matches('/')),
+            )),
             Ok(false) => (),
             Err(_) => states.push(Protection::Unknown),
         }
     }
-    for app in ["/usr/lib/firefox", "/usr/lib/firefox-esr"] {
-        match Path::new(app).join("firefox").try_exists() {
+    for (app, binary) in [
+        ("usr/lib/firefox", "firefox"),
+        ("usr/lib/firefox-esr", "firefox-esr"),
+        ("usr/lib/firefox-esr", "firefox"),
+        ("usr/lib64/firefox", "firefox"),
+    ] {
+        let app = root.join(app);
+        match app.join(binary).try_exists() {
             Ok(true) => states.push(linux_firefox(
                 &home.join(".mozilla/firefox"),
-                Path::new(app),
+                &app,
+                &root.join("etc/firefox/policies/policies.json"),
             )),
             Ok(false) => (),
             Err(_) => states.push(Protection::Unknown),
@@ -519,8 +538,8 @@ pub fn linux() -> &'static str {
     }
     // Sandboxed packages use separate policy and profile locations.
     if home.join(".var/app").exists()
-        || Path::new("/snap/firefox").exists()
-        || Path::new("/snap/chromium").exists()
+        || root.join("snap/firefox").exists()
+        || root.join("snap/chromium").exists()
     {
         states.push(Protection::Unknown);
     }
@@ -1110,5 +1129,74 @@ mod linux_tests {
         );
         fs::write(managed.join("conflict.json"), "{broken").unwrap();
         assert!(linux_policy(&managed).is_err());
+    }
+}
+
+#[cfg(test)]
+mod linux_package_tests {
+    use super::*;
+
+    #[test]
+    fn fedora_chromium_is_included_with_enabled_chrome() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home/fictional");
+        let config = home.join(".config");
+        for (binary, policy, enabled) in [
+            (
+                "opt/google/chrome/chrome",
+                "etc/opt/chrome/policies/managed",
+                true,
+            ),
+            (
+                "usr/lib64/chromium-browser/chromium-browser",
+                "etc/chromium/policies/managed",
+                false,
+            ),
+        ] {
+            let binary = root.path().join(binary);
+            fs::create_dir_all(binary.parent().unwrap()).unwrap();
+            fs::write(binary, "").unwrap();
+            let policy = root.path().join(policy);
+            fs::create_dir_all(&policy).unwrap();
+            fs::write(
+                policy.join("fictional.json"),
+                format!(r#"{{"SafeBrowsingEnabled":{enabled}}}"#),
+            )
+            .unwrap();
+        }
+        assert_eq!(linux_at(&home, &config, root.path()), "off");
+    }
+
+    #[test]
+    fn packaged_firefox_is_included_with_enabled_chrome() {
+        for binary in [
+            "usr/lib64/firefox/firefox",
+            "usr/lib/firefox-esr/firefox-esr",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let home = root.path().join("home/fictional");
+            let config = home.join(".config");
+            for file in ["opt/google/chrome/chrome", binary] {
+                let path = root.path().join(file);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, "").unwrap();
+            }
+            let policy = root.path().join("etc/opt/chrome/policies/managed");
+            fs::create_dir_all(&policy).unwrap();
+            fs::write(
+                policy.join("fictional.json"),
+                r#"{"SafeBrowsingEnabled":true}"#,
+            )
+            .unwrap();
+            let profile = home.join(".mozilla/firefox/fictional");
+            fs::create_dir_all(&profile).unwrap();
+            fs::write(
+                profile.parent().unwrap().join("profiles.ini"),
+                "[Profile0]\nPath=fictional\nIsRelative=1\n",
+            )
+            .unwrap();
+            fs::write(profile.join("prefs.js"), "user_pref(\"browser.safebrowsing.malware.enabled\", false);\nuser_pref(\"browser.safebrowsing.phishing.enabled\", false);\n").unwrap();
+            assert_eq!(linux_at(&home, &config, root.path()), "off", "{binary}");
+        }
     }
 }

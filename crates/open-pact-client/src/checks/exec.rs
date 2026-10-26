@@ -49,22 +49,57 @@ pub struct CapturedOutput {
 }
 
 #[cfg(unix)]
+fn executable(candidate: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(path) = std::ffi::CString::new(candidate.as_os_str().as_bytes()) else {
+        return false;
+    };
+    std::fs::metadata(candidate).is_ok_and(|m| m.is_file())
+        && unsafe { libc::faccessat(libc::AT_FDCWD, path.as_ptr(), libc::X_OK, libc::AT_EACCESS) }
+            == 0
+}
+
+#[cfg(unix)]
+fn script_interpreter_exists(candidate: &std::path::Path) -> bool {
+    use std::io::BufRead;
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(file) = std::fs::File::open(candidate) else {
+        return true;
+    };
+    let mut line = Vec::new();
+    if std::io::BufReader::new(file.take(512))
+        .read_until(b'\n', &mut line)
+        .is_err()
+    {
+        return true;
+    }
+    let Some(interpreter) = line.strip_prefix(b"#!") else {
+        return true;
+    };
+    let interpreter = interpreter.strip_suffix(b"\n").unwrap_or(interpreter);
+    let interpreter = interpreter
+        .split(|b| matches!(b, b' ' | b'\t'))
+        .find(|s| !s.is_empty())
+        .unwrap_or_default();
+    // Some emulators report a successful spawn even when the interpreter is absent.
+    executable(std::path::Path::new(std::ffi::OsStr::from_bytes(
+        interpreter,
+    )))
+}
+
+#[cfg(unix)]
 fn resolve_program(
     program: &str,
     path: Option<&std::ffi::OsStr>,
 ) -> std::io::Result<std::path::PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
 
-    let executable = |candidate: &Path| {
-        std::fs::metadata(candidate)
-            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-    };
     let resolved = if program.contains('/') {
         let candidate = PathBuf::from(program);
-        executable(&candidate).then_some(candidate)
+        (executable(&candidate) && script_interpreter_exists(&candidate)).then_some(candidate)
     } else {
-        path.and_then(|path| {
+        let default = default_search_path();
+        Some(path.unwrap_or(&default)).and_then(|path| {
             std::env::split_paths(path)
                 .map(|entry| {
                     if entry.as_os_str().is_empty() {
@@ -79,17 +114,74 @@ fn resolve_program(
     resolved.ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))
 }
 
-pub fn capture(program: &str, args: &[&str], timeout: Duration) -> std::io::Result<CapturedOutput> {
-    let start = Instant::now();
-    #[cfg(unix)]
-    let program = resolve_program(program, std::env::var_os("PATH").as_deref())?;
-    let mut child = Command::new(program)
+#[cfg(unix)]
+fn default_search_path() -> std::ffi::OsString {
+    use std::os::unix::ffi::OsStringExt;
+    // confstr supplies the platform's exec search path without consulting PATH.
+    unsafe {
+        let size = libc::confstr(libc::_CS_PATH, std::ptr::null_mut(), 0);
+        let mut bytes = vec![0; size];
+        if size == 0 || libc::confstr(libc::_CS_PATH, bytes.as_mut_ptr().cast(), size) == 0 {
+            return "/bin:/usr/bin".into();
+        }
+        bytes.pop();
+        std::ffi::OsString::from_vec(bytes)
+    }
+}
+
+fn spawn(
+    program: impl AsRef<std::ffi::OsStr>,
+    args: &[&str],
+) -> std::io::Result<std::process::Child> {
+    Command::new(program)
         .args(args)
         .env("LC_ALL", "C")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()?;
+        .spawn()
+}
+
+#[cfg(unix)]
+fn spawn_program(
+    program: &str,
+    args: &[&str],
+    path: Option<&std::ffi::OsStr>,
+) -> std::io::Result<std::process::Child> {
+    if program.contains('/') {
+        return spawn(resolve_program(program, path)?, args);
+    }
+    let default = default_search_path();
+    let path = path.unwrap_or(&default);
+    let mut denied = None;
+    for entry in std::env::split_paths(path) {
+        let entry = if entry.as_os_str().is_empty() {
+            std::path::PathBuf::from(".")
+        } else {
+            entry
+        };
+        let candidate = entry.join(program);
+        if !executable(&candidate) || !script_interpreter_exists(&candidate) {
+            continue;
+        }
+        match spawn(&candidate, args) {
+            Ok(child) => return Ok(child),
+            Err(error) => match error.raw_os_error() {
+                Some(libc::EACCES) => denied = Some(error),
+                Some(libc::ENOENT | libc::ENOTDIR) => (),
+                _ => return Err(error),
+            },
+        }
+    }
+    Err(denied.unwrap_or_else(|| std::io::ErrorKind::NotFound.into()))
+}
+
+pub fn capture(program: &str, args: &[&str], timeout: Duration) -> std::io::Result<CapturedOutput> {
+    let start = Instant::now();
+    #[cfg(unix)]
+    let mut child = spawn_program(program, args, std::env::var_os("PATH").as_deref())?;
+    #[cfg(not(unix))]
+    let mut child = spawn(program, args)?;
     let readers = [
         child.stdout.take().map(drain),
         child.stderr.take().map(drain),
@@ -249,6 +341,49 @@ mod unix_resolution_tests {
             std::fs::Permissions::from_mode(if executable { 0o700 } else { 0o600 }),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn absent_path_uses_platform_default_but_empty_path_does_not() {
+        let output = spawn_program("sh", &["-c", "printf default-path"], None)
+            .unwrap()
+            .wait_with_output()
+            .unwrap();
+        assert_eq!(output.stdout, b"default-path");
+        assert_eq!(
+            spawn_program("sh", &[], Some(std::ffi::OsStr::new("")))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn search_continues_after_denied_or_missing_interpreter() {
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let file = first.join("fictional-program");
+        write_program(&second.join("fictional-program"), true, "usable");
+        let path = std::env::join_paths([&first, &second]).unwrap();
+        for stale_interpreter in [false, true] {
+            write_program(&file, true, "denied");
+            if stale_interpreter {
+                std::fs::write(&file, "#!/fictional/missing-interpreter\n").unwrap();
+            } else {
+                std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o601)).unwrap();
+                if unsafe { libc::geteuid() } == 0 {
+                    continue;
+                }
+            }
+            let output = spawn_program("fictional-program", &[], Some(&path))
+                .unwrap()
+                .wait_with_output()
+                .unwrap();
+            assert_eq!(output.stdout, b"usable");
+        }
     }
 
     #[test]

@@ -11,5 +11,6 @@ for distro in ${DISTROS:-ubuntu fedora}; do
     docker run --rm --platform "$platform" "$image"
     if [[ "$distro" == ubuntu && ${SYSTEMD:-1} == 1 ]]; then
         python3 tests/linux-docker/systemd.py "$image" "$platform"
+        python3 tests/linux-docker/failed-start.py "$image" "$platform"
     fi
 done
