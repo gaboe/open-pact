@@ -614,6 +614,28 @@ mod crypttab_tests {
     }
 
     #[test]
+    fn quoted_kernel_words_match_complete_parameter_names() {
+        let crypttab = "root UUID=11111111-1111-1111-1111-111111111111 - tpm2-device=auto,tpm2-pin=yes";
+        for cmdline in [
+            "\"luks\"=on",
+            "\"rd.luks\"=on",
+            "\"luks\".options=11111111-1111-1111-1111-111111111111=tpm2-device=auto",
+        ] {
+            assert_eq!(
+                BootConfig::parse(crypttab, cmdline).key("root").unlock(None),
+                Unlock::Unknown,
+                "{cmdline}"
+            );
+        }
+        assert_eq!(
+            BootConfig::parse(crypttab, "note=\"hello luks.options=ignored\"")
+                .key("root")
+                .unlock(None),
+            Unlock::Secret
+        );
+    }
+
+    #[test]
     fn unrelated_kernel_words_do_not_change_crypttab_results() {
         let crypttab =
             "root UUID=fictional - tpm2-device=auto,tpm2-pin=yes\nswap UUID=other - clevis";
