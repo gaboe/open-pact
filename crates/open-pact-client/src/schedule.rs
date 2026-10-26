@@ -855,7 +855,19 @@ fn windows_protected_paths(home: &Home, copy_binary: bool) -> Result<(PathBuf, P
     validate_windows_home(absolute)?;
     let hash = hex::encode(Sha256::digest(text(absolute)?.as_bytes()));
     let source = powershell_literal(text(&std::env::current_exe()?)?);
-    let script = format!(
+    let script = windows_protected_paths_script(&hash, &source, copy_binary);
+    let paths = windows_powershell(&script)?;
+    let mut lines = paths.lines();
+    let binary = PathBuf::from(lines.next().context("protected binary path missing")?);
+    let state = PathBuf::from(lines.next().context("protected state path missing")?);
+    if lines.next().is_some() {
+        bail!("unexpected protected path output");
+    }
+    Ok((binary, state))
+}
+
+fn windows_protected_paths_script(hash: &str, source: &str, copy_binary: bool) -> String {
+    format!(
         r#"{PROTECTED_DIRECTORY}
 $program = ProgramFilesPath
 AssertProtected $program
@@ -881,15 +893,7 @@ Write-Output $binary
 Write-Output $data
 "#,
         copy = if copy_binary { "$true" } else { "$false" },
-    );
-    let paths = windows_powershell(&script)?;
-    let mut lines = paths.lines();
-    let binary = PathBuf::from(lines.next().context("protected binary path missing")?);
-    let state = PathBuf::from(lines.next().context("protected state path missing")?);
-    if lines.next().is_some() {
-        bail!("unexpected protected path output");
-    }
-    Ok((binary, state))
+    )
 }
 
 fn windows_task_query_script(job: &Job) -> String {
@@ -913,14 +917,22 @@ try {{ $task = $folder.GetTask({id}) }} catch {{
     )
 }
 
-fn windows_require_elevation() -> Result<()> {
-    windows_powershell(
-        r#"$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+fn windows_require_elevation_script() -> &'static str {
+    r#"$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = New-Object Security.Principal.WindowsPrincipal($identity)
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     throw 'run `apply` from an elevated prompt'
-}"#,
-    )?;
+}"#
+}
+
+fn windows_system_executable_script() -> String {
+    format!(
+        "{PROTECTED_DIRECTORY}\nWrite-Output (Join-Path (ProgramFilesPath) 'open-pact\\open-pact-client.exe')"
+    )
+}
+
+fn windows_require_elevation() -> Result<()> {
+    windows_powershell(windows_require_elevation_script())?;
     Ok(())
 }
 
@@ -957,7 +969,16 @@ fn windows_uninstall(job: &Job, system: bool) -> Result<()> {
 fn windows_existing_system_state(home: &Path) -> Result<Option<PathBuf>> {
     validate_windows_home(home)?;
     let hash = hex::encode(Sha256::digest(text(home)?.as_bytes()));
-    let output = windows_powershell(&format!(
+    let output = windows_powershell(&windows_existing_system_state_script(&hash))?;
+    Ok(if output.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(output))
+    })
+}
+
+fn windows_existing_system_state_script(hash: &str) -> String {
+    format!(
         r#"{PROTECTED_DIRECTORY}
 $data = Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'open-pact'
 $system = Join-Path $data 'system'
@@ -969,17 +990,20 @@ if (Test-Path -LiteralPath $state) {{
     Write-Output $state
 }}
 "#
-    ))?;
-    Ok(if output.is_empty() {
-        None
-    } else {
-        Some(PathBuf::from(output))
-    })
+    )
 }
 
 fn windows_cleanup_binary(job: &Job) -> Result<()> {
+    let output = windows_powershell(&windows_cleanup_binary_script(job))?;
+    if !output.is_empty() {
+        println!("{output}");
+    }
+    Ok(())
+}
+
+fn windows_cleanup_binary_script(job: &Job) -> String {
     let query = windows_task_query_script(job);
-    let output = windows_powershell(&format!(
+    format!(
         r#"{PROTECTED_DIRECTORY}
 {query}
 $install = Join-Path (ProgramFilesPath) 'open-pact'
@@ -1006,11 +1030,7 @@ if ($leftovers.Count -gt 0) {{
 }}
 if ($null -ne $failure) {{ throw $failure }}
 "#
-    ))?;
-    if !output.is_empty() {
-        println!("{output}");
-    }
-    Ok(())
+    )
 }
 
 fn windows_system_uninstall(job: &Job, home: &Home) -> Result<()> {
@@ -1164,6 +1184,39 @@ fn read_text_if_exists(path: &Path) -> Result<Option<String>> {
     }
 }
 
+fn windows_observation_script(
+    job: &Job,
+    executable: &Path,
+    source_executable: &Path,
+    expected_args: &str,
+) -> Result<String> {
+    let query = windows_task_query_script(job);
+    Ok(format!(
+        r#"function ProgramFilesPath {{ [Environment]::GetFolderPath('ProgramFiles') }}
+{query}
+if ($null -eq $task) {{ Write-Output 'missing'; return }}
+if (IsSystemTask $task) {{ Write-Output 'system' }} else {{ Write-Output 'user' }}
+$action = @($task.Definition.Actions)
+$triggers = @($task.Definition.Triggers)
+if ($triggers.Count -eq 1) {{
+    Write-Output ("trigger_enabled=" + [int]$triggers[0].Enabled)
+    Write-Output ("trigger_type=" + $triggers[0].Type)
+}}
+if (IsSystemTask $task) {{
+    $protected = Join-Path (Join-Path (ProgramFilesPath) 'open-pact') 'open-pact-client.exe'
+    $protectedExists = Test-Path -LiteralPath $protected -PathType Leaf
+    Write-Output ("protected_exists=" + [int]$protectedExists)
+    $protectedMatches = $protectedExists -and (Get-FileHash -LiteralPath $protected -Algorithm SHA256).Hash -eq (Get-FileHash -LiteralPath {source} -Algorithm SHA256).Hash
+    Write-Output ("protected_matches=" + [int]$protectedMatches)
+}}
+if ($action.Count -eq 1 -and $action[0].Path -eq {binary} -and $action[0].Arguments -eq {args} -and $task.Enabled -and $triggers.Count -eq 1 -and $triggers[0].Enabled -and $triggers[0].Type -eq 1 -and $triggers[0].Repetition.Interval -eq 'PT5M') {{ Write-Output 'matches' }}
+"#,
+        binary = powershell_literal(text(executable)?),
+        args = powershell_literal(expected_args),
+        source = powershell_literal(text(source_executable)?),
+    ))
+}
+
 fn observe(home: &Home, desired: Option<&Applied>, inspect_protected: bool) -> Result<Observed> {
     let source_executable = desired
         .map(|settings| settings.executable.clone())
@@ -1174,9 +1227,7 @@ fn observe(home: &Home, desired: Option<&Applied>, inspect_protected: bool) -> R
     let executable = if crate::current_os()? == open_pact_core::Os::Windows
         && desired.is_some_and(|settings| settings.run_as == RunAs::System)
     {
-        PathBuf::from(windows_powershell(&format!(
-            "{PROTECTED_DIRECTORY}\nWrite-Output (Join-Path (ProgramFilesPath) 'open-pact\\open-pact-client.exe')"
-        ))?)
+        PathBuf::from(windows_powershell(&windows_system_executable_script())?)
     } else {
         executable
     };
@@ -1226,7 +1277,6 @@ fn observe(home: &Home, desired: Option<&Applied>, inspect_protected: bool) -> R
             }
         }
         open_pact_core::Os::Windows => {
-            let query = windows_task_query_script(&job);
             let expected_args = job
                 .argv
                 .iter()
@@ -1234,29 +1284,9 @@ fn observe(home: &Home, desired: Option<&Applied>, inspect_protected: bool) -> R
                 .map(|arg| windows_arg(arg))
                 .collect::<Vec<_>>()
                 .join(" ");
-            let output = windows_powershell(&format!(
-                r#"{query}
-if ($null -eq $task) {{ Write-Output 'missing'; return }}
-if (IsSystemTask $task) {{ Write-Output 'system' }} else {{ Write-Output 'user' }}
-$action = @($task.Definition.Actions)
-$triggers = @($task.Definition.Triggers)
-if ($triggers.Count -eq 1) {{
-    Write-Output ("trigger_enabled=" + [int]$triggers[0].Enabled)
-    Write-Output ("trigger_type=" + $triggers[0].Type)
-}}
-if (IsSystemTask $task) {{
-    $protected = Join-Path (Join-Path (ProgramFilesPath) 'open-pact') 'open-pact-client.exe'
-    $protectedExists = Test-Path -LiteralPath $protected -PathType Leaf
-    Write-Output ("protected_exists=" + [int]$protectedExists)
-    $protectedMatches = $protectedExists -and (Get-FileHash -LiteralPath $protected -Algorithm SHA256).Hash -eq (Get-FileHash -LiteralPath {source} -Algorithm SHA256).Hash
-    Write-Output ("protected_matches=" + [int]$protectedMatches)
-}}
-if ($action.Count -eq 1 -and $action[0].Path -eq {binary} -and $action[0].Arguments -eq {args} -and $task.Enabled -and $triggers.Count -eq 1 -and $triggers[0].Enabled -and $triggers[0].Type -eq 1 -and $triggers[0].Repetition.Interval -eq 'PT5M') {{ Write-Output 'matches' }}
-"#,
-                binary = powershell_literal(text(&executable)?),
-                args = powershell_literal(&expected_args),
-                source = powershell_literal(text(&source_executable)?)
-            ))?;
+            let script =
+                windows_observation_script(&job, &executable, &source_executable, &expected_args)?;
+            let output = windows_powershell(&script)?;
             let system = output.lines().any(|line| line == "system");
             let field = |name: &str| {
                 output
@@ -1349,8 +1379,13 @@ fn needs_system_cleanup(requested_system: bool, removing: bool, observed: &Obser
 }
 
 fn windows_orphaned_binary(job: &Job) -> Result<bool> {
+    let output = windows_powershell(&windows_orphaned_binary_script(job))?;
+    Ok(output == "leftovers")
+}
+
+fn windows_orphaned_binary_script(job: &Job) -> String {
     let query = windows_task_query_script(job);
-    let output = windows_powershell(&format!(
+    format!(
         r#"{PROTECTED_DIRECTORY}
 {query}
 $remaining = @($folder.GetTasks(1) | Where-Object {{ $_.Name.StartsWith('org.open-pact.report.') -and (IsSystemTask $_) }})
@@ -1361,8 +1396,7 @@ if (Test-Path -LiteralPath $install) {{
     if (@(Get-ChildItem -LiteralPath $install -Filter 'open-pact-client.exe*' -File -Force -ErrorAction Stop).Count -gt 0) {{ Write-Output 'leftovers' }}
 }}
 "#
-    ))?;
-    Ok(output == "leftovers")
+    )
 }
 
 pub(crate) async fn apply(home: &Home, dry_run: bool) -> Result<()> {
@@ -1613,6 +1647,86 @@ async fn operate(home: &Home, command: Operation, home_locked: bool) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn powershell_functions(script: &str) -> Vec<String> {
+        script
+            .lines()
+            .filter_map(|line| {
+                let declaration = line.trim().strip_prefix("function ")?;
+                let name = declaration
+                    .split(|character: char| character.is_whitespace() || character == '(')
+                    .next()?;
+                Some(name.to_ascii_lowercase())
+            })
+            .collect()
+    }
+
+    fn calls_powershell_function(script: &str, name: &str) -> bool {
+        script.lines().any(|line| {
+            let trimmed = line.trim();
+            if trimmed.starts_with("function ") {
+                return false;
+            }
+            let lower = line.to_ascii_lowercase();
+            let mut offset = 0;
+            while let Some(found) = lower[offset..].find(name) {
+                let start = offset + found;
+                let end = start + name.len();
+                let before = lower[..start].chars().next_back();
+                let after = lower[end..].chars().next();
+                let word_start = before
+                    .is_none_or(|character| !character.is_ascii_alphanumeric() && character != '_');
+                let word_end = after
+                    .is_none_or(|character| !character.is_ascii_alphanumeric() && character != '_');
+                let invocation = after
+                    .is_some_and(|character| character.is_whitespace() || character == '(')
+                    || (before == Some('(') && after == Some(')'));
+                if word_start && word_end && invocation {
+                    return true;
+                }
+                offset = end;
+            }
+            false
+        })
+    }
+
+    #[test]
+    fn every_built_powershell_script_defines_its_called_helpers() {
+        let job = Job::new(Path::new("client.exe"), Path::new("fixture-home")).unwrap();
+        let scripts = [
+            windows_protected_paths_script("fixture-hash", "'source.exe'", true),
+            windows_task_query_script(&job),
+            windows_uninstall_script(&job, false),
+            windows_existing_system_state_script("fixture-hash"),
+            windows_cleanup_binary_script(&job),
+            windows_orphaned_binary_script(&job),
+            windows_system_executable_script(),
+            windows_observation_script(
+                &job,
+                Path::new("fixture.exe"),
+                Path::new("source.exe"),
+                "--system",
+            )
+            .unwrap(),
+            windows_require_elevation_script().to_owned(),
+        ];
+        let helpers = scripts
+            .iter()
+            .flat_map(|script| powershell_functions(script))
+            .collect::<Vec<_>>();
+
+        for script in &scripts {
+            let definitions = powershell_functions(script);
+            for helper in &helpers {
+                if calls_powershell_function(script, helper) {
+                    assert!(
+                        definitions.iter().any(|defined| defined == helper),
+                        "PowerShell helper {helper} is called but not defined in the same script:\n{script}"
+                    );
+                }
+            }
+        }
+    }
 
     #[cfg(target_os = "macos")]
     #[test]
