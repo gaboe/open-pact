@@ -81,7 +81,6 @@
         "uint32 299",
         "uint32 0"
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "le_5min",
       "known_diff": null
@@ -94,7 +93,6 @@
         "uint32 300",
         "uint32 0"
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "le_5min",
       "known_diff": null
@@ -107,7 +105,6 @@
         "uint32 301",
         "uint32 0"
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "le_15min",
       "known_diff": null
@@ -120,7 +117,6 @@
         "uint32 899",
         "uint32 0"
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "le_15min",
       "known_diff": null
@@ -133,7 +129,6 @@
         "uint32 900",
         "uint32 0"
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "le_15min",
       "known_diff": null
@@ -146,7 +141,6 @@
         "uint32 901",
         "uint32 0"
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "gt_15min",
       "known_diff": null
@@ -203,7 +197,6 @@
         "uint32 300",
         "uint32 0"
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "none",
       "known_diff": null
@@ -216,7 +209,6 @@
         "uint32 0",
         "uint32 0"
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "none",
       "known_diff": null
@@ -229,7 +221,6 @@
         "",
         ""
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "unknown",
       "known_diff": null
@@ -240,7 +231,6 @@
       "input": [
         "[Daemon]\nAutolock=true\nLock=false\nRequirePassword=false\nTimeout=5\nLockGrace=10"
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "none",
       "known_diff": null,
@@ -253,7 +243,6 @@
       "input": [
         "screenLock is off"
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "none",
       "known_diff": null
@@ -264,43 +253,42 @@
       "input": [
         ""
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "unknown",
       "known_diff": null
     },
     {
-      "name": "total-delay-300",
+      "name": "delay-300-without-trigger-evidence",
       "os": "macos",
       "input": [
-        "idle trigger = 0\ndelay is 300 seconds"
+        "delay is 300 seconds"
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
-      "expected": "le_5min",
-      "known_diff": null
+      "expected": "unknown",
+      "known_diff": "internal/jobs/review-contracts/report.md#screen_lock-m-and-i",
+      "unrepresentable_input": "The macOS adapter cannot consume the effective password requirement or idle and display-off trigger."
     },
     {
-      "name": "total-delay-301",
+      "name": "delay-301-without-trigger-evidence",
       "os": "macos",
       "input": [
-        "idle trigger = 0\ndelay is 301 seconds"
+        "delay is 301 seconds"
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
-      "expected": "le_15min",
-      "known_diff": null
+      "expected": "unknown",
+      "known_diff": "internal/jobs/review-contracts/report.md#screen_lock-m-and-i",
+      "unrepresentable_input": "The macOS adapter cannot consume the effective password requirement or idle and display-off trigger."
     },
     {
-      "name": "total-delay-901",
+      "name": "delay-901-without-trigger-evidence",
       "os": "macos",
       "input": [
-        "idle trigger = 0\ndelay is 901 seconds"
+        "delay is 901 seconds"
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
-      "expected": "gt_15min",
-      "known_diff": null
+      "expected": "unknown",
+      "known_diff": "internal/jobs/review-contracts/report.md#screen_lock-m-and-i",
+      "unrepresentable_input": "The macOS adapter cannot consume the effective password requirement or idle and display-off trigger."
     },
     {
       "name": "grace-without-idle-trigger",
@@ -308,7 +296,6 @@
       "input": [
         "delay is 300 seconds"
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "unknown",
       "known_diff": null,

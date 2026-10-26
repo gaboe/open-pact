@@ -7,7 +7,6 @@
       "input": [
         "\"date\" => 2026-10-16 12:00:00 +0000\n\"displayName\" => \"macOS 26.0.1\""
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": 10,
       "known_diff": null
@@ -18,7 +17,6 @@
       "input": [
         ""
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "unknown",
       "known_diff": null
@@ -29,7 +27,6 @@
       "input": [
         "\"date\" => 2026-10-26 11:59:00 +0000\n\"displayName\" => \"macOS 26.0.1\""
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": 0,
       "known_diff": null
@@ -40,7 +37,6 @@
       "input": [
         "\"date\" => 2026-10-25 23:59:00 +0000\n\"displayName\" => \"macOS 26.0.1\""
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": 0,
       "known_diff": null,
@@ -147,7 +143,6 @@
       "input": [
         "\"date\" => 2026-10-16 12:00:00 +0000\n\"displayName\" => \"macOS FictionalTool 1.0\""
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "unknown",
       "known_diff": null,

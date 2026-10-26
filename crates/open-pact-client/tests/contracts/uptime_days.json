@@ -7,7 +7,6 @@
       "input": [
         "172800.5 10"
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": 2,
       "known_diff": null
@@ -18,7 +17,6 @@
       "input": [
         "0.5 0"
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": 0,
       "known_diff": null
@@ -29,7 +27,6 @@
       "input": [
         "-1"
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "unknown",
       "known_diff": null
@@ -40,7 +37,6 @@
       "input": [
         "NaN"
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "unknown",
       "known_diff": null
@@ -51,7 +47,6 @@
       "input": [
         "inf"
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "unknown",
       "known_diff": null
@@ -62,7 +57,6 @@
       "input": [
         ""
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "unknown",
       "known_diff": null
@@ -73,7 +67,6 @@
       "input": [
         "{ sec = 1792843200, usec = 0 }"
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": 2,
       "known_diff": null
@@ -84,7 +77,6 @@
       "input": [
         "{ sec = 1793016000, usec = 0 }"
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": 0,
       "known_diff": null
@@ -95,7 +87,6 @@
       "input": [
         "{ sec = 9999999999, usec = 0 }"
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "unknown",
       "known_diff": null
@@ -106,7 +97,6 @@
       "input": [
         ""
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "unknown",
       "known_diff": null

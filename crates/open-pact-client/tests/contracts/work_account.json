@@ -5,10 +5,8 @@
       "name": "macos-1",
       "os": "macos",
       "input": [
-        "20 80",
-        "relevant user identified; complete effective policy: administrative capability enabled"
+        "20 80"
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "admin",
       "known_diff": null
@@ -17,10 +15,8 @@
       "name": "macos-2",
       "os": "macos",
       "input": [
-        "20 12",
-        "relevant user identified; complete effective policy: no administrative capability"
+        "20 12"
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "standard",
       "known_diff": null
@@ -31,7 +27,6 @@
       "input": [
         ""
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "unknown",
       "known_diff": null
@@ -41,10 +36,8 @@
       "os": "linux",
       "input": [
         "1000 27",
-        "sudo:x:27:\nwheel:x:10:\nroot:x:0:",
-        ""
+        "sudo:x:27:\nwheel:x:10:\nroot:x:0:"
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "admin",
       "known_diff": null
@@ -54,10 +47,8 @@
       "os": "linux",
       "input": [
         "1000 100",
-        "sudo:x:27:\nwheel:x:10:\nroot:x:0:",
-        ""
+        "sudo:x:27:\nwheel:x:10:\nroot:x:0:"
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "standard",
       "known_diff": null
@@ -69,7 +60,6 @@
         "",
         "sudo:x:27:\nwheel:x:10:\nroot:x:0:"
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "unknown",
       "known_diff": null
@@ -78,8 +68,7 @@
       "name": "windows-7",
       "os": "windows",
       "input": [
-        "admin",
-        "relevant user identified; complete effective policy: administrative capability enabled"
+        "admin"
       ],
       "code": 0,
       "now": "2026-10-26T12:00:00Z",
@@ -90,8 +79,7 @@
       "name": "windows-8",
       "os": "windows",
       "input": [
-        "standard",
-        "relevant user identified; complete effective policy: no administrative capability"
+        "standard"
       ],
       "code": 0,
       "now": "2026-10-26T12:00:00Z",
@@ -110,14 +98,12 @@
       "known_diff": null
     },
     {
-      "name": "linux-individual-sudoers-grant",
+      "name": "linux-no-admin-group-membership",
       "os": "linux",
       "input": [
         "1000 100",
-        "sudo:x:27:\nwheel:x:10:\nroot:x:0:",
-        "fictional-user ALL=(ALL) ALL"
+        "sudo:x:27:\nwheel:x:10:\nroot:x:0:"
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "standard",
       "known_diff": null
@@ -129,7 +115,6 @@
         "1000 115",
         "admin:x:115:\nsudo:x:27:\nwheel:x:10:\nroot:x:0:"
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "admin",
       "observed": "unknown",
@@ -137,12 +122,8 @@
       "known_diff": null
     },
     {
-      "name": "windows-filtered-token-member",
+      "name": "unrepresentable-filtered-token-member",
       "os": "windows",
-      "input": [
-        "admin",
-        "Administrators member with a filtered UAC token"
-      ],
       "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "admin",

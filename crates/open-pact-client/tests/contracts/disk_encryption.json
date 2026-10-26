@@ -7,7 +7,6 @@
       "input": [
         "FileVault is On."
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "full",
       "known_diff": null
@@ -18,7 +17,6 @@
       "input": [
         "FileVault is Off."
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "none",
       "known_diff": null
@@ -29,7 +27,6 @@
       "input": [
         ""
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "unknown",
       "known_diff": null
@@ -40,7 +37,6 @@
       "input": [
         "FileVault is On.\nEncryption in progress: 42%"
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "partial",
       "known_diff": null,
@@ -53,7 +49,6 @@
       "input": [
         "sda2 part 0 0 ext4 /\n sda disk 0 0\n"
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "none",
       "known_diff": null
@@ -64,7 +59,6 @@
       "input": [
         "cryptroot crypt 0 0 ext4 /\n sda2 part 0 0 crypto_LUKS\n sda disk 0 0\n"
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "full",
       "known_diff": null
@@ -75,7 +69,6 @@
       "input": [
         "cryptroot crypt 0 0 ext4 /\n sda2 part 0 0 crypto_LUKS\n sda disk 0 0\nsdb1 part 0 0 ext4 /data\n sdb disk 0 0\n"
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "partial",
       "known_diff": null
@@ -86,7 +79,6 @@
       "input": [
         ""
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "unknown",
       "known_diff": null

@@ -5,7 +5,6 @@
       "name": "provider-not-applicable",
       "os": "macos",
       "input": [],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "n/a",
       "known_diff": null

@@ -5,7 +5,6 @@
       "name": "no-approved-reader",
       "os": "linux",
       "input": [],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "unknown",
       "known_diff": null
@@ -64,7 +63,6 @@
       "input": [
         "{\"kind\": \"chrome\", \"policy\": {}, \"recommended\": {}, \"prefs\": {}}"
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "on",
       "known_diff": null
@@ -75,7 +73,6 @@
       "input": [
         "{\"kind\": \"chrome\", \"policy\": {\"SafeBrowsingProtectionLevel\": 0}, \"recommended\": {}, \"prefs\": {}}"
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "off",
       "known_diff": null
@@ -86,7 +83,6 @@
       "input": [
         null
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "unknown",
       "known_diff": null
@@ -95,7 +91,6 @@
       "name": "macos-9",
       "os": "macos",
       "input": [],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "n/a",
       "known_diff": null
@@ -107,7 +102,6 @@
         "{\"kind\": \"chrome\", \"policy\": {\"SafeBrowsingProtectionLevel\": 0}, \"recommended\": {}, \"prefs\": {}}",
         "SingletonCookie -> fictional-cookie"
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "off",
       "known_diff": "pending integration",
@@ -119,7 +113,6 @@
       "input": [
         null
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "unknown",
       "known_diff": null
@@ -130,7 +123,6 @@
       "input": [
         "{\"kind\": \"edge\", \"policy\": {\"SmartScreenEnabled\": false}, \"recommended\": {}, \"prefs\": {}}"
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "off",
       "known_diff": null

@@ -7,7 +7,6 @@
       "input": [
         "Firewall is enabled."
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "on",
       "known_diff": null
@@ -18,7 +17,6 @@
       "input": [
         "Firewall is disabled."
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "off",
       "known_diff": null
@@ -29,7 +27,6 @@
       "input": [
         ""
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "unknown",
       "known_diff": null
@@ -86,7 +83,6 @@
         "ENABLED=yes",
         "active"
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "on",
       "known_diff": null
@@ -99,7 +95,6 @@
         "ENABLED=no",
         "inactive"
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "off",
       "known_diff": null
@@ -112,7 +107,6 @@
         null,
         null
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "unknown",
       "known_diff": null
@@ -125,7 +119,6 @@
         null,
         null
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "unknown",
       "known_diff": null,

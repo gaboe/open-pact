@@ -7,7 +7,6 @@
       "input": [
         "fictional-user"
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "on",
       "known_diff": null
@@ -18,7 +17,6 @@
       "input": [
         "The domain/default pair does not exist"
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "off",
       "known_diff": null
@@ -29,7 +27,6 @@
       "input": [
         ""
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "unknown",
       "known_diff": null
@@ -71,32 +68,31 @@
       "name": "linux-7",
       "os": "linux",
       "input": [],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "unknown",
       "known_diff": null
     },
     {
-      "name": "linux-8",
+      "name": "active-display-manager-unknown-enabled",
       "os": "linux",
       "input": [
         "[daemon]\nAutomaticLoginEnable=true\nAutomaticLogin=fictional-user"
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
-      "expected": "on",
-      "known_diff": null
+      "expected": "unknown",
+      "known_diff": "internal/jobs/review-contracts/report.md#auto_login-m-and-i",
+      "unrepresentable_input": "The Linux adapter cannot identify the active display manager or verify merged configuration."
     },
     {
-      "name": "linux-9",
+      "name": "active-display-manager-unknown-disabled",
       "os": "linux",
       "input": [
         "[daemon]\nAutomaticLoginEnable=false"
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
-      "expected": "off",
-      "known_diff": null
+      "expected": "unknown",
+      "known_diff": "internal/jobs/review-contracts/report.md#auto_login-m-and-i",
+      "unrepresentable_input": "The Linux adapter cannot identify the active display manager or verify merged configuration."
     },
     {
       "name": "enabled-without-account",
@@ -104,7 +100,6 @@
       "input": [
         "[daemon]\nAutomaticLoginEnable=true"
       ],
-      "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "unknown",
       "known_diff": null,
