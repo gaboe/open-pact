@@ -16,6 +16,7 @@ Each case has these fields.
 | `difference` | Reason and study reference for the current parser difference. Required with `observed`. |
 | `known_diff` | Reason and study reference for an unimplemented contract. `pending integration` identifies the two pending branches. A runnable case with this marker fails: remove it if the case passes, or use `observed` and `difference` for a current difference. |
 | `unrepresentable_input` | Evidence the current adapter cannot express. It is valid only with `known_diff`; that case is skipped and does not count as result coverage. |
+| `uncovered` | Contract-level list of `{os, result, reason}` entries for table results that have no runnable case because the adapter cannot accept required evidence. A result must be in the documented row and needs a reason. A runnable case makes the entry stale and fails coverage. |
 
 The [adapters](adapters) pass inputs to existing code. They contain no replacement parser. The runner selects one from the case OS and control ID, so a case cannot select another OS's parser. Windows cases enter the registered functions through a thread-local batch fixture and the real batch parser. Linux package cases implement the existing `PackageHost` seam with fictional DNF history and security-query output. Browser cases use the shared policy resolver and aggregation. They do not create a native browser installation.
 
@@ -41,4 +42,4 @@ The ordered inputs follow these conventions.
 
 Skipped cases hold evidence the current adapter does not accept. They document the intended result without claiming that the current parser can consume that evidence. A skipped case does not count toward result-category coverage. Native policy interpretation and source discovery remain outside these portable tests.
 
-The coverage test compares the registry, the documentation table, and the case files. Each documented result category must have a case on its OS. A number or timestamp category does not enumerate every possible value. Boundary and negative cases supplement that category coverage.
+The coverage test compares the registry, the documentation table, and the case files. Each documented result category must have either a runnable case or an `uncovered` entry with a reason. It prints every uncovered entry on each run. A runnable case makes a matching entry stale, so the list only shrinks. A number or timestamp category does not enumerate every possible value. Boundary and negative cases supplement that category coverage.

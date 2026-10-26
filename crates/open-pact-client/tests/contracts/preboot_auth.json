@@ -228,5 +228,32 @@
       "known_diff": "pending integration",
       "unrepresentable_input": "The current Linux V3 adapter cannot represent an unreadable /proc/cmdline source."
     }
+  ],
+  "uncovered": [
+    {
+      "os": "macos",
+      "result": "hardware_only",
+      "reason": "The macOS adapter cannot consume architecture and startup override evidence."
+    },
+    {
+      "os": "macos",
+      "result": "none",
+      "reason": "The macOS adapter cannot consume architecture and startup override evidence."
+    },
+    {
+      "os": "linux",
+      "result": "hardware_only",
+      "reason": "The Linux V3 adapter cannot consume /proc/cmdline, crypttab, or LUKS token metadata."
+    },
+    {
+      "os": "linux",
+      "result": "none",
+      "reason": "The Linux V3 adapter cannot consume /proc/cmdline, crypttab, or LUKS metadata needed to establish plain storage."
+    },
+    {
+      "os": "linux",
+      "result": "user_secret",
+      "reason": "The Linux V3 adapter cannot consume crypttab or LUKS keyslot and token metadata."
+    }
   ]
 }

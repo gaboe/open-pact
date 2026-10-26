@@ -12,6 +12,16 @@ use super::*;
 pub(super) struct Contract {
     pub id: String,
     pub cases: Vec<Case>,
+    #[serde(default)]
+    pub uncovered: Vec<UncoveredResult>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct UncoveredResult {
+    pub os: Os,
+    pub result: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -79,6 +89,58 @@ fn kind(value: &ControlValue) -> String {
             }
         }
     }
+}
+
+fn validate_coverage(
+    expected: &BTreeSet<String>,
+    actual: &BTreeSet<String>,
+    uncovered: &[&UncoveredResult],
+) -> Result<(), String> {
+    let mut declared = BTreeSet::new();
+    for item in uncovered {
+        if !expected.contains(&item.result) {
+            return Err(format!(
+                "uncovered result {:?} is not in the table",
+                item.result
+            ));
+        }
+        if item.reason.trim().is_empty() {
+            return Err(format!("uncovered result {:?} needs a reason", item.result));
+        }
+        if !declared.insert(item.result.as_str()) {
+            return Err(format!("duplicate uncovered result {:?}", item.result));
+        }
+        if actual.contains(&item.result) {
+            return Err(format!(
+                "uncovered result {:?} is covered by a runnable case; remove it",
+                item.result
+            ));
+        }
+    }
+
+    for result in actual {
+        if !expected.contains(result) {
+            return Err(format!("case result {result:?} is not in the table"));
+        }
+    }
+    for result in expected {
+        if !actual.contains(result) && !declared.contains(result.as_str()) {
+            return Err(format!(
+                "missing result case or uncovered reason for {result:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn coverage_report(id: &str, os: Os, uncovered: &[&UncoveredResult]) -> Vec<String> {
+    if uncovered.is_empty() {
+        return vec![format!("UNCOVERED {id} {os}: none")];
+    }
+    uncovered
+        .iter()
+        .map(|item| format!("UNCOVERED {id} {os} {}: {}", item.result, item.reason))
+        .collect()
 }
 
 #[derive(Clone, Copy)]
@@ -236,11 +298,16 @@ fn registered_contract_coverage() {
                 })
                 .map(|case| kind(&case.expected))
                 .collect();
-            assert_eq!(
-                actual, expected,
-                "{} {os}: missing result case",
-                contract.id
-            );
+            let uncovered: Vec<_> = contract
+                .uncovered
+                .iter()
+                .filter(|item| item.os == os)
+                .collect();
+            for line in coverage_report(&contract.id, os, &uncovered) {
+                eprintln!("{line}");
+            }
+            validate_coverage(&expected, &actual, &uncovered)
+                .unwrap_or_else(|error| panic!("{} {os}: {error}", contract.id));
         }
     }
 }
@@ -307,4 +374,117 @@ fn contract_cases() {
         }
     }
     eprintln!("contracts: {ran} executed, {skipped} unrepresentable inputs");
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+
+    fn item(result: &str, reason: &str) -> UncoveredResult {
+        UncoveredResult {
+            os: Os::Linux,
+            result: result.into(),
+            reason: reason.into(),
+        }
+    }
+
+    #[test]
+    fn runnable_and_reasoned_uncovered_results_complete_the_table() {
+        let expected = BTreeSet::from(["off".into(), "on".into()]);
+        let actual = BTreeSet::from(["on".into()]);
+        let uncovered = item(
+            "off",
+            "The adapter cannot read the complete provider inventory.",
+        );
+
+        assert_eq!(validate_coverage(&expected, &actual, &[&uncovered]), Ok(()));
+    }
+
+    #[test]
+    fn missing_result_must_be_covered_or_listed() {
+        let expected = BTreeSet::from(["off".into(), "on".into()]);
+        let actual = BTreeSet::from(["on".into()]);
+
+        assert_eq!(
+            validate_coverage(&expected, &actual, &[]),
+            Err("missing result case or uncovered reason for \"off\"".into())
+        );
+    }
+
+    #[test]
+    fn uncovered_result_requires_a_reason() {
+        let expected = BTreeSet::from(["off".into()]);
+        let actual = BTreeSet::new();
+        let uncovered = item("off", "  ");
+
+        assert_eq!(
+            validate_coverage(&expected, &actual, &[&uncovered]),
+            Err("uncovered result \"off\" needs a reason".into())
+        );
+    }
+
+    #[test]
+    fn newly_covered_result_makes_its_uncovered_entry_stale() {
+        let expected = BTreeSet::from(["off".into()]);
+        let actual = BTreeSet::from(["off".into()]);
+        let uncovered = item(
+            "off",
+            "The adapter cannot read the complete provider inventory.",
+        );
+
+        assert_eq!(
+            validate_coverage(&expected, &actual, &[&uncovered]),
+            Err("uncovered result \"off\" is covered by a runnable case; remove it".into())
+        );
+    }
+
+    #[test]
+    fn uncovered_list_is_reported_for_each_row() {
+        let uncovered = item(
+            "off",
+            "The adapter cannot read the complete provider inventory.",
+        );
+
+        assert_eq!(
+            coverage_report("antimalware_active", Os::Linux, &[&uncovered]),
+            vec![
+                "UNCOVERED antimalware_active linux off: The adapter cannot read the complete provider inventory.".to_owned()
+            ]
+        );
+        assert_eq!(
+            coverage_report("firewall", Os::Linux, &[]),
+            vec!["UNCOVERED firewall linux: none".to_owned()]
+        );
+    }
+
+    #[test]
+    fn uncovered_result_must_belong_to_the_table() {
+        let expected = BTreeSet::from(["off".into()]);
+        let actual = BTreeSet::new();
+        let uncovered = item("on", "No accepted source provides this result.");
+
+        assert_eq!(
+            validate_coverage(&expected, &actual, &[&uncovered]),
+            Err("uncovered result \"on\" is not in the table".into())
+        );
+    }
+
+    #[test]
+    fn uncovered_results_cannot_be_duplicated() {
+        let expected = BTreeSet::from(["off".into()]);
+        let actual = BTreeSet::new();
+        let first = item(
+            "off",
+            "The adapter cannot read the complete provider inventory.",
+        );
+        let second = item(
+            "off",
+            "The adapter cannot read the complete provider inventory.",
+        );
+
+        assert_eq!(
+            validate_coverage(&expected, &actual, &[&first, &second]),
+            Err("duplicate uncovered result \"off\"".into())
+        );
+    }
 }

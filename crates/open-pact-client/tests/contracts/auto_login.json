@@ -106,5 +106,17 @@
       "observed": "on",
       "difference": "Enabled flag alone establishes on without a target account; study: internal/jobs/review-contracts/report.md#auto_login-m-and-i"
     }
+  ],
+  "uncovered": [
+    {
+      "os": "linux",
+      "result": "on",
+      "reason": "The Linux adapter cannot identify the active display manager or verify its merged setting and target account."
+    },
+    {
+      "os": "linux",
+      "result": "off",
+      "reason": "The Linux adapter cannot identify the active display manager or verify complete merged configuration."
+    }
   ]
 }

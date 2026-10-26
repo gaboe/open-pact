@@ -302,5 +302,22 @@
       "observed": "le_5min",
       "difference": "Password grace alone is not total inactivity delay; study: internal/jobs/review-contracts/report.md#screen_lock-m-and-i"
     }
+  ],
+  "uncovered": [
+    {
+      "os": "macos",
+      "result": "le_5min",
+      "reason": "The macOS adapter accepts delay text but cannot consume the effective password requirement or idle and display-off trigger."
+    },
+    {
+      "os": "macos",
+      "result": "le_15min",
+      "reason": "The macOS adapter accepts delay text but cannot consume the effective password requirement or idle and display-off trigger."
+    },
+    {
+      "os": "macos",
+      "result": "gt_15min",
+      "reason": "The macOS adapter accepts delay text but cannot consume the effective password requirement or idle and display-off trigger."
+    }
   ]
 }
