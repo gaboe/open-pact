@@ -13,6 +13,8 @@ use std::collections::BTreeMap;
 use open_pact_core::{Control, ControlValue, Manifest, Os};
 use serde::{Deserialize, Serialize};
 
+use crate::folders::ManagedFolders;
+
 pub use hints::fix_hint;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -98,97 +100,172 @@ pub fn check_supported(manifest: &Manifest) -> Result<(), String> {
     }
 }
 
-type CheckFn = fn() -> ControlValue;
+#[allow(dead_code)]
+pub(crate) struct CheckInput<'a> {
+    pub(crate) control: &'a Control,
+    pub(crate) folders: &'a ManagedFolders,
+}
+
+type CheckFn = for<'a> fn(&CheckInput<'a>) -> ControlValue;
 type Registry = &'static [(&'static str, CheckFn)];
 
+macro_rules! ignore_input {
+    ($check:expr) => {
+        |_: &CheckInput<'_>| ($check)()
+    };
+}
+
 const MACOS: Registry = &[
-    ("os_auto_updates", macos_v3::os_auto_updates),
-    ("antimalware_realtime", macos_v3::antimalware_realtime),
-    ("antimalware_active_threats", macos_v3::not_applicable),
-    ("work_account", macos_v3::work_account),
-    ("uptime_days", macos_v3::uptime_days),
-    ("disk_encryption", || macos::disk_encryption().into()),
-    ("firewall", || macos::firewall().into()),
-    ("screen_lock", || macos::screen_lock().into()),
-    ("os_supported", || macos::os_supported().into()),
-    ("os_patch_age_days", macos::os_patch_age_days),
-    ("password_set", macos_v3::unknown),
-    ("auto_login", || macos::auto_login().into()),
-    ("secure_boot", macos_v3::unknown),
-    ("antimalware_active", || macos::antimalware_active().into()),
-    ("preboot_auth", macos_v3::preboot_auth),
+    ("os_auto_updates", ignore_input!(macos_v3::os_auto_updates)),
     (
-        "antimalware_signature_age_days",
-        macos_v3::antimalware_signature_age_days,
+        "antimalware_realtime",
+        ignore_input!(macos_v3::antimalware_realtime),
     ),
-    ("antimalware_full_scan_age_days", macos_v3::not_applicable),
-    ("web_protection", macos_v3::web_protection),
-    ("log_oldest_record_days", macos_v3::not_applicable),
-    ("process_audit", macos_v3::not_applicable),
-    ("powershell_logging", macos_v3::not_applicable),
-    ("log_cleared", macos_v3::not_applicable),
-];
-
-const LINUX: Registry = &[
-    ("os_auto_updates", linux_v3::os_auto_updates),
-    ("antimalware_realtime", linux_v3::antimalware_realtime),
-    ("antimalware_active_threats", macos_v3::unknown),
-    ("work_account", linux_v3::work_account),
-    ("uptime_days", linux_v3::uptime_days),
-    ("disk_encryption", || linux::disk_encryption().into()),
-    ("firewall", || linux::firewall().into()),
-    ("screen_lock", || linux::screen_lock().into()),
-    ("os_supported", || linux::os_supported().into()),
-    ("os_patch_age_days", linux::os_patch_age_days),
-    ("password_set", macos_v3::unknown),
-    ("auto_login", || linux::auto_login().into()),
-    ("secure_boot", || linux::secure_boot().into()),
-    ("antimalware_active", || linux::antimalware_active().into()),
-    ("preboot_auth", linux_v3::preboot_auth),
-    (
-        "antimalware_signature_age_days",
-        linux_v3::antimalware_signature_age_days,
-    ),
-    ("antimalware_full_scan_age_days", macos_v3::unknown),
-    ("web_protection", macos_v3::unknown),
-    ("log_oldest_record_days", linux_v3::log_oldest_record_days),
-    ("process_audit", macos_v3::not_applicable),
-    ("powershell_logging", macos_v3::not_applicable),
-    ("log_cleared", macos_v3::not_applicable),
-];
-
-const WINDOWS: Registry = &[
-    ("os_auto_updates", windows::os_auto_updates),
-    ("antimalware_realtime", windows::antimalware_realtime),
     (
         "antimalware_active_threats",
-        windows::antimalware_active_threats,
+        ignore_input!(macos_v3::not_applicable),
     ),
-    ("work_account", windows::work_account),
-    ("uptime_days", windows::uptime_days),
-    ("disk_encryption", windows::disk_encryption),
-    ("firewall", windows::firewall),
-    ("screen_lock", windows::screen_lock),
-    ("os_supported", windows::os_supported),
-    ("os_patch_age_days", windows::os_patch_age_days),
-    ("password_set", macos_v3::unknown),
-    ("auto_login", windows::auto_login),
-    ("secure_boot", windows::secure_boot),
-    ("antimalware_active", windows::antimalware_active),
-    ("preboot_auth", windows::preboot_auth),
+    ("work_account", ignore_input!(macos_v3::work_account)),
+    ("uptime_days", ignore_input!(macos_v3::uptime_days)),
+    (
+        "disk_encryption",
+        ignore_input!(|| macos::disk_encryption().into()),
+    ),
+    ("firewall", ignore_input!(|| macos::firewall().into())),
+    ("screen_lock", ignore_input!(|| macos::screen_lock().into())),
+    (
+        "os_supported",
+        ignore_input!(|| macos::os_supported().into()),
+    ),
+    ("os_patch_age_days", ignore_input!(macos::os_patch_age_days)),
+    ("password_set", ignore_input!(macos_v3::unknown)),
+    ("auto_login", ignore_input!(|| macos::auto_login().into())),
+    ("secure_boot", ignore_input!(macos_v3::unknown)),
+    (
+        "antimalware_active",
+        ignore_input!(|| macos::antimalware_active().into()),
+    ),
+    ("preboot_auth", ignore_input!(macos_v3::preboot_auth)),
     (
         "antimalware_signature_age_days",
-        windows::antimalware_signature_age_days,
+        ignore_input!(macos_v3::antimalware_signature_age_days),
     ),
     (
         "antimalware_full_scan_age_days",
-        windows::antimalware_full_scan_age_days,
+        ignore_input!(macos_v3::not_applicable),
     ),
-    ("web_protection", windows::web_protection),
-    ("log_oldest_record_days", windows::log_oldest_record_days),
-    ("process_audit", windows::process_audit),
-    ("powershell_logging", windows::powershell_logging),
-    ("log_cleared", windows::log_cleared),
+    ("web_protection", ignore_input!(macos_v3::web_protection)),
+    (
+        "log_oldest_record_days",
+        ignore_input!(macos_v3::not_applicable),
+    ),
+    ("process_audit", ignore_input!(macos_v3::not_applicable)),
+    (
+        "powershell_logging",
+        ignore_input!(macos_v3::not_applicable),
+    ),
+    ("log_cleared", ignore_input!(macos_v3::not_applicable)),
+];
+
+const LINUX: Registry = &[
+    ("os_auto_updates", ignore_input!(linux_v3::os_auto_updates)),
+    (
+        "antimalware_realtime",
+        ignore_input!(linux_v3::antimalware_realtime),
+    ),
+    (
+        "antimalware_active_threats",
+        ignore_input!(macos_v3::unknown),
+    ),
+    ("work_account", ignore_input!(linux_v3::work_account)),
+    ("uptime_days", ignore_input!(linux_v3::uptime_days)),
+    (
+        "disk_encryption",
+        ignore_input!(|| linux::disk_encryption().into()),
+    ),
+    ("firewall", ignore_input!(|| linux::firewall().into())),
+    ("screen_lock", ignore_input!(|| linux::screen_lock().into())),
+    (
+        "os_supported",
+        ignore_input!(|| linux::os_supported().into()),
+    ),
+    ("os_patch_age_days", ignore_input!(linux::os_patch_age_days)),
+    ("password_set", ignore_input!(macos_v3::unknown)),
+    ("auto_login", ignore_input!(|| linux::auto_login().into())),
+    ("secure_boot", ignore_input!(|| linux::secure_boot().into())),
+    (
+        "antimalware_active",
+        ignore_input!(|| linux::antimalware_active().into()),
+    ),
+    ("preboot_auth", ignore_input!(linux_v3::preboot_auth)),
+    (
+        "antimalware_signature_age_days",
+        ignore_input!(linux_v3::antimalware_signature_age_days),
+    ),
+    (
+        "antimalware_full_scan_age_days",
+        ignore_input!(macos_v3::unknown),
+    ),
+    ("web_protection", ignore_input!(macos_v3::unknown)),
+    (
+        "log_oldest_record_days",
+        ignore_input!(linux_v3::log_oldest_record_days),
+    ),
+    ("process_audit", ignore_input!(macos_v3::not_applicable)),
+    (
+        "powershell_logging",
+        ignore_input!(macos_v3::not_applicable),
+    ),
+    ("log_cleared", ignore_input!(macos_v3::not_applicable)),
+];
+
+const WINDOWS: Registry = &[
+    ("os_auto_updates", ignore_input!(windows::os_auto_updates)),
+    (
+        "antimalware_realtime",
+        ignore_input!(windows::antimalware_realtime),
+    ),
+    (
+        "antimalware_active_threats",
+        ignore_input!(windows::antimalware_active_threats),
+    ),
+    ("work_account", ignore_input!(windows::work_account)),
+    ("uptime_days", ignore_input!(windows::uptime_days)),
+    ("disk_encryption", ignore_input!(windows::disk_encryption)),
+    ("firewall", ignore_input!(windows::firewall)),
+    ("screen_lock", ignore_input!(windows::screen_lock)),
+    ("os_supported", ignore_input!(windows::os_supported)),
+    (
+        "os_patch_age_days",
+        ignore_input!(windows::os_patch_age_days),
+    ),
+    ("password_set", ignore_input!(macos_v3::unknown)),
+    ("auto_login", ignore_input!(windows::auto_login)),
+    ("secure_boot", ignore_input!(windows::secure_boot)),
+    (
+        "antimalware_active",
+        ignore_input!(windows::antimalware_active),
+    ),
+    ("preboot_auth", ignore_input!(windows::preboot_auth)),
+    (
+        "antimalware_signature_age_days",
+        ignore_input!(windows::antimalware_signature_age_days),
+    ),
+    (
+        "antimalware_full_scan_age_days",
+        ignore_input!(windows::antimalware_full_scan_age_days),
+    ),
+    ("web_protection", ignore_input!(windows::web_protection)),
+    (
+        "log_oldest_record_days",
+        ignore_input!(windows::log_oldest_record_days),
+    ),
+    ("process_audit", ignore_input!(windows::process_audit)),
+    (
+        "powershell_logging",
+        ignore_input!(windows::powershell_logging),
+    ),
+    ("log_cleared", ignore_input!(windows::log_cleared)),
 ];
 
 fn registry(os: Os) -> Registry {
@@ -200,13 +277,19 @@ fn registry(os: Os) -> Registry {
 }
 
 /// Runs the registered checks whose id is in `ids`, and no other.
-pub fn run(os: Os, ids: &[&str]) -> BTreeMap<String, ControlValue> {
+pub fn run(
+    os: Os,
+    controls: &[Control],
+    folders: &ManagedFolders,
+) -> BTreeMap<String, ControlValue> {
     registry(os)
         .iter()
-        .filter(|(id, _)| ids.contains(id))
-        .map(|(id, check)| {
-            let value = std::panic::catch_unwind(check).unwrap_or_else(|_| "unknown".into());
-            ((*id).to_string(), value)
+        .filter_map(|(id, check)| {
+            let control = controls.iter().find(|control| control.id == *id)?;
+            let input = CheckInput { control, folders };
+            let value =
+                std::panic::catch_unwind(|| check(&input)).unwrap_or_else(|_| "unknown".into());
+            Some(((*id).to_string(), value))
         })
         .collect()
 }
@@ -214,10 +297,20 @@ pub fn run(os: Os, ids: &[&str]) -> BTreeMap<String, ControlValue> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::folders::ManagedFolders;
 
     fn run_all(os: Os) -> BTreeMap<String, ControlValue> {
-        let ids: Vec<&str> = BUILTINS.iter().map(|(id, _)| *id).collect();
-        run(os, &ids)
+        let manifest =
+            Manifest::parse(include_bytes!("../../../../examples/manifest.toml")).unwrap();
+        let mut controls = manifest.body().controls.clone();
+        for (id, _) in BUILTINS {
+            if !controls.iter().any(|control| control.id == *id) {
+                let mut control = controls[0].clone();
+                control.id = (*id).to_string();
+                controls.push(control);
+            }
+        }
+        run(os, &controls, &ManagedFolders::default())
     }
 
     #[test]
@@ -231,8 +324,30 @@ mod tests {
 
     #[test]
     fn runs_only_the_requested_checks() {
-        let ran = run(Os::Windows, &["firewall", "not_a_check"]);
+        let manifest =
+            Manifest::parse(include_bytes!("../../../../examples/manifest.toml")).unwrap();
+        let controls = manifest
+            .body()
+            .controls
+            .iter()
+            .filter(|control| control.id == "firewall")
+            .cloned()
+            .collect::<Vec<_>>();
+        let ran = run(Os::Windows, &controls, &ManagedFolders::default());
         assert_eq!(ran.into_keys().collect::<Vec<_>>(), ["firewall"]);
+    }
+
+    #[test]
+    fn registries_ignore_check_input_for_the_same_control_ids() {
+        let manifest =
+            Manifest::parse(include_bytes!("../../../../examples/manifest.toml")).unwrap();
+        let folders = ManagedFolders::default();
+        for os in Os::ALL {
+            let controls = &manifest.body().controls;
+            let first = run(os, controls, &folders);
+            let second = run(os, controls, &folders);
+            assert_eq!(first, second, "{os}");
+        }
     }
 
     #[test]
