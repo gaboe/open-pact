@@ -34,7 +34,7 @@ When a control returns `n/a`, the client sends `n/a` only if the manifest allows
 
 ## Windows access limits
 
-Run `schedule install --system` from an elevated prompt to read machine-wide Windows settings. The SYSTEM task can read `preboot_auth`, `os_patch_age_days`, `log_oldest_record_days`, `process_audit`, and `log_cleared`. It can also inspect browser settings in other user profiles. The task reads settings. It does not change them.
+Set `[schedule].run_as = "system"` in `open-pact.toml` and run `apply` from an elevated PowerShell prompt to read machine-wide Windows settings. The SYSTEM task can read `preboot_auth`, `os_patch_age_days`, `log_oldest_record_days`, `process_audit`, and `log_cleared`. It can also inspect browser settings in other user profiles. The task reads settings. It does not change them.
 
 The limited Windows task runs as the current user. It may report `unknown` when Windows denies access. To trigger an extra report after a Security log clear, add the task user to the built-in `Event Log Readers` group. SYSTEM can read the Security log without that group. Without either access, the Security log clear trigger is unavailable.
 

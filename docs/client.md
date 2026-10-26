@@ -76,84 +76,97 @@ The client runs the checks in the signed manifest and sends one signed claim. It
 
 Run `open-pact-client log head` to show the last verified checkpoint. Run `open-pact-client log prove` to verify the inclusion proof for this device's enrolment. Run `open-pact-client log show` to print the local record of claims and gateway responses.
 
+## Declare the device configuration
+
+Run `open-pact-client config example` after enrolment. Copy the sections you need into `open-pact.toml` beside `manifest.toml` in the client home. The example includes the enrolled requirements as comments. It writes nothing.
+
+```toml
+[report]
+collector = "https://collector.internal.example.org/status"
+# Optional. Defaults to the collector host and port.
+# vpn_probe = "vpn.example.org:443"
+
+[schedule]
+enabled = true
+run_as = "user"
+
+[managed_repos]
+folders = ["~/work"]
+```
+
+Every section is optional. The client never writes this file. Unknown sections or keys cause an error that names the file and key. Folder entries must be absolute after `~` expands to your user home. The loader does not inspect those paths. Folder paths stay on the device. These folders are reserved for managed repository checks.
+
+Run `check` to see one row per manifest control. Each row shows the requirement for your OS, the device setting that feeds it, and the result. A missing or invalid configuration prints what to add or fix. Other controls still run.
+
 ## Send a report
 
-Use `report --dry-run` to inspect a report without sending it:
+Declare `[report].collector`, then inspect the signed payload:
 
 ```sh
-open-pact-client report --collector https://collector.example.org/status --dry-run
+open-pact-client report --dry-run
 ```
 
-The command prints the JSON report and its compact ES256 JWS. It sends nothing. The HTTPS collector must verify the JWS with the enrolled device's public key. A non-dry-run report sends the JWS to that collector. The collector must return an HTTP 2xx response.
+The command prints the JSON report and its compact ES256 JWS. It sends nothing. Run `open-pact-client report` to send it. The HTTPS collector must verify the JWS with the enrolled device's public key and return HTTP 2xx to acknowledge it.
 
-A report includes `spec_version` set to `1.1`, the device pseudonym in `device_id`, a random `report_id`, UTC time, client version in `solution`, OS name, and OS version. `device_id` is the enrolled device pseudonym, `pseudonym:` followed by the SHA-256 hash of its uncompressed SEC1 public key. The gateway stores this identifier. `solution` is `open-pact-client <version>`. `report_type` is `connect`, `event`, or `periodic`. Manual reports use `periodic`. A connection report takes precedence over a pending event. It also includes the key protection type and the results of the manifest checks. It does not include the public key. The gateway does not receive this report. It is a separate endpoint from the gateway claim API.
+A report includes `spec_version = "1.1"`, the enrolled device pseudonym in `device_id`, a random `report_id`, UTC time, client version, OS, key protection type, and manifest control results. `report_type` is `connect`, `event`, or `periodic`. Manual reports use `periodic`. Reports contain no public key or folder paths. The gateway does not receive this separate report.
 
-## Schedule reports while the VPN is connected
+## Apply the schedule
 
-Choose a collector URL that the device can reach only through the VPN. Install a schedule with the same client binary that you will keep at that path:
+Choose a collector that the device can reach only through the VPN. Set `[schedule].enabled = true`, then run:
 
 ```sh
-open-pact-client schedule install --collector https://collector.internal.example.org/status
+open-pact-client apply --dry-run
+open-pact-client apply
+open-pact-client apply
 ```
 
-The scheduler checks a TCP connection to the collector host every five minutes. It sends the first report after it detects a VPN connection. A transition from disconnected to connected also triggers a report. Otherwise, it sends again after at least 55 minutes have passed since the last acknowledged report. It checks the VPN probe before preparing the report and again before sending it. Set `--vpn-probe host:port` if the collector host is not a suitable probe. A failed send retries on a later run. A lost acknowledgement can cause a duplicate report.
+The first apply prints `schedule: install`. The second prints `no changes`. Dry run writes nothing. A collector or run-as edit produces `schedule: update`. Keep the client binary at its installed path. Use the same absolute `--home` for each apply.
 
-Every task run evaluates results against the signed manifest's requirements for this OS. A change from compliant to non-compliant triggers an extra report within the next five-minute run. Missing results and `unknown` count as non-compliant, without grace. Reported-only controls never trigger. The first acknowledged report sets a compliance baseline. The task replaces that baseline only after the collector acknowledges the results sent.
+The scheduled run reads the file each time. It probes the collector host and port every five minutes. Set `[report].vpn_probe = "host:port"` to override the target. Use brackets around IPv6 addresses. Both the collector and probe must be unreachable outside the VPN. A public collector does not prevent off-VPN sends.
 
-On Windows, a new Security event 1102 or any new Defender detection also triggers an extra report. A resolved detection still triggers. The first successful read of each event source sets its baseline. Later event marker advances are saved only after acknowledgment. The task sends at most one report per run.
+The job probes before report preparation and again before sending. It sends after a detected connection, then after at least 55 minutes since the last acknowledgment. A failed send retries later. A lost acknowledgment can cause a duplicate report. A required control that changes from compliant to non-compliant triggers an extra report. Missing results and `unknown` count as non-compliant without grace. Controls with no requirement do not trigger.
 
-The task evaluates locally while the VPN is down and holds detected events until the next connection. A compliance failure stays pending even if the control recovers before that connection. The connection report sends current results. A failed send keeps the event pending. Only acknowledgment clears it. Events before the first successful baseline read are part of that baseline.
+On Windows, a new Security event 1102 or Defender detection also triggers an event report. A limited task needs Event Log Readers access to read Security events. SYSTEM can read that log. The first successful read sets each event baseline. The job keeps pending events while offline. It sends at most one report per run. Only acknowledgment clears pending events.
 
-For a limited Windows task, add the task user to the built-in `Event Log Readers` group to read Security event 1102. A SYSTEM task can read the Security log without that group. Without either access, the Security log clear trigger is unavailable. The Defender detection trigger still works when Defender history is readable.
+macOS uses a launchd LaunchAgent. Linux uses a systemd user timer and needs a running user manager. Windows uses a limited Task Scheduler task when `run_as = "user"`.
 
-macOS uses a launchd LaunchAgent. Linux uses a systemd user timer and needs a running user manager. Windows uses a limited Task Scheduler task by default. No client daemon runs until you install the schedule.
+If an old job exists without `open-pact.toml`, `check` and `apply` print the content that reproduces it. Create that file before applying. Until then, apply changes nothing. Successful apply removes the old `report-schedule.json`. The imperative schedule install and uninstall commands and the report collector flag are removed.
 
-Uninstall the schedule before you remove the binary or its home directory:
+### Use Windows SYSTEM checks
 
-```sh
-open-pact-client schedule uninstall
-```
-
-Use the same `--home` value for install and uninstall. The schedule keeps its configuration and state in the client home. The command removes the operating-system job, schedule configuration, and report state.
-
-### Install a Windows SYSTEM task
-
-Run an elevated prompt to install the task as SYSTEM:
+Set `[schedule].run_as = "system"`. Run apply from an elevated PowerShell prompt:
 
 ```powershell
-open-pact-client --home 'C:\Example User\pact' schedule install --system --collector https://collector.internal.example.org/status
+open-pact-client --home 'C:\Example User\pact' apply
 ```
 
-The installer copies the binary to `%ProgramFiles%\open-pact\open-pact-client.exe`. It refuses a binary directory that non-administrators can write. SYSTEM reads the selected user's absolute `--home` path and stores report state under `%ProgramData%`. Choose a home path without `%`. The task reads Windows settings. It does not change them. See the [platform support table](platform-support.md) for controls that need SYSTEM or administrator access.
+Without elevation, apply prints the exact elevated command and changes nothing. Other operating systems reject `system`. The installer copies the client into `%ProgramFiles%\open-pact\open-pact-client.exe` and refuses a directory that non-administrators can write. SYSTEM reads the selected absolute client home and keeps report state under protected `%ProgramData%`. Choose a home path without `%`. The task reads Windows settings and does not change them. See [platform support](platform-support.md) for checks that need SYSTEM access.
 
-Remove a limited task with `open-pact-client --home 'C:\Example User\pact' schedule uninstall`. Run the command as the task user. If the command finds a SYSTEM task, use an elevated prompt and remove it with:
+### Stop reports and remove the client
 
-```powershell
-open-pact-client --home 'C:\Example User\pact' schedule uninstall --system
-```
+Set `[schedule].enabled = false` or remove the schedule section. Run `apply` with the same absolute `--home` before deleting the binary or client home. Apply removes the job, the applied-settings receipt, and report state. It keeps `open-pact.toml`. Run `stop` to print these instructions.
 
-SYSTEM uninstall can remove this home's limited or SYSTEM task. It also removes protected report state and cleans up the shared binary when no SYSTEM task uses it. Keep the absolute `--home` value from installation. If cleanup remains incomplete, retry from an elevated prompt after the client stops or after Windows restarts.
+SYSTEM removal needs elevation and uses the existing protected state lock. A held lock stops task removal and asks you to retry. Removal cleans up the shared binary only when no SYSTEM task uses it. If cleanup fails, retry apply after the client stops or Windows restarts. Keep the configuration file until cleanup succeeds.
 
 ## Understand what leaves the device
 
-`join` sends the invitation, signed manifest, owner and device public keys, and signatures that bind the owner, device, invitation, and manifest. It does not send private keys.
+`join` sends the invitation, signed manifest, owner and device public keys, and signatures that bind the owner, device, invitation, and manifest. It sends no private keys.
 
-`check` sends a signed claim. It includes the manifest hash, device pseudonym, public key, nonce, time, client version, OS, asserted trust level, and VPN request hash. The manifest lists this metadata and each control's allowed outputs. It can also list `virtualized` and `log_checkpoint`. The claim includes those fields only when the manifest lists them. The claim includes results only for controls in the manifest.
+`check` sends the signed claim fields that the manifest permits. These include control results and permitted device metadata. The VPN certificate request travels beside the claim. Its private key stays on the device. The client stores claims and responses in `claims.jsonl`.
 
-The VPN certificate request travels beside the signed claim. It contains the VPN public key. The private VPN key stays on the device. The gateway stores the signed claim and certificate hash, not the request. The client also stores each claim and response in `claims.jsonl`.
-
-`report` sends a separate signed JSON Web Signature to the HTTPS collector. It contains the fields listed above and the control results. It does not contain raw system logs or the device public key. A scheduled report uses this same payload and sends only when the VPN probe succeeds.
+`report` sends a separate signed payload to the HTTPS collector. It contains report metadata and control results. It contains no raw system logs, public key, or folder paths.
 
 ## Troubleshoot common failures
 
-| Symptom | Check |
+| Symptom | Action |
 | --- | --- |
-| Release verification fails | Get `scripts/verify-client-release.sh` from the matching repository tag or its source archive. Check that GitHub CLI and Cosign are installed. Run the script with a release tag. Install the matching binary from the printed directory after the script succeeds. |
-| `join` refuses the gateway | Confirm the invitation URL, company key fingerprint, HTTPS certificate, and pinned log key with the gateway operator. |
-| `check` reports a manifest hash mismatch | Get a new invitation for the current manifest. Run `join` with that invitation. Review the manifest. Sign its hash during `join`. Ask the gateway operator to approve the device again for the current manifest. `join` reuses the existing device key, so the device code stays the same. |
-| `check` says the device is pending | Give the device code to the gateway operator. Wait for approval. |
-| A check returns `unknown` on Windows | Run the task as an elevated administrator or install it with `schedule install --system` when the control needs machine-wide access. |
-| Windows event reports do not trigger | Check Event Log Readers access for the limited task user. Check that Defender history can be read. |
-| Linux schedule install cannot reach systemd | Start the user systemd manager. Run `schedule install` again. |
-| Schedule does not send | Check that the collector uses HTTPS, the VPN probe is reachable only through the VPN, and the binary remains at its installed path. |
-| `schedule uninstall` cannot find the job | Use the same absolute `--home` path that you used to install it. |
+| Release verification fails | Use the script from the matching release tag. Check GitHub CLI and Cosign. |
+| Join refuses the gateway | Confirm the invitation, company fingerprint, certificate, and log key with the operator. |
+| Manifest hash mismatch | Get a new invitation. Review and sign the current manifest. Ask the operator to approve the device. |
+| Device is pending | Give the device code to the operator. Wait for approval. |
+| Windows control returns unknown | Use SYSTEM or administrator access for machine-wide controls. |
+| Windows events do not trigger | Check Event Log Readers access and Defender history access. |
+| Apply cannot reach systemd | Start the user systemd manager. Run apply again. |
+| Schedule does not send | Check the HTTPS collector, VPN-only routing, probe, and binary path. |
+| Apply cannot find the job | Use the same absolute client home as the original apply. |
+| Apply names an unknown key | Correct the named section and key in open-pact.toml. Run apply again. |

@@ -132,7 +132,7 @@ run_as = "user"
 
 [managed_repos]
 # Use absolute paths or ~/ paths. Paths stay on this device.
-# Managed repository checks arrive in DS3.
+# These folders are reserved for managed repository checks.
 folders = []
 "#,
     );
@@ -179,6 +179,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn device_config_load_names_the_file_section_and_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_owned());
+        assert!(DeviceConfig::load(&home).unwrap().is_none());
+        std::fs::write(
+            home.file(FILE),
+            "[report]\ncollector = 'http://example.org'",
+        )
+        .unwrap();
+        let error = format!("{:#}", DeviceConfig::load(&home).unwrap_err());
+        assert!(
+            error.contains(FILE) && error.contains("[report].collector"),
+            "{error}"
+        );
+        std::fs::write(
+            home.file(FILE),
+            "[schedule]\nenabled = false\nrun_as = 'user'",
+        )
+        .unwrap();
+        assert!(DeviceConfig::load(&home).unwrap().unwrap().report.is_none());
+    }
+
+    #[test]
     fn device_config_example_is_valid_and_names_every_manifest_control() {
         let manifest =
             open_pact_core::Manifest::parse(include_bytes!("../../../examples/manifest.toml"))
@@ -193,7 +216,13 @@ mod tests {
 
     #[test]
     fn device_config_sections_and_expansion_need_no_filesystem() {
-        let config = DeviceConfig::parse(
+        let user_home = if cfg!(windows) {
+            Path::new(r"C:\Users\example")
+        } else {
+            Path::new("/home/example")
+        };
+        let absolute = user_home.join("work");
+        let text = format!(
             r#"
 [report]
 collector = "https://collector.example.org/status"
@@ -201,18 +230,15 @@ collector = "https://collector.example.org/status"
 enabled = true
 run_as = "user"
 [managed_repos]
-folders = ["~/missing", "/missing/work"]
+folders = ['~/missing', '{}']
 "#,
-            Some(Path::new("/home/example")),
-        )
-        .unwrap();
+            absolute.display()
+        );
+        let config = DeviceConfig::parse(&text, Some(user_home)).unwrap();
         assert_eq!(config.report.unwrap().probe(), "collector.example.org:443");
         assert_eq!(
             config.managed_repos.unwrap().folders,
-            [
-                PathBuf::from("/home/example/missing"),
-                PathBuf::from("/missing/work")
-            ]
+            [user_home.join("missing"), absolute]
         );
         assert_eq!(
             DeviceConfig::parse("", None).unwrap(),

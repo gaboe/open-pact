@@ -60,7 +60,7 @@ On Windows, `vpn/current` is a text pointer, not a directory. A pair reader read
 
 Windows replaces the flat copies sequentially, so they can briefly differ. The selected pair stays complete because readers use `vpn/current` and `vpn/<generation>/`. If a program holds a flat copy open, replacement can fail. The client keeps the new generation selected, marks the flat copies stale, and reports the locked file. Close the program that holds it and run `check` again. Every later start retries the flat-copy refresh. Startup recovery tries the VPN lock without waiting. If another process holds it, recovery warns and continues. `report`, `schedule`, and `log` never wait for the VPN lock. `install` and `check` take the lock. New Windows files and directories inherit the home ACL. The client does not preserve an explicit ACL from a replaced file.
 
-No job runs in the background unless you install a report schedule. Before you delete the binary and the directory, run `open-pact-client schedule uninstall`.
+No report job runs until you declare a schedule in `open-pact.toml` and run `open-pact-client apply`. Before you delete the binary or client home, set `[schedule].enabled = false` and run `apply`.
 
 ## Verify a release
 
@@ -337,7 +337,7 @@ Windows collects the controls in one cached PowerShell batch. A missing source, 
 
 Defender metrics require Defender in Normal mode with its antivirus and service enabled. Other antivirus providers return `unknown` for these metrics. Active threat counts describe Defender threats that are still active. Standard users get `unknown` for the controls that enforce elevation. Access failures also return `unknown`.
 
-On Windows, `preboot_auth`, `log_oldest_record_days`, `process_audit`, and `log_cleared` need SYSTEM or an elevated administrator. The `web_protection` check also needs SYSTEM to read browser settings for other user profiles. Install the report task with `schedule install --system` to run these checks as SYSTEM. The task reads Windows settings and reports their values. It does not change those settings.
+On Windows, `preboot_auth`, `log_oldest_record_days`, `process_audit`, and `log_cleared` need SYSTEM or an elevated administrator. The `web_protection` check also needs SYSTEM to read browser settings for other user profiles. Set `[schedule].run_as = "system"` in `open-pact.toml` and run `apply` from an elevated PowerShell prompt to run these checks as SYSTEM. The task reads Windows settings and reports their values. It does not change those settings.
 
 Windows `screen_lock` uses a machine inactivity limit first. Otherwise it reads the effective screen-saver policy before local desktop settings. It requires a positive timer, secure mode, and an existing `.scr` file. As SYSTEM, it reads the HKU hives of interactive users. The weakest readable user setting decides. Missing users, unloaded hives, and unreadable evidence return `unknown`.
 
@@ -365,11 +365,31 @@ The ClamAV parser uses the [documented database header](https://docs.clamav.net/
 
 ## Send a signed status report
 
-After `join`, send the manifest's check results to an HTTPS collector:
+After `join`, declare the device configuration in `open-pact.toml` next to the enrolled `manifest.toml`. Print a template with `open-pact-client config example`. The template includes the manifest requirements as comments. Copy the sections you need into the file. The client never writes this file.
+
+```toml
+[report]
+collector = "https://collector.internal.example.org/status"
+# Optional. The default is the collector host and port.
+# vpn_probe = "vpn.example.org:443"
+
+[schedule]
+enabled = true
+run_as = "user"
+
+[managed_repos]
+folders = ["~/work"]
+```
+
+Every section is optional. A scheduled job needs `[report].collector`. Folder paths must be absolute after `~` expands to the user's home. Loading does not inspect the filesystem. Folder paths stay on the device. These folders are reserved for managed repository checks.
+
+`check` prints each manifest control, its requirement for this OS, the device setting that feeds it, and the result. A missing or invalid configuration prints what to add or fix. Other controls still run.
+
+Send the manifest's check results to the configured HTTPS collector:
 
 ```sh
-open-pact-client report --collector https://collector.example.org/status --dry-run
-open-pact-client report --collector https://collector.example.org/status
+open-pact-client report --dry-run
+open-pact-client report
 ```
 
 `--dry-run` prints the JSON payload and its compact ES256 JWS. It sends nothing. The report uses the existing device key and pseudonym. The client checks the local manifest against the enrolled hash and runs the same checks as `check`.
@@ -380,20 +400,25 @@ The collector receives the compact JWS as `application/jose`. It must verify ES2
 
 ## Schedule reports while the VPN is connected
 
-Install a report job with an internal collector address reachable only through your VPN:
+Set `[schedule].enabled = true` in `open-pact.toml`, then reconcile the job:
 
 ```sh
-open-pact-client schedule install --collector https://collector.internal.example.org/status
-open-pact-client schedule uninstall
+open-pact-client apply --dry-run
+open-pact-client apply
+open-pact-client apply
 ```
 
-Use the same `--home` for installation and removal. Uninstall can remove the job after its home directory is missing when you pass the same absolute path. Keep the binary at its installed path. By default, the task runs under your OS user account. macOS uses a launchd LaunchAgent. Linux uses a systemd user timer and requires a running user manager. Windows uses Task Scheduler. These jobs run without a separate open-pact daemon. No job exists until you run `schedule install`.
+The first apply prints `schedule: install`. The second prints `no changes`. A collector or run-as change prints `schedule: update`. Dry run prints the planned change and writes nothing. Keep the binary at its installed path. macOS uses a launchd LaunchAgent. Linux uses a systemd user timer and needs a running user manager. Windows uses Task Scheduler. No separate client daemon is needed.
 
-On Windows, run `schedule install --system --collector https://collector.internal.example.org/status` from an elevated prompt to create a SYSTEM task with the highest run level. The installer copies the client into `%ProgramFiles%\open-pact\open-pact-client.exe` and refuses a directory that non-administrators can write. SYSTEM reads configuration, enrolment, manifest, and device key from the selected user's absolute `--home` path. It refuses reparse-point files. SYSTEM keeps its lock and report state under `%ProgramData%\open-pact\system\<home hash>`, with access limited to SYSTEM and Administrators. Choose a Windows home path without `%`. Run `schedule uninstall --system` from an elevated prompt with the same `--home`. Removal keeps the shared binary while another SYSTEM open-pact task remains. Without `--system`, Windows keeps the current-user, limited task. Other operating systems reject `--system`.
+Use the same absolute `--home` for each apply. The scheduled run reads `[report]` from `open-pact.toml` every time. To stop reports, set `enabled = false` or remove `[schedule]`, then run `apply`. The command removes the job and its report state. Keep the configuration file until removal succeeds.
+
+On Windows, set `run_as = "system"` and run `apply` from an elevated PowerShell prompt. Without elevation, apply prints the exact command and changes nothing. Other operating systems reject this run-as value. The installer copies the client into `%ProgramFiles%\open-pact\open-pact-client.exe` and refuses a directory that non-administrators can write. SYSTEM reads the selected user's absolute `--home` and refuses reparse-point files. It keeps report state under `%ProgramData%\open-pact\system\<home hash>`, with access limited to SYSTEM and Administrators. Choose a home path without `%`.
+
+If an older job exists without `open-pact.toml`, `check` and `apply` print the file content that reproduces it. Apply changes nothing until you create that file. A successful apply removes the old `report-schedule.json` configuration. The imperative schedule install and uninstall commands and the report collector flag are removed.
 
 The collector must have an internal address that is reachable only through the VPN. VPN routing makes off-VPN sends impossible. A public collector cannot meet this requirement, even with a separate VPN probe. A probe can succeed just before the VPN disconnects.
 
-Every five minutes, the job tries a TCP connection to the collector host and port, with a two-second timeout that includes name resolution. HTTPS uses port 443 unless the collector URL gives another port. Use `--vpn-probe host:port` to override this target. Choose a probe address that is unavailable outside the VPN. A successful connection records connectivity for this check. The job sends on the first observed connection and then when at least 55 minutes have passed since the last acknowledgement. The job checks the probe again after it prepares the report and before it starts the collector request. It sends nothing if either probe fails. DNS runs in a child process that the parent kills at the two-second deadline. A disconnect and reconnect entirely between two probes is not observed. A failed send retries on a later run. A lost acknowledgement can cause a duplicate report on retry. If the clock moves behind the last acknowledgement time, the next connected run retries and resets that time.
+Every five minutes, the job tries a TCP connection to the collector host and port, with a two-second timeout that includes name resolution. HTTPS uses port 443 unless the collector URL gives another port. Set `[report].vpn_probe = "host:port"` to override this target. Choose a probe address that is unavailable outside the VPN. A successful connection records connectivity for this check. The job sends on the first observed connection and then when at least 55 minutes have passed since the last acknowledgement. The job checks the probe again after it prepares the report and before it starts the collector request. It sends nothing if either probe fails. DNS runs in a child process that the parent kills at the two-second deadline. A disconnect and reconnect entirely between two probes is not observed. A failed send retries on a later run. A lost acknowledgement can cause a duplicate report on retry. If the clock moves behind the last acknowledgement time, the next connected run retries and resets that time.
 
 Every run evaluates the collected results against this OS's requirements in the signed manifest. A required control that changes from compliant to non-compliant triggers an extra report. Missing results and `unknown` count as non-compliant, regardless of grace. Controls with no requirement for this OS never trigger. The first acknowledged report sets the compliance baseline. Later acknowledgments replace that baseline with the results sent.
 
@@ -401,9 +426,9 @@ On Windows, Security event 1102 and any new Defender detection also trigger an e
 
 The job sends at most one report per five-minute run and sends nothing off VPN. It holds detected events and compliance failures while the VPN is down, even if the control recovers before reconnecting. The next detected connection sends a `connect` report with current results. Only acknowledgment clears the pending event. Events before the first successful baseline read are part of that baseline.
 
-The client home holds `report-schedule.json`. Limited jobs also keep `report-state.json` and `report-schedule.lock` there. SYSTEM jobs keep `report-state.json` in their protected state directory and use a sibling `<home hash>.lock` file. The state records the last observed VPN state, a pending reconnect report, the last acknowledged report time, Windows event times, the last acknowledged per-control compliance, and a pending event flag. A lock prevents overlapping runs. Reinstallation replaces this home's job and resets its report state. Each home has a separate job name. `schedule uninstall` removes the limited OS job, its generated files, and its user-home configuration and report state. On Windows, this mode never accesses protected ProgramData or Program Files paths. It refuses a SYSTEM task or a denied task query and asks you to run `schedule uninstall --system` from an elevated prompt.
+The client home holds the user-authored `open-pact.toml`, an applied-settings receipt in `schedule-applied.json`, and `report-schedule.lock`. Limited jobs also keep `report-state.json` there. SYSTEM jobs keep report state in their protected directory and use a sibling `<home hash>.lock` file. State records connectivity, acknowledged reports, compliance, and pending events. A lock prevents overlapping commands. Each client home has its own job name. Updates reset report state.
 
-Windows `schedule uninstall --system` requires elevation. It removes this home's task, whether SYSTEM or limited, and its protected state directory under the state lock. A held state lock leaves the task in place and asks you to retry. Cleanup uses the files that remain, so it also works after a failed removal, a replacement limited task, or a missing home. When no SYSTEM task remains, it removes pending binary leftovers and renames the shared binary for deletion at the next reboot. It lists remaining files and returns an error while cleanup remains incomplete, including queued files that still exist. Retry from an elevated prompt after the binary stops or after reboot. Lock files remain. `stop` prints the removal command with the home path quoted for POSIX shells, or PowerShell on Windows. On Unix, new scheduler homes have mode `0700`. Configuration and state files have mode `0600`, or keep stricter owner permissions on replacement. Collector request errors omit the URL so query tokens do not enter the error log.
+Windows removal uses the existing SYSTEM cleanup path when a SYSTEM task or protected state remains. It requires elevation. A held state lock stops removal before the task changes and asks you to retry. Cleanup keeps the shared binary while another SYSTEM task uses it. Otherwise, it queues the binary for deletion at reboot. Incomplete cleanup returns an error and lists the remaining files. Retry `apply` from an elevated prompt after the client stops or Windows restarts. Lock files remain. `stop` prints the declarative removal instructions. On Unix, new scheduler homes use mode `0700`. State files use mode `0600` or keep stricter owner permissions. Collector request errors omit the URL.
 
 ## Log-clearing output
 

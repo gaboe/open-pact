@@ -378,15 +378,6 @@ fn save<T: Serialize>(home: &Home, name: &str, value: &T) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn uninstall_command(home: &Path) -> String {
-    let raw = home.to_string_lossy();
-    #[cfg(windows)]
-    let quoted = format!("'{}'", raw.replace('\'', "''"));
-    #[cfg(not(windows))]
-    let quoted = format!("'{}'", raw.replace('\'', "'\"'\"'"));
-    format!("open-pact-client --home {quoted} apply")
-}
-
 fn text(path: &Path) -> Result<&str> {
     let text = path.to_str().context("scheduler paths must be UTF-8")?;
     if text.chars().any(char::is_control) {
@@ -636,6 +627,14 @@ fn systemd_dir() -> Result<PathBuf> {
     .join("systemd/user"))
 }
 
+fn systemd_status(timer: &str, query: &str) -> Result<bool> {
+    Ok(std::process::Command::new("systemctl")
+        .args(["--user", query, timer])
+        .output()?
+        .status
+        .success())
+}
+
 fn launch_domain() -> Result<String> {
     let output = std::process::Command::new("id").arg("-u").output()?;
     let uid = String::from_utf8(output.stdout)?
@@ -691,7 +690,11 @@ fn register(job: &Job, action: RegistrationAction) -> Result<()> {
                 std::fs::write(&timer, job.timer())?;
                 execute("systemctl", &["--user", "daemon-reload"])?;
                 execute("systemctl", &["--user", "enable", "--now", &timer_name])?;
-            } else if timer.exists() || service.exists() {
+            } else if timer.exists()
+                || service.exists()
+                || systemd_status(&timer_name, "is-active")?
+                || systemd_status(&timer_name, "is-enabled")?
+            {
                 execute("systemctl", &["--user", "disable", "--now", &timer_name])?;
                 execute(
                     "systemctl",
@@ -1167,16 +1170,8 @@ fn observe(home: &Home, desired: Option<&Applied>) -> Result<Observed> {
             let service = read_text_if_exists(&dir.join(format!("{}.service", job.id)))?;
             let timer = read_text_if_exists(&dir.join(format!("{}.timer", job.id)))?;
             let timer_name = format!("{}.timer", job.id);
-            let active = std::process::Command::new("systemctl")
-                .args(["--user", "is-active", &timer_name])
-                .output()?
-                .status
-                .success();
-            let enabled = std::process::Command::new("systemctl")
-                .args(["--user", "is-enabled", &timer_name])
-                .output()?
-                .status
-                .success();
+            let active = systemd_status(&timer_name, "is-active")?;
+            let enabled = systemd_status(&timer_name, "is-enabled")?;
             Observed {
                 exists: service.is_some() || timer.is_some() || active || enabled,
                 matches: service.as_deref() == Some(job.service().as_str())
@@ -1251,7 +1246,7 @@ pub(crate) fn migration_example(home: &Home) -> Result<bool> {
     Ok(true)
 }
 
-fn apply_command(home: &Path) -> String {
+pub(crate) fn apply_command(home: &Path) -> String {
     #[cfg(windows)]
     {
         format!(
@@ -1296,6 +1291,17 @@ pub(crate) async fn apply(home: &Home, dry_run: bool) -> Result<()> {
     } else {
         None
     };
+    if desired
+        .as_ref()
+        .is_some_and(|settings| settings.run_as == RunAs::System)
+        && windows_require_elevation().is_err()
+    {
+        println!(
+            "Run this exact command from an elevated PowerShell prompt:\n{}",
+            apply_command(&home.0)
+        );
+        return Ok(());
+    }
     let observed = observe(&home, desired.as_ref())?;
     let system = observed.system
         || desired
@@ -1507,6 +1513,137 @@ async fn operate(home: &Home, command: Operation, home_locked: bool) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires a built OPEN_PACT_CLIENT_BIN; all scheduler commands use a fixture mock"]
+    fn declarative_cli_with_mock_scheduler() {
+        use std::os::unix::fs::PermissionsExt;
+        let binary = std::env::var_os("OPEN_PACT_CLIENT_BIN")
+            .expect("build the client and set OPEN_PACT_CLIENT_BIN");
+        let root = tempfile::Builder::new()
+            .prefix("open-pact-example-")
+            .tempdir()
+            .unwrap();
+        let user = root.path().join("home");
+        let path = user.join(".config/open-pact");
+        let mock = root.path().join("bin");
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::create_dir(&mock).unwrap();
+        let home = enrolled_home(&path);
+        let mut enrollment: crate::Enrolment = home.enrolment().unwrap();
+        enrollment.gateway = "http://127.0.0.1:1".into();
+        home.write("enrolment.json", &serde_json::to_vec(&enrollment).unwrap())
+            .unwrap();
+        let launchctl = mock.join("launchctl");
+        std::fs::write(
+            &launchctl,
+            r#"#!/bin/sh
+case "$1" in
+  print) test -f "$OPEN_PACT_MOCK/loaded" ;;
+  bootstrap) echo bootstrap >> "$OPEN_PACT_MOCK/changes"; touch "$OPEN_PACT_MOCK/loaded" ;;
+  bootout) echo bootout >> "$OPEN_PACT_MOCK/changes"; rm -f "$OPEN_PACT_MOCK/loaded" ;;
+  *) exit 99 ;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&launchctl, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut transcript = String::new();
+        let mut run = |args: &[&str], success: bool, expected: &str| {
+            let output = std::process::Command::new(&binary)
+                .args(args)
+                .env("HOME", &user)
+                .env("OPEN_PACT_MOCK", root.path())
+                .env(
+                    "PATH",
+                    format!("{}:{}", mock.display(), std::env::var("PATH").unwrap()),
+                )
+                .env_remove("HTTP_PROXY")
+                .env_remove("HTTPS_PROXY")
+                .env_remove("ALL_PROXY")
+                .output()
+                .unwrap();
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            transcript.push_str(&format!(
+                "$ open-pact-client {}\n{text}exit: {:?}\n",
+                args.join(" "),
+                output.status.code()
+            ));
+            assert_eq!(output.status.success(), success, "{text}");
+            assert!(text.contains(expected), "{text}");
+            text
+        };
+        let before = std::fs::read_dir(&path).unwrap().count();
+        let example = run(&["config", "example"], true, "[managed_repos]");
+        DeviceConfig::parse(&example, Some(&user)).unwrap();
+        assert_eq!(std::fs::read_dir(&path).unwrap().count(), before);
+        let write = |collector: &str, schedule: &str| {
+            std::fs::write(home.file(crate::device_config::FILE), format!("[report]\ncollector = '{collector}'\n{schedule}\n[managed_repos]\nfolders = ['~/work']\n")).unwrap();
+        };
+        let enabled = "[schedule]\nenabled = true\nrun_as = 'user'";
+        write("https://collector.example.org/status", enabled);
+        run(&["apply", "--dry-run"], true, "schedule: install");
+        assert!(!root.path().join("changes").exists());
+        run(&["apply"], true, "schedule: install");
+        assert!(!home.file(CONFIG).exists());
+        let report = run(&["report", "--dry-run"], true, "spec_version");
+        assert!(!report.contains("~/work"));
+        assert!(!report.contains(user.join("work").to_str().unwrap()));
+        let changes = std::fs::read(root.path().join("changes")).unwrap();
+        run(&["apply"], true, "no changes");
+        assert_eq!(std::fs::read(root.path().join("changes")).unwrap(), changes);
+        write("https://other.example.org/status", enabled);
+        run(&["apply"], true, "schedule: update");
+        run(&["apply"], true, "no changes");
+        std::fs::remove_file(root.path().join("loaded")).unwrap();
+        run(&["apply"], true, "schedule: update");
+        write(
+            "https://other.example.org/status",
+            "[schedule]\nenabled = false\nrun_as = 'user'",
+        );
+        run(&["apply"], true, "schedule: remove");
+        assert!(!home.file(STATE).exists());
+        assert!(!home.file(APPLIED).exists());
+        run(&["apply"], true, "no changes");
+        write("https://collector.example.org/status", enabled);
+        run(&["apply"], true, "schedule: install");
+        write("https://collector.example.org/status", "");
+        run(&["apply"], true, "schedule: remove");
+        write("https://collector.example.org/status", enabled);
+        std::fs::write(
+            home.file(crate::device_config::FILE),
+            "[schedule]\nenabled = true\nrun_as = 'user'\nextra = 1",
+        )
+        .unwrap();
+        let changes = std::fs::read(root.path().join("changes")).unwrap();
+        run(&["apply"], false, "extra");
+        assert_eq!(std::fs::read(root.path().join("changes")).unwrap(), changes);
+        run(&["check"], false, "Other controls will still run");
+        std::fs::remove_file(home.file(crate::device_config::FILE)).unwrap();
+        let check = run(&["check"], false, "Create ");
+        assert!(check.contains("control | manifest requirement | device setting | result"));
+        assert!(check.contains("firewall |"));
+        save(
+            &home,
+            CONFIG,
+            &Config::new("https://legacy.example.org/status".into(), None).unwrap(),
+        )
+        .unwrap();
+        let legacy = std::fs::read(home.file(CONFIG)).unwrap();
+        run(&["apply"], true, "https://legacy.example.org/status");
+        assert_eq!(std::fs::read(home.file(CONFIG)).unwrap(), legacy);
+        run(&["check"], false, "https://legacy.example.org/status");
+        assert_eq!(std::fs::read(root.path().join("changes")).unwrap(), changes);
+        println!("{transcript}");
+        if let Some(output) = std::env::var_os("OPEN_PACT_CLI_TRANSCRIPT") {
+            std::fs::write(output, transcript).unwrap();
+        }
+    }
 
     #[test]
     fn imperative_setup_commands_are_removed() {
@@ -1962,10 +2099,10 @@ Write-Output 'refused'
 
     #[cfg(unix)]
     #[test]
-    fn uninstall_command_preserves_shell_metacharacters() {
+    fn apply_command_preserves_shell_metacharacters() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home with 'quotes' $cash `false` ; & end");
-        let command = uninstall_command(&home);
+        let command = apply_command(&home);
         let output = std::process::Command::new("sh")
             .args([
                 "-c",

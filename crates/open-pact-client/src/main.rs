@@ -1426,7 +1426,7 @@ fn print_hints(
 }
 
 async fn check(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
-    schedule::migration_example(home)?;
+    let migrating = schedule::migration_example(home)?;
     let device_config = match device_config::DeviceConfig::load(home) {
         Ok(Some(config)) => Some(config),
         Ok(None) => {
@@ -1459,6 +1459,9 @@ async fn check(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
     let device = DeviceKey::load(&home.0)?;
     let os = current_os()?;
 
+    if device_config.is_none() && !migrating {
+        print!("{}", device_config::example(&manifest, os));
+    }
     let results = collect_results(&manifest, os, device_config.as_ref());
     device_config::print_table(&manifest, os, device_config.as_ref(), &results);
     let http = http_client()?;
@@ -1736,7 +1739,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Command::Stop => {
             println!(
                 "Set [schedule].enabled = false in open-pact.toml, then run `{}` to stop scheduled reports.",
-                schedule::uninstall_command(&home.0)
+                schedule::apply_command(&home.0)
             );
             println!("To uninstall, delete the binary and {}.", home.0.display());
             Ok(ExitCode::SUCCESS)
@@ -2136,6 +2139,7 @@ mod tests {
     async fn check_with_response_checkpoint(
         response: impl FnOnce(&Company, &Witness, &[Entry], u64) -> Option<String>,
         pair: impl FnOnce(&KeyPair) -> VpnPair,
+        device_config: Option<&str>,
     ) -> (
         Result<ExitCode>,
         BTreeMap<String, Vec<u8>>,
@@ -2201,6 +2205,10 @@ mod tests {
         .await;
         let home = enrolled_home_with(dir.path(), &gateway.url, &company, &toml);
         home.write(LOG_CHECKPOINT, before_claim.as_bytes()).unwrap();
+        if let Some(config) = device_config {
+            home.write(crate::device_config::FILE, config.as_bytes())
+                .unwrap();
+        }
         let before = snapshot(dir.path());
 
         let code = check(&home, false).await;
@@ -2428,7 +2436,7 @@ mod tests {
         let mut accepted = Vec::new();
         for (case, pair) in cases {
             let (code, before, after, _) =
-                check_with_response_checkpoint(grown_checkpoint, pair).await;
+                check_with_response_checkpoint(grown_checkpoint, pair, None).await;
             let failed = code.as_ref().is_err() || code.as_ref().unwrap() != &ExitCode::SUCCESS;
             let kept = ["ca.pem", "vpn-cert.pem", "vpn-key.pem"]
                 .iter()
@@ -2442,9 +2450,38 @@ mod tests {
 
     #[cfg(any(unix, windows))]
     #[tokio::test]
+    async fn invalid_device_config_still_sends_all_manifest_controls() {
+        use base64::Engine;
+        let (code, _, after, _) = check_with_response_checkpoint(
+            grown_checkpoint,
+            valid_pair,
+            Some("[managed_repos]\nfolders = ['relative-private-folder']"),
+        )
+        .await;
+        assert_eq!(code.unwrap(), ExitCode::SUCCESS);
+        let record: locallog::Record = serde_json::from_slice(&after["claims.jsonl"]).unwrap();
+        let sent: Value = serde_json::from_slice(&record.sent().unwrap()).unwrap();
+        let payload = sent["jws"].as_str().unwrap().split('.').nth(1).unwrap();
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload)
+            .unwrap();
+        let claim: Value = serde_json::from_slice(&bytes).unwrap();
+        let manifest = Manifest::parse(&after["manifest.toml"]).unwrap();
+        assert_eq!(
+            claim["results"].as_object().unwrap().len(),
+            manifest.body().controls.len()
+        );
+        assert!(
+            !String::from_utf8(bytes)
+                .unwrap()
+                .contains("relative-private-folder")
+        );
+    }
+
+    #[tokio::test]
     async fn check_installs_the_certificate_of_a_verified_response_checkpoint() {
         let (code, before, after, pair) =
-            check_with_response_checkpoint(grown_checkpoint, valid_pair).await;
+            check_with_response_checkpoint(grown_checkpoint, valid_pair, None).await;
         assert_eq!(code.unwrap(), ExitCode::SUCCESS);
         assert_eq!(after["ca.pem"], pair.ca.as_bytes());
         assert_eq!(after["vpn-cert.pem"], pair.cert.unwrap().as_bytes());
@@ -2495,7 +2532,7 @@ mod tests {
         ];
         for (case, response) in cases {
             let (code, before, after, _) =
-                check_with_response_checkpoint(response, valid_pair).await;
+                check_with_response_checkpoint(response, valid_pair, None).await;
             assert_eq!(code.unwrap(), ExitCode::from(2), "{case}: log alarm");
             for file in ["ca.pem", "vpn-cert.pem", LOG_CHECKPOINT] {
                 assert_eq!(after[file], before[file], "{case}: {file} unchanged");
