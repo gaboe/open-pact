@@ -59,6 +59,11 @@ enum Command {
     },
     /// Run the manifest's checks, send a signed claim and fetch a VPN certificate
     Check,
+    /// Manage folders that the device owner approves for repository checks
+    Folders {
+        #[command(subcommand)]
+        command: FoldersCommand,
+    },
     /// Send a signed status report to an HTTPS collector
     Report {
         #[arg(long)]
@@ -78,6 +83,16 @@ enum Command {
     },
     /// Show how to stop scheduled reports and remove the client
     Stop,
+}
+
+#[derive(Subcommand)]
+enum FoldersCommand {
+    /// Register a folder
+    Add { path: PathBuf },
+    /// Remove a registered folder
+    Remove { path: PathBuf },
+    /// List registered folders
+    List,
 }
 
 #[derive(Subcommand)]
@@ -645,14 +660,18 @@ fn virtualized() -> Virtualized {
 }
 
 fn collect_results(manifest: &Manifest, os: Os) -> BTreeMap<String, open_pact_core::ControlValue> {
+    collect_results_with_folders(manifest, os, &folders::ManagedFolders::default())
+}
+
+fn collect_results_with_folders(
+    manifest: &Manifest,
+    os: Os,
+    folders: &folders::ManagedFolders,
+) -> BTreeMap<String, open_pact_core::ControlValue> {
     disclosable(
         manifest,
         os,
-        checks::run(
-            os,
-            &manifest.body().controls,
-            &folders::ManagedFolders::default(),
-        ),
+        checks::run(os, &manifest.body().controls, folders),
     )
 }
 
@@ -1412,6 +1431,13 @@ fn print_hints(
 }
 
 async fn check(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
+    let managed_folders = match folders::ManagedFolders::load(home) {
+        Ok(folders) => folders,
+        Err(error) => {
+            eprintln!("managed folders: {error:#}");
+            folders::ManagedFolders::default()
+        }
+    };
     let mut enrolment = home.enrolment()?;
     check_scheme(&enrolment.gateway, insecure_dev)?;
     home.recover_vpn()?;
@@ -1436,7 +1462,7 @@ async fn check(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
             return Ok(ExitCode::from(2));
         }
     };
-    let results = collect_results(&manifest, os);
+    let results = collect_results_with_folders(&manifest, os, &managed_folders);
     let gateway = base(&enrolment.gateway);
     let log_checkpoint = disclosable_checkpoint(&manifest, home.checkpoint()?);
     let nonce: Nonce = http
@@ -1664,6 +1690,27 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             software_key,
         } => join(&home, &invitation, yes, software_key, cli.insecure_dev).await,
         Command::Check => check(&home, cli.insecure_dev).await,
+        Command::Folders { command } => {
+            let mut managed = folders::ManagedFolders::load(&home)?;
+            match command {
+                FoldersCommand::Add { path } => {
+                    let registered = managed.add(&path)?;
+                    managed.save(&home)?;
+                    println!("registered {}", registered.display());
+                }
+                FoldersCommand::Remove { path } => {
+                    let removed = managed.remove(&path)?;
+                    managed.save(&home)?;
+                    println!("removed {}", removed.display());
+                }
+                FoldersCommand::List => {
+                    for path in managed.list() {
+                        println!("{}", path.display());
+                    }
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Report { collector, dry_run } => {
             report::run(&home, &collector, dry_run).await?;
             Ok(ExitCode::SUCCESS)
