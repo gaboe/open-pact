@@ -1,3 +1,4 @@
+import hashlib
 import platform as host_platform
 import re
 import subprocess
@@ -59,12 +60,30 @@ try:
     home = "/home/fictional-timer/pact"
     user_args = ["runuser", "-u", "fictional-timer", "--", "env", f"XDG_RUNTIME_DIR=/run/user/{uid}"]
     execute(*user_args, f"OPEN_PACT_SCHEDULE_FIXTURE={home}", "open-pact-checks", "prepare_linux_schedule_home", "--ignored", "--nocapture")
-    installed = execute(*user_args, "open-pact-client", "--home", home, "schedule", "install", "--collector", "https://collector.example.org/status", "--vpn-probe", "127.0.0.1:9").stdout
-    task = re.search(r"Installed ([^ ]+)\.", installed).group(1)
+    def write_schedule(enabled):
+        config = (
+            "[report]\n"
+            'collector = "https://collector.example.org/status"\n'
+            'vpn_probe = "127.0.0.1:9"\n\n'
+            "[schedule]\n"
+            f"enabled = {str(enabled).lower()}\n"
+            'run_as = "user"\n'
+        )
+        code = f"from pathlib import Path; Path({home!r}, 'open-pact.toml').write_text({config!r})"
+        execute(*user_args, "python3", "-c", code)
+
+    write_schedule(True)
+    installed = execute(*user_args, "open-pact-client", "--home", home, "apply").stdout
+    assert "schedule: install" in installed, installed
+    task = "org.open-pact.report." + hashlib.sha256(home.encode()).hexdigest()[:16]
     assert execute(*user_args, "systemctl", "--user", "is-active", task + ".timer").stdout.strip() == "active"
     execute(*user_args, "systemctl", "--user", "start", task + ".service")
     assert execute(*user_args, "systemctl", "--user", "show", task + ".service", "--property=Result", "--value").stdout.strip() == "success"
-    execute(*user_args, "open-pact-client", "--home", home, "schedule", "uninstall")
+    write_schedule(False)
+    removed = execute(*user_args, "open-pact-client", "--home", home, "apply").stdout
+    assert "schedule: remove" in removed, removed
+    assert execute(*user_args, "systemctl", "--user", "is-active", task + ".timer", check=False).returncode != 0
+    assert execute(*user_args, "systemctl", "--user", "is-enabled", task + ".timer", check=False).returncode != 0
     print("PASS native systemd user timer install, run off VPN, and uninstall", flush=True)
 
     def marker():

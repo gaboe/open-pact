@@ -7,7 +7,8 @@
       "input": [],
       "now": "2026-10-26T12:00:00Z",
       "expected": "unknown",
-      "known_diff": null
+      "known_diff": "The registered Linux check discovers browsers from native filesystem paths that the contract adapter cannot supply.",
+      "unrepresentable_input": "The adapter cannot provide Linux package roots, XDG configuration, browser profiles, system policies, or sandbox inventory."
     },
     {
       "name": "windows-2",
@@ -104,7 +105,7 @@
       ],
       "now": "2026-10-26T12:00:00Z",
       "expected": "off",
-      "known_diff": "pending integration",
+      "known_diff": "The adapter cannot express profile directory-entry types.",
       "unrepresentable_input": "The browser adapter accepts policy JSON, not profile entry types."
     },
     {
@@ -126,6 +127,23 @@
       "now": "2026-10-26T12:00:00Z",
       "expected": "off",
       "known_diff": null
+    }
+  ],
+  "uncovered": [
+    {
+      "os": "linux",
+      "result": "off",
+      "reason": "The adapter cannot provide Linux package roots, XDG configuration, browser profiles, system policies, or sandbox inventory."
+    },
+    {
+      "os": "linux",
+      "result": "on",
+      "reason": "The adapter cannot provide Linux package roots, XDG configuration, browser profiles, system policies, or sandbox inventory."
+    },
+    {
+      "os": "linux",
+      "result": "unknown",
+      "reason": "The adapter cannot provide Linux package roots, XDG configuration, browser profiles, system policies, or sandbox inventory."
     }
   ]
 }

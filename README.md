@@ -442,8 +442,9 @@ On Windows, TPM protection requires an elevated administrator join. A non-elevat
 
 An elevated administrator Windows join tries a non-exportable ECDSA P-256 key in the TPM through the
 Microsoft Platform Crypto Provider. The private key does not leave the TPM.
-The machine-scope key grants use to the joining user and SYSTEM, so either scheduler
-mode can sign reports. Other users do not receive key access.
+The machine-scope key ACL is configured for the joining user and SYSTEM. Other users do
+not receive explicit access. Hosted Windows CI did not verify signing under a standard-user
+or SYSTEM task token, so scheduler use under those tokens remains unverified.
 Creation requires an elevated administrator prompt. If the provider is unavailable,
 the client warns and uses a software key. `--software-key` forces software on a new home.
 Existing software keys stay in use. Before rotation, remove the old schedule and run

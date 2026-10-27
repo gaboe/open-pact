@@ -21,7 +21,6 @@ pub(crate) fn run(id: &str, case: &Case) -> ControlValue {
             crate::checks::macos_v3::parse_groups(text, &admins)
         }
         "uptime_days" => parse_uptime(text),
-        "preboot_auth" => parse_preboot(text).into(),
         "antimalware_signature_age_days" => parse_cvd_header(text.as_bytes()).map_or_else(
             || "unknown".into(),
             |date| super::super::buckets::elapsed_age_days(date, case.now(), 3650),

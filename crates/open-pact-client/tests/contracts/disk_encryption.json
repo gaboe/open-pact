@@ -41,7 +41,7 @@
       "expected": "partial",
       "known_diff": null,
       "observed": "full",
-      "difference": "FileVault parser does not report incomplete conversion; study: internal/jobs/review-contracts/report.md#disk_encryption-m-and-i"
+      "difference": "FileVault parser does not report incomplete conversion"
     },
     {
       "name": "linux-5",
@@ -94,7 +94,7 @@
       "expected": "full",
       "known_diff": null,
       "observed": "unknown",
-      "difference": "Collector uses undocumented Shell numbers instead of conversion and protection status; study: internal/jobs/review-contracts/report.md#disk_encryption-m-and-i"
+      "difference": "Collector uses undocumented Shell numbers instead of conversion and protection status"
     },
     {
       "name": "documented-conversion-protection-2-0",
@@ -107,7 +107,7 @@
       "expected": "partial",
       "known_diff": null,
       "observed": "unknown",
-      "difference": "Collector uses undocumented Shell numbers instead of conversion and protection status; study: internal/jobs/review-contracts/report.md#disk_encryption-m-and-i"
+      "difference": "Collector uses undocumented Shell numbers instead of conversion and protection status"
     },
     {
       "name": "documented-conversion-protection-0-0",
@@ -120,7 +120,7 @@
       "expected": "none",
       "known_diff": null,
       "observed": "unknown",
-      "difference": "Collector uses undocumented Shell numbers instead of conversion and protection status; study: internal/jobs/review-contracts/report.md#disk_encryption-m-and-i"
+      "difference": "Collector uses undocumented Shell numbers instead of conversion and protection status"
     },
     {
       "name": "missing-source",

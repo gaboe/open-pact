@@ -13,8 +13,8 @@ Each case has these fields.
 | `now` | Fixed UTC observation time. The runner never supplies the host clock to a parser. |
 | `expected` | Exact typed result. An integer, a string, and JSON null remain distinct. |
 | `observed` | Current parser result when it differs from `expected`. The test asserts this result and reports the difference. |
-| `difference` | Reason and study reference for the current parser difference. Required with `observed`. |
-| `known_diff` | Reason and study reference for an unimplemented contract. `pending integration` identifies the two pending branches. A runnable case with this marker fails: remove it if the case passes, or use `observed` and `difference` for a current difference. |
+| `difference` | Public reason for the current parser difference. Required with `observed`. |
+| `known_diff` | Public reason the current adapter cannot meet this case. Pair it with `unrepresentable_input` to skip the case. A runnable case with this marker fails: remove it if the case passes, or use `observed` and `difference` for a current difference. |
 | `unrepresentable_input` | Evidence the current adapter cannot express. It is valid only with `known_diff`; that case is skipped and does not count as result coverage. |
 | `uncovered` | Contract-level list of `{os, result, reason}` entries for table results that have no runnable case because the adapter cannot accept required evidence. A result must be in the documented row and needs a reason. A runnable case makes the entry stale and fails coverage. |
 

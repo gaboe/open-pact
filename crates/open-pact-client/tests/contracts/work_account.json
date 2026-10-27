@@ -118,7 +118,7 @@
       "now": "2026-10-26T12:00:00Z",
       "expected": "admin",
       "observed": "unknown",
-      "difference": "The parser does not accept the admin group; study: internal/jobs/review-contracts/report.md#work_account-i-only",
+      "difference": "The parser does not accept the admin group",
       "known_diff": null
     },
     {
@@ -127,7 +127,7 @@
       "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "admin",
-      "known_diff": "The Windows batch reports effective IsInRole state, not group membership; study: internal/jobs/review-contracts/report.md#work_account-i-only",
+      "known_diff": "The contract case records a difference that current code does not implement.",
       "unrepresentable_input": "The Windows contract adapter accepts an emitted result, not token group attributes."
     }
   ]

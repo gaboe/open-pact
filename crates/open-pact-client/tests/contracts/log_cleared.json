@@ -72,7 +72,7 @@
       "expected": "unknown",
       "known_diff": null,
       "observed": "2099-01-01T00:00:00Z",
-      "difference": "Parser does not reject future event timestamps; study: internal/jobs/review-contracts/report.md#log_cleared-i-only"
+      "difference": "Parser does not reject future event timestamps"
     }
   ]
 }

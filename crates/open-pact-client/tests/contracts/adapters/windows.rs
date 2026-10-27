@@ -77,7 +77,7 @@ pub(crate) fn run(id: &str, case: &Case) -> ControlValue {
         return contract_patch_age(last.with_timezone(&chrono::Utc), case.now());
     }
     CURRENT.with(|current| *current.borrow_mut() = Some((id.into(), case.name.clone())));
-    let check = crate::checks::WINDOWS
+    let check = crate::checks::legacy_registry(open_pact_core::Os::Windows)
         .iter()
         .find(|(name, _)| *name == id)
         .unwrap()

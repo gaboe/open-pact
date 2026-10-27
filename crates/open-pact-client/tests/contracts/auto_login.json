@@ -9,7 +9,7 @@
       ],
       "now": "2026-10-26T12:00:00Z",
       "expected": "unknown",
-      "known_diff": "internal/jobs/review-contracts/report.md#auto_login-m-and-i",
+      "known_diff": "The contract case records a difference that current code does not implement.",
       "unrepresentable_input": "The macOS adapter accepts only the username setting and cannot consume override evidence."
     },
     {
@@ -41,7 +41,7 @@
       "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "unknown",
-      "known_diff": "internal/jobs/review-contracts/report.md#auto_login-m-and-i",
+      "known_diff": "The contract case records a difference that current code does not implement.",
       "unrepresentable_input": "The Windows adapter accepts AutoAdminLogon only and cannot consume inhibition evidence."
     },
     {
@@ -82,7 +82,7 @@
       ],
       "now": "2026-10-26T12:00:00Z",
       "expected": "unknown",
-      "known_diff": "internal/jobs/review-contracts/report.md#auto_login-m-and-i",
+      "known_diff": "The contract case records a difference that current code does not implement.",
       "unrepresentable_input": "The Linux adapter cannot identify the active display manager or verify merged configuration."
     },
     {
@@ -93,7 +93,7 @@
       ],
       "now": "2026-10-26T12:00:00Z",
       "expected": "unknown",
-      "known_diff": "internal/jobs/review-contracts/report.md#auto_login-m-and-i",
+      "known_diff": "The contract case records a difference that current code does not implement.",
       "unrepresentable_input": "The Linux adapter cannot identify the active display manager or verify merged configuration."
     },
     {
@@ -106,7 +106,7 @@
       "expected": "unknown",
       "known_diff": null,
       "observed": "on",
-      "difference": "Enabled flag alone establishes on without a target account; study: internal/jobs/review-contracts/report.md#auto_login-m-and-i"
+      "difference": "Enabled flag alone establishes on without a target account"
     }
   ],
   "uncovered": [

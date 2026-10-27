@@ -41,7 +41,7 @@
       "expected": "unknown",
       "known_diff": null,
       "observed": "yes",
-      "difference": "Future macOS majors are assumed supported; study: internal/jobs/review-contracts/report.md#os_supported-m-and-i"
+      "difference": "Future macOS majors are assumed supported"
     },
     {
       "name": "linux-5",
@@ -63,7 +63,7 @@
       "expected": "unknown",
       "known_diff": null,
       "observed": "no",
-      "difference": "Ubuntu 18.04 can have paid Pro coverage; support class is missing; study: internal/jobs/review-contracts/report.md#os_supported-m-and-i"
+      "difference": "Ubuntu 18.04 can have paid Pro coverage; support class is missing"
     },
     {
       "name": "linux-7",
@@ -95,7 +95,7 @@
       "expected": "unknown",
       "known_diff": null,
       "observed": "yes",
-      "difference": "Future distribution releases are assumed supported; study: internal/jobs/review-contracts/report.md#os_supported-m-and-i"
+      "difference": "Future distribution releases are assumed supported"
     },
     {
       "name": "windows-10",

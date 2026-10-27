@@ -123,7 +123,7 @@
       "expected": "unknown",
       "known_diff": null,
       "observed": "off",
-      "difference": "One inactive manager masks an unknown manager; study: internal/jobs/review-contracts/report.md#firewall-m-and-i"
+      "difference": "One inactive manager masks an unknown manager"
     }
   ]
 }

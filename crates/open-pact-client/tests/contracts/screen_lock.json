@@ -235,7 +235,7 @@
       "expected": "none",
       "known_diff": null,
       "observed": "le_5min",
-      "difference": "KDE Lock RequirePassword and LockGrace are ignored; study: internal/jobs/review-contracts/report.md#screen_lock-m-and-i"
+      "difference": "KDE Lock RequirePassword and LockGrace are ignored"
     },
     {
       "name": "macos-21",
@@ -265,7 +265,7 @@
       ],
       "now": "2026-10-26T12:00:00Z",
       "expected": "unknown",
-      "known_diff": "internal/jobs/review-contracts/report.md#screen_lock-m-and-i",
+      "known_diff": "The contract case records a difference that current code does not implement.",
       "unrepresentable_input": "The macOS adapter cannot consume the effective password requirement or idle and display-off trigger."
     },
     {
@@ -276,7 +276,7 @@
       ],
       "now": "2026-10-26T12:00:00Z",
       "expected": "unknown",
-      "known_diff": "internal/jobs/review-contracts/report.md#screen_lock-m-and-i",
+      "known_diff": "The contract case records a difference that current code does not implement.",
       "unrepresentable_input": "The macOS adapter cannot consume the effective password requirement or idle and display-off trigger."
     },
     {
@@ -287,7 +287,7 @@
       ],
       "now": "2026-10-26T12:00:00Z",
       "expected": "unknown",
-      "known_diff": "internal/jobs/review-contracts/report.md#screen_lock-m-and-i",
+      "known_diff": "The contract case records a difference that current code does not implement.",
       "unrepresentable_input": "The macOS adapter cannot consume the effective password requirement or idle and display-off trigger."
     },
     {
@@ -300,7 +300,7 @@
       "expected": "unknown",
       "known_diff": null,
       "observed": "le_5min",
-      "difference": "Password grace alone is not total inactivity delay; study: internal/jobs/review-contracts/report.md#screen_lock-m-and-i"
+      "difference": "Password grace alone is not total inactivity delay"
     }
   ],
   "uncovered": [

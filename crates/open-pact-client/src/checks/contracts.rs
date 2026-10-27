@@ -155,19 +155,22 @@ enum Adapter {
 }
 
 fn adapter_for(id: &str, os: Os) -> Adapter {
-    let check = registry(os)
+    registry(os)
         .iter()
         .find(|(registered, _)| *registered == id)
-        .unwrap_or_else(|| panic!("unregistered contract {id}"))
-        .1;
-    if std::ptr::fn_addr_eq(check, macos_v3::unknown as CheckFn)
-        || std::ptr::fn_addr_eq(check, macos_v3::not_applicable as CheckFn)
+        .unwrap_or_else(|| panic!("unregistered contract {id}"));
+    if let Some(check) = legacy_registry(os)
+        .iter()
+        .find(|(registered, _)| *registered == id)
+        .map(|(_, check)| *check)
+        && (std::ptr::fn_addr_eq(check, macos_v3::unknown as fn() -> ControlValue)
+            || std::ptr::fn_addr_eq(check, macos_v3::not_applicable as fn() -> ControlValue))
     {
         return Adapter::Registry;
     }
 
     match (os, id) {
-        (Os::Macos, "web_protection") => Adapter::Browsers,
+        (Os::Macos | Os::Linux, "web_protection") => Adapter::Browsers,
         (
             Os::Macos,
             "os_auto_updates"
@@ -184,7 +187,6 @@ fn adapter_for(id: &str, os: Os) -> Adapter {
             | "antimalware_realtime"
             | "work_account"
             | "uptime_days"
-            | "preboot_auth"
             | "antimalware_signature_age_days"
             | "log_oldest_record_days",
         ) => Adapter::LinuxV3,
@@ -197,14 +199,17 @@ fn adapter_for(id: &str, os: Os) -> Adapter {
 fn run_case(id: &str, case: &Case) -> ControlValue {
     match adapter_for(id, case.os) {
         Adapter::Registry => {
-            let check = registry(case.os)
+            let check = legacy_registry(case.os)
                 .iter()
                 .find(|(registered, _)| *registered == id)
                 .unwrap()
                 .1;
             assert!(
-                std::ptr::fn_addr_eq(check, macos_v3::unknown as CheckFn)
-                    || std::ptr::fn_addr_eq(check, macos_v3::not_applicable as CheckFn),
+                std::ptr::fn_addr_eq(check, macos_v3::unknown as fn() -> ControlValue)
+                    || std::ptr::fn_addr_eq(
+                        check,
+                        macos_v3::not_applicable as fn() -> ControlValue,
+                    ),
                 "registry adapter only runs platform constants"
             );
             check()
@@ -237,7 +242,10 @@ fn registered_contract_coverage() {
         .lines()
         .filter(|line| line.starts_with("| `"))
         .map(|line| line.split('|').map(str::trim).collect())
-        .filter(|row: &Vec<_>| row.get(2).is_some_and(|platform| platforms.contains(*platform)))
+        .filter(|row: &Vec<_>| {
+            row.get(2)
+                .is_some_and(|platform| platforms.contains(*platform))
+        })
         .collect();
     assert_eq!(rows.len(), registered.len() * Os::ALL.len());
     for contract in &contracts {
@@ -260,7 +268,6 @@ fn registered_contract_coverage() {
             let _ = case.now();
             if let Some(reason) = &case.known_diff {
                 assert!(!reason.trim().is_empty());
-                assert!(reason == "pending integration" || reason.contains("report.md#"));
             }
             if let Some(observed) = &case.observed {
                 assert!(

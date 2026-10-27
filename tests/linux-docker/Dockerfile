@@ -5,6 +5,7 @@ FROM tools AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock PAPER.md ./
 COPY crates crates
+COPY docs docs
 COPY examples examples
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && \

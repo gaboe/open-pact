@@ -41,7 +41,7 @@
       "expected": 0,
       "known_diff": null,
       "observed": 1,
-      "difference": "Calendar-day counting discards installation time; study: internal/jobs/review-contracts/report.md#os_patch_age_days-m-and-i"
+      "difference": "Calendar-day counting discards installation time"
     },
     {
       "name": "ten-complete-days",
@@ -135,7 +135,7 @@
       "expected": 0,
       "known_diff": null,
       "observed": 1,
-      "difference": "Calendar-day counting discards transaction time; study: internal/jobs/review-contracts/report.md#os_patch_age_days-m-and-i"
+      "difference": "Calendar-day counting discards transaction time"
     },
     {
       "name": "macos-unrelated-product-receipt",
@@ -147,7 +147,7 @@
       "expected": "unknown",
       "known_diff": null,
       "observed": 10,
-      "difference": "Display-name heuristic does not bind a receipt to the running OS; study: internal/jobs/review-contracts/report.md#os_patch_age_days-m-and-i"
+      "difference": "Display-name heuristic does not bind a receipt to the running OS"
     },
     {
       "name": "date-only-ten-days",
@@ -158,7 +158,7 @@
       "code": 0,
       "now": "2026-10-26T12:00:00Z",
       "expected": "unknown",
-      "known_diff": "A date alone cannot establish ten completed elapsed days; study: internal/jobs/review-contracts/report.md#os_patch_age_days-m-and-i",
+      "known_diff": "The contract case records a difference that current code does not implement.",
       "unrepresentable_input": "The Windows batch emits only yyyy-MM-dd and loses InstallTime within the day."
     }
   ]

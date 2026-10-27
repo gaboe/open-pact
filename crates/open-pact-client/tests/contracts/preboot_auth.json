@@ -86,7 +86,8 @@
       ],
       "now": "2026-10-26T12:00:00Z",
       "expected": "unknown",
-      "known_diff": null
+      "known_diff": "The registered Linux check reads native boot and disk sources that the contract adapter cannot mock.",
+      "unrepresentable_input": "The adapter cannot provide /proc/cmdline bytes, /etc/crypttab, lsblk output, or cryptsetup metadata to the registered Linux check."
     },
     {
       "name": "linux-9",
@@ -96,7 +97,8 @@
       ],
       "now": "2026-10-26T12:00:00Z",
       "expected": "unknown",
-      "known_diff": null
+      "known_diff": "The registered Linux check reads native boot and disk sources that the contract adapter cannot mock.",
+      "unrepresentable_input": "The adapter cannot provide /proc/cmdline bytes, /etc/crypttab, lsblk output, or cryptsetup metadata to the registered Linux check."
     },
     {
       "name": "unrepresentable-unencrypted-root",
@@ -106,8 +108,8 @@
       ],
       "now": "2026-10-26T12:00:00Z",
       "expected": "none",
-      "known_diff": "pending integration",
-      "unrepresentable_input": "The Linux V3 adapter cannot consume /proc/cmdline, crypttab, or LUKS metadata needed to establish that no unlock protection applies."
+      "known_diff": "The registered Linux check reads native boot and disk sources that the contract adapter cannot mock.",
+      "unrepresentable_input": "The adapter cannot provide /proc/cmdline bytes, /etc/crypttab, lsblk output, or cryptsetup metadata to the registered Linux check."
     },
     {
       "name": "unrepresentable-kernel-luks-word",
@@ -117,8 +119,8 @@
       ],
       "now": "2026-10-26T12:00:00Z",
       "expected": "unknown",
-      "known_diff": "pending integration",
-      "unrepresentable_input": "The current Linux V3 adapter does not accept /proc/cmdline."
+      "known_diff": "The registered Linux check reads native boot and disk sources that the contract adapter cannot mock.",
+      "unrepresentable_input": "The adapter cannot provide /proc/cmdline bytes, /etc/crypttab, lsblk output, or cryptsetup metadata to the registered Linux check."
     },
     {
       "name": "macos-12",
@@ -148,7 +150,7 @@
       ],
       "now": "2026-10-26T12:00:00Z",
       "expected": "hardware_only",
-      "known_diff": "internal/jobs/review-contracts/report.md#preboot_auth-m-and-i",
+      "known_diff": "The contract case records a difference that current code does not implement.",
       "unrepresentable_input": "The macOS adapter cannot consume the device architecture and startup override evidence needed to distinguish hardware-only protection."
     },
     {
@@ -159,52 +161,52 @@
       ],
       "now": "2026-10-26T12:00:00Z",
       "expected": "none",
-      "known_diff": "internal/jobs/review-contracts/report.md#preboot_auth-m-and-i",
+      "known_diff": "The contract case records a difference that current code does not implement.",
       "unrepresentable_input": "The macOS adapter cannot consume the device architecture and startup override evidence needed to establish unprotected storage."
     },
     {
       "os": "linux",
       "now": "2026-10-26T12:00:00Z",
-      "known_diff": "pending integration",
+      "known_diff": "The registered Linux check reads native boot and disk sources that the contract adapter cannot mock.",
       "name": "crypttab-password",
       "input": [
         "dm-0 crypt 0 0 ext4 /\n  sda2 part 0 0 crypto_LUKS -"
       ],
-      "expected": "unknown",
-      "unrepresentable_input": "The current Linux V3 adapter does not accept crypttab or LUKS metadata."
+      "expected": "user_secret",
+      "unrepresentable_input": "The adapter cannot provide /proc/cmdline bytes, /etc/crypttab, lsblk output, or cryptsetup metadata to the registered Linux check."
     },
     {
       "os": "linux",
       "now": "2026-10-26T12:00:00Z",
-      "known_diff": "pending integration",
+      "known_diff": "The registered Linux check reads native boot and disk sources that the contract adapter cannot mock.",
       "name": "unrepresentable-crypttab-tpm",
       "input": [
         "dm-0 crypt 0 0 ext4 /\n  sda2 part 0 0 crypto_LUKS -"
       ],
       "expected": "hardware_only",
-      "unrepresentable_input": "The Linux V3 adapter cannot consume crypttab or LUKS token metadata."
+      "unrepresentable_input": "The adapter cannot provide /proc/cmdline bytes, /etc/crypttab, lsblk output, or cryptsetup metadata to the registered Linux check."
     },
     {
       "os": "linux",
       "now": "2026-10-26T12:00:00Z",
-      "known_diff": "pending integration",
+      "known_diff": "The registered Linux check reads native boot and disk sources that the contract adapter cannot mock.",
       "name": "unrepresentable-crypttab-tpm-pin",
       "input": [
         "dm-0 crypt 0 0 ext4 /\n  sda2 part 0 0 crypto_LUKS -"
       ],
       "expected": "user_secret",
-      "unrepresentable_input": "The Linux V3 adapter cannot consume crypttab or LUKS token metadata."
+      "unrepresentable_input": "The adapter cannot provide /proc/cmdline bytes, /etc/crypttab, lsblk output, or cryptsetup metadata to the registered Linux check."
     },
     {
       "os": "linux",
       "now": "2026-10-26T12:00:00Z",
-      "known_diff": "pending integration",
+      "known_diff": "The registered Linux check reads native boot and disk sources that the contract adapter cannot mock.",
       "name": "luks-without-unlock-evidence",
       "input": [
         "dm-0 crypt 0 0 ext4 /\n  sda2 part 0 0 crypto_LUKS -"
       ],
       "expected": "unknown",
-      "unrepresentable_input": "The Linux V3 adapter cannot consume crypttab or LUKS metadata."
+      "unrepresentable_input": "The adapter cannot provide /proc/cmdline bytes, /etc/crypttab, lsblk output, or cryptsetup metadata to the registered Linux check."
     },
     {
       "name": "unrepresentable-kernel-luks-substring",
@@ -214,8 +216,8 @@
       ],
       "now": "2026-10-26T12:00:00Z",
       "expected": "unknown",
-      "known_diff": "pending integration",
-      "unrepresentable_input": "The current Linux V3 adapter does not accept /proc/cmdline bytes."
+      "known_diff": "The registered Linux check reads native boot and disk sources that the contract adapter cannot mock.",
+      "unrepresentable_input": "The adapter cannot provide /proc/cmdline bytes, /etc/crypttab, lsblk output, or cryptsetup metadata to the registered Linux check."
     },
     {
       "name": "unrepresentable-unreadable-cmdline",
@@ -225,35 +227,40 @@
       ],
       "now": "2026-10-26T12:00:00Z",
       "expected": "unknown",
-      "known_diff": "pending integration",
-      "unrepresentable_input": "The current Linux V3 adapter cannot represent an unreadable /proc/cmdline source."
+      "known_diff": "The registered Linux check reads native boot and disk sources that the contract adapter cannot mock.",
+      "unrepresentable_input": "The adapter cannot provide /proc/cmdline bytes, /etc/crypttab, lsblk output, or cryptsetup metadata to the registered Linux check."
     }
   ],
   "uncovered": [
     {
-      "os": "macos",
-      "result": "hardware_only",
-      "reason": "The macOS adapter cannot consume architecture and startup override evidence."
-    },
-    {
-      "os": "macos",
-      "result": "none",
-      "reason": "The macOS adapter cannot consume architecture and startup override evidence."
-    },
-    {
       "os": "linux",
       "result": "hardware_only",
-      "reason": "The Linux V3 adapter cannot consume /proc/cmdline, crypttab, or LUKS token metadata."
+      "reason": "The adapter cannot provide /proc/cmdline bytes, /etc/crypttab, lsblk output, or cryptsetup metadata to the registered Linux check."
     },
     {
       "os": "linux",
       "result": "none",
-      "reason": "The Linux V3 adapter cannot consume /proc/cmdline, crypttab, or LUKS metadata needed to establish plain storage."
+      "reason": "The adapter cannot provide /proc/cmdline bytes, /etc/crypttab, lsblk output, or cryptsetup metadata to the registered Linux check."
+    },
+    {
+      "os": "linux",
+      "result": "unknown",
+      "reason": "The adapter cannot provide /proc/cmdline bytes, /etc/crypttab, lsblk output, or cryptsetup metadata to the registered Linux check."
     },
     {
       "os": "linux",
       "result": "user_secret",
-      "reason": "The Linux V3 adapter cannot consume crypttab or LUKS keyslot and token metadata."
+      "reason": "The adapter cannot provide /proc/cmdline bytes, /etc/crypttab, lsblk output, or cryptsetup metadata to the registered Linux check."
+    },
+    {
+      "os": "macos",
+      "result": "hardware_only",
+      "reason": "The macOS adapter cannot consume architecture and startup override evidence."
+    },
+    {
+      "os": "macos",
+      "result": "none",
+      "reason": "The macOS adapter cannot consume architecture and startup override evidence."
     }
   ]
 }

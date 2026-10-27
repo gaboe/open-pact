@@ -45,7 +45,7 @@
       "expected": "off",
       "known_diff": null,
       "observed": "unknown",
-      "difference": "NotificationLevel 2 requires user approval; study: internal/jobs/review-contracts/report.md#os_auto_updates-i-only"
+      "difference": "NotificationLevel 2 requires user approval"
     },
     {
       "name": "notify-before-install",
@@ -58,7 +58,7 @@
       "expected": "off",
       "known_diff": null,
       "observed": "unknown",
-      "difference": "NotificationLevel 3 requires user approval; study: internal/jobs/review-contracts/report.md#os_auto_updates-i-only"
+      "difference": "NotificationLevel 3 requires user approval"
     },
     {
       "name": "macos-6",
@@ -82,7 +82,7 @@
       "expected": "unknown",
       "known_diff": null,
       "observed": "off",
-      "difference": "Background-data flags do not establish OS installation; study: internal/jobs/review-contracts/report.md#os_auto_updates-i-only"
+      "difference": "Background-data flags do not establish OS installation"
     },
     {
       "name": "background-data-does-not-prove-os-install",
@@ -95,7 +95,7 @@
       "expected": "unknown",
       "known_diff": null,
       "observed": "on",
-      "difference": "Background-data flags do not prove automatic OS installation; study: internal/jobs/review-contracts/report.md#os_auto_updates-i-only"
+      "difference": "Background-data flags do not prove automatic OS installation"
     },
     {
       "name": "os-install-enabled",
@@ -108,7 +108,7 @@
       "expected": "on",
       "known_diff": null,
       "observed": "unknown",
-      "difference": "The parser reads background-data flags, not the effective OS-install setting; study: internal/jobs/review-contracts/report.md#os_auto_updates-i-only"
+      "difference": "The parser reads background-data flags, not the effective OS-install setting"
     },
     {
       "name": "linux-10",
@@ -205,7 +205,7 @@
       "expected": "off",
       "known_diff": null,
       "observed": "unknown",
-      "difference": "The parser does not read the effective OS-install setting; study: internal/jobs/review-contracts/report.md#os_auto_updates-i-only"
+      "difference": "The parser does not read the effective OS-install setting"
     }
   ]
 }

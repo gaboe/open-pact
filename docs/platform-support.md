@@ -61,9 +61,10 @@ replace the old enrolment and scheduler registration. Copying the marker to anot
 cannot move the private key. Losing the marker or clearing the TPM requires a new join.
 TPM claims request `L1`, like Secure Enclave claims. The gateway still records verified `L0`
 because a key-protection label does not prove hardware attestation.
-Windows CI tests the same CNG operations with the Microsoft Software Key Storage Provider,
-including private-export refusal and signing under a standard user and SYSTEM.
-Real TPM signing remains unverified until `windows_tpm_roundtrip` runs on a TPM machine.
+Hosted Windows CI checks CNG key operations with the Microsoft Software Key Storage Provider,
+including private-export refusal. Its cross-token fixture failed during standard-user key
+creation, so standard-user and SYSTEM signing remain unverified. Real TPM signing remains
+unverified until `windows_tpm_roundtrip` runs on a TPM machine.
 
 ## Schedule support
 
