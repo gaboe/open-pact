@@ -27,30 +27,23 @@ jobs:
 
           $binaryDir = Join-Path $env:RUNNER_TEMP 'open-pact-client'
           New-Item -ItemType Directory -Force $binaryDir | Out-Null
-          Copy-Item 'target/x86_64-pc-windows-msvc/release/open-pact-client.exe' "$binaryDir/open-pact-client.exe"
-          $binaryHash = (Get-FileHash "$binaryDir/open-pact-client.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
-          $manifestPath = Join-Path $env:RUNNER_TEMP 'open-pact-local.json'
-          $manifest = @{
-            version = '0.0.0-ci'
-            description = 'Local CI build of the Open Pact client'
-            homepage = 'https://github.com/gaboe/open-pact'
-            license = 'Apache-2.0'
-            architecture = @{
-              '64bit' = @{
-                url = 'http://127.0.0.1:8765/open-pact-client.exe'
-                hash = $binaryHash
-              }
-            }
-            bin = @('open-pact-client.exe')
-          }
-          $manifest | ConvertTo-Json -Depth 8 | Set-Content -Encoding utf8 $manifestPath
+          $binaryName = 'open-pact-client-x86_64-pc-windows-msvc.exe'
+          Copy-Item 'target/x86_64-pc-windows-msvc/release/open-pact-client.exe' (Join-Path $binaryDir $binaryName)
+          $binaryPath = Join-Path $binaryDir $binaryName
+          $checksumPath = Join-Path $env:RUNNER_TEMP 'SHA256SUMS'
+          $binaryHash = (Get-FileHash $binaryPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$binaryHash  $binaryName" | Set-Content -Encoding ascii $checksumPath
+          $manifestDir = Join-Path $env:RUNNER_TEMP 'manifest'
+          python scripts/packaging/generate-release-metadata.py 0.0.0-ci $checksumPath `
+            --scoop-only --scoop-dir $manifestDir --scoop-url "http://127.0.0.1:8765/$binaryName"
+          $manifestPath = Join-Path $manifestDir 'open-pact.json'
 
           $server = Start-Process -FilePath python -ArgumentList @('-m', 'http.server', '8765', '--bind', '127.0.0.1', '--directory', $binaryDir) -PassThru -WindowStyle Hidden
           try {
             $ready = $false
             for ($attempt = 0; $attempt -lt 20; $attempt++) {
               try {
-                Invoke-WebRequest -Uri 'http://127.0.0.1:8765/open-pact-client.exe' -Method Head | Out-Null
+                Invoke-WebRequest -Uri "http://127.0.0.1:8765/$binaryName" -Method Head | Out-Null
                 $ready = $true
                 break
               } catch {

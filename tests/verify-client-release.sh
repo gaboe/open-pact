@@ -29,9 +29,38 @@ if [ "${MOCK_GH_FAIL:-}" = 1 ]; then
   echo "mock GitHub download failed" >&2
   exit 9
 fi
-[ "$1" = release ] && [ "$2" = download ] || exit 90
-shift 2
-[ "$1" = v1.2.3 ] || exit 91
+[ "$1" = release ] || exit 90
+shift
+case "$1" in
+  view)
+    shift
+    [ "$1" = v1.2.3 ] || exit 91
+    shift
+    [ "$1" = --repo ] && [ "$2" = example/project ] || exit 92
+    shift 2
+    [ "$1" = --json ] && [ "$2" = assets ] || exit 93
+    shift 2
+    [ "$1" = --jq ] && [ "$2" = '.assets[].name' ] || exit 94
+    assets=(
+      open-pact-client-aarch64-apple-darwin
+      open-pact-client-x86_64-apple-darwin
+      open-pact-client-x86_64-unknown-linux-musl
+      open-pact-client-x86_64-pc-windows-msvc.exe
+      NOTICE
+      SHA256SUMS
+    )
+    if [ "${MOCK_PACKAGE_ASSETS:-}" = 1 ]; then
+      assets+=(open-pact-client_1.2.3_amd64.deb open-pact-client-1.2.3-1.x86_64.rpm)
+    fi
+    for file in "${assets[@]}"; do
+      printf '%s\n%s.sigstore.json\n' "$file" "$file"
+    done
+    exit 0
+    ;;
+  download) shift ;;
+  *) exit 90 ;;
+esac
+[ "$1" = v1.2.3 ] || exit 95
 shift
 patterns=()
 while [ "$#" -gt 0 ]; do
@@ -50,6 +79,12 @@ assets=(
   NOTICE
   SHA256SUMS
 )
+if [ "${MOCK_PACKAGE_ASSETS:-}" = 1 ]; then
+  assets+=(
+    open-pact-client_1.2.3_amd64.deb
+    open-pact-client-1.2.3-1.x86_64.rpm
+  )
+fi
 expected_patterns=()
 for file in "${assets[@]}"; do
   expected_patterns+=("$file" "$file.sigstore.json")
@@ -111,12 +146,17 @@ fail() {
 }
 run_success() {
   local name=$1
+  shift
+  local include_packages=0
+  for setting in "$@"; do
+    [ "$setting" = MOCK_PACKAGE_ASSETS=1 ] && include_packages=1
+  done
   local output="$tmp/$name.output"
   local marker="$tmp/$name.work-path"
   local out
   env -u MOCK_GH_FAIL -u MOCK_MISSING -u MOCK_MISSING_BUNDLE \
-    -u MOCK_BAD_CHECKSUM -u MOCK_COSIGN_FAIL \
-    "MOCK_WORK_PATH_FILE=$marker" "$script" v1.2.3 > "$output"
+    -u MOCK_BAD_CHECKSUM -u MOCK_COSIGN_FAIL -u MOCK_PACKAGE_ASSETS \
+    "$@" "MOCK_WORK_PATH_FILE=$marker" "$script" v1.2.3 > "$output"
   out=$(sed -n '$s/^verified files: //p' "$output")
   [ -n "$out" ] || fail "$name did not print its verified directory last"
   [[ "$out" = /* ]] || fail "$name did not print an absolute path"
@@ -139,6 +179,15 @@ open-pact-client-x86_64-pc-windows-msvc.exe.sigstore.json
 open-pact-client-x86_64-unknown-linux-musl
 open-pact-client-x86_64-unknown-linux-musl.sigstore.json
 EXPECTED
+  if [ "$include_packages" = 1 ]; then
+    cat >> "$tmp/$name.expected" <<'EXPECTED'
+open-pact-client-1.2.3-1.x86_64.rpm
+open-pact-client-1.2.3-1.x86_64.rpm.sigstore.json
+open-pact-client_1.2.3_amd64.deb
+open-pact-client_1.2.3_amd64.deb.sigstore.json
+EXPECTED
+  fi
+  sort -o "$tmp/$name.expected" "$tmp/$name.expected"
   cmp -s "$tmp/$name.expected" "$tmp/$name.actual" || fail "$name directory did not contain exactly the verified files"
 }
 run_failure() {
@@ -155,11 +204,12 @@ run_failure() {
 }
 run_missing_asset() {
   local file=$1
+  shift
   local marker="$tmp/missing-$file.work-path"
   local expected="$tmp/expected-diagnostic"
   local actual="$tmp/actual-diagnostic"
   printf 'missing release asset: %s\n' "$file" > "$expected"
-  if env "MOCK_MISSING=$file" "MOCK_WORK_PATH_FILE=$marker" "$script" v1.2.3 >/dev/null 2>"$actual"; then
+  if env "$@" "MOCK_MISSING=$file" "MOCK_WORK_PATH_FILE=$marker" "$script" v1.2.3 >/dev/null 2>"$actual"; then
     fail "missing-$file unexpectedly succeeded"
   fi
   cmp -s "$expected" "$actual" || fail "missing-$file returned the wrong diagnostic"
@@ -169,6 +219,7 @@ run_missing_asset() {
 }
 
 run_success successful-download
+run_success package-download MOCK_PACKAGE_ASSETS=1
 run_failure github-download MOCK_GH_FAIL=1
 run_failure bad-checksum MOCK_BAD_CHECKSUM=1
 run_failure signature-check MOCK_COSIGN_FAIL=NOTICE
@@ -182,5 +233,9 @@ for file in \
   run_missing_asset "$file"
   run_failure "missing-bundle-$file" "MOCK_MISSING_BUNDLE=$file"
 done
+run_missing_asset open-pact-client_1.2.3_amd64.deb MOCK_PACKAGE_ASSETS=1
+run_missing_asset open-pact-client-1.2.3-1.x86_64.rpm MOCK_PACKAGE_ASSETS=1
+run_failure missing-package-bundle MOCK_PACKAGE_ASSETS=1 MOCK_MISSING_BUNDLE=open-pact-client_1.2.3_amd64.deb
+run_failure missing-rpm-bundle MOCK_PACKAGE_ASSETS=1 MOCK_MISSING_BUNDLE=open-pact-client-1.2.3-1.x86_64.rpm
 
 echo "mocked release verification passed"

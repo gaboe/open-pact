@@ -15,7 +15,7 @@ RELEASE_FILES = {
 }
 
 
-def read_checksums(path: Path) -> dict[str, str]:
+def read_checksums(path: Path, required_files: set[str] | None = None) -> dict[str, str]:
     checksums: dict[str, str] = {}
     for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         match = re.fullmatch(r"([0-9a-f]{64})  (\S+)", line)
@@ -25,7 +25,9 @@ def read_checksums(path: Path) -> dict[str, str]:
         if filename in checksums:
             raise ValueError(f"{path}:{number}: duplicate checksum for {filename}")
         checksums[filename] = digest
-    missing = sorted(set(RELEASE_FILES.values()) - checksums.keys())
+    if required_files is None:
+        required_files = set(RELEASE_FILES.values())
+    missing = sorted(required_files - checksums.keys())
     if missing:
         raise ValueError(f"{path}: missing checksums for {', '.join(missing)}")
     return checksums
@@ -77,8 +79,16 @@ end
 '''
 
 
-def scoop_manifest(version: str, digest: str, placeholder: bool) -> str:
-    note = "PLACEHOLDER HASH: replace with the published SHA256SUMS value." if placeholder else "Open Pact client."
+def scoop_manifest(version: str, digest: str, placeholder: bool, url: str | None) -> str:
+    note = (
+        "PLACEHOLDER HASH: replace with the published SHA256SUMS value."
+        if placeholder
+        else "Open Pact client."
+    )
+    download_url = url or (
+        f"https://github.com/gaboe/open-pact/releases/download/v{version}/"
+        f"{RELEASE_FILES['windows_x86_64']}"
+    )
     return f'''{{
   "version": "{version}",
   "description": "{note}",
@@ -86,11 +96,11 @@ def scoop_manifest(version: str, digest: str, placeholder: bool) -> str:
   "license": "Apache-2.0",
   "architecture": {{
     "64bit": {{
-      "url": "https://github.com/gaboe/open-pact/releases/download/v{version}/{RELEASE_FILES['windows_x86_64']}",
+      "url": "{download_url}",
       "hash": "{digest}"
     }}
   }},
-  "bin": [["{RELEASE_FILES['windows_x86_64']}", "open-pact-client.exe"]],
+  "bin": [["{RELEASE_FILES['windows_x86_64']}", "open-pact-client"]],
   "checkver": {{
     "github": "https://github.com/gaboe/open-pact"
   }},
@@ -113,24 +123,31 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("version", help="release version without the v prefix")
     parser.add_argument("checksums", type=Path, help="release SHA256SUMS file")
-    parser.add_argument("--homebrew-dir", type=Path, required=True)
+    parser.add_argument("--homebrew-dir", type=Path)
     parser.add_argument("--scoop-dir", type=Path, required=True)
+    parser.add_argument("--scoop-url", help="override the Scoop download URL")
+    parser.add_argument("--scoop-only", action="store_true", help="write only the Scoop manifest")
     parser.add_argument(
         "--placeholder-hashes",
         action="store_true",
         help="write clearly marked seed metadata before the release exists",
     )
     args = parser.parse_args()
-    if not re.fullmatch(r"\d+\.\d+\.\d+", args.version):
+    if not re.fullmatch(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?", args.version):
         parser.error("version must be a semantic version without a v prefix")
-    checksums = read_checksums(args.checksums)
-    args.homebrew_dir.mkdir(parents=True, exist_ok=True)
+    if not args.scoop_only and args.homebrew_dir is None:
+        parser.error("--homebrew-dir is required unless --scoop-only is set")
+    required_files = {RELEASE_FILES["windows_x86_64"]} if args.scoop_only else None
+    checksums = read_checksums(args.checksums, required_files)
+    if args.homebrew_dir is not None:
+        args.homebrew_dir.mkdir(parents=True, exist_ok=True)
     args.scoop_dir.mkdir(parents=True, exist_ok=True)
-    formula_path = args.homebrew_dir / "open-pact.rb"
     manifest_path = args.scoop_dir / "open-pact.json"
-    formula_path.write_text(
-        formula(args.version, checksums, args.placeholder_hashes), encoding="utf-8"
-    )
+    if not args.scoop_only:
+        formula_path = args.homebrew_dir / "open-pact.rb"
+        formula_path.write_text(
+            formula(args.version, checksums, args.placeholder_hashes), encoding="utf-8"
+        )
     manifest_path.write_text(
         scoop_manifest(
             args.version,
@@ -138,10 +155,12 @@ def main() -> None:
             if args.placeholder_hashes
             else checksums[RELEASE_FILES["windows_x86_64"]],
             args.placeholder_hashes,
+            args.scoop_url,
         ),
         encoding="utf-8",
     )
-    print(formula_path)
+    if not args.scoop_only:
+        print(formula_path)
     print(manifest_path)
 
 

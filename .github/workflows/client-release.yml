@@ -54,12 +54,12 @@ jobs:
       contents: write
       id-token: write
     steps:
+      - uses: actions/checkout@v6
       - uses: actions/download-artifact@v4
         with:
           pattern: client-*
           merge-multiple: true
           path: dist
-      - uses: actions/checkout@v6
       - uses: actions/setup-go@v6
         with:
           go-version: "1.26.10"
@@ -84,14 +84,43 @@ jobs:
             cosign sign-blob --yes --bundle "$file.sigstore.json" "$file"
           done
       - name: Generate package manager metadata
+        if: ${{ !contains(github.ref_name, '-') }}
         run: |
           python3 scripts/packaging/generate-release-metadata.py "${GITHUB_REF_NAME#v}" dist/SHA256SUMS \
             --homebrew-dir dist/Formula --scoop-dir dist/bucket
+      - name: Attach assets to the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --verify-tag --title "$TAG" --notes "" || gh release view "$TAG" >/dev/null
+          fi
+          assets=(dist/open-pact-client* dist/NOTICE dist/NOTICE.sigstore.json dist/SHA256SUMS dist/SHA256SUMS.sigstore.json)
+          if [[ ! "$TAG" =~ - ]]; then
+            assets+=(dist/Formula/open-pact.rb dist/bucket/open-pact.json)
+          fi
+          gh release upload "$TAG" "${assets[@]}" --clobber
+          release_assets=$(gh release view "$TAG" --json assets --jq '.assets[].name')
+          for path in "${assets[@]}"; do
+            name=$(basename "$path")
+            if [[ $'\n'"$release_assets"$'\n' != *$'\n'"$name"$'\n'* ]]; then
+              echo "release asset is missing after upload: $name" >&2
+              exit 1
+            fi
+          done
       - name: Publish Homebrew tap and Scoop bucket
         env:
           PACKAGING_TOKEN: ${{ secrets.PACKAGING_TOKEN }}
+          TAG: ${{ github.ref_name }}
         shell: bash
         run: |
+          if [[ "$TAG" =~ - ]]; then
+            echo "Prerelease $TAG does not update Homebrew or Scoop."
+            exit 0
+          fi
           if [[ -z "$PACKAGING_TOKEN" ]]; then
             echo "::warning::PACKAGING_TOKEN is not set. Generated Homebrew and Scoop files will be attached to the release."
             exit 0
@@ -115,14 +144,3 @@ jobs:
             git -C /tmp/scoop-bucket commit -m "chore: update open-pact to ${GITHUB_REF_NAME#v}"
             git -C /tmp/scoop-bucket push
           fi
-      - name: Attach assets to the GitHub release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO: ${{ github.repository }}
-          TAG: ${{ github.ref_name }}
-        run: |
-          if ! gh release view "$TAG" >/dev/null 2>&1; then
-            gh release create "$TAG" --verify-tag --title "$TAG" --notes "" || gh release view "$TAG" >/dev/null
-          fi
-          gh release upload "$TAG" dist/open-pact-client* dist/NOTICE dist/SHA256SUMS dist/*.sigstore.json \
-            dist/Formula/open-pact.rb dist/bucket/open-pact.json --clobber
