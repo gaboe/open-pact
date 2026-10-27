@@ -31,6 +31,7 @@ use sha2::{Digest, Sha256};
 #[derive(Parser)]
 #[command(
     name = "open-pact-client",
+    version,
     about = "Prove this device meets the company's signed manifest, nothing more"
 )]
 struct Cli {

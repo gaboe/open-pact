@@ -60,16 +60,61 @@ jobs:
           merge-multiple: true
           path: dist
       - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26.10"
+      - name: Install nfpm
+        run: |
+          go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.47.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Package Linux client
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          VERSION="${VERSION#v}" nfpm package --config packaging/nfpm.yaml --packager deb --target dist/
+          VERSION="${VERSION#v}" nfpm package --config packaging/nfpm.yaml --packager rpm --target dist/
       - name: Include third-party data license
         run: cp NOTICE dist/NOTICE
       - uses: sigstore/cosign-installer@v4.1.2
       - name: Create checksums and signatures
         working-directory: dist
         run: |
-          sha256sum open-pact-client-* NOTICE > SHA256SUMS
-          for file in open-pact-client-* NOTICE SHA256SUMS; do
+          sha256sum open-pact-client* NOTICE > SHA256SUMS
+          for file in open-pact-client* NOTICE SHA256SUMS; do
             cosign sign-blob --yes --bundle "$file.sigstore.json" "$file"
           done
+      - name: Generate package manager metadata
+        run: |
+          python3 scripts/packaging/generate-release-metadata.py "${GITHUB_REF_NAME#v}" dist/SHA256SUMS \
+            --homebrew-dir dist/Formula --scoop-dir dist/bucket
+      - name: Publish Homebrew tap and Scoop bucket
+        env:
+          PACKAGING_TOKEN: ${{ secrets.PACKAGING_TOKEN }}
+        shell: bash
+        run: |
+          if [[ -z "$PACKAGING_TOKEN" ]]; then
+            echo "::warning::PACKAGING_TOKEN is not set. Generated Homebrew and Scoop files will be attached to the release."
+            exit 0
+          fi
+          git clone "https://x-access-token:${PACKAGING_TOKEN}@github.com/gaboe/homebrew-tap.git" /tmp/homebrew-tap
+          git clone "https://x-access-token:${PACKAGING_TOKEN}@github.com/gaboe/scoop-bucket.git" /tmp/scoop-bucket
+          mkdir -p /tmp/homebrew-tap/Formula /tmp/scoop-bucket/bucket
+          cp dist/Formula/open-pact.rb /tmp/homebrew-tap/Formula/open-pact.rb
+          cp dist/bucket/open-pact.json /tmp/scoop-bucket/bucket/open-pact.json
+          git -C /tmp/homebrew-tap config user.name "github-actions[bot]"
+          git -C /tmp/homebrew-tap config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C /tmp/homebrew-tap add Formula/open-pact.rb
+          if ! git -C /tmp/homebrew-tap diff --cached --quiet; then
+            git -C /tmp/homebrew-tap commit -m "chore: update open-pact to ${GITHUB_REF_NAME#v}"
+            git -C /tmp/homebrew-tap push
+          fi
+          git -C /tmp/scoop-bucket config user.name "github-actions[bot]"
+          git -C /tmp/scoop-bucket config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C /tmp/scoop-bucket add bucket/open-pact.json
+          if ! git -C /tmp/scoop-bucket diff --cached --quiet; then
+            git -C /tmp/scoop-bucket commit -m "chore: update open-pact to ${GITHUB_REF_NAME#v}"
+            git -C /tmp/scoop-bucket push
+          fi
       - name: Attach assets to the GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -79,4 +124,5 @@ jobs:
           if ! gh release view "$TAG" >/dev/null 2>&1; then
             gh release create "$TAG" --verify-tag --title "$TAG" --notes "" || gh release view "$TAG" >/dev/null
           fi
-          gh release upload "$TAG" dist/* --clobber
+          gh release upload "$TAG" dist/open-pact-client* dist/NOTICE dist/SHA256SUMS dist/*.sigstore.json \
+            dist/Formula/open-pact.rb dist/bucket/open-pact.json --clobber

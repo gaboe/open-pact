@@ -2,12 +2,41 @@
 
 The client sends results only for controls and outputs that the signed manifest permits. On Windows, a selected check can run a cached PowerShell batch that also reads other controls, browser profiles, and event sources. The client sends only permitted results in its claim or report. It sends a signed claim when you run `check`. It sends a separate status report when you run `report` or install a report schedule.
 
+## Install with a package manager
+
+Install the client with the package manager for your platform:
+
+```sh
+brew install gaboe/tap/open-pact
+```
+
+On Windows, add the Scoop bucket and install the client:
+
+```powershell
+scoop bucket add gaboe https://github.com/gaboe/scoop-bucket
+scoop install gaboe/open-pact
+```
+
+For Debian or Ubuntu, download the `.deb` from the [client releases](https://github.com/gaboe/open-pact/releases), then run:
+
+```sh
+sudo apt install ./open-pact-client_0.3.1_amd64.deb
+```
+
+For Fedora, download the `.rpm` from the [client releases](https://github.com/gaboe/open-pact/releases), then run:
+
+```sh
+sudo dnf install ./open-pact-client-0.3.1-1.x86_64.rpm
+```
+
+Homebrew and Scoop check the SHA-256 value recorded in their formula or manifest. They do not verify the Cosign signature. The Linux commands install local files, so verify them with the release steps below before you install them. Run `brew upgrade` or `scoop update open-pact` to update an installed client. For APT or DNF, download and install each new release when you choose to update.
+
 ## Verify a release
 
 Run the verification script with a release tag:
 
 ```sh
-scripts/verify-client-release.sh v0.2.0
+scripts/verify-client-release.sh v0.3.1
 ```
 
 The script checks every checksum and Sigstore bundle. It keeps the verified files in a private temporary directory when verification succeeds. It removes the directory if verification fails. It prints the directory path on the last line. Copy that path for the install command.
@@ -51,6 +80,13 @@ Copy-Item "$verifiedDir\open-pact-client-x86_64-pc-windows-msvc.exe" "$env:USERP
 ```
 
 The script needs GitHub CLI, Cosign, and `sha256sum` or `shasum`. Set `GH_REPO` when you verify a release from a fork.
+
+The verified directory includes the `.deb` and `.rpm` packages. Install them with the matching package manager:
+
+```sh
+sudo apt install "$verified_dir/open-pact-client_0.3.1_amd64.deb"
+sudo dnf install "$verified_dir/open-pact-client-0.3.1-1.x86_64.rpm"
+```
 
 ## Join and check the gateway
 

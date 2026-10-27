@@ -68,9 +68,38 @@ Windows replaces the flat copies sequentially, so they can briefly differ. The s
 
 No report job runs until you enable a schedule in `open-pact.toml` and run `open-pact-client apply`. Before you delete the binary or client home, set `[schedule].enabled = false` and run `apply`. To remove the device key, run `open-pact-client --home <home> delete-device-key` before you delete the home.
 
+## Install the client
+
+Install the client with your platform's package manager:
+
+```sh
+brew install gaboe/tap/open-pact
+```
+
+On Windows, add the Scoop bucket and install the client:
+
+```powershell
+scoop bucket add gaboe https://github.com/gaboe/scoop-bucket
+scoop install gaboe/open-pact
+```
+
+For Debian or Ubuntu, download the `.deb` from the [client releases](https://github.com/gaboe/open-pact/releases) and install it:
+
+```sh
+sudo apt install ./open-pact-client_0.3.1_amd64.deb
+```
+
+For Fedora, download the `.rpm` from the [client releases](https://github.com/gaboe/open-pact/releases) and install it:
+
+```sh
+sudo dnf install ./open-pact-client-0.3.1-1.x86_64.rpm
+```
+
+Homebrew and Scoop check release SHA-256 hashes. The Linux commands install local files. Verify those packages with the release verification steps below before installation. These tools do not update the client automatically. Run `brew upgrade` or `scoop update open-pact` to update an installed client. For APT or DNF, download and install each new release when you choose to update.
+
 ## Verify a release
 
-Client releases include binaries for macOS, Linux, and Windows. They also include `NOTICE`, `SHA256SUMS`, and Sigstore bundles for each binary, `NOTICE`, and `SHA256SUMS`. Verify a client release with `scripts/verify-client-release.sh v0.2.0`. The script downloads these files from the GitHub release, checks their hashes, and verifies their signatures against the tagged release workflow. It needs GitHub CLI, Cosign, and `sha256sum` or `shasum`. Set `GH_REPO` to check a release from a fork. See the [client release verification procedure](docs/client.md#verify-a-release) to save and install a verified binary.
+Client releases include binaries for macOS, Linux, and Windows, plus `.deb` and `.rpm` packages. They also include `NOTICE`, `SHA256SUMS`, and Sigstore bundles for each binary, package, `NOTICE`, and `SHA256SUMS`. Verify a client release with `scripts/verify-client-release.sh v0.3.1`. The script downloads these files from the GitHub release, checks their hashes, and verifies their signatures against the tagged release workflow. It needs GitHub CLI, Cosign, and `sha256sum` or `shasum`. Set `GH_REPO` to check a release from a fork. See the [client release verification procedure](docs/client.md#verify-a-release) to save and install a verified binary or Linux package.
 
 The gateway image is reproducible: a pinned toolchain and builder, a static musl binary, `FROM scratch`, and timestamps fixed to the commit time. CI builds each release twice on separate runners and fails when the digests differ. The witness image (`ghcr.io/<owner>/open-pact-witness`, the Dockerfile `witness` target) is built and checked the same way. To check a release yourself, run `scripts/verify-release.sh v0.0.1 ghcr.io/<owner>/open-pact-gateway@sha256:<digest>`, or add `--target witness` and the witness image reference. It rebuilds the tag from the public source, prints the digest, and exits nonzero on a mismatch. It needs Docker with buildx and takes several minutes. The image carries no system CA bundle. Optional SIEM TLS uses its explicitly mounted CA file. Do not use `sslmode=verify-full` for PostgreSQL without providing its CA.
 
@@ -136,7 +165,7 @@ Each JSON event has exactly one top-level key, `open_pact`. Its fields are flat.
 | `time` | RFC 3339 UTC time from the signed claim. |
 | `device_pseudonym` | String, the enrolled device's pseudonym. |
 | `manifest_hash` | String, the hash in the signed claim. |
-| `client_version` | String, for example `open-pact-client 0.2.0`. |
+| `client_version` | String, for example `open-pact-client 0.3.1`. |
 | `os` | `macos`, `windows`, or `linux`. |
 | `verified_trust_level` | `L0` until the gateway supports attestation. |
 | `asserted_trust_level` | `L0`, `L1`, or `L2`, as asserted by the client. |

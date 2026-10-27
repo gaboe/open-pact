@@ -1,0 +1,65 @@
+name: windows-packaging
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scoop-local-manifest:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Build client
+        run: cargo build --locked --release --package open-pact-client --target x86_64-pc-windows-msvc
+      - name: Install Scoop from a local manifest
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser -Force
+          Invoke-RestMethod -Uri https://get.scoop.sh | Invoke-Expression
+
+          $binaryDir = Join-Path $env:RUNNER_TEMP 'open-pact-client'
+          New-Item -ItemType Directory -Force $binaryDir | Out-Null
+          Copy-Item 'target/x86_64-pc-windows-msvc/release/open-pact-client.exe' "$binaryDir/open-pact-client.exe"
+          $binaryHash = (Get-FileHash "$binaryDir/open-pact-client.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
+          $manifestPath = Join-Path $env:RUNNER_TEMP 'open-pact-local.json'
+          $manifest = @{
+            version = '0.0.0-ci'
+            description = 'Local CI build of the Open Pact client'
+            homepage = 'https://github.com/gaboe/open-pact'
+            license = 'Apache-2.0'
+            architecture = @{
+              '64bit' = @{
+                url = 'http://127.0.0.1:8765/open-pact-client.exe'
+                hash = $binaryHash
+              }
+            }
+            bin = @('open-pact-client.exe')
+          }
+          $manifest | ConvertTo-Json -Depth 8 | Set-Content -Encoding utf8 $manifestPath
+
+          $server = Start-Process -FilePath python -ArgumentList @('-m', 'http.server', '8765', '--bind', '127.0.0.1', '--directory', $binaryDir) -PassThru -WindowStyle Hidden
+          try {
+            $ready = $false
+            for ($attempt = 0; $attempt -lt 20; $attempt++) {
+              try {
+                Invoke-WebRequest -Uri 'http://127.0.0.1:8765/open-pact-client.exe' -Method Head | Out-Null
+                $ready = $true
+                break
+              } catch {
+                Start-Sleep -Milliseconds 250
+              }
+            }
+            if (-not $ready) { throw 'Local binary server did not start.' }
+            scoop install $manifestPath
+            open-pact-client --version
+          } finally {
+            Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
+          }
