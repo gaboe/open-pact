@@ -34,7 +34,7 @@ shift
 case "$1" in
   view)
     shift
-    [ "$1" = v1.2.3 ] || exit 91
+    [ "$1" = "${MOCK_RELEASE_TAG:-v1.2.3}" ] || exit 91
     shift
     [ "$1" = --repo ] && [ "$2" = example/project ] || exit 92
     shift 2
@@ -50,7 +50,11 @@ case "$1" in
       SHA256SUMS
     )
     if [ "${MOCK_PACKAGE_ASSETS:-}" = 1 ]; then
-      assets+=(open-pact-client_1.2.3_amd64.deb open-pact-client-1.2.3-1.x86_64.rpm)
+      if [ "${MOCK_PRERELEASE:-}" = 1 ]; then
+        assets+=(open-pact-client_0.3.1~rc.1_amd64.deb open-pact-client-0.3.1~rc.1-1.x86_64.rpm)
+      else
+        assets+=(open-pact-client_1.2.3_amd64.deb open-pact-client-1.2.3-1.x86_64.rpm)
+      fi
     fi
     for file in "${assets[@]}"; do
       printf '%s\n%s.sigstore.json\n' "$file" "$file"
@@ -60,7 +64,7 @@ case "$1" in
   download) shift ;;
   *) exit 90 ;;
 esac
-[ "$1" = v1.2.3 ] || exit 95
+[ "$1" = "${MOCK_RELEASE_TAG:-v1.2.3}" ] || exit 95
 shift
 patterns=()
 while [ "$#" -gt 0 ]; do
@@ -80,10 +84,11 @@ assets=(
   SHA256SUMS
 )
 if [ "${MOCK_PACKAGE_ASSETS:-}" = 1 ]; then
-  assets+=(
-    open-pact-client_1.2.3_amd64.deb
-    open-pact-client-1.2.3-1.x86_64.rpm
-  )
+  if [ "${MOCK_PRERELEASE:-}" = 1 ]; then
+    assets+=(open-pact-client_0.3.1~rc.1_amd64.deb open-pact-client-0.3.1~rc.1-1.x86_64.rpm)
+  else
+    assets+=(open-pact-client_1.2.3_amd64.deb open-pact-client-1.2.3-1.x86_64.rpm)
+  fi
 fi
 expected_patterns=()
 for file in "${assets[@]}"; do
@@ -148,15 +153,20 @@ run_success() {
   local name=$1
   shift
   local include_packages=0
+  local prerelease=0
+  local release_tag=v1.2.3
   for setting in "$@"; do
     [ "$setting" = MOCK_PACKAGE_ASSETS=1 ] && include_packages=1
+    [ "$setting" = MOCK_PRERELEASE=1 ] && prerelease=1
+    [[ "$setting" = MOCK_RELEASE_TAG=* ]] && release_tag=${setting#*=}
   done
   local output="$tmp/$name.output"
   local marker="$tmp/$name.work-path"
   local out
   env -u MOCK_GH_FAIL -u MOCK_MISSING -u MOCK_MISSING_BUNDLE \
     -u MOCK_BAD_CHECKSUM -u MOCK_COSIGN_FAIL -u MOCK_PACKAGE_ASSETS \
-    "$@" "MOCK_WORK_PATH_FILE=$marker" "$script" v1.2.3 > "$output"
+    -u MOCK_PRERELEASE -u MOCK_RELEASE_TAG \
+    "$@" "MOCK_WORK_PATH_FILE=$marker" "$script" "$release_tag" > "$output"
   out=$(sed -n '$s/^verified files: //p' "$output")
   [ -n "$out" ] || fail "$name did not print its verified directory last"
   [[ "$out" = /* ]] || fail "$name did not print an absolute path"
@@ -180,12 +190,21 @@ open-pact-client-x86_64-unknown-linux-musl
 open-pact-client-x86_64-unknown-linux-musl.sigstore.json
 EXPECTED
   if [ "$include_packages" = 1 ]; then
-    cat >> "$tmp/$name.expected" <<'EXPECTED'
+    if [ "$prerelease" = 1 ]; then
+      cat >> "$tmp/$name.expected" <<'EXPECTED'
+open-pact-client-0.3.1~rc.1-1.x86_64.rpm
+open-pact-client-0.3.1~rc.1-1.x86_64.rpm.sigstore.json
+open-pact-client_0.3.1~rc.1_amd64.deb
+open-pact-client_0.3.1~rc.1_amd64.deb.sigstore.json
+EXPECTED
+    else
+      cat >> "$tmp/$name.expected" <<'EXPECTED'
 open-pact-client-1.2.3-1.x86_64.rpm
 open-pact-client-1.2.3-1.x86_64.rpm.sigstore.json
 open-pact-client_1.2.3_amd64.deb
 open-pact-client_1.2.3_amd64.deb.sigstore.json
 EXPECTED
+    fi
   fi
   sort -o "$tmp/$name.expected" "$tmp/$name.expected"
   cmp -s "$tmp/$name.expected" "$tmp/$name.actual" || fail "$name directory did not contain exactly the verified files"
@@ -220,6 +239,7 @@ run_missing_asset() {
 
 run_success successful-download
 run_success package-download MOCK_PACKAGE_ASSETS=1
+run_success prerelease-package-download MOCK_PACKAGE_ASSETS=1 MOCK_PRERELEASE=1 MOCK_RELEASE_TAG=v0.3.1-rc.1
 run_failure github-download MOCK_GH_FAIL=1
 run_failure bad-checksum MOCK_BAD_CHECKSUM=1
 run_failure signature-check MOCK_COSIGN_FAIL=NOTICE

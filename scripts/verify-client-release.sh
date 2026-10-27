@@ -38,11 +38,11 @@ assets=(
   SHA256SUMS
 )
 release_assets=$(gh release view "$tag" --repo "$repo" --json assets --jq '.assets[].name')
-for package in "open-pact-client_${tag#v}_amd64.deb" "open-pact-client-${tag#v}-1.x86_64.rpm"; do
-  if [[ $'\n'"$release_assets"$'\n' == *$'\n'"$package"$'\n'* ]]; then
-    assets+=("$package")
-  fi
-done
+while IFS= read -r asset; do
+  case "$asset" in
+    open-pact-client_*.deb|open-pact-client-*.rpm) assets+=("$asset") ;;
+  esac
+done <<< "$release_assets"
 download_patterns=()
 for file in "${assets[@]}"; do
   download_patterns+=(--pattern "$file" --pattern "$file.sigstore.json")
