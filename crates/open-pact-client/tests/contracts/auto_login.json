@@ -1,0 +1,134 @@
+{
+  "id": "auto_login",
+  "cases": [
+    {
+      "name": "macos-1",
+      "os": "macos",
+      "input": [
+        "fictional-user"
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": "internal/jobs/review-contracts/report.md#auto_login-m-and-i",
+      "unrepresentable_input": "The macOS adapter accepts only the username setting and cannot consume override evidence."
+    },
+    {
+      "name": "macos-2",
+      "os": "macos",
+      "input": [
+        "The domain/default pair does not exist"
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "off",
+      "known_diff": null
+    },
+    {
+      "name": "macos-3",
+      "os": "macos",
+      "input": [
+        ""
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "windows-4",
+      "os": "windows",
+      "input": [
+        "1"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": "internal/jobs/review-contracts/report.md#auto_login-m-and-i",
+      "unrepresentable_input": "The Windows adapter accepts AutoAdminLogon only and cannot consume inhibition evidence."
+    },
+    {
+      "name": "windows-5",
+      "os": "windows",
+      "input": [
+        "0"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "off",
+      "known_diff": null
+    },
+    {
+      "name": "windows-6",
+      "os": "windows",
+      "input": [
+        "!"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "linux-7",
+      "os": "linux",
+      "input": [],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "active-display-manager-unknown-enabled",
+      "os": "linux",
+      "input": [
+        "[daemon]\nAutomaticLoginEnable=true\nAutomaticLogin=fictional-user"
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": "internal/jobs/review-contracts/report.md#auto_login-m-and-i",
+      "unrepresentable_input": "The Linux adapter cannot identify the active display manager or verify merged configuration."
+    },
+    {
+      "name": "active-display-manager-unknown-disabled",
+      "os": "linux",
+      "input": [
+        "[daemon]\nAutomaticLoginEnable=false"
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": "internal/jobs/review-contracts/report.md#auto_login-m-and-i",
+      "unrepresentable_input": "The Linux adapter cannot identify the active display manager or verify merged configuration."
+    },
+    {
+      "name": "enabled-without-account",
+      "os": "linux",
+      "input": [
+        "[daemon]\nAutomaticLoginEnable=true"
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null,
+      "observed": "on",
+      "difference": "Enabled flag alone establishes on without a target account; study: internal/jobs/review-contracts/report.md#auto_login-m-and-i"
+    }
+  ],
+  "uncovered": [
+    {
+      "os": "macos",
+      "result": "on",
+      "reason": "The macOS adapter reads the username setting only. It cannot consume effective login or override evidence."
+    },
+    {
+      "os": "windows",
+      "result": "on",
+      "reason": "The Windows adapter reads AutoAdminLogon only. It cannot consume effective inhibition evidence."
+    },
+    {
+      "os": "linux",
+      "result": "on",
+      "reason": "The Linux adapter cannot identify the active display manager or verify its merged setting and target account."
+    },
+    {
+      "os": "linux",
+      "result": "off",
+      "reason": "The Linux adapter cannot identify the active display manager or verify complete merged configuration."
+    }
+  ]
+}

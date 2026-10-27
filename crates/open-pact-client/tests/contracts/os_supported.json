@@ -1,0 +1,155 @@
+{
+  "id": "os_supported",
+  "cases": [
+    {
+      "name": "macos-1",
+      "os": "macos",
+      "input": [
+        "26.0"
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "yes",
+      "known_diff": null
+    },
+    {
+      "name": "macos-2",
+      "os": "macos",
+      "input": [
+        "11.0"
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "no",
+      "known_diff": null
+    },
+    {
+      "name": "macos-3",
+      "os": "macos",
+      "input": [
+        ""
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "unlisted-future-release",
+      "os": "macos",
+      "input": [
+        "99.0"
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null,
+      "observed": "yes",
+      "difference": "Future macOS majors are assumed supported; study: internal/jobs/review-contracts/report.md#os_supported-m-and-i"
+    },
+    {
+      "name": "linux-5",
+      "os": "linux",
+      "input": [
+        "ID=ubuntu\nVERSION_ID=\"24.04\""
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "yes",
+      "known_diff": null
+    },
+    {
+      "name": "linux-6",
+      "os": "linux",
+      "input": [
+        "ID=ubuntu\nVERSION_ID=\"18.04\""
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null,
+      "observed": "no",
+      "difference": "Ubuntu 18.04 can have paid Pro coverage; support class is missing; study: internal/jobs/review-contracts/report.md#os_supported-m-and-i"
+    },
+    {
+      "name": "linux-7",
+      "os": "linux",
+      "input": [
+        "ID=fictional\nVERSION_ID=\"1\""
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "linux-8",
+      "os": "linux",
+      "input": [
+        ""
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "unlisted-future-release",
+      "os": "linux",
+      "input": [
+        "ID=ubuntu\nVERSION_ID=\"99.04\""
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null,
+      "observed": "yes",
+      "difference": "Future distribution releases are assumed supported; study: internal/jobs/review-contracts/report.md#os_supported-m-and-i"
+    },
+    {
+      "name": "windows-10",
+      "os": "windows",
+      "input": [
+        "26100|24H2|Enterprise|Client"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "yes",
+      "known_diff": null
+    },
+    {
+      "name": "windows-11",
+      "os": "windows",
+      "input": [
+        "10240|1507|EnterpriseS|Client"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "no",
+      "known_diff": null
+    },
+    {
+      "name": "windows-12",
+      "os": "windows",
+      "input": [
+        "99999|99H1|Professional|Client"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "windows-13",
+      "os": "windows",
+      "input": [
+        ""
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "ubuntu-18-standard-support-expired",
+      "os": "linux",
+      "input": [
+        "ID=ubuntu\nVERSION_ID=\"18.04\"\nSUPPORT_CLASS=\"standard\""
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "no",
+      "known_diff": null
+    }
+  ]
+}

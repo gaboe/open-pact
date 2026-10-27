@@ -1,0 +1,165 @@
+{
+  "id": "os_patch_age_days",
+  "cases": [
+    {
+      "name": "ten-complete-days",
+      "os": "macos",
+      "input": [
+        "\"date\" => 2026-10-16 12:00:00 +0000\n\"displayName\" => \"macOS 26.0.1\""
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": 10,
+      "known_diff": null
+    },
+    {
+      "name": "missing-receipt",
+      "os": "macos",
+      "input": [
+        ""
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "same-day",
+      "os": "macos",
+      "input": [
+        "\"date\" => 2026-10-26 11:59:00 +0000\n\"displayName\" => \"macOS 26.0.1\""
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": 0,
+      "known_diff": null
+    },
+    {
+      "name": "midnight-is-not-full-day",
+      "os": "macos",
+      "input": [
+        "\"date\" => 2026-10-25 23:59:00 +0000\n\"displayName\" => \"macOS 26.0.1\""
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": 0,
+      "known_diff": null,
+      "observed": 1,
+      "difference": "Calendar-day counting discards installation time; study: internal/jobs/review-contracts/report.md#os_patch_age_days-m-and-i"
+    },
+    {
+      "name": "ten-complete-days",
+      "os": "windows",
+      "input": [
+        "2026-10-16T00:00:00Z"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": 10,
+      "known_diff": null
+    },
+    {
+      "name": "missing-receipt",
+      "os": "windows",
+      "input": [
+        ""
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "same-day",
+      "os": "windows",
+      "input": [
+        "2026-10-26T11:59:00Z"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": 0,
+      "known_diff": null
+    },
+    {
+      "name": "midnight-is-not-full-day",
+      "os": "windows",
+      "input": [
+        "2026-10-16T23:59:00Z"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": 9,
+      "known_diff": null
+    },
+    {
+      "name": "linux-9",
+      "os": "linux",
+      "input": [
+        "1 | upgrade | 2026-10-16 12:00 | I, U | 12",
+        ""
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": 10,
+      "known_diff": null
+    },
+    {
+      "name": "linux-10",
+      "os": "linux",
+      "input": [
+        null,
+        null
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "linux-11",
+      "os": "linux",
+      "input": [
+        "1 | upgrade | 2026-10-16 12:00 | I, U | 12",
+        "FEDORA-2026-fictional Important/Sec. fictional-1.x86_64"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "linux-midnight-is-not-full-day",
+      "os": "linux",
+      "input": [
+        "1 | upgrade | 2026-10-25 23:59 | I, U | 12",
+        ""
+      ],
+      "code": 0,
+      "now": "2026-10-26T00:01:00Z",
+      "expected": 0,
+      "known_diff": null,
+      "observed": 1,
+      "difference": "Calendar-day counting discards transaction time; study: internal/jobs/review-contracts/report.md#os_patch_age_days-m-and-i"
+    },
+    {
+      "name": "macos-unrelated-product-receipt",
+      "os": "macos",
+      "input": [
+        "\"date\" => 2026-10-16 12:00:00 +0000\n\"displayName\" => \"macOS FictionalTool 1.0\""
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null,
+      "observed": 10,
+      "difference": "Display-name heuristic does not bind a receipt to the running OS; study: internal/jobs/review-contracts/report.md#os_patch_age_days-m-and-i"
+    },
+    {
+      "name": "date-only-ten-days",
+      "os": "windows",
+      "input": [
+        "2026-10-16"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": "A date alone cannot establish ten completed elapsed days; study: internal/jobs/review-contracts/report.md#os_patch_age_days-m-and-i",
+      "unrepresentable_input": "The Windows batch emits only yyyy-MM-dd and loses InstallTime within the day."
+    }
+  ]
+}

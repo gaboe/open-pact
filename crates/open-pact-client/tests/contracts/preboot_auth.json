@@ -1,0 +1,259 @@
+{
+  "id": "preboot_auth",
+  "cases": [
+    {
+      "name": "windows-1",
+      "os": "windows",
+      "input": [
+        "0|"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "none",
+      "known_diff": null
+    },
+    {
+      "name": "windows-2",
+      "os": "windows",
+      "input": [
+        "1|1,3"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "hardware_only",
+      "known_diff": null
+    },
+    {
+      "name": "windows-3",
+      "os": "windows",
+      "input": [
+        "1|4,3"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "user_secret",
+      "known_diff": null
+    },
+    {
+      "name": "windows-4",
+      "os": "windows",
+      "input": [
+        "1|3"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "windows-5",
+      "os": "windows",
+      "input": [
+        "1|1,4"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "hardware_only",
+      "known_diff": null
+    },
+    {
+      "name": "windows-6",
+      "os": "windows",
+      "input": [
+        "1|999"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "windows-7",
+      "os": "windows",
+      "input": [
+        ""
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "linux-8",
+      "os": "linux",
+      "input": [
+        "cryptroot crypt 0 0 ext4 /\n sda2 part 0 0 crypto_LUKS\n sda disk 0 0\n"
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "linux-9",
+      "os": "linux",
+      "input": [
+        ""
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "unrepresentable-unencrypted-root",
+      "os": "linux",
+      "input": [
+        "sda part 0 0 ext4 /"
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "none",
+      "known_diff": "pending integration",
+      "unrepresentable_input": "The Linux V3 adapter cannot consume /proc/cmdline, crypttab, or LUKS metadata needed to establish that no unlock protection applies."
+    },
+    {
+      "name": "unrepresentable-kernel-luks-word",
+      "os": "linux",
+      "input": [
+        "sda part 0 0 ext4 /"
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": "pending integration",
+      "unrepresentable_input": "The current Linux V3 adapter does not accept /proc/cmdline."
+    },
+    {
+      "name": "macos-12",
+      "os": "macos",
+      "input": [
+        "FileVault is On."
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "user_secret",
+      "known_diff": null
+    },
+    {
+      "name": "macos-13",
+      "os": "macos",
+      "input": [
+        ""
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "filevault-off-Apple-silicon",
+      "os": "macos",
+      "input": [
+        "FileVault is Off."
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "hardware_only",
+      "known_diff": "internal/jobs/review-contracts/report.md#preboot_auth-m-and-i",
+      "unrepresentable_input": "The macOS adapter cannot consume the device architecture and startup override evidence needed to distinguish hardware-only protection."
+    },
+    {
+      "name": "filevault-off-Intel-without-T2",
+      "os": "macos",
+      "input": [
+        "FileVault is Off."
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "none",
+      "known_diff": "internal/jobs/review-contracts/report.md#preboot_auth-m-and-i",
+      "unrepresentable_input": "The macOS adapter cannot consume the device architecture and startup override evidence needed to establish unprotected storage."
+    },
+    {
+      "os": "linux",
+      "now": "2026-10-26T12:00:00Z",
+      "known_diff": "pending integration",
+      "name": "crypttab-password",
+      "input": [
+        "dm-0 crypt 0 0 ext4 /\n  sda2 part 0 0 crypto_LUKS -"
+      ],
+      "expected": "unknown",
+      "unrepresentable_input": "The current Linux V3 adapter does not accept crypttab or LUKS metadata."
+    },
+    {
+      "os": "linux",
+      "now": "2026-10-26T12:00:00Z",
+      "known_diff": "pending integration",
+      "name": "unrepresentable-crypttab-tpm",
+      "input": [
+        "dm-0 crypt 0 0 ext4 /\n  sda2 part 0 0 crypto_LUKS -"
+      ],
+      "expected": "hardware_only",
+      "unrepresentable_input": "The Linux V3 adapter cannot consume crypttab or LUKS token metadata."
+    },
+    {
+      "os": "linux",
+      "now": "2026-10-26T12:00:00Z",
+      "known_diff": "pending integration",
+      "name": "unrepresentable-crypttab-tpm-pin",
+      "input": [
+        "dm-0 crypt 0 0 ext4 /\n  sda2 part 0 0 crypto_LUKS -"
+      ],
+      "expected": "user_secret",
+      "unrepresentable_input": "The Linux V3 adapter cannot consume crypttab or LUKS token metadata."
+    },
+    {
+      "os": "linux",
+      "now": "2026-10-26T12:00:00Z",
+      "known_diff": "pending integration",
+      "name": "luks-without-unlock-evidence",
+      "input": [
+        "dm-0 crypt 0 0 ext4 /\n  sda2 part 0 0 crypto_LUKS -"
+      ],
+      "expected": "unknown",
+      "unrepresentable_input": "The Linux V3 adapter cannot consume crypttab or LUKS metadata."
+    },
+    {
+      "name": "unrepresentable-kernel-luks-substring",
+      "os": "linux",
+      "input": [
+        "sda part 0 0 ext4 /"
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": "pending integration",
+      "unrepresentable_input": "The current Linux V3 adapter does not accept /proc/cmdline bytes."
+    },
+    {
+      "name": "unrepresentable-unreadable-cmdline",
+      "os": "linux",
+      "input": [
+        "sda part 0 0 ext4 /"
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": "pending integration",
+      "unrepresentable_input": "The current Linux V3 adapter cannot represent an unreadable /proc/cmdline source."
+    }
+  ],
+  "uncovered": [
+    {
+      "os": "macos",
+      "result": "hardware_only",
+      "reason": "The macOS adapter cannot consume architecture and startup override evidence."
+    },
+    {
+      "os": "macos",
+      "result": "none",
+      "reason": "The macOS adapter cannot consume architecture and startup override evidence."
+    },
+    {
+      "os": "linux",
+      "result": "hardware_only",
+      "reason": "The Linux V3 adapter cannot consume /proc/cmdline, crypttab, or LUKS token metadata."
+    },
+    {
+      "os": "linux",
+      "result": "none",
+      "reason": "The Linux V3 adapter cannot consume /proc/cmdline, crypttab, or LUKS metadata needed to establish plain storage."
+    },
+    {
+      "os": "linux",
+      "result": "user_secret",
+      "reason": "The Linux V3 adapter cannot consume crypttab or LUKS keyslot and token metadata."
+    }
+  ]
+}

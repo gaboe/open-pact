@@ -1,0 +1,90 @@
+{
+  "id": "log_oldest_record_days",
+  "cases": [
+    {
+      "name": "provider-not-applicable",
+      "os": "macos",
+      "input": [],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "n/a",
+      "known_diff": null
+    },
+    {
+      "name": "linux-2",
+      "os": "linux",
+      "input": [
+        "{\"__REALTIME_TIMESTAMP\":\"1792152000000000\"}"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": 10,
+      "known_diff": null
+    },
+    {
+      "name": "linux-3",
+      "os": "linux",
+      "input": [
+        ""
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "partial-visibility",
+      "os": "linux",
+      "input": [
+        "{\"__REALTIME_TIMESTAMP\":\"1792152000000000\"}\nHint: permission denied"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "nonzero-exit",
+      "os": "linux",
+      "input": [
+        "{\"__REALTIME_TIMESTAMP\":\"1792152000000000\"}"
+      ],
+      "code": 1,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "windows-6",
+      "os": "windows",
+      "input": [
+        "10|20"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": 10,
+      "known_diff": null
+    },
+    {
+      "name": "windows-7",
+      "os": "windows",
+      "input": [
+        ""
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "one-log-denied",
+      "os": "windows",
+      "input": [
+        "10|!"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    }
+  ]
+}

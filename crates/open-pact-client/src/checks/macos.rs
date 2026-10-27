@@ -224,3 +224,7 @@ mod tests {
         assert_eq!(parse_auto_login(""), "unknown");
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/contracts/adapters/macos.rs"]
+pub(super) mod contract_adapter;

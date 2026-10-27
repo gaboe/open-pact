@@ -29,26 +29,35 @@ pub fn os_auto_updates() -> ControlValue {
             result.filter(|r| r.success).map(|r| r.text)
         })
         .collect();
+    let apt_config = run_status(
+        "apt-config",
+        &[
+            "shell",
+            "AUTO",
+            "APT::Periodic::Unattended-Upgrade",
+            "ENABLE",
+            "APT::Periodic::Enable",
+        ],
+    )
+    .filter(|r| r.success)
+    .map(|r| r.text);
+    let dnf_config = std::fs::read_to_string("/etc/dnf/automatic.conf").ok();
+    parse_update_sources(&states, apt_config.as_deref(), dnf_config.as_deref())
+}
+
+fn parse_update_sources(
+    states: &[Option<String>],
+    apt_config: Option<&str>,
+    dnf_config: Option<&str>,
+) -> ControlValue {
     let installation = [
-        run_status(
-            "apt-config",
-            &[
-                "shell",
-                "AUTO",
-                "APT::Periodic::Unattended-Upgrade",
-                "ENABLE",
-                "APT::Periodic::Enable",
-            ],
-        )
-        .filter(|r| r.success)
-        .map(|r| parse_apt_auto(&r.text)),
-        std::fs::read_to_string("/etc/dnf/automatic.conf")
-            .ok()
-            .map(|s| parse_dnf_auto(&s)),
+        apt_config.map(parse_apt_auto),
+        dnf_config.map(parse_dnf_auto),
         Some("on".into()),
     ];
     let effective: Vec<_> = states
-        .into_iter()
+        .iter()
+        .cloned()
         .zip(installation)
         .map(|(state, install)| {
             state.map(|s| {
@@ -259,7 +268,7 @@ pub fn antimalware_signature_age_days() -> ControlValue {
             dates.push(date);
         }
         if let Some(last) = dates.into_iter().max() {
-            return bounded_age((Utc::now() - last).num_days(), 3650);
+            return super::buckets::elapsed_age_days(last, Utc::now(), 3650);
         }
     }
     "unknown".into()
@@ -480,3 +489,7 @@ mod v31_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/contracts/adapters/linux_v3.rs"]
+pub(super) mod contract_adapter;

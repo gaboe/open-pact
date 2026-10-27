@@ -102,6 +102,14 @@ fn parse_patch_age(text: &str, today: NaiveDate) -> ControlValue {
         .unwrap_or_else(|| "unknown".into())
 }
 
+#[cfg(test)]
+pub(super) fn contract_patch_age(
+    last: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> ControlValue {
+    buckets::elapsed_age_days(last, now, 3650)
+}
+
 pub fn auto_login() -> ControlValue {
     value("autologin")
         .map_or("unknown", |value| {
@@ -303,6 +311,10 @@ fn value(name: &str) -> Option<&'static str> {
 }
 
 fn batch() -> &'static Batch {
+    #[cfg(test)]
+    if let Some(batch) = contract_adapter::batch() {
+        return batch;
+    }
     VALUES.get_or_init(|| {
         let start = std::time::Instant::now();
         let output = capture(
@@ -1292,3 +1304,7 @@ mod v31_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/contracts/adapters/windows.rs"]
+pub(super) mod contract_adapter;

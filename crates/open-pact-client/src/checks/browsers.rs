@@ -1114,3 +1114,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/contracts/adapters/browsers.rs"]
+pub(super) mod contract_adapter;

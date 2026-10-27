@@ -2513,3 +2513,7 @@ vda2         part  0 0 ext4 /boot
         assert_eq!(parse_lsblk_inverse(out), "full");
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/contracts/adapters/linux.rs"]
+pub(super) mod contract_adapter;

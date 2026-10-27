@@ -1,0 +1,137 @@
+{
+  "id": "disk_encryption",
+  "cases": [
+    {
+      "name": "macos-1",
+      "os": "macos",
+      "input": [
+        "FileVault is On."
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "full",
+      "known_diff": null
+    },
+    {
+      "name": "macos-2",
+      "os": "macos",
+      "input": [
+        "FileVault is Off."
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "none",
+      "known_diff": null
+    },
+    {
+      "name": "macos-3",
+      "os": "macos",
+      "input": [
+        ""
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "conversion-incomplete",
+      "os": "macos",
+      "input": [
+        "FileVault is On.\nEncryption in progress: 42%"
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "partial",
+      "known_diff": null,
+      "observed": "full",
+      "difference": "FileVault parser does not report incomplete conversion; study: internal/jobs/review-contracts/report.md#disk_encryption-m-and-i"
+    },
+    {
+      "name": "linux-5",
+      "os": "linux",
+      "input": [
+        "sda2 part 0 0 ext4 /\n sda disk 0 0\n"
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "none",
+      "known_diff": null
+    },
+    {
+      "name": "linux-6",
+      "os": "linux",
+      "input": [
+        "cryptroot crypt 0 0 ext4 /\n sda2 part 0 0 crypto_LUKS\n sda disk 0 0\n"
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "full",
+      "known_diff": null
+    },
+    {
+      "name": "linux-7",
+      "os": "linux",
+      "input": [
+        "cryptroot crypt 0 0 ext4 /\n sda2 part 0 0 crypto_LUKS\n sda disk 0 0\nsdb1 part 0 0 ext4 /data\n sdb disk 0 0\n"
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "partial",
+      "known_diff": null
+    },
+    {
+      "name": "linux-8",
+      "os": "linux",
+      "input": [
+        ""
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "documented-conversion-protection-1-1",
+      "os": "windows",
+      "input": [
+        "1|1"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "full",
+      "known_diff": null,
+      "observed": "unknown",
+      "difference": "Collector uses undocumented Shell numbers instead of conversion and protection status; study: internal/jobs/review-contracts/report.md#disk_encryption-m-and-i"
+    },
+    {
+      "name": "documented-conversion-protection-2-0",
+      "os": "windows",
+      "input": [
+        "2|0"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "partial",
+      "known_diff": null,
+      "observed": "unknown",
+      "difference": "Collector uses undocumented Shell numbers instead of conversion and protection status; study: internal/jobs/review-contracts/report.md#disk_encryption-m-and-i"
+    },
+    {
+      "name": "documented-conversion-protection-0-0",
+      "os": "windows",
+      "input": [
+        "0|0"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "none",
+      "known_diff": null,
+      "observed": "unknown",
+      "difference": "Collector uses undocumented Shell numbers instead of conversion and protection status; study: internal/jobs/review-contracts/report.md#disk_encryption-m-and-i"
+    },
+    {
+      "name": "missing-source",
+      "os": "windows",
+      "input": [
+        ""
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    }
+  ]
+}

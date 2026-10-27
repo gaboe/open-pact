@@ -1,0 +1,211 @@
+{
+  "id": "os_auto_updates",
+  "cases": [
+    {
+      "name": "windows-1",
+      "os": "windows",
+      "input": [
+        "on"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "on",
+      "known_diff": null
+    },
+    {
+      "name": "windows-2",
+      "os": "windows",
+      "input": [
+        "off"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "off",
+      "known_diff": null
+    },
+    {
+      "name": "windows-3",
+      "os": "windows",
+      "input": [
+        ""
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "notify-before-download",
+      "os": "windows",
+      "input": [
+        "NotificationLevel=2"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "off",
+      "known_diff": null,
+      "observed": "unknown",
+      "difference": "NotificationLevel 2 requires user approval; study: internal/jobs/review-contracts/report.md#os_auto_updates-i-only"
+    },
+    {
+      "name": "notify-before-install",
+      "os": "windows",
+      "input": [
+        "NotificationLevel=3"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "off",
+      "known_diff": null,
+      "observed": "unknown",
+      "difference": "NotificationLevel 3 requires user approval; study: internal/jobs/review-contracts/report.md#os_auto_updates-i-only"
+    },
+    {
+      "name": "macos-6",
+      "os": "macos",
+      "input": [
+        null,
+        null
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "macos-7",
+      "os": "macos",
+      "input": [
+        "0",
+        "0"
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null,
+      "observed": "off",
+      "difference": "Background-data flags do not establish OS installation; study: internal/jobs/review-contracts/report.md#os_auto_updates-i-only"
+    },
+    {
+      "name": "background-data-does-not-prove-os-install",
+      "os": "macos",
+      "input": [
+        "1",
+        "1"
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null,
+      "observed": "on",
+      "difference": "Background-data flags do not prove automatic OS installation; study: internal/jobs/review-contracts/report.md#os_auto_updates-i-only"
+    },
+    {
+      "name": "os-install-enabled",
+      "os": "macos",
+      "input": [
+        "AutomaticallyInstallMacOSUpdates=1",
+        null
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "on",
+      "known_diff": null,
+      "observed": "unknown",
+      "difference": "The parser reads background-data flags, not the effective OS-install setting; study: internal/jobs/review-contracts/report.md#os_auto_updates-i-only"
+    },
+    {
+      "name": "linux-10",
+      "os": "linux",
+      "input": [
+        "LoadState=loaded\nUnitFileState=enabled\nActiveState=active",
+        "LoadState=not-found",
+        "LoadState=not-found",
+        "AUTO='1'\nENABLE='1'",
+        null
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "on",
+      "known_diff": null
+    },
+    {
+      "name": "linux-11",
+      "os": "linux",
+      "input": [
+        "LoadState=loaded\nUnitFileState=enabled\nActiveState=active",
+        "LoadState=not-found",
+        "LoadState=not-found",
+        "AUTO='0'\nENABLE='1'",
+        null
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "off",
+      "known_diff": null
+    },
+    {
+      "name": "linux-12",
+      "os": "linux",
+      "input": [
+        null,
+        null,
+        null,
+        null,
+        null
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "linux-13",
+      "os": "linux",
+      "input": [
+        "LoadState=loaded\nUnitFileState=enabled\nActiveState=active",
+        null,
+        null,
+        null,
+        null
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "dnf-automatic-install-enabled",
+      "os": "linux",
+      "input": [
+        "LoadState=not-found",
+        "LoadState=loaded\nUnitFileState=enabled\nActiveState=active",
+        "LoadState=not-found",
+        null,
+        "[commands]\napply_updates = yes"
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "on",
+      "known_diff": null
+    },
+    {
+      "name": "dnf-automatic-install-disabled",
+      "os": "linux",
+      "input": [
+        "LoadState=not-found",
+        "LoadState=loaded\nUnitFileState=enabled\nActiveState=active",
+        "LoadState=not-found",
+        null,
+        "[commands]\napply_updates = no"
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "off",
+      "known_diff": null
+    },
+    {
+      "name": "macos-os-install-disabled",
+      "os": "macos",
+      "input": [
+        "AutomaticallyInstallMacOSUpdates=0",
+        null
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "off",
+      "known_diff": null,
+      "observed": "unknown",
+      "difference": "The parser does not read the effective OS-install setting; study: internal/jobs/review-contracts/report.md#os_auto_updates-i-only"
+    }
+  ]
+}

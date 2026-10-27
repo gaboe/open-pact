@@ -1,0 +1,131 @@
+{
+  "id": "web_protection",
+  "cases": [
+    {
+      "name": "no-approved-reader",
+      "os": "linux",
+      "input": [],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "windows-2",
+      "os": "windows",
+      "input": [
+        "1|",
+        "[{\"kind\": \"chrome\", \"policy\": {}, \"recommended\": {}, \"prefs\": {}}]"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "on",
+      "known_diff": null
+    },
+    {
+      "name": "windows-3",
+      "os": "windows",
+      "input": [
+        "0|",
+        "[{\"kind\": \"chrome\", \"policy\": {}, \"recommended\": {}, \"prefs\": {}}]"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "off",
+      "known_diff": null
+    },
+    {
+      "name": "windows-4",
+      "os": "windows",
+      "input": [
+        "1|",
+        "[{\"kind\": \"chrome\", \"policy\": {\"SafeBrowsingProtectionLevel\": 0}, \"recommended\": {}, \"prefs\": {}}]"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "off",
+      "known_diff": null
+    },
+    {
+      "name": "windows-5",
+      "os": "windows",
+      "input": [
+        "",
+        ""
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "macos-6",
+      "os": "macos",
+      "input": [
+        "{\"kind\": \"chrome\", \"policy\": {}, \"recommended\": {}, \"prefs\": {}}"
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "on",
+      "known_diff": null
+    },
+    {
+      "name": "macos-7",
+      "os": "macos",
+      "input": [
+        "{\"kind\": \"chrome\", \"policy\": {\"SafeBrowsingProtectionLevel\": 0}, \"recommended\": {}, \"prefs\": {}}"
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "off",
+      "known_diff": null
+    },
+    {
+      "name": "macos-8",
+      "os": "macos",
+      "input": [
+        null
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "macos-9",
+      "os": "macos",
+      "input": [],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "n/a",
+      "known_diff": null
+    },
+    {
+      "name": "non-directory-lock-symlink",
+      "os": "macos",
+      "input": [
+        "{\"kind\": \"chrome\", \"policy\": {\"SafeBrowsingProtectionLevel\": 0}, \"recommended\": {}, \"prefs\": {}}",
+        "SingletonCookie -> fictional-cookie"
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "off",
+      "known_diff": "pending integration",
+      "unrepresentable_input": "The browser adapter accepts policy JSON, not profile entry types."
+    },
+    {
+      "name": "missing-Preferences",
+      "os": "macos",
+      "input": [
+        null
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "edge-Smartscreen",
+      "os": "macos",
+      "input": [
+        "{\"kind\": \"edge\", \"policy\": {\"SmartScreenEnabled\": false}, \"recommended\": {}, \"prefs\": {}}"
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "off",
+      "known_diff": null
+    }
+  ]
+}

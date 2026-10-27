@@ -571,3 +571,6 @@ mod tests {
         println!("elapsed {:?}", started.elapsed());
     }
 }
+
+#[cfg(test)]
+mod contracts;

@@ -1,0 +1,12 @@
+{
+  "id": "managed_repos_outside",
+  "cases": [],
+  "uncovered": [
+    { "os": "macos", "result": "number", "reason": "The contract runner has no mocked repo-scan.json input adapter. Scanner behavior remains covered by repository scan tests." },
+    { "os": "macos", "result": "unknown", "reason": "The contract runner has no mocked repo-scan.json input adapter. Scanner behavior remains covered by repository scan tests." },
+    { "os": "linux", "result": "number", "reason": "The contract runner has no mocked repo-scan.json input adapter. Scanner behavior remains covered by repository scan tests." },
+    { "os": "linux", "result": "unknown", "reason": "The contract runner has no mocked repo-scan.json input adapter. Scanner behavior remains covered by repository scan tests." },
+    { "os": "windows", "result": "number", "reason": "The contract runner has no mocked repo-scan.json input adapter. Scanner behavior remains covered by repository scan tests." },
+    { "os": "windows", "result": "unknown", "reason": "The contract runner has no mocked repo-scan.json input adapter. Scanner behavior remains covered by repository scan tests." }
+  ]
+}
