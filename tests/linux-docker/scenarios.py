@@ -5,6 +5,18 @@ import shutil
 import subprocess
 
 
+try:
+    kernel_cmdline = Path("/proc/cmdline").read_bytes()
+except OSError as error:
+    boot_auth_is_unknown = True
+    print(f"HOST /proc/cmdline unreadable ({error}); boot-auth cases expect unknown", flush=True)
+else:
+    boot_auth_is_unknown = b"luks" in kernel_cmdline
+    branch = "contains luks" if boot_auth_is_unknown else "does not contain luks"
+    expected = "unknown" if boot_auth_is_unknown else "fixture expectations"
+    print(f"HOST /proc/cmdline {branch}; boot-auth cases expect {expected}", flush=True)
+
+
 def command(*args, **kwargs):
     return subprocess.run(args, text=True, check=True, capture_output=True, **kwargs).stdout
 
@@ -20,8 +32,14 @@ def check(name, expected, user=None):
             key, value = line.split(" = ", 1)
             values[key.split()[-1]] = value
     for key, want in expected.items():
+        if key == "preboot_auth" and boot_auth_is_unknown:
+            want = "unknown"
         assert values.get(key) == want, (name, key, values.get(key), want, output)
-    print(f"PASS {name}: {expected}", flush=True)
+    resolved = {
+        key: "unknown" if key == "preboot_auth" and boot_auth_is_unknown else want
+        for key, want in expected.items()
+    }
+    print(f"PASS {name}: {resolved}", flush=True)
 
 
 def marker(expected):

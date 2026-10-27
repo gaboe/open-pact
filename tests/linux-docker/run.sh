@@ -6,12 +6,20 @@ if [[ -z ${PLATFORM:-} && $(uname -m) != arm64 && $(uname -m) != aarch64 ]]; the
     platform=linux/amd64
 fi
 PLATFORM="$platform" python3 tests/linux-docker/cache-regression.py
+systemd_result="not run"
 for distro in ${DISTROS:-ubuntu fedora}; do
     image="open-pact-linux-v31-$distro"
     docker build --platform "$platform" --target "$distro" -f tests/linux-docker/Dockerfile -t "$image" .
     docker run --rm --platform "$platform" "$image"
     if [[ "$distro" == ubuntu && ${SYSTEMD:-1} == 1 ]]; then
-        python3 tests/linux-docker/systemd.py "$image" "$platform"
+        systemd_output=$(python3 tests/linux-docker/systemd.py "$image" "$platform")
+        printf '%s\n' "$systemd_output"
+        if [[ "$systemd_output" == *"SKIP systemd"* ]]; then
+            systemd_result="SKIP (see reason above)"
+        else
+            systemd_result="PASS"
+        fi
         python3 tests/linux-docker/failed-start.py "$image" "$platform"
     fi
 done
+printf 'Linux Docker scenarios: PASS\nSystemd scenario: %s\n' "$systemd_result"

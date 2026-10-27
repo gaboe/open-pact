@@ -168,11 +168,11 @@ Limited Windows operations leave orphaned protected state and the shared binary 
 | `join` refuses the gateway | Confirm the invitation URL, company key fingerprint, HTTPS certificate, and pinned log key with the gateway operator. |
 | `check` reports a manifest hash mismatch | Get a new invitation for the current manifest. Run `join` with that invitation. Review the manifest. Sign its hash during `join`. Ask the gateway operator to approve the device again for the current manifest. `join` reuses the existing device key, so the device code stays the same. |
 | `check` says the device is pending | Give the device code to the gateway operator. Wait for approval. |
-| A check returns `unknown` on Windows | Run the task as an elevated administrator or install it with `schedule install --system` when the control needs machine-wide access. |
+| A check returns `unknown` on Windows | Run the task as an elevated administrator when the control needs machine-wide access. Set `run_as = "system"` in `open-pact.toml`, then run `apply` as an administrator. |
 | Windows event reports do not trigger | Check Event Log Readers access for the limited task user. Check that Defender history can be read. |
-| Linux schedule install cannot reach systemd | Start the user systemd manager. Run `schedule install` again. |
+| Linux apply cannot reach systemd | Start the user systemd manager. Run `apply` again. |
 | Schedule does not send | Check that the collector uses HTTPS, the VPN probe is reachable only through the VPN, and the binary remains at its installed path. |
-| `schedule uninstall` cannot find the job | Use the same absolute `--home` path that you used to install it. |
+| `apply` cannot find the job | Use the same absolute `--home` path that you used for the earlier `apply` command. |
 | `apply` names an unknown key | Correct the section and key in `open-pact.toml`. Run `apply` again. |
 
 ## Remove the device key

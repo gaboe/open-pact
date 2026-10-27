@@ -436,6 +436,20 @@ fn linux_chromium(data: &Path, policy_root: &Path) -> Protection {
         return Protection::Unknown;
     };
     let recommendation = linux_policy(&policy_root.join("recommended"));
+    let named_profile_symlink_unreadable = fs::read_dir(data).is_ok_and(|entries| {
+        entries.flatten().any(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let named_profile =
+                name == "Default" || name.starts_with("Profile ") || name == "Guest Profile";
+            named_profile
+                && entry.file_type().is_ok_and(|kind| kind.is_symlink())
+                && fs::metadata(entry.path()).is_err()
+        })
+    });
+    if named_profile_symlink_unreadable {
+        return Protection::Unknown;
+    }
     let Ok(dirs) = profiles(data, false) else {
         return Protection::Unknown;
     };
@@ -444,14 +458,18 @@ fn linux_chromium(data: &Path, policy_root: &Path) -> Protection {
         let Ok(prefs) = optional_json(&dir.join("Preferences"), false) else {
             return Protection::Unknown;
         };
-        states.push(chromium_with_recommendation(
-            &prefs,
-            &policy,
-            recommendation.as_ref().ok(),
-            false,
-        ));
+        let recommendation_is_required = chromium_policy(&policy, false).is_none()
+            && prefs.pointer("/safebrowsing/enabled").is_none();
+        states.push(if recommendation.is_err() && recommendation_is_required {
+            Protection::Unknown
+        } else {
+            chromium_with_recommendation(&prefs, &policy, recommendation.as_ref().ok(), false)
+        });
     }
     if states.is_empty() {
+        if recommendation.is_err() && chromium_policy(&policy, false).is_none() {
+            return Protection::Unknown;
+        }
         return chromium_with_recommendation(
             &Value::Object(Map::new()),
             &policy,
@@ -1300,6 +1318,7 @@ pub(super) mod contract_adapter;
 #[cfg(test)]
 mod linux_tests {
     use super::*;
+
     #[test]
     fn linux_mandatory_policy_overrides_profile_and_conflicts_are_unknown() {
         let root = tempfile::tempdir().unwrap();
@@ -1336,6 +1355,49 @@ mod linux_tests {
         );
         fs::write(managed.join("conflict.json"), "{broken").unwrap();
         assert!(linux_policy(&managed).is_err());
+    }
+
+    #[test]
+    fn linux_recommended_policy_read_failure_is_unknown_when_needed() {
+        let root = tempfile::tempdir().unwrap();
+        let recommended = root.path().join("policy/recommended");
+        fs::create_dir_all(&recommended).unwrap();
+        fs::write(recommended.join("fictional.json"), "{broken").unwrap();
+
+        assert_eq!(
+            linux_chromium(&root.path().join("data"), &root.path().join("policy")),
+            Protection::Unknown
+        );
+
+        let managed = root.path().join("policy/managed");
+        fs::create_dir_all(&managed).unwrap();
+        fs::write(
+            managed.join("fictional.json"),
+            r#"{"SafeBrowsingProtectionLevel":1}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            linux_chromium(&root.path().join("data"), &root.path().join("policy")),
+            Protection::On
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_unreadable_named_profile_symlink_is_unknown() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("data");
+        let default = data.join("Default");
+        fs::create_dir_all(&default).unwrap();
+        fs::write(default.join("Preferences"), "{}").unwrap();
+        symlink(root.path().join("missing-target"), data.join("Profile 1")).unwrap();
+
+        assert_eq!(
+            linux_chromium(&data, &root.path().join("policy")),
+            Protection::Unknown
+        );
     }
 }
 
