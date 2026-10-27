@@ -164,13 +164,25 @@ Limited Windows operations leave orphaned protected state and the shared binary 
 
 | Symptom | Action |
 | --- | --- |
-| Release verification fails | Use the script from the matching release tag. Check GitHub CLI and Cosign. |
-| Join refuses the gateway | Confirm the invitation, company fingerprint, certificate, and log key with the operator. |
-| Manifest hash mismatch | Get a new invitation. Review and sign the current manifest. Ask the operator to approve the device. |
-| Device is pending | Give the device code to the operator. Wait for approval. |
-| Windows control returns unknown | Use SYSTEM or administrator access for machine-wide controls. |
-| Windows events do not trigger | Check Event Log Readers access and Defender history access. |
-| Apply cannot reach systemd | Start the user systemd manager. Run apply again. |
-| Schedule does not send | Check the HTTPS collector, VPN-only routing, probe, and binary path. |
-| Apply cannot find the job | Use the same absolute client home as the original apply. |
-| Apply names an unknown key | Correct the named section and key in open-pact.toml. Run apply again. |
+| Release verification fails | Get `scripts/verify-client-release.sh` from the matching repository tag or its source archive. Check that GitHub CLI and Cosign are installed. Run the script with a release tag. Install the matching binary from the printed directory after the script succeeds. |
+| `join` refuses the gateway | Confirm the invitation URL, company key fingerprint, HTTPS certificate, and pinned log key with the gateway operator. |
+| `check` reports a manifest hash mismatch | Get a new invitation for the current manifest. Run `join` with that invitation. Review the manifest. Sign its hash during `join`. Ask the gateway operator to approve the device again for the current manifest. `join` reuses the existing device key, so the device code stays the same. |
+| `check` says the device is pending | Give the device code to the gateway operator. Wait for approval. |
+| A check returns `unknown` on Windows | Run the task as an elevated administrator or install it with `schedule install --system` when the control needs machine-wide access. |
+| Windows event reports do not trigger | Check Event Log Readers access for the limited task user. Check that Defender history can be read. |
+| Linux schedule install cannot reach systemd | Start the user systemd manager. Run `schedule install` again. |
+| Schedule does not send | Check that the collector uses HTTPS, the VPN probe is reachable only through the VPN, and the binary remains at its installed path. |
+| `schedule uninstall` cannot find the job | Use the same absolute `--home` path that you used to install it. |
+| `apply` names an unknown key | Correct the section and key in `open-pact.toml`. Run `apply` again. |
+
+## Linux checks and detection reports
+
+Run the client as the account that uses the device. `work_account` reports `admin` for membership in `sudo`, `wheel`, or `root`. The systemd user timer needs a running user manager. A container without that manager cannot install or exercise the user timer.
+
+To use the Linux ClamAV detection trigger, route `clamonacc` or `clamd` detection output to the system journal. Give the client account read access to that journal. The client reads trusted process names and `FOUND` records. The report timer checks every five minutes while the VPN is connected. File-only logs do not supply this trigger. A denied journal read preserves the saved detection baseline.
+
+The boot authentication check reads root and active swap mappings from `lsblk` and `/etc/crypttab`. An unspecified crypttab key reports `unknown` because automatic keys cannot be excluded. Explicit hardware PIN options report `user_secret`. A configured TPM2, FIDO2, or Clevis unlock reports `hardware_only`. A keyfile on a verified unencrypted filesystem reports `none`. Missing evidence reports `unknown`.
+
+The check returns `unknown` if it cannot read `/proc/cmdline` or if its raw bytes contain `luks` anywhere. This conservative check avoids guessing how a LUKS unlock parameter combines with crypttab. A match inside an unrelated word also returns `unknown`. A command line without `luks` does not change the `lsblk` and `/etc/crypttab` result. See [Linux source limits](platform-support.md#linux-sources-and-limits) for policy locations and controls that remain unknown.
+
+To run the Linux container scenarios, use `tests/linux-docker/run.sh`. Set `DISTROS=ubuntu` to run Ubuntu only. Set `PLATFORM=linux/amd64` or `PLATFORM=linux/arm64` to choose the target. The Docker build runs format verification, Clippy, and workspace tests before the scenarios. It builds the client and its check printer inside Linux. The test containers are removed after each run.

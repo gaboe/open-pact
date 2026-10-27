@@ -48,15 +48,55 @@ pub struct CapturedOutput {
     pub stderr: String,
 }
 
-pub fn capture(program: &str, args: &[&str], timeout: Duration) -> std::io::Result<CapturedOutput> {
-    let start = Instant::now();
-    let mut child = Command::new(program)
+#[cfg(unix)]
+fn program_exists(program: &str, path: Option<&std::ffi::OsStr>) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let executable = |candidate: &std::path::Path| {
+        std::fs::metadata(candidate)
+            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    };
+    if program.contains('/') {
+        return executable(std::path::Path::new(program));
+    }
+    let default = default_search_path();
+    std::env::split_paths(path.unwrap_or(&default)).any(|entry| executable(&entry.join(program)))
+}
+
+#[cfg(unix)]
+fn default_search_path() -> std::ffi::OsString {
+    use std::os::unix::ffi::OsStringExt;
+    // confstr supplies the platform's exec search path without consulting PATH.
+    unsafe {
+        let size = libc::confstr(libc::_CS_PATH, std::ptr::null_mut(), 0);
+        let mut bytes = vec![0; size];
+        if size == 0 || libc::confstr(libc::_CS_PATH, bytes.as_mut_ptr().cast(), size) == 0 {
+            return "/bin:/usr/bin".into();
+        }
+        bytes.pop();
+        std::ffi::OsString::from_vec(bytes)
+    }
+}
+
+fn spawn(
+    program: impl AsRef<std::ffi::OsStr>,
+    args: &[&str],
+) -> std::io::Result<std::process::Child> {
+    Command::new(program)
         .args(args)
         .env("LC_ALL", "C")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()?;
+        .spawn()
+}
+
+pub fn capture(program: &str, args: &[&str], timeout: Duration) -> std::io::Result<CapturedOutput> {
+    let start = Instant::now();
+    #[cfg(unix)]
+    if !program_exists(program, std::env::var_os("PATH").as_deref()) {
+        return Err(std::io::ErrorKind::NotFound.into());
+    }
+    let mut child = spawn(program, args)?;
     let readers = [
         child.stdout.take().map(drain),
         child.stderr.take().map(drain),
@@ -200,5 +240,152 @@ mod tests {
         );
         assert!(start.elapsed() >= timeout);
         assert!(start.elapsed() < Duration::from_secs(2));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod unix_resolution_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+
+    fn write_program(path: &Path, executable: bool, output: &str) {
+        std::fs::write(path, format!("#!/bin/sh\nprintf '{output}'\n")).unwrap();
+        std::fs::set_permissions(
+            path,
+            std::fs::Permissions::from_mode(if executable { 0o700 } else { 0o600 }),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn absent_path_uses_platform_default_but_empty_path_does_not() {
+        assert!(program_exists("sh", None));
+        assert!(!program_exists("sh", Some(std::ffi::OsStr::new(""))));
+    }
+
+    #[test]
+    fn missing_bare_program_returns_not_found() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(!program_exists(
+            "fictional-missing",
+            Some(root.path().as_os_str())
+        ));
+        assert!(!program_exists("fictional-missing", None));
+    }
+
+    #[test]
+    fn missing_absolute_program_returns_not_found_without_spawning() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("fictional-missing");
+        assert_eq!(
+            capture(missing.to_str().unwrap(), &[], TIMEOUT)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn non_executable_file_and_directory_are_not_programs() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("fictional-program");
+        write_program(&file, false, "fictional");
+        for path in [file.as_path(), root.path()] {
+            assert_eq!(
+                capture(path.to_str().unwrap(), &[], TIMEOUT)
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::NotFound
+            );
+        }
+    }
+
+    #[test]
+    fn execute_bit_precheck_does_not_test_effective_access_or_interpreters() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("fictional-program");
+        std::fs::write(&file, "#!/fictional/missing-interpreter\n").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o601)).unwrap();
+        assert!(program_exists(file.to_str().unwrap(), None));
+        assert!(program_exists(
+            "fictional-program",
+            Some(root.path().as_os_str())
+        ));
+    }
+
+    #[test]
+    fn lookup_child() {
+        let Ok(program) = std::env::var("FICTIONAL_LOOKUP_PROGRAM") else {
+            return;
+        };
+        let expected = spawn(&program, &["-c", "printf default-path"])
+            .and_then(|child| child.wait_with_output());
+        let actual = capture(&program, &["-c", "printf default-path"], TIMEOUT);
+        match (expected, actual) {
+            (Ok(expected), Ok(actual)) => {
+                assert_eq!(actual.status, Some(expected.status));
+                assert_eq!(actual.stdout.as_bytes(), expected.stdout);
+                assert_eq!(actual.stderr.as_bytes(), expected.stderr);
+            }
+            (Err(expected), Err(actual)) => assert_eq!(actual.kind(), expected.kind()),
+            (expected, actual) => panic!("direct spawn {expected:?}, capture {actual:?}"),
+        }
+    }
+
+    fn compare_lookup(program: &str, path: Option<&std::ffi::OsStr>, cwd: &Path) {
+        let mut child = Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                "checks::exec::unix_resolution_tests::lookup_child",
+                "--nocapture",
+            ])
+            .current_dir(cwd)
+            .env("FICTIONAL_LOOKUP_PROGRAM", program);
+        if let Some(path) = path {
+            child.env("PATH", path);
+        } else {
+            child.env_remove("PATH");
+        }
+        let output = child.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn original_name_preserves_platform_lookup_for_all_script_formats() {
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let file = first.join("fictional-program");
+        write_program(&second.join("fictional-program"), true, "second");
+        let path = std::env::join_paths([&first, &second]).unwrap();
+        for script in [
+            "#!\nprintf first",
+            "#!   \nprintf first",
+            "printf first",
+            "#!/fictional/missing-interpreter\n",
+            "#!/bin/sh\nprintf first",
+        ] {
+            std::fs::write(&file, script).unwrap();
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o700)).unwrap();
+            compare_lookup("fictional-program", Some(&path), root.path());
+            compare_lookup(file.to_str().unwrap(), Some(&path), root.path());
+        }
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o601)).unwrap();
+        compare_lookup("fictional-program", Some(&path), root.path());
+        compare_lookup("sh", None, root.path());
+        compare_lookup(
+            "fictional-program",
+            Some(std::ffi::OsStr::new(":")),
+            &second,
+        );
     }
 }

@@ -2374,6 +2374,15 @@ Write-Output 'refused'
         home
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "Docker prepares a fictional home for native systemd user timer verification"]
+    fn prepare_linux_schedule_home() {
+        let path = PathBuf::from(std::env::var_os("OPEN_PACT_SCHEDULE_FIXTURE").unwrap());
+        std::fs::create_dir_all(&path).unwrap();
+        enrolled_home(&path);
+    }
+
     #[cfg(windows)]
     #[test]
     #[ignore = "Windows CI prepares fictional homes for native CLI verification"]

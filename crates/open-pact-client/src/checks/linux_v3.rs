@@ -13,6 +13,7 @@ pub fn os_auto_updates() -> ControlValue {
         "apt-daily-upgrade.timer",
         "dnf-automatic.timer",
         "dnf-automatic-install.timer",
+        "dnf5-automatic.timer",
     ];
     let states: Vec<_> = units
         .iter()
@@ -54,6 +55,7 @@ fn parse_update_sources(
         apt_config.map(parse_apt_auto),
         dnf_config.map(parse_dnf_auto),
         Some("on".into()),
+        dnf5_auto(),
     ];
     let effective: Vec<_> = states
         .iter()
@@ -70,6 +72,24 @@ fn parse_update_sources(
         .collect();
     parse_update_units(&effective)
 }
+fn dnf5_auto() -> Option<ControlValue> {
+    let mut config = String::new();
+    for path in [
+        "/usr/share/dnf5/dnf5-plugins/automatic.conf",
+        "/etc/dnf/automatic.conf",
+    ] {
+        match std::fs::read_to_string(path) {
+            Ok(text) => {
+                config.push_str(&text);
+                config.push('\n');
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            Err(_) => return None,
+        }
+    }
+    Some(parse_dnf_auto(&config))
+}
+
 fn parse_apt_auto(text: &str) -> ControlValue {
     let mut interval = "0";
     for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
@@ -228,26 +248,6 @@ fn parse_uptime(text: &str) -> ControlValue {
         )
 }
 
-pub fn preboot_auth() -> ControlValue {
-    let output = run_status(
-        "lsblk",
-        &["-s", "-n", "-o", "NAME,TYPE,RO,RM,FSTYPE,MOUNTPOINT"],
-    );
-    output
-        .filter(|r| r.success)
-        .map_or("unknown", |r| parse_preboot(&r.text))
-        .into()
-}
-
-fn parse_preboot(text: &str) -> &'static str {
-    match super::linux::parse_lsblk_inverse(text) {
-        "none" => "none",
-        // LUKS keyslots do not distinguish passwords from keyfiles. A standard user
-        // cannot reliably inspect the root volume metadata to establish its unlock method.
-        _ => "unknown",
-    }
-}
-
 pub fn antimalware_signature_age_days() -> ControlValue {
     for root in ["/var/lib/clamav", "/usr/local/share/clamav"] {
         let mut dates = vec![];
@@ -317,23 +317,78 @@ fn parse_journal_age(text: &str, now: DateTime<Utc>) -> ControlValue {
     bounded_age((now - oldest).num_days(), i32::MAX)
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(super) fn event_markers() -> super::EventMarkerReads {
+    let detection = super::exec::capture(
+        "journalctl",
+        &[
+            "--system",
+            "--no-pager",
+            "--output=json",
+            "--reverse",
+            "--lines=1",
+            "--grep= FOUND$",
+            "_COMM=clamonacc",
+            "+",
+            "_COMM=clamd",
+        ],
+        super::exec::TIMEOUT,
+    )
+    .ok()
+    .filter(|r| !r.timed_out && r.stderr.is_empty())
+    .map_or(super::EventMarkerRead::Unknown, |r| {
+        parse_detection_status(r.status.and_then(|s| s.code()), &r.stdout, Utc::now())
+    });
+    super::EventMarkerReads {
+        security_log_cleared: super::EventMarkerRead::Unknown,
+        antimalware_detection: detection,
+    }
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_detection_status(
+    code: Option<i32>,
+    text: &str,
+    now: DateTime<Utc>,
+) -> super::EventMarkerRead {
+    match code {
+        Some(0) => parse_detection_journal(text, now),
+        Some(1) if text.trim().is_empty() => super::EventMarkerRead::Read(None),
+        _ => super::EventMarkerRead::Unknown,
+    }
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_detection_journal(text: &str, now: DateTime<Utc>) -> super::EventMarkerRead {
+    use super::EventMarkerRead::{Read, Unknown};
+    if text.trim().is_empty() {
+        return Read(None);
+    }
+    let Ok(entry) = serde_json::from_str::<Value>(text) else {
+        return Unknown;
+    };
+    if !matches!(entry["_COMM"].as_str(), Some("clamonacc" | "clamd"))
+        || !entry["MESSAGE"]
+            .as_str()
+            .is_some_and(|m| m.ends_with(" FOUND"))
+    {
+        return Unknown;
+    }
+    let Some(micros) = entry["__REALTIME_TIMESTAMP"]
+        .as_str()
+        .and_then(|s| s.parse::<i64>().ok())
+    else {
+        return Unknown;
+    };
+    if micros < 0 || micros > now.timestamp_micros() {
+        return Unknown;
+    }
+    Read(Some(micros))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn luks_without_verified_unlock_method_is_unknown() {
-        assert_eq!(
-            parse_preboot("sda2 part 0 0 ext4 /\n sda disk 0 0\n"),
-            "none"
-        );
-        assert_eq!(
-            parse_preboot(
-                "cryptroot crypt 0 0 ext4 /\n sda2 part 0 0 crypto_LUKS\n sda disk 0 0\n"
-            ),
-            "unknown"
-        );
-        assert_eq!(parse_preboot(""), "unknown");
-    }
     #[test]
     fn daily_database_uses_embedded_timestamp_not_file_mtime() {
         let text = "ClamAV-VDB:14 Oct 2026 08-00 +0000:28000:3000000:90:00000000000000000000000000000000:fictional-signature:fictional-builder:1791964800";
@@ -493,3 +548,55 @@ mod v31_tests {
 #[cfg(test)]
 #[path = "../../tests/contracts/adapters/linux_v3.rs"]
 pub(super) mod contract_adapter;
+#[cfg(test)]
+mod detection_tests {
+    use super::super::EventMarkerRead::{Read, Unknown};
+    use super::*;
+    #[test]
+    fn trusted_journal_detection_keeps_microseconds_and_rejects_partial_reads() {
+        let now = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        let entry = r#"{"_COMM":"clamonacc","MESSAGE":"/fictional/sample: Fictional.Test FOUND","__REALTIME_TIMESTAMP":"1799999999123456"}"#;
+        assert_eq!(
+            parse_detection_journal(entry, now),
+            Read(Some(1_799_999_999_123_456))
+        );
+        assert_eq!(parse_detection_journal("", now), Read(None));
+        assert_eq!(
+            parse_detection_journal(&(entry.to_owned() + "\nHint: permission denied"), now),
+            Unknown
+        );
+        assert_eq!(
+            parse_detection_journal(&entry.replace("clamonacc", "logger"), now),
+            Unknown
+        );
+        assert_eq!(
+            parse_detection_journal(&entry.replace(" FOUND", " OK"), now),
+            Unknown
+        );
+        assert_eq!(
+            parse_detection_journal(entry, now - chrono::Duration::days(1)),
+            Unknown
+        );
+    }
+
+    #[test]
+    fn journal_grep_no_match_establishes_an_empty_baseline() {
+        let now = Utc::now();
+        assert_eq!(parse_detection_status(Some(1), "", now), Read(None));
+        assert_eq!(
+            parse_detection_status(Some(1), "permission denied", now),
+            Unknown
+        );
+        assert_eq!(parse_detection_status(Some(2), "", now), Unknown);
+        assert_eq!(parse_detection_status(None, "", now), Unknown);
+    }
+
+    #[test]
+    #[ignore]
+    fn print_linux_detection_marker() {
+        println!(
+            "linux_detection_marker = {:?}",
+            event_markers().antimalware_detection
+        );
+    }
+}

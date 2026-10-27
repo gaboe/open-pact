@@ -3,6 +3,7 @@ mod buckets;
 mod exec;
 mod hints;
 mod linux;
+mod linux_luks;
 mod linux_v3;
 mod macos;
 mod macos_v3;
@@ -43,7 +44,11 @@ pub(crate) fn event_markers() -> EventMarkerReads {
     {
         windows::event_markers()
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
+    {
+        linux_v3::event_markers()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     {
         EventMarkerReads::default()
     }
@@ -221,7 +226,7 @@ const LINUX: Registry = &[
         "antimalware_active",
         ignore_input!(|| linux::antimalware_active().into()),
     ),
-    ("preboot_auth", ignore_input!(linux_v3::preboot_auth)),
+    ("preboot_auth", ignore_input!(linux_luks::preboot_auth)),
     (
         "antimalware_signature_age_days",
         ignore_input!(linux_v3::antimalware_signature_age_days),
@@ -230,7 +235,7 @@ const LINUX: Registry = &[
         "antimalware_full_scan_age_days",
         ignore_input!(macos_v3::unknown),
     ),
-    ("web_protection", ignore_input!(macos_v3::unknown)),
+    ("web_protection", ignore_input!(|| browsers::linux().into())),
     (
         "log_oldest_record_days",
         ignore_input!(linux_v3::log_oldest_record_days),
