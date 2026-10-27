@@ -6,6 +6,7 @@ mod linux;
 mod linux_v3;
 mod macos;
 mod macos_v3;
+pub(crate) mod repos;
 mod windows;
 
 use std::collections::BTreeMap;
@@ -73,6 +74,8 @@ const BUILTINS: &[(&str, u32)] = &[
     ("process_audit", 1),
     ("powershell_logging", 1),
     ("log_cleared", 1),
+    ("managed_repos_outside", 1),
+    ("managed_repos_total", 1),
 ];
 
 fn implements(control: &Control) -> bool {
@@ -104,10 +107,25 @@ pub fn check_supported(manifest: &Manifest) -> Result<(), String> {
 pub(crate) struct CheckInput<'a> {
     pub(crate) control: &'a Control,
     pub(crate) device_config: Option<&'a DeviceConfig>,
+    pub(crate) repo_scan: Option<&'a repos::RepoScan>,
 }
 
 type CheckFn = for<'a> fn(&CheckInput<'a>) -> ControlValue;
 type Registry = &'static [(&'static str, CheckFn)];
+
+fn managed_repo_value(input: &CheckInput<'_>, outside: bool) -> ControlValue {
+    let Some(scan) = input.repo_scan else {
+        return "unknown".into();
+    };
+    if scan.partial {
+        return "unknown".into();
+    }
+    if outside {
+        scan.managed_repos_outside.into()
+    } else {
+        scan.managed_repos_total.into()
+    }
+}
 
 macro_rules! ignore_input {
     ($check:expr) => {
@@ -165,6 +183,12 @@ const MACOS: Registry = &[
         ignore_input!(macos_v3::not_applicable),
     ),
     ("log_cleared", ignore_input!(macos_v3::not_applicable)),
+    ("managed_repos_outside", |input| {
+        managed_repo_value(input, true)
+    }),
+    ("managed_repos_total", |input| {
+        managed_repo_value(input, false)
+    }),
 ];
 
 const LINUX: Registry = &[
@@ -217,6 +241,12 @@ const LINUX: Registry = &[
         ignore_input!(macos_v3::not_applicable),
     ),
     ("log_cleared", ignore_input!(macos_v3::not_applicable)),
+    ("managed_repos_outside", |input| {
+        managed_repo_value(input, true)
+    }),
+    ("managed_repos_total", |input| {
+        managed_repo_value(input, false)
+    }),
 ];
 
 const WINDOWS: Registry = &[
@@ -266,6 +296,12 @@ const WINDOWS: Registry = &[
         ignore_input!(windows::powershell_logging),
     ),
     ("log_cleared", ignore_input!(windows::log_cleared)),
+    ("managed_repos_outside", |input| {
+        managed_repo_value(input, true)
+    }),
+    ("managed_repos_total", |input| {
+        managed_repo_value(input, false)
+    }),
 ];
 
 fn registry(os: Os) -> Registry {
@@ -380,6 +416,7 @@ pub fn run(
     os: Os,
     controls: &[Control],
     device_config: Option<&DeviceConfig>,
+    repo_scan: Option<&repos::RepoScan>,
 ) -> BTreeMap<String, ControlValue> {
     registry(os)
         .iter()
@@ -388,6 +425,7 @@ pub fn run(
             let input = CheckInput {
                 control,
                 device_config,
+                repo_scan,
             };
             let value =
                 std::panic::catch_unwind(|| check(&input)).unwrap_or_else(|_| "unknown".into());
@@ -411,7 +449,7 @@ mod tests {
                 controls.push(control);
             }
         }
-        run(os, &controls, None)
+        run(os, &controls, None, None)
     }
 
     #[test]
@@ -434,7 +472,7 @@ mod tests {
             .filter(|control| control.id == "firewall")
             .cloned()
             .collect::<Vec<_>>();
-        let ran = run(Os::Windows, &controls, None);
+        let ran = run(Os::Windows, &controls, None, None);
         assert_eq!(ran.into_keys().collect::<Vec<_>>(), ["firewall"]);
     }
 
@@ -451,7 +489,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         for os in Os::ALL {
-            let expected = legacy_registry(os)
+            let mut expected = legacy_registry(os)
                 .iter()
                 .map(|(id, check)| {
                     (
@@ -460,7 +498,9 @@ mod tests {
                     )
                 })
                 .collect::<BTreeMap<_, _>>();
-            assert_eq!(run(os, &controls, None), expected, "{os}");
+            expected.insert("managed_repos_outside".into(), "unknown".into());
+            expected.insert("managed_repos_total".into(), "unknown".into());
+            assert_eq!(run(os, &controls, None, None), expected, "{os}");
         }
     }
 

@@ -1072,11 +1072,25 @@ async fn run_report(
     home: &Home,
     state_home: &Home,
     config: &Config,
+    device_config: Option<&DeviceConfig>,
     read_events: impl FnOnce() -> checks::EventMarkerReads,
 ) -> Result<()> {
     let mut state: State = state_home.read_json(STATE)?.unwrap_or_default();
     state.observe(vpn_up(&config.vpn_probe).await);
     save(state_home, STATE, &state)?;
+    let now = chrono::Utc::now().timestamp();
+    let due = checks::repos::load_attempt(&home.0)?
+        .is_none_or(|scan| now.saturating_sub(scan.scanned_at) >= 24 * 60 * 60);
+    if due {
+        checks::repos::lower_process_priority();
+        let enrolment = home.enrolment()?;
+        let manifest =
+            open_pact_core::Manifest::parse(&crate::read_home_file(&home.file("manifest.toml"))?)?;
+        if manifest.hash() != &enrolment.manifest {
+            bail!("manifest.toml no longer matches the hash you signed");
+        }
+        crate::scan_repositories(home, &manifest, device_config)?;
+    }
     let events = read_events();
     let (snapshot, compliance) = report::prepare(home)?;
     state.observe_compliance(&compliance);
@@ -1557,20 +1571,28 @@ async fn operate(home: &Home, command: Operation, home_locked: bool) -> Result<(
     };
     match command {
         Operation::Run { .. } => {
-            let config = DeviceConfig::load(&home)?
+            let device_config = DeviceConfig::load(&home)?
                 .context("open-pact.toml is missing; run `config example`")?;
-            if !config
+            if !device_config
                 .schedule
                 .as_ref()
                 .is_some_and(|schedule| schedule.enabled)
             {
                 return Ok(());
             }
-            let report = config
+            let report = device_config
                 .report
+                .as_ref()
                 .context("open-pact.toml [report].collector is required")?;
-            let config = Config::new(report.collector, report.vpn_probe)?;
-            run_report(&home, &state_home, &config, checks::event_markers).await?;
+            let config = Config::new(report.collector.clone(), report.vpn_probe.clone())?;
+            run_report(
+                &home,
+                &state_home,
+                &config,
+                Some(&device_config),
+                checks::event_markers,
+            )
+            .await?;
         }
         Operation::Install {
             collector,
@@ -3025,7 +3047,7 @@ Write-Output 'refused'
             security_log_cleared: checks::EventMarkerRead::Read(Some(timestamp)),
             antimalware_detection: checks::EventMarkerRead::Unknown,
         };
-        run_report(&home, &state_home, &config, || events(100))
+        run_report(&home, &state_home, &config, None, || events(100))
             .await
             .unwrap();
         let baseline: State = state_home.read_json(STATE).unwrap().unwrap();
@@ -3033,7 +3055,7 @@ Write-Output 'refused'
             baseline.last_events.unwrap().security_log_cleared,
             Some(100)
         );
-        let error = run_report(&home, &state_home, &config, || events(101))
+        let error = run_report(&home, &state_home, &config, None, || events(101))
             .await
             .unwrap_err();
         assert!(

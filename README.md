@@ -53,6 +53,11 @@ The client keeps its files in `~/.config/open-pact/`, or in the directory given 
 | `company-key.txt`, `log-key.txt` | the company key fingerprint and the log key, pinned from the invitation at `join` |
 | `log-checkpoint.txt` | the last verified, gateway-signed log checkpoint |
 | `claims.jsonl` | every claim sent and every response, byte for byte |
+| `repo-scan.json` | the local scan time, counts, and paths of matching repositories outside registered folders |
+
+Managed-repository reports send only the counts. Outside paths stay in `repo-scan.json` and appear only in local `check` output. See [client controls](docs/controls.md) for scan depth, skipped folders, and limits.
+
+On macOS, grant Full Disk Access to the client binary in System Settings before you use repository counts. If `check` reports unknown repository values, add the printed client binary under Privacy & Security, then Full Disk Access. The client does not print denied folder paths.
 
 On Unix, `vpn/current/` is a directory link. The two top-level links can straddle a replacement between two reads.
 

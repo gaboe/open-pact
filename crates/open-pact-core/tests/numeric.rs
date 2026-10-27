@@ -40,6 +40,7 @@ fn claim(m: &Manifest, value: ControlValue) -> Claim {
             ("process_audit", "n/a".into()),
             ("powershell_logging", "n/a".into()),
             ("log_cleared", "n/a".into()),
+            ("managed_repos_outside", 0.into()),
         ]
         .into_iter()
         .map(|(k, v)| (k.into(), v))

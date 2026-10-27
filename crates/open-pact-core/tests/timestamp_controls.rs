@@ -100,6 +100,8 @@ fn v31_example_declares_exact_fields_and_reported_only_controls() {
         "process_audit",
         "powershell_logging",
         "log_cleared",
+        "managed_repos_outside",
+        "managed_repos_total",
         "work_account",
         "uptime_days",
     ];
