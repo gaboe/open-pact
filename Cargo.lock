@@ -1561,6 +1561,7 @@ dependencies = [
  "sha2 0.11.0",
  "tempfile",
  "tokio",
+ "toml",
  "uuid",
  "x509-parser",
 ]

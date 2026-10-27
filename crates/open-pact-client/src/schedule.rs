@@ -8,6 +8,7 @@ use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::device_config::{DeviceConfig, RunAs};
 use crate::{Home, checks, report};
 
 const CONFIG: &str = "report-schedule.json";
@@ -16,22 +17,6 @@ const LOCK: &str = "report-schedule.lock";
 
 #[derive(Subcommand)]
 pub(crate) enum Command {
-    /// Register a report job that checks VPN connectivity every five minutes
-    Install {
-        #[arg(long)]
-        collector: String,
-        #[arg(long)]
-        vpn_probe: Option<String>,
-        /// Run Windows checks as SYSTEM to read machine-wide settings
-        #[arg(long)]
-        system: bool,
-    },
-    /// Remove the report job, its configuration and report state
-    Uninstall {
-        /// Remove Windows SYSTEM state and the shared protected binary
-        #[arg(long)]
-        system: bool,
-    },
     #[command(hide = true)]
     Run {
         #[arg(long)]
@@ -44,7 +29,21 @@ pub(crate) enum Command {
     },
 }
 
-#[derive(Serialize, Deserialize)]
+enum Operation {
+    Install {
+        collector: String,
+        vpn_probe: Option<String>,
+        system: bool,
+    },
+    Uninstall {
+        system: bool,
+    },
+    Run {
+        system: bool,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct Config {
     collector: String,
     vpn_probe: String,
@@ -224,7 +223,7 @@ fn newer(current: checks::EventMarkerRead, initialized: bool, previous: Option<i
             if previous.is_none_or(|previous| current > previous))
 }
 
-fn probe_address(raw: &str) -> Result<()> {
+pub(crate) fn probe_address(raw: &str) -> Result<()> {
     let url =
         reqwest::Url::parse(&format!("tcp://{raw}")).context("VPN probe must be host:port")?;
     if url.host_str().is_none()
@@ -377,15 +376,6 @@ fn save<T: Serialize>(home: &Home, name: &str, value: &T) -> Result<()> {
     }
     result?;
     Ok(())
-}
-
-pub(crate) fn uninstall_command(home: &Path) -> String {
-    let raw = home.to_string_lossy();
-    #[cfg(windows)]
-    let quoted = format!("'{}'", raw.replace('\'', "''"));
-    #[cfg(not(windows))]
-    let quoted = format!("'{}'", raw.replace('\'', "'\"'\"'"));
-    format!("open-pact-client --home {quoted} schedule uninstall")
 }
 
 fn text(path: &Path) -> Result<&str> {
@@ -637,6 +627,14 @@ fn systemd_dir() -> Result<PathBuf> {
     .join("systemd/user"))
 }
 
+fn systemd_status(timer: &str, query: &str) -> Result<bool> {
+    Ok(std::process::Command::new("systemctl")
+        .args(["--user", query, timer])
+        .output()?
+        .status
+        .success())
+}
+
 fn launch_domain() -> Result<String> {
     let output = std::process::Command::new("id").arg("-u").output()?;
     let uid = String::from_utf8(output.stdout)?
@@ -692,7 +690,11 @@ fn register(job: &Job, action: RegistrationAction) -> Result<()> {
                 std::fs::write(&timer, job.timer())?;
                 execute("systemctl", &["--user", "daemon-reload"])?;
                 execute("systemctl", &["--user", "enable", "--now", &timer_name])?;
-            } else if timer.exists() || service.exists() {
+            } else if timer.exists()
+                || service.exists()
+                || systemd_status(&timer_name, "is-active")?
+                || systemd_status(&timer_name, "is-enabled")?
+            {
                 execute("systemctl", &["--user", "disable", "--now", &timer_name])?;
                 execute(
                     "systemctl",
@@ -853,7 +855,19 @@ fn windows_protected_paths(home: &Home, copy_binary: bool) -> Result<(PathBuf, P
     validate_windows_home(absolute)?;
     let hash = hex::encode(Sha256::digest(text(absolute)?.as_bytes()));
     let source = powershell_literal(text(&std::env::current_exe()?)?);
-    let script = format!(
+    let script = windows_protected_paths_script(&hash, &source, copy_binary);
+    let paths = windows_powershell(&script)?;
+    let mut lines = paths.lines();
+    let binary = PathBuf::from(lines.next().context("protected binary path missing")?);
+    let state = PathBuf::from(lines.next().context("protected state path missing")?);
+    if lines.next().is_some() {
+        bail!("unexpected protected path output");
+    }
+    Ok((binary, state))
+}
+
+fn windows_protected_paths_script(hash: &str, source: &str, copy_binary: bool) -> String {
+    format!(
         r#"{PROTECTED_DIRECTORY}
 $program = ProgramFilesPath
 AssertProtected $program
@@ -879,15 +893,7 @@ Write-Output $binary
 Write-Output $data
 "#,
         copy = if copy_binary { "$true" } else { "$false" },
-    );
-    let paths = windows_powershell(&script)?;
-    let mut lines = paths.lines();
-    let binary = PathBuf::from(lines.next().context("protected binary path missing")?);
-    let state = PathBuf::from(lines.next().context("protected state path missing")?);
-    if lines.next().is_some() {
-        bail!("unexpected protected path output");
-    }
-    Ok((binary, state))
+    )
 }
 
 fn windows_task_query_script(job: &Job) -> String {
@@ -911,14 +917,22 @@ try {{ $task = $folder.GetTask({id}) }} catch {{
     )
 }
 
-fn windows_require_elevation() -> Result<()> {
-    windows_powershell(
-        r#"$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+fn windows_require_elevation_script() -> &'static str {
+    r#"$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = New-Object Security.Principal.WindowsPrincipal($identity)
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    throw 'run `schedule uninstall --system` from an elevated prompt'
-}"#,
-    )?;
+    throw 'run `apply` from an elevated prompt'
+}"#
+}
+
+fn windows_system_executable_script() -> String {
+    format!(
+        "{PROTECTED_DIRECTORY}\nWrite-Output (Join-Path (ProgramFilesPath) 'open-pact\\open-pact-client.exe')"
+    )
+}
+
+fn windows_require_elevation() -> Result<()> {
+    windows_powershell(windows_require_elevation_script())?;
     Ok(())
 }
 
@@ -927,7 +941,7 @@ fn windows_uninstall_script(job: &Job, system: bool) -> String {
     format!(
         r#"{query}
 if (-not {system} -and $null -ne $task -and (IsSystemTask $task)) {{
-    throw 'run `schedule uninstall --system` from an elevated prompt'
+    throw 'run `apply` from an elevated prompt'
 }}
 if ($null -ne $task) {{ $folder.DeleteTask({id},0) }}
 try {{
@@ -948,14 +962,23 @@ throw 'scheduled task remains: {name}'
 
 fn windows_uninstall(job: &Job, system: bool) -> Result<()> {
     windows_powershell(&windows_uninstall_script(job, system))
-        .context("run `schedule uninstall --system` from an elevated prompt")?;
+        .context("run `apply` from an elevated prompt")?;
     Ok(())
 }
 
 fn windows_existing_system_state(home: &Path) -> Result<Option<PathBuf>> {
     validate_windows_home(home)?;
     let hash = hex::encode(Sha256::digest(text(home)?.as_bytes()));
-    let output = windows_powershell(&format!(
+    let output = windows_powershell(&windows_existing_system_state_script(&hash))?;
+    Ok(if output.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(output))
+    })
+}
+
+fn windows_existing_system_state_script(hash: &str) -> String {
+    format!(
         r#"{PROTECTED_DIRECTORY}
 $data = Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'open-pact'
 $system = Join-Path $data 'system'
@@ -967,17 +990,20 @@ if (Test-Path -LiteralPath $state) {{
     Write-Output $state
 }}
 "#
-    ))?;
-    Ok(if output.is_empty() {
-        None
-    } else {
-        Some(PathBuf::from(output))
-    })
+    )
 }
 
 fn windows_cleanup_binary(job: &Job) -> Result<()> {
+    let output = windows_powershell(&windows_cleanup_binary_script(job))?;
+    if !output.is_empty() {
+        println!("{output}");
+    }
+    Ok(())
+}
+
+fn windows_cleanup_binary_script(job: &Job) -> String {
     let query = windows_task_query_script(job);
-    let output = windows_powershell(&format!(
+    format!(
         r#"{PROTECTED_DIRECTORY}
 {query}
 $install = Join-Path (ProgramFilesPath) 'open-pact'
@@ -1000,15 +1026,11 @@ try {{
 }} catch {{ $failure = $_.Exception.Message }}
 $leftovers = @(Get-ChildItem -LiteralPath $install -Filter 'open-pact-client.exe*' -File -Force -ErrorAction Stop)
 if ($leftovers.Count -gt 0) {{
-    throw "SYSTEM files remain: $($leftovers.FullName -join ', '). $failure Retry schedule uninstall --system, or reboot for queued files."
+    throw "SYSTEM files remain: $($leftovers.FullName -join ', '). $failure Retry apply, or reboot for queued files."
 }}
 if ($null -ne $failure) {{ throw $failure }}
 "#
-    ))?;
-    if !output.is_empty() {
-        println!("{output}");
-    }
-    Ok(())
+    )
 }
 
 fn windows_system_uninstall(job: &Job, home: &Home) -> Result<()> {
@@ -1041,7 +1063,7 @@ fn windows_system_uninstall(job: &Job, home: &Home) -> Result<()> {
 
 fn validate_system_install(system: bool, os: open_pact_core::Os) -> Result<()> {
     if system && os != open_pact_core::Os::Windows {
-        bail!("schedule install --system is available only on Windows");
+        bail!("[schedule].run_as = system is available only on Windows");
     }
     Ok(())
 }
@@ -1083,22 +1105,419 @@ async fn run_report(
     Ok(())
 }
 
+const APPLIED: &str = "schedule-applied.json";
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct Applied {
+    report: Config,
+    run_as: RunAs,
+    executable: PathBuf,
+}
+
+#[derive(Debug, Default)]
+struct Observed {
+    exists: bool,
+    matches: bool,
+    system: bool,
+    leftovers: bool,
+    protected_leftovers: bool,
+    windows_task: Option<WindowsTaskState>,
+}
+
+#[derive(Debug, Default)]
+struct WindowsTaskState {
+    trigger_enabled: bool,
+    trigger_type: Option<i32>,
+    protected_binary: Option<ProtectedBinaryState>,
+}
+
+#[derive(Debug)]
+struct ProtectedBinaryState {
+    exists: bool,
+    matches_source: bool,
+}
+
+impl WindowsTaskState {
+    fn matches_desired(&self, system: bool) -> bool {
+        self.trigger_enabled
+            && self.trigger_type == Some(1)
+            && (!system
+                || self
+                    .protected_binary
+                    .as_ref()
+                    .is_some_and(|binary| binary.exists && binary.matches_source))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Change {
+    Install,
+    Update,
+    Remove,
+    None,
+}
+
+fn reconcile(desired: Option<&Applied>, applied: Option<&Applied>, observed: &Observed) -> Change {
+    match desired {
+        Some(_) if !observed.exists => Change::Install,
+        Some(desired)
+            if Some(desired) != applied
+                || !observed.matches
+                || observed
+                    .windows_task
+                    .as_ref()
+                    .is_some_and(|task| !task.matches_desired(desired.run_as == RunAs::System)) =>
+        {
+            Change::Update
+        }
+        Some(_) => Change::None,
+        None if observed.exists || observed.leftovers || applied.is_some() => Change::Remove,
+        None => Change::None,
+    }
+}
+
+fn read_text_if_exists(path: &Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
+    }
+}
+
+fn windows_observation_script(
+    job: &Job,
+    executable: &Path,
+    source_executable: &Path,
+    expected_args: &str,
+) -> Result<String> {
+    let query = windows_task_query_script(job);
+    Ok(format!(
+        r#"function ProgramFilesPath {{ [Environment]::GetFolderPath('ProgramFiles') }}
+{query}
+if ($null -eq $task) {{ Write-Output 'missing'; return }}
+if (IsSystemTask $task) {{ Write-Output 'system' }} else {{ Write-Output 'user' }}
+$action = @($task.Definition.Actions)
+$triggers = @($task.Definition.Triggers)
+if ($triggers.Count -eq 1) {{
+    Write-Output ("trigger_enabled=" + [int]$triggers[0].Enabled)
+    Write-Output ("trigger_type=" + $triggers[0].Type)
+}}
+if (IsSystemTask $task) {{
+    $protected = Join-Path (Join-Path (ProgramFilesPath) 'open-pact') 'open-pact-client.exe'
+    $protectedExists = Test-Path -LiteralPath $protected -PathType Leaf
+    Write-Output ("protected_exists=" + [int]$protectedExists)
+    $protectedMatches = $protectedExists -and (Get-FileHash -LiteralPath $protected -Algorithm SHA256).Hash -eq (Get-FileHash -LiteralPath {source} -Algorithm SHA256).Hash
+    Write-Output ("protected_matches=" + [int]$protectedMatches)
+}}
+if ($action.Count -eq 1 -and $action[0].Path -eq {binary} -and $action[0].Arguments -eq {args} -and $task.Enabled -and $triggers.Count -eq 1 -and $triggers[0].Enabled -and $triggers[0].Type -eq 1 -and $triggers[0].Repetition.Interval -eq 'PT5M') {{ Write-Output 'matches' }}
+"#,
+        binary = powershell_literal(text(executable)?),
+        args = powershell_literal(expected_args),
+        source = powershell_literal(text(source_executable)?),
+    ))
+}
+
+fn observe(home: &Home, desired: Option<&Applied>, inspect_protected: bool) -> Result<Observed> {
+    let source_executable = desired
+        .map(|settings| settings.executable.clone())
+        .unwrap_or(std::env::current_exe()?);
+    let executable = desired
+        .map(|settings| settings.executable.clone())
+        .unwrap_or(std::env::current_exe()?);
+    let executable = if crate::current_os()? == open_pact_core::Os::Windows
+        && desired.is_some_and(|settings| settings.run_as == RunAs::System)
+    {
+        PathBuf::from(windows_powershell(&windows_system_executable_script())?)
+    } else {
+        executable
+    };
+    let mut job = Job::new(&executable, &home.0)?;
+    if desired.is_some_and(|settings| settings.run_as == RunAs::System) {
+        job.argv.push("--system".into());
+    }
+    let leftovers = home.file(CONFIG).exists() || home.file(STATE).exists();
+    Ok(match crate::current_os()? {
+        open_pact_core::Os::Macos => {
+            let path = user_home()?
+                .join("Library/LaunchAgents")
+                .join(format!("{}.plist", job.id));
+            let stored = read_text_if_exists(&path)?;
+            let target = format!("{}/{}", launch_domain()?, job.id);
+            let loaded = std::process::Command::new("launchctl")
+                .args(["print", &target])
+                .output()?
+                .status
+                .success();
+            Observed {
+                exists: stored.is_some() || loaded,
+                matches: stored.as_deref() == Some(job.plist().as_str()) && loaded,
+                leftovers,
+                system: false,
+                protected_leftovers: false,
+                windows_task: None,
+            }
+        }
+        open_pact_core::Os::Linux => {
+            let dir = systemd_dir()?;
+            let service = read_text_if_exists(&dir.join(format!("{}.service", job.id)))?;
+            let timer = read_text_if_exists(&dir.join(format!("{}.timer", job.id)))?;
+            let timer_name = format!("{}.timer", job.id);
+            let active = systemd_status(&timer_name, "is-active")?;
+            let enabled = systemd_status(&timer_name, "is-enabled")?;
+            Observed {
+                exists: service.is_some() || timer.is_some() || active || enabled,
+                matches: service.as_deref() == Some(job.service().as_str())
+                    && timer.as_deref() == Some(job.timer().as_str())
+                    && active
+                    && enabled,
+                leftovers,
+                system: false,
+                protected_leftovers: false,
+                windows_task: None,
+            }
+        }
+        open_pact_core::Os::Windows => {
+            let expected_args = job
+                .argv
+                .iter()
+                .skip(1)
+                .map(|arg| windows_arg(arg))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let script =
+                windows_observation_script(&job, &executable, &source_executable, &expected_args)?;
+            let output = windows_powershell(&script)?;
+            let system = output.lines().any(|line| line == "system");
+            let field = |name: &str| {
+                output
+                    .lines()
+                    .find_map(|line| line.strip_prefix(name))
+                    .and_then(|value| value.parse::<i32>().ok())
+            };
+            let windows_task = output
+                .lines()
+                .any(|line| line.starts_with("trigger_enabled="))
+                .then(|| WindowsTaskState {
+                    trigger_enabled: field("trigger_enabled=") == Some(1),
+                    trigger_type: field("trigger_type="),
+                    protected_binary: system.then(|| ProtectedBinaryState {
+                        exists: field("protected_exists=") == Some(1),
+                        matches_source: field("protected_matches=") == Some(1),
+                    }),
+                });
+            let protected_leftovers = inspect_protected
+                && (windows_existing_system_state(&home.0)?.is_some()
+                    || windows_orphaned_binary(&job)?);
+            Observed {
+                exists: output.lines().next() != Some("missing"),
+                matches: output.lines().any(|line| line == "matches")
+                    && system == desired.is_some_and(|settings| settings.run_as == RunAs::System),
+                system,
+                leftovers: leftovers || protected_leftovers,
+                protected_leftovers,
+                windows_task,
+            }
+        }
+    })
+}
+
+pub(crate) fn migration_example(home: &Home) -> Result<bool> {
+    if home.file(crate::device_config::FILE).exists() {
+        return Ok(false);
+    }
+    let Some(config) = home.read_json::<Config>(CONFIG)? else {
+        return Ok(false);
+    };
+    let system = if crate::current_os()? == open_pact_core::Os::Windows {
+        observe(home, None, false)?.system
+    } else {
+        false
+    };
+    let example = DeviceConfig {
+        report: Some(crate::device_config::Report {
+            collector: config.collector,
+            vpn_probe: Some(config.vpn_probe),
+        }),
+        schedule: Some(crate::device_config::Schedule {
+            enabled: true,
+            run_as: if system { RunAs::System } else { RunAs::User },
+        }),
+        managed_repos: None,
+    };
+    println!(
+        "Create {} with this content to preserve the existing job. No changes were made.\n{}",
+        home.file(crate::device_config::FILE).display(),
+        toml::to_string_pretty(&example)?
+    );
+    Ok(true)
+}
+
+pub(crate) fn apply_command(home: &Path) -> String {
+    #[cfg(windows)]
+    {
+        format!(
+            "& {} --home {} apply",
+            powershell_literal(
+                &std::env::current_exe()
+                    .unwrap_or_else(|_| PathBuf::from("open-pact-client.exe"))
+                    .to_string_lossy()
+            ),
+            powershell_literal(&home.to_string_lossy())
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        format!(
+            "open-pact-client --home '{}' apply",
+            home.to_string_lossy().replace('\'', "'\"'\"'")
+        )
+    }
+}
+
+fn needs_system_cleanup(requested_system: bool, removing: bool, observed: &Observed) -> bool {
+    requested_system || observed.system || (removing && observed.protected_leftovers)
+}
+
+fn windows_orphaned_binary(job: &Job) -> Result<bool> {
+    let output = windows_powershell(&windows_orphaned_binary_script(job))?;
+    Ok(output == "leftovers")
+}
+
+fn windows_orphaned_binary_script(job: &Job) -> String {
+    let query = windows_task_query_script(job);
+    format!(
+        r#"{PROTECTED_DIRECTORY}
+{query}
+$remaining = @($folder.GetTasks(1) | Where-Object {{ $_.Name.StartsWith('org.open-pact.report.') -and (IsSystemTask $_) }})
+if ($remaining.Count -gt 0) {{ return }}
+$install = Join-Path (ProgramFilesPath) 'open-pact'
+if (Test-Path -LiteralPath $install) {{
+    AssertProtected $install
+    if (@(Get-ChildItem -LiteralPath $install -Filter 'open-pact-client.exe*' -File -Force -ErrorAction Stop).Count -gt 0) {{ Write-Output 'leftovers' }}
+}}
+"#
+    )
+}
+
+pub(crate) async fn apply(home: &Home, dry_run: bool) -> Result<()> {
+    if migration_example(home)? {
+        return Ok(());
+    }
+    let home_exists = home.0.try_exists()?;
+    let config = match DeviceConfig::load(home)? {
+        Some(config) => config,
+        None if !home_exists => DeviceConfig::default(),
+        None => bail!(
+            "Create {}. Use `open-pact-client config example` for a template.",
+            home.file(crate::device_config::FILE).display()
+        ),
+    };
+    let requested_system = config
+        .schedule
+        .as_ref()
+        .is_some_and(|schedule| schedule.run_as == RunAs::System);
+    let home = Home(schedule_home(&home.0, true)?);
+    let desired = if let Some(schedule) = config.schedule.filter(|schedule| schedule.enabled) {
+        let report = config.report.context(
+            "open-pact.toml [report].collector is required when [schedule].enabled = true",
+        )?;
+        Some(Applied {
+            report: Config::new(report.collector, report.vpn_probe)?,
+            run_as: schedule.run_as,
+            executable: std::env::current_exe()?,
+        })
+    } else {
+        None
+    };
+    let elevated =
+        crate::current_os()? == open_pact_core::Os::Windows && windows_require_elevation().is_ok();
+    if requested_system && !elevated {
+        bail!(
+            "Run this exact command from an elevated PowerShell prompt:\n{}",
+            apply_command(&home.0)
+        );
+    }
+    let observed = observe(&home, desired.as_ref(), elevated)
+        .with_context(|| format!("Cannot inspect the scheduled job. If access is denied, run this exact command from an elevated prompt:\n{}", apply_command(&home.0)))?;
+    let system = needs_system_cleanup(requested_system, desired.is_none(), &observed);
+    if system && !elevated {
+        bail!(
+            "Run this exact command from an elevated PowerShell prompt:\n{}",
+            apply_command(&home.0)
+        );
+    }
+    let _lock = if dry_run || !home_exists {
+        None
+    } else {
+        Some(lock(&home)?)
+    };
+    let observed = if dry_run {
+        observed
+    } else {
+        observe(&home, desired.as_ref(), elevated)?
+    };
+    let applied = home.read_json::<Applied>(APPLIED)?;
+    let change = reconcile(desired.as_ref(), applied.as_ref(), &observed);
+    match change {
+        Change::None => println!("no changes"),
+        Change::Install => println!("schedule: install"),
+        Change::Update => println!("schedule: update"),
+        Change::Remove => println!("schedule: remove"),
+    }
+    if dry_run {
+        return Ok(());
+    }
+    match change {
+        Change::Install | Change::Update => {
+            let desired = desired.as_ref().unwrap();
+            if observed.system && desired.run_as == RunAs::User {
+                operate(&home, Operation::Uninstall { system: true }, true).await?;
+            }
+            operate(
+                &home,
+                Operation::Install {
+                    collector: desired.report.collector.clone(),
+                    vpn_probe: Some(desired.report.vpn_probe.clone()),
+                    system: desired.run_as == RunAs::System,
+                },
+                true,
+            )
+            .await?;
+            save(&home, APPLIED, desired)?;
+        }
+        Change::Remove => {
+            operate(&home, Operation::Uninstall { system }, true).await?;
+            remove_if_exists(&home.file(APPLIED))?;
+        }
+        Change::None => {}
+    }
+    remove_if_exists(&home.file(CONFIG))?;
+    Ok(())
+}
+
 pub(crate) async fn run(home: &Home, command: Command) -> Result<()> {
+    match command {
+        Command::Run { system } => operate(home, Operation::Run { system }, false).await,
+        Command::Probe { address } => probe_blocking(&address),
+    }
+}
+
+async fn operate(home: &Home, command: Operation, home_locked: bool) -> Result<()> {
     let os = crate::current_os()?;
-    if let Command::Install { system, .. } = &command
+    if let Operation::Install { system, .. } = &command
         && *system
     {
         validate_system_install(true, os)?;
     }
-    let system_run = matches!(&command, Command::Run { system: true });
+    let system_run = matches!(&command, Operation::Run { system: true });
     if system_run {
         validate_system_install(true, os)?;
     }
-    let uninstall = matches!(&command, Command::Uninstall { .. });
+    let uninstall = matches!(&command, Operation::Uninstall { .. });
     let absolute = schedule_home(&home.0, uninstall)?;
     let home = Home(absolute);
-    let system_install = matches!(&command, Command::Install { system: true, .. });
-    if let Command::Install {
+    let system_install = matches!(&command, Operation::Install { system: true, .. });
+    if let Operation::Install {
         collector,
         vpn_probe,
         system: true,
@@ -1109,7 +1528,7 @@ pub(crate) async fn run(home: &Home, command: Command) -> Result<()> {
         crate::DeviceKey::load(&home.0)?;
         validate_windows_home(&home.0)?;
     }
-    let system_uninstall = matches!(&command, Command::Uninstall { system: true });
+    let system_uninstall = matches!(&command, Operation::Uninstall { system: true });
     if system_uninstall {
         validate_system_install(true, os)?;
         windows_require_elevation()?;
@@ -1124,34 +1543,41 @@ pub(crate) async fn run(home: &Home, command: Command) -> Result<()> {
         .map(|(_, state)| Home(state.clone()))
         .unwrap_or_else(|| Home(home.0.clone()));
     let home_exists = home.0.exists();
-    let _home_lock = if system_install {
+    let _home_lock = if system_install && !home_locked {
         Some(lock(&home)?)
     } else {
         None
     };
     let _lock = if system_run || system_install {
         Some(lock_system_state(&state_home)?)
-    } else if !uninstall || home_exists {
+    } else if (!uninstall || home_exists) && !home_locked {
         Some(lock(&state_home)?)
     } else {
         None
     };
     match command {
-        Command::Probe { .. } => unreachable!(),
-        Command::Run { .. } => {
-            let config: Config = home
-                .read_json(CONFIG)?
-                .context("report schedule is not installed")?;
-            report::collector_url(&config.collector)?;
-            probe_address(&config.vpn_probe)?;
+        Operation::Run { .. } => {
+            let config = DeviceConfig::load(&home)?
+                .context("open-pact.toml is missing; run `config example`")?;
+            if !config
+                .schedule
+                .as_ref()
+                .is_some_and(|schedule| schedule.enabled)
+            {
+                return Ok(());
+            }
+            let report = config
+                .report
+                .context("open-pact.toml [report].collector is required")?;
+            let config = Config::new(report.collector, report.vpn_probe)?;
             run_report(&home, &state_home, &config, checks::event_markers).await?;
         }
-        Command::Install {
+        Operation::Install {
             collector,
             vpn_probe,
             system,
         } => {
-            let config = Config::new(collector, vpn_probe)?;
+            Config::new(collector, vpn_probe)?;
             home.enrolment()?;
             crate::DeviceKey::load(&home.0)?;
             if os == open_pact_core::Os::Windows {
@@ -1172,7 +1598,6 @@ pub(crate) async fn run(home: &Home, command: Command) -> Result<()> {
             if system {
                 job.argv.push("--system".into());
             }
-            save(&home, CONFIG, &config)?;
             save(&install_state, STATE, &State::default())?;
             let run_as = if system {
                 TaskRunAs::System
@@ -1185,7 +1610,7 @@ pub(crate) async fn run(home: &Home, command: Command) -> Result<()> {
                 job.id
             );
         }
-        Command::Uninstall { system } => {
+        Operation::Uninstall { system } => {
             let job = Job::new(&std::env::current_exe()?, &home.0)?;
             if os == open_pact_core::Os::Windows {
                 if system {
@@ -1193,7 +1618,7 @@ pub(crate) async fn run(home: &Home, command: Command) -> Result<()> {
                 } else {
                     windows_uninstall(&job, false)?;
                     println!(
-                        "SYSTEM leftovers, if any, are removed with schedule uninstall --system from an elevated prompt."
+                        "SYSTEM leftovers, if any, are removed with apply from an elevated prompt."
                     );
                 }
             } else {
@@ -1222,6 +1647,404 @@ pub(crate) async fn run(home: &Home, command: Command) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn powershell_functions(script: &str) -> Vec<String> {
+        script
+            .lines()
+            .filter_map(|line| {
+                let declaration = line.trim().strip_prefix("function ")?;
+                let name = declaration
+                    .split(|character: char| character.is_whitespace() || character == '(')
+                    .next()?;
+                Some(name.to_ascii_lowercase())
+            })
+            .collect()
+    }
+
+    fn calls_powershell_function(script: &str, name: &str) -> bool {
+        script.lines().any(|line| {
+            let trimmed = line.trim();
+            if trimmed.starts_with("function ") {
+                return false;
+            }
+            let lower = line.to_ascii_lowercase();
+            let mut offset = 0;
+            while let Some(found) = lower[offset..].find(name) {
+                let start = offset + found;
+                let end = start + name.len();
+                let before = lower[..start].chars().next_back();
+                let after = lower[end..].chars().next();
+                let word_start = before
+                    .is_none_or(|character| !character.is_ascii_alphanumeric() && character != '_');
+                let word_end = after
+                    .is_none_or(|character| !character.is_ascii_alphanumeric() && character != '_');
+                let invocation = after
+                    .is_some_and(|character| character.is_whitespace() || character == '(')
+                    || (before == Some('(') && after == Some(')'));
+                if word_start && word_end && invocation {
+                    return true;
+                }
+                offset = end;
+            }
+            false
+        })
+    }
+
+    #[test]
+    fn every_built_powershell_script_defines_its_called_helpers() {
+        let job = Job::new(Path::new("client.exe"), Path::new("fixture-home")).unwrap();
+        let scripts = [
+            windows_protected_paths_script("fixture-hash", "'source.exe'", true),
+            windows_task_query_script(&job),
+            windows_uninstall_script(&job, false),
+            windows_existing_system_state_script("fixture-hash"),
+            windows_cleanup_binary_script(&job),
+            windows_orphaned_binary_script(&job),
+            windows_system_executable_script(),
+            windows_observation_script(
+                &job,
+                Path::new("fixture.exe"),
+                Path::new("source.exe"),
+                "--system",
+            )
+            .unwrap(),
+            windows_require_elevation_script().to_owned(),
+        ];
+        let helpers = scripts
+            .iter()
+            .flat_map(|script| powershell_functions(script))
+            .collect::<Vec<_>>();
+
+        for script in &scripts {
+            let definitions = powershell_functions(script);
+            for helper in &helpers {
+                if calls_powershell_function(script, helper) {
+                    assert!(
+                        definitions.iter().any(|defined| defined == helper),
+                        "PowerShell helper {helper} is called but not defined in the same script:\n{script}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn limited_operations_leave_protected_cleanup_for_elevated_removal() {
+        let protected = Observed {
+            protected_leftovers: true,
+            ..Observed::default()
+        };
+        assert!(!needs_system_cleanup(false, false, &protected));
+        assert!(needs_system_cleanup(false, true, &protected));
+        assert!(needs_system_cleanup(true, true, &Observed::default()));
+        assert!(needs_system_cleanup(
+            false,
+            false,
+            &Observed {
+                system: true,
+                ..Observed::default()
+            }
+        ));
+        assert!(!needs_system_cleanup(false, true, &Observed::default()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires a built OPEN_PACT_CLIENT_BIN; all scheduler commands use a fixture mock"]
+    fn declarative_cli_with_mock_scheduler() {
+        use std::os::unix::fs::PermissionsExt;
+        let binary = std::env::var_os("OPEN_PACT_CLIENT_BIN")
+            .expect("build the client and set OPEN_PACT_CLIENT_BIN");
+        let root = tempfile::Builder::new()
+            .prefix("open-pact-example-")
+            .tempdir()
+            .unwrap();
+        let user = root.path().join("home");
+        let path = user.join(".config/open-pact");
+        let mock = root.path().join("bin");
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::create_dir(&mock).unwrap();
+        let home = enrolled_home(&path);
+        let mut enrollment: crate::Enrolment = home.enrolment().unwrap();
+        enrollment.gateway = "http://127.0.0.1:1".into();
+        home.write("enrolment.json", &serde_json::to_vec(&enrollment).unwrap())
+            .unwrap();
+        let launchctl = mock.join("launchctl");
+        std::fs::write(
+            &launchctl,
+            r#"#!/bin/sh
+case "$1" in
+  print) test -f "$OPEN_PACT_MOCK/loaded" ;;
+  bootstrap) echo bootstrap >> "$OPEN_PACT_MOCK/changes"; touch "$OPEN_PACT_MOCK/loaded" ;;
+  bootout) echo bootout >> "$OPEN_PACT_MOCK/changes"; rm -f "$OPEN_PACT_MOCK/loaded" ;;
+  *) exit 99 ;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&launchctl, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut transcript = String::new();
+        let mut run = |args: &[&str], success: bool, expected: &str| {
+            let output = std::process::Command::new(&binary)
+                .args(args)
+                .env("HOME", &user)
+                .env("OPEN_PACT_MOCK", root.path())
+                .env(
+                    "PATH",
+                    format!("{}:{}", mock.display(), std::env::var("PATH").unwrap()),
+                )
+                .env_remove("HTTP_PROXY")
+                .env_remove("HTTPS_PROXY")
+                .env_remove("ALL_PROXY")
+                .output()
+                .unwrap();
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            transcript.push_str(&format!(
+                "$ open-pact-client {}\n{text}exit: {:?}\n",
+                args.join(" "),
+                output.status.code()
+            ));
+            assert_eq!(output.status.success(), success, "{text}");
+            assert!(text.contains(expected), "{text}");
+            text
+        };
+        let before = std::fs::read_dir(&path).unwrap().count();
+        let example = run(&["config", "example"], true, "[managed_repos]");
+        DeviceConfig::parse(&example, Some(&user)).unwrap();
+        assert_eq!(std::fs::read_dir(&path).unwrap().count(), before);
+        let write = |collector: &str, schedule: &str| {
+            std::fs::write(home.file(crate::device_config::FILE), format!("[report]\ncollector = '{collector}'\n{schedule}\n[managed_repos]\nfolders = ['~/work']\n")).unwrap();
+        };
+        let enabled = "[schedule]\nenabled = true\nrun_as = 'user'";
+        write("https://collector.example.org/status", enabled);
+        run(&["apply", "--dry-run"], true, "schedule: install");
+        assert!(!root.path().join("changes").exists());
+        run(&["apply"], true, "schedule: install");
+        assert!(!home.file(CONFIG).exists());
+        let report = run(&["report", "--dry-run"], true, "spec_version");
+        assert!(!report.contains("~/work"));
+        assert!(!report.contains(user.join("work").to_str().unwrap()));
+        let changes = std::fs::read(root.path().join("changes")).unwrap();
+        run(&["apply"], true, "no changes");
+        assert_eq!(std::fs::read(root.path().join("changes")).unwrap(), changes);
+        let configuration = std::fs::read(home.file(crate::device_config::FILE)).unwrap();
+        std::fs::remove_file(home.file(crate::device_config::FILE)).unwrap();
+        run(&["apply"], false, "Create ");
+        assert!(root.path().join("loaded").exists());
+        assert_eq!(std::fs::read(root.path().join("changes")).unwrap(), changes);
+        std::fs::write(home.file(crate::device_config::FILE), configuration).unwrap();
+        write("https://other.example.org/status", enabled);
+        run(&["apply"], true, "schedule: update");
+        run(&["apply"], true, "no changes");
+        std::fs::remove_file(root.path().join("loaded")).unwrap();
+        run(&["apply"], true, "schedule: update");
+        write(
+            "https://other.example.org/status",
+            "[schedule]\nenabled = false\nrun_as = 'user'",
+        );
+        run(&["apply"], true, "schedule: remove");
+        assert!(!home.file(STATE).exists());
+        assert!(!home.file(APPLIED).exists());
+        run(&["apply"], true, "no changes");
+        write("https://collector.example.org/status", enabled);
+        run(&["apply"], true, "schedule: install");
+        write("https://collector.example.org/status", "");
+        run(&["apply"], true, "schedule: remove");
+        write("https://collector.example.org/status", enabled);
+        std::fs::write(
+            home.file(crate::device_config::FILE),
+            "[schedule]\nenabled = true\nrun_as = 'user'\nextra = 1",
+        )
+        .unwrap();
+        let changes = std::fs::read(root.path().join("changes")).unwrap();
+        run(&["apply"], false, "extra");
+        assert_eq!(std::fs::read(root.path().join("changes")).unwrap(), changes);
+        run(&["check"], false, "Other controls will still run");
+        std::fs::remove_file(home.file(crate::device_config::FILE)).unwrap();
+        let check = run(&["check"], false, "Create ");
+        assert!(check.contains("control | manifest requirement | device setting | result"));
+        assert!(check.contains("firewall |"));
+        save(
+            &home,
+            CONFIG,
+            &Config::new("https://legacy.example.org/status".into(), None).unwrap(),
+        )
+        .unwrap();
+        let legacy = std::fs::read(home.file(CONFIG)).unwrap();
+        run(&["apply"], true, "https://legacy.example.org/status");
+        assert_eq!(std::fs::read(home.file(CONFIG)).unwrap(), legacy);
+        run(&["check"], false, "https://legacy.example.org/status");
+        assert_eq!(std::fs::read(root.path().join("changes")).unwrap(), changes);
+        std::fs::remove_file(home.file(CONFIG)).unwrap();
+        write("https://collector.example.org/status", enabled);
+        run(&["apply"], true, "schedule: install");
+        std::fs::remove_dir_all(&path).unwrap();
+        run(&["apply"], true, "schedule: remove");
+        assert!(!path.exists(), "apply recreated the missing client home");
+        println!("{transcript}");
+        if let Some(output) = std::env::var_os("OPEN_PACT_CLI_TRANSCRIPT") {
+            std::fs::write(output, transcript).unwrap();
+        }
+    }
+
+    #[test]
+    fn imperative_setup_commands_are_removed() {
+        use clap::Parser;
+        for args in [
+            vec![
+                "client",
+                "schedule",
+                "install",
+                "--collector",
+                "https://example.org",
+            ],
+            vec!["client", "schedule", "uninstall"],
+            vec!["client", "report", "--collector", "https://example.org"],
+        ] {
+            assert!(crate::Cli::try_parse_from(args).is_err());
+        }
+        assert!(crate::Cli::try_parse_from(["client", "report", "--dry-run"]).is_ok());
+    }
+
+    #[test]
+    fn schedule_reconcile_covers_install_update_remove_and_retry() {
+        let settings = Applied {
+            report: Config::new("https://collector.example.org/status".into(), None).unwrap(),
+            run_as: RunAs::User,
+            executable: PathBuf::from("/opt/example/client"),
+        };
+        let missing = Observed::default();
+        let matching = Observed {
+            exists: true,
+            matches: true,
+            ..Observed::default()
+        };
+        assert_eq!(reconcile(Some(&settings), None, &missing), Change::Install);
+        assert_eq!(
+            reconcile(Some(&settings), Some(&settings), &matching),
+            Change::None
+        );
+        assert_eq!(
+            reconcile(Some(&settings), Some(&settings), &missing),
+            Change::Install
+        );
+        assert_eq!(reconcile(None, Some(&settings), &matching), Change::Remove);
+        assert_eq!(reconcile(None, None, &missing), Change::None);
+        assert_eq!(
+            reconcile(
+                None,
+                None,
+                &Observed {
+                    leftovers: true,
+                    ..Observed::default()
+                }
+            ),
+            Change::Remove
+        );
+        for changed in [
+            Applied {
+                report: Config::new("https://other.example.org/status".into(), None).unwrap(),
+                ..settings.clone()
+            },
+            Applied {
+                run_as: RunAs::System,
+                ..settings.clone()
+            },
+        ] {
+            assert_eq!(
+                reconcile(Some(&changed), Some(&settings), &matching),
+                Change::Update
+            );
+        }
+        assert_eq!(
+            reconcile(
+                Some(&settings),
+                Some(&settings),
+                &Observed {
+                    matches: false,
+                    ..matching
+                }
+            ),
+            Change::Update
+        );
+    }
+
+    #[test]
+    fn windows_reconcile_repairs_disabled_or_wrong_triggers() {
+        let settings = Applied {
+            report: Config::new("https://collector.example.org/status".into(), None).unwrap(),
+            run_as: RunAs::User,
+            executable: PathBuf::from("C:\\Program Files\\open-pact\\open-pact-client.exe"),
+        };
+        let applied = Some(&settings);
+        let disabled = Observed {
+            exists: true,
+            matches: true,
+            windows_task: Some(WindowsTaskState {
+                trigger_enabled: false,
+                trigger_type: Some(1),
+                protected_binary: None,
+            }),
+            ..Observed::default()
+        };
+        assert_eq!(
+            reconcile(Some(&settings), applied, &disabled),
+            Change::Update
+        );
+        let wrong_type = Observed {
+            windows_task: Some(WindowsTaskState {
+                trigger_enabled: true,
+                trigger_type: Some(7),
+                protected_binary: None,
+            }),
+            ..disabled
+        };
+        assert_eq!(
+            reconcile(Some(&settings), applied, &wrong_type),
+            Change::Update
+        );
+    }
+
+    #[test]
+    fn windows_reconcile_repairs_missing_or_stale_system_binary() {
+        let settings = Applied {
+            report: Config::new("https://collector.example.org/status".into(), None).unwrap(),
+            run_as: RunAs::System,
+            executable: PathBuf::from("C:\\example\\open-pact-client.exe"),
+        };
+        let applied = Some(&settings);
+        for protected_binary in [
+            ProtectedBinaryState {
+                exists: false,
+                matches_source: false,
+            },
+            ProtectedBinaryState {
+                exists: true,
+                matches_source: false,
+            },
+        ] {
+            let observed = Observed {
+                exists: true,
+                matches: true,
+                system: true,
+                windows_task: Some(WindowsTaskState {
+                    trigger_enabled: true,
+                    trigger_type: Some(1),
+                    protected_binary: Some(protected_binary),
+                }),
+                ..Observed::default()
+            };
+            assert_eq!(
+                reconcile(Some(&settings), applied, &observed),
+                Change::Update
+            );
+        }
+    }
 
     #[test]
     fn missing_home_keeps_the_install_task_identifier() {
@@ -1333,7 +2156,7 @@ function New-Object {
         let checks = r#"$script:failure = 0
 $script:userId = 'SYSTEM'
 $caught = $false
-try { & $action | Out-Null } catch { $caught = $_.Exception.Message -like '*schedule uninstall --system*' }
+try { & $action | Out-Null } catch { $caught = $_.Exception.Message -like '*apply*' }
 if (-not $caught -or $script:deleted) { throw 'limited uninstall did not refuse SYSTEM task' }
 $script:userId = 'EXAMPLE\user'
 foreach ($code in @(5,2,0)) {
@@ -1582,15 +2405,7 @@ Write-Output 'refused'
             drop(probe);
             observed.store(true, Ordering::SeqCst);
         });
-        save(
-            &home,
-            CONFIG,
-            &Config {
-                collector,
-                vpn_probe: probe_address.clone(),
-            },
-        )
-        .unwrap();
+        std::fs::write(home.file(crate::device_config::FILE), format!("[report]\ncollector = '{collector}'\nvpn_probe = '{probe_address}'\n[schedule]\nenabled = true\nrun_as = 'user'\n")).unwrap();
         let result = run(&home, Command::Run { system: false }).await;
         close.join().unwrap();
         assert!(went_down.load(Ordering::SeqCst));
@@ -1603,16 +2418,14 @@ Write-Output 'refused'
 
     #[cfg(unix)]
     #[test]
-    fn uninstall_command_preserves_shell_metacharacters() {
+    fn apply_command_preserves_shell_metacharacters() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home with 'quotes' $cash `false` ; & end");
-        let command = uninstall_command(&home);
+        let command = apply_command(&home);
         let output = std::process::Command::new("sh")
             .args([
                 "-c",
-                &format!(
-                    "set -- {command}; printf '%s\\n' \"$#\" \"$1\" \"$2\" \"$3\" \"$4\" \"$5\""
-                ),
+                &format!("set -- {command}; printf '%s\\n' \"$#\" \"$1\" \"$2\" \"$3\" \"$4\""),
             ])
             .output()
             .unwrap();
@@ -1623,12 +2436,11 @@ Write-Output 'refused'
                 .lines()
                 .collect::<Vec<_>>(),
             [
-                "5",
+                "4",
                 "open-pact-client",
                 "--home",
                 home.to_str().unwrap(),
-                "schedule",
-                "uninstall"
+                "apply"
             ]
         );
     }
@@ -2242,15 +3054,10 @@ Write-Output 'refused'
         let home = Home(dir.path().to_path_buf());
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let probe = listener.local_addr().unwrap().to_string();
-        save(
-            &home,
-            CONFIG,
-            &Config {
-                collector: "https://collector.example.org/status".into(),
-                vpn_probe: probe,
-            },
-        )
-        .unwrap();
+        let write_config = |probe: &str| {
+            std::fs::write(home.file(crate::device_config::FILE), format!("[report]\ncollector = 'https://collector.example.org/status'\nvpn_probe = '{probe}'\n[schedule]\nenabled = true\nrun_as = 'user'\n")).unwrap();
+        };
+        write_config(&probe);
         save(
             &home,
             STATE,
@@ -2276,9 +3083,7 @@ Write-Output 'refused'
         let reserved = tokio::net::TcpSocket::new_v4().unwrap();
         reserved.bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let refused = reserved.local_addr().unwrap().to_string();
-        let mut config: Config = home.read_json(CONFIG).unwrap().unwrap();
-        config.vpn_probe = refused;
-        save(&home, CONFIG, &config).unwrap();
+        write_config(&refused);
         assert!(
             run(&home, Command::Run { system: false }).await.is_err(),
             "no enrolment for local evaluation"
@@ -2393,7 +3198,7 @@ Write-Output 'refused'
         ] {
             assert!(!script.contains(forbidden), "{forbidden}");
         }
-        assert!(script.contains("schedule uninstall --system"));
+        assert!(script.contains("apply"));
     }
 
     #[test]
