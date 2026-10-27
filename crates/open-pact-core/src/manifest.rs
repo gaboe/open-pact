@@ -197,6 +197,77 @@ impl From<Span> for String {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct RemotePattern(String);
+
+impl RemotePattern {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for RemotePattern {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        let invalid = || format!("remote pattern {value:?} must be a host/path-prefix/ pattern");
+        if value
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+            || value.contains(['*', '?', '@', ':'])
+            || !value.ends_with('/')
+        {
+            return Err(invalid());
+        }
+
+        let mut segments: Vec<&str> = value[..value.len() - 1].split('/').collect();
+        if segments.len() < 2 || segments.iter().any(|segment| segment.is_empty()) {
+            return Err(invalid());
+        }
+
+        let valid_host = |host: &str| {
+            host.len() <= 253
+                && host.split('.').all(|label| {
+                    !label.is_empty()
+                        && label.len() <= 63
+                        && label.as_bytes()[0].is_ascii_alphanumeric()
+                        && label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
+                        && label
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                })
+        };
+        if !valid_host(segments[0]) {
+            return Err(invalid());
+        }
+
+        let host = segments[0].to_ascii_lowercase();
+        let last = segments.len() - 1;
+        let path_end = segments[last]
+            .strip_suffix(".git")
+            .unwrap_or(segments[last]);
+        if path_end.is_empty() || path_end.ends_with(".git") {
+            return Err(invalid());
+        }
+        segments[last] = path_end;
+
+        Ok(Self(format!("{host}/{}/", segments[1..].join("/"))))
+    }
+}
+
+impl From<RemotePattern> for String {
+    fn from(pattern: RemotePattern) -> Self {
+        pattern.0
+    }
+}
+
+impl fmt::Display for RemotePattern {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 impl fmt::Display for Span {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let unit = match self.unit {
@@ -500,6 +571,8 @@ pub struct Control {
     pub output: Output,
     pub required: BTreeMap<Os, Accepted>,
     pub grace: Span,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remotes: Vec<RemotePattern>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -623,6 +696,19 @@ impl ManifestBody {
             }
             if !c.check.starts_with("builtin:") {
                 return Err(format!("{}: check must be builtin:<name>@<version>", c.id));
+            }
+            let accepts_remotes = matches!(
+                c.check.as_str(),
+                "builtin:managed_repos_outside@1" | "builtin:managed_repos_total@1"
+            );
+            if accepts_remotes && c.remotes.is_empty() {
+                return Err(format!("{}: remotes must list at least one pattern", c.id));
+            }
+            if !accepts_remotes && !c.remotes.is_empty() {
+                return Err(format!(
+                    "{}: remotes are only valid for managed repository checks",
+                    c.id
+                ));
             }
             if !c.output.validate() {
                 return Err(format!(

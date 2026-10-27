@@ -28,6 +28,8 @@ pub enum Violation {
     RequiredStricter { id: String, os: Os },
     #[error("control {id} has a shorter grace")]
     GraceShorter { id: String },
+    #[error("control {id} changes remote patterns")]
+    RemotesChanged { id: String },
     #[error("unknown_grace is shorter")]
     UnknownGraceShorter,
     #[error("claim_max_age is shorter")]
@@ -57,6 +59,11 @@ pub fn is_narrowing(old: &Manifest, new: &Manifest) -> Result<(), Vec<Violation>
                 old: o.check.clone(),
                 new: c.check.clone(),
             });
+        }
+        let old_remotes: BTreeSet<_> = o.remotes.iter().collect();
+        let new_remotes: BTreeSet<_> = c.remotes.iter().collect();
+        if old_remotes != new_remotes {
+            v.push(Violation::RemotesChanged { id: c.id.clone() });
         }
         if !c.output.is_subset_of(&o.output) {
             match (&c.output, &o.output) {
