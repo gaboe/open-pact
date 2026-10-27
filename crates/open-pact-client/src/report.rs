@@ -102,15 +102,7 @@ fn os_version(os: Os) -> Result<String> {
     let (program, args): (&str, &[&str]) = match os {
         Os::Macos => ("/usr/bin/sw_vers", &["-productVersion"]),
         Os::Linux => ("uname", &["-r"]),
-        Os::Windows => (
-            "powershell.exe",
-            &[
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "[Environment]::OSVersion.Version.ToString()",
-            ],
-        ),
+        Os::Windows => return Ok(windows_os_version()),
     };
     let output = std::process::Command::new(program)
         .args(args)
@@ -124,6 +116,76 @@ fn os_version(os: Os) -> Result<String> {
         bail!("OS version was empty");
     }
     Ok(version)
+}
+
+struct WindowsVersionParts<'a> {
+    build: Option<&'a str>,
+    ubr: Option<&'a str>,
+    display_version: Option<&'a str>,
+}
+
+fn windows_os_version() -> String {
+    let script = concat!(
+        "$ErrorActionPreference = 'Stop'; ",
+        "try { ",
+        "$v = Get-ItemProperty -LiteralPath 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion' -ErrorAction Stop; ",
+        "$build = [string]$v.CurrentBuildNumber; ",
+        "if ([string]::IsNullOrWhiteSpace($build)) { $build = [string]$v.CurrentBuild }; ",
+        "$ubr = [string]$v.UBR; $display = [string]$v.DisplayVersion; ",
+        "[Console]::Out.WriteLine(\"$build`t$ubr`t$display\") ",
+        "} catch { [Console]::Out.WriteLine(\"`t`t\") }",
+    );
+    let output = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned());
+    format_windows_version(output.as_deref())
+}
+
+fn format_windows_version(raw: Option<&str>) -> String {
+    let mut fields = raw
+        .unwrap_or_default()
+        .trim_end_matches(['\r', '\n'])
+        .split('\t');
+    let parts = WindowsVersionParts {
+        build: fields
+            .next()
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+        ubr: fields
+            .next()
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+        display_version: fields
+            .next()
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+    };
+    let build = parts
+        .build
+        .and_then(|value| value.parse::<u32>().ok().map(|number| (value, number)));
+    let ubr = parts.ubr.filter(|value| value.parse::<u32>().is_ok());
+    let mut version = Vec::new();
+    if let Some((_, build_number)) = build {
+        let product = if build_number >= 22_000 { "11" } else { "10" };
+        version.push(product.to_owned());
+    }
+    if let Some(display_version) = parts.display_version {
+        version.push(display_version.to_owned());
+    }
+    if let Some((build, _)) = build {
+        version.push(match ubr {
+            Some(ubr) => format!("{build}.{ubr}"),
+            None => build.to_owned(),
+        });
+    }
+    if version.is_empty() {
+        "unknown".into()
+    } else {
+        version.join(" ")
+    }
 }
 
 pub(crate) fn prepare(home: &Home) -> Result<(Report, BTreeMap<String, bool>)> {
@@ -215,6 +277,31 @@ mod tests {
     use super::*;
     use open_pact_core::dev_key;
     use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
+
+    #[test]
+    fn formats_windows_version_from_registry_parts() {
+        assert_eq!(
+            format_windows_version(Some("26100\t4061\t24H2")),
+            "11 24H2 26100.4061"
+        );
+        assert_eq!(
+            format_windows_version(Some("19045\t6216\t22H2")),
+            "10 22H2 19045.6216"
+        );
+    }
+
+    #[test]
+    fn windows_version_uses_available_registry_parts() {
+        assert_eq!(format_windows_version(None), "unknown");
+        assert_eq!(format_windows_version(Some("\t\t")), "unknown");
+        assert_eq!(
+            format_windows_version(Some("22631\t\t24H2")),
+            "11 24H2 22631"
+        );
+        assert_eq!(format_windows_version(Some("\t4061\t24H2")), "24H2");
+        assert_eq!(format_windows_version(Some("invalid\t4061\t24H2")), "24H2");
+        assert_eq!(format_windows_version(Some("22000\tinvalid\t")), "11 22000");
+    }
 
     #[test]
     fn builds_report_and_verifies_jws_with_public_key() {
