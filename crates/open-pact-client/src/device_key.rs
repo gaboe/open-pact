@@ -1,5 +1,7 @@
 //! The device key that signs claims. Its backing sets the claim's trust level.
 
+#[cfg(any(windows, test))]
+use std::io::Write;
 use std::path::Path;
 
 use anyhow::{Result, bail};
@@ -10,11 +12,88 @@ use open_pact_core::{
 #[cfg(target_os = "macos")]
 use crate::secure_enclave::SecureEnclaveKey;
 
+#[cfg(windows)]
+#[path = "windows_key.rs"]
+mod windows_key;
+
+const TPM_FILE: &str = "device-tpm.key";
 const SOFTWARE_FILE: &str = "device-dev.pem";
 const SECURE_ENCLAVE_FILE: &str = "device-se.key";
 
+#[cfg(any(windows, test))]
+#[derive(Debug)]
+pub(super) struct ProviderUnavailable;
+
+#[cfg(any(windows, test))]
+impl std::fmt::Display for ProviderUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TPM provider unavailable")
+    }
+}
+
+#[cfg(any(windows, test))]
+impl std::error::Error for ProviderUnavailable {}
+
+#[cfg(any(windows, test))]
+fn hardware_result<T>(result: Result<T>) -> Result<Option<T>> {
+    match result {
+        Ok(key) => Ok(Some(key)),
+        Err(error) if error.is::<ProviderUnavailable>() => {
+            eprintln!("No TPM key ({error:#}); using a software device key.");
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(any(windows, test))]
+fn write_marker(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_marker_with(path, |file| {
+        file.write_all(bytes)?;
+        file.sync_all()
+    })
+}
+
+#[cfg(any(windows, test))]
+fn write_marker_with(
+    path: &Path,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    if let Err(error) = write(&mut file) {
+        drop(file);
+        std::fs::remove_file(path)?;
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+fn key_lock(home: &Path) -> Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(home.join("device-key.lock"))?;
+    file.lock()?;
+    Ok(file)
+}
+
+fn remove_if_present(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 pub enum DeviceKey {
     Software(SigningKey),
+    #[cfg(windows)]
+    Tpm(windows_key::WindowsKey),
     #[cfg(target_os = "macos")]
     SecureEnclave(SecureEnclaveKey),
 }
@@ -22,6 +101,12 @@ pub enum DeviceKey {
 impl DeviceKey {
     /// The key `join` created. Never creates one.
     pub fn load(home: &Path) -> Result<Self> {
+        if home.join(TPM_FILE).exists() {
+            #[cfg(windows)]
+            return Ok(Self::Tpm(windows_key::WindowsKey::load(home)?));
+            #[cfg(not(windows))]
+            bail!("{} needs the Windows TPM key store", home.display());
+        }
         let blob_path = home.join(SECURE_ENCLAVE_FILE);
         if blob_path.exists() {
             #[cfg(target_os = "macos")]
@@ -36,8 +121,17 @@ impl DeviceKey {
         Ok(Self::Software(dev_key::from_pem(pem)?))
     }
 
-    /// Reuses the key on disk. A new key goes into the Secure Enclave when there is one, unless `software`.
+    /// Reuses the existing key. Tries platform hardware for a new key unless `software`.
     pub fn load_or_create(home: &Path, software: bool) -> Result<Self> {
+        let _lock = key_lock(home)?;
+        if home.join(TPM_FILE).exists() {
+            if software {
+                bail!(
+                    "this home already holds a TPM device key; use a new --home for a software key"
+                );
+            }
+            return Self::load(home);
+        }
         if home.join(SECURE_ENCLAVE_FILE).exists() {
             if software {
                 bail!(
@@ -48,6 +142,16 @@ impl DeviceKey {
             return Self::load(home);
         }
         let pem = home.join(SOFTWARE_FILE);
+        #[cfg(windows)]
+        if !software && !pem.exists() {
+            if windows_key::is_elevated()? {
+                if let Some(key) = hardware_result(windows_key::WindowsKey::create(home))? {
+                    return Ok(Self::Tpm(key));
+                }
+            } else {
+                eprintln!("TPM protection requires an elevated join; using a software device key.");
+            }
+        }
         #[cfg(target_os = "macos")]
         if !software && !pem.exists() {
             match SecureEnclaveKey::create() {
@@ -61,9 +165,25 @@ impl DeviceKey {
         Ok(Self::Software(dev_key::load_or_create(&pem)?))
     }
 
+    /// Destroy the device credential before full uninstall or rotation.
+    pub fn delete(home: &Path) -> Result<()> {
+        let _lock = key_lock(home)?;
+        if home.join(TPM_FILE).exists() {
+            #[cfg(windows)]
+            windows_key::WindowsKey::delete(home)?;
+            #[cfg(not(windows))]
+            bail!("delete this home's TPM key on Windows before removing its marker");
+        }
+        remove_if_present(&home.join(SECURE_ENCLAVE_FILE))?;
+        remove_if_present(&home.join(SOFTWARE_FILE))?;
+        Ok(())
+    }
+
     pub fn public_key(&self) -> PublicKey {
         match self {
             Self::Software(key) => PublicKey::from(key),
+            #[cfg(windows)]
+            Self::Tpm(key) => key.public_key().clone(),
             #[cfg(target_os = "macos")]
             Self::SecureEnclave(key) => key.public_key().clone(),
         }
@@ -72,14 +192,28 @@ impl DeviceKey {
     pub fn trust_level(&self) -> TrustLevel {
         match self {
             Self::Software(_) => TrustLevel::L0,
+            #[cfg(windows)]
+            Self::Tpm(_) => TrustLevel::L1,
             #[cfg(target_os = "macos")]
             Self::SecureEnclave(_) => TrustLevel::L1,
+        }
+    }
+
+    pub fn protection(&self) -> &'static str {
+        match self {
+            Self::Software(_) => "os_permissions",
+            #[cfg(windows)]
+            Self::Tpm(_) => "tpm",
+            #[cfg(target_os = "macos")]
+            Self::SecureEnclave(_) => "secure_enclave",
         }
     }
 
     pub fn describe(&self) -> &'static str {
         match self {
             Self::Software(_) => "software key file",
+            #[cfg(windows)]
+            Self::Tpm(_) => "TPM",
             #[cfg(target_os = "macos")]
             Self::SecureEnclave(_) => "Secure Enclave",
         }
@@ -88,6 +222,8 @@ impl DeviceKey {
     pub fn sign(&self, message: &[u8]) -> Result<Signature> {
         match self {
             Self::Software(key) => Ok(Signature::sign(key, message)),
+            #[cfg(windows)]
+            Self::Tpm(key) => key.sign(message),
             #[cfg(target_os = "macos")]
             Self::SecureEnclave(key) => key.sign(message),
         }
@@ -109,7 +245,7 @@ mod tests {
 
     use super::*;
 
-    fn claim_for(key: &DeviceKey, nonce: usize) -> Claim {
+    pub(super) fn claim_for(key: &DeviceKey, nonce: usize) -> Claim {
         let device_key = key.public_key();
         Claim {
             manifest: ManifestHash::of(b"manifest_version = 1\n"),
@@ -127,7 +263,7 @@ mod tests {
         }
     }
 
-    fn enrol(key: &DeviceKey) -> EnrolRequest {
+    pub(super) fn enrol(key: &DeviceKey) -> EnrolRequest {
         let toml = include_str!("../../../examples/manifest.toml");
         let hash = ManifestHash::of(toml.as_bytes());
         let owner = dev_key::generate();
@@ -186,6 +322,59 @@ mod tests {
         std::fs::write(home.path().join(SECURE_ENCLAVE_FILE), b"blob").unwrap();
         assert!(DeviceKey::load_or_create(home.path(), true).is_err());
         assert!(!home.path().join(SOFTWARE_FILE).exists());
+    }
+
+    #[test]
+    fn tpm_marker_never_silently_becomes_a_software_key() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join(TPM_FILE), b"invalid-key-name").unwrap();
+        assert!(DeviceKey::load(home.path()).is_err());
+        assert!(DeviceKey::load_or_create(home.path(), false).is_err());
+        assert!(DeviceKey::load_or_create(home.path(), true).is_err());
+        assert!(!home.path().join(SOFTWARE_FILE).exists());
+    }
+
+    #[test]
+    fn partial_marker_write_is_removed_and_does_not_fall_back() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join(TPM_FILE);
+        let result: Result<()> = write_marker_with(&path, |file| {
+            file.write_all(b"partial")?;
+            Err(std::io::Error::other("injected write failure"))
+        });
+        assert!(hardware_result(result).is_err());
+        assert!(!path.exists());
+        assert!(!home.path().join(SOFTWARE_FILE).exists());
+    }
+
+    #[test]
+    fn competing_marker_is_preserved_and_does_not_fall_back() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join(TPM_FILE);
+        write_marker(&path, b"winner").unwrap();
+        assert!(hardware_result(write_marker(&path, b"loser")).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), b"winner");
+        assert!(!home.path().join(SOFTWARE_FILE).exists());
+    }
+
+    #[test]
+    fn only_provider_unavailability_permits_hardware_fallback() {
+        assert!(
+            hardware_result::<()>(Err(ProviderUnavailable.into()))
+                .unwrap()
+                .is_none()
+        );
+        assert!(hardware_result::<()>(Err(anyhow::anyhow!("ACL setup failed"))).is_err());
+    }
+
+    #[test]
+    fn delete_removes_software_identity_and_can_be_repeated() {
+        let home = tempfile::tempdir().unwrap();
+        DeviceKey::load_or_create(home.path(), true).unwrap();
+        DeviceKey::delete(home.path()).unwrap();
+        assert!(!home.path().join(SOFTWARE_FILE).exists());
+        assert!(DeviceKey::load(home.path()).is_err());
+        DeviceKey::delete(home.path()).unwrap();
     }
 
     #[cfg(target_os = "macos")]

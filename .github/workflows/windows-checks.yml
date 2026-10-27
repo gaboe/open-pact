@@ -19,6 +19,129 @@ jobs:
       - name: Test Windows client
         run: cargo test -p open-pact-client -- --show-output
 
+      - name: Verify elevated CNG roundtrip
+        run: cargo test -p open-pact-client windows_cng_software_provider_roundtrip -- --ignored --nocapture
+
+      - name: Verify CNG signing and deletion as creator, administrator, and SYSTEM
+        timeout-minutes: 8
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $build = cargo test -p open-pact-client --no-run --message-format=json | ForEach-Object { $_ | ConvertFrom-Json }
+          if ($LASTEXITCODE -ne 0) { throw 'CNG test build failed' }
+          $test = ($build | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.profile.test -and $_.target.name -eq 'open-pact-client' -and $_.executable } | Select-Object -First 1).executable
+          if (-not $test) { throw 'CNG test executable missing' }
+          $root = Join-Path $env:PUBLIC ('open-pact-cng-fictional-' + [Guid]::NewGuid().ToString('N'))
+          New-Item -ItemType Directory $root | Out-Null
+          Copy-Item $test (Join-Path $root 'cng-tests.exe')
+          $user = 'op_cng_' + [Guid]::NewGuid().ToString('N').Substring(0,8)
+          $password = ConvertTo-SecureString ('Op!7' + [Guid]::NewGuid().ToString('N')) -AsPlainText -Force
+          $task = 'open-pact-cng-fictional-' + [Guid]::NewGuid().ToString('N')
+          $worker = Join-Path $root 'worker.ps1'
+          @'
+          param($root,$action,$identity)
+          $ErrorActionPreference = 'Stop'
+          $current = [Security.Principal.WindowsIdentity]::GetCurrent()
+          if ($identity -eq 'system') {
+            if ($current.User.Value -ne 'S-1-5-18') { throw 'fixture is not SYSTEM' }
+          } elseif ($identity -eq 'elevated') {
+            if (-not (New-Object Security.Principal.WindowsPrincipal($current)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'fixture is not elevated' }
+          } else {
+            if ((New-Object Security.Principal.WindowsPrincipal($current)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'fixture is elevated' }
+          }
+          $env:OPEN_PACT_CNG_HOME = $root
+          if ($action -eq 'software') {
+            $env:OPEN_PACT_CNG_HOME = Join-Path $root 'software'
+            New-Item -ItemType Directory $env:OPEN_PACT_CNG_HOME -Force | Out-Null
+          }
+          $env:OPEN_PACT_CNG_ACTION = $action
+          $process = Start-Process (Join-Path $root 'cng-tests.exe') -ArgumentList @('windows_cng_shared_fixture','--ignored','--nocapture') -RedirectStandardOutput (Join-Path $root "$identity-$action.log") -RedirectStandardError (Join-Path $root "$identity-$action.stderr.log") -Wait -PassThru -NoNewWindow
+          Set-Content (Join-Path $root "$identity-$action.exitcode") $process.ExitCode
+          if ($process.ExitCode -ne 0) { exit $process.ExitCode }
+          Set-Content (Join-Path $root "$identity-$action.ok") 'passed'
+          '@ | Set-Content $worker
+          try {
+            New-LocalUser -Name $user -Password $password -AccountNeverExpires | Out-Null
+            $sid = (Get-LocalUser $user).SID.Value
+            & icacls.exe $root /grant "*${sid}:(OI)(CI)M" /T | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'CNG fixture ACL failed' }
+            $credential = New-Object PSCredential("$env:COMPUTERNAME\$user", $password)
+            foreach ($action in @('software')) {
+              $arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$worker`" -root `"$root`" -action $action -identity limited"
+              $process = Start-Process powershell.exe -Credential $credential -LoadUserProfile -ArgumentList $arguments -Wait -PassThru
+              Get-Content (Join-Path $root "limited-$action.log")
+              Get-Content (Join-Path $root "limited-$action.stderr.log")
+              Write-Output "limited $action client exit code: $(Get-Content (Join-Path $root "limited-$action.exitcode"))"
+              if ($process.ExitCode -ne 0 -or -not (Test-Path (Join-Path $root "limited-$action.ok"))) { throw "limited CNG $action failed" }
+            }
+            # Use one fixture SID for elevated creation and a fresh standard-user logon.
+            $admins = Get-LocalGroup -SID 'S-1-5-32-544'
+            Add-LocalGroupMember -Group $admins -Member $user
+            $arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$worker`" -root `"$root`" -action create -identity elevated"
+            $principal = New-ScheduledTaskPrincipal -UserId $credential.UserName -LogonType Password -RunLevel Highest
+            $command = New-ScheduledTaskAction -Execute powershell.exe -Argument $arguments
+            Register-ScheduledTask -TaskName $task -InputObject (New-ScheduledTask -Action $command -Principal $principal) -User $credential.UserName -Password ($credential.GetNetworkCredential().Password) | Out-Null
+            Start-ScheduledTask -TaskName $task
+            $deadline = (Get-Date).AddMinutes(2)
+            while (-not (Test-Path (Join-Path $root 'elevated-create.ok')) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 1 }
+            Get-ScheduledTaskInfo -TaskName $task | Format-List
+            Get-Content (Join-Path $root 'elevated-create.log') -ErrorAction SilentlyContinue
+            Get-Content (Join-Path $root 'elevated-create.stderr.log') -ErrorAction SilentlyContinue
+            Write-Output "elevated create client exit code: $(Get-Content (Join-Path $root 'elevated-create.exitcode') -ErrorAction SilentlyContinue)"
+            if (-not (Test-Path (Join-Path $root 'elevated-create.ok'))) { throw 'elevated create failed' }
+            Unregister-ScheduledTask -TaskName $task -Confirm:$false
+            Remove-LocalGroupMember -Group $admins -Member $user
+            $arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$worker`" -root `"$root`" -action sign -identity limited"
+            $process = Start-Process powershell.exe -Credential $credential -LoadUserProfile -ArgumentList $arguments -Wait -PassThru
+            Get-Content (Join-Path $root 'limited-sign.log')
+            Get-Content (Join-Path $root 'limited-sign.stderr.log')
+            Write-Output "same user limited sign client exit code: $(Get-Content (Join-Path $root 'limited-sign.exitcode'))"
+            if ($process.ExitCode -ne 0 -or -not (Test-Path (Join-Path $root 'limited-sign.ok'))) { throw 'same user limited sign failed' }
+            $env:OPEN_PACT_CNG_HOME = $root
+            $env:OPEN_PACT_CNG_ACTION = 'deny-delete'
+            & (Join-Path $root 'cng-tests.exe') windows_cng_shared_fixture --ignored --nocapture
+            if ($LASTEXITCODE -ne 0) { throw 'unrelated administrator deletion was not denied' }
+            $arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$worker`" -root `"$root`" -action retry-delete -identity limited"
+            $process = Start-Process powershell.exe -Credential $credential -LoadUserProfile -ArgumentList $arguments -Wait -PassThru
+            Get-Content (Join-Path $root 'limited-retry-delete.log')
+            Get-Content (Join-Path $root 'limited-retry-delete.stderr.log')
+            if ($process.ExitCode -ne 0 -or -not (Test-Path (Join-Path $root 'limited-retry-delete.ok'))) { throw 'creator retry deletion failed' }
+            Add-LocalGroupMember -Group $admins -Member $user
+            Remove-Item (Join-Path $root 'elevated-create.ok')
+            $arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$worker`" -root `"$root`" -action create -identity elevated"
+            $principal = New-ScheduledTaskPrincipal -UserId $credential.UserName -LogonType Password -RunLevel Highest
+            $command = New-ScheduledTaskAction -Execute powershell.exe -Argument $arguments
+            Register-ScheduledTask -TaskName $task -InputObject (New-ScheduledTask -Action $command -Principal $principal) -User $credential.UserName -Password ($credential.GetNetworkCredential().Password) | Out-Null
+            Start-ScheduledTask -TaskName $task
+            $deadline = (Get-Date).AddMinutes(2)
+            while (-not (Test-Path (Join-Path $root 'elevated-create.ok')) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 1 }
+            Get-ScheduledTaskInfo -TaskName $task | Format-List
+            Get-Content (Join-Path $root 'elevated-create.log') -ErrorAction SilentlyContinue
+            Get-Content (Join-Path $root 'elevated-create.stderr.log') -ErrorAction SilentlyContinue
+            Write-Output "elevated create client exit code: $(Get-Content (Join-Path $root 'elevated-create.exitcode') -ErrorAction SilentlyContinue)"
+            if (-not (Test-Path (Join-Path $root 'elevated-create.ok'))) { throw 'elevated create failed' }
+            Unregister-ScheduledTask -TaskName $task -Confirm:$false
+            Remove-LocalGroupMember -Group $admins -Member $user
+            foreach ($action in @('sign','delete')) {
+              $arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$worker`" -root `"$root`" -action $action -identity system"
+              $principal = New-ScheduledTaskPrincipal -UserId SYSTEM -LogonType ServiceAccount -RunLevel Highest
+              $command = New-ScheduledTaskAction -Execute powershell.exe -Argument $arguments
+              Register-ScheduledTask -TaskName $task -Action $command -Principal $principal | Out-Null
+              Start-ScheduledTask -TaskName $task
+              $deadline = (Get-Date).AddMinutes(2)
+              while (-not (Test-Path (Join-Path $root "system-$action.ok")) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 1 }
+              Get-Content (Join-Path $root "system-$action.log") -ErrorAction SilentlyContinue
+              Get-Content (Join-Path $root "system-$action.stderr.log") -ErrorAction SilentlyContinue
+              Write-Output "SYSTEM $action client exit code: $(Get-Content (Join-Path $root "system-$action.exitcode") -ErrorAction SilentlyContinue)"
+              if (-not (Test-Path (Join-Path $root "system-$action.ok"))) { throw "SYSTEM CNG $action failed" }
+              Unregister-ScheduledTask -TaskName $task -Confirm:$false
+            }
+          } finally {
+            Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue
+            Remove-LocalUser -Name $user -ErrorAction SilentlyContinue
+            Remove-Item $root -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
       - name: Measure isolated native batches
         if: always()
         shell: powershell

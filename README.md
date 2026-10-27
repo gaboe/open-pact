@@ -2,7 +2,7 @@
 
 Verifiable security checks on personally owned devices, without blanket monitoring. The owner signs the company's manifest once. Each time the device connects, the client sends one small signed claim to the company gateway, and a compliant device gets a short-lived VPN client certificate. Read [PAPER.md](PAPER.md) for the design.
 
-Status: proof of concept, not for production. On a Mac, `join` creates the device key in the Secure Enclave, and the client reports trust level L1; elsewhere, or with `join --software-key`, all keys are development software keys (trust level L0). The gateway has no attestation, so it counts every claim as L0 whatever the client reports. The gateway enforces [examples/manifest.toml](examples/manifest.toml), or the file in `MANIFEST_PATH`.
+Status: proof of concept, not for production. On macOS, `join` tries a Secure Enclave device key. On Windows, an elevated administrator join tries a TPM device key. These keys report trust level L1. If the Windows provider is unavailable, if macOS hardware key creation fails, on Linux, or with `join --software-key`, the device key is a software key with trust level L0. The gateway has no attestation, so it counts every claim as L0 whatever the client reports. The gateway enforces [examples/manifest.toml](examples/manifest.toml), or the file in `MANIFEST_PATH`.
 
 ## Layout
 
@@ -44,6 +44,7 @@ The client keeps its files in `~/.config/open-pact/`, or in the directory given 
 | File | Content |
 | --- | --- |
 | `owner-dev.pem` | owner key; signs the manifest hash |
+| `device-tpm.key` | Windows TPM device key name; private key stays in the machine key store with access for the joining user and SYSTEM |
 | `device-se.key` | device key on a Mac: a Secure Enclave key wrapped for this Mac only; signs the enrolment statement and claims, its public key's hash is the pseudonym |
 | `device-dev.pem` | device key as a software file, instead of `device-se.key` |
 | `vpn-key.pem` | VPN certificate key; only its certificate request leaves the device |
@@ -65,7 +66,7 @@ On Windows, `vpn/current` is a text pointer, not a directory. A pair reader read
 
 Windows replaces the flat copies sequentially, so they can briefly differ. The selected pair stays complete because readers use `vpn/current` and `vpn/<generation>/`. If a program holds a flat copy open, replacement can fail. The client keeps the new generation selected, marks the flat copies stale, and reports the locked file. Close the program that holds it and run `check` again. Every later start retries the flat-copy refresh. Startup recovery tries the VPN lock without waiting. If another process holds it, recovery warns and continues. `report`, `schedule`, and `log` never wait for the VPN lock. `install` and `check` take the lock. New Windows files and directories inherit the home ACL. The client does not preserve an explicit ACL from a replaced file.
 
-No report job runs until you declare a schedule in `open-pact.toml` and run `open-pact-client apply`. Before you delete the binary or client home, set `[schedule].enabled = false` and run `apply`.
+No report job runs until you enable a schedule in `open-pact.toml` and run `open-pact-client apply`. Before you delete the binary or client home, set `[schedule].enabled = false` and run `apply`. To remove the device key, run `open-pact-client --home <home> delete-device-key` before you delete the home.
 
 ## Verify a release
 
@@ -399,7 +400,7 @@ open-pact-client report
 
 `--dry-run` prints the JSON payload and its compact ES256 JWS. It sends nothing. The report uses the existing device key and pseudonym. The client checks the local manifest against the enrolled hash and runs the same checks as `check`.
 
-The JSON carries `spec_version`, `device_id`, a random UUIDv4 `report_id`, UTC `time`, `report_type`, `solution`, `os`, `os_version`, `key_protection`, and `results`. `spec_version` is `1.1`. `solution` is `open-pact-client <version>`. `device_id` is the enrolled device pseudonym, `pseudonym:` followed by the SHA-256 hash of its uncompressed SEC1 public key. This is the identifier stored by the gateway. `report_type` is `connect` for a detected connection, `event` for an extra event report, or `periodic` for other reports, including manual reports. Connection reports take precedence when an event is pending. `os_version` is the macOS product version, Linux kernel release, or Windows version. `key_protection` is `secure_enclave` for a Secure Enclave key and `os_permissions` for a software key. Text results stay JSON strings. Integer results stay JSON numbers. Null results stay JSON null.
+The JSON carries `spec_version`, `device_id`, a random UUIDv4 `report_id`, UTC `time`, `report_type`, `solution`, `os`, `os_version`, `key_protection`, and `results`. `spec_version` is `1.1`. `solution` is `open-pact-client <version>`. `device_id` is the enrolled device pseudonym, `pseudonym:` followed by the SHA-256 hash of its uncompressed SEC1 public key. This is the identifier stored by the gateway. `report_type` is `connect` for a detected connection, `event` for an extra event report, or `periodic` for other reports, including manual reports. Connection reports take precedence when an event is pending. `os_version` is the macOS product version, Linux kernel release, or Windows version. `key_protection` is `tpm` for a Windows TPM key, `secure_enclave` for a Secure Enclave key, and `os_permissions` for a software key. Text results stay JSON strings. Integer results stay JSON numbers. Null results stay JSON null.
 
 The collector receives the compact JWS as `application/jose`. It must verify ES256 with the public device key obtained through enrolment. A report carries no public key. Only an HTTP 2xx response acknowledges a report. The client ignores the response body, refuses redirects, and uses rustls with TLS 1.2 or later. This one-way report does not fetch a VPN certificate or contact the gateway. A collector receives the additional report metadata listed above.
 
@@ -434,6 +435,30 @@ The job sends at most one report per five-minute run and sends nothing off VPN. 
 The client home holds the user-authored `open-pact.toml`, an applied-settings receipt in `schedule-applied.json`, and `report-schedule.lock`. Limited jobs also keep `report-state.json` there. SYSTEM jobs keep report state in their protected directory and use a sibling `<home hash>.lock` file. State records connectivity, acknowledged reports, compliance, and pending events. A lock prevents overlapping commands. Each client home has its own job name. Updates reset report state.
 
 Limited Windows operations leave orphaned protected state and the shared binary unchanged. Set `run_as = "system"` with `enabled = false` and run apply elevated to remove those leftovers. Elevated removal uses the existing SYSTEM cleanup path when a SYSTEM task or protected state remains. It requires elevation. A held state lock stops removal before the task changes and asks you to retry. Cleanup keeps the shared binary while another SYSTEM task uses it. Otherwise, it queues the binary for deletion at reboot. Incomplete cleanup returns an error and lists the remaining files. Retry `apply` from an elevated prompt after the client stops or Windows restarts. Lock files remain. `stop` prints the declarative removal instructions. On Unix, new scheduler homes use mode `0700`. State files use mode `0600` or keep stricter owner permissions. Collector request errors omit the URL.
+
+### Windows device keys
+
+On Windows, TPM protection requires an elevated administrator join. A non-elevated join creates a software key and reports `key_protection = os_permissions`. Existing keys stay in use.
+
+An elevated administrator Windows join tries a non-exportable ECDSA P-256 key in the TPM through the
+Microsoft Platform Crypto Provider. The private key does not leave the TPM.
+The machine-scope key grants use to the joining user and SYSTEM, so either scheduler
+mode can sign reports. Other users do not receive key access.
+Creation requires an elevated administrator prompt. If the provider is unavailable,
+the client warns and uses a software key. `--software-key` forces software on a new home.
+Existing software keys stay in use. Before rotation, remove the old schedule and run
+`open-pact-client --home <old-home> delete-device-key`. To rotate to TPM, use a new `--home`, join again,
+and replace the old enrolment and scheduler registration.
+The home stores only the TPM key name in `device-tpm.key`. Keep this marker with the home.
+TPM claims request `L1`, like Secure Enclave claims. The gateway verifies them as `L0`
+until hardware attestation is supported. Real TPM signing is unverified on hosted CI.
+See [platform support](docs/platform-support.md#key-protection) for the test limits.
+For full uninstall, remove the schedule first. Run `open-pact-client --home <home> delete-device-key` before deleting the home or binary.
+Schedule removal keeps the device key. Key deletion removes the persisted CNG key, its marker, and any software device key file.
+On Windows, run key deletion as the user who created the key or as SYSTEM. A different administrator has no explicit key access.
+Windows CI checks creator deletion after removal of administrator membership, SYSTEM deletion, and refusal for a different administrator through the software CNG provider.
+TPM hardware deletion remains unverified on hosted runners. Marker write and ACL failures stop join without software fallback.
+
 
 ## Log-clearing output
 
