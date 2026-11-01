@@ -54,6 +54,7 @@ pub fn fix_hint(check: &str, value: &str, os: Os) -> Option<&'static str> {
         ("remote_wipe", Os::Macos) => {
             Some("Turn on Find My Mac: System Settings > Apple Account > iCloud > Find My Mac.")
         }
+        ("remote_wipe", _) => Some("This platform does not provide a built-in remote erase check."),
         ("os_auto_updates", _) => {
             Some("Enable automatic security updates in the operating system update settings.")
         }

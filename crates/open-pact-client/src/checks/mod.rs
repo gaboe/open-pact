@@ -545,10 +545,15 @@ mod tests {
 
     #[test]
     #[cfg(not(windows))]
-    fn windows_checks_report_unknown_off_windows() {
+    fn windows_checks_report_unknown_off_windows_except_not_applicable_controls() {
         let all = run_all(Os::Windows);
         assert_eq!(all.len(), BUILTINS.len());
-        assert!(all.values().all(|v| v == "unknown"));
+        assert_eq!(all["remote_wipe"], "n/a");
+        assert!(
+            all.iter()
+                .filter(|(id, _)| id.as_str() != "remote_wipe")
+                .all(|(_, value)| value == "unknown")
+        );
     }
 
     #[test]
