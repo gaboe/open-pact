@@ -1832,6 +1832,24 @@ fn log_reports(files: &[ReportLogFile<'_>], output: &mut impl Write) -> Result<(
     Ok(())
 }
 
+fn log_reports_with_discovery(
+    home: &Home,
+    discover: impl FnOnce(&Home) -> Result<Vec<(PathBuf, bool)>>,
+    output: &mut impl Write,
+    _warnings: &mut impl Write,
+) -> Result<()> {
+    let paths = discover(home)?;
+    let files = paths
+        .iter()
+        .map(|(path, system_state)| ReportLogFile {
+            path,
+            source: if *system_state { "system" } else { "home" },
+            system_state: *system_state,
+        })
+        .collect::<Vec<_>>();
+    log_reports(&files, output)
+}
+
 async fn run(cli: Cli) -> Result<ExitCode> {
     if let Command::Schedule {
         command: schedule::Command::Probe { address },
@@ -1896,20 +1914,13 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Command::Log {
             command: LogCommand::Reports,
         } => {
-            #[cfg(windows)]
-            let paths = schedule::report_log_paths(&home)
-                .context("SYSTEM report history may require an elevated prompt")?;
-            #[cfg(not(windows))]
-            let paths = schedule::report_log_paths(&home)?;
-            let files = paths
-                .iter()
-                .map(|(path, system_state)| ReportLogFile {
-                    path,
-                    source: if *system_state { "system" } else { "home" },
-                    system_state: *system_state,
-                })
-                .collect::<Vec<_>>();
-            log_reports(&files, &mut std::io::stdout().lock()).map(|()| ExitCode::SUCCESS)
+            log_reports_with_discovery(
+                &home,
+                schedule::report_log_paths,
+                &mut std::io::stdout().lock(),
+                &mut std::io::stderr().lock(),
+            )
+            .map(|()| ExitCode::SUCCESS)
         }
         Command::DeleteDeviceKey => {
             DeviceKey::delete(&home.0)?;
@@ -1949,6 +1960,48 @@ async fn main() -> ExitCode {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn log_reports_keeps_home_history_when_system_discovery_fails() {
+        use base64::Engine;
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+        let payload = serde_json::json!({
+            "report_id": "home-row",
+            "report_type": "periodic",
+        });
+        let jws = format!(
+            "e30.{}.signature",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap())
+        );
+        locallog::append_report_retained(
+            &home.file("reports.jsonl"),
+            &home.file("report-state.json"),
+            jws.as_bytes(),
+            b"ok",
+            200,
+            false,
+        )
+        .unwrap();
+
+        let mut output = Vec::new();
+        let mut warnings = Vec::new();
+        log_reports_with_discovery(
+            &home,
+            |_| Err(anyhow::anyhow!("access denied")),
+            &mut output,
+            &mut warnings,
+        )
+        .unwrap();
+
+        assert!(String::from_utf8(output).unwrap().contains("report_id:home-row"));
+        let warnings = String::from_utf8(warnings).unwrap();
+        assert_eq!(warnings.lines().count(), 1);
+        assert!(warnings.contains("SYSTEM history was not included"));
+        assert!(warnings.contains("access denied"));
+        assert!(warnings.contains("elevated prompt"));
+    }
 
     #[test]
     fn log_reports_prints_records_oldest_first_with_payload_and_response() {
