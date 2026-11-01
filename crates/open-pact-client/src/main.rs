@@ -1749,9 +1749,48 @@ struct ReportLogFile<'a> {
     system_state: bool,
 }
 
-fn log_reports(files: &[ReportLogFile<'_>], output: &mut impl Write) -> Result<()> {
+fn system_history_warning(reason: &str, warnings: &mut impl Write) -> Result<()> {
+    writeln!(
+        warnings,
+        "SYSTEM history was not included: {reason}; run from an elevated prompt to include it."
+    )?;
+    Ok(())
+}
+
+fn system_discovery_reason(error: &anyhow::Error) -> &'static str {
+    let detail = format!("{error:#}").to_ascii_lowercase();
+    if [
+        "acl",
+        "reparse point",
+        "non-admin owner",
+        "permissions are unsafe",
+    ]
+    .iter()
+    .any(|marker| detail.contains(marker))
+    {
+        "protected directory permissions are unsafe"
+    } else if [
+        "access denied",
+        "access is denied",
+        "permission denied",
+        "unauthorizedaccess",
+    ]
+    .iter()
+    .any(|marker| detail.contains(marker))
+    {
+        "access denied"
+    } else {
+        "protected SYSTEM history could not be discovered"
+    }
+}
+
+fn log_reports(
+    files: &[ReportLogFile<'_>],
+    output: &mut impl Write,
+    warnings: &mut impl Write,
+) -> Result<()> {
     let mut records = Vec::new();
-    let mut system_unreadable = false;
+    let mut system_unreadable = None;
     for file in files {
         match locallog::read_with_lines(file.path) {
             Ok(file_records) => records.extend(
@@ -1760,7 +1799,11 @@ fn log_reports(files: &[ReportLogFile<'_>], output: &mut impl Write) -> Result<(
                     .map(|(line, record)| (*file, line, record)),
             ),
             Err(error) if file.system_state && error.kind() != std::io::ErrorKind::InvalidData => {
-                system_unreadable = true;
+                system_unreadable = Some(if error.kind() == std::io::ErrorKind::PermissionDenied {
+                    "access denied"
+                } else {
+                    "protected history could not be read"
+                });
             }
             Err(error) => {
                 return Err(
@@ -1770,11 +1813,8 @@ fn log_reports(files: &[ReportLogFile<'_>], output: &mut impl Write) -> Result<(
         }
     }
     records.sort_by(|(_, _, left), (_, _, right)| left.time.cmp(&right.time));
-    if system_unreadable {
-        writeln!(
-            output,
-            "SYSTEM report history is unreadable; run `log reports` from an elevated prompt to include SYSTEM history."
-        )?;
+    if let Some(reason) = system_unreadable {
+        system_history_warning(reason, warnings)?;
     }
     if records.is_empty() {
         writeln!(output, "No reports sent yet.")?;
@@ -1836,9 +1876,16 @@ fn log_reports_with_discovery(
     home: &Home,
     discover: impl FnOnce(&Home) -> Result<Vec<(PathBuf, bool)>>,
     output: &mut impl Write,
-    _warnings: &mut impl Write,
+    warnings: &mut impl Write,
 ) -> Result<()> {
-    let paths = discover(home)?;
+    let canonical_home = Home(schedule::report_log_home_path(home)?);
+    let paths = match discover(&canonical_home) {
+        Ok(paths) => paths,
+        Err(error) => {
+            system_history_warning(system_discovery_reason(&error), warnings)?;
+            vec![(canonical_home.file("reports.jsonl"), false)]
+        }
+    };
     let files = paths
         .iter()
         .map(|(path, system_state)| ReportLogFile {
@@ -1847,7 +1894,7 @@ fn log_reports_with_discovery(
             system_state: *system_state,
         })
         .collect::<Vec<_>>();
-    log_reports(&files, output)
+    log_reports(&files, output, warnings)
 }
 
 async fn run(cli: Cli) -> Result<ExitCode> {
@@ -1913,15 +1960,13 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         } => log_show(&home.file("claims.jsonl")).map(|()| ExitCode::SUCCESS),
         Command::Log {
             command: LogCommand::Reports,
-        } => {
-            log_reports_with_discovery(
-                &home,
-                schedule::report_log_paths,
-                &mut std::io::stdout().lock(),
-                &mut std::io::stderr().lock(),
-            )
-            .map(|()| ExitCode::SUCCESS)
-        }
+        } => log_reports_with_discovery(
+            &home,
+            schedule::report_log_paths,
+            &mut std::io::stdout().lock(),
+            &mut std::io::stderr().lock(),
+        )
+        .map(|()| ExitCode::SUCCESS),
         Command::DeleteDeviceKey => {
             DeviceKey::delete(&home.0)?;
             println!("Device key deleted.");
@@ -1995,12 +2040,30 @@ mod tests {
         )
         .unwrap();
 
-        assert!(String::from_utf8(output).unwrap().contains("report_id:home-row"));
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("report_id:home-row"));
+        assert!(!output.contains("SYSTEM history was not included"));
         let warnings = String::from_utf8(warnings).unwrap();
         assert_eq!(warnings.lines().count(), 1);
         assert!(warnings.contains("SYSTEM history was not included"));
         assert!(warnings.contains("access denied"));
         assert!(warnings.contains("elevated prompt"));
+
+        let mut unsafe_warning = Vec::new();
+        log_reports_with_discovery(
+            &home,
+            |_| {
+                Err(anyhow::anyhow!(
+                    "Protected path ACL grants write to a non-admin principal"
+                ))
+            },
+            &mut Vec::new(),
+            &mut unsafe_warning,
+        )
+        .unwrap();
+        let unsafe_warning = String::from_utf8(unsafe_warning).unwrap();
+        assert_eq!(unsafe_warning.lines().count(), 1);
+        assert!(unsafe_warning.contains("protected directory permissions are unsafe"));
     }
 
     #[test]
@@ -2057,6 +2120,7 @@ mod tests {
                 system_state: false,
             }],
             &mut output,
+            &mut Vec::new(),
         )
         .unwrap();
         let output = String::from_utf8(output).unwrap();
@@ -2109,8 +2173,9 @@ mod tests {
             },
         ];
         let mut output = Vec::new();
+        let mut warnings = Vec::new();
 
-        log_reports(&files, &mut output).unwrap();
+        log_reports(&files, &mut output, &mut warnings).unwrap();
 
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("source:home"));
@@ -2135,10 +2200,14 @@ mod tests {
             },
         ];
         let mut fallback = Vec::new();
-        log_reports(&unreadable_files, &mut fallback).unwrap();
+        let mut warnings = Vec::new();
+        log_reports(&unreadable_files, &mut fallback, &mut warnings).unwrap();
         let fallback = String::from_utf8(fallback).unwrap();
         assert!(fallback.contains("report_id:home-row"));
-        assert!(fallback.contains("run `log reports` from an elevated prompt"));
+        let warnings = String::from_utf8(warnings).unwrap();
+        assert_eq!(warnings.lines().count(), 1);
+        assert!(warnings.contains("SYSTEM history was not included"));
+        assert!(warnings.contains("elevated prompt"));
     }
 
     #[test]
@@ -2166,6 +2235,7 @@ mod tests {
                 source: "home",
                 system_state: false,
             }],
+            &mut Vec::new(),
             &mut Vec::new(),
         )
         .unwrap_err();
@@ -2221,6 +2291,7 @@ mod tests {
                 source: "home",
                 system_state: false,
             }],
+            &mut Vec::new(),
             &mut Vec::new(),
         )
         .unwrap_err();

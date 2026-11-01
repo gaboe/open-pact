@@ -1155,12 +1155,16 @@ fn report_log_paths_for(home: &Home, system_state: Option<PathBuf>) -> Vec<(Path
 }
 
 pub(crate) fn report_log_paths(home: &Home) -> Result<Vec<(PathBuf, bool)>> {
-    let home = Home(schedule_home(&home.0, true)?);
+    let home = Home(report_log_home_path(home)?);
     #[cfg(windows)]
     let system_state = windows_existing_system_state(&home.0)?;
     #[cfg(not(windows))]
     let system_state = None;
     Ok(report_log_paths_for(&home, system_state))
+}
+
+pub(crate) fn report_log_home_path(home: &Home) -> Result<PathBuf> {
+    schedule_home(&home.0, true)
 }
 
 const APPLIED: &str = "schedule-applied.json";
