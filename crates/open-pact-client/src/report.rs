@@ -35,7 +35,12 @@ pub(crate) struct Report {
 
 pub(crate) fn collector_url(raw: &str) -> Result<reqwest::Url> {
     let url = reqwest::Url::parse(raw).context("invalid collector URL")?;
-    if url.scheme() != "https" || url.host_str().is_none() {
+    #[cfg(test)]
+    let local_test_http = url.scheme() == "http"
+        && matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"));
+    #[cfg(not(test))]
+    let local_test_http = false;
+    if (url.scheme() != "https" && !local_test_http) || url.host_str().is_none() {
         bail!("collector must be an HTTPS URL");
     }
     if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
@@ -206,24 +211,26 @@ pub(crate) fn prepare(home: &Home) -> Result<(Report, BTreeMap<String, bool>)> {
 pub(crate) async fn run(home: &Home, collector: &str, dry_run: bool) -> Result<()> {
     collector_url(collector)?;
     let (report, _) = prepare(home)?;
-    send(home, collector, report, dry_run, None)
+    send(home, home, collector, report, dry_run, None)
         .await
         .map(|_| ())
 }
 
 pub(crate) async fn run_scheduled(
     home: &Home,
+    state_home: &Home,
     collector: &str,
     probe: &str,
     mut report: Report,
     report_type: ReportType,
 ) -> Result<bool> {
     report.report_type = report_type;
-    send(home, collector, report, false, Some(probe)).await
+    send(home, state_home, collector, report, false, Some(probe)).await
 }
 
 async fn send(
     home: &Home,
+    log_home: &Home,
     collector: &str,
     report: Report,
     dry_run: bool,
@@ -239,7 +246,7 @@ async fn send(
     }
     let http = reqwest::Client::builder()
         .use_rustls_tls()
-        .https_only(true)
+        .https_only(!cfg!(test))
         .min_tls_version(reqwest::tls::Version::TLS_1_2)
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(10))
@@ -250,19 +257,36 @@ async fn send(
     {
         return Ok(false);
     }
-    let response = http
+    let mut response = http
         .post(url)
         .header(reqwest::header::CONTENT_TYPE, "application/jose")
-        .body(jws)
+        .body(jws.as_bytes().to_vec())
         .send()
         .await
         .map_err(reqwest::Error::without_url)
         .context("send report to collector")?;
-    if !response.status().is_success() {
-        bail!(
-            "collector did not acknowledge report: HTTP {}",
-            response.status()
-        );
+    let status = response.status();
+    let mut response_body = Vec::new();
+    while let Some(chunk) = match response.chunk().await {
+        Ok(chunk) => chunk,
+        Err(_) => {
+            eprintln!("warning: could not read collector response body for local report history");
+            None
+        }
+    } {
+        response_body.extend_from_slice(&chunk);
+    }
+    if let Err(error) = crate::locallog::append_report_retained(
+        &log_home.file("reports.jsonl"),
+        &log_home.file("report-state.json"),
+        jws.as_bytes(),
+        &response_body,
+        status.as_u16(),
+    ) {
+        eprintln!("warning: could not write local report history: {error}");
+    }
+    if !status.is_success() {
+        bail!("collector did not acknowledge report: HTTP {}", status);
     }
     println!("Collector acknowledged report {}", report.report_id);
     Ok(true)
@@ -273,6 +297,152 @@ mod tests {
     use super::*;
     use open_pact_core::dev_key;
     use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn collector(
+        status: u16,
+        response: &'static [u8],
+    ) -> (String, tokio::task::JoinHandle<Vec<u8>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let body_start = loop {
+                let mut chunk = [0; 4096];
+                let count = stream.read(&mut chunk).await.unwrap();
+                assert_ne!(count, 0);
+                request.extend_from_slice(&chunk[..count]);
+                if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break index + 4;
+                }
+            };
+            let headers = std::str::from_utf8(&request[..body_start]).unwrap();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length: ")
+                        .and_then(|value| value.parse::<usize>().ok())
+                })
+                .unwrap();
+            while request.len() < body_start + content_length {
+                let mut chunk = [0; 4096];
+                let count = stream.read(&mut chunk).await.unwrap();
+                assert_ne!(count, 0);
+                request.extend_from_slice(&chunk[..count]);
+            }
+            let reason = if (200..300).contains(&status) {
+                "OK"
+            } else {
+                "Error"
+            };
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        response.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            stream.write_all(response).await.unwrap();
+            request[body_start..body_start + content_length].to_vec()
+        });
+        (format!("http://{address}/report"), task)
+    }
+
+    fn report_home() -> (tempfile::TempDir, Home, Report) {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+        let key = dev_key::generate();
+        std::fs::write(home.file("device-dev.pem"), dev_key::to_pem(&key)).unwrap();
+        let report = Report::new(
+            &DeviceKey::Software(key),
+            Os::Linux,
+            "test".into(),
+            BTreeMap::from([("firewall".into(), "on")]),
+        )
+        .unwrap();
+        (dir, home, report)
+    }
+
+    #[tokio::test]
+    async fn acknowledged_report_records_exact_request_and_response() {
+        let (_dir, home, report) = report_home();
+        let state_dir = tempfile::tempdir().unwrap();
+        let state_home = Home(state_dir.path().to_path_buf());
+        let (url, server) = collector(201, b"{\"accepted\":true}").await;
+        send(&home, &state_home, &url, report, false, None)
+            .await
+            .unwrap();
+        let sent = server.await.unwrap();
+        let records = crate::locallog::read(&state_home.file("reports.jsonl")).unwrap();
+        assert!(!home.file("reports.jsonl").exists());
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].sent().unwrap(), sent);
+        assert_eq!(records[0].status, Some(201));
+        assert_eq!(records[0].response().unwrap(), b"{\"accepted\":true}");
+    }
+
+    #[tokio::test]
+    async fn non_success_response_is_recorded_and_keeps_send_error() {
+        let (_dir, home, report) = report_home();
+        let (url, server) = collector(503, b"unavailable").await;
+        let error = send(&home, &home, &url, report, false, None)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("collector did not acknowledge report: HTTP 503"));
+        let sent = server.await.unwrap();
+        let records = crate::locallog::read(&home.file("reports.jsonl")).unwrap();
+        assert_eq!(records[0].sent().unwrap(), sent);
+        assert_eq!(records[0].status, Some(503));
+        assert_eq!(records[0].response().unwrap(), b"unavailable");
+    }
+
+    #[tokio::test]
+    async fn connect_failure_and_dry_run_do_not_create_history() {
+        let (_dir, home, report) = report_home();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        assert!(
+            send(
+                &home,
+                &home,
+                &format!("http://{address}/report"),
+                report,
+                false,
+                None
+            )
+            .await
+            .is_err()
+        );
+        assert!(!home.file("reports.jsonl").exists());
+
+        let (_dry_dir, dry_home, dry_report) = report_home();
+        send(
+            &dry_home,
+            &dry_home,
+            "https://collector.example.org/report",
+            dry_report,
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!dry_home.file("reports.jsonl").exists());
+    }
+
+    #[tokio::test]
+    async fn history_write_failure_does_not_change_acknowledgement() {
+        let (_dir, home, report) = report_home();
+        std::fs::create_dir(home.file("reports.jsonl")).unwrap();
+        let (url, server) = collector(200, b"ok").await;
+        assert!(send(&home, &home, &url, report, false, None).await.unwrap());
+        server.await.unwrap();
+    }
 
     #[test]
     fn formats_windows_version_from_registry_parts() {
@@ -443,13 +613,14 @@ mod tests {
     #[test]
     fn collector_requires_https_and_no_embedded_credentials() {
         for url in [
-            "http://localhost/report",
+            "http://collector.example.org/report",
             "file:///report",
             "https://user:pass@example.org/report",
             "https://example.org/report#fragment",
         ] {
             assert!(collector_url(url).is_err(), "{url}");
         }
+        assert!(collector_url("http://localhost/report").is_ok());
         assert!(collector_url("https://collector.example.org/report").is_ok());
     }
 }

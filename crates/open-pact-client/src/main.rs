@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use clap::{Parser, Subcommand};
 use device_key::DeviceKey;
 use open_pact_core::{
@@ -105,6 +107,8 @@ enum LogCommand {
     Prove { index: Option<u64> },
     /// Print every claim this device sent and the gateway's response
     Show,
+    /// Print report requests and collector responses
+    Reports,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1738,6 +1742,67 @@ fn log_show(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn log_reports(path: &Path, _system_state: bool, output: &mut impl Write) -> Result<()> {
+    let mut records = locallog::read(path).map_err(|error| {
+        #[cfg(windows)]
+        if _system_state && error.kind() == std::io::ErrorKind::PermissionDenied {
+            return anyhow::Error::new(error).context(
+                "SYSTEM report history is unreadable; run `log reports` from an elevated prompt",
+            );
+        }
+        anyhow::Error::new(error)
+    })?;
+    records.sort_by(|left, right| left.time.cmp(&right.time));
+    if records.is_empty() {
+        writeln!(output, "No reports sent yet.")?;
+    }
+    for (index, record) in records.iter().enumerate() {
+        let sent = record
+            .sent()
+            .with_context(|| format!("line {}: invalid sent report", index + 1))?;
+        let jws = std::str::from_utf8(&sent)
+            .with_context(|| format!("line {}: report JWS is not UTF-8", index + 1))?;
+        let mut parts = jws.split('.');
+        let _header = parts.next();
+        let payload = parts
+            .next()
+            .context("report JWS payload is missing")
+            .with_context(|| format!("line {}", index + 1))?;
+        if parts.next().is_none() || parts.next().is_some() {
+            bail!("line {}: report JWS must have three segments", index + 1);
+        }
+        let payload = URL_SAFE_NO_PAD
+            .decode(payload)
+            .with_context(|| format!("line {}: invalid report JWS payload", index + 1))?;
+        let value: Value = serde_json::from_slice(&payload)
+            .with_context(|| format!("line {}: report payload is not JSON", index + 1))?;
+        let report_id = value["report_id"].as_str().unwrap_or("unknown");
+        let report_type = value["report_type"].as_str().unwrap_or("unknown");
+        writeln!(
+            output,
+            "== {}  status:{}  report_id:{}  report_type:{}",
+            record.time,
+            record
+                .status
+                .map_or_else(|| "unknown".into(), |status| status.to_string()),
+            report_id,
+            report_type
+        )?;
+        writeln!(output, "{}", serde_json::to_string_pretty(&value)?)?;
+        writeln!(output, "-- response")?;
+        let response = record.response()?;
+        match String::from_utf8(response) {
+            Ok(response) => writeln!(output, "{response}\n")?,
+            Err(error) => writeln!(
+                output,
+                "{} response bytes (not UTF-8)\n",
+                error.as_bytes().len()
+            )?,
+        }
+    }
+    Ok(())
+}
+
 async fn run(cli: Cli) -> Result<ExitCode> {
     if let Command::Schedule {
         command: schedule::Command::Probe { address },
@@ -1799,6 +1864,17 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Command::Log {
             command: LogCommand::Show,
         } => log_show(&home.file("claims.jsonl")).map(|()| ExitCode::SUCCESS),
+        Command::Log {
+            command: LogCommand::Reports,
+        } => {
+            #[cfg(windows)]
+            let (path, system_state) = schedule::report_log_path(&home)
+                .context("SYSTEM report history may require an elevated prompt")?;
+            #[cfg(not(windows))]
+            let (path, system_state) = schedule::report_log_path(&home)?;
+            log_reports(&path, system_state, &mut std::io::stdout().lock())
+                .map(|()| ExitCode::SUCCESS)
+        }
         Command::DeleteDeviceKey => {
             DeviceKey::delete(&home.0)?;
             println!("Device key deleted.");
@@ -1836,6 +1912,56 @@ async fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    #[test]
+    fn log_reports_prints_records_oldest_first_with_payload_and_response() {
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reports.jsonl");
+        let state = dir.path().join("report-state.json");
+        for (id, kind, response, status) in [
+            ("first", "periodic", b"ok".as_slice(), 200),
+            ("second", "event", b"\xff".as_slice(), 503),
+        ] {
+            let payload = serde_json::json!({
+                "report_id": id,
+                "report_type": kind,
+                "results": {"firewall": "on"},
+            });
+            let jws = format!(
+                "e30.{}.signature",
+                URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap())
+            );
+            locallog::append_report_retained(&path, &state, jws.as_bytes(), response, status)
+                .unwrap();
+        }
+        let mut records = locallog::read(&path).unwrap();
+        records[0].time = "2026-01-01T00:00:00Z".into();
+        records[1].time = "2026-01-02T00:00:00Z".into();
+        fs::write(
+            &path,
+            records
+                .iter()
+                .map(serde_json::to_string)
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+                .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        let mut output = Vec::new();
+        log_reports(&path, false, &mut output).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.find("report_id:first").unwrap() < output.find("report_id:second").unwrap());
+        assert!(output.contains("status:200"));
+        assert!(output.contains("report_type:periodic"));
+        assert!(output.contains("\"firewall\": \"on\""));
+        assert!(output.contains("ok"));
+        assert!(output.contains("1 response bytes (not UTF-8)"));
+    }
 
     #[test]
     fn plain_http_only_to_this_machine_unless_insecure_dev() {

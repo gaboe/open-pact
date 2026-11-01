@@ -1100,6 +1100,7 @@ async fn run_report(
         save(state_home, STATE, &state)?;
         let acknowledged = report::run_scheduled(
             home,
+            state_home,
             &config.collector,
             &config.vpn_probe,
             snapshot,
@@ -1117,6 +1118,14 @@ async fn run_report(
     }
     save(state_home, STATE, &state)?;
     Ok(())
+}
+
+pub(crate) fn report_log_path(home: &Home) -> Result<(PathBuf, bool)> {
+    #[cfg(windows)]
+    if let Some(state) = windows_existing_system_state(&home.0)? {
+        return Ok((state.join("reports.jsonl"), true));
+    }
+    Ok((home.file("reports.jsonl"), false))
 }
 
 const APPLIED: &str = "schedule-applied.json";
