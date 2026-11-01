@@ -51,9 +51,9 @@ pub fn fix_hint(check: &str, value: &str, os: Os) -> Option<&'static str> {
         );
     }
     match (check, os) {
-        ("remote_wipe", Os::Macos) => Some(
-            "Turn on Find My Mac: System Settings > Apple Account > iCloud > Find My Mac.",
-        ),
+        ("remote_wipe", Os::Macos) => {
+            Some("Turn on Find My Mac: System Settings > Apple Account > iCloud > Find My Mac.")
+        }
         ("os_auto_updates", _) => {
             Some("Enable automatic security updates in the operating system update settings.")
         }
