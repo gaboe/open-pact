@@ -182,6 +182,7 @@ fn declared_not_applicable_is_evaluated_as_an_ordinary_value() {
         Decision::Allow { warnings: vec![] }
     );
     c.os = Os::Macos;
+    c.results.insert("remote_wipe".into(), "on".into());
     assert!(
         matches!(evaluate(&m, &c, c.time, &FirstFailures::new()).decision,
         Decision::Allow { warnings } if warnings.len() == 1)
