@@ -16,6 +16,8 @@ pub struct Record {
     pub response_sha256: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<u16>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub response_incomplete: bool,
 }
 
 impl Record {
@@ -46,7 +48,7 @@ pub fn append(path: &Path, sent_bytes: &[u8], response_bytes: &[u8]) -> io::Resu
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         fs::create_dir_all(dir)?;
     }
-    let record = make_record(sent_bytes, response_bytes, None);
+    let record = make_record(sent_bytes, response_bytes, None, false);
     let mut line = serde_json::to_vec(&record).map_err(io::Error::other)?;
     line.push(b'\n');
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
@@ -60,6 +62,7 @@ pub fn append_report_retained(
     sent_bytes: &[u8],
     response_bytes: &[u8],
     status: u16,
+    response_incomplete: bool,
 ) -> io::Result<()> {
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         fs::create_dir_all(dir)?;
@@ -83,7 +86,12 @@ pub fn append_report_retained(
     records.retain(|record| {
         chrono::DateTime::parse_from_rfc3339(&record.time).map_or(true, |time| time >= cutoff)
     });
-    records.push(make_record(sent_bytes, response_bytes, Some(status)));
+    records.push(make_record(
+        sent_bytes,
+        response_bytes,
+        Some(status),
+        response_incomplete,
+    ));
 
     let temp = path.with_extension("jsonl.tmp");
     let _ = fs::remove_file(&temp);
@@ -115,7 +123,12 @@ pub fn append_report_retained(
     result
 }
 
-fn make_record(sent_bytes: &[u8], response_bytes: &[u8], status: Option<u16>) -> Record {
+fn make_record(
+    sent_bytes: &[u8],
+    response_bytes: &[u8],
+    status: Option<u16>,
+    response_incomplete: bool,
+) -> Record {
     Record {
         time: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         sent_b64: STANDARD.encode(sent_bytes),
@@ -123,26 +136,35 @@ fn make_record(sent_bytes: &[u8], response_bytes: &[u8], status: Option<u16>) ->
         response_b64: STANDARD.encode(response_bytes),
         response_sha256: hex::encode(Sha256::digest(response_bytes)),
         status,
+        response_incomplete,
     }
 }
 
 pub fn read(path: &Path) -> io::Result<Vec<Record>> {
+    Ok(read_with_lines(path)?
+        .into_iter()
+        .map(|(_, record)| record)
+        .collect())
+}
+
+pub fn read_with_lines(path: &Path) -> io::Result<Vec<(usize, Record)>> {
     let text = match fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e),
     };
     text.lines()
-        .filter(|l| !l.trim().is_empty())
+        .filter(|line| !line.trim().is_empty())
         .enumerate()
-        .map(|(i, line)| {
-            let record: Record =
-                serde_json::from_str(line).map_err(|e| invalid(format!("line {}: {e}", i + 1)))?;
+        .map(|(index, line)| {
+            let line_number = index + 1;
+            let record: Record = serde_json::from_str(line)
+                .map_err(|e| invalid(format!("line {line_number}: {e}")))?;
             record
                 .sent()
                 .and_then(|_| record.response())
-                .map_err(|e| invalid(format!("line {}: {e}", i + 1)))?;
-            Ok(record)
+                .map_err(|e| invalid(format!("line {line_number}: {e}")))?;
+            Ok((line_number, record))
         })
         .collect()
 }
@@ -235,11 +257,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("reports.jsonl");
         let state_path = dir.path().join("report-state.json");
-        let mut old = make_record(b"old", b"response", Some(200));
+        let mut old = make_record(b"old", b"response", Some(200), false);
         old.time = (chrono::Utc::now() - chrono::Duration::days(91))
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
-        append_report_retained(&path, &state_path, b"new", b"ok", 201).unwrap();
+        append_report_retained(&path, &state_path, b"new", b"ok", 201, false).unwrap();
         let records = read(&path).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].sent().unwrap(), b"new");
@@ -256,7 +278,7 @@ mod tests {
         let state_path = dir.path().join("report-state.json");
         fs::write(&state_path, b"{}").unwrap();
         fs::set_permissions(&state_path, fs::Permissions::from_mode(0o400)).unwrap();
-        append_report_retained(&path, &state_path, b"sent", b"response", 200).unwrap();
+        append_report_retained(&path, &state_path, b"sent", b"response", 200, false).unwrap();
         assert_eq!(
             fs::metadata(path).unwrap().permissions().mode() & 0o777,
             0o400

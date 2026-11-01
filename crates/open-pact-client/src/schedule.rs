@@ -13,6 +13,13 @@ use crate::{Home, checks, report};
 
 const CONFIG: &str = "report-schedule.json";
 const STATE: &str = "report-state.json";
+const HOME_LEFTOVER_FILES: &[&str] = &[CONFIG, STATE];
+const HOME_REMOVE_FILES: &[&str] = &[
+    CONFIG,
+    STATE,
+    "report-state.json.tmp",
+    "report-schedule.json.tmp",
+];
 const LOCK: &str = "report-schedule.lock";
 
 #[derive(Subcommand)]
@@ -655,6 +662,23 @@ fn remove_if_exists(path: &Path) -> Result<()> {
     }
 }
 
+fn home_schedule_has_leftovers(home: &Home) -> bool {
+    HOME_LEFTOVER_FILES
+        .iter()
+        .any(|name| home.file(name).exists())
+}
+
+fn remove_home_schedule_files(home: &Home) -> Result<()> {
+    for name in HOME_REMOVE_FILES {
+        remove_if_exists(&home.file(name))?;
+    }
+    Ok(())
+}
+
+fn remove_system_state_directory(path: &Path) -> std::io::Result<()> {
+    std::fs::remove_dir_all(path)
+}
+
 fn register(job: &Job, action: RegistrationAction) -> Result<()> {
     match crate::current_os()? {
         open_pact_core::Os::Macos => {
@@ -1045,7 +1069,7 @@ fn windows_system_uninstall(job: &Job, home: &Home) -> Result<()> {
         failures.push(format!("task {}: {error:#}", job.id));
     }
     if let Some(state) = state
-        && let Err(error) = std::fs::remove_dir_all(&state)
+        && let Err(error) = remove_system_state_directory(&state)
     {
         failures.push(format!(
             "SYSTEM report state remains at {}: {error}",
@@ -1120,12 +1144,21 @@ async fn run_report(
     Ok(())
 }
 
-pub(crate) fn report_log_path(home: &Home) -> Result<(PathBuf, bool)> {
-    #[cfg(windows)]
-    if let Some(state) = windows_existing_system_state(&home.0)? {
-        return Ok((state.join("reports.jsonl"), true));
+fn report_log_paths_for(home: &Home, system_state: Option<PathBuf>) -> Vec<(PathBuf, bool)> {
+    let mut paths = vec![(home.file("reports.jsonl"), false)];
+    if let Some(state) = system_state {
+        paths.push((state.join("reports.jsonl"), true));
     }
-    Ok((home.file("reports.jsonl"), false))
+    paths
+}
+
+pub(crate) fn report_log_paths(home: &Home) -> Result<Vec<(PathBuf, bool)>> {
+    let home = home;
+    #[cfg(windows)]
+    let system_state = windows_existing_system_state(&home.0)?;
+    #[cfg(not(windows))]
+    let system_state = None;
+    Ok(report_log_paths_for(&home, system_state))
 }
 
 const APPLIED: &str = "schedule-applied.json";
@@ -1258,7 +1291,7 @@ fn observe(home: &Home, desired: Option<&Applied>, inspect_protected: bool) -> R
     if desired.is_some_and(|settings| settings.run_as == RunAs::System) {
         job.argv.push("--system".into());
     }
-    let leftovers = home.file(CONFIG).exists() || home.file(STATE).exists();
+    let leftovers = home_schedule_has_leftovers(home);
     Ok(match crate::current_os()? {
         open_pact_core::Os::Macos => {
             let path = user_home()?
@@ -1656,14 +1689,7 @@ async fn operate(home: &Home, command: Operation, home_locked: bool) -> Result<(
                 register(&job, RegistrationAction::Uninstall)?;
             }
             if home_exists {
-                for name in [
-                    CONFIG,
-                    STATE,
-                    "report-state.json.tmp",
-                    "report-schedule.json.tmp",
-                ] {
-                    remove_if_exists(&home.file(name))?;
-                }
+                remove_home_schedule_files(&home)?;
             }
             if home_exists {
                 println!("Removed {} and its report configuration and state.", job.id);
@@ -2078,6 +2104,33 @@ esac
     }
 
     #[test]
+    fn limited_report_history_is_removed_and_counts_as_leftover() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+        std::fs::write(home.file("reports.jsonl"), b"history\n").unwrap();
+        std::fs::write(home.file("reports.jsonl.tmp"), b"partial\n").unwrap();
+
+        assert!(home_schedule_has_leftovers(&home));
+        remove_home_schedule_files(&home).unwrap();
+
+        assert!(!home.file("reports.jsonl").exists());
+        assert!(!home.file("reports.jsonl.tmp").exists());
+    }
+
+    #[test]
+    fn system_state_removal_deletes_report_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("system-state");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::write(state.join("reports.jsonl"), b"history\n").unwrap();
+        std::fs::write(state.join("reports.jsonl.tmp"), b"partial\n").unwrap();
+
+        remove_system_state_directory(&state).unwrap();
+
+        assert!(!state.exists());
+    }
+
+    #[test]
     fn missing_home_keeps_the_install_task_identifier() {
         let dir = tempfile::tempdir().unwrap();
         let home_path = dir.path().join("fictional-home");
@@ -2090,6 +2143,32 @@ esac
         assert_eq!(install_home, uninstall_home);
         assert_eq!(install_job.id, uninstall_job.id);
         assert!(!home_path.exists());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn report_log_paths_use_the_canonical_schedule_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let home_path = dir.path().join("client-home");
+        std::fs::create_dir(&home_path).unwrap();
+        let alternate = dir.path().join("parent").join("..").join("client-home");
+        let expected = std::fs::canonicalize(&home_path).unwrap();
+
+        let (path, _) = report_log_paths(&Home(alternate)).unwrap().remove(0);
+
+        assert_eq!(path, expected.join("reports.jsonl"));
+    }
+
+    #[test]
+    fn report_log_paths_include_home_and_protected_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().join("home"));
+        let state = dir.path().join("protected-state");
+
+        let paths = report_log_paths_for(&home, Some(state.clone()));
+
+        assert_eq!(paths[0], (home.file("reports.jsonl"), false));
+        assert_eq!(paths[1], (state.join("reports.jsonl"), true));
     }
 
     fn jobs_before_and_after_home_removal() -> (Job, Job) {

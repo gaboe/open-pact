@@ -267,21 +267,25 @@ async fn send(
         .context("send report to collector")?;
     let status = response.status();
     let mut response_body = Vec::new();
-    while let Some(chunk) = match response.chunk().await {
-        Ok(chunk) => chunk,
-        Err(_) => {
-            eprintln!("warning: could not read collector response body for local report history");
-            None
+    let _response_incomplete = loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => response_body.extend_from_slice(&chunk),
+            Ok(None) => break false,
+            Err(_) => {
+                eprintln!(
+                    "warning: could not read collector response body for local report history"
+                );
+                break true;
+            }
         }
-    } {
-        response_body.extend_from_slice(&chunk);
-    }
+    };
     if let Err(error) = crate::locallog::append_report_retained(
         &log_home.file("reports.jsonl"),
         &log_home.file("report-state.json"),
         jws.as_bytes(),
         &response_body,
         status.as_u16(),
+        false,
     ) {
         eprintln!("warning: could not write local report history: {error}");
     }
@@ -302,6 +306,14 @@ mod tests {
     async fn collector(
         status: u16,
         response: &'static [u8],
+    ) -> (String, tokio::task::JoinHandle<Vec<u8>>) {
+        collector_with_response_length(status, response, response.len()).await
+    }
+
+    async fn collector_with_response_length(
+        status: u16,
+        response: &'static [u8],
+        response_length: usize,
     ) -> (String, tokio::task::JoinHandle<Vec<u8>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -341,7 +353,7 @@ mod tests {
                 .write_all(
                     format!(
                         "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        response.len()
+                        response_length
                     )
                     .as_bytes(),
                 )
@@ -442,6 +454,19 @@ mod tests {
         let (url, server) = collector(200, b"ok").await;
         assert!(send(&home, &home, &url, report, false, None).await.unwrap());
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn incomplete_response_body_is_marked_in_report_history() {
+        let (_dir, home, report) = report_home();
+        let (url, server) = collector_with_response_length(200, b"ok", 10).await;
+
+        assert!(send(&home, &home, &url, report, false, None).await.unwrap());
+        server.await.unwrap();
+        let line = std::fs::read_to_string(home.file("reports.jsonl")).unwrap();
+        let record: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+
+        assert!(record["response_incomplete"].as_bool().unwrap());
     }
 
     #[test]

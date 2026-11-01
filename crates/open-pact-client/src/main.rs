@@ -1742,46 +1742,73 @@ fn log_show(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn log_reports(path: &Path, _system_state: bool, output: &mut impl Write) -> Result<()> {
-    let mut records = locallog::read(path).map_err(|error| {
-        #[cfg(windows)]
-        if _system_state && error.kind() == std::io::ErrorKind::PermissionDenied {
-            return anyhow::Error::new(error).context(
-                "SYSTEM report history is unreadable; run `log reports` from an elevated prompt",
+#[derive(Clone, Copy)]
+struct ReportLogFile<'a> {
+    path: &'a Path,
+    source: &'static str,
+    system_state: bool,
+}
+
+fn log_reports(files: &[ReportLogFile<'_>], output: &mut impl Write) -> Result<()> {
+    let Some(file) = files.last() else {
+        writeln!(output, "No reports sent yet.")?;
+        return Ok(());
+    };
+    let mut records = Vec::new();
+    let mut system_unreadable = false;
+    match locallog::read_with_lines(file.path) {
+        Ok(file_records) => records.extend(
+            file_records
+                .into_iter()
+                .map(|(line, record)| (*file, line, record)),
+        ),
+        Err(error) if file.system_state && error.kind() != std::io::ErrorKind::InvalidData => {
+            system_unreadable = true;
+        }
+        Err(error) => {
+            return Err(
+                anyhow::Error::new(error).context(format!("{} report history", file.source))
             );
         }
-        anyhow::Error::new(error)
-    })?;
-    records.sort_by(|left, right| left.time.cmp(&right.time));
+    }
+    records.sort_by(|(_, _, left), (_, _, right)| left.time.cmp(&right.time));
+    if system_unreadable {
+        writeln!(
+            output,
+            "SYSTEM report history is unreadable; run `log reports` from an elevated prompt to include SYSTEM history."
+        )?;
+    }
     if records.is_empty() {
         writeln!(output, "No reports sent yet.")?;
     }
-    for (index, record) in records.iter().enumerate() {
+    for (file, line, record) in &records {
+        let location = format!("{} line {line}", file.source);
         let sent = record
             .sent()
-            .with_context(|| format!("line {}: invalid sent report", index + 1))?;
+            .with_context(|| format!("{location}: invalid sent report"))?;
         let jws = std::str::from_utf8(&sent)
-            .with_context(|| format!("line {}: report JWS is not UTF-8", index + 1))?;
+            .with_context(|| format!("{location}: report JWS is not UTF-8"))?;
         let mut parts = jws.split('.');
         let _header = parts.next();
         let payload = parts
             .next()
             .context("report JWS payload is missing")
-            .with_context(|| format!("line {}", index + 1))?;
+            .with_context(|| location.clone())?;
         if parts.next().is_none() || parts.next().is_some() {
-            bail!("line {}: report JWS must have three segments", index + 1);
+            bail!("{location}: report JWS must have three segments");
         }
         let payload = URL_SAFE_NO_PAD
             .decode(payload)
-            .with_context(|| format!("line {}: invalid report JWS payload", index + 1))?;
+            .with_context(|| format!("{location}: invalid report JWS payload"))?;
         let value: Value = serde_json::from_slice(&payload)
-            .with_context(|| format!("line {}: report payload is not JSON", index + 1))?;
+            .with_context(|| format!("{location}: report payload is not JSON"))?;
         let report_id = value["report_id"].as_str().unwrap_or("unknown");
         let report_type = value["report_type"].as_str().unwrap_or("unknown");
         writeln!(
             output,
-            "== {}  status:{}  report_id:{}  report_type:{}",
+            "== {}  source:{}  status:{}  report_id:{}  report_type:{}",
             record.time,
+            file.source,
             record
                 .status
                 .map_or_else(|| "unknown".into(), |status| status.to_string()),
@@ -1789,7 +1816,11 @@ fn log_reports(path: &Path, _system_state: bool, output: &mut impl Write) -> Res
             report_type
         )?;
         writeln!(output, "{}", serde_json::to_string_pretty(&value)?)?;
-        writeln!(output, "-- response")?;
+        if record.response_incomplete {
+            writeln!(output, "-- response (response incomplete)")?;
+        } else {
+            writeln!(output, "-- response")?;
+        }
         let response = record.response()?;
         match String::from_utf8(response) {
             Ok(response) => writeln!(output, "{response}\n")?,
@@ -1868,12 +1899,19 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             command: LogCommand::Reports,
         } => {
             #[cfg(windows)]
-            let (path, system_state) = schedule::report_log_path(&home)
+            let paths = schedule::report_log_paths(&home)
                 .context("SYSTEM report history may require an elevated prompt")?;
             #[cfg(not(windows))]
-            let (path, system_state) = schedule::report_log_path(&home)?;
-            log_reports(&path, system_state, &mut std::io::stdout().lock())
-                .map(|()| ExitCode::SUCCESS)
+            let paths = schedule::report_log_paths(&home)?;
+            let files = paths
+                .iter()
+                .map(|(path, system_state)| ReportLogFile {
+                    path,
+                    source: if *system_state { "system" } else { "home" },
+                    system_state: *system_state,
+                })
+                .collect::<Vec<_>>();
+            log_reports(&files, &mut std::io::stdout().lock()).map(|()| ExitCode::SUCCESS)
         }
         Command::DeleteDeviceKey => {
             DeviceKey::delete(&home.0)?;
@@ -1935,12 +1973,20 @@ mod tests {
                 "e30.{}.signature",
                 URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap())
             );
-            locallog::append_report_retained(&path, &state, jws.as_bytes(), response, status)
-                .unwrap();
+            locallog::append_report_retained(
+                &path,
+                &state,
+                jws.as_bytes(),
+                response,
+                status,
+                false,
+            )
+            .unwrap();
         }
         let mut records = locallog::read(&path).unwrap();
         records[0].time = "2026-01-01T00:00:00Z".into();
         records[1].time = "2026-01-02T00:00:00Z".into();
+        records[1].response_incomplete = true;
         fs::write(
             &path,
             records
@@ -1953,7 +1999,15 @@ mod tests {
         )
         .unwrap();
         let mut output = Vec::new();
-        log_reports(&path, false, &mut output).unwrap();
+        log_reports(
+            &[ReportLogFile {
+                path: &path,
+                source: "home",
+                system_state: false,
+            }],
+            &mut output,
+        )
+        .unwrap();
         let output = String::from_utf8(output).unwrap();
         assert!(output.find("report_id:first").unwrap() < output.find("report_id:second").unwrap());
         assert!(output.contains("status:200"));
@@ -1961,6 +2015,165 @@ mod tests {
         assert!(output.contains("\"firewall\": \"on\""));
         assert!(output.contains("ok"));
         assert!(output.contains("1 response bytes (not UTF-8)"));
+        assert!(output.contains("response incomplete"));
+    }
+
+    #[test]
+    fn log_reports_reads_home_and_system_history() {
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home-reports.jsonl");
+        let system = dir.path().join("system-reports.jsonl");
+        let state = dir.path().join("report-state.json");
+        for (path, id, time) in [
+            (&system, "system-row", "2026-01-01T00:00:00Z"),
+            (&home, "home-row", "2026-01-02T00:00:00Z"),
+        ] {
+            let payload = serde_json::json!({
+                "report_id": id,
+                "report_type": "periodic",
+            });
+            let jws = format!(
+                "e30.{}.signature",
+                URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap())
+            );
+            locallog::append_report_retained(path, &state, jws.as_bytes(), b"ok", 200, false)
+                .unwrap();
+            let mut record = locallog::read(path).unwrap().remove(0);
+            record.time = time.into();
+            fs::write(path, serde_json::to_vec(&record).unwrap()).unwrap();
+        }
+        let files = [
+            ReportLogFile {
+                path: &home,
+                source: "home",
+                system_state: false,
+            },
+            ReportLogFile {
+                path: &system,
+                source: "system",
+                system_state: true,
+            },
+        ];
+        let mut output = Vec::new();
+
+        log_reports(&files, &mut output).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("source:home"));
+        assert!(output.contains("source:system"));
+        assert!(
+            output.find("report_id:system-row").unwrap()
+                < output.find("report_id:home-row").unwrap()
+        );
+
+        let unreadable_system = dir.path().join("unreadable-system");
+        fs::create_dir(&unreadable_system).unwrap();
+        let unreadable_files = [
+            ReportLogFile {
+                path: &home,
+                source: "home",
+                system_state: false,
+            },
+            ReportLogFile {
+                path: &unreadable_system,
+                source: "system",
+                system_state: true,
+            },
+        ];
+        let mut fallback = Vec::new();
+        log_reports(&unreadable_files, &mut fallback).unwrap();
+        let fallback = String::from_utf8(fallback).unwrap();
+        assert!(fallback.contains("report_id:home-row"));
+        assert!(fallback.contains("run `log reports` from an elevated prompt"));
+    }
+
+    #[test]
+    fn report_errors_name_physical_file_lines() {
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("report-state.json");
+        let hash_path = dir.path().join("hash-reports.jsonl");
+        locallog::append_report_retained(&hash_path, &state, b"first", b"ok", 200, false).unwrap();
+        locallog::append_report_retained(&hash_path, &state, b"second", b"ok", 200, false).unwrap();
+        let mut lines = fs::read_to_string(&hash_path)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let mut bad_hash: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
+        bad_hash["sent_sha256"] = serde_json::Value::String("0".repeat(64));
+        lines[1] = serde_json::to_string(&bad_hash).unwrap();
+        fs::write(&hash_path, format!("{}\n\n{}\n", lines[0], lines[1])).unwrap();
+        let hash_error = log_reports(
+            &[ReportLogFile {
+                path: &hash_path,
+                source: "home",
+                system_state: false,
+            }],
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{hash_error:#}").contains("line 3"),
+            "{hash_error:#}"
+        );
+
+        let sorted_path = dir.path().join("sorted-reports.jsonl");
+        let valid_payload = serde_json::json!({
+            "report_id": "newer",
+            "report_type": "periodic",
+        });
+        let valid_jws = format!(
+            "e30.{}.signature",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&valid_payload).unwrap())
+        );
+        locallog::append_report_retained(
+            &sorted_path,
+            &state,
+            valid_jws.as_bytes(),
+            b"ok",
+            200,
+            false,
+        )
+        .unwrap();
+        locallog::append_report_retained(
+            &sorted_path,
+            &state,
+            b"e30.*.signature",
+            b"ok",
+            200,
+            false,
+        )
+        .unwrap();
+        let mut records = locallog::read(&sorted_path).unwrap();
+        records[0].time = "2026-01-02T00:00:00Z".into();
+        records[1].time = "2026-01-01T00:00:00Z".into();
+        fs::write(
+            &sorted_path,
+            records
+                .iter()
+                .map(serde_json::to_string)
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+                .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        let jws_error = log_reports(
+            &[ReportLogFile {
+                path: &sorted_path,
+                source: "home",
+                system_state: false,
+            }],
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert!(jws_error.to_string().contains("line 2"), "{jws_error:#}");
     }
 
     #[test]
