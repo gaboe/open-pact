@@ -267,7 +267,7 @@ async fn send(
         .context("send report to collector")?;
     let status = response.status();
     let mut response_body = Vec::new();
-    let _response_incomplete = loop {
+    let response_incomplete = loop {
         match response.chunk().await {
             Ok(Some(chunk)) => response_body.extend_from_slice(&chunk),
             Ok(None) => break false,
@@ -285,7 +285,7 @@ async fn send(
         jws.as_bytes(),
         &response_body,
         status.as_u16(),
-        false,
+        response_incomplete,
     ) {
         eprintln!("warning: could not write local report history: {error}");
     }

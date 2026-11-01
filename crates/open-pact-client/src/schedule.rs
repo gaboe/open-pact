@@ -13,12 +13,14 @@ use crate::{Home, checks, report};
 
 const CONFIG: &str = "report-schedule.json";
 const STATE: &str = "report-state.json";
-const HOME_LEFTOVER_FILES: &[&str] = &[CONFIG, STATE];
+const HOME_LEFTOVER_FILES: &[&str] = &[CONFIG, STATE, "reports.jsonl", "reports.jsonl.tmp"];
 const HOME_REMOVE_FILES: &[&str] = &[
     CONFIG,
     STATE,
     "report-state.json.tmp",
     "report-schedule.json.tmp",
+    "reports.jsonl",
+    "reports.jsonl.tmp",
 ];
 const LOCK: &str = "report-schedule.lock";
 
@@ -1153,7 +1155,7 @@ fn report_log_paths_for(home: &Home, system_state: Option<PathBuf>) -> Vec<(Path
 }
 
 pub(crate) fn report_log_paths(home: &Home) -> Result<Vec<(PathBuf, bool)>> {
-    let home = home;
+    let home = Home(schedule_home(&home.0, true)?);
     #[cfg(windows)]
     let system_state = windows_existing_system_state(&home.0)?;
     #[cfg(not(windows))]

@@ -1750,25 +1750,23 @@ struct ReportLogFile<'a> {
 }
 
 fn log_reports(files: &[ReportLogFile<'_>], output: &mut impl Write) -> Result<()> {
-    let Some(file) = files.last() else {
-        writeln!(output, "No reports sent yet.")?;
-        return Ok(());
-    };
     let mut records = Vec::new();
     let mut system_unreadable = false;
-    match locallog::read_with_lines(file.path) {
-        Ok(file_records) => records.extend(
-            file_records
-                .into_iter()
-                .map(|(line, record)| (*file, line, record)),
-        ),
-        Err(error) if file.system_state && error.kind() != std::io::ErrorKind::InvalidData => {
-            system_unreadable = true;
-        }
-        Err(error) => {
-            return Err(
-                anyhow::Error::new(error).context(format!("{} report history", file.source))
-            );
+    for file in files {
+        match locallog::read_with_lines(file.path) {
+            Ok(file_records) => records.extend(
+                file_records
+                    .into_iter()
+                    .map(|(line, record)| (*file, line, record)),
+            ),
+            Err(error) if file.system_state && error.kind() != std::io::ErrorKind::InvalidData => {
+                system_unreadable = true;
+            }
+            Err(error) => {
+                return Err(
+                    anyhow::Error::new(error).context(format!("{} report history", file.source))
+                );
+            }
         }
     }
     records.sort_by(|(_, _, left), (_, _, right)| left.time.cmp(&right.time));

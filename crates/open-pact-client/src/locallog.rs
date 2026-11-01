@@ -154,8 +154,8 @@ pub fn read_with_lines(path: &Path) -> io::Result<Vec<(usize, Record)>> {
         Err(e) => return Err(e),
     };
     text.lines()
-        .filter(|line| !line.trim().is_empty())
         .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
         .map(|(index, line)| {
             let line_number = index + 1;
             let record: Record = serde_json::from_str(line)

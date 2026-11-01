@@ -110,7 +110,7 @@ open-pact-client check
 
 The client runs the checks in the signed manifest and sends one signed claim. It verifies the response and log checkpoint. It installs the VPN certificate and CA when the gateway accepts the claim. On Windows, read the consistent pair through `vpn\current`. The README section on the client home describes this pointer. A denied check returns the gateway's reason. A log verification failure raises an alarm and exits with status 2.
 
-Run `open-pact-client log head` to show the last verified checkpoint. Run `open-pact-client log prove` to verify the inclusion proof for this device's enrolment. Run `open-pact-client log show` to print claims and gateway responses. Run `open-pact-client log reports` to print report requests and collector responses from the last 90 days. On Windows, use an elevated prompt to read a SYSTEM job's history.
+Run `open-pact-client log head` to show the last verified checkpoint. Run `open-pact-client log prove` to verify the inclusion proof for this device's enrolment. Run `open-pact-client log show` to print claims and gateway responses. Run `open-pact-client log reports` to print report requests and collector responses from the last 90 days. It combines home and SYSTEM history, sorts records by time, and labels each source. On Windows, an elevated prompt includes protected SYSTEM history. Without elevation, the command prints readable home history and says how to include SYSTEM history.
 
 ## Declare the device configuration
 
@@ -196,7 +196,7 @@ Limited Windows operations leave orphaned protected state and the shared binary 
 
 `report` sends a signed payload to the HTTPS collector. It contains report metadata and control results. It contains no raw system logs, public key, or folder paths. The client stores each non-dry-run `report` command and scheduled report that receives an HTTP response in `reports.jsonl`.
 
-Each record keeps the exact signed request, response body, and HTTP status. The client removes records older than 90 days on the next report. Limited jobs store this file beside `report-state.json` in the client home. Windows SYSTEM jobs store it in the protected SYSTEM state directory.
+Each record keeps the exact signed request, response body, and HTTP status. If the client cannot read the full response body, `log reports` marks the record as incomplete. The client removes records older than 90 days on the next report. Limited jobs and manual `report` commands store this file beside `report-state.json` in the client home. Windows SYSTEM jobs store scheduled report history in the protected SYSTEM state directory. `log reports` combines both files and labels each record as `home` or `system`.
 
 ## Troubleshoot common failures
 
