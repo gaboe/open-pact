@@ -350,6 +350,7 @@ All checks are read-only. macOS and Linux checks run as the device owner. Window
 | `web_protection` | Chrome, Edge, Brave and Firefox profiles and readable managed policies. Safari is not checked because its settings need Full Disk Access. | `unknown` |
 | `log_oldest_record_days` | `n/a`, unified log retention is size-based | Age of the oldest readable system journal entry; permission warnings mean `unknown` |
 | `process_audit`, `powershell_logging` | `n/a` | `n/a` |
+| `remote_wipe` | Activation Lock state; remote erase requires the Mac to be online | `n/a` |
 | `log_cleared` | `n/a` | `n/a` |
 
 Windows collects the controls in one cached PowerShell batch. A missing source, command failure, timeout or unrecognized output returns `unknown`.
@@ -367,6 +368,7 @@ Windows collects the controls in one cached PowerShell batch. A missing source, 
 | `web_protection` | Explorer SmartScreen plus Chrome, Edge, Brave, and Firefox preferences and HKLM/HKCU policies | Registry and browser-profile read access |
 | `log_oldest_record_days` | Shorter age of the oldest Security and System records | SYSTEM or elevated administrator |
 | `process_audit` | Native Process Creation audit-policy success flag and command-line policy | SYSTEM or elevated administrator |
+| `remote_wipe` | `n/a`; Windows Find my device cannot erase without an MDM | n/a |
 | `powershell_logging` | Windows PowerShell ScriptBlockLogging policy, machine before interactive users, weakest user policy wins | Registry read access |
 | `log_cleared` | Latest Security event 1102 or System event 104; JSON null after both readable logs have no matching event | SYSTEM or elevated administrator |
 

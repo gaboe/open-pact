@@ -179,7 +179,8 @@ fn adapter_for(id: &str, os: Os) -> Adapter {
             | "uptime_days"
             | "preboot_auth"
             | "antimalware_active"
-            | "antimalware_signature_age_days",
+            | "antimalware_signature_age_days"
+            | "remote_wipe",
         ) => Adapter::MacosV3,
         (
             Os::Linux,

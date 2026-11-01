@@ -2,6 +2,7 @@ use std::fs;
 
 use chrono::{DateTime, Utc};
 use open_pact_core::ControlValue;
+use serde::Deserialize;
 
 use super::exec::run_status;
 
@@ -11,11 +12,48 @@ const REMEDIATOR: &str =
     "/Library/Apple/System/Library/CoreServices/XProtect.app/Contents/MacOS/XProtect";
 const HISTORY: &str = "/Library/Receipts/InstallHistory.plist";
 const SCAN_SERVICE: &str = "com.apple.XProtect.daemon.scan";
+const SYSTEM_PROFILER: &str = "/usr/sbin/system_profiler";
 
 fn command(program: &str, args: &[&str]) -> Option<String> {
     run_status(program, args)
         .filter(|r| r.success)
         .map(|r| r.text)
+}
+
+#[derive(Deserialize)]
+struct SystemProfilerHardware {
+    #[serde(rename = "SPHardwareDataType")]
+    hardware: Vec<SystemProfilerHardwareItem>,
+}
+
+#[derive(Deserialize)]
+struct SystemProfilerHardwareItem {
+    activation_lock_status: Option<String>,
+}
+
+pub fn remote_wipe() -> ControlValue {
+    let Some(result) = run_status(SYSTEM_PROFILER, &["-json", "SPHardwareDataType"]) else {
+        return "unknown".into();
+    };
+    if !result.success {
+        return "unknown".into();
+    }
+    parse_activation_lock(&result.text)
+}
+
+fn parse_activation_lock(text: &str) -> ControlValue {
+    let Ok(output) = serde_json::from_str::<SystemProfilerHardware>(text) else {
+        return "unknown".into();
+    };
+    match output
+        .hardware
+        .first()
+        .and_then(|item| item.activation_lock_status.as_deref())
+    {
+        Some("activation_lock_enabled") => "on".into(),
+        Some("activation_lock_disabled") => "off".into(),
+        _ => "unknown".into(),
+    }
 }
 
 pub fn os_auto_updates() -> ControlValue {

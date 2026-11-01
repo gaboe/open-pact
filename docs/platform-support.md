@@ -24,6 +24,7 @@ This page lists the built-in controls in `crates/open-pact-client/src/checks/mod
 | `web_protection` | `on`, `off`, `n/a`, or `unknown` from Chrome, Edge, Brave, and Firefox; Safari is not checked | `on`, `off`, or `unknown` from SmartScreen and supported browsers | `on`, `off`, or `unknown` from standard Chrome, Chromium, and Firefox policy and profile files | Windows needs SYSTEM to inspect other user profiles. macOS and Linux use the device user. |
 | `log_oldest_record_days` | `n/a`; unified log retention is size-based | Integer days or `unknown` from Security and System logs | Integer days or `unknown` from the system journal | Windows needs administrator or SYSTEM access. The Linux device user needs read access to the system journal. macOS uses the device user. |
 | `process_audit` | `n/a` | `on`, `off`, or `unknown` | `n/a` | Windows needs administrator or SYSTEM access. |
+| `remote_wipe` | `on`, `off`, or `unknown` | `n/a` | `n/a` | The Mac must be online for remote erase. MDM can disable Activation Lock while Find My stays on. |
 | `powershell_logging` | `n/a` | `on`, `off`, or `unknown` | `n/a` | Run as the device user with registry read access. |
 | `log_cleared` | `n/a` | RFC 3339 UTC time, JSON null, or `unknown` from Security and System logs | `n/a` | Windows needs administrator or SYSTEM access to read both logs. |
 | VPN certificate installation | Supported | Supported; `vpn\current` pointer, flat copies can lag while another program holds them open | Supported | Device user. |

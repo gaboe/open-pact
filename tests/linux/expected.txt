@@ -8,8 +8,8 @@
 # count, never unknown.
 # Fedora os_supported follows the clock (Fedora 43 reaches end of life on
 # 2026-12-09), so a fresh image may report either value.
-ubuntu default disk_encryption=unknown firewall=off screen_lock=unknown os_supported=yes os_patch_age_days=0..3650 password_set=unknown auto_login=unknown secure_boot=unknown antimalware_active=unknown
-fedora default disk_encryption=unknown firewall=unknown screen_lock=unknown os_supported=yes|no os_patch_age_days=0..3650 password_set=unknown auto_login=unknown secure_boot=unknown antimalware_active=unknown
+ubuntu default disk_encryption=unknown firewall=off screen_lock=unknown os_supported=yes os_patch_age_days=0..3650 password_set=unknown auto_login=unknown secure_boot=unknown antimalware_active=unknown remote_wipe=n/a
+fedora default disk_encryption=unknown firewall=unknown screen_lock=unknown os_supported=yes|no os_patch_age_days=0..3650 password_set=unknown auto_login=unknown secure_boot=unknown antimalware_active=unknown remote_wipe=n/a
 
 * ufw-active firewall=on antimalware_active=no
 * ufw-active-disabled firewall=off antimalware_active=no

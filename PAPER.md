@@ -415,7 +415,7 @@ check = "builtin:antimalware_active@1"   # Windows: Security Center; macOS: XPro
 # Additional implemented ids: preboot_auth, antimalware_signature_age_days,
 # os_auto_updates, antimalware_realtime, antimalware_active_threats,
 # work_account, uptime_days, antimalware_full_scan_age_days, web_protection, log_oldest_record_days,
-# process_audit, powershell_logging, log_cleared. See README for sources.
+# process_audit, remote_wipe, powershell_logging, log_cleared. See README for sources.
 # macOS reports n/a for active threat counts and full-scan age.
 output = ["yes", "no", "unknown"]
 required = { macos = "yes", windows = "yes" }   # omitted on Linux

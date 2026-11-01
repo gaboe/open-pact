@@ -98,6 +98,7 @@ fn v31_example_declares_exact_fields_and_reported_only_controls() {
         "web_protection",
         "log_oldest_record_days",
         "process_audit",
+        "remote_wipe",
         "powershell_logging",
         "log_cleared",
         "managed_repos_outside",

@@ -19,6 +19,7 @@ const COMPLIANT: &[(&str, &[&str])] = &[
     ("web_protection", &["on", "n/a"]),
     ("log_oldest_record_days", &["n/a"]),
     ("process_audit", &["on", "n/a"]),
+    ("remote_wipe", &["on", "n/a"]),
     ("powershell_logging", &["on", "n/a"]),
     ("log_cleared", &["null", "n/a"]),
 ];
@@ -36,6 +37,7 @@ pub fn fix_hint(check: &str, value: &str, os: Os) -> Option<&'static str> {
                 | "antimalware_active_threats"
                 | "log_oldest_record_days"
                 | "process_audit"
+                | "remote_wipe"
                 | "log_cleared"
         )
     {
@@ -49,6 +51,9 @@ pub fn fix_hint(check: &str, value: &str, os: Os) -> Option<&'static str> {
         );
     }
     match (check, os) {
+        ("remote_wipe", Os::Macos) => Some(
+            "Turn on Find My Mac: System Settings > Apple Account > iCloud > Find My Mac.",
+        ),
         ("os_auto_updates", _) => {
             Some("Enable automatic security updates in the operating system update settings.")
         }
@@ -201,6 +206,8 @@ mod tests {
     fn failing_values_get_owner_instructions() {
         let hint = fix_hint("disk_encryption", "none", Os::Macos).unwrap();
         assert!(hint.contains("FileVault"));
+        let hint = fix_hint("remote_wipe", "off", Os::Macos).unwrap();
+        assert!(hint.contains("Find My Mac"));
     }
 
     #[test]

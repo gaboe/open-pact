@@ -349,6 +349,7 @@ mod tests {
                 ("antimalware_active_threats".into(), "n/a".into()),
                 ("log_oldest_record_days".into(), "n/a".into()),
                 ("process_audit".into(), "n/a".into()),
+                ("remote_wipe".into(), "n/a".into()),
                 ("powershell_logging".into(), "n/a".into()),
                 ("log_cleared".into(), "n/a".into()),
                 ("managed_repos_outside".into(), 0.into()),

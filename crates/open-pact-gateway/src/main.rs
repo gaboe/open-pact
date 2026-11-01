@@ -1221,6 +1221,7 @@ mod tests {
                 ("os_auto_updates", "on"),
                 ("antimalware_realtime", "on"),
                 ("process_audit", "n/a"),
+                ("remote_wipe", "n/a"),
                 ("powershell_logging", "n/a"),
                 ("log_cleared", "n/a"),
             ]

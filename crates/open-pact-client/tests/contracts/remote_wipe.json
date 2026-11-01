@@ -1,0 +1,75 @@
+{
+  "id": "remote_wipe",
+  "cases": [
+    {
+      "name": "linux-not-applicable",
+      "os": "linux",
+      "input": [],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "n/a",
+      "known_diff": null
+    },
+    {
+      "name": "windows-not-applicable",
+      "os": "windows",
+      "input": [],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "n/a",
+      "known_diff": null
+    },
+    {
+      "name": "activation-lock-enabled",
+      "os": "macos",
+      "input": ["{\"SPHardwareDataType\":[{\"activation_lock_status\":\"activation_lock_enabled\",\"serial_number\":\"C02FAKE00000\",\"platform_UUID\":\"FAKE-UUID\",\"provisioning_UDID\":\"FAKE-UDID\"}]}"],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "on",
+      "known_diff": null
+    },
+    {
+      "name": "activation-lock-disabled",
+      "os": "macos",
+      "input": ["{\"SPHardwareDataType\":[{\"activation_lock_status\":\"activation_lock_disabled\",\"serial_number\":\"C02FAKE00000\"}]}"],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "off",
+      "known_diff": null
+    },
+    {
+      "name": "missing-activation-lock-key",
+      "os": "macos",
+      "input": ["{\"SPHardwareDataType\":[{\"serial_number\":\"C02FAKE00000\",\"platform_UUID\":\"FAKE-UUID\"}]}"],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "unrecognized-activation-lock-token",
+      "os": "macos",
+      "input": ["{\"SPHardwareDataType\":[{\"activation_lock_status\":\"not_available\"}]}"],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "malformed-json",
+      "os": "macos",
+      "input": ["{not-json"],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "command-failed",
+      "os": "macos",
+      "input": ["{\"SPHardwareDataType\":[{\"activation_lock_status\":\"activation_lock_enabled\"}]}"],
+      "code": 1,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    }
+  ]
+}

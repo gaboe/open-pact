@@ -77,6 +77,7 @@ const BUILTINS: &[(&str, u32)] = &[
     ("web_protection", 1),
     ("log_oldest_record_days", 1),
     ("process_audit", 1),
+    ("remote_wipe", 1),
     ("powershell_logging", 1),
     ("log_cleared", 1),
     ("managed_repos_outside", 1),
@@ -183,6 +184,7 @@ const MACOS: Registry = &[
         ignore_input!(macos_v3::not_applicable),
     ),
     ("process_audit", ignore_input!(macos_v3::not_applicable)),
+    ("remote_wipe", ignore_input!(macos_v3::remote_wipe)),
     (
         "powershell_logging",
         ignore_input!(macos_v3::not_applicable),
@@ -241,6 +243,7 @@ const LINUX: Registry = &[
         ignore_input!(linux_v3::log_oldest_record_days),
     ),
     ("process_audit", ignore_input!(macos_v3::not_applicable)),
+    ("remote_wipe", ignore_input!(macos_v3::not_applicable)),
     (
         "powershell_logging",
         ignore_input!(macos_v3::not_applicable),
@@ -296,6 +299,7 @@ const WINDOWS: Registry = &[
         ignore_input!(windows::log_oldest_record_days),
     ),
     ("process_audit", ignore_input!(windows::process_audit)),
+    ("remote_wipe", ignore_input!(macos_v3::not_applicable)),
     (
         "powershell_logging",
         ignore_input!(windows::powershell_logging),
@@ -346,6 +350,7 @@ fn legacy_registry(os: Os) -> LegacyRegistry {
         ("web_protection", macos_v3::web_protection),
         ("log_oldest_record_days", macos_v3::not_applicable),
         ("process_audit", macos_v3::not_applicable),
+        ("remote_wipe", macos_v3::remote_wipe),
         ("powershell_logging", macos_v3::not_applicable),
         ("log_cleared", macos_v3::not_applicable),
     ];
@@ -373,6 +378,7 @@ fn legacy_registry(os: Os) -> LegacyRegistry {
         ("web_protection", || browsers::linux().into()),
         ("log_oldest_record_days", linux_v3::log_oldest_record_days),
         ("process_audit", macos_v3::not_applicable),
+        ("remote_wipe", macos_v3::not_applicable),
         ("powershell_logging", macos_v3::not_applicable),
         ("log_cleared", macos_v3::not_applicable),
     ];
@@ -406,6 +412,7 @@ fn legacy_registry(os: Os) -> LegacyRegistry {
         ("web_protection", windows::web_protection),
         ("log_oldest_record_days", windows::log_oldest_record_days),
         ("process_audit", windows::process_audit),
+        ("remote_wipe", macos_v3::not_applicable),
         ("powershell_logging", windows::powershell_logging),
         ("log_cleared", windows::log_cleared),
     ];

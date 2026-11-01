@@ -12,6 +12,13 @@ pub(crate) fn run(id: &str, case: &Case) -> ControlValue {
         "preboot_auth" => parse_preboot(text).into(),
         "antimalware_active" => parse_xprotect(text, case.optional(1)).into(),
         "antimalware_signature_age_days" => parse_signature_age(text, case.text(1), case.now()),
+        "remote_wipe" => {
+            if case.code == Some(0) {
+                parse_activation_lock(text)
+            } else {
+                "unknown".into()
+            }
+        }
         _ => panic!("unsupported macOS V3 contract {id}"),
     }
 }

@@ -112,6 +112,14 @@ required = { windows = "on", macos = "n/a", linux = "n/a" }
 grace = "1d"
 
 [[control]]
+id = "remote_wipe"
+source = "company_policy"
+check = "builtin:remote_wipe@1"
+output = ["on", "off", "n/a", "unknown"]
+required = { macos = "on", windows = "n/a", linux = "n/a" }
+grace = "1d"
+
+[[control]]
 id = "powershell_logging"
 source = "company_policy"
 check = "builtin:powershell_logging@1"

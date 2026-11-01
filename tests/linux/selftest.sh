@@ -16,7 +16,7 @@ cat >"$bin/docker" <<'FAKE'
 variant=${*: -1}
 img=${*: -2:1}
 distro=${img##*-}
-for c in disk_encryption firewall screen_lock os_supported os_patch_age_days password_set auto_login secure_boot antimalware_active; do
+for c in disk_encryption firewall screen_lock os_supported os_patch_age_days password_set auto_login secure_boot antimalware_active remote_wipe; do
     want=$(expected "$distro" "$variant" "$c")
     value=${want%%|*}
     value=${value%%..*}
