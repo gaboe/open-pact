@@ -100,6 +100,8 @@ open-pact-client join 'opi1:replace-with-your-invitation'
 
 The client checks the gateway keys and transparency checkpoint before it displays the manifest. Read the manifest before you approve the signature prompt. The owner key signs the manifest hash and the device enrolment statement. The gateway leaves the device pending until an operator approves its device code.
 
+A manifest with `[report]` requires client 0.4.0 or later. Older clients refuse to join. IT must update clients before it publishes the table.
+
 On macOS, `join` reuses an existing device key. It creates a Secure Enclave key only when no key exists and creation succeeds. If creation fails, the client warns and uses a software key. Pass `--software-key` to select a software key for a new device. On Windows, an elevated administrator join tries a TPM key. A non-elevated join or an unavailable provider uses a software key. Marker write and key ACL failures stop join. Linux uses software keys. The owner key and the VPN certificate key are software keys on every platform.
 
 After the operator approves the device, check it:
@@ -114,7 +116,7 @@ Run `open-pact-client log head` to show the last verified checkpoint. Run `open-
 
 ## Declare the device configuration
 
-After IT approves the device, run `open-pact-client finish`. It prepares `open-pact.toml` beside `manifest.toml`, shows a diff and any company defaults that conflict with your values, and writes the file only after you confirm. It then runs `check`. Use `--yes` to skip the confirmation. Run `open-pact-client config example` to print a template without writing a file.
+After IT approves the device, run `open-pact-client finish`. It prepares `open-pact.toml` beside `manifest.toml`, shows a diff and any company defaults that conflict with your values, and writes the file only after you confirm. It then runs `check`. Use `--yes` to skip the confirmation. When `finish` changes an existing file, it creates `open-pact.toml.bak-YYYYMMDDTHHMMSSZ`. It adds a numeric suffix if that name exists. The command prints the backup path. Run `open-pact-client config example` to print a template without writing a file.
 
 ```toml
 [report]

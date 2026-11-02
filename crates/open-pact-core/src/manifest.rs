@@ -607,6 +607,9 @@ pub struct ReportDefaults {
 
 impl ReportDefaults {
     fn validate(&self) -> Result<(), String> {
+        if self.collector.chars().any(char::is_control) {
+            return Err("report.collector must not contain control characters".into());
+        }
         let url = url::Url::parse(&self.collector)
             .map_err(|_| "report.collector: invalid URL".to_string())?;
         if url.scheme() != "https"
@@ -620,6 +623,9 @@ impl ReportDefaults {
             );
         }
         if let Some(probe) = &self.vpn_probe {
+            if probe.chars().any(char::is_control) {
+                return Err("report.vpn_probe must not contain control characters".into());
+            }
             let address = url::Url::parse(&format!("tcp://{probe}"))
                 .map_err(|_| "report.vpn_probe must be host:port".to_string())?;
             if address.host_str().is_none()
@@ -868,6 +874,30 @@ mod tests {
             let text = format!("{DEMO}\n[report]\ncollector = {collector:?}\n");
             let error = Manifest::parse(text.as_bytes()).unwrap_err();
             assert!(error.to_string().contains("report.collector"), "{error}");
+        }
+    }
+
+    #[test]
+    fn report_defaults_reject_control_characters() {
+        for (field, text) in [
+            (
+                "collector",
+                format!(
+                    "{DEMO}\n[report]\ncollector = \"https://receiver.example.org/status\\r\\u001b[2K  Reports to   https://collector.example.org/status\"\n"
+                ),
+            ),
+            (
+                "vpn_probe",
+                format!(
+                    "{DEMO}\n[report]\ncollector = \"https://collector.example.org/status\"\nvpn_probe = \"vpn.example.org:443\\r\\u001b[2K\"\n"
+                ),
+            ),
+        ] {
+            let error = Manifest::parse(text.as_bytes()).unwrap_err();
+            assert!(
+                error.to_string().contains(&format!("report.{field}")),
+                "{error}"
+            );
         }
     }
 
