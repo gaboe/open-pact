@@ -667,27 +667,33 @@ async fn log_mine(
 ) -> Result<Json<MyEntries>, Reply> {
     let Json(request) = body.map_err(|_| device_denied())?;
     authenticate_device(&app, &request, DeviceAuthPurpose::LogMine).await?;
-    let mut tx = app.db.begin().await.map_err(internal)?;
-    let state = devices::lock(&mut tx, &request.pseudonym, app.manifest.hash().as_str())
-        .await
-        .map_err(internal)?;
-    if state != Some(devices::State::Approved) {
-        return Err(device_denied());
-    }
-    let salt: String =
-        sqlx::query_scalar("SELECT salt FROM devices WHERE pseudonym = $1 AND manifest_hash = $2")
-            .bind(request.pseudonym.as_str())
-            .bind(app.manifest.hash().as_str())
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(internal)?;
-    let commitment = devices::commitment(&salt, request.pseudonym.as_str()).map_err(internal)?;
     let checkpoint = app.checkpoint().await?;
     let cp = Checkpoint::parse(&checkpoint.text).map_err(internal)?;
     let tree = app.tree().await?;
-    let entries = translog::mine(&mut tx, cp.size, app.manifest.hash().as_str(), &commitment)
-        .await
-        .map_err(internal)?;
+    let device = sqlx::query_as::<_, (String, String)>(
+        "SELECT state, salt FROM devices WHERE pseudonym = $1 AND manifest_hash = $2",
+    )
+    .bind(request.pseudonym.as_str())
+    .bind(app.manifest.hash().as_str())
+    .fetch_optional(&app.db)
+    .await
+    .map_err(internal)?;
+    let Some((state, salt)) = device else {
+        return Err(device_denied());
+    };
+    if state != devices::State::Approved.as_str() {
+        return Err(device_denied());
+    }
+    let commitment = devices::commitment(&salt, request.pseudonym.as_str()).map_err(internal)?;
+    let mut conn = app.conn().await?;
+    let entries = translog::mine(
+        &mut conn,
+        cp.size,
+        app.manifest.hash().as_str(),
+        &commitment,
+    )
+    .await
+    .map_err(internal)?;
     let with_proof = |entry: Entry| -> Result<EntryWithProof, Reply> {
         let proof = inclusion_proof(tree.prefix(cp.size), entry.index).map_err(internal)?;
         Ok(EntryWithProof { entry, proof })
@@ -1232,7 +1238,16 @@ mod tests {
     }
 
     async fn test_app_with(toml: &str, enrol_limit: u32, nonce_limit: u32) -> (Router, PgPool) {
-        let db = testdb::fresh().await;
+        test_app_with_pool_limit(toml, enrol_limit, nonce_limit, 10).await
+    }
+
+    async fn test_app_with_pool_limit(
+        toml: &str,
+        enrol_limit: u32,
+        nonce_limit: u32,
+        max_connections: u32,
+    ) -> (Router, PgPool) {
+        let db = testdb::fresh_with_max_connections(max_connections).await;
         let kek = SealingKey::new(&TEST_KEK);
         let keys = Keys::load_or_create(&db, &kek).await.unwrap();
         let manifest = Manifest::parse(toml.as_bytes()).unwrap();
@@ -1337,6 +1352,69 @@ mod tests {
             signature: open_pact_core::Signature::sign(key, &statement),
         })
         .unwrap()
+    }
+
+    #[tokio::test]
+    #[ignore = "needs TEST_DATABASE_URL"]
+    async fn concurrent_log_mine_requests_do_not_exhaust_the_pool() {
+        let (app, db) = test_app_with_pool_limit(DEMO, 100, 100, 1).await;
+        let manifest = Manifest::parse(DEMO.as_bytes()).unwrap();
+        let mut tx = db.begin().await.unwrap();
+        translog::append(
+            &mut tx,
+            EntryKind::ManifestPublished,
+            json!({"manifest": manifest.hash().as_str()}),
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let mut devices = Vec::new();
+        for _ in 0..20 {
+            let key = open_pact_core::dev_key::generate();
+            let pseudonym = Pseudonym::of(&PublicKey::from(&key));
+            testdb::enrolled_device(&db, pseudonym.as_str(), manifest.hash().as_str()).await;
+            devices.push((key, pseudonym));
+        }
+        let mut tx = db.begin().await.unwrap();
+        for (_, pseudonym) in &devices {
+            let commitment = devices::commitment("00", pseudonym.as_str()).unwrap();
+            for kind in [EntryKind::DeviceEnrolled, EntryKind::DeviceApproved] {
+                translog::append(&mut tx, kind, json!({"commitment": commitment}))
+                    .await
+                    .unwrap();
+            }
+        }
+        tx.commit().await.unwrap();
+
+        let mut requests = Vec::new();
+        for (key, _) in devices {
+            requests.push(auth_request(&app, &key, DeviceAuthPurpose::LogMine).await);
+        }
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for request in requests {
+            let app = app.clone();
+            tasks.spawn(async move { post_json(&app, "/v1/log/mine", &request).await });
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!tasks.is_empty(), "log requests must still be in flight");
+        let nonce = tokio::time::timeout(
+            Duration::from_secs(5),
+            post_json(&app, "/v1/nonce", &Value::Null),
+        )
+        .await
+        .expect("nonce endpoint must remain available during log requests");
+        assert_eq!(nonce.0, StatusCode::OK);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(result) = tasks.join_next().await {
+                let (status, body) = result.unwrap();
+                assert_eq!(status, StatusCode::OK, "{body}");
+            }
+        })
+        .await
+        .expect("all log requests must complete promptly");
     }
 
     #[tokio::test]

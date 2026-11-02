@@ -2,9 +2,13 @@
 //! `TEST_DATABASE_URL=postgres://... cargo test -p open-pact-gateway -- --ignored`.
 
 use sqlx::PgPool;
-use sqlx::postgres::PgConnectOptions;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
 pub async fn fresh() -> PgPool {
+    fresh_with_max_connections(10).await
+}
+
+pub async fn fresh_with_max_connections(max_connections: u32) -> PgPool {
     let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL must be set");
     let admin = PgPool::connect(&url)
         .await
@@ -15,7 +19,9 @@ pub async fn fresh() -> PgPool {
         .await
         .expect("create test database");
     let options: PgConnectOptions = url.parse().expect("TEST_DATABASE_URL");
-    let db = PgPool::connect_with(options.database(&name))
+    let db = PgPoolOptions::new()
+        .max_connections(max_connections)
+        .connect_with(options.database(&name))
         .await
         .expect("connect test database");
     sqlx::migrate!("./migrations")
