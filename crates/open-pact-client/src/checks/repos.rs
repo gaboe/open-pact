@@ -11,6 +11,9 @@ const FILE: &str = "repo-scan.json";
 const MAX_DEPTH: usize = 8;
 const MAX_AGE_SECS: i64 = 48 * 60 * 60;
 const PRUNED: &[&str] = &["node_modules", "target", "bin", "obj", ".Trash"];
+/// Folders directly in the user home that hold no repositories. macOS asks for permission
+/// before a program reads the media folders.
+const HOME_PRUNED: &[&str] = &["Library", "Pictures", "Movies", "Music"];
 
 pub(crate) fn lower_process_priority() {
     #[cfg(unix)]
@@ -218,7 +221,10 @@ fn walk(
             continue;
         }
         let name = entry.file_name();
-        if PRUNED.iter().any(|pruned| name == *pruned) || (depth == 0 && name == "Library") {
+        if PRUNED.iter().any(|pruned| name == *pruned)
+            || (depth == 0 && HOME_PRUNED.iter().any(|pruned| name == *pruned))
+            || name.to_string_lossy().ends_with(".photoslibrary")
+        {
             continue;
         }
         children.push(path);
@@ -813,6 +819,35 @@ mod tests {
         )
         .unwrap();
         assert_eq!(scan.managed_repos_total, 0);
+    }
+
+    #[test]
+    fn skips_media_folders_in_the_home_and_photos_libraries() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("user");
+        for dir in [
+            "Pictures/repo",
+            "Movies/repo",
+            "Music/repo",
+            "archive/Photos Library.photoslibrary/repo",
+            "projects/Pictures/repo",
+        ] {
+            let repo = root.join(dir);
+            fs::create_dir_all(repo.join(".git")).unwrap();
+            fs::write(
+                repo.join(".git/config"),
+                "[remote \"origin\"]\n url = git@github.com:example-org/app.git\n",
+            )
+            .unwrap();
+        }
+        let scan = scan_and_store(
+            &temp.path().join("client"),
+            &root,
+            &[],
+            &[pattern("github.com/example-org/")],
+        )
+        .unwrap();
+        assert_eq!(scan.managed_repos_total, 1);
     }
 
     #[test]
