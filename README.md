@@ -248,6 +248,8 @@ witness_quorum = 1          # cosignatures a client requires
 checkpoint_max_age = "1h"   # oldest cosignature a client accepts
 ```
 
+An optional `[report]` table is also part of the signed manifest. It requires an HTTPS `collector` URL and can set `vpn_probe` to a host and port. The client shows the collector during `join` and `finish` copies these defaults into the device configuration without replacing values the owner already set.
+
 `witness_quorum` must be more than half of the listed witnesses: 1 of 1, 2 of 2 or 3, 3 of 4. Any two sets that large share a witness, and that witness cosigns only one history, so two clients cannot accept checkpoints from different histories. A manifest with 1 of 2 or 2 of 4 does not parse. Every manifest needs a `[log]` section. To run without witnesses, set `allow_split_views = true` with `witnesses = []` and `witness_quorum = 0`; the client then prints a loud warning on every `join` and `check`.
 
 The gateway sends every new checkpoint to the witnesses in `WITNESS_URLS` before it serves it, keeps the cosignatures that a manifest witness key verifies, and serves them with the checkpoint. It sends the current checkpoint again every `WITNESS_REFRESH_SECS` (default a quarter of `checkpoint_max_age`, at most 600), so the cosignatures stay fresh while the log does not grow.
@@ -403,7 +405,7 @@ The ClamAV parser uses the [documented database header](https://docs.clamav.net/
 
 ## Send a signed status report
 
-After `join`, declare the device configuration in `open-pact.toml` next to the enrolled `manifest.toml`. Print a template with `open-pact-client config example`. The template includes the manifest requirements as comments. Copy the sections you need into the file. The client never writes this file.
+After IT approves the device, run `open-pact-client finish`. It prepares `open-pact.toml` beside the enrolled `manifest.toml`, shows the proposed changes, and writes the file only after you confirm. Existing values stay in place. Run `open-pact-client config example` to print a template without writing a file.
 
 ```toml
 [report]
