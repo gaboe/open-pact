@@ -827,26 +827,9 @@ fn stored_claim(claim: &Claim, certificate_pem: Option<&str>) -> anyhow::Result<
 }
 
 async fn index(State(app): State<App>) -> Result<Html<String>, Reply> {
-    let devices: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM devices WHERE manifest_hash = $1 AND state = 'approved'",
-    )
-    .bind(app.manifest.hash().as_str())
-    .fetch_one(&app.db)
-    .await
-    .map_err(internal)?;
-    let (allowed, denied): (i64, i64) = sqlx::query_as(
-        "SELECT count(*) FILTER (WHERE allowed), count(*) FILTER (WHERE NOT allowed) \
-         FROM claims WHERE received_at > now() - interval '24 hours'",
-    )
-    .fetch_one(&app.db)
-    .await
-    .map_err(internal)?;
     let tree = app.tree().await?;
     Ok(Html(format!(
         include_str!("index.html"),
-        devices = devices,
-        allowed = allowed,
-        denied = denied,
         manifest = app.manifest.hash(),
         company = app.company.key.fingerprint(),
         log_size = tree.size(),
@@ -1289,6 +1272,32 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "needs TEST_DATABASE_URL"]
+    async fn public_summary_page_does_not_show_counts() {
+        let (app, _) = test_app_with(DEMO, 100, 100).await;
+        let response = app
+            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let page = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        for label in [
+            "devices approved",
+            "stored claims allowed",
+            "stored claims denied",
+        ] {
+            assert!(!page.contains(label), "public page contains {label}");
+        }
+        assert!(page.contains("Transparency log checkpoint"));
     }
 
     async fn test_app(enrol_limit: u32, nonce_limit: u32) -> Router {
