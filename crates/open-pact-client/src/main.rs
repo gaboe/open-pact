@@ -812,7 +812,8 @@ fn print_summary(manifest: &Manifest, company: &PublicKey, os: Os) {
     println!("  Issuer       {}, valid from {}", b.issuer, b.valid_from);
     println!("  Controller   {}", b.data_controller);
     if let Some(report) = &b.report {
-        println!("  Reports to   {}", report.collector);
+        let collector = report::collector_url(&report.collector).expect("validated collector");
+        println!("  Reports to   {collector}");
     }
     println!(
         "  Recipients   {}",
@@ -927,11 +928,11 @@ fn unified_diff(old: Option<&str>, new: &str) -> String {
     diff
 }
 
-fn write_atomic(
+fn write_temporary(
     path: &Path,
     bytes: &[u8],
     permissions: Option<std::fs::Permissions>,
-) -> Result<()> {
+) -> Result<PathBuf> {
     use std::fs::OpenOptions;
 
     let parent = path.parent().context("file has no parent directory")?;
@@ -941,7 +942,7 @@ fn write_atomic(
         .context("file has no name")?
         .to_string_lossy();
     let temporary = parent.join(format!("{name}.{}.tmp", uuid::Uuid::new_v4()));
-    let result = (|| -> Result<()> {
+    let result = (|| -> Result<PathBuf> {
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -958,11 +959,7 @@ fn write_atomic(
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
-        std::fs::rename(&temporary, path)
-            .with_context(|| format!("rename {} to {}", temporary.display(), path.display()))?;
-        #[cfg(unix)]
-        std::fs::File::open(parent)?.sync_all()?;
-        Ok(())
+        Ok(temporary.clone())
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temporary);
@@ -970,17 +967,113 @@ fn write_atomic(
     result
 }
 
-fn write_proposal(home: &Home, expected: Option<&[u8]>, proposal: &str) -> Result<bool> {
+fn reject_config_symlink(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            bail!(
+                "open-pact.toml is a symbolic link. finish does not change it. Edit the target file by hand."
+            );
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("inspect {}", path.display())),
+    }
+}
+
+fn create_backup(
+    path: &Path,
+    bytes: &[u8],
+    permissions: Option<std::fs::Permissions>,
+) -> Result<PathBuf> {
+    create_backup_at(
+        path,
+        bytes,
+        permissions,
+        &chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string(),
+    )
+}
+
+fn create_backup_at(
+    path: &Path,
+    bytes: &[u8],
+    permissions: Option<std::fs::Permissions>,
+    timestamp: &str,
+) -> Result<PathBuf> {
+    use std::fs::OpenOptions;
+
+    let name = path
+        .file_name()
+        .context("file has no name")?
+        .to_string_lossy();
+    let prefix = format!("{name}.bak-{timestamp}");
+    let mut attempt = 1u32;
+    loop {
+        let candidate = if attempt == 1 {
+            prefix.clone()
+        } else {
+            format!("{prefix}-{attempt}")
+        };
+        let backup = path.with_file_name(candidate);
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = match options.open(&backup) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                attempt = attempt
+                    .checked_add(1)
+                    .context("backup name suffix overflow")?;
+                continue;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("create {}", backup.display()));
+            }
+        };
+        let result = (|| -> Result<()> {
+            if let Some(permissions) = permissions {
+                file.set_permissions(permissions)?;
+            }
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&backup);
+        }
+        result?;
+        return Ok(backup);
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static FINISH_WRITE_HOOK: std::cell::Cell<Option<fn(&Path)>> = const { std::cell::Cell::new(None) };
+}
+
+fn before_finish_rename(path: &Path) {
+    #[cfg(test)]
+    FINISH_WRITE_HOOK.with(|hook| {
+        if let Some(hook) = hook.take() {
+            hook(path);
+        }
+    });
+    #[cfg(not(test))]
+    let _ = path;
+}
+
+fn write_proposal(home: &Home, expected: Option<&[u8]>, proposal: &str) -> Result<Option<PathBuf>> {
     let path = home.file(device_config::FILE);
+    reject_config_symlink(&path)?;
     let current = read_optional_file(&path)?;
     if current.as_deref() != expected {
-        bail!(
-            "{} changed while finish was preparing it; run finish again",
-            path.display()
-        );
+        bail!("open-pact.toml changed while finish ran. Run finish again.");
     }
     if current.as_deref() == Some(proposal.as_bytes()) {
-        return Ok(false);
+        return Ok(None);
     }
     let permissions = match std::fs::metadata(&path) {
         Ok(metadata) => Some(metadata.permissions()),
@@ -989,32 +1082,63 @@ fn write_proposal(home: &Home, expected: Option<&[u8]>, proposal: &str) -> Resul
             return Err(error).with_context(|| format!("read permissions for {}", path.display()));
         }
     };
-    if let Some(bytes) = &current {
-        write_atomic(
-            &home.file(&format!("{}.bak", device_config::FILE)),
-            bytes,
-            permissions.clone(),
-        )?;
+    let temporary = write_temporary(&path, proposal.as_bytes(), permissions.clone())?;
+    let backup = match &current {
+        Some(bytes) => match create_backup(&path, bytes, permissions) {
+            Ok(backup) => Some(backup),
+            Err(error) => {
+                let _ = std::fs::remove_file(&temporary);
+                return Err(error);
+            }
+        },
+        None => None,
+    };
+    before_finish_rename(&path);
+    let check = reject_config_symlink(&path).and_then(|()| read_optional_file(&path));
+    let unchanged = matches!(check.as_ref(), Ok(bytes) if bytes.as_deref() == expected);
+    if !unchanged {
+        let _ = std::fs::remove_file(&temporary);
+        if let Some(backup) = &backup {
+            let _ = std::fs::remove_file(backup);
+        }
+        check?;
+        bail!("open-pact.toml changed while finish ran. Run finish again.");
     }
-    write_atomic(&path, proposal.as_bytes(), permissions)?;
-    Ok(true)
+    let result = std::fs::rename(&temporary, &path)
+        .with_context(|| format!("rename {} to {}", temporary.display(), path.display()));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+        if let Some(backup) = &backup {
+            let _ = std::fs::remove_file(backup);
+        }
+    }
+    result?;
+    #[cfg(unix)]
+    std::fs::File::open(path.parent().context("file has no parent directory")?)?.sync_all()?;
+    Ok(backup)
 }
 
 async fn finish(home: &Home, insecure_dev: bool, yes: bool) -> Result<ExitCode> {
+    let path = home.file(device_config::FILE);
+    reject_config_symlink(&path)?;
     let enrolment = home.enrolment()?;
     let manifest_path = home.file("manifest.toml");
     let manifest = Manifest::parse(&read_home_file(&manifest_path)?)?;
     if manifest.hash() != &enrolment.manifest {
         bail!("manifest.toml no longer matches the hash you signed");
     }
-    let path = home.file(device_config::FILE);
     let existing_bytes = read_optional_file(&path)?;
     let existing_text = existing_bytes
         .as_deref()
         .map(|bytes| String::from_utf8(bytes.to_vec()))
         .transpose()
         .with_context(|| format!("{} must be UTF-8", path.display()))?;
-    let proposal = device_config::merge(manifest.body().report.as_ref(), existing_text.as_deref());
+    let proposal = device_config::merge(
+        &manifest,
+        current_os()?,
+        manifest.body().report.as_ref(),
+        existing_text.as_deref(),
+    );
     if existing_text.as_deref() == Some(&proposal.text) {
         println!("No changes to {}.", path.display());
     } else {
@@ -1032,7 +1156,9 @@ async fn finish(home: &Home, insecure_dev: bool, yes: bool) -> Result<ExitCode> 
     if !yes && !confirm("Write open-pact.toml?")? {
         return Ok(ExitCode::SUCCESS);
     }
-    write_proposal(home, existing_bytes.as_deref(), &proposal.text)?;
+    if let Some(backup) = write_proposal(home, existing_bytes.as_deref(), &proposal.text)? {
+        println!("Backup written to {}", backup.display());
+    }
     check(home, insecure_dev).await
 }
 
@@ -2399,18 +2525,23 @@ mod tests {
     }
 
     #[test]
-    fn finish_write_keeps_owner_values_backs_up_once_and_leaves_no_temp_file() {
+    fn finish_write_keeps_owner_values_and_creates_a_timestamped_backup_once() {
         let dir = tempfile::tempdir().unwrap();
         let home = Home(dir.path().to_path_buf());
         let path = home.file(device_config::FILE);
         let original =
             b"# owner note\n[report]\ncollector = \"https://owner.example.org/status\"\n";
+        let old_backup = home.file("open-pact.toml.bak");
+        fs::write(&old_backup, b"older owner config").unwrap();
         fs::write(&path, original).unwrap();
         let defaults = open_pact_core::ReportDefaults {
             collector: "https://collector.example.org/status".into(),
             vpn_probe: Some("vpn.example.org:443".into()),
         };
+        let manifest = Manifest::parse(include_bytes!("../../../examples/manifest.toml")).unwrap();
         let proposal = device_config::merge(
+            &manifest,
+            Os::Macos,
             Some(&defaults),
             Some(std::str::from_utf8(original).unwrap()),
         );
@@ -2424,18 +2555,34 @@ mod tests {
                 .text
                 .contains("vpn_probe = \"vpn.example.org:443\"")
         );
-        assert!(write_proposal(&home, Some(original), &proposal.text).unwrap());
+        let backup = write_proposal(&home, Some(original), &proposal.text)
+            .unwrap()
+            .unwrap();
         let written = fs::read(&path).unwrap();
-        assert_eq!(fs::read(home.file("open-pact.toml.bak")).unwrap(), original);
+        assert_eq!(fs::read(&backup).unwrap(), original);
+        assert_eq!(fs::read(&old_backup).unwrap(), b"older owner config");
+        assert!(
+            backup
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("open-pact.toml.bak-")
+        );
         assert!(written.starts_with(b"# owner note\n"));
 
         let second = device_config::merge(
+            &manifest,
+            Os::Macos,
             Some(&defaults),
             Some(std::str::from_utf8(&written).unwrap()),
         );
-        assert!(!write_proposal(&home, Some(&written), &second.text).unwrap());
+        assert!(
+            write_proposal(&home, Some(&written), &second.text)
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(fs::read(&path).unwrap(), written);
-        assert_eq!(fs::read(home.file("open-pact.toml.bak")).unwrap(), original);
+        assert_eq!(fs::read(&backup).unwrap(), original);
         assert!(fs::read_dir(dir.path()).unwrap().all(|entry| {
             !entry
                 .unwrap()
@@ -2443,6 +2590,82 @@ mod tests {
                 .to_string_lossy()
                 .ends_with(".tmp")
         }));
+    }
+
+    #[test]
+    fn finish_write_uses_a_suffix_when_the_timestamped_backup_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("open-pact.toml");
+        let first = create_backup_at(&config, b"older", None, "20261102T120000Z").unwrap();
+        let second = create_backup_at(&config, b"current", None, "20261102T120000Z").unwrap();
+        assert_eq!(
+            first.file_name().unwrap(),
+            "open-pact.toml.bak-20261102T120000Z"
+        );
+        assert_eq!(
+            second.file_name().unwrap(),
+            "open-pact.toml.bak-20261102T120000Z-2"
+        );
+        assert_eq!(fs::read(first).unwrap(), b"older");
+        assert_eq!(fs::read(second).unwrap(), b"current");
+    }
+
+    #[test]
+    fn finish_write_rejects_a_concurrent_owner_edit_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+        let path = home.file(device_config::FILE);
+        let original = b"[report]\ncollector = 'https://owner.example.org/status'\n";
+        fs::write(&path, original).unwrap();
+        FINISH_WRITE_HOOK.with(|hook| hook.set(Some(simulate_concurrent_owner_edit)));
+        let error = write_proposal(
+            &home,
+            Some(original),
+            "[report]\ncollector = 'https://company.example.org/status'\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            error,
+            "open-pact.toml changed while finish ran. Run finish again."
+        );
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("# concurrent edit")
+        );
+        assert!(fs::read_dir(dir.path()).unwrap().all(|entry| {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            !name.ends_with(".tmp") && !name.starts_with("open-pact.toml.bak-")
+        }));
+    }
+
+    fn simulate_concurrent_owner_edit(path: &Path) {
+        fs::write(
+            path,
+            b"[report]\ncollector = 'https://owner.example.org/status'\n# concurrent edit\n",
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finish_refuses_a_dangling_config_symlink_before_writing() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+        let path = home.file(device_config::FILE);
+        symlink("missing-target", &path).unwrap();
+        let error = write_proposal(&home, None, "[report]\n")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "open-pact.toml is a symbolic link. finish does not change it. Edit the target file by hand."
+        );
+        assert!(fs::read_link(&path).unwrap().ends_with("missing-target"));
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]

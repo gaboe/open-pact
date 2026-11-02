@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use toml_edit::{DocumentMut, Item, Table, value};
+use toml_edit::{DocumentMut, Item, Table, TableLike, value};
 
 use crate::{Home, report, schedule};
 
@@ -55,10 +55,14 @@ pub(crate) struct Merge {
 }
 
 pub(crate) fn merge(
+    manifest: &open_pact_core::Manifest,
+    os: open_pact_core::Os,
     company: Option<&open_pact_core::ReportDefaults>,
     existing: Option<&str>,
 ) -> Merge {
-    let mut text = existing.map(str::to_owned).unwrap_or_else(template);
+    let mut text = existing
+        .map(str::to_owned)
+        .unwrap_or_else(|| example(manifest, os));
     if company.is_none() {
         return Merge {
             text,
@@ -84,7 +88,7 @@ pub(crate) fn merge(
     let mut conflicts = Vec::new();
     if let Some(company) = company {
         let report_exists = document.contains_key("report");
-        if report_exists && !document["report"].is_table() {
+        if report_exists && !document["report"].is_table_like() {
             conflicts.push(Conflict {
                 key: "[report]".into(),
                 company_value: "table".into(),
@@ -96,7 +100,7 @@ pub(crate) fn merge(
                 added.push("[report]".into());
             }
             let report = document["report"]
-                .as_table_mut()
+                .as_table_like_mut()
                 .expect("report table created");
             merge_report_value(
                 report,
@@ -128,14 +132,8 @@ pub(crate) fn merge(
     }
 }
 
-fn template() -> String {
-    format!(
-        "# Review this template. The client writes it only through `finish`, after your confirmation.\n\n{CONFIG_TEMPLATE}\n"
-    )
-}
-
 fn merge_report_value(
-    report: &mut Table,
+    report: &mut dyn TableLike,
     key: &str,
     company_value: &str,
     template_only: bool,
@@ -154,7 +152,7 @@ fn merge_report_value(
         }
         return;
     }
-    report[key] = value(company_value);
+    report.insert(key, value(company_value));
     added.push(full_key);
 }
 
@@ -409,11 +407,25 @@ folders = ['~/missing', '{}']
         }
     }
 
+    fn test_manifest() -> open_pact_core::Manifest {
+        open_pact_core::Manifest::parse(include_bytes!("../../../examples/manifest.toml")).unwrap()
+    }
+
     #[test]
     fn merge_without_a_file_uses_the_template_and_company_values() {
-        let result = merge(Some(&company_defaults()), None);
+        let manifest = test_manifest();
+        let result = merge(
+            &manifest,
+            open_pact_core::Os::Macos,
+            Some(&company_defaults()),
+            None,
+        );
+        let template = example(&manifest, open_pact_core::Os::Macos);
         assert!(result.text.contains("[schedule]"));
         assert!(result.text.contains("[managed_repos]"));
+        for line in template.lines().filter(|line| line.starts_with("# ")) {
+            assert!(result.text.contains(line), "missing template line {line}");
+        }
         assert!(
             result
                 .text
@@ -430,9 +442,24 @@ folders = ['~/missing', '{}']
     }
 
     #[test]
+    fn merge_without_company_values_matches_the_manifest_example() {
+        let manifest = test_manifest();
+        let os = open_pact_core::Os::Macos;
+        assert_eq!(
+            merge(&manifest, os, None, None).text,
+            example(&manifest, os)
+        );
+    }
+
+    #[test]
     fn merge_adds_a_missing_report_table_without_changing_owner_text() {
         let existing = "# owner note\n[schedule]\nenabled = true\nrun_as = \"user\"\n";
-        let result = merge(Some(&company_defaults()), Some(existing));
+        let result = merge(
+            &test_manifest(),
+            open_pact_core::Os::Macos,
+            Some(&company_defaults()),
+            Some(existing),
+        );
         assert!(result.text.starts_with("# owner note\n[schedule]"));
         assert!(
             result
@@ -452,7 +479,12 @@ folders = ['~/missing', '{}']
             "[report]\n# chosen by owner\ncollector = \"https://owner.example.org/status\"\n";
         let mut company = company_defaults();
         company.collector = "https://owner.example.org/status".into();
-        let result = merge(Some(&company), Some(existing));
+        let result = merge(
+            &test_manifest(),
+            open_pact_core::Os::Macos,
+            Some(&company),
+            Some(existing),
+        );
         assert!(result.text.contains("# chosen by owner"));
         assert!(result.text.contains("vpn_probe = \"vpn.example.org:443\""));
         assert_eq!(result.added, ["[report].vpn_probe"]);
@@ -462,7 +494,12 @@ folders = ['~/missing', '{}']
     #[test]
     fn merge_keeps_owner_values_and_reports_company_conflicts() {
         let existing = "# keep this comment\n[report]\ncollector = \"https://owner.example.org/status\"\nvpn_probe = \"owner-vpn.example.org:443\"\n";
-        let result = merge(Some(&company_defaults()), Some(existing));
+        let result = merge(
+            &test_manifest(),
+            open_pact_core::Os::Macos,
+            Some(&company_defaults()),
+            Some(existing),
+        );
         assert_eq!(result.text, existing);
         assert!(result.added.is_empty());
         assert_eq!(result.conflicts.len(), 2);
@@ -479,13 +516,63 @@ folders = ['~/missing', '{}']
         let existing = "# owner file\n[report]\n# collector comment\ncollector = \"https://collector.example.org/status\"\n\n[schedule]\nenabled = true\nrun_as = \"user\"\n";
         let mut company = company_defaults();
         company.vpn_probe = Some("vpn.example.org:443".into());
-        let first = merge(Some(&company), Some(existing));
+        let first = merge(
+            &test_manifest(),
+            open_pact_core::Os::Macos,
+            Some(&company),
+            Some(existing),
+        );
         assert!(first.text.contains("# collector comment"));
         assert!(first.text.find("[report]").unwrap() < first.text.find("[schedule]").unwrap());
         assert_eq!(first.added, ["[report].vpn_probe"]);
-        let second = merge(Some(&company), Some(&first.text));
+        let second = merge(
+            &test_manifest(),
+            open_pact_core::Os::Macos,
+            Some(&company),
+            Some(&first.text),
+        );
         assert_eq!(second.text, first.text);
         assert!(second.added.is_empty());
         assert!(second.conflicts.is_empty());
+    }
+
+    #[test]
+    fn merge_adds_missing_values_to_an_inline_report_table() {
+        let existing = "report = { collector = 'https://collector.example.org/status', # chosen by owner\n    # probe belongs to the company\n}\n";
+        let result = merge(
+            &test_manifest(),
+            open_pact_core::Os::Macos,
+            Some(&company_defaults()),
+            Some(existing),
+        );
+        assert!(
+            result
+                .text
+                .contains("collector = 'https://collector.example.org/status'")
+        );
+        assert!(result.text.contains("vpn_probe = \"vpn.example.org:443\""));
+        assert!(result.text.contains("# chosen by owner"));
+        assert_eq!(result.added, ["[report].vpn_probe"]);
+        assert!(result.conflicts.is_empty());
+    }
+
+    #[test]
+    fn merge_reports_only_different_values_in_an_inline_report_table() {
+        let existing = "report = { collector = 'https://owner.example.org/status' }\n";
+        let result = merge(
+            &test_manifest(),
+            open_pact_core::Os::Macos,
+            Some(&company_defaults()),
+            Some(existing),
+        );
+        assert!(
+            result
+                .text
+                .contains("collector = 'https://owner.example.org/status'")
+        );
+        assert!(result.text.contains("vpn_probe = \"vpn.example.org:443\""));
+        assert_eq!(result.added, ["[report].vpn_probe"]);
+        assert_eq!(result.conflicts.len(), 1);
+        assert_eq!(result.conflicts[0].key, "[report].collector");
     }
 }
