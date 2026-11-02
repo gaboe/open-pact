@@ -8,9 +8,10 @@ mod report;
 mod schedule;
 #[cfg(target_os = "macos")]
 mod secure_enclave;
+mod ui;
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, IsTerminal, Write};
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -801,46 +802,69 @@ async fn get_json<T: for<'de> Deserialize<'de>>(http: &reqwest::Client, url: Str
 fn print_summary(manifest: &Manifest, company: &PublicKey, os: Os) {
     let b = manifest.body();
     let list = |set: &mut dyn Iterator<Item = String>| set.collect::<Vec<_>>().join(", ");
-    println!("Manifest     {}", manifest.hash());
+    println!("  Issuer       {}, valid from {}", b.issuer, b.valid_from);
+    println!("  Controller   {}", b.data_controller);
     println!(
-        "Company key  {}  (matches your invitation)",
-        company.fingerprint()
-    );
-    println!("Issuer       {}, valid from {}", b.issuer, b.valid_from);
-    println!("Controller   {}", b.data_controller);
-    println!("Retention    claims kept {}", b.claim_retention);
-    println!(
-        "Recipients   {}",
+        "  Recipients   {}",
         list(&mut b.claim_recipients.iter().cloned())
     );
+    println!("  Retention    claims kept {}", b.claim_retention);
     println!(
-        "Metadata     {}",
+        "  Metadata     {}",
         list(&mut b.disclosed_metadata.iter().map(ToString::to_string))
     );
     println!(
-        "Claims       valid {}, unknown results tolerated for {}, minimum trust {:?}",
+        "  Claims       valid {}, unknown results tolerated for {}, minimum trust {:?}",
         b.claim_max_age, b.unknown_grace, b.min_trust_level
     );
-    println!();
-    println!("Controls (this device runs {os}):");
-    for c in &b.controls {
-        let required = c
-            .required
-            .get(&os)
-            .map_or("not required".to_string(), |r| format!("required {r}"));
-        println!("  {:<20} {required}, grace {}", c.id, c.grace);
-        if matches!(
-            c.id.as_str(),
-            "managed_repos_outside" | "managed_repos_total"
-        ) {
+    println!("  Manifest     {}", manifest.hash());
+    println!(
+        "  Company key  {}  (matches your invitation)",
+        company.fingerprint()
+    );
+    let required = |c: &&open_pact_core::Control| c.required.get(&os).map(ToString::to_string);
+    let (not_applicable, applicable): (Vec<_>, Vec<_>) = b
+        .controls
+        .iter()
+        .partition(|c| required(c).as_deref() == Some("n/a"));
+    let (enforced, reported): (Vec<_>, Vec<_>) =
+        applicable.into_iter().partition(|c| required(c).is_some());
+    let width = b.controls.iter().map(|c| c.id.len()).max().unwrap_or(0);
+    let ui = ui::styled();
+    let show = |title: String, controls: &[&open_pact_core::Control]| {
+        if controls.is_empty() {
+            return;
+        }
+        println!("\n  {}", ui::bold(&title, ui));
+        for c in controls {
+            let rule = required(c).map_or(String::new(), |r| format!("must be {r}, "));
+            println!("    {:<width$}  {rule}grace {}", c.id, c.grace);
             for pattern in &c.remotes {
-                println!("  {:<20} counts repositories from {}", "", pattern);
+                println!("    {:<width$}  counts repositories from {pattern}", "");
             }
+            if let Some(why) = &c.rationale {
+                println!("    {:<width$}  why: {why}", "");
+            }
+            println!("    {:<width$}  reports: {}", "", c.output);
         }
-        if let Some(why) = &c.rationale {
-            println!("  {:<20} why: {why}", "");
-        }
-        println!("  {:<20} can report: {}", "", c.output);
+    };
+    show(
+        format!("Required on this {os} device ({})", enforced.len()),
+        &enforced,
+    );
+    show(
+        format!("Reported, not required ({})", reported.len()),
+        &reported,
+    );
+    if !not_applicable.is_empty() {
+        println!(
+            "\n  {}\n    {}",
+            ui::bold(
+                &format!("Not checked on {os}, always n/a ({})", not_applicable.len()),
+                ui
+            ),
+            list(&mut not_applicable.iter().map(|c| c.id.clone()))
+        );
     }
     println!();
 }
@@ -1208,6 +1232,18 @@ async fn join(
     let invitation = Invitation::decode(invitation)?;
     let gateway = invitation.gateway.as_str();
     check_scheme(gateway, insecure_dev)?;
+    #[cfg(unix)]
+    if unsafe { libc::geteuid() } == 0 {
+        println!(
+            "You are running join as root, for example with sudo. The client would then check \
+             root's settings instead of yours and keep its keys in root's home. Run join without \
+             sudo, as the account that uses this device."
+        );
+        if !yes && !confirm("Continue as root anyway?")? {
+            println!("Stopped. Nothing was sent.");
+            return Ok(ExitCode::FAILURE);
+        }
+    }
     let wanted = Pins {
         company: invitation.company.clone(),
         log: invitation.log_key(),
@@ -1242,8 +1278,11 @@ async fn join(
         anyhow::anyhow!("{e}; refusing to show or sign this manifest. Nothing was sent")
     })?;
     wanted.save(home)?;
-    println!("Gateway keys match the invitation:");
-    print!("{}", invitation.describe());
+    ui::step(1, 4, "Check the invitation");
+    println!("  The gateway keys match your invitation.");
+    for line in invitation.describe().lines() {
+        println!("  {line}");
+    }
     if home.has_legacy_log_head() {
         std::fs::remove_file(home.file(LEGACY_LOG_HEAD))?;
         println!("Removed the old hash-chain log head; this device now pins the Merkle log.");
@@ -1252,14 +1291,27 @@ async fn join(
         report_log(alarm(e), home);
         return Ok(ExitCode::from(2));
     }
-    println!();
     let os = current_os()?;
+    ui::step(2, 4, "Read what you agree to");
     print_summary(&manifest, &published.company.key, os);
     if !yes && !confirm("Sign this manifest as the device owner?")? {
-        println!("Not signed. Nothing was sent.");
+        println!("Not signed. Nothing was sent. Run join again when you want to enrol.");
         return Ok(ExitCode::FAILURE);
     }
+    ui::step(3, 4, "Enrol this device");
     let config = device_config::DeviceConfig::load(home)?;
+    if os == Os::Macos
+        && manifest
+            .body()
+            .controls
+            .iter()
+            .any(|c| !c.remotes.is_empty())
+    {
+        println!(
+            "  Looking for managed repositories in your home folder. If macOS asks for access \
+             to a folder, you can deny it."
+        );
+    }
     scan_repositories(home, &manifest, config.as_ref())?;
     let owner = dev_key::load_or_create(&home.file("owner-dev.pem"))?;
     let device = DeviceKey::load_or_create(&home.0, software_key)?;
@@ -1305,35 +1357,56 @@ async fn join(
         log_entries,
     };
     home.write("enrolment.json", &serde_json::to_vec_pretty(&enrolment)?)?;
-    println!("Owner signed {}", manifest.hash());
-    println!("Enrolled as {}", enrolment.device);
+    let client_home = std::path::absolute(&home.0).unwrap_or_else(|_| home.0.clone());
+    println!("  Signed       {}  (the manifest above)", manifest.hash());
+    println!("  Enrolled as  {}", enrolment.device);
     println!(
-        "Device key: {}, trust level {:?} (asserted by this client; without attestation the gateway counts it as L0)",
+        "  Device key   {}, trust level {:?} (asserted by this client; without attestation the gateway counts it as L0)",
         device.describe(),
         device.trust_level()
     );
     if let Some(index) = body["log_index"].as_u64() {
-        println!("Enrolment is log entry #{index}; prove it with: open-pact-client log prove");
+        println!(
+            "  Public log   enrolment is entry #{index}. Prove it with: open-pact-client log prove"
+        );
     }
     println!(
-        "The public log records only sha256(salt || pseudonym); the salt stays in enrolment.json."
+        "               The log records only sha256(salt || pseudonym). The salt stays in enrolment.json."
     );
-    let pending_code = match body["state"].as_str() {
-        Some("pending") => Some(device_code(&enrolment.device)),
-        Some("revoked") => {
-            println!("This device key is revoked.");
-            None
-        }
-        _ => None,
-    };
+    println!("  Client home  {}", client_home.display());
+    let state = body["state"].as_str();
+    if state == Some("revoked") {
+        println!("  This device key is revoked.");
+    }
     let verified = sync_log(&http, home, &manifest, &mut enrolment)
         .await
         .map(|sync| report_log(sync, home));
-    if let Some(code) = pending_code {
-        let styled = std::io::stdout().is_terminal()
-            && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
-        println!("\n{}", device_code_line(&code, styled));
-        println!("Waiting for IT approval. Read the device code to IT.");
+    let command = client_command(&home.0);
+    let config_file = client_home.join("open-pact.toml");
+    match state {
+        Some("pending") => {
+            ui::step(4, 4, "Wait for IT approval");
+            println!(
+                "\n  {}\n",
+                ui::device_code_line(&device_code(&enrolment.device), ui::styled())
+            );
+            println!("  Read this code to IT. IT approves the device with it.");
+            println!("\nNext, after IT approves:");
+        }
+        Some("approved") => {
+            ui::step(4, 4, "Ready");
+            println!("  IT has already approved this device.");
+            println!("\nNext:");
+        }
+        _ => {}
+    }
+    if matches!(state, Some("pending" | "approved")) {
+        println!("  1. {command} config example");
+        println!(
+            "  2. Save the sections you need as {}",
+            config_file.display()
+        );
+        println!("  3. {command} check");
     }
     Ok(if verified? {
         ExitCode::SUCCESS
@@ -1346,11 +1419,11 @@ fn device_code(device: &Pseudonym) -> String {
     device.as_str().trim_start_matches("pseudonym:")[..12].to_string()
 }
 
-fn device_code_line(code: &str, bold: bool) -> String {
-    if bold {
-        format!("\x1b[1mDevice code for IT: {code}\x1b[0m")
-    } else {
-        format!("Device code for IT: {code}")
+/// The command prefix the owner types next: with `--home` only when join used another home.
+fn client_command(home: &Path) -> String {
+    match Home::new(None) {
+        Ok(default) if default.0 == home => "open-pact-client".to_string(),
+        _ => format!("open-pact-client --home {}", home.display()),
     }
 }
 
@@ -1630,7 +1703,7 @@ async fn check(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
                     return Ok(ExitCode::from(2));
                 }
             }
-            println!("ACCEPTED");
+            println!("{}", ui::bold("ACCEPTED", ui::styled()));
             for w in &warnings {
                 println!("  warning: {w}");
             }
@@ -1650,7 +1723,7 @@ async fn check(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
             true
         }
         Response::Denied { reasons } => {
-            println!("DENIED");
+            println!("{}", ui::bold("DENIED", ui::styled()));
             for r in &reasons {
                 println!("  {r}");
             }
@@ -1659,6 +1732,12 @@ async fn check(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
         }
     };
     report_log(LogSync::Verified(verified, own), home);
+    let command = client_command(&home.0);
+    if accepted {
+        println!("\nNext: {command} log show lists every claim this device sent.");
+    } else {
+        println!("\nNext: fix the items above, then run {command} check again.");
+    }
     Ok(if accepted {
         ExitCode::SUCCESS
     } else {
@@ -1952,6 +2031,11 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 bail!("manifest.toml no longer matches the hash you signed");
             }
             print!("{}", device_config::example(&manifest, current_os()?));
+            eprintln!(
+                "Next: save the sections you need as {}, then run {} check",
+                std::path::absolute(home.file("open-pact.toml"))?.display(),
+                client_command(&home.0)
+            );
             Ok(ExitCode::SUCCESS)
         }
         Command::Apply { dry_run } => {
@@ -2018,18 +2102,6 @@ async fn main() -> ExitCode {
 mod tests {
     use super::*;
     use std::fs;
-
-    #[test]
-    fn device_code_line_is_bold_only_when_styled() {
-        assert_eq!(
-            device_code_line("7bfd0e4453f4", false),
-            "Device code for IT: 7bfd0e4453f4"
-        );
-        assert_eq!(
-            device_code_line("7bfd0e4453f4", true),
-            "\x1b[1mDevice code for IT: 7bfd0e4453f4\x1b[0m"
-        );
-    }
 
     #[test]
     fn log_reports_keeps_home_history_when_system_discovery_fails() {
