@@ -120,9 +120,11 @@ impl Invitation {
             .trim()
             .strip_prefix(PREFIX)
             .ok_or_else(|| bad("it must start with opi1:"))?;
-        let json = B64
-            .decode(body)
-            .map_err(|_| bad("the part after opi1: is not base64url"))?;
+        // A terminal that wraps a long line can paste spaces or line breaks into it.
+        let body: String = body.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+        let json = B64.decode(&body).map_err(|_| {
+            bad("the part after opi1: is not base64url. Copy the whole invitation again")
+        })?;
         let invitation: Invitation =
             serde_json::from_slice(&json).map_err(|e| InvalidInvitation(e.to_string()))?;
         LogKey::parse(&invitation.log).map_err(|e| InvalidInvitation(e.to_string()))?;
@@ -171,6 +173,9 @@ mod tests {
         assert!(text.starts_with("opi1:"));
         assert_eq!(Invitation::decode(&text).unwrap(), inv);
         assert_eq!(Invitation::decode(&format!("  {text}\n")).unwrap(), inv);
+        let (head, tail) = text.split_at(40);
+        let wrapped = format!("{head} \n {tail}");
+        assert_eq!(Invitation::decode(&wrapped).unwrap(), inv);
         assert_eq!(inv.gateway, "https://pact.example.com");
     }
 
