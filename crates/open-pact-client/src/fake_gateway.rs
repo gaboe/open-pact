@@ -47,9 +47,13 @@ impl FakeGateway {
                         nth
                     };
                     let (status, body) = respond(&line, nth);
+                    if status == 0 {
+                        return;
+                    }
                     let reply = format!(
-                        "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                        body.len()
+                        "HTTP/1.1 {} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        if status == 598 { 200 } else { status },
+                        if status == 598 { 100 } else { body.len() }
                     );
                     let _ = stream.write_all(reply.as_bytes()).await;
                 });

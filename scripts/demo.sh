@@ -55,6 +55,10 @@ echo "$invitation"
 
 step "The owner joins: the client checks the gateway's keys against the invitation, then shows the manifest"
 "${client[@]}" join "$invitation" --yes --no-wait | tee "$tmp/join"
+grep -q '^  Read this code to IT. IT approves the device with it\.' "$tmp/join"
+grep -q '^Next, after IT approves:' "$tmp/join"
+! grep -q '^Transparency log verified' "$tmp/join"
+! grep -q '^Inclusion proofs verified:' "$tmp/join"
 
 step "Until IT approves, the gateway refuses the device"
 "${client[@]}" check || echo "(check exited with status $?)"
