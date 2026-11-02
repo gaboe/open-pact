@@ -10,7 +10,7 @@ mod schedule;
 mod secure_enclave;
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, Write};
+use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -1318,27 +1318,40 @@ async fn join(
     println!(
         "The public log records only sha256(salt || pseudonym); the salt stays in enrolment.json."
     );
-    match body["state"].as_str() {
-        Some("pending") => {
-            let hex = enrolment.device.as_str().trim_start_matches("pseudonym:");
-            println!(
-                "Waiting for IT approval. Read this device code to IT: {}",
-                &hex[..12]
-            );
+    let pending_code = match body["state"].as_str() {
+        Some("pending") => Some(device_code(&enrolment.device)),
+        Some("revoked") => {
+            println!("This device key is revoked.");
+            None
         }
-        Some("revoked") => println!("This device key is revoked."),
-        _ => {}
+        _ => None,
+    };
+    let verified = sync_log(&http, home, &manifest, &mut enrolment)
+        .await
+        .map(|sync| report_log(sync, home));
+    if let Some(code) = pending_code {
+        let styled = std::io::stdout().is_terminal()
+            && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
+        println!("\n{}", device_code_line(&code, styled));
+        println!("Waiting for IT approval. Read the device code to IT.");
     }
-    Ok(
-        if report_log(
-            sync_log(&http, home, &manifest, &mut enrolment).await?,
-            home,
-        ) {
-            ExitCode::SUCCESS
-        } else {
-            ExitCode::from(2)
-        },
-    )
+    Ok(if verified? {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(2)
+    })
+}
+
+fn device_code(device: &Pseudonym) -> String {
+    device.as_str().trim_start_matches("pseudonym:")[..12].to_string()
+}
+
+fn device_code_line(code: &str, bold: bool) -> String {
+    if bold {
+        format!("\x1b[1mDevice code for IT: {code}\x1b[0m")
+    } else {
+        format!("Device code for IT: {code}")
+    }
 }
 
 /// A certificate request for the VPN key with an empty subject and no attributes: it carries the
@@ -2005,6 +2018,18 @@ async fn main() -> ExitCode {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn device_code_line_is_bold_only_when_styled() {
+        assert_eq!(
+            device_code_line("7bfd0e4453f4", false),
+            "Device code for IT: 7bfd0e4453f4"
+        );
+        assert_eq!(
+            device_code_line("7bfd0e4453f4", true),
+            "\x1b[1mDevice code for IT: 7bfd0e4453f4\x1b[0m"
+        );
+    }
 
     #[test]
     fn log_reports_keeps_home_history_when_system_discovery_fails() {

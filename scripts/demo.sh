@@ -60,7 +60,7 @@ step "Until IT approves, the gateway refuses the device"
 "${client[@]}" check || echo "(check exited with status $?)"
 
 step "IT approves the device by the code the owner reads out"
-admin devices approve "$(sed -nE 's/^Waiting for IT approval. Read this device code to IT: ([0-9a-f]{12})$/\1/p' "$tmp/join")"
+admin devices approve "$(sed -nE 's/^Device code for IT: ([0-9a-f]{12})$/\1/p' "$tmp/join")"
 
 step "The device runs the checks and sends one signed claim"
 "${client[@]}" check
