@@ -64,6 +64,12 @@ enum Command {
     },
     /// Run the manifest's checks, send a signed claim and fetch a VPN certificate
     Check,
+    /// Prepare open-pact.toml from the signed manifest, then run the checks
+    Finish {
+        /// Write without asking for confirmation
+        #[arg(long)]
+        yes: bool,
+    },
     /// Send a signed status report to an HTTPS collector
     Report {
         #[arg(long)]
@@ -805,6 +811,9 @@ fn print_summary(manifest: &Manifest, company: &PublicKey, os: Os) {
     let list = |set: &mut dyn Iterator<Item = String>| set.collect::<Vec<_>>().join(", ");
     println!("  Issuer       {}, valid from {}", b.issuer, b.valid_from);
     println!("  Controller   {}", b.data_controller);
+    if let Some(report) = &b.report {
+        println!("  Reports to   {}", report.collector);
+    }
     println!(
         "  Recipients   {}",
         list(&mut b.claim_recipients.iter().cloned())
@@ -885,6 +894,146 @@ enum LogSync {
 
 fn alarm(e: impl std::fmt::Display) -> LogSync {
     LogSync::Alarm(e.to_string())
+}
+
+fn read_optional_file(path: &Path) -> Result<Option<Vec<u8>>> {
+    match read_home_file(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
+    }
+}
+
+fn unified_diff(old: Option<&str>, new: &str) -> String {
+    let old_lines: Vec<_> = old.unwrap_or_default().lines().collect();
+    let new_lines: Vec<_> = new.lines().collect();
+    let mut diff = format!(
+        "--- open-pact.toml\n+++ open-pact.toml (proposal)\n@@ -1,{} +1,{} @@\n",
+        old_lines.len(),
+        new_lines.len()
+    );
+    diff.push_str(
+        &old_lines
+            .iter()
+            .map(|line| format!("-{line}\n"))
+            .collect::<String>(),
+    );
+    diff.push_str(
+        &new_lines
+            .iter()
+            .map(|line| format!("+{line}\n"))
+            .collect::<String>(),
+    );
+    diff
+}
+
+fn write_atomic(
+    path: &Path,
+    bytes: &[u8],
+    permissions: Option<std::fs::Permissions>,
+) -> Result<()> {
+    use std::fs::OpenOptions;
+
+    let parent = path.parent().context("file has no parent directory")?;
+    std::fs::create_dir_all(parent)?;
+    let name = path
+        .file_name()
+        .context("file has no name")?
+        .to_string_lossy();
+    let temporary = parent.join(format!("{name}.{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| -> Result<()> {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&temporary)
+            .with_context(|| format!("create {}", temporary.display()))?;
+        if let Some(permissions) = permissions {
+            file.set_permissions(permissions)?;
+        }
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, path)
+            .with_context(|| format!("rename {} to {}", temporary.display(), path.display()))?;
+        #[cfg(unix)]
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn write_proposal(home: &Home, expected: Option<&[u8]>, proposal: &str) -> Result<bool> {
+    let path = home.file(device_config::FILE);
+    let current = read_optional_file(&path)?;
+    if current.as_deref() != expected {
+        bail!(
+            "{} changed while finish was preparing it; run finish again",
+            path.display()
+        );
+    }
+    if current.as_deref() == Some(proposal.as_bytes()) {
+        return Ok(false);
+    }
+    let permissions = match std::fs::metadata(&path) {
+        Ok(metadata) => Some(metadata.permissions()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error).with_context(|| format!("read permissions for {}", path.display()));
+        }
+    };
+    if let Some(bytes) = &current {
+        write_atomic(
+            &home.file(&format!("{}.bak", device_config::FILE)),
+            bytes,
+            permissions.clone(),
+        )?;
+    }
+    write_atomic(&path, proposal.as_bytes(), permissions)?;
+    Ok(true)
+}
+
+async fn finish(home: &Home, insecure_dev: bool, yes: bool) -> Result<ExitCode> {
+    let enrolment = home.enrolment()?;
+    let manifest_path = home.file("manifest.toml");
+    let manifest = Manifest::parse(&read_home_file(&manifest_path)?)?;
+    if manifest.hash() != &enrolment.manifest {
+        bail!("manifest.toml no longer matches the hash you signed");
+    }
+    let path = home.file(device_config::FILE);
+    let existing_bytes = read_optional_file(&path)?;
+    let existing_text = existing_bytes
+        .as_deref()
+        .map(|bytes| String::from_utf8(bytes.to_vec()))
+        .transpose()
+        .with_context(|| format!("{} must be UTF-8", path.display()))?;
+    let proposal = device_config::merge(manifest.body().report.as_ref(), existing_text.as_deref());
+    if existing_text.as_deref() == Some(&proposal.text) {
+        println!("No changes to {}.", path.display());
+    } else {
+        print!("{}", unified_diff(existing_text.as_deref(), &proposal.text));
+    }
+    for key in &proposal.added {
+        println!("Added {key}");
+    }
+    for conflict in &proposal.conflicts {
+        println!(
+            "Conflict {}: company has {}, file keeps {}",
+            conflict.key, conflict.company_value, conflict.file_value
+        );
+    }
+    if !yes && !confirm("Write open-pact.toml?")? {
+        return Ok(ExitCode::SUCCESS);
+    }
+    write_proposal(home, existing_bytes.as_deref(), &proposal.text)?;
+    check(home, insecure_dev).await
 }
 
 /// The gateway serves at most this many entries per request.
@@ -2098,6 +2247,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             software_key,
         } => join(&home, &invitation, yes, software_key, cli.insecure_dev).await,
         Command::Check => check(&home, cli.insecure_dev).await,
+        Command::Finish { yes } => finish(&home, cli.insecure_dev, yes).await,
         Command::Report { dry_run } => {
             let config = device_config::DeviceConfig::load(&home)?
                 .context("open-pact.toml is missing; run `config example`")?;
@@ -2246,6 +2396,53 @@ mod tests {
         let unsafe_warning = String::from_utf8(unsafe_warning).unwrap();
         assert_eq!(unsafe_warning.lines().count(), 1);
         assert!(unsafe_warning.contains("protected directory permissions are unsafe"));
+    }
+
+    #[test]
+    fn finish_write_keeps_owner_values_backs_up_once_and_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+        let path = home.file(device_config::FILE);
+        let original =
+            b"# owner note\n[report]\ncollector = \"https://owner.example.org/status\"\n";
+        fs::write(&path, original).unwrap();
+        let defaults = open_pact_core::ReportDefaults {
+            collector: "https://collector.example.org/status".into(),
+            vpn_probe: Some("vpn.example.org:443".into()),
+        };
+        let proposal = device_config::merge(
+            Some(&defaults),
+            Some(std::str::from_utf8(original).unwrap()),
+        );
+        assert!(
+            proposal
+                .text
+                .contains("collector = \"https://owner.example.org/status\"")
+        );
+        assert!(
+            proposal
+                .text
+                .contains("vpn_probe = \"vpn.example.org:443\"")
+        );
+        assert!(write_proposal(&home, Some(original), &proposal.text).unwrap());
+        let written = fs::read(&path).unwrap();
+        assert_eq!(fs::read(home.file("open-pact.toml.bak")).unwrap(), original);
+        assert!(written.starts_with(b"# owner note\n"));
+
+        let second = device_config::merge(
+            Some(&defaults),
+            Some(std::str::from_utf8(&written).unwrap()),
+        );
+        assert!(!write_proposal(&home, Some(&written), &second.text).unwrap());
+        assert_eq!(fs::read(&path).unwrap(), written);
+        assert_eq!(fs::read(home.file("open-pact.toml.bak")).unwrap(), original);
+        assert!(fs::read_dir(dir.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")
+        }));
     }
 
     #[test]

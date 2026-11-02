@@ -593,6 +593,52 @@ pub struct ManifestBody {
     /// Always present after `Manifest::parse`.
     #[serde(default)]
     pub log: Option<LogPolicy>,
+    #[serde(default)]
+    pub report: Option<ReportDefaults>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReportDefaults {
+    pub collector: String,
+    #[serde(default)]
+    pub vpn_probe: Option<String>,
+}
+
+impl ReportDefaults {
+    fn validate(&self) -> Result<(), String> {
+        let url = url::Url::parse(&self.collector)
+            .map_err(|_| "report.collector: invalid URL".to_string())?;
+        if url.scheme() != "https"
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(
+                "report.collector must be an HTTPS URL without credentials or a fragment".into(),
+            );
+        }
+        if let Some(probe) = &self.vpn_probe {
+            let address = url::Url::parse(&format!("tcp://{probe}"))
+                .map_err(|_| "report.vpn_probe must be host:port".to_string())?;
+            if address.host_str().is_none()
+                || address.port().is_none()
+                || !address.path().is_empty()
+                || !address.username().is_empty()
+                || address.password().is_some()
+                || address.query().is_some()
+                || address.fragment().is_some()
+                || probe.chars().any(char::is_whitespace)
+            {
+                return Err(
+                    "report.vpn_probe must be host:port, with brackets around IPv6 addresses"
+                        .into(),
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Which witnesses must cosign a log checkpoint before a client trusts it.
@@ -689,6 +735,9 @@ impl ManifestBody {
             .as_ref()
             .ok_or("the manifest needs a [log] section: list witnesses, or set allow_split_views = true")?
             .validate()?;
+        if let Some(report) = &self.report {
+            report.validate()?;
+        }
         let mut ids = BTreeSet::new();
         for c in &self.controls {
             if !ids.insert(&c.id) {
@@ -772,6 +821,54 @@ mod tests {
         );
         assert!(disk.grace.is_zero());
         assert_eq!(m.body().min_trust_level, TrustLevel::L0);
+        assert!(m.body().report.is_none());
+    }
+
+    #[test]
+    fn report_defaults_parse_and_are_covered_by_the_manifest_hash() {
+        let text = format!(
+            "{DEMO}\n[report]\ncollector = \"https://collector.example.org/status\"\nvpn_probe = \"vpn.example.org:443\"\n"
+        );
+        let manifest = Manifest::parse(text.as_bytes()).unwrap();
+        assert_eq!(
+            manifest.body().report,
+            Some(ReportDefaults {
+                collector: "https://collector.example.org/status".into(),
+                vpn_probe: Some("vpn.example.org:443".into()),
+            })
+        );
+        let changed = text.replace("collector.example.org", "other.example.org");
+        let changed = Manifest::parse(changed.as_bytes()).unwrap();
+        assert_ne!(manifest.hash(), changed.hash());
+
+        let optional_probe =
+            format!("{DEMO}\n[report]\ncollector = \"https://collector.example.org/status\"\n");
+        assert_eq!(
+            Manifest::parse(optional_probe.as_bytes())
+                .unwrap()
+                .body()
+                .report
+                .as_ref()
+                .unwrap()
+                .vpn_probe,
+            None
+        );
+    }
+
+    #[test]
+    fn report_defaults_reject_bad_collector_urls() {
+        let missing = format!("{DEMO}\n[report]\n");
+        assert!(Manifest::parse(missing.as_bytes()).is_err());
+        for collector in [
+            "http://collector.example.org/status",
+            "https://user:secret@collector.example.org/status",
+            "https://collector.example.org/status#fragment",
+            "not a URL",
+        ] {
+            let text = format!("{DEMO}\n[report]\ncollector = {collector:?}\n");
+            let error = Manifest::parse(text.as_bytes()).unwrap_err();
+            assert!(error.to_string().contains("report.collector"), "{error}");
+        }
     }
 
     #[test]

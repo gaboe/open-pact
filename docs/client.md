@@ -114,7 +114,7 @@ Run `open-pact-client log head` to show the last verified checkpoint. Run `open-
 
 ## Declare the device configuration
 
-Run `open-pact-client config example` after enrolment. Copy the sections you need into `open-pact.toml` beside `manifest.toml` in the client home. The example includes the enrolled requirements as comments. It writes nothing.
+After IT approves the device, run `open-pact-client finish`. It prepares `open-pact.toml` beside `manifest.toml`, shows a diff and any company defaults that conflict with your values, and writes the file only after you confirm. It then runs `check`. Use `--yes` to skip the confirmation. Run `open-pact-client config example` to print a template without writing a file.
 
 ```toml
 [report]
@@ -130,7 +130,7 @@ run_as = "user"
 folders = ["~/work"]
 ```
 
-Every section is optional. The client never writes this file. Unknown sections or keys cause an error that names the file and key. Folder entries must be absolute after `~` expands to your user home. The loader does not inspect those paths. Folder paths stay on the device. These folders are reserved for managed repository checks.
+Every section is optional. Only `finish` writes this file, after your confirmation. Unknown sections or keys cause an error that names the file and key. Folder entries must be absolute after `~` expands to your user home. The loader does not inspect those paths. Folder paths stay on the device. These folders are reserved for managed repository checks.
 
 Run `check` to see one row per manifest control. Each row shows the requirement for your OS, the device setting that feeds it, and the result. A missing or invalid configuration prints what to add or fix. Other controls still run.
 
