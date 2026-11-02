@@ -187,7 +187,7 @@ On disk, claims are encrypted with a key per period (for example per month). The
 
 We considered sealed copies, 2-of-3 key sharing with a third party, and time-lock encryption (drand). None of them can give the company access without the owner while also preventing an attacker holding the company's data from reading it, and time-locks need an external clock. For a handful of enumerated values the added complexity is not worth it.
 
-**Admin access.** The gateway has no claim browser. An admin sees a summary (how many devices comply) and approves new devices. Details for one device are shown only during an audit or incident, and each view is recorded in the transparency log. Limit: someone with root on the gateway server can bypass the interface. That is covered by the company's own access controls.
+**Admin access.** The gateway has no claim browser. An admin approves new devices through the operator command line. Details for one device are shown only during an audit or incident, and each view is recorded in the transparency log. Limit: someone with root on the gateway server can bypass the interface. That is covered by the company's own access controls.
 
 **Deployment.** One Rust binary in a container with PostgreSQL (the company's existing instance or one alongside), HTTPS, on the company's infrastructure. Claims are encrypted by the gateway per period before they reach the database, so a database copy is unreadable without the KEK, which the company keeps outside the database and its backups. The company manages its own keys (manifest signing key and gateway CA). open-pact documents the risks and recommends hardware key storage, but does not dictate how.
 
