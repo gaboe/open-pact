@@ -1401,8 +1401,10 @@ async fn verify_checkpoint(
                     .bytes()
                     .await
                     .map_err(|error| CheckpointVerifyError::Network(error.into()))?;
-                serde_json::from_slice::<Proof>(&bytes).map_err(|_| {
-                    CheckpointVerifyError::Alarm("error decoding response body".into())
+                serde_json::from_slice::<Proof>(&bytes).map_err(|error| {
+                    CheckpointVerifyError::Alarm(format!(
+                        "GET {url}: error decoding response body: {error}"
+                    ))
                 })
             }
             .await;
@@ -1997,14 +1999,23 @@ async fn join(
         && existing.gateway == gateway
         && existing.manifest == *manifest.hash()
     {
-        let device = DeviceKey::load(&home.0)?;
-        if Pseudonym::of(&device.public_key()) != existing.device {
-            bail!(
+        match DeviceKey::load(&home.0) {
+            Ok(device) if Pseudonym::of(&device.public_key()) == existing.device => {
+                return wait_after_join(&http, home, &existing, &manifest, no_wait, poll_interval)
+                    .await;
+            }
+            Ok(_) => bail!(
                 "This home has an enrolment for a different device key. Run open-pact-client join with a new invitation after removing the old enrolment. Recovery command: `{}` delete-device-key",
                 client_command(&home.0)
-            );
+            ),
+            Err(error)
+                if error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                }) => {}
+            Err(error) => return Err(error),
         }
-        return wait_after_join(&http, home, &existing, &manifest, no_wait, poll_interval).await;
     }
     let os = current_os()?;
     ui::step(2, 4, "Read what you agree to");
@@ -4013,6 +4024,139 @@ mod tests {
                 .requests()
                 .iter()
                 .any(|request| request == "POST /v1/enroll" || request == "POST /v1/device/status")
+        );
+    }
+
+    #[tokio::test]
+    async fn join_reenrols_after_the_saved_device_key_is_deleted() {
+        let witness = Witness::new();
+        let toml = witnessed_manifest(&witness);
+        let company = Company::new();
+        let published = Company::published(&toml, &company.key);
+        let log = company.log.vkey();
+        let mut checkpoint = company.sign(&Checkpoint {
+            origin: company.log.origin().into(),
+            size: 1,
+            root: LogHash([3; 32]),
+        });
+        witness.cosign(
+            &mut checkpoint,
+            u64::try_from(chrono::Utc::now().timestamp()).unwrap(),
+        );
+        let checkpoint = checkpoint.to_string();
+        let checkpoint_for_gateway = checkpoint.clone();
+        let gateway = FakeGateway::start(move |line, _| match line {
+            "GET /v1/manifest" => (200, published.clone()),
+            "GET /v1/log/key" => (200, format!("{log}\n")),
+            "GET /v1/log/checkpoint" => (200, checkpoint_for_gateway.clone()),
+            "POST /v1/enroll" => (
+                200,
+                json!({"salt":"11".repeat(32),"state":"pending"}).to_string(),
+            ),
+            _ => not_found(),
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let home = enrolled_home_with(dir.path(), &gateway.url, &company, &toml);
+        home.write(LOG_CHECKPOINT, checkpoint.as_bytes()).unwrap();
+        let original = home.enrolment().unwrap();
+        let old_invitation = Invitation::new(
+            &gateway.url,
+            &PublicKey::from(&company.key),
+            &company.log,
+            open_pact_core::InvitationCode::from_bytes([7; 32]),
+        )
+        .encode();
+
+        DeviceKey::delete(dir.path()).unwrap();
+        DeviceKey::load_or_create(dir.path(), true).unwrap();
+        let mismatch = join(
+            &home,
+            &old_invitation,
+            true,
+            true,
+            false,
+            true,
+            APPROVAL_POLL_INTERVAL,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(mismatch.contains("This home has an enrolment for a different device key."));
+        assert!(gateway.posts().is_empty(), "mismatch must not enrol");
+
+        DeviceKey::delete(dir.path()).unwrap();
+        let new_invitation = Invitation::new(
+            &gateway.url,
+            &PublicKey::from(&company.key),
+            &company.log,
+            open_pact_core::InvitationCode::from_bytes([8; 32]),
+        )
+        .encode();
+        let exit = join(
+            &home,
+            &new_invitation,
+            true,
+            true,
+            false,
+            true,
+            APPROVAL_POLL_INTERVAL,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(exit, ExitCode::SUCCESS);
+        assert_eq!(gateway.posts(), vec!["POST /v1/enroll"]);
+        let replacement = home.enrolment().unwrap();
+        assert_ne!(replacement.device, original.device);
+        assert!(dir.path().join("device-dev.pem").exists());
+    }
+
+    #[tokio::test]
+    async fn check_reports_consistency_proof_url_and_json_error() {
+        let company = Company::new();
+        let dir = tempfile::tempdir().unwrap();
+        let home = enrolled_home(dir.path(), "", &company);
+        let new = Checkpoint {
+            origin: company.log.origin().into(),
+            size: 2,
+            root: LogHash([1; 32]),
+        };
+        let new_note = company.sign(&new).to_string();
+        let old = Checkpoint {
+            origin: company.log.origin().into(),
+            size: 1,
+            root: LogHash([2; 32]),
+        };
+        let gateway = FakeGateway::start(|line, _| {
+            if line.starts_with("GET /v1/log/proof/consistency?") {
+                (200, "not json".into())
+            } else {
+                not_found()
+            }
+        })
+        .await;
+        let error = verify_checkpoint(
+            &http_client().unwrap(),
+            &home,
+            &gateway.url,
+            &company.log,
+            None,
+            Some(&old),
+            &new_note,
+        )
+        .await
+        .unwrap()
+        .unwrap_err()
+        .alarm_text();
+
+        assert!(error.contains(&format!(
+            "GET {}/v1/log/proof/consistency?from=1&to=2",
+            gateway.url
+        )));
+        assert!(
+            error.contains("expected ident at line 1 column 2"),
+            "{error}"
         );
     }
 
