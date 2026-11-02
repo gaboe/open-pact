@@ -200,6 +200,8 @@ It prints the `opi1:` string on stdout and a readable form on stderr. The string
 
 The owner runs `open-pact-client join 'opi1:...'`. Before it shows the manifest or sends anything, the client checks that the gateway serves the company key and the log key that the invitation names, and verifies the signed checkpoint. Then it pins both keys. The owner key and the device key both sign one statement over the manifest hash, the invitation hash and both public keys. The gateway checks both signatures, its own company key and the enforced manifest. Then it consumes the invitation and stores the device as `pending`, in one transaction. Running `join` again with the same invitation from the same device changes nothing. A device enrolled before invitations existed stays approved, but the client has no pinned keys; the owner joins again with a new invitation, which binds to the device and keeps its state.
 
+After `join` prints the device code, it checks for IT approval every 10 seconds. It reports approval only after it verifies this device's `device_approved` entry in the signed log. Press Ctrl+C to stop waiting. The enrolment stays on disk, so run `join` again or run `check` later. Pass `--no-wait` to print the code and exit without polling.
+
 IT approves the device by the code that `join` prints, which is the first 12 hex digits of the pseudonym. The owner reads it out:
 
 ```sh

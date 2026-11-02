@@ -54,7 +54,7 @@ invitation="$(admin invite --url "$url" --ttl 1h --note "demo owner")"
 echo "$invitation"
 
 step "The owner joins: the client checks the gateway's keys against the invitation, then shows the manifest"
-"${client[@]}" join "$invitation" --yes | tee "$tmp/join"
+"${client[@]}" join "$invitation" --yes --no-wait | tee "$tmp/join"
 
 step "Until IT approves, the gateway refuses the device"
 "${client[@]}" check || echo "(check exited with status $?)"

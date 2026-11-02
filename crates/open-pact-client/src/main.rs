@@ -11,9 +11,10 @@ mod secure_enclave;
 mod ui;
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, Write};
+use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
@@ -63,6 +64,9 @@ enum Command {
         /// Keep a new device key in a file (trust level L0) even when a Secure Enclave is available
         #[arg(long)]
         software_key: bool,
+        /// Print the device code and exit without waiting for IT
+        #[arg(long)]
+        no_wait: bool,
     },
     /// Run the manifest's checks, send a signed claim and fetch a VPN certificate
     Check,
@@ -147,6 +151,40 @@ struct PublishedManifest {
 #[derive(Deserialize)]
 struct Proof {
     proof: Vec<LogHash>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Approval {
+    Pending,
+    Approved,
+    Revoked,
+}
+
+#[derive(Deserialize)]
+struct DeviceStatusResponse {
+    state: Approval,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApprovalWait {
+    Approved,
+    Revoked,
+    Interrupted,
+}
+
+const APPROVAL_POLL_INTERVAL: Duration = Duration::from_secs(10);
+
+fn is_retryable_poll_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<reqwest::Error>().is_some_and(|error| {
+            error.is_connect()
+                || error.is_timeout()
+                || error
+                    .status()
+                    .is_some_and(|status| status.is_server_error())
+        })
+    })
 }
 
 const LOG_KEY: &str = "log-key.txt";
@@ -1540,12 +1578,218 @@ fn print_log_upgrade(home: &Home) {
     );
 }
 
+async fn fetch_device_status(
+    http: &reqwest::Client,
+    home: &Home,
+    enrolment: &Enrolment,
+) -> Result<Approval> {
+    let device = DeviceKey::load(&home.0)?;
+    let nonce: Nonce = http
+        .post(format!("{}/v1/nonce", base(&enrolment.gateway)))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let statement = device_auth_statement(
+        DeviceAuthPurpose::DeviceStatus,
+        &enrolment.device,
+        &nonce.nonce,
+    );
+    let request = MyEntriesRequest {
+        pseudonym: enrolment.device.clone(),
+        nonce: nonce.nonce,
+        device_key: device.public_key(),
+        signature: device.sign(&statement)?,
+    };
+    let response: DeviceStatusResponse = http
+        .post(format!("{}/v1/device/status", base(&enrolment.gateway)))
+        .json(&request)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    Ok(response.state)
+}
+
+/// Verifies the gateway checkpoint and every private entry before trusting an approval entry.
+async fn verify_approval_entry(
+    http: &reqwest::Client,
+    home: &Home,
+    enrolment: &Enrolment,
+    manifest: &Manifest,
+) -> Result<Result<bool, String>> {
+    let response = fetch_my_entries(http, home, enrolment).await?;
+    let pins = Pins::load(home)?;
+    let prev = home.checkpoint()?;
+    let checkpoint = match verify_checkpoint(
+        http,
+        home,
+        &enrolment.gateway,
+        &pins.log,
+        manifest.body().log.as_ref(),
+        prev.as_ref(),
+        &response.checkpoint,
+    )
+    .await?
+    {
+        Ok(checkpoint) => checkpoint,
+        Err(error) => return Ok(Err(error)),
+    };
+    let commitment = commitment(enrolment)?;
+    if let Err(error) = verify_my_entries(&response, enrolment, &commitment, &checkpoint) {
+        return Ok(Err(error));
+    }
+    Ok(Ok(response.device.iter().any(|item| {
+        item.entry.kind == EntryKind::DeviceApproved && item.entry.data["commitment"] == commitment
+    })))
+}
+
+fn print_waiting_line(message: &str) {
+    let mut stdout = std::io::stdout().lock();
+    if stdout.is_terminal() {
+        let _ = write!(stdout, "\r\x1b[2K  {message}");
+        let _ = stdout.flush();
+    } else {
+        println!("  {message}");
+    }
+}
+
+async fn wait_for_approval(
+    http: &reqwest::Client,
+    home: &Home,
+    enrolment: &Enrolment,
+    manifest: &Manifest,
+    poll_interval: Duration,
+) -> Result<Result<ApprovalWait, String>> {
+    print_waiting_line("Waiting for IT approval...");
+    let mut warning_printed = false;
+    let mut first_poll = true;
+    loop {
+        if !first_poll {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => return Ok(Ok(ApprovalWait::Interrupted)),
+                _ = tokio::time::sleep(poll_interval) => {}
+            }
+        }
+        let first = first_poll;
+        first_poll = false;
+        let status_result = tokio::select! {
+            result = fetch_device_status(http, home, enrolment) => result,
+            _ = tokio::signal::ctrl_c() => return Ok(Ok(ApprovalWait::Interrupted)),
+        };
+        let status = match status_result {
+            Ok(status) => status,
+            Err(error) if is_retryable_poll_error(&error) => {
+                if !warning_printed {
+                    eprintln!("warning: could not reach the gateway for IT approval; retrying");
+                    warning_printed = true;
+                }
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        match status {
+            Approval::Revoked => return Ok(Ok(ApprovalWait::Revoked)),
+            Approval::Pending if !first => print_waiting_line("Waiting for IT approval..."),
+            Approval::Pending => {}
+            Approval::Approved => {
+                let proof_result = tokio::select! {
+                    result = verify_approval_entry(http, home, enrolment, manifest) => result,
+                    _ = tokio::signal::ctrl_c() => return Ok(Ok(ApprovalWait::Interrupted)),
+                };
+                match proof_result {
+                    Err(error) if is_retryable_poll_error(&error) => {
+                        if !warning_printed {
+                            eprintln!(
+                                "warning: could not reach the gateway for IT approval; retrying"
+                            );
+                            warning_printed = true;
+                        }
+                    }
+                    Err(error) => return Err(error),
+                    Ok(Ok(true)) => return Ok(Ok(ApprovalWait::Approved)),
+                    Ok(Ok(false)) => print_waiting_line(
+                        "IT approved the device. Waiting for the signed log proof...",
+                    ),
+                    Ok(Err(error)) => return Ok(Err(error)),
+                }
+            }
+        }
+    }
+}
+
+fn print_approved_next_step(command: &str) {
+    println!("\n  {}", ui::bold(approval_confirmation(), ui::styled()));
+    println!("\nNext: {command} finish");
+}
+
+fn approval_confirmation() -> &'static str {
+    "This device is approved."
+}
+
+fn approval_exit(wait: ApprovalWait, command: &str) -> ExitCode {
+    match wait {
+        ApprovalWait::Approved => {
+            print_approved_next_step(command);
+            ExitCode::SUCCESS
+        }
+        ApprovalWait::Revoked => {
+            println!("\nThis device was revoked. Contact IT before you continue.");
+            ExitCode::FAILURE
+        }
+        ApprovalWait::Interrupted => {
+            println!("\nStopped waiting. Run `join` again or `check` to continue.");
+            ExitCode::SUCCESS
+        }
+    }
+}
+
+async fn wait_after_join(
+    http: &reqwest::Client,
+    home: &Home,
+    enrolment: &Enrolment,
+    manifest: &Manifest,
+    no_wait: bool,
+    poll_interval: Duration,
+) -> Result<ExitCode> {
+    ui::step(4, 4, "Wait for IT approval");
+    println!(
+        "  {}\n",
+        ui::device_code_line(&device_code(&enrolment.device), ui::styled())
+    );
+    println!("  Read this code to IT. IT approves the device with it.");
+    let command = client_command(&home.0);
+    if no_wait {
+        println!("\nNext, after IT approves:");
+        println!("  1. {command} config example");
+        println!(
+            "  2. Save the sections you need as {}",
+            home.file("open-pact.toml").display()
+        );
+        println!("  3. {command} check");
+        return Ok(ExitCode::SUCCESS);
+    }
+    match wait_for_approval(http, home, enrolment, manifest, poll_interval).await? {
+        Ok(wait) => Ok(approval_exit(wait, &command)),
+        Err(error) => {
+            eprintln!(
+                "\nTRANSPARENCY LOG ALARM: the gateway's signed history or proof does not match.\n!! {error}"
+            );
+            Ok(ExitCode::from(2))
+        }
+    }
+}
+
 async fn join(
     home: &Home,
     invitation: &str,
     yes: bool,
     software_key: bool,
     insecure_dev: bool,
+    no_wait: bool,
+    poll_interval: Duration,
 ) -> Result<ExitCode> {
     let invitation = Invitation::decode(invitation)?;
     let gateway = invitation.gateway.as_str();
@@ -1608,6 +1852,12 @@ async fn join(
     if let Err(e) = sync_checkpoint(&http, home, gateway, manifest.body().log.as_ref()).await? {
         report_log(alarm(e), home);
         return Ok(ExitCode::from(2));
+    }
+    if let Some(existing) = home.read_json::<Enrolment>("enrolment.json")?
+        && existing.gateway == gateway
+        && existing.manifest == *manifest.hash()
+    {
+        return wait_after_join(&http, home, &existing, &manifest, no_wait, poll_interval).await;
     }
     let os = current_os()?;
     ui::step(2, 4, "Read what you agree to");
@@ -1694,43 +1944,13 @@ async fn join(
     println!("  Client home  {}", client_home.display());
     let state = body["state"].as_str();
     if state == Some("revoked") {
-        println!("  This device key is revoked.");
-    }
-    let verified = sync_log(&http, home, &manifest, &mut enrolment)
-        .await
-        .map(|sync| report_log(sync, home));
-    let command = client_command(&home.0);
-    let config_file = client_home.join("open-pact.toml");
-    match state {
-        Some("pending") => {
-            ui::step(4, 4, "Wait for IT approval");
-            println!(
-                "\n  {}\n",
-                ui::device_code_line(&device_code(&enrolment.device), ui::styled())
-            );
-            println!("  Read this code to IT. IT approves the device with it.");
-            println!("\nNext, after IT approves:");
-        }
-        Some("approved") => {
-            ui::step(4, 4, "Ready");
-            println!("  IT has already approved this device.");
-            println!("\nNext:");
-        }
-        _ => {}
+        println!("This device was revoked. Contact IT before you continue.");
+        return Ok(ExitCode::FAILURE);
     }
     if matches!(state, Some("pending" | "approved")) {
-        println!("  1. {command} config example");
-        println!(
-            "  2. Save the sections you need as {}",
-            config_file.display()
-        );
-        println!("  3. {command} check");
+        return wait_after_join(&http, home, &enrolment, &manifest, no_wait, poll_interval).await;
     }
-    Ok(if verified? {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::from(2)
-    })
+    Ok(ExitCode::SUCCESS)
 }
 
 fn device_code(device: &Pseudonym) -> String {
@@ -2369,7 +2589,19 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             invitation,
             yes,
             software_key,
-        } => join(&home, &invitation, yes, software_key, cli.insecure_dev).await,
+            no_wait,
+        } => {
+            join(
+                &home,
+                &invitation,
+                yes,
+                software_key,
+                cli.insecure_dev,
+                no_wait,
+                APPROVAL_POLL_INTERVAL,
+            )
+            .await
+        }
         Command::Check => check(&home, cli.insecure_dev).await,
         Command::Finish { yes } => finish(&home, cli.insecure_dev, yes).await,
         Command::Report { dry_run } => {
@@ -3144,6 +3376,67 @@ mod tests {
         Company, DEMO_MANIFEST, FakeGateway, Witness, checkpoint_of, not_found, serve_log, snapshot,
     };
 
+    fn approval_fixture(
+        home: &Home,
+        company: &Company,
+        witness: &Witness,
+    ) -> (Manifest, Enrolment, Vec<Entry>, String, String) {
+        let manifest = Manifest::parse(&fs::read(home.file("manifest.toml")).unwrap()).unwrap();
+        let enrolment = home.enrolment().unwrap();
+        let entries = vec![
+            Entry {
+                index: 0,
+                kind: EntryKind::ManifestPublished,
+                data: json!({"manifest": enrolment.manifest.as_str()}),
+            },
+            Entry {
+                index: 1,
+                kind: EntryKind::DeviceEnrolled,
+                data: json!({"commitment": commitment(&enrolment).unwrap()}),
+            },
+            Entry {
+                index: 2,
+                kind: EntryKind::DeviceApproved,
+                data: json!({"commitment": commitment(&enrolment).unwrap()}),
+            },
+        ];
+        let mut before_approval = company.sign(&checkpoint_of(company.log.origin(), &entries, 2));
+        let now = u64::try_from(chrono::Utc::now().timestamp()).unwrap();
+        witness.cosign(&mut before_approval, now);
+        let before_approval = before_approval.to_string();
+        home.write(LOG_CHECKPOINT, before_approval.as_bytes())
+            .unwrap();
+        let mut approved = company.sign(&checkpoint_of(company.log.origin(), &entries, 3));
+        witness.cosign(&mut approved, now);
+        let approved = approved.to_string();
+        (manifest, enrolment, entries, before_approval, approved)
+    }
+
+    fn my_entries_response(checkpoint: &str, entries: &[Entry], size: usize) -> String {
+        let leaves: Vec<_> = entries.iter().map(Entry::leaf_hash).collect();
+        serde_json::to_string(&MyEntries {
+            checkpoint: checkpoint.into(),
+            manifest: open_pact_core::EntryWithProof {
+                entry: entries[0].clone(),
+                proof: open_pact_core::inclusion_proof(&leaves[..size], 0).unwrap(),
+            },
+            device: entries[1..size]
+                .iter()
+                .map(|entry| open_pact_core::EntryWithProof {
+                    entry: entry.clone(),
+                    proof: open_pact_core::inclusion_proof(&leaves[..size], entry.index).unwrap(),
+                })
+                .collect(),
+        })
+        .unwrap()
+    }
+
+    fn put_gateway_in_enrolment(home: &Home, enrolment: &mut Enrolment, url: &str) {
+        enrolment.gateway = url.to_string();
+        home.write("enrolment.json", &serde_json::to_vec(enrolment).unwrap())
+            .unwrap();
+    }
+
     #[test]
     fn home_reader_returns_file_bytes_and_missing_errors() {
         let dir = tempfile::tempdir().unwrap();
@@ -3380,6 +3673,193 @@ mod tests {
             assert_eq!(gateway.requests(), ["POST /v1/nonce", "POST /v1/log/mine"]);
             assert_eq!(enrolment.log_entries.is_some(), !corrupt);
         }
+    }
+
+    #[tokio::test]
+    async fn join_waits_for_approval_and_verifies_its_log_entry() {
+        let company = Company::new();
+        let witness = Witness::new();
+        let toml = witnessed_manifest(&witness);
+        let dir = tempfile::tempdir().unwrap();
+        let home = enrolled_home_with(dir.path(), "", &company, &toml);
+        let (manifest, mut enrolment, entries, before_approval, approved_checkpoint) =
+            approval_fixture(&home, &company, &witness);
+        let response = my_entries_response(&approved_checkpoint, &entries, 3);
+        let entries_for_log = entries.clone();
+        let published = Company::published(&toml, &company.key);
+        let log_key = company.log.vkey();
+        let gateway = FakeGateway::start(move |line, nth| match line {
+            "GET /v1/manifest" => (200, published.clone()),
+            "GET /v1/log/key" => (200, format!("{log_key}\n")),
+            "GET /v1/log/checkpoint" => (200, before_approval.clone()),
+            "POST /v1/nonce" => (200, json!({"nonce":format!("approval-{nth}")}).to_string()),
+            "POST /v1/device/status" => (
+                200,
+                json!({"state": if nth == 0 { "pending" } else { "approved" }}).to_string(),
+            ),
+            "POST /v1/log/mine" => (200, response.clone()),
+            _ => serve_log(&entries_for_log, line).unwrap_or_else(not_found),
+        })
+        .await;
+        put_gateway_in_enrolment(&home, &mut enrolment, &gateway.url);
+        let invitation = Invitation::new(
+            &gateway.url,
+            &PublicKey::from(&company.key),
+            &company.log,
+            open_pact_core::InvitationCode::from_bytes([7; 32]),
+        )
+        .encode();
+
+        let code = join(
+            &home,
+            &invitation,
+            true,
+            true,
+            false,
+            false,
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(approval_confirmation(), "This device is approved.");
+        let requests = gateway.requests();
+        assert!(!requests.iter().any(|request| request == "POST /v1/enroll"));
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.as_str() == "POST /v1/device/status")
+                .count(),
+            2
+        );
+        let second_status = requests
+            .iter()
+            .rposition(|request| request == "POST /v1/device/status")
+            .unwrap();
+        let log_read = requests
+            .iter()
+            .position(|request| request == "POST /v1/log/mine")
+            .unwrap();
+        assert!(
+            second_status < log_read,
+            "approval status precedes private log read"
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.as_str() == "POST /v1/log/mine")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn join_waits_until_the_approval_entry_reaches_the_signed_checkpoint() {
+        let company = Company::new();
+        let witness = Witness::new();
+        let toml = witnessed_manifest(&witness);
+        let dir = tempfile::tempdir().unwrap();
+        let home = enrolled_home_with(dir.path(), "", &company, &toml);
+        let (manifest, mut enrolment, entries, before_approval, approved_checkpoint) =
+            approval_fixture(&home, &company, &witness);
+        let lagging_response = my_entries_response(&before_approval, &entries, 2);
+        let approved_response = my_entries_response(&approved_checkpoint, &entries, 3);
+        let entries_for_log = entries.clone();
+        let gateway = FakeGateway::start(move |line, nth| match line {
+            "POST /v1/nonce" => (200, json!({"nonce":format!("lag-{nth}")}).to_string()),
+            "POST /v1/device/status" => (200, r#"{"state":"approved"}"#.into()),
+            "POST /v1/log/mine" if nth == 0 => (200, lagging_response.clone()),
+            "POST /v1/log/mine" => (200, approved_response.clone()),
+            _ => serve_log(&entries_for_log, line).unwrap_or_else(not_found),
+        })
+        .await;
+        put_gateway_in_enrolment(&home, &mut enrolment, &gateway.url);
+
+        let waited = wait_for_approval(
+            &http_client().unwrap(),
+            &home,
+            &enrolment,
+            &manifest,
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(waited, ApprovalWait::Approved);
+        assert_eq!(
+            gateway
+                .requests()
+                .iter()
+                .filter(|request| request.as_str() == "POST /v1/log/mine")
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn join_stops_when_it_revokes_a_waiting_device() {
+        let company = Company::new();
+        let dir = tempfile::tempdir().unwrap();
+        let home = enrolled_home(dir.path(), "", &company);
+        let manifest = Manifest::parse(DEMO_MANIFEST.as_bytes()).unwrap();
+        let mut enrolment = home.enrolment().unwrap();
+        let gateway = FakeGateway::start(|line, nth| match line {
+            "POST /v1/nonce" => (200, json!({"nonce":format!("revoked-{nth}")}).to_string()),
+            "POST /v1/device/status" => (
+                200,
+                json!({"state": if nth == 0 { "pending" } else { "revoked" }}).to_string(),
+            ),
+            _ => not_found(),
+        })
+        .await;
+        put_gateway_in_enrolment(&home, &mut enrolment, &gateway.url);
+
+        let waited = wait_for_approval(
+            &http_client().unwrap(),
+            &home,
+            &enrolment,
+            &manifest,
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(waited, ApprovalWait::Revoked);
+        assert_eq!(approval_exit(waited, "open-pact-client"), ExitCode::FAILURE);
+        assert!(
+            !gateway
+                .requests()
+                .iter()
+                .any(|request| request == "POST /v1/log/mine")
+        );
+    }
+
+    #[tokio::test]
+    async fn join_no_wait_does_not_poll_status() {
+        let company = Company::new();
+        let dir = tempfile::tempdir().unwrap();
+        let home = enrolled_home(dir.path(), "", &company);
+        let mut enrolment = home.enrolment().unwrap();
+        let manifest = Manifest::parse(DEMO_MANIFEST.as_bytes()).unwrap();
+        let gateway = FakeGateway::start(|_, _| not_found()).await;
+        put_gateway_in_enrolment(&home, &mut enrolment, &gateway.url);
+
+        let code = wait_after_join(
+            &http_client().unwrap(),
+            &home,
+            &enrolment,
+            &manifest,
+            true,
+            APPROVAL_POLL_INTERVAL,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(gateway.posts().is_empty());
     }
 
     #[tokio::test]
@@ -3928,7 +4408,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let home = Home(dir.path().to_path_buf());
 
-        let joined = join(&home, &invitation, true, true, false).await;
+        let joined = join(
+            &home,
+            &invitation,
+            true,
+            true,
+            false,
+            true,
+            APPROVAL_POLL_INTERVAL,
+        )
+        .await;
 
         assert_eq!(gateway.posts(), Vec::<String>::new(), "no enrolment sent");
         assert!(!home.file(COMPANY_KEY).exists(), "nothing pinned");
@@ -3961,6 +4450,8 @@ mod tests {
             true,
             true,
             false,
+            true,
+            APPROVAL_POLL_INTERVAL,
         )
         .await;
         (gateway, joined)
