@@ -1917,7 +1917,7 @@ async fn join(
         }),
         _ => None,
     };
-    let mut enrolment = Enrolment {
+    let enrolment = Enrolment {
         gateway: gateway.to_string(),
         manifest: manifest.hash().clone(),
         device: Pseudonym::of(&device.public_key()),
@@ -3682,7 +3682,7 @@ mod tests {
         let toml = witnessed_manifest(&witness);
         let dir = tempfile::tempdir().unwrap();
         let home = enrolled_home_with(dir.path(), "", &company, &toml);
-        let (manifest, mut enrolment, entries, before_approval, approved_checkpoint) =
+        let (_manifest, mut enrolment, entries, before_approval, approved_checkpoint) =
             approval_fixture(&home, &company, &witness);
         let response = my_entries_response(&approved_checkpoint, &entries, 3);
         let entries_for_log = entries.clone();
