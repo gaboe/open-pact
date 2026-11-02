@@ -49,6 +49,8 @@ Write the manifest as TOML. Include the check IDs and output types that the clie
 
 The gateway publishes the enforced manifest and appends its hash to the transparency log. A changed manifest has a new hash. Enrol the device again with a new invitation. Approve the device again. Approval applies to one manifest hash.
 
+Give the collector address to the device owner. The owner writes it in `[report]` in local `open-pact.toml`. The collector address does not belong in the public manifest.
+
 The core library can validate whether a manifest change is a narrowing under the old owner signature. The current client and gateway do not apply that capability when they check an enrolled device. Every changed manifest needs a new join, a new owner signature, and operator approval. The owner signs the new manifest hash during the join.
 
 Review retention before each rollout. PostgreSQL stores encrypted claims until the manifest deadline. A backup can keep a deleted claim readable while it still contains the month key and the KEK. Expire database backups and WAL archives in line with the retention that owners accepted.

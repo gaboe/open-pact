@@ -184,7 +184,7 @@ Install [rules.xml](deploy/wazuh/rules.xml) in the manager's local rules directo
 
 The rules alert on deny, numeric `os_patch_age_days > 30`, numeric `antimalware_signature_age_days > 3`, numeric `antimalware_active_threats > 0`, and a present `log_cleared` other than null or `n/a`. These are control IDs, not check names. The manifest must declare these exact IDs and numeric outputs for the numeric rules. The export does not turn bucketed results such as `gt_30d` into numbers. Wazuh can select one matching child rule for an event with several failures; inspect the event's complete fields and reasons.
 
-A missing event cannot trigger these event-driven rules. On the SIEM side, maintain an expected-device list and a last-ingestion time per `open_pact.device_pseudonym`. Run a scheduled check every few minutes and emit a separate alert when an expected device has no event for more than two hours. Use receiver ingestion time, not the signed claim time. Include devices that never sent a first report, and remove devices that no longer need reports. A two-hour silence policy also requires an agreed claim schedule. The optional collector report schedule sends reports to a separate collector endpoint, not claims to this gateway.
+A missing event cannot trigger these event-driven rules. On the SIEM side, maintain an expected-device list and a last-ingestion time per `open_pact.device_pseudonym`. Run a scheduled check every few minutes and emit a separate alert when an expected device has no event for more than two hours. Use receiver ingestion time, not the signed claim time. Include devices that never sent a first report, and remove devices that no longer need reports. A two-hour silence policy also requires an agreed claim schedule. The optional collector schedule sends device status to a collector endpoint separate from this gateway.
 
 The XML is checked for well-formedness. The samples are unverified against a real Wazuh manager. Before use, run `/var/ossec/bin/wazuh-logtest` with allow, deny, threshold-boundary, `none`, `n/a`, and absent-field fixtures on the target manager. Validate the rsyslog configuration there with `rsyslogd -N1`.
 
@@ -253,7 +253,7 @@ witness_quorum = 1          # cosignatures a client requires
 checkpoint_max_age = "1h"   # oldest cosignature a client accepts
 ```
 
-An optional `[report]` table is part of the signed manifest. It requires an HTTPS `collector` URL and can set `vpn_probe` to a host and port. The client shows the collector during `join`. The `finish` command copies these defaults into the device configuration and keeps values the owner already set. A manifest with `[report]` requires client 0.4.0 or later. Older clients refuse to join. IT must update clients before it publishes the table.
+The manifest does not contain the company's collector address. When the company gives the owner a collector address, the owner writes it in the `[report]` table in `open-pact.toml`. `finish` creates the `config example` text when that file does not exist. It leaves an existing file unchanged.
 
 `witness_quorum` must be more than half of the listed witnesses: 1 of 1, 2 of 2 or 3, 3 of 4. Any two sets that large share a witness, and that witness cosigns only one history, so two clients cannot accept checkpoints from different histories. A manifest with 1 of 2 or 2 of 4 does not parse. Every manifest needs a `[log]` section. To run without witnesses, set `allow_split_views = true` with `witnesses = []` and `witness_quorum = 0`; the client then prints a loud warning on every `join` and `check`.
 

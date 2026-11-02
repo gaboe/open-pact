@@ -887,10 +887,6 @@ fn print_summary(manifest: &Manifest, company: &PublicKey, os: Os) {
     let list = |set: &mut dyn Iterator<Item = String>| set.collect::<Vec<_>>().join(", ");
     println!("  Issuer       {}, valid from {}", b.issuer, b.valid_from);
     println!("  Controller   {}", b.data_controller);
-    if let Some(report) = &b.report {
-        let collector = report::collector_url(&report.collector).expect("validated collector");
-        println!("  Reports to   {collector}");
-    }
     println!(
         "  Recipients   {}",
         list(&mut b.claim_recipients.iter().cloned())
@@ -1229,30 +1225,19 @@ async fn finish(home: &Home, insecure_dev: bool, yes: bool) -> Result<ExitCode> 
         .map(|bytes| String::from_utf8(bytes.to_vec()))
         .transpose()
         .with_context(|| format!("{} must be UTF-8", path.display()))?;
-    let proposal = device_config::merge(
-        &manifest,
-        current_os()?,
-        manifest.body().report.as_ref(),
-        existing_text.as_deref(),
-    );
-    if existing_text.as_deref() == Some(&proposal.text) {
+    let os = current_os()?;
+    let proposal = existing_text
+        .clone()
+        .unwrap_or_else(|| device_config::example(&manifest, os));
+    if existing_text.as_deref() == Some(proposal.as_str()) {
         println!("No changes to {}.", path.display());
     } else {
-        print!("{}", unified_diff(existing_text.as_deref(), &proposal.text));
-    }
-    for key in &proposal.added {
-        println!("Added {key}");
-    }
-    for conflict in &proposal.conflicts {
-        println!(
-            "Conflict {}: company has {}, file keeps {}",
-            conflict.key, conflict.company_value, conflict.file_value
-        );
+        print!("{}", unified_diff(existing_text.as_deref(), &proposal));
     }
     if !yes && !confirm("Write open-pact.toml?")? {
         return Ok(ExitCode::SUCCESS);
     }
-    if let Some(backup) = write_proposal(home, existing_bytes.as_deref(), &proposal.text)? {
+    if let Some(backup) = write_proposal(home, existing_bytes.as_deref(), &proposal)? {
         println!("Backup written to {}", backup.display());
     }
     check(home, insecure_dev).await
@@ -2914,7 +2899,7 @@ mod tests {
     }
 
     #[test]
-    fn finish_write_keeps_owner_values_and_creates_a_timestamped_backup_once() {
+    fn finish_writer_does_not_rewrite_an_unchanged_owner_config() {
         let dir = tempfile::tempdir().unwrap();
         let home = Home(dir.path().to_path_buf());
         let path = home.file(device_config::FILE);
@@ -2923,31 +2908,52 @@ mod tests {
         let old_backup = home.file("open-pact.toml.bak");
         fs::write(&old_backup, b"older owner config").unwrap();
         fs::write(&path, original).unwrap();
-        let defaults = open_pact_core::ReportDefaults {
-            collector: "https://collector.example.org/status".into(),
-            vpn_probe: Some("vpn.example.org:443".into()),
-        };
+        let proposal = std::str::from_utf8(original).unwrap();
+        assert!(
+            write_proposal(&home, Some(original), proposal)
+                .unwrap()
+                .is_none()
+        );
+        let written = fs::read(&path).unwrap();
+        assert_eq!(written, original);
+        assert_eq!(fs::read(&old_backup).unwrap(), b"older owner config");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn finish_creates_the_config_example_once_when_no_file_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+        let path = home.file(device_config::FILE);
         let manifest = Manifest::parse(include_bytes!("../../../examples/manifest.toml")).unwrap();
-        let proposal = device_config::merge(
-            &manifest,
-            Os::Macos,
-            Some(&defaults),
-            Some(std::str::from_utf8(original).unwrap()),
-        );
+        let proposal = device_config::example(&manifest, Os::Macos);
+
+        assert!(write_proposal(&home, None, &proposal).unwrap().is_none());
+        assert_eq!(fs::read(&path).unwrap(), proposal.as_bytes());
+        let written = fs::read(&path).unwrap();
         assert!(
-            proposal
-                .text
-                .contains("collector = \"https://owner.example.org/status\"")
+            write_proposal(&home, Some(&written), &proposal)
+                .unwrap()
+                .is_none()
         );
-        assert!(
-            proposal
-                .text
-                .contains("vpn_probe = \"vpn.example.org:443\"")
-        );
-        let backup = write_proposal(&home, Some(original), &proposal.text)
+        assert_eq!(fs::read(&path).unwrap(), written);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn finish_write_creates_a_timestamped_backup_without_replacing_old_backups() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+        let path = home.file(device_config::FILE);
+        let original = b"owner config\n";
+        fs::write(&path, original).unwrap();
+        let old_backup = home.file("open-pact.toml.bak");
+        fs::write(&old_backup, b"older owner config").unwrap();
+
+        let backup = write_proposal(&home, Some(original), "updated config\n")
             .unwrap()
             .unwrap();
-        let written = fs::read(&path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"updated config\n");
         assert_eq!(fs::read(&backup).unwrap(), original);
         assert_eq!(fs::read(&old_backup).unwrap(), b"older owner config");
         assert!(
@@ -2957,21 +2963,6 @@ mod tests {
                 .to_string_lossy()
                 .starts_with("open-pact.toml.bak-")
         );
-        assert!(written.starts_with(b"# owner note\n"));
-
-        let second = device_config::merge(
-            &manifest,
-            Os::Macos,
-            Some(&defaults),
-            Some(std::str::from_utf8(&written).unwrap()),
-        );
-        assert!(
-            write_proposal(&home, Some(&written), &second.text)
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(fs::read(&path).unwrap(), written);
-        assert_eq!(fs::read(&backup).unwrap(), original);
         assert!(fs::read_dir(dir.path()).unwrap().all(|entry| {
             !entry
                 .unwrap()
