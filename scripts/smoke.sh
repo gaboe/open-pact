@@ -81,8 +81,10 @@ echo "plain http to a remote gateway is refused"
 "${client[@]}" join "$inv" --yes --software-key --no-wait > "$tmp/join"
 grep -q '^  The gateway keys match your invitation' "$tmp/join"
 grep -q '^  Enrolled as  pseudonym:' "$tmp/join"
-grep -q '^Transparency log verified' "$tmp/join"
-grep -q '^Inclusion proofs verified: the manifest you signed (#0) and your enrolment' "$tmp/join"
+grep -q '^  Read this code to IT. IT approves the device with it\.' "$tmp/join"
+grep -q '^Next, after IT approves:' "$tmp/join"
+! grep -q '^Transparency log verified' "$tmp/join"
+! grep -q '^Inclusion proofs verified:' "$tmp/join"
 code="$(sed -nE 's/^ *Device code for IT: ([0-9a-f]{12})$/\1/p' "$tmp/join")"
 [ -n "$code" ]
 echo "join with the untouched invitation: $(sed -n 's/^  Enrolled as  /enrolled as /p' "$tmp/join"), pending, device code $code"
@@ -319,7 +321,8 @@ rm "$home/log-checkpoint.txt"
 echo '{"index": 3, "hash": "00"}' > "$home/log-head.json"
 expect_status "a v0.1.0 log head asks for re-join instead of an alarm" 1 'log format was upgraded'
 "${client[@]}" join "$inv" --yes --software-key --no-wait > "$tmp/rejoin2"
-grep -q '^Transparency log verified' "$tmp/rejoin2"
+grep -q '^  Read this code to IT. IT approves the device with it\.' "$tmp/rejoin2"
+! grep -q '^Transparency log verified' "$tmp/rejoin2"
 [ ! -e "$home/log-head.json" ]
 echo "join replaces the old head with a checkpoint"
 

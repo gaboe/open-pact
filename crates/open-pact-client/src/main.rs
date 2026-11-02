@@ -173,18 +173,59 @@ enum ApprovalWait {
     Interrupted,
 }
 
+#[derive(Debug)]
+enum WaitError {
+    Network,
+    Alarm(String),
+    Fatal(anyhow::Error),
+}
+
+#[derive(Debug)]
+enum CheckpointVerifyError {
+    Network(anyhow::Error),
+    Alarm(String),
+}
+
+impl CheckpointVerifyError {
+    fn alarm_text(self) -> String {
+        match self {
+            Self::Network(error) => {
+                format!("no consistency proof from the gateway: {error:#}")
+            }
+            Self::Alarm(message) => message,
+        }
+    }
+}
+
+impl WaitError {
+    fn from_error(error: anyhow::Error) -> Self {
+        if error.chain().any(|cause| {
+            cause
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(is_retryable_http_error)
+        }) {
+            Self::Network
+        } else {
+            Self::Fatal(error)
+        }
+    }
+
+    fn body_error(_error: reqwest::Error) -> Self {
+        Self::Network
+    }
+}
+
 const APPROVAL_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
-fn is_retryable_poll_error(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause.downcast_ref::<reqwest::Error>().is_some_and(|error| {
-            error.is_connect()
-                || error.is_timeout()
-                || error
-                    .status()
-                    .is_some_and(|status| status.is_server_error())
-        })
-    })
+fn is_retryable_http_error(error: &reqwest::Error) -> bool {
+    !error.is_decode()
+        && (error.is_connect()
+            || error.is_timeout()
+            || error.is_request()
+            || error.is_body()
+            || error
+                .status()
+                .is_some_and(|status| status.is_server_error()))
 }
 
 const LOG_KEY: &str = "log-key.txt";
@@ -1284,7 +1325,7 @@ async fn sync_checkpoint(
         .await?
     {
         Ok(new) => new,
-        Err(e) => return Ok(Err(e)),
+        Err(e) => return Ok(Err(e.alarm_text())),
     };
     if policy.is_none_or(|p| p.allow_split_views) {
         eprintln!(
@@ -1308,7 +1349,7 @@ async fn verify_checkpoint(
     policy: Option<&LogPolicy>,
     prev: Option<&Checkpoint>,
     text: &str,
-) -> Result<Result<Checkpoint, String>> {
+) -> Result<Result<Checkpoint, CheckpointVerifyError>> {
     let now = u64::try_from(chrono::Utc::now().timestamp()).context("clock")?;
     let new = match Note::parse(text).and_then(|note| {
         let checkpoint = key.verify(&note)?;
@@ -1316,13 +1357,13 @@ async fn verify_checkpoint(
         Ok(checkpoint)
     }) {
         Ok(checkpoint) => checkpoint,
-        Err(e) => return Ok(Err(e.to_string())),
+        Err(e) => return Ok(Err(CheckpointVerifyError::Alarm(e.to_string()))),
     };
     let checked = match prev {
         None => Ok(()),
         Some(old) if old.size == new.size => {
             verify_consistency(old.size, new.size, &old.root, &new.root, &[])
-                .map_err(|e| e.to_string())
+                .map_err(|e| CheckpointVerifyError::Alarm(e.to_string()))
         }
         Some(old) => {
             let url = format!(
@@ -1331,10 +1372,49 @@ async fn verify_checkpoint(
                 old.size,
                 new.size
             );
-            match get_json::<Proof>(http, url).await {
+            let proof = async {
+                let response = http.get(&url).send().await.map_err(|error| {
+                    let error = anyhow::Error::from(error);
+                    if error.chain().any(|cause| {
+                        cause
+                            .downcast_ref::<reqwest::Error>()
+                            .is_some_and(is_retryable_http_error)
+                    }) {
+                        CheckpointVerifyError::Network(error)
+                    } else {
+                        CheckpointVerifyError::Alarm(error.to_string())
+                    }
+                })?;
+                let response = response.error_for_status().map_err(|error| {
+                    let error = anyhow::Error::from(error);
+                    if error.chain().any(|cause| {
+                        cause
+                            .downcast_ref::<reqwest::Error>()
+                            .is_some_and(is_retryable_http_error)
+                    }) {
+                        CheckpointVerifyError::Network(error)
+                    } else {
+                        CheckpointVerifyError::Alarm(error.to_string())
+                    }
+                })?;
+                let bytes = response
+                    .bytes()
+                    .await
+                    .map_err(|error| CheckpointVerifyError::Network(error.into()))?;
+                serde_json::from_slice::<Proof>(&bytes).map_err(|_| {
+                    CheckpointVerifyError::Alarm("error decoding response body".into())
+                })
+            }
+            .await;
+            match proof {
                 Ok(p) => verify_consistency(old.size, new.size, &old.root, &new.root, &p.proof)
-                    .map_err(|e| e.to_string()),
-                Err(e) => Err(format!("no consistency proof from the gateway: {e:#}")),
+                    .map_err(|e| CheckpointVerifyError::Alarm(e.to_string())),
+                Err(CheckpointVerifyError::Network(error)) => {
+                    Err(CheckpointVerifyError::Network(error))
+                }
+                Err(CheckpointVerifyError::Alarm(message)) => Err(CheckpointVerifyError::Alarm(
+                    format!("no consistency proof from the gateway: {message}"),
+                )),
             }
         }
     };
@@ -1430,6 +1510,53 @@ async fn status_after_log_denial(
     Ok(status.state)
 }
 
+async fn fetch_my_entries_for_wait(
+    http: &reqwest::Client,
+    home: &Home,
+    enrolment: &Enrolment,
+) -> std::result::Result<MyEntries, WaitError> {
+    let device = DeviceKey::load(&home.0).map_err(WaitError::Fatal)?;
+    let gateway = base(&enrolment.gateway);
+    let nonce_bytes = http
+        .post(format!("{gateway}/v1/nonce"))
+        .send()
+        .await
+        .map_err(|error| WaitError::from_error(error.into()))?
+        .error_for_status()
+        .map_err(|error| WaitError::from_error(error.into()))?
+        .bytes()
+        .await
+        .map_err(WaitError::body_error)?;
+    let nonce: Nonce =
+        serde_json::from_slice(&nonce_bytes).map_err(|error| WaitError::Fatal(error.into()))?;
+    let statement =
+        device_auth_statement(DeviceAuthPurpose::LogMine, &enrolment.device, &nonce.nonce);
+    let request = MyEntriesRequest {
+        pseudonym: enrolment.device.clone(),
+        nonce: nonce.nonce,
+        device_key: device.public_key(),
+        signature: device.sign(&statement).map_err(WaitError::Fatal)?,
+    };
+    let response = http
+        .post(format!("{gateway}/v1/log/mine"))
+        .json(&request)
+        .send()
+        .await
+        .map_err(|error| WaitError::from_error(error.into()))?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(WaitError::Fatal(anyhow::anyhow!(
+            "The gateway does not support this client version. Ask IT to update the gateway to 0.4.0 or later."
+        )));
+    }
+    let bytes = response
+        .error_for_status()
+        .map_err(|error| WaitError::from_error(error.into()))?
+        .bytes()
+        .await
+        .map_err(WaitError::body_error)?;
+    serde_json::from_slice(&bytes).map_err(|error| WaitError::Fatal(error.into()))
+}
+
 fn verify_my_entries(
     response: &MyEntries,
     enrolment: &Enrolment,
@@ -1493,7 +1620,7 @@ async fn check_own_entries(
     .await?
     {
         Ok(next) => next,
-        Err(error) => return Ok(Err(error)),
+        Err(error) => return Ok(Err(error.alarm_text())),
     };
     let own = match verify_my_entries(&response, enrolment, &commitment(enrolment)?, &next) {
         Ok(own) => own,
@@ -1582,15 +1709,20 @@ async fn fetch_device_status(
     http: &reqwest::Client,
     home: &Home,
     enrolment: &Enrolment,
-) -> Result<Approval> {
-    let device = DeviceKey::load(&home.0)?;
-    let nonce: Nonce = http
+) -> std::result::Result<Approval, WaitError> {
+    let device = DeviceKey::load(&home.0).map_err(WaitError::Fatal)?;
+    let nonce_bytes = http
         .post(format!("{}/v1/nonce", base(&enrolment.gateway)))
         .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+        .await
+        .map_err(|e| WaitError::from_error(e.into()))?
+        .error_for_status()
+        .map_err(|e| WaitError::from_error(e.into()))?
+        .bytes()
+        .await
+        .map_err(WaitError::body_error)?;
+    let nonce: Nonce =
+        serde_json::from_slice(&nonce_bytes).map_err(|e| WaitError::Fatal(e.into()))?;
     let statement = device_auth_statement(
         DeviceAuthPurpose::DeviceStatus,
         &enrolment.device,
@@ -1600,16 +1732,21 @@ async fn fetch_device_status(
         pseudonym: enrolment.device.clone(),
         nonce: nonce.nonce,
         device_key: device.public_key(),
-        signature: device.sign(&statement)?,
+        signature: device.sign(&statement).map_err(WaitError::Fatal)?,
     };
-    let response: DeviceStatusResponse = http
+    let bytes = http
         .post(format!("{}/v1/device/status", base(&enrolment.gateway)))
         .json(&request)
         .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+        .await
+        .map_err(|e| WaitError::from_error(e.into()))?
+        .error_for_status()
+        .map_err(|e| WaitError::from_error(e.into()))?
+        .bytes()
+        .await
+        .map_err(WaitError::body_error)?;
+    let response: DeviceStatusResponse =
+        serde_json::from_slice(&bytes).map_err(|e| WaitError::Fatal(e.into()))?;
     Ok(response.state)
 }
 
@@ -1619,10 +1756,10 @@ async fn verify_approval_entry(
     home: &Home,
     enrolment: &Enrolment,
     manifest: &Manifest,
-) -> Result<Result<bool, String>> {
-    let response = fetch_my_entries(http, home, enrolment).await?;
-    let pins = Pins::load(home)?;
-    let prev = home.checkpoint()?;
+) -> std::result::Result<bool, WaitError> {
+    let response = fetch_my_entries_for_wait(http, home, enrolment).await?;
+    let pins = Pins::load(home).map_err(WaitError::Fatal)?;
+    let prev = home.checkpoint().map_err(WaitError::Fatal)?;
     let checkpoint = match verify_checkpoint(
         http,
         home,
@@ -1632,18 +1769,20 @@ async fn verify_approval_entry(
         prev.as_ref(),
         &response.checkpoint,
     )
-    .await?
+    .await
+    .map_err(WaitError::Fatal)?
     {
         Ok(checkpoint) => checkpoint,
-        Err(error) => return Ok(Err(error)),
+        Err(CheckpointVerifyError::Network(_)) => return Err(WaitError::Network),
+        Err(CheckpointVerifyError::Alarm(error)) => return Err(WaitError::Alarm(error)),
     };
-    let commitment = commitment(enrolment)?;
+    let commitment = commitment(enrolment).map_err(WaitError::Fatal)?;
     if let Err(error) = verify_my_entries(&response, enrolment, &commitment, &checkpoint) {
-        return Ok(Err(error));
+        return Err(WaitError::Alarm(error));
     }
-    Ok(Ok(response.device.iter().any(|item| {
+    Ok(response.device.iter().any(|item| {
         item.entry.kind == EntryKind::DeviceApproved && item.entry.data["commitment"] == commitment
-    })))
+    }))
 }
 
 fn print_waiting_line(message: &str) {
@@ -1681,14 +1820,15 @@ async fn wait_for_approval(
         };
         let status = match status_result {
             Ok(status) => status,
-            Err(error) if is_retryable_poll_error(&error) => {
+            Err(WaitError::Network) => {
                 if !warning_printed {
                     eprintln!("warning: could not reach the gateway for IT approval; retrying");
                     warning_printed = true;
                 }
                 continue;
             }
-            Err(error) => return Err(error),
+            Err(WaitError::Alarm(error)) => return Ok(Err(error)),
+            Err(WaitError::Fatal(error)) => return Err(error),
         };
         match status {
             Approval::Revoked => return Ok(Ok(ApprovalWait::Revoked)),
@@ -1700,7 +1840,7 @@ async fn wait_for_approval(
                     _ = tokio::signal::ctrl_c() => return Ok(Ok(ApprovalWait::Interrupted)),
                 };
                 match proof_result {
-                    Err(error) if is_retryable_poll_error(&error) => {
+                    Err(WaitError::Network) => {
                         if !warning_printed {
                             eprintln!(
                                 "warning: could not reach the gateway for IT approval; retrying"
@@ -1708,12 +1848,12 @@ async fn wait_for_approval(
                             warning_printed = true;
                         }
                     }
-                    Err(error) => return Err(error),
-                    Ok(Ok(true)) => return Ok(Ok(ApprovalWait::Approved)),
-                    Ok(Ok(false)) => print_waiting_line(
+                    Err(WaitError::Alarm(error)) => return Ok(Err(error)),
+                    Err(WaitError::Fatal(error)) => return Err(error),
+                    Ok(true) => return Ok(Ok(ApprovalWait::Approved)),
+                    Ok(false) => print_waiting_line(
                         "IT approved the device. Waiting for the signed log proof...",
                     ),
-                    Ok(Err(error)) => return Ok(Err(error)),
                 }
             }
         }
@@ -1857,6 +1997,13 @@ async fn join(
         && existing.gateway == gateway
         && existing.manifest == *manifest.hash()
     {
+        let device = DeviceKey::load(&home.0)?;
+        if Pseudonym::of(&device.public_key()) != existing.device {
+            bail!(
+                "This home has an enrolment for a different device key. Run open-pact-client join with a new invitation after removing the old enrolment. Recovery command: `{}` delete-device-key",
+                client_command(&home.0)
+            );
+        }
         return wait_after_join(&http, home, &existing, &manifest, no_wait, poll_interval).await;
     }
     let os = current_os()?;
@@ -2239,9 +2386,9 @@ async fn check(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
             log_checkpoint,
         } => {
             let checked = match log_checkpoint {
-                None => Ok(Err(
-                    "the accepted claim response has no log checkpoint".into()
-                )),
+                None => Ok(Err(CheckpointVerifyError::Alarm(
+                    "the accepted claim response has no log checkpoint".into(),
+                ))),
                 Some(text) => {
                     let key = Pins::load(home)?.log;
                     let policy = manifest.body().log.as_ref();
@@ -2255,7 +2402,8 @@ async fn check(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
                     println!("ACCEPTED, but the response failed log verification");
                     report_log(
                         alarm(format!(
-                            "the checkpoint in the accepted claim response: {e}; no certificate was installed"
+                            "the checkpoint in the accepted claim response: {}; no certificate was installed",
+                            e.alarm_text()
                         )),
                         home,
                     );
@@ -3673,6 +3821,199 @@ mod tests {
             assert_eq!(gateway.requests(), ["POST /v1/nonce", "POST /v1/log/mine"]);
             assert_eq!(enrolment.log_entries.is_some(), !corrupt);
         }
+    }
+
+    #[tokio::test]
+    async fn join_retries_a_dropped_or_truncated_status_response() {
+        for (first_status, first_body) in
+            [(0, String::new()), (598, r#"{"state":"pending""#.into())]
+        {
+            let company = Company::new();
+            let dir = tempfile::tempdir().unwrap();
+            let home = enrolled_home(dir.path(), "", &company);
+            let enrolment = home.enrolment().unwrap();
+            let manifest = Manifest::parse(DEMO_MANIFEST.as_bytes()).unwrap();
+            let gateway = FakeGateway::start(move |line, nth| match line {
+                "POST /v1/nonce" => (200, json!({"nonce":format!("network-{nth}")}).to_string()),
+                "POST /v1/device/status" if nth == 0 => (first_status, first_body.clone()),
+                "POST /v1/device/status" => (200, r#"{"state":"revoked"}"#.into()),
+                _ => not_found(),
+            })
+            .await;
+            let mut enrolment = enrolment;
+            put_gateway_in_enrolment(&home, &mut enrolment, &gateway.url);
+
+            let waited = wait_for_approval(
+                &http_client().unwrap(),
+                &home,
+                &enrolment,
+                &manifest,
+                Duration::from_millis(1),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+            assert_eq!(waited, ApprovalWait::Revoked);
+            assert_eq!(
+                gateway
+                    .requests()
+                    .iter()
+                    .filter(|request| request.as_str() == "POST /v1/device/status")
+                    .count(),
+                2
+            );
+            assert!(
+                !gateway
+                    .requests()
+                    .iter()
+                    .any(|request| request == "POST /v1/log/mine")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn join_stops_on_a_complete_malformed_status_response() {
+        let company = Company::new();
+        let dir = tempfile::tempdir().unwrap();
+        let home = enrolled_home(dir.path(), "", &company);
+        let mut enrolment = home.enrolment().unwrap();
+        let manifest = Manifest::parse(DEMO_MANIFEST.as_bytes()).unwrap();
+        let gateway = FakeGateway::start(|line, nth| match line {
+            "POST /v1/nonce" => (200, json!({"nonce":format!("malformed-{nth}")}).to_string()),
+            "POST /v1/device/status" => (200, "not json".into()),
+            _ => not_found(),
+        })
+        .await;
+        put_gateway_in_enrolment(&home, &mut enrolment, &gateway.url);
+
+        let error = wait_for_approval(
+            &http_client().unwrap(),
+            &home,
+            &enrolment,
+            &manifest,
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("expected ident"), "{error}");
+        assert_eq!(
+            gateway
+                .requests()
+                .iter()
+                .filter(|request| request.as_str() == "POST /v1/device/status")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn join_retries_a_transient_consistency_proof_fetch_failure() {
+        let company = Company::new();
+        let witness = Witness::new();
+        let toml = witnessed_manifest(&witness);
+        let dir = tempfile::tempdir().unwrap();
+        let home = enrolled_home_with(dir.path(), "", &company, &toml);
+        let (manifest, mut enrolment, entries, _, approved_checkpoint) =
+            approval_fixture(&home, &company, &witness);
+        let response = my_entries_response(&approved_checkpoint, &entries, 3);
+        let gateway = FakeGateway::start(move |line, nth| match line {
+            "POST /v1/nonce" => (200, json!({"nonce":format!("proof-{nth}")}).to_string()),
+            "POST /v1/device/status" => (200, r#"{"state":"approved"}"#.into()),
+            "POST /v1/log/mine" => (200, response.clone()),
+            line if line.starts_with("GET /v1/log/proof/consistency?") && nth == 0 => {
+                (503, "{}".into())
+            }
+            line => serve_log(&entries, line).unwrap_or_else(not_found),
+        })
+        .await;
+        put_gateway_in_enrolment(&home, &mut enrolment, &gateway.url);
+
+        let waited = wait_for_approval(
+            &http_client().unwrap(),
+            &home,
+            &enrolment,
+            &manifest,
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(waited, ApprovalWait::Approved);
+        assert_eq!(
+            gateway
+                .requests()
+                .iter()
+                .filter(|request| request.as_str() == "POST /v1/device/status")
+                .count(),
+            2
+        );
+        assert_eq!(
+            gateway
+                .requests()
+                .iter()
+                .filter(|request| request.starts_with("GET /v1/log/proof/consistency?"))
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn join_refuses_to_resume_an_enrolment_with_another_device_key() {
+        let company = Company::new();
+        let witness = Witness::new();
+        let manifest = witnessed_manifest(&witness);
+        let published = Company::published(&manifest, &company.key);
+        let log = company.log.vkey();
+        let mut checkpoint = Note::parse(&company.empty_checkpoint()).unwrap();
+        witness.cosign(
+            &mut checkpoint,
+            u64::try_from(chrono::Utc::now().timestamp()).unwrap(),
+        );
+        let checkpoint = checkpoint.to_string();
+        let gateway = FakeGateway::start(move |line, _| match line {
+            "GET /v1/manifest" => (200, published.clone()),
+            "GET /v1/log/key" => (200, format!("{log}\n")),
+            "GET /v1/log/checkpoint" => (200, checkpoint.clone()),
+            _ => not_found(),
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let home = enrolled_home_with(dir.path(), &gateway.url, &company, &manifest);
+        DeviceKey::delete(dir.path()).unwrap();
+        DeviceKey::load_or_create(dir.path(), true).unwrap();
+        let invitation = Invitation::new(
+            &gateway.url,
+            &PublicKey::from(&company.key),
+            &company.log,
+            open_pact_core::InvitationCode::from_bytes([7; 32]),
+        )
+        .encode();
+
+        let error = join(
+            &home,
+            &invitation,
+            true,
+            true,
+            false,
+            true,
+            APPROVAL_POLL_INTERVAL,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("This home has an enrolment for a different device key."));
+        assert!(error.contains("delete-device-key"));
+        assert!(
+            !gateway
+                .requests()
+                .iter()
+                .any(|request| request == "POST /v1/enroll" || request == "POST /v1/device/status")
+        );
     }
 
     #[tokio::test]
