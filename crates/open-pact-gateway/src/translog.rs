@@ -20,6 +20,28 @@ pub async fn lock(conn: &mut PgConnection) -> sqlx::Result<()> {
         .map(drop)
 }
 
+pub async fn mine(
+    conn: &mut PgConnection,
+    size: u64,
+    manifest: &str,
+    commitment: &str,
+) -> anyhow::Result<Vec<Entry>> {
+    sqlx::query_as::<_, Row>(
+        "SELECT idx, kind, data FROM log_entries WHERE idx < $1 AND \
+         ((kind = 'manifest_published' AND data->>'manifest' = $2) OR \
+         (kind IN ('device_enrolled', 'device_approved', 'device_revoked') \
+         AND data->>'commitment' = $3)) ORDER BY idx",
+    )
+    .bind(i64::try_from(size)?)
+    .bind(manifest)
+    .bind(commitment)
+    .fetch_all(conn)
+    .await?
+    .into_iter()
+    .map(entry)
+    .collect()
+}
+
 /// Entries `from..to` in index order; fails if the table has a gap there.
 pub async fn range(conn: &mut PgConnection, from: u64, to: u64) -> anyhow::Result<Vec<Entry>> {
     let entries = sqlx::query_as::<_, Row>(

@@ -8,6 +8,7 @@ mod log;
 mod manifest;
 mod narrowing;
 mod note;
+mod own_entries;
 mod witness;
 
 pub use claim::{
@@ -33,6 +34,10 @@ pub use manifest::{
 };
 pub use narrowing::{Violation, is_narrowing};
 pub use note::{Checkpoint, LogKey, Note, NoteSignature, WitnessKey};
+pub use own_entries::{
+    DeviceAuthPurpose, DeviceStatus, EntryWithProof, MyEntries, MyEntriesRequest,
+    device_auth_statement,
+};
 pub use p256::ecdsa::SigningKey;
 pub use witness::{AddCheckpoint, CLOCK_SKEW_SECS, Refusal, add_checkpoint, verify_cosignatures};
 

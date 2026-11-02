@@ -26,6 +26,7 @@ use open_pact_core::{
     Pseudonym, PublicKey, SignedManifest, Virtualized, dev_key, root, verify_claim,
     verify_consistency, verify_cosignatures, verify_inclusion,
 };
+use open_pact_core::{DeviceAuthPurpose, MyEntries, MyEntriesRequest, device_auth_statement};
 use rcgen::{CertificateParams, DistinguishedName, KeyPair};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -1099,39 +1100,118 @@ fn own_enrolment_entry(commitment: &str) -> impl Fn(&Entry) -> bool + '_ {
     move |e: &Entry| e.kind == EntryKind::DeviceEnrolled && e.data["commitment"] == commitment
 }
 
+async fn fetch_my_entries(
+    http: &reqwest::Client,
+    home: &Home,
+    enrolment: &Enrolment,
+) -> Result<MyEntries> {
+    let device = DeviceKey::load(&home.0)?;
+    let gateway = base(&enrolment.gateway);
+    let nonce: Nonce = http
+        .post(format!("{gateway}/v1/nonce"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let statement =
+        device_auth_statement(DeviceAuthPurpose::LogMine, &enrolment.device, &nonce.nonce);
+    let request = MyEntriesRequest {
+        pseudonym: enrolment.device.clone(),
+        nonce: nonce.nonce,
+        device_key: device.public_key(),
+        signature: device.sign(&statement)?,
+    };
+    Ok(http
+        .post(format!("{gateway}/v1/log/mine"))
+        .json(&request)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?)
+}
+
+fn verify_my_entries(
+    response: &MyEntries,
+    enrolment: &Enrolment,
+    commitment: &str,
+    cp: &Checkpoint,
+) -> Result<OwnEntries, String> {
+    if !signed_manifest_entry(enrolment)(&response.manifest.entry) {
+        return Err("the gateway returned a different manifest entry".into());
+    }
+    for item in std::iter::once(&response.manifest).chain(&response.device) {
+        if item.entry.index >= cp.size {
+            return Err("own entry is outside the checkpoint".into());
+        }
+        verify_inclusion(
+            &item.entry.leaf_hash(),
+            item.entry.index,
+            cp.size,
+            &item.proof,
+            &cp.root,
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    if response.device.iter().any(|item| {
+        !matches!(
+            item.entry.kind,
+            EntryKind::DeviceEnrolled | EntryKind::DeviceApproved | EntryKind::DeviceRevoked
+        ) || item.entry.data["commitment"] != commitment
+    }) {
+        return Err("the gateway returned another device's entry".into());
+    }
+    let enrolled = response
+        .device
+        .iter()
+        .find(|item| own_enrolment_entry(commitment)(&item.entry))
+        .ok_or_else(|| "the log has no entry for this device's enrolment".to_string())?;
+    Ok(OwnEntries {
+        manifest: response.manifest.entry.index,
+        enrolment: enrolled.entry.index,
+    })
+}
+
 /// Proves that the verified tree holds the manifest the owner signed and this device's enrolment.
 /// Without stored indexes it searches the log once and stores what it finds.
 async fn check_own_entries(
     http: &reqwest::Client,
     home: &Home,
     enrolment: &mut Enrolment,
-    cp: &Checkpoint,
+    cp: &mut Checkpoint,
 ) -> Result<Result<OwnEntries, String>> {
     let gateway = enrolment.gateway.clone();
     let mine = commitment(enrolment)?;
     let own = match enrolment.log_entries {
         Some(own) => own,
         None => {
-            let entries = fetch_entries(http, &gateway, 0, cp.size).await?;
-            let find = |f: &dyn Fn(&Entry) -> bool| entries.iter().find(|e| f(e)).map(|e| e.index);
-            let Some(manifest) = find(&signed_manifest_entry(enrolment)) else {
-                return Ok(Err(format!(
-                    "the log has no entry for the manifest you signed, {}",
-                    enrolment.manifest
-                )));
+            let response = fetch_my_entries(http, home, enrolment).await?;
+            let pins = Pins::load(home)?;
+            let manifest = Manifest::parse(&read_home_file(&home.file("manifest.toml"))?)?;
+            let next = match verify_checkpoint(
+                http,
+                home,
+                &gateway,
+                &pins.log,
+                manifest.body().log.as_ref(),
+                Some(cp),
+                &response.checkpoint,
+            )
+            .await?
+            {
+                Ok(next) => next,
+                Err(error) => return Ok(Err(error)),
             };
-            let Some(index) = find(&own_enrolment_entry(&mine)) else {
-                return Ok(Err(format!(
-                    "the log has no entry for this device's enrolment, {mine}"
-                )));
+            let own = match verify_my_entries(&response, enrolment, &mine, &next) {
+                Ok(own) => own,
+                Err(error) => return Ok(Err(error)),
             };
-            let own = OwnEntries {
-                manifest,
-                enrolment: index,
-            };
+            home.write(LOG_CHECKPOINT, response.checkpoint.as_bytes())?;
+            *cp = next;
             enrolment.log_entries = Some(own);
             home.write("enrolment.json", &serde_json::to_vec_pretty(&enrolment)?)?;
-            own
+            return Ok(Ok(own));
         }
     };
     let manifest_entry = format!("the manifest you signed, {}", enrolment.manifest);
@@ -1168,14 +1248,16 @@ async fn sync_log(
 ) -> Result<LogSync> {
     let gateway = enrolment.gateway.clone();
     let policy = manifest.body().log.as_ref();
-    let cp = match sync_checkpoint(http, home, &gateway, policy).await? {
+    let mut cp = match sync_checkpoint(http, home, &gateway, policy).await? {
         Ok(cp) => cp,
         Err(e) => return Ok(alarm(e)),
     };
-    Ok(match check_own_entries(http, home, enrolment, &cp).await? {
-        Ok(own) => LogSync::Verified(cp, own),
-        Err(e) => alarm(e),
-    })
+    Ok(
+        match check_own_entries(http, home, enrolment, &mut cp).await? {
+            Ok(own) => LogSync::Verified(cp, own),
+            Err(e) => alarm(e),
+        },
+    )
 }
 
 /// A root as the checkpoint text shows it.
@@ -2700,6 +2782,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn own_entries_use_private_endpoint_and_reject_bad_proofs() {
+        for corrupt in [false, true] {
+            let company = Company::new();
+            let witness = Witness::new();
+            let toml = witnessed_manifest(&witness);
+            let dir = tempfile::tempdir().unwrap();
+            let home = enrolled_home_with(dir.path(), "", &company, &toml);
+            let mut enrolment = home.enrolment().unwrap();
+            let mine = commitment(&enrolment).unwrap();
+            let entries = vec![
+                Entry {
+                    index: 0,
+                    kind: EntryKind::ManifestPublished,
+                    data: json!({"manifest": enrolment.manifest}),
+                },
+                Entry {
+                    index: 1,
+                    kind: EntryKind::DeviceEnrolled,
+                    data: json!({"commitment": mine}),
+                },
+                Entry {
+                    index: 2,
+                    kind: EntryKind::DeviceApproved,
+                    data: json!({"commitment": mine}),
+                },
+            ];
+            let mut cp = checkpoint_of(company.log.origin(), &entries, 3);
+            let leaves: Vec<_> = entries.iter().map(Entry::leaf_hash).collect();
+            let mut note = company.sign(&cp);
+            witness.cosign(
+                &mut note,
+                u64::try_from(chrono::Utc::now().timestamp()).unwrap(),
+            );
+            let mut response = MyEntries {
+                checkpoint: note.to_string(),
+                manifest: open_pact_core::EntryWithProof {
+                    entry: entries[0].clone(),
+                    proof: open_pact_core::inclusion_proof(&leaves, 0).unwrap(),
+                },
+                device: entries[1..]
+                    .iter()
+                    .map(|entry| open_pact_core::EntryWithProof {
+                        entry: entry.clone(),
+                        proof: open_pact_core::inclusion_proof(&leaves, entry.index).unwrap(),
+                    })
+                    .collect(),
+            };
+            if corrupt {
+                response.device[1].proof[0] = LogHash([0; 32]);
+            }
+            let response = serde_json::to_string(&response).unwrap();
+            let gateway = FakeGateway::start(move |line, _| match line {
+                "POST /v1/nonce" => (200, json!({"nonce":"own-entry-nonce"}).to_string()),
+                "POST /v1/log/mine" => (200, response.clone()),
+                _ => not_found(),
+            })
+            .await;
+            enrolment.gateway = gateway.url.clone();
+            let result = check_own_entries(&http_client().unwrap(), &home, &mut enrolment, &mut cp)
+                .await
+                .unwrap();
+            assert_eq!(result.is_ok(), !corrupt, "{result:?}");
+            assert_eq!(gateway.requests(), ["POST /v1/nonce", "POST /v1/log/mine"]);
+            assert_eq!(enrolment.log_entries.is_some(), !corrupt);
+        }
+    }
+
+    #[tokio::test]
     async fn check_after_a_log_alarm_sends_nothing_and_writes_no_file() {
         let company = Company::new();
         let attacker = dev_key::generate();
@@ -2821,12 +2971,26 @@ mod tests {
         }
         let (published, log) = (Company::published(&toml, &company.key), company.log.vkey());
         let (claim, stored) = (claim.to_string(), before_claim.clone());
+        let leaves: Vec<_> = entries[..2].iter().map(Entry::leaf_hash).collect();
+        let mine_response = serde_json::to_string(&MyEntries {
+            checkpoint: before_claim.clone(),
+            manifest: open_pact_core::EntryWithProof {
+                entry: entries[0].clone(),
+                proof: open_pact_core::inclusion_proof(&leaves, 0).unwrap(),
+            },
+            device: vec![open_pact_core::EntryWithProof {
+                entry: entries[1].clone(),
+                proof: open_pact_core::inclusion_proof(&leaves, 1).unwrap(),
+            }],
+        })
+        .unwrap();
         let gateway = FakeGateway::start(move |line, _| match line {
             "GET /v1/manifest" => (200, published.clone()),
             "GET /v1/log/key" => (200, format!("{log}\n")),
             "GET /v1/log/checkpoint" => (200, stored.clone()),
             "POST /v1/nonce" => (200, r#"{"nonce":"n"}"#.into()),
             "POST /v1/claim" => (200, claim.clone()),
+            "POST /v1/log/mine" => (200, mine_response.clone()),
             _ => serve_log(&entries, line).unwrap_or_else(not_found),
         })
         .await;
@@ -2850,7 +3014,12 @@ mod tests {
         let posts = gateway.posts();
         assert_eq!(
             posts,
-            ["POST /v1/nonce", "POST /v1/claim"],
+            [
+                "POST /v1/nonce",
+                "POST /v1/log/mine",
+                "POST /v1/nonce",
+                "POST /v1/claim"
+            ],
             "the claim was sent"
         );
         (code, before, snapshot(dir.path()), pair)
