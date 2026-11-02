@@ -2518,7 +2518,7 @@ async fn log_prove(home: &Home, index: Option<u64>, insecure_dev: bool) -> Resul
     {
         Ok(cp) => cp,
         Err(error) => {
-            report_log(alarm(error), home);
+            report_log(alarm(error.alarm_text()), home);
             return Ok(ExitCode::from(2));
         }
     };
