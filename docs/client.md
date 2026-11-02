@@ -98,7 +98,7 @@ Get a one-time `opi1:` invitation from the gateway operator. Confirm the gateway
 open-pact-client join 'opi1:replace-with-your-invitation'
 ```
 
-The client checks the gateway keys and transparency checkpoint before it displays the manifest. Read the manifest before you approve the signature prompt. The owner key signs the manifest hash and the device enrolment statement. The gateway leaves the device pending until an operator approves its device code.
+The client checks the gateway keys and transparency checkpoint before it displays the manifest. Read the manifest before you approve the signature prompt. The owner key signs the manifest hash and the device enrolment statement. The gateway leaves the device pending until an operator approves its device code. After it prints the code, `join` checks for approval every 10 seconds. It reports approval only after it verifies the device's `device_approved` entry in the signed log. Press Ctrl+C to stop waiting. The enrolment stays on disk, so run `join` again or run `check` later. Pass `--no-wait` to print the code and exit without polling.
 
 A manifest with `[report]` requires client 0.4.0 or later. Older clients refuse to join. IT must update clients before it publishes the table.
 
