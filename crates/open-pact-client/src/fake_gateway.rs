@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use open_pact_core::{
     Checkpoint, Endorsement, Entry, LogHash, LogKey, Manifest, Note, PublicKey, SigningKey,
-    WitnessKey, consistency_proof, dev_key, inclusion_proof, root,
+    WitnessKey, consistency_proof, dev_key, root,
 };
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -203,8 +203,7 @@ fn leaves(entries: &[Entry]) -> Vec<LogHash> {
     entries.iter().map(Entry::leaf_hash).collect()
 }
 
-/// Answers the log reads an honest gateway serves for `entries`: entry pages, inclusion proofs
-/// and consistency proofs. Returns `None` for any other request line.
+/// Answers public consistency proof requests. Returns `None` for other requests.
 pub fn serve_log(entries: &[Entry], line: &str) -> Option<(u16, String)> {
     let (path, query) = line.strip_prefix("GET ")?.split_once('?')?;
     let arg = |name: &str| -> Option<u64> {
@@ -215,17 +214,6 @@ pub fn serve_log(entries: &[Entry], line: &str) -> Option<(u16, String)> {
             .ok()
     };
     let body = match path {
-        "/v1/log/entries" => {
-            let (from, to) = (
-                arg("from")? as usize,
-                (arg("to")? as usize).min(entries.len()),
-            );
-            json!({ "entries": entries.get(from..to)? })
-        }
-        "/v1/log/proof/inclusion" => {
-            let size = arg("size")? as usize;
-            json!({ "proof": inclusion_proof(&leaves(entries.get(..size)?), arg("index")?).ok()? })
-        }
         "/v1/log/proof/consistency" => {
             let to = arg("to")? as usize;
             json!({ "proof": consistency_proof(&leaves(entries.get(..to)?), arg("from")?).ok()? })

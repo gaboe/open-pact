@@ -112,6 +112,14 @@ open-pact-client check
 
 The client runs the checks in the signed manifest and sends one signed claim. It verifies the response and log checkpoint. It installs the VPN certificate and CA when the gateway accepts the claim. On Windows, read the consistent pair through `vpn\current`. The README section on the client home describes this pointer. A denied check returns the gateway's reason. A log verification failure raises an alarm and exits with status 2.
 
+Log entries are private. The public `/v1/log/entries` and `/v1/log/proof/inclusion` routes return 404. An approved device uses `POST /v1/log/mine` to get its signed manifest and its own device entries with inclusion proofs. The log key, signed checkpoint and consistency proofs remain public. Witnesses receive checkpoints and consistency proofs by push; they do not download entries.
+
+An outside auditor can no longer read enrolment events to count devices or identify when each enrolment occurred. The public checkpoint still reveals the total number of log entries, and repeated observations reveal log growth. It does not identify which changes are enrolments. Witnesses verify checkpoint consistency, and each approved device verifies its own entries. This does not provide public inspection of every event.
+
+The first sync verifies the gateway signature with the pinned log key and enforces the signed manifest’s witness quorum and cosignature age. It does not download the full log. Later syncs also verify consistency from the stored checkpoint. A manifest that explicitly permits split views with no witnesses accepts a gateway-signed checkpoint alone and prints a warning. `log prove [index]` can show only the manifest and device entries returned for this device.
+
+If private log access is denied, `check` asks for this device's status. A pending device gets an IT approval message. A revoked device gets a revocation message. Both return exit code 1 without sending a claim.
+
 Run `open-pact-client log head` to show the last verified checkpoint. Run `open-pact-client log prove` to verify the inclusion proof for this device's enrolment. Run `open-pact-client log show` to print claims and gateway responses. Run `open-pact-client log reports` to print report requests and collector responses from the last 90 days. It combines home and SYSTEM history, sorts records by time, and labels each source. On Windows, an elevated prompt includes protected SYSTEM history. Without elevation, the command prints readable home history and says how to include SYSTEM history.
 
 ## Declare the device configuration

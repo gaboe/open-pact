@@ -89,8 +89,7 @@ echo "join with the untouched invitation: $(sed -n 's/^  Enrolled as  /enrolled 
 
 got="$(run_status "${client[@]}" check)"
 [ "$got" = 1 ]
-grep -qx DENIED "$tmp/out"
-grep -q 'device awaiting IT approval' "$tmp/out"
+grep -q 'This device waits for IT approval' "$tmp/out"
 echo "check before approval: denied, device awaiting IT approval"
 
 head_before="$("${client[@]}" log head)"
@@ -185,8 +184,7 @@ kill "$proxy_pid"
 wait "$proxy_pid" 2> /dev/null || true
 proxy_pid=""
 
-for q in "entries?from=0&to=99999" "entries?from=3&to=2" "proof/inclusion?index=99999" \
-  "proof/inclusion?index=0&size=99999" "proof/consistency?from=0" "proof/consistency?from=2&to=1" \
+for q in "proof/consistency?from=0" "proof/consistency?from=2&to=1" \
   "proof/consistency?from=1&to=99999"; do
   code="$(curl -sS -o "$tmp/body" -w '%{http_code}' "$url/v1/log/$q")"
   [ "$code" = 400 ] || { echo "$q: $code $(cat "$tmp/body")"; exit 1; }
@@ -334,12 +332,12 @@ pseudonym="$(sed -n 's/^  Enrolled as  //p' "$tmp/join")"
 admin devices revoke "$pseudonym" | grep -q '^revoked '
 got="$(run_status "${client[@]}" check)"
 [ "$got" = 1 ]
-grep -q 'device revoked' "$tmp/out"
+grep -q 'IT revoked this device' "$tmp/out"
 expect "revoked device" 403 'device revoked' \
   "$("$dev_claim" "$device" "$manifest" "$(nonce)" linux "${passing[@]}")"
 got="$(run_status admin devices approve "$code")"
 [ "$got" != 0 ]
-[ "$(curl -fsS "$url/v1/log/entries" | grep -o '"kind":"device_revoked"' | wc -l | tr -d ' ')" -ge 1 ]
+[ "$(admin log entries --limit 10000 | grep -o '"kind":"device_revoked"' | wc -l | tr -d ' ')" -ge 1 ]
 echo "IT revoked the device: check denied, approval refused, revocation logged"
 
 echo "smoke passed"
