@@ -68,10 +68,26 @@ enum Command {
         #[arg(long, env = "PUBLIC_URL")]
         url: String,
     },
+    /// Read the log from the gateway database
+    Log {
+        #[command(subcommand)]
+        command: LogCommand,
+    },
     /// List, approve or revoke devices
     Devices {
         #[command(subcommand)]
         command: DevicesCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum LogCommand {
+    /// Print log entries as JSON lines
+    Entries {
+        #[arg(long, default_value_t = 0)]
+        from: u64,
+        #[arg(long, default_value_t = 256)]
+        limit: u64,
     },
 }
 
@@ -118,9 +134,6 @@ struct LogCache {
     signed: Option<(Checkpoint, Note)>,
 }
 
-/// The largest page `GET /v1/log/entries` serves.
-const MAX_ENTRIES: u64 = 256;
-
 struct Tree {
     leaves: Vec<LogHash>,
 }
@@ -148,12 +161,6 @@ struct ClaimRequest {
 struct RangeQuery {
     from: Option<u64>,
     to: Option<u64>,
-}
-
-#[derive(Deserialize)]
-struct InclusionQuery {
-    index: u64,
-    size: Option<u64>,
 }
 
 fn internal(e: impl Display) -> Reply {
@@ -342,45 +349,6 @@ async fn log_checkpoint(State(app): State<App>) -> Result<impl IntoResponse, Rep
     Ok((
         [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
         note.to_string(),
-    ))
-}
-
-async fn log_entries(
-    State(app): State<App>,
-    Query(q): Query<RangeQuery>,
-) -> Result<Json<Value>, Reply> {
-    let size = app.tree().await?.size();
-    let (from, to) = entries_range(q.from, q.to, size).map_err(bad_request)?;
-    let entries = translog::range(&mut *app.conn().await?, from, to)
-        .await
-        .map_err(internal)?;
-    Ok(Json(json!({ "entries": entries })))
-}
-
-/// `to` defaults to one full page or the end of the log.
-fn entries_range(from: Option<u64>, to: Option<u64>, size: u64) -> Result<(u64, u64), String> {
-    let from = from.unwrap_or(0);
-    let to = to.unwrap_or_else(|| size.min(from.saturating_add(MAX_ENTRIES)));
-    if from > to || to > size || to - from > MAX_ENTRIES {
-        return Err(format!(
-            "need from <= to <= {size} and at most {MAX_ENTRIES} entries, got from={from} to={to}"
-        ));
-    }
-    Ok((from, to))
-}
-
-async fn inclusion(
-    State(app): State<App>,
-    Query(q): Query<InclusionQuery>,
-) -> Result<Json<Value>, Reply> {
-    let tree = app.tree().await?;
-    let size = q.size.unwrap_or(tree.size());
-    if size > tree.size() {
-        return Err(bad_request(format!("the log has {} entries", tree.size())));
-    }
-    let proof = inclusion_proof(tree.prefix(size), q.index).map_err(bad_request)?;
-    Ok(Json(
-        json!({"index": q.index, "size": size, "proof": proof}),
     ))
 }
 
@@ -1054,8 +1022,6 @@ fn router(app: App) -> Router {
         .route("/v1/log", get(legacy_log))
         .route("/v1/log/key", get(self::log_key_text))
         .route("/v1/log/checkpoint", get(log_checkpoint))
-        .route("/v1/log/entries", get(log_entries))
-        .route("/v1/log/proof/inclusion", get(inclusion))
         .route("/v1/log/proof/consistency", get(consistency))
         .route("/v1/nonce", post(nonce))
         .route("/v1/claim", post(claim))
@@ -1180,6 +1146,22 @@ async fn serve(db: PgPool) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn log_entries(
+    db: &PgPool,
+    from: u64,
+    limit: u64,
+    output: &mut impl std::io::Write,
+) -> anyhow::Result<()> {
+    let to = from
+        .checked_add(limit)
+        .ok_or_else(|| anyhow::anyhow!("from + limit exceeds the log index range"))?;
+    for entry in translog::range(&mut *db.acquire().await?, from, to).await? {
+        serde_json::to_writer(&mut *output, &entry)?;
+        writeln!(output)?;
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -1189,6 +1171,9 @@ async fn main() -> anyhow::Result<()> {
         Command::Serve => serve(db).await,
         Command::Invite { ttl, note, url } => invite(&db, &url, ttl, note.trim()).await,
         Command::Devices { command } => admin_devices(&db, command).await,
+        Command::Log {
+            command: LogCommand::Entries { from, limit },
+        } => log_entries(&db, from, limit, &mut std::io::stdout()).await,
     }
 }
 
@@ -1231,6 +1216,79 @@ mod tests {
             };
             assert!(err.to_string().contains("TTL"), "{bad:?}: {err}");
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "needs TEST_DATABASE_URL"]
+    async fn closed_log_routes_and_operator_entries() {
+        let (app, db) = test_app_with(DEMO, 100, 100).await;
+        let mut conn = db.acquire().await.unwrap();
+        let first = translog::append(
+            &mut conn,
+            EntryKind::ManifestPublished,
+            json!({"manifest":"fictional"}),
+        )
+        .await
+        .unwrap();
+        let second = translog::append(
+            &mut conn,
+            EntryKind::DeviceEnrolled,
+            json!({"commitment":"fictional"}),
+        )
+        .await
+        .unwrap();
+        drop(conn);
+        for (path, expected) in [
+            ("/v1/log/entries", StatusCode::NOT_FOUND),
+            ("/v1/log/proof/inclusion?index=0", StatusCode::NOT_FOUND),
+            ("/v1/log/key", StatusCode::OK),
+            ("/v1/log/checkpoint", StatusCode::OK),
+            ("/v1/log/proof/consistency?from=1", StatusCode::OK),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{path}");
+        }
+        let cli = Cli::try_parse_from([
+            "open-pact-gateway",
+            "log",
+            "entries",
+            "--from",
+            "1",
+            "--limit",
+            "1",
+        ])
+        .unwrap();
+        let Some(Command::Log {
+            command: LogCommand::Entries { from, limit },
+        }) = cli.command
+        else {
+            panic!("log entries command")
+        };
+        let mut output = Vec::new();
+        log_entries(&db, from, limit, &mut output).await.unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            format!("{}\n", serde_json::to_string(&second).unwrap())
+        );
+        let mut output = Vec::new();
+        log_entries(&db, 0, 256, &mut output).await.unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&first).unwrap(),
+                serde_json::to_string(&second).unwrap()
+            )
+        );
+        assert!(
+            log_entries(&db, u64::MAX, 1, &mut Vec::new())
+                .await
+                .is_err()
+        );
     }
 
     async fn test_app(enrol_limit: u32, nonce_limit: u32) -> Router {
@@ -1809,16 +1867,5 @@ mod tests {
         };
         assert!(foreign_checkpoint(&tree, &beyond).is_some());
         assert!(foreign_checkpoint(&tree, &at(0)).is_some());
-    }
-
-    #[test]
-    fn entries_are_served_in_pages_of_at_most_256() {
-        assert_eq!(entries_range(None, None, 1000), Ok((0, 256)));
-        assert_eq!(entries_range(Some(900), None, 1000), Ok((900, 1000)));
-        assert_eq!(entries_range(Some(10), Some(266), 1000), Ok((10, 266)));
-        assert!(entries_range(Some(10), Some(267), 1000).is_err());
-        assert!(entries_range(Some(5), Some(4), 1000).is_err());
-        assert!(entries_range(Some(0), Some(1001), 1000).is_err());
-        assert_eq!(entries_range(None, None, 0), Ok((0, 0)));
     }
 }

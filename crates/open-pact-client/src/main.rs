@@ -23,10 +23,12 @@ use device_key::DeviceKey;
 use open_pact_core::{
     Checkpoint, Claim, CsrHash, Endorsement, EnrolRequest, Entry, EntryKind, Invitation,
     LogCheckpoint, LogHash, LogKey, LogPolicy, Manifest, ManifestHash, Metadata, Note, Os,
-    Pseudonym, PublicKey, SignedManifest, Virtualized, dev_key, root, verify_claim,
-    verify_consistency, verify_cosignatures, verify_inclusion,
+    Pseudonym, PublicKey, SignedManifest, Virtualized, dev_key, verify_claim, verify_consistency,
+    verify_cosignatures, verify_inclusion,
 };
-use open_pact_core::{DeviceAuthPurpose, MyEntries, MyEntriesRequest, device_auth_statement};
+use open_pact_core::{
+    DeviceAuthPurpose, DeviceStatus, MyEntries, MyEntriesRequest, device_auth_statement,
+};
 use rcgen::{CertificateParams, DistinguishedName, KeyPair};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -140,11 +142,6 @@ struct OwnEntries {
 struct PublishedManifest {
     toml: String,
     company: Endorsement,
-}
-
-#[derive(Deserialize)]
-struct Entries {
-    entries: Vec<Entry>,
 }
 
 #[derive(Deserialize)]
@@ -1161,32 +1158,6 @@ async fn finish(home: &Home, insecure_dev: bool, yes: bool) -> Result<ExitCode> 
     }
     check(home, insecure_dev).await
 }
-
-/// The gateway serves at most this many entries per request.
-const ENTRIES_PAGE: u64 = 256;
-
-/// Entries `from..to`, fetched page by page.
-async fn fetch_entries(
-    http: &reqwest::Client,
-    gateway: &str,
-    from: u64,
-    to: u64,
-) -> Result<Vec<Entry>> {
-    let mut entries = vec![];
-    let mut next = from;
-    while next < to {
-        let end = to.min(next + ENTRIES_PAGE);
-        let url = format!("{}/v1/log/entries?from={next}&to={end}", base(gateway));
-        let page: Entries = get_json(http, url).await?;
-        if page.entries.is_empty() {
-            bail!("the gateway served no entries from #{next}");
-        }
-        next += page.entries.len() as u64;
-        entries.extend(page.entries);
-    }
-    Ok(entries)
-}
-
 struct Pins {
     company: String,
     log: LogKey,
@@ -1269,8 +1240,8 @@ async fn sync_checkpoint(
 }
 
 /// Verifies a checkpoint note from the gateway: the pinned log key, the manifest's witness policy,
-/// and that it extends `prev`, the last checkpoint this device verified. Without `prev` it
-/// downloads every entry and recomputes the root instead. Stores the note only if all hold.
+/// and that it extends `prev`, the last checkpoint this device verified. The first checkpoint
+/// trusts the same signature and witness policy. Stores the note only if all hold.
 async fn verify_checkpoint(
     http: &reqwest::Client,
     home: &Home,
@@ -1290,19 +1261,7 @@ async fn verify_checkpoint(
         Err(e) => return Ok(Err(e.to_string())),
     };
     let checked = match prev {
-        None => {
-            let entries = fetch_entries(http, gateway, 0, new.size).await?;
-            let leaves: Vec<LogHash> = entries.iter().map(Entry::leaf_hash).collect();
-            let indexes_ok = entries.iter().enumerate().all(|(i, e)| e.index == i as u64);
-            if indexes_ok && leaves.len() as u64 == new.size && root(&leaves) == new.root {
-                Ok(())
-            } else {
-                Err(format!(
-                    "the entries the gateway served do not hash to its signed root {}",
-                    new.root
-                ))
-            }
-        }
+        None => Ok(()),
         Some(old) if old.size == new.size => {
             verify_consistency(old.size, new.size, &old.root, &new.root, &[])
                 .map_err(|e| e.to_string())
@@ -1326,43 +1285,6 @@ async fn verify_checkpoint(
     }
     home.write(LOG_CHECKPOINT, text.as_bytes())?;
     Ok(Ok(new))
-}
-
-/// Fetches entry `index` and its inclusion proof, and checks both against `cp`.
-async fn prove_entry(
-    http: &reqwest::Client,
-    gateway: &str,
-    cp: &Checkpoint,
-    index: u64,
-    what: &str,
-    expected: impl Fn(&Entry) -> bool,
-) -> Result<(Entry, Vec<LogHash>), String> {
-    if index >= cp.size {
-        return Err(format!(
-            "{what} (entry #{index}) is outside the checkpoint of size {}",
-            cp.size
-        ));
-    }
-    let entry = match fetch_entries(http, gateway, index, index + 1).await {
-        Ok(mut page) if page.len() == 1 && page[0].index == index => page.remove(0),
-        Ok(_) => return Err(format!("the gateway did not serve entry #{index}")),
-        Err(e) => return Err(format!("the gateway did not serve entry #{index}: {e:#}")),
-    };
-    if !expected(&entry) {
-        return Err(format!("entry #{index} is not {what}"));
-    }
-    let url = format!(
-        "{}/v1/log/proof/inclusion?index={index}&size={}",
-        base(gateway),
-        cp.size
-    );
-    let proof = get_json::<Proof>(http, url)
-        .await
-        .map_err(|e| format!("no inclusion proof for {what}: {e:#}"))?
-        .proof;
-    verify_inclusion(&entry.leaf_hash(), index, cp.size, &proof, &cp.root)
-        .map_err(|e| format!("{what}: {e}"))?;
-    Ok((entry, proof))
 }
 
 fn signed_manifest_entry(enrolment: &Enrolment) -> impl Fn(&Entry) -> bool + '_ {
@@ -1410,6 +1332,46 @@ async fn fetch_my_entries(
     Ok(response.error_for_status()?.json().await?)
 }
 
+async fn status_after_log_denial(
+    http: &reqwest::Client,
+    home: &Home,
+    enrolment: &Enrolment,
+) -> Result<DeviceStatus> {
+    let device = DeviceKey::load(&home.0)?;
+    let gateway = base(&enrolment.gateway);
+    let nonce: Nonce = http
+        .post(format!("{gateway}/v1/nonce"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let statement = device_auth_statement(
+        DeviceAuthPurpose::DeviceStatus,
+        &enrolment.device,
+        &nonce.nonce,
+    );
+    let request = MyEntriesRequest {
+        pseudonym: enrolment.device.clone(),
+        nonce: nonce.nonce,
+        device_key: device.public_key(),
+        signature: device.sign(&statement)?,
+    };
+    #[derive(Deserialize)]
+    struct Status {
+        state: DeviceStatus,
+    }
+    let status: Status = http
+        .post(format!("{gateway}/v1/device/status"))
+        .json(&request)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    Ok(status.state)
+}
+
 fn verify_my_entries(
     response: &MyEntries,
     enrolment: &Enrolment,
@@ -1451,70 +1413,46 @@ fn verify_my_entries(
     })
 }
 
-/// Proves that the verified tree holds the manifest the owner signed and this device's enrolment.
-/// Without stored indexes it searches the log once and stores what it finds.
+/// Verifies this device's entries against an authenticated checkpoint.
 async fn check_own_entries(
     http: &reqwest::Client,
     home: &Home,
     enrolment: &mut Enrolment,
     cp: &mut Checkpoint,
 ) -> Result<Result<OwnEntries, String>> {
-    let gateway = enrolment.gateway.clone();
-    let mine = commitment(enrolment)?;
-    let own = match enrolment.log_entries {
-        Some(own) => own,
-        None => {
-            let response = fetch_my_entries(http, home, enrolment).await?;
-            let pins = Pins::load(home)?;
-            let manifest = Manifest::parse(&read_home_file(&home.file("manifest.toml"))?)?;
-            let next = match verify_checkpoint(
-                http,
-                home,
-                &gateway,
-                &pins.log,
-                manifest.body().log.as_ref(),
-                Some(cp),
-                &response.checkpoint,
-            )
-            .await?
-            {
-                Ok(next) => next,
-                Err(error) => return Ok(Err(error)),
-            };
-            let own = match verify_my_entries(&response, enrolment, &mine, &next) {
-                Ok(own) => own,
-                Err(error) => return Ok(Err(error)),
-            };
-            home.write(LOG_CHECKPOINT, response.checkpoint.as_bytes())?;
-            *cp = next;
-            enrolment.log_entries = Some(own);
-            home.write("enrolment.json", &serde_json::to_vec_pretty(&enrolment)?)?;
-            return Ok(Ok(own));
-        }
+    let response = fetch_my_entries(http, home, enrolment).await?;
+    let pins = Pins::load(home)?;
+    let manifest = Manifest::parse(&read_home_file(&home.file("manifest.toml"))?)?;
+    let next = match verify_checkpoint(
+        http,
+        home,
+        &enrolment.gateway,
+        &pins.log,
+        manifest.body().log.as_ref(),
+        Some(cp),
+        &response.checkpoint,
+    )
+    .await?
+    {
+        Ok(next) => next,
+        Err(error) => return Ok(Err(error)),
     };
-    let manifest_entry = format!("the manifest you signed, {}", enrolment.manifest);
-    let checked = async {
-        prove_entry(
-            http,
-            &gateway,
-            cp,
-            own.manifest,
-            &manifest_entry,
-            signed_manifest_entry(enrolment),
-        )
-        .await?;
-        prove_entry(
-            http,
-            &gateway,
-            cp,
-            own.enrolment,
-            "this device's enrolment",
-            own_enrolment_entry(&mine),
-        )
-        .await?;
-        Ok(own)
+    let own = match verify_my_entries(&response, enrolment, &commitment(enrolment)?, &next) {
+        Ok(own) => own,
+        Err(error) => return Ok(Err(error)),
     };
-    Ok(checked.await)
+    if enrolment
+        .log_entries
+        .is_some_and(|stored| stored.manifest != own.manifest || stored.enrolment != own.enrolment)
+    {
+        return Ok(Err(
+            "the gateway changed this device's log entry indexes".into()
+        ));
+    }
+    *cp = next;
+    enrolment.log_entries = Some(own);
+    home.write("enrolment.json", &serde_json::to_vec_pretty(&enrolment)?)?;
+    Ok(Ok(own))
 }
 
 /// Verifies the new checkpoint against the stored one, then this enrolment's entries in it.
@@ -1978,7 +1916,26 @@ async fn check(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
         }
     }
     let http = http_client()?;
-    let (mut verified, own) = match sync_log(&http, home, &manifest, &mut enrolment).await? {
+    let sync = match sync_log(&http, home, &manifest, &mut enrolment).await {
+        Err(error)
+            if error.downcast_ref::<reqwest::Error>().is_some_and(|error| {
+                error.status() == Some(reqwest::StatusCode::FORBIDDEN)
+                    && error.url().is_some_and(|url| url.path() == "/v1/log/mine")
+            }) =>
+        {
+            match status_after_log_denial(&http, home, &enrolment).await? {
+                DeviceStatus::Pending => println!(
+                    "This device waits for IT approval. Run {} join to wait for it.",
+                    client_command(&home.0)
+                ),
+                DeviceStatus::Revoked => println!("IT revoked this device."),
+                DeviceStatus::Approved => return Err(error),
+            }
+            return Ok(ExitCode::FAILURE);
+        }
+        result => result?,
+    };
+    let (mut verified, own) = match sync {
         LogSync::Verified(cp, own) => (cp, own),
         alarm => {
             report_log(alarm, home);
@@ -2145,22 +2102,41 @@ async fn log_prove(home: &Home, index: Option<u64>, insecure_dev: bool) -> Resul
         return Ok(ExitCode::from(2));
     };
     let index = index.unwrap_or(own.enrolment);
-    let what = format!("entry #{index}");
-    let (entry, proof) =
-        match prove_entry(&http, &enrolment.gateway, &cp, index, &what, |_| true).await {
-            Ok(proved) => proved,
-            Err(e) => {
-                report_log(alarm(e), home);
-                return Ok(ExitCode::from(2));
-            }
-        };
+    let response = fetch_my_entries(&http, home, &enrolment).await?;
+    let pins = Pins::load(home)?;
+    let cp = match verify_checkpoint(
+        &http,
+        home,
+        &enrolment.gateway,
+        &pins.log,
+        manifest.body().log.as_ref(),
+        Some(&cp),
+        &response.checkpoint,
+    )
+    .await?
+    {
+        Ok(cp) => cp,
+        Err(error) => {
+            report_log(alarm(error), home);
+            return Ok(ExitCode::from(2));
+        }
+    };
+    if let Err(error) = verify_my_entries(&response, &enrolment, &commitment(&enrolment)?, &cp) {
+        report_log(alarm(error), home);
+        return Ok(ExitCode::from(2));
+    }
+    let item = std::iter::once(&response.manifest)
+        .chain(response.device.iter())
+        .find(|item| item.entry.index == index)
+        .context("that entry is not available to this device")?;
+    let (entry, proof) = (&item.entry, &item.proof);
     println!("Entry #{} {}", entry.index, serde_json::to_string(&entry)?);
     println!(
         "Leaf hash  {}  (sha256 of 0x00 || JCS({{kind, data}}))",
         entry.leaf_hash()
     );
     println!("Proof      {} hashes", proof.len());
-    for h in &proof {
+    for h in proof {
         println!("           {h}");
     }
     println!(
@@ -3205,14 +3181,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn check_reports_device_state_after_private_log_denial() {
+        for state in ["pending", "revoked"] {
+            let company = Company::new();
+            let witness = Witness::new();
+            let toml = witnessed_manifest(&witness);
+            let published = Company::published(&toml, &company.key);
+            let log = company.log.vkey();
+            let mut checkpoint = Note::parse(&company.empty_checkpoint()).unwrap();
+            witness.cosign(
+                &mut checkpoint,
+                u64::try_from(chrono::Utc::now().timestamp()).unwrap(),
+            );
+            let checkpoint = checkpoint.to_string();
+            let gateway = FakeGateway::start(move |line, _| match line {
+                "GET /v1/manifest" => (200, published.clone()),
+                "GET /v1/log/key" => (200, log.clone()),
+                "GET /v1/log/checkpoint" => (200, checkpoint.clone()),
+                "POST /v1/nonce" => (200, json!({"nonce":"state-nonce"}).to_string()),
+                "POST /v1/log/mine" => (403, json!({"status":"denied"}).to_string()),
+                "POST /v1/device/status" => (200, json!({"state":state}).to_string()),
+                _ => not_found(),
+            })
+            .await;
+            let dir = tempfile::tempdir().unwrap();
+            let home = enrolled_home_with(dir.path(), &gateway.url, &company, &toml);
+            assert_eq!(
+                check(&home, true).await.unwrap(),
+                ExitCode::FAILURE,
+                "{state}"
+            );
+            assert_eq!(
+                gateway.posts(),
+                [
+                    "POST /v1/nonce",
+                    "POST /v1/log/mine",
+                    "POST /v1/nonce",
+                    "POST /v1/device/status"
+                ]
+            );
+            assert!(!home.file("vpn-key.pem").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn first_checkpoint_requires_gateway_and_witness_signatures_without_public_entries() {
+        for case in ["valid", "wrong gateway", "missing witness", "wrong witness"] {
+            let company = Company::new();
+            let witness = Witness::new();
+            let toml = witnessed_manifest(&witness);
+            let manifest = Manifest::parse(toml.as_bytes()).unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let home = enrolled_home_with(dir.path(), "", &company, &toml);
+            let cp = checkpoint_of(
+                company.log.origin(),
+                &[Entry {
+                    index: 0,
+                    kind: EntryKind::ManifestPublished,
+                    data: json!({"manifest": manifest.hash()}),
+                }],
+                1,
+            );
+            let mut note = if case == "wrong gateway" {
+                Company::new().sign(&cp)
+            } else {
+                company.sign(&cp)
+            };
+            let now = u64::try_from(chrono::Utc::now().timestamp()).unwrap();
+            if case != "missing witness" {
+                witness.cosign(&mut note, now);
+            }
+            if case == "wrong witness" {
+                note.signatures.last_mut().unwrap().payload[12] ^= 1;
+            }
+            let published = Company::published(&toml, &company.key);
+            let log = company.log.vkey();
+            let note = note.to_string();
+            let gateway = FakeGateway::start(move |line, _| match line {
+                "GET /v1/manifest" => (200, published.clone()),
+                "GET /v1/log/key" => (200, log.clone()),
+                "GET /v1/log/checkpoint" => (200, note.clone()),
+                _ => not_found(),
+            })
+            .await;
+            let result = sync_checkpoint(
+                &http_client().unwrap(),
+                &home,
+                &gateway.url,
+                manifest.body().log.as_ref(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.is_ok(), case == "valid", "{case}: {result:?}");
+            assert_eq!(home.checkpoint().unwrap().is_some(), case == "valid");
+            assert_eq!(
+                gateway.requests(),
+                [
+                    "GET /v1/manifest",
+                    "GET /v1/log/key",
+                    "GET /v1/log/checkpoint"
+                ]
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn own_entries_use_private_endpoint_and_reject_bad_proofs() {
-        for corrupt in [false, true] {
+        for (corrupt, stored) in [(false, false), (false, true), (true, false)] {
             let company = Company::new();
             let witness = Witness::new();
             let toml = witnessed_manifest(&witness);
             let dir = tempfile::tempdir().unwrap();
             let home = enrolled_home_with(dir.path(), "", &company, &toml);
             let mut enrolment = home.enrolment().unwrap();
+            if stored {
+                enrolment.log_entries = Some(OwnEntries {
+                    manifest: 0,
+                    enrolment: 1,
+                });
+            }
             let mine = commitment(&enrolment).unwrap();
             let entries = vec![
                 Entry {

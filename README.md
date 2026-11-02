@@ -116,10 +116,9 @@ This project is licensed under the Apache License, Version 2.0. See [LICENSE](LI
 | `POST /v1/enroll {signed_manifest, device_key, invitation_code, owner_signature, device_signature}` | `{status: "enrolled", device, state, salt, log_index, manifest_log_index, log_checkpoint}`. See [Enrolment](#enrolment). `state` is `pending` until IT approves. |
 | `POST /v1/nonce` | `{nonce}`, single use, valid 5 minutes; 429 after `NONCE_MAX_PER_WINDOW` (default 600) nonces in `NONCE_WINDOW_SECS` (default 60) from one address, IPv6 per /64; 503 while `NONCE_MAX_OUTSTANDING` (default 10000) unexpired nonces exist. Expired nonces are deleted every minute |
 | `POST /v1/claim {jws}` | `{status: "accepted", warnings, certificate_pem, ca_pem, log_checkpoint}`, or 403 `{status: "denied", reasons}` |
+| `POST /v1/log/mine {pseudonym, nonce, signature}` | Approved device only; `{checkpoint, manifest, device}`, each entry with an inclusion proof |
 | `GET /v1/log/key` | the log verifier key, `<origin>+<key id>+<base64 key>` |
 | `GET /v1/log/checkpoint` | the signed checkpoint note, with stored witness cosignatures |
-| `GET /v1/log/entries?from=&to=` | `{entries}`, `from` inclusive, `to` exclusive, at most 256 entries; without `to`, one page |
-| `GET /v1/log/proof/inclusion?index=&size=` | `{index, size, proof}`, hashes in lowercase hex |
 | `GET /v1/log/proof/consistency?from=&to=` | `{from, to, proof}` |
 | `GET /v1/log` | 410: the v0.1.0 hash-chain endpoint is gone |
 | `GET /` | aggregate summary page, no per-device detail |
@@ -234,6 +233,10 @@ The log is a Merkle tree with RFC 9162 (Certificate Transparency 2.0) hashing. A
 - `device_enrolled` `{commitment}` holds `sha256(salt || pseudonym)`, not the pseudonym. The owner keeps the 256-bit salt and can prove the entry is theirs.
 - `device_approved` and `device_revoked` `{commitment}` carry the same commitment when IT approves or revokes the device.
 - `retention_purge` `{claims, period_keys}` counts the claims and month keys that the retention job deleted. It holds no device data. A client older than this entry kind cannot read a log that contains one.
+
+Log entries are private. The public `/v1/log/entries` and `/v1/log/proof/inclusion` routes return 404. An approved device uses `POST /v1/log/mine` to get its signed manifest and its own device entries with inclusion proofs. The log key, signed checkpoint and consistency proofs remain public. Witnesses receive checkpoints and consistency proofs by push; they do not download entries.
+
+An outside auditor can no longer read enrolment events to count devices or identify when each enrolment occurred. The public checkpoint still reveals the total number of log entries, and repeated observations reveal log growth. It does not identify which changes are enrolments. Witnesses verify checkpoint consistency, and each approved device verifies its own entries. This does not provide public inspection of every event.
 
 **Checkpoints.** The gateway signs a checkpoint, the C2SP [tlog-checkpoint](https://c2sp.org/tlog-checkpoint) body `<origin>\n<size>\n<base64 root>\n`, in C2SP [signed-note](https://c2sp.org/signed-note) format. The key name is the origin, set by `LOG_ORIGIN` (default `pact.example.com/log`). The log key is ECDSA P-256, signed-note type `0x02` as transparency-dev/formats implements it: a DER signature over SHA-256, and a key ID from the DER public key. Most C2SP tools use Ed25519. P-256 keeps the log key in the same hardware as the other keys.
 
