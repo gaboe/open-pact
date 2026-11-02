@@ -83,7 +83,7 @@ grep -q '^Gateway keys match the invitation' "$tmp/join"
 grep -q '^Enrolled as pseudonym:' "$tmp/join"
 grep -q '^Transparency log verified' "$tmp/join"
 grep -q '^Inclusion proofs verified: the manifest you signed (#0) and your enrolment' "$tmp/join"
-code="$(sed -nE 's/^Waiting for IT approval. Read this device code to IT: ([0-9a-f]{12})$/\1/p' "$tmp/join")"
+code="$(sed -nE 's/^Device code for IT: ([0-9a-f]{12})$/\1/p' "$tmp/join")"
 [ -n "$code" ]
 echo "join with the untouched invitation: $(grep '^Enrolled' "$tmp/join"), pending, device code $code"
 
