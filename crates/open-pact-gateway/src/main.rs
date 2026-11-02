@@ -1,4 +1,5 @@
 mod claims;
+use open_pact_core::{DeviceAuthPurpose, EntryWithProof, MyEntries, MyEntriesRequest};
 mod devices;
 mod grace;
 mod invitations;
@@ -615,6 +616,98 @@ async fn try_enroll(
     })))
 }
 
+fn device_denied() -> Reply {
+    denied(vec!["device access denied".into()])
+}
+
+async fn consume_nonce(app: &App, nonce: &str) -> Result<(), Reply> {
+    let live: Option<bool> =
+        sqlx::query_scalar("DELETE FROM nonces WHERE nonce = $1 RETURNING expires_at > now()")
+            .bind(nonce)
+            .fetch_optional(&app.db)
+            .await
+            .map_err(internal)?;
+    match live {
+        Some(true) => Ok(()),
+        Some(false) => Err(denied(vec!["expired nonce".into()])),
+        None => Err(denied(vec!["unknown or used nonce".into()])),
+    }
+}
+
+async fn authenticate_device(
+    app: &App,
+    request: &MyEntriesRequest,
+    purpose: DeviceAuthPurpose,
+) -> Result<(), Reply> {
+    request.verify(purpose).map_err(|_| device_denied())?;
+    consume_nonce(app, &request.nonce)
+        .await
+        .map_err(|_| device_denied())
+}
+
+async fn device_status(
+    State(app): State<App>,
+    body: Result<Json<MyEntriesRequest>, JsonRejection>,
+) -> Result<Json<Value>, Reply> {
+    let Json(request) = body.map_err(|_| device_denied())?;
+    authenticate_device(&app, &request, DeviceAuthPurpose::DeviceStatus).await?;
+    let state: Option<String> =
+        sqlx::query_scalar("SELECT state FROM devices WHERE pseudonym = $1 AND manifest_hash = $2")
+            .bind(request.pseudonym.as_str())
+            .bind(app.manifest.hash().as_str())
+            .fetch_optional(&app.db)
+            .await
+            .map_err(internal)?;
+    Ok(Json(json!({"state": state.ok_or_else(device_denied)?})))
+}
+
+async fn log_mine(
+    State(app): State<App>,
+    body: Result<Json<MyEntriesRequest>, JsonRejection>,
+) -> Result<Json<MyEntries>, Reply> {
+    let Json(request) = body.map_err(|_| device_denied())?;
+    authenticate_device(&app, &request, DeviceAuthPurpose::LogMine).await?;
+    let mut tx = app.db.begin().await.map_err(internal)?;
+    let state = devices::lock(&mut tx, &request.pseudonym, app.manifest.hash().as_str())
+        .await
+        .map_err(internal)?;
+    if state != Some(devices::State::Approved) {
+        return Err(device_denied());
+    }
+    let salt: String =
+        sqlx::query_scalar("SELECT salt FROM devices WHERE pseudonym = $1 AND manifest_hash = $2")
+            .bind(request.pseudonym.as_str())
+            .bind(app.manifest.hash().as_str())
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(internal)?;
+    let commitment = devices::commitment(&salt, request.pseudonym.as_str()).map_err(internal)?;
+    let checkpoint = app.checkpoint().await?;
+    let cp = Checkpoint::parse(&checkpoint.text).map_err(internal)?;
+    let tree = app.tree().await?;
+    let entries = translog::mine(&mut tx, cp.size, app.manifest.hash().as_str(), &commitment)
+        .await
+        .map_err(internal)?;
+    let with_proof = |entry: Entry| -> Result<EntryWithProof, Reply> {
+        let proof = inclusion_proof(tree.prefix(cp.size), entry.index).map_err(internal)?;
+        Ok(EntryWithProof { entry, proof })
+    };
+    let mut manifest = None;
+    let mut device = Vec::new();
+    for entry in entries {
+        if entry.kind == EntryKind::ManifestPublished {
+            manifest = Some(with_proof(entry)?);
+        } else {
+            device.push(with_proof(entry)?);
+        }
+    }
+    Ok(Json(MyEntries {
+        checkpoint: checkpoint.to_string(),
+        manifest: manifest.ok_or_else(|| internal("manifest log entry missing"))?,
+        device,
+    }))
+}
+
 async fn claim(
     State(app): State<App>,
     body: Result<Json<ClaimRequest>, JsonRejection>,
@@ -627,17 +720,7 @@ async fn claim(
     };
     let verified = verify_claim(&jws).map_err(|e| denied(vec![e.to_string()]))?;
     let claim = verified.claim();
-    let live: Option<bool> =
-        sqlx::query_scalar("DELETE FROM nonces WHERE nonce = $1 RETURNING expires_at > now()")
-            .bind(&claim.nonce)
-            .fetch_optional(&app.db)
-            .await
-            .map_err(internal)?;
-    match live {
-        None => return Err(denied(vec!["unknown or used nonce".into()])),
-        Some(false) => return Err(denied(vec!["expired nonce".into()])),
-        Some(true) => {}
-    }
+    consume_nonce(&app, &claim.nonce).await?;
     let foreign = match &claim.log_checkpoint {
         Some(cp) => foreign_checkpoint(&app.tree().await?, cp),
         None => None,
@@ -970,6 +1053,8 @@ fn router(app: App) -> Router {
         .route("/v1/log/proof/consistency", get(consistency))
         .route("/v1/nonce", post(nonce))
         .route("/v1/claim", post(claim))
+        .route("/v1/log/mine", post(log_mine))
+        .route("/v1/device/status", post(device_status))
         .with_state(app)
 }
 
@@ -1230,12 +1315,181 @@ mod tests {
             .chain([
                 ("os_patch_age_days".into(), 14.into()),
                 ("antimalware_signature_age_days".into(), 0.into()),
+                ("managed_repos_outside".into(), 0.into()),
             ])
             .collect(),
             csr_sha256: None,
             log_checkpoint: None,
         };
         (key, claim)
+    }
+
+    async fn auth_request(app: &Router, key: &SigningKey, purpose: DeviceAuthPurpose) -> Value {
+        let (_, nonce) = post_json(app, "/v1/nonce", &Value::Null).await;
+        let nonce = nonce["nonce"].as_str().unwrap().to_string();
+        let device_key = PublicKey::from(key);
+        let pseudonym = Pseudonym::of(&device_key);
+        let statement = open_pact_core::device_auth_statement(purpose, &pseudonym, &nonce);
+        serde_json::to_value(MyEntriesRequest {
+            pseudonym,
+            nonce,
+            device_key,
+            signature: open_pact_core::Signature::sign(key, &statement),
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    #[ignore = "needs TEST_DATABASE_URL"]
+    async fn own_log_is_isolated_and_status_is_private() {
+        let (app, db) = test_app_with(DEMO, 100, 100).await;
+        let (first, first_claim) = enrolled_claim(&app, &db, DEMO).await;
+        let (second, second_claim) = enrolled_claim(&app, &db, DEMO).await;
+        sqlx::query("DELETE FROM devices")
+            .execute(&db)
+            .await
+            .unwrap();
+        let mut tx = db.begin().await.unwrap();
+        translog::append(
+            &mut tx,
+            EntryKind::ManifestPublished,
+            json!({"manifest": first_claim.manifest.as_str()}),
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        let keys = Keys::load_or_create(&db, &SealingKey::new(&TEST_KEK))
+            .await
+            .unwrap();
+        let mut private_values = Vec::new();
+        for key in [&first, &second] {
+            let owner = open_pact_core::dev_key::generate();
+            let note = "private owner at example.org";
+            let (code, _) = invitations::create(&db, chrono::Duration::hours(1), note)
+                .await
+                .unwrap();
+            private_values.extend([
+                note.to_string(),
+                code.hash().to_string(),
+                String::from(code.clone()),
+            ]);
+            let signed = open_pact_core::SignedManifest {
+                toml: DEMO.into(),
+                company: Endorsement::sign(&keys.manifest, &first_claim.manifest),
+                owner: Endorsement::sign(&owner, &first_claim.manifest),
+            };
+            let request = EnrolRequest::sign(signed, code, &owner, key).unwrap();
+            let (status, body) =
+                post_json(&app, "/v1/enroll", &serde_json::to_value(request).unwrap()).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            devices::apply(
+                &db,
+                Pseudonym::of(&PublicKey::from(key)).as_str(),
+                devices::Action::Approve,
+            )
+            .await
+            .unwrap();
+        }
+        for (key, own, other) in [
+            (&first, &first_claim, &second_claim),
+            (&second, &second_claim, &first_claim),
+        ] {
+            let request = auth_request(&app, key, DeviceAuthPurpose::LogMine).await;
+            let (status, response) = post_json(&app, "/v1/log/mine", &request).await;
+            assert_eq!(status, StatusCode::OK, "{response}");
+            let mine: MyEntries = serde_json::from_value(response.clone()).unwrap();
+            let cp = LogKey::new("log.example.org/test", &PublicKey::from(&keys.log))
+                .verify(&Note::parse(&mine.checkpoint).unwrap())
+                .unwrap();
+            let salt: String = sqlx::query_scalar("SELECT salt FROM devices WHERE pseudonym = $1")
+                .bind(own.device.as_str())
+                .fetch_one(&db)
+                .await
+                .unwrap();
+            let other_salt: String =
+                sqlx::query_scalar("SELECT salt FROM devices WHERE pseudonym = $1")
+                    .bind(other.device.as_str())
+                    .fetch_one(&db)
+                    .await
+                    .unwrap();
+            let own = devices::commitment(&salt, own.device.as_str()).unwrap();
+            let other = devices::commitment(&other_salt, other.device.as_str()).unwrap();
+            assert_eq!(mine.device.len(), 2);
+            assert!(!response.to_string().contains(&other));
+            assert!(!response.to_string().contains("invitation"));
+            for value in &private_values {
+                assert!(!response.to_string().contains(value));
+            }
+            for item in &mine.device {
+                assert_eq!(item.entry.data["commitment"], own);
+            }
+            for item in std::iter::once(&mine.manifest).chain(&mine.device) {
+                open_pact_core::verify_inclusion(
+                    &item.entry.leaf_hash(),
+                    item.entry.index,
+                    cp.size,
+                    &item.proof,
+                    &cp.root,
+                )
+                .unwrap();
+            }
+            assert_eq!(
+                post_json(&app, "/v1/log/mine", &request).await.0,
+                StatusCode::FORBIDDEN
+            );
+        }
+        let mut denial = None;
+        for state in ["pending", "approved", "revoked"] {
+            sqlx::query("UPDATE devices SET state = $1 WHERE pseudonym = $2")
+                .bind(state)
+                .bind(first_claim.device.as_str())
+                .execute(&db)
+                .await
+                .unwrap();
+            let request = auth_request(&app, &first, DeviceAuthPurpose::DeviceStatus).await;
+            let (status, body) = post_json(&app, "/v1/device/status", &request).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body, json!({"state": state}));
+            if state != "approved" {
+                let request = auth_request(&app, &first, DeviceAuthPurpose::LogMine).await;
+                let (status, body) = post_json(&app, "/v1/log/mine", &request).await;
+                assert_eq!(status, StatusCode::FORBIDDEN);
+                if let Some(previous) = &denial {
+                    assert_eq!(&body, previous);
+                }
+                denial = Some(body);
+            }
+        }
+        let unknown = open_pact_core::dev_key::generate();
+        for path in ["/v1/log/mine", "/v1/device/status"] {
+            let purpose = if path == "/v1/log/mine" {
+                DeviceAuthPurpose::LogMine
+            } else {
+                DeviceAuthPurpose::DeviceStatus
+            };
+            let request = auth_request(&app, &unknown, purpose).await;
+            let (status, body) = post_json(&app, path, &request).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_eq!(Some(body), denial);
+        }
+        for (path, wrong_purpose) in [
+            ("/v1/log/mine", DeviceAuthPurpose::DeviceStatus),
+            ("/v1/device/status", DeviceAuthPurpose::LogMine),
+        ] {
+            let request = auth_request(&app, &second, wrong_purpose).await;
+            assert_eq!(
+                post_json(&app, path, &request).await.0,
+                StatusCode::FORBIDDEN
+            );
+            let mut request = auth_request(&app, &second, wrong_purpose).await;
+            request["signature"] = open_pact_core::sign_claim(&second_claim, &second)
+                .unwrap()
+                .into();
+            assert_eq!(
+                post_json(&app, path, &request).await.0,
+                StatusCode::FORBIDDEN
+            );
+        }
     }
 
     fn bare_csr() -> (String, Vec<u8>) {
