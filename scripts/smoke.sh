@@ -293,7 +293,7 @@ e = json.load(open(sys.argv[1]))
 e["salt"] = ("1" if e["salt"][0] != "1" else "2") + e["salt"][1:]
 json.dump(e, open(sys.argv[1], "w"))
 PY
-expect_status "a log without this device's enrolment raises the alarm" 2 "is not this device's enrolment"
+expect_status "a log without this device's enrolment raises the alarm" 2 "the gateway returned another device's entry"
 
 cp "$tmp/good-enrolment" "$home/enrolment.json"
 python3 - "$home/enrolment.json" <<'PY'
@@ -302,7 +302,7 @@ e = json.load(open(sys.argv[1]))
 e["log_entries"]["manifest"] = e["log_entries"]["enrolment"]
 json.dump(e, open(sys.argv[1], "w"))
 PY
-expect_status "a log without the signed manifest at its index raises the alarm" 2 "is not the manifest you signed"
+expect_status "a log without the signed manifest at its index raises the alarm" 2 "the gateway changed this device's log entry indexes"
 
 python3 - "$home/enrolment.json" <<'PY'
 import json, sys

@@ -830,6 +830,26 @@ fn print_summary(manifest: &Manifest, company: &PublicKey, os: Os) {
         "  Company key  {}  (matches your invitation)",
         company.fingerprint()
     );
+    if let Some(policy) = &b.log {
+        let witnesses = list(&mut policy.witnesses.iter().map(|w| w.name.clone()));
+        println!(
+            "  Witnesses    {}",
+            if witnesses.is_empty() {
+                "none"
+            } else {
+                &witnesses
+            }
+        );
+        println!("  Quorum       {}", policy.witness_quorum);
+        println!(
+            "  Split views  {}",
+            if policy.allow_split_views {
+                "allowed"
+            } else {
+                "not allowed"
+            }
+        );
+    }
     let required = |c: &&open_pact_core::Control| c.required.get(&os).map(ToString::to_string);
     let (not_applicable, applicable): (Vec<_>, Vec<_>) = b
         .controls
@@ -1920,7 +1940,9 @@ async fn check(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
         Err(error)
             if error.downcast_ref::<reqwest::Error>().is_some_and(|error| {
                 error.status() == Some(reqwest::StatusCode::FORBIDDEN)
-                    && error.url().is_some_and(|url| url.path() == "/v1/log/mine")
+                    && error
+                        .url()
+                        .is_some_and(|url| url.path().ends_with("/v1/log/mine"))
             }) =>
         {
             match status_after_log_denial(&http, home, &enrolment).await? {
@@ -3181,7 +3203,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn check_reports_device_state_after_private_log_denial() {
+    async fn check_reports_device_state_after_private_log_denial_under_path_prefix() {
         for state in ["pending", "revoked"] {
             let company = Company::new();
             let witness = Witness::new();
@@ -3195,17 +3217,18 @@ mod tests {
             );
             let checkpoint = checkpoint.to_string();
             let gateway = FakeGateway::start(move |line, _| match line {
-                "GET /v1/manifest" => (200, published.clone()),
-                "GET /v1/log/key" => (200, log.clone()),
-                "GET /v1/log/checkpoint" => (200, checkpoint.clone()),
-                "POST /v1/nonce" => (200, json!({"nonce":"state-nonce"}).to_string()),
-                "POST /v1/log/mine" => (403, json!({"status":"denied"}).to_string()),
-                "POST /v1/device/status" => (200, json!({"state":state}).to_string()),
+                "GET /api/v1/manifest" => (200, published.clone()),
+                "GET /api/v1/log/key" => (200, log.clone()),
+                "GET /api/v1/log/checkpoint" => (200, checkpoint.clone()),
+                "POST /api/v1/nonce" => (200, json!({"nonce":"state-nonce"}).to_string()),
+                "POST /api/v1/log/mine" => (403, json!({"status":"denied"}).to_string()),
+                "POST /api/v1/device/status" => (200, json!({"state":state}).to_string()),
                 _ => not_found(),
             })
             .await;
             let dir = tempfile::tempdir().unwrap();
-            let home = enrolled_home_with(dir.path(), &gateway.url, &company, &toml);
+            let gateway_url = format!("{}/api", gateway.url);
+            let home = enrolled_home_with(dir.path(), &gateway_url, &company, &toml);
             assert_eq!(
                 check(&home, true).await.unwrap(),
                 ExitCode::FAILURE,
@@ -3214,10 +3237,10 @@ mod tests {
             assert_eq!(
                 gateway.posts(),
                 [
-                    "POST /v1/nonce",
-                    "POST /v1/log/mine",
-                    "POST /v1/nonce",
-                    "POST /v1/device/status"
+                    "POST /api/v1/nonce",
+                    "POST /api/v1/log/mine",
+                    "POST /api/v1/nonce",
+                    "POST /api/v1/device/status"
                 ]
             );
             assert!(!home.file("vpn-key.pem").exists());

@@ -136,7 +136,7 @@ The chart restarts the gateway when the manifest changes. Confirm that the gatew
 
 Log entries are private. The public `/v1/log/entries` and `/v1/log/proof/inclusion` routes return 404. An approved device uses `POST /v1/log/mine` to get its signed manifest and its own device entries with inclusion proofs. The log key, signed checkpoint and consistency proofs remain public. Witnesses receive checkpoints and consistency proofs by push; they do not download entries.
 
-An outside auditor can no longer read enrolment events to count devices or identify when each enrolment occurred. The public checkpoint still reveals the total number of log entries, and repeated observations reveal log growth. It does not identify which changes are enrolments. Witnesses verify checkpoint consistency, and each approved device verifies its own entries. This does not provide public inspection of every event.
+Public consistency proofs expose leaf hashes for log changes. An outsider who polls checkpoints can count and time changes. The outsider can recognize manifest and retention-purge entries, then identify the remaining changes as device events. Salted commitments stop the outsider from linking a device event to a device. Entry contents remain private. Witnesses verify checkpoint consistency, and each approved device verifies its own entries.
 
 Operators can read JSON lines directly from the database through `kubectl exec <gateway-pod> -- open-pact-gateway log entries --from 0 --limit 256`. Both flags are optional. Their defaults are 0 and 256. This command requires database access; it does not expose an HTTP route.
 
