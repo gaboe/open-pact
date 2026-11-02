@@ -1122,14 +1122,17 @@ async fn fetch_my_entries(
         device_key: device.public_key(),
         signature: device.sign(&statement)?,
     };
-    Ok(http
+    let response = http
         .post(format!("{gateway}/v1/log/mine"))
         .json(&request)
         .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?)
+        .await?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(anyhow::anyhow!(
+            "The gateway does not support this client version. Ask IT to update the gateway to 0.4.0 or later."
+        ));
+    }
+    Ok(response.error_for_status()?.json().await?)
 }
 
 fn verify_my_entries(
@@ -2847,6 +2850,36 @@ mod tests {
             assert_eq!(gateway.requests(), ["POST /v1/nonce", "POST /v1/log/mine"]);
             assert_eq!(enrolment.log_entries.is_some(), !corrupt);
         }
+    }
+
+    #[tokio::test]
+    async fn old_gateway_returns_a_clear_version_error_without_fetching_the_full_log() {
+        let company = Company::new();
+        let toml = witnessed_manifest(&Witness::new());
+        let dir = tempfile::tempdir().unwrap();
+        let home = enrolled_home_with(dir.path(), "", &company, &toml);
+        let mut enrolment = home.enrolment().unwrap();
+        let mut cp = Checkpoint {
+            origin: company.log.origin().into(),
+            size: 1,
+            root: LogHash([0; 32]),
+        };
+        let gateway = FakeGateway::start(|line, _| match line {
+            "POST /v1/nonce" => (200, json!({"nonce":"old-gateway-nonce"}).to_string()),
+            "POST /v1/log/mine" => not_found(),
+            _ => not_found(),
+        })
+        .await;
+        enrolment.gateway = gateway.url.clone();
+
+        let error = check_own_entries(&http_client().unwrap(), &home, &mut enrolment, &mut cp)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "The gateway does not support this client version. Ask IT to update the gateway to 0.4.0 or later."
+        );
+        assert_eq!(gateway.requests(), ["POST /v1/nonce", "POST /v1/log/mine"]);
     }
 
     #[tokio::test]
