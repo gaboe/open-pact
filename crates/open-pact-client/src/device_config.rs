@@ -541,6 +541,7 @@ grace = "0d"
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn device_config_example_escapes_control_characters_in_repository_locations() {
         let manifest =
