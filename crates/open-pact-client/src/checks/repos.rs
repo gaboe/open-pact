@@ -1,8 +1,9 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::fs;
-use std::io::Write;
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -14,6 +15,18 @@ const PRUNED: &[&str] = &["node_modules", "target", "bin", "obj", ".Trash"];
 /// Folders directly in the user home that hold no repositories. macOS asks for permission
 /// before a program reads the media folders.
 const HOME_PRUNED: &[&str] = &["Library", "Pictures", "Movies", "Music"];
+/// Caches and trash add scan time without expected user repositories.
+const HOME_CACHE_PRUNED: &[&str] = &[
+    ".bun",
+    ".cache",
+    ".cargo",
+    ".rustup",
+    ".npm",
+    ".pnpm-store",
+    ".gradle",
+    ".m2",
+    ".local/share/Trash",
+];
 
 pub(crate) fn lower_process_priority() {
     #[cfg(unix)]
@@ -41,6 +54,14 @@ pub(crate) struct RepoScan {
     pub(crate) partial: bool,
     #[serde(default)]
     pub(crate) access_denied: bool,
+    #[serde(default)]
+    pub(crate) causes: Vec<ScanCause>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct ScanCause {
+    pub(crate) path: PathBuf,
+    pub(crate) kind: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -83,55 +104,63 @@ pub(crate) fn scan_and_store(
         .iter()
         .map(|folder| fs::canonicalize(folder).unwrap_or_else(|_| absolute(folder)))
         .collect::<Vec<_>>();
-    let mut repos = HashSet::new();
     let mut counts = (0_i32, 0_i32);
     let mut outside_paths = Vec::new();
-    let mut partial = false;
-    let mut access_denied = false;
+    let mut walk_state = WalkState::default();
     let repo_partial = Cell::new(false);
     let repo_access_denied = Cell::new(false);
-    walk(
-        root,
-        0,
-        &mut repos,
-        &mut partial,
-        &mut access_denied,
-        &mut |repo| {
-            let urls = match read_remote_urls(repo) {
-                Ok(urls) => urls,
-                Err(error) => {
+    let repo_causes = RefCell::new(Vec::new());
+    let progress = RefCell::new(ScanProgress::new(root));
+    progress.borrow_mut().update(root, 0, 0, true);
+    walk(root, 0, &mut walk_state, &progress, &mut |repo| {
+        let urls = match read_remote_urls(repo) {
+            Ok(urls) => urls,
+            Err(error) => {
+                if is_partial_error(&error) {
                     repo_partial.set(true);
                     repo_access_denied.set(
-                        repo_access_denied.get()
-                            || error.kind() == std::io::ErrorKind::PermissionDenied,
+                        repo_access_denied.get() || error.kind() == io::ErrorKind::PermissionDenied,
                     );
-                    return;
+                    record_cause(
+                        &mut repo_causes.borrow_mut(),
+                        repo.join(".git/config"),
+                        &error,
+                    );
                 }
-            };
-            if !urls
-                .iter()
-                .any(|url| remote_matches(url, &ssh_hosts, patterns))
-            {
                 return;
             }
-            counts.1 += 1;
-            let repo_path = fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
-            if !folders.iter().any(|folder| repo_path.starts_with(folder)) {
-                counts.0 += 1;
-                outside_paths.push(repo_path);
-            }
-        },
-    )?;
-    partial |= repo_partial.get();
-    access_denied |= repo_access_denied.get();
+        };
+        if !urls
+            .iter()
+            .any(|url| remote_matches(url, &ssh_hosts, patterns))
+        {
+            return;
+        }
+        progress.borrow_mut().found_repository(repo);
+        counts.1 += 1;
+        let repo_path = fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
+        if !folders.iter().any(|folder| repo_path.starts_with(folder)) {
+            counts.0 += 1;
+            outside_paths.push(repo_path);
+        }
+    })?;
+    walk_state.partial |= repo_partial.get();
+    walk_state.access_denied |= repo_access_denied.get();
+    walk_state.causes.extend(
+        repo_causes
+            .into_inner()
+            .into_iter()
+            .take(5 - walk_state.causes.len()),
+    );
     outside_paths.sort();
     let scan = RepoScan {
         scanned_at: chrono::Utc::now().timestamp(),
         managed_repos_outside: counts.0,
         managed_repos_total: counts.1,
         outside_paths,
-        partial,
-        access_denied,
+        partial: walk_state.partial,
+        access_denied: walk_state.access_denied,
+        causes: walk_state.causes,
     };
     fs::create_dir_all(home)?;
     let path = home.join(FILE);
@@ -151,7 +180,94 @@ pub(crate) fn scan_and_store(
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
     }
+    progress.borrow_mut().clear();
     Ok(scan)
+}
+
+struct ScanProgress {
+    root: PathBuf,
+    terminal: bool,
+    last_update: Option<Instant>,
+    folders: usize,
+    repositories: usize,
+}
+
+impl ScanProgress {
+    fn new(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            terminal: io::stderr().is_terminal(),
+            last_update: None,
+            folders: 0,
+            repositories: 0,
+        }
+    }
+
+    fn visited(&mut self, path: &Path) {
+        self.folders += 1;
+        self.update(path, self.folders, self.repositories, false);
+    }
+
+    fn found_repository(&mut self, path: &Path) {
+        self.repositories += 1;
+        self.update(path, self.folders, self.repositories, false);
+    }
+
+    fn update(&mut self, path: &Path, folders: usize, repositories: usize, force: bool) {
+        if !self.terminal
+            || (!force
+                && self
+                    .last_update
+                    .is_some_and(|last| last.elapsed() < Duration::from_millis(200)))
+        {
+            return;
+        }
+        self.folders = folders;
+        self.repositories = repositories;
+        let top = path
+            .strip_prefix(&self.root)
+            .ok()
+            .and_then(|relative| relative.components().next())
+            .map(|component| format!("~/{}", component.as_os_str().to_string_lossy()))
+            .unwrap_or_else(|| "~/".to_string());
+        let line = format!(
+            "Searched {} folders, found {} repositories ({top})",
+            self.folders, self.repositories
+        );
+        let mut stderr = io::stderr().lock();
+        let _ = write!(stderr, "\r{line}\x1b[K");
+        let _ = stderr.flush();
+        self.last_update = Some(Instant::now());
+    }
+
+    fn clear(&mut self) {
+        if self.terminal && self.last_update.is_some() {
+            let mut stderr = io::stderr().lock();
+            let _ = write!(stderr, "\r\x1b[2K");
+            let _ = stderr.flush();
+            self.last_update = None;
+        }
+    }
+}
+
+impl Drop for ScanProgress {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
+fn record_cause(causes: &mut Vec<ScanCause>, path: PathBuf, error: &io::Error) {
+    if causes.len() < 5
+        && !matches!(
+            error.kind(),
+            io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+        )
+    {
+        causes.push(ScanCause {
+            path,
+            kind: format!("{:?}", error.kind()),
+        });
+    }
 }
 
 fn absolute(path: &Path) -> PathBuf {
@@ -162,12 +278,19 @@ fn absolute(path: &Path) -> PathBuf {
     }
 }
 
+#[derive(Default)]
+struct WalkState {
+    seen: HashSet<PathBuf>,
+    partial: bool,
+    access_denied: bool,
+    causes: Vec<ScanCause>,
+}
+
 fn walk(
     dir: &Path,
     depth: usize,
-    seen: &mut HashSet<PathBuf>,
-    partial: &mut bool,
-    access_denied: &mut bool,
+    state: &mut WalkState,
+    progress: &RefCell<ScanProgress>,
     visit: &mut impl FnMut(&Path),
 ) -> Result<()> {
     if depth > MAX_DEPTH {
@@ -178,8 +301,7 @@ fn walk(
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => {
-            *partial = true;
-            *access_denied |= error.kind() == std::io::ErrorKind::PermissionDenied;
+            mark_partial(state, dir.to_path_buf(), &error);
             return Ok(());
         }
     }
@@ -187,19 +309,18 @@ fn walk(
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => {
-            *partial = true;
-            *access_denied |= error.kind() == std::io::ErrorKind::PermissionDenied;
+            mark_partial(state, dir.to_path_buf(), &error);
             return Ok(());
         }
     };
+    progress.borrow_mut().visited(dir);
     let mut has_git = false;
     let mut children = Vec::new();
     for entry in entries {
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
-                *partial = true;
-                *access_denied |= error.kind() == std::io::ErrorKind::PermissionDenied;
+                mark_partial(state, dir.to_path_buf(), &error);
                 continue;
             }
         };
@@ -208,8 +329,7 @@ fn walk(
             Ok(meta) => meta.file_type(),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
-                *partial = true;
-                *access_denied |= error.kind() == std::io::ErrorKind::PermissionDenied;
+                mark_partial(state, path, &error);
                 continue;
             }
         };
@@ -223,6 +343,8 @@ fn walk(
         let name = entry.file_name();
         if PRUNED.iter().any(|pruned| name == *pruned)
             || (depth == 0 && HOME_PRUNED.iter().any(|pruned| name == *pruned))
+            || (depth == 0 && HOME_CACHE_PRUNED.iter().any(|pruned| name == *pruned))
+            || (depth == 2 && name == "Trash" && dir.ends_with(".local/share"))
             || name.to_string_lossy().ends_with(".photoslibrary")
         {
             continue;
@@ -231,16 +353,32 @@ fn walk(
     }
     if has_git {
         let canonical = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-        if seen.insert(canonical) {
+        if state.seen.insert(canonical) {
             visit(dir);
         }
     }
     if depth < MAX_DEPTH {
         for child in children {
-            walk(&child, depth + 1, seen, partial, access_denied, visit)?;
+            walk(&child, depth + 1, state, progress, visit)?;
         }
     }
     Ok(())
+}
+
+fn mark_partial(state: &mut WalkState, path: PathBuf, error: &io::Error) {
+    if !is_partial_error(error) {
+        return;
+    }
+    state.partial = true;
+    state.access_denied |= error.kind() == io::ErrorKind::PermissionDenied;
+    record_cause(&mut state.causes, path, error);
+}
+
+fn is_partial_error(error: &io::Error) -> bool {
+    !matches!(
+        error.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+    )
 }
 
 fn read_remote_urls(repo: &Path) -> std::io::Result<Vec<String>> {
@@ -562,6 +700,7 @@ mod tests {
             outside_paths: vec![PathBuf::from("/device/private/repo")],
             partial: false,
             access_denied: false,
+            causes: Vec::new(),
         };
         assert!(fresh(&scan, 100 + MAX_AGE_SECS));
         assert!(!fresh(&scan, 101 + MAX_AGE_SECS));
@@ -585,6 +724,7 @@ mod tests {
             outside_paths: Vec::new(),
             partial: true,
             access_denied: false,
+            causes: Vec::new(),
         };
         fs::write(temp.path().join(FILE), serde_json::to_vec(&scan).unwrap()).unwrap();
         assert_eq!(
@@ -730,6 +870,87 @@ mod tests {
     }
 
     #[test]
+    fn skips_home_cache_repositories_but_finds_code_repositories() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("user");
+        let code = root.join("code/x");
+        let mut repos = HOME_CACHE_PRUNED
+            .iter()
+            .map(|path| root.join(path).join("x"))
+            .collect::<Vec<_>>();
+        repos.push(code.clone());
+        for repo in &repos {
+            fs::create_dir_all(repo.join(".git")).unwrap();
+            fs::write(
+                repo.join(".git/config"),
+                "[remote \"origin\"]\n url = git@github.com:example-org/app.git\n",
+            )
+            .unwrap();
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            root.join("missing-cache-target"),
+            root.join(".cache/broken"),
+        )
+        .unwrap();
+        let scan = scan_and_store(
+            &temp.path().join("client"),
+            &root,
+            &[],
+            &[pattern("github.com/example-org/")],
+        )
+        .unwrap();
+        assert_eq!(scan.managed_repos_total, 1);
+        assert_eq!(scan.outside_paths, vec![fs::canonicalize(code).unwrap()]);
+        assert!(!scan.partial);
+    }
+
+    #[test]
+    fn scan_ignores_raced_non_directories_but_keeps_permission_errors_partial() {
+        let mut state = WalkState::default();
+        mark_partial(
+            &mut state,
+            PathBuf::from("/home/cache-entry"),
+            &io::Error::from(io::ErrorKind::NotADirectory),
+        );
+        assert!(!state.partial);
+        assert!(state.causes.is_empty());
+        mark_partial(
+            &mut state,
+            PathBuf::from("/home/private"),
+            &io::Error::from(io::ErrorKind::PermissionDenied),
+        );
+        assert!(state.partial && state.access_denied);
+        assert_eq!(state.causes.len(), 1);
+        assert_eq!(state.causes[0].path, PathBuf::from("/home/private"));
+    }
+
+    #[test]
+    fn scan_records_at_most_five_causes() {
+        let mut causes = Vec::new();
+        for n in 0..8 {
+            record_cause(
+                &mut causes,
+                PathBuf::from(format!("/home/unreadable-{n}")),
+                &io::Error::from(io::ErrorKind::PermissionDenied),
+            );
+        }
+        assert_eq!(causes.len(), 5);
+    }
+
+    #[test]
+    fn old_scan_files_load_without_causes() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join(FILE),
+            br#"{"scanned_at":100,"managed_repos_outside":0,"managed_repos_total":0,"outside_paths":[],"partial":true,"access_denied":false}"#,
+        )
+        .unwrap();
+        let scan = load_attempt(temp.path()).unwrap().unwrap();
+        assert!(scan.causes.is_empty());
+    }
+
+    #[test]
     fn returns_unknown_control_values_without_a_fresh_scan() {
         let manifest =
             open_pact_core::Manifest::parse(include_bytes!("../../../../examples/manifest.toml"))
@@ -775,6 +996,7 @@ mod tests {
             outside_paths: vec![PathBuf::from("/device/private/repo")],
             partial: false,
             access_denied: false,
+            causes: Vec::new(),
         };
         let values = super::super::run(open_pact_core::Os::Linux, &controls, None, Some(&scan));
         assert_eq!(
@@ -884,6 +1106,7 @@ mod tests {
             outside_paths: vec![PathBuf::from("/device/private/repo")],
             partial: false,
             access_denied: false,
+            causes: Vec::new(),
         };
         fs::create_dir_all(temp.path()).unwrap();
         fs::write(temp.path().join(FILE), serde_json::to_vec(&scan).unwrap()).unwrap();

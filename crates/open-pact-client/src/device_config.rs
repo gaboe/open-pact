@@ -123,18 +123,60 @@ pub(crate) fn example(manifest: &open_pact_core::Manifest, os: open_pact_core::O
     let mut output = String::from(
         "# Review this template. The client writes it only through `finish`, after your confirmation.\n",
     );
-    for control in &manifest.body().controls {
-        let requirement = control
-            .required
-            .get(&os)
-            .map(ToString::to_string)
-            .unwrap_or_else(|| "report only".into());
-        for line in format!("{} requires {} on {}", control.id, requirement, os).lines() {
-            output.push_str(&format!("# {line}\n"));
-        }
+    let controls = &manifest.body().controls;
+    let required = controls
+        .iter()
+        .filter_map(|control| {
+            control
+                .required
+                .get(&os)
+                .map(|value| (control.id.as_str(), value))
+        })
+        .collect::<Vec<_>>();
+    let reported = controls
+        .iter()
+        .filter(|control| control.required.is_empty())
+        .map(|control| control.id.as_str())
+        .collect::<Vec<_>>();
+    let not_checked = controls
+        .iter()
+        .filter(|control| !control.required.is_empty() && !control.required.contains_key(&os))
+        .map(|control| control.id.as_str())
+        .collect::<Vec<_>>();
+
+    output.push_str(&format!("# Company requirements on {os}:\n"));
+    let id_width = required.iter().map(|(id, _)| id.len()).max().unwrap_or(0);
+    for (id, value) in required {
+        output.push_str(&format!("#   {id:<id_width$}  {value}\n"));
     }
+    append_comment_list(&mut output, "Reported only, no requirement:", &reported);
+    append_comment_list(&mut output, &format!("Not checked on {os}:"), &not_checked);
     output.push_str(&format!("\n{CONFIG_TEMPLATE}\n"));
     output
+}
+
+fn append_comment_list(output: &mut String, label: &str, ids: &[&str]) {
+    output.push_str(&format!("# {label}\n"));
+    let mut line = String::from("#   ");
+    for (index, id) in ids.iter().enumerate() {
+        let item = if index == 0 {
+            (*id).to_string()
+        } else {
+            format!(", {id}")
+        };
+        if line.len() + item.len() > 80 && line.len() > 4 {
+            output.push_str(&line);
+            output.push('\n');
+            line = String::from("#   ");
+            line.push_str(id);
+        } else {
+            line.push_str(&item);
+        }
+    }
+    if line.len() > 4 {
+        output.push_str(&line);
+        output.push('\n');
+    }
 }
 
 pub(crate) fn print_table(
@@ -207,8 +249,17 @@ mod tests {
         let text = example(&manifest, open_pact_core::Os::Macos);
         let config = DeviceConfig::parse(&text, Some(Path::new("/home/example"))).unwrap();
         assert!(!config.schedule.unwrap().enabled);
+        assert!(text.contains("# Company requirements on macos:"));
+        assert!(text.contains("# Reported only, no requirement:"));
+        assert!(text.contains("# Not checked on macos:"));
+        assert!(!text.contains(" requires "));
+        let grouped = text
+            .lines()
+            .skip_while(|line| !line.starts_with("# Company requirements"))
+            .take_while(|line| !line.is_empty());
+        assert!(grouped.into_iter().all(|line| line.len() <= 80));
         for control in &manifest.body().controls {
-            assert!(text.contains(&format!("# {} requires ", control.id)));
+            assert!(text.contains(control.id.as_str()));
         }
     }
 

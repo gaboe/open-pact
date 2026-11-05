@@ -47,7 +47,7 @@ pub fn fix_hint(check: &str, value: &str, os: Os) -> Option<&'static str> {
     }
     if value == "unknown" {
         return Some(
-            "This check could not read the setting. Make sure the system tool it uses is installed and run the check again.",
+            "This check could not read the setting. Run the check again; if it stays unknown, tell IT.",
         );
     }
     match (check, os) {
@@ -214,6 +214,16 @@ mod tests {
     #[test]
     fn unknown_check_has_no_hint() {
         assert_eq!(fix_hint("nonsense", "none", Os::Macos), None);
+    }
+
+    #[test]
+    fn generic_unknown_hint_does_not_guess_that_a_tool_is_missing() {
+        assert_eq!(
+            fix_hint("os_auto_updates", "unknown", Os::Macos),
+            Some(
+                "This check could not read the setting. Run the check again; if it stays unknown, tell IT."
+            )
+        );
     }
 
     #[test]

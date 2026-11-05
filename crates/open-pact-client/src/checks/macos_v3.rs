@@ -57,18 +57,50 @@ fn parse_activation_lock(text: &str) -> ControlValue {
 }
 
 pub fn os_auto_updates() -> ControlValue {
-    let values = ["ConfigDataInstall", "CriticalUpdateInstall"].map(|key| {
-        command(
-            "/usr/bin/defaults",
-            &["read", "/Library/Preferences/com.apple.SoftwareUpdate", key],
-        )
-    });
-    parse_update_flags(values[0].as_deref(), values[1].as_deref())
+    let values = ["ConfigDataInstall", "CriticalUpdateInstall"].map(update_setting);
+    parse_update_flags(values[0], values[1])
 }
-fn parse_update_flags(data: Option<&str>, critical: Option<&str>) -> ControlValue {
-    match (data.map(str::trim), critical.map(str::trim)) {
-        (Some("0"), _) | (_, Some("0")) => "off".into(),
-        (Some("1"), Some("1")) => "on".into(),
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UpdateSetting {
+    On,
+    Off,
+    Unknown,
+}
+
+fn update_setting(key: &str) -> UpdateSetting {
+    let Some(result) = run_status(
+        "/usr/bin/defaults",
+        &["read", "/Library/Preferences/com.apple.SoftwareUpdate", key],
+    ) else {
+        return UpdateSetting::Unknown;
+    };
+    classify_update_result(result.success, &result.text)
+}
+
+fn classify_update_result(success: bool, text: &str) -> UpdateSetting {
+    if success {
+        return parse_update_value(text);
+    }
+    if text.contains("Could not find key") {
+        UpdateSetting::On
+    } else {
+        UpdateSetting::Unknown
+    }
+}
+
+fn parse_update_value(value: &str) -> UpdateSetting {
+    match value.trim() {
+        "0" => UpdateSetting::Off,
+        "1" => UpdateSetting::On,
+        _ => UpdateSetting::Unknown,
+    }
+}
+
+fn parse_update_flags(data: UpdateSetting, critical: UpdateSetting) -> ControlValue {
+    match (data, critical) {
+        (UpdateSetting::Off, _) | (_, UpdateSetting::Off) => "off".into(),
+        (UpdateSetting::On, UpdateSetting::On) => "on".into(),
         _ => "unknown".into(),
     }
 }
@@ -385,16 +417,42 @@ mod tests {
 mod v31_tests {
     use super::*;
     #[test]
-    fn update_flags_need_both_security_data_settings() {
+    fn update_flags_treat_absent_settings_as_enabled() {
         for (data, critical, expected) in [
-            (Some("1\n"), Some("1"), "on"),
-            (Some("0"), Some("1"), "off"),
-            (Some("1"), Some("0"), "off"),
-            (None, Some("1"), "unknown"),
-            (Some("true"), Some("1"), "unknown"),
+            (UpdateSetting::On, UpdateSetting::On, "on"),
+            (UpdateSetting::Off, UpdateSetting::On, "off"),
+            (UpdateSetting::On, UpdateSetting::Off, "off"),
+            (UpdateSetting::Unknown, UpdateSetting::On, "unknown"),
+            (UpdateSetting::On, UpdateSetting::Unknown, "unknown"),
         ] {
             assert_eq!(parse_update_flags(data, critical), expected);
         }
+    }
+
+    #[test]
+    fn update_values_accept_only_zero_and_one() {
+        assert_eq!(parse_update_value("1\n"), UpdateSetting::On);
+        assert_eq!(parse_update_value("0"), UpdateSetting::Off);
+        assert_eq!(parse_update_value("true"), UpdateSetting::Unknown);
+    }
+
+    #[test]
+    fn update_command_distinguishes_absent_keys_from_failures() {
+        assert_eq!(
+            classify_update_result(false, "Could not find key ConfigDataInstall"),
+            UpdateSetting::On
+        );
+        assert_eq!(
+            classify_update_result(false, "domain could not be read"),
+            UpdateSetting::Unknown
+        );
+        assert_eq!(
+            parse_update_flags(
+                classify_update_result(false, "Could not find key ConfigDataInstall"),
+                classify_update_result(true, "1"),
+            ),
+            "on"
+        );
     }
     #[test]
     fn xprotect_realtime_fixtures() {

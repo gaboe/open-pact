@@ -55,11 +55,11 @@ The client keeps its files in `~/.config/open-pact/`, or in the directory given 
 | `log-checkpoint.txt` | the last verified, gateway-signed log checkpoint |
 | `claims.jsonl` | every claim sent and every response, byte for byte |
 | `reports.jsonl` | history from limited jobs and manual reports for the last 90 days; Windows SYSTEM scheduled history stays in protected state |
-| `repo-scan.json` | the local scan time, counts, and paths of matching repositories outside registered folders |
+| `repo-scan.json` | the local scan time, counts, matching repository paths, and up to five scan causes |
 
 Managed-repository reports send only the counts. Outside paths stay in `repo-scan.json` and appear only in local `check` output. See [client controls](docs/controls.md) for scan depth, skipped folders, and limits.
 
-On macOS, grant Full Disk Access to the client binary in System Settings before you use repository counts. If `check` reports unknown repository values, add the printed client binary under Privacy & Security, then Full Disk Access. The client does not print denied folder paths.
+On macOS, grant Full Disk Access to the client binary in System Settings before you use repository counts. If `check` reports unknown repository values, add the printed client binary under Privacy & Security, then Full Disk Access. A partial scan prints up to five unreadable paths and error kinds. These paths stay local.
 
 On Unix, `vpn/current/` is a directory link. The two top-level links can straddle a replacement between two reads.
 

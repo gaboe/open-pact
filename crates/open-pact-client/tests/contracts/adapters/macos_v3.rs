@@ -5,7 +5,12 @@ use open_pact_core::ControlValue;
 pub(crate) fn run(id: &str, case: &Case) -> ControlValue {
     let text = case.text(0);
     match id {
-        "os_auto_updates" => parse_update_flags(case.optional(0), case.optional(1)),
+        "os_auto_updates" => parse_update_flags(
+            case.optional(0)
+                .map_or(UpdateSetting::Unknown, parse_update_value),
+            case.optional(1)
+                .map_or(UpdateSetting::Unknown, parse_update_value),
+        ),
         "antimalware_realtime" => parse_realtime(text),
         "work_account" => parse_groups(text, &[80]),
         "uptime_days" => parse_boot_time(text, case.now().timestamp()),
