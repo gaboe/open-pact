@@ -109,6 +109,12 @@ pub fn check_supported(manifest: &Manifest) -> Result<(), String> {
     }
 }
 
+pub(crate) fn can_check(os: Os, id: &str) -> bool {
+    registry(os)
+        .iter()
+        .any(|(registered_id, _)| *registered_id == id)
+}
+
 #[allow(dead_code)]
 pub(crate) struct CheckInput<'a> {
     pub(crate) control: &'a Control,

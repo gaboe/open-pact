@@ -43,21 +43,53 @@ const HOME_CACHE_PRUNED: &[&str] = &[
     ".local/share/Trash",
 ];
 
-pub(crate) fn outside_repo_groups(scan: &RepoScan, home: &Path) -> Vec<(String, usize)> {
-    let mut groups = BTreeMap::<String, usize>::new();
+pub(crate) fn managed_repo_groups(paths: &[PathBuf], home: &Path) -> Vec<(String, usize)> {
+    let mut groups = BTreeMap::<String, BTreeMap<Option<String>, usize>>::new();
     let home = fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
-    for path in &scan.outside_paths {
+    for path in paths {
         let Some(relative) = path.strip_prefix(&home).ok() else {
             continue;
         };
-        let Some(first) = relative.components().next() else {
-            *groups.entry("~/".to_string()).or_default() += 1;
+        let Some(parent) = relative.parent() else {
+            *groups
+                .entry("~".to_string())
+                .or_default()
+                .entry(None)
+                .or_default() += 1;
             continue;
         };
-        let folder = format!("~/{}", first.as_os_str().to_string_lossy());
-        *groups.entry(folder).or_default() += 1;
+        let mut components = parent.components();
+        let Some(first) = components.next() else {
+            *groups
+                .entry("~".to_string())
+                .or_default()
+                .entry(None)
+                .or_default() += 1;
+            continue;
+        };
+        let first = first.as_os_str().to_string_lossy().to_string();
+        let second = components
+            .next()
+            .map(|part| part.as_os_str().to_string_lossy().to_string());
+        *groups.entry(first).or_default().entry(second).or_default() += 1;
     }
-    groups.into_iter().collect()
+    let mut result = Vec::new();
+    for (first, children) in groups {
+        let second_levels = children.keys().filter(|second| second.is_some()).count();
+        if second_levels >= 2 {
+            for (second, count) in children {
+                let path = second.map_or_else(
+                    || format!("~/{first}"),
+                    |second| format!("~/{first}/{second}"),
+                );
+                result.push((path, count));
+            }
+        } else {
+            result.push((format!("~/{first}"), children.values().sum()));
+        }
+    }
+    result.sort_by(|left, right| left.0.cmp(&right.0));
+    result
 }
 
 pub(crate) fn lower_process_priority() {
@@ -82,6 +114,8 @@ pub(crate) struct RepoScan {
     pub(crate) managed_repos_outside: i32,
     pub(crate) managed_repos_total: i32,
     pub(crate) outside_paths: Vec<PathBuf>,
+    #[serde(default)]
+    pub(crate) managed_paths: Option<Vec<PathBuf>>,
     #[serde(default)]
     pub(crate) partial: bool,
     #[serde(default)]
@@ -138,6 +172,7 @@ pub(crate) fn scan_and_store(
         .collect::<Vec<_>>();
     let mut counts = (0_i32, 0_i32);
     let mut outside_paths = Vec::new();
+    let mut managed_paths = Vec::new();
     let mut walk_state = WalkState::default();
     let repo_partial = Cell::new(false);
     let repo_access_denied = Cell::new(false);
@@ -171,6 +206,7 @@ pub(crate) fn scan_and_store(
         progress.borrow_mut().found_repository(repo);
         counts.1 += 1;
         let repo_path = fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
+        managed_paths.push(repo_path.clone());
         if !folders.iter().any(|folder| repo_path.starts_with(folder)) {
             counts.0 += 1;
             outside_paths.push(repo_path);
@@ -185,11 +221,13 @@ pub(crate) fn scan_and_store(
             .take(5 - walk_state.causes.len()),
     );
     outside_paths.sort();
+    managed_paths.sort();
     let scan = RepoScan {
         scanned_at: chrono::Utc::now().timestamp(),
         managed_repos_outside: counts.0,
         managed_repos_total: counts.1,
         outside_paths,
+        managed_paths: Some(managed_paths),
         partial: walk_state.partial,
         access_denied: walk_state.access_denied,
         causes: walk_state.causes,
@@ -740,6 +778,7 @@ mod tests {
             managed_repos_outside: 1,
             managed_repos_total: 1,
             outside_paths: vec![PathBuf::from("/device/private/repo")],
+            managed_paths: None,
             partial: false,
             access_denied: false,
             causes: Vec::new(),
@@ -764,6 +803,7 @@ mod tests {
             managed_repos_outside: 0,
             managed_repos_total: 0,
             outside_paths: Vec::new(),
+            managed_paths: None,
             partial: true,
             access_denied: false,
             causes: Vec::new(),
@@ -822,8 +862,14 @@ mod tests {
         let saved: RepoScan = serde_json::from_slice(&saved).unwrap();
         assert_eq!(
             saved.outside_paths,
-            vec![fs::canonicalize(outside).unwrap()]
+            vec![fs::canonicalize(&outside).unwrap()]
         );
+        let mut expected_managed = vec![
+            fs::canonicalize(&managed).unwrap(),
+            fs::canonicalize(&outside).unwrap(),
+        ];
+        expected_managed.sort();
+        assert_eq!(saved.managed_paths, Some(expected_managed));
         let saved_json = serde_json::to_string(&saved).unwrap();
         assert!(!saved_json.contains("github.com"));
         #[cfg(unix)]
@@ -990,6 +1036,7 @@ mod tests {
         .unwrap();
         let scan = load_attempt(temp.path()).unwrap().unwrap();
         assert!(scan.causes.is_empty());
+        assert_eq!(scan.managed_paths, None);
     }
 
     #[test]
@@ -1036,6 +1083,7 @@ mod tests {
             managed_repos_outside: 1,
             managed_repos_total: 2,
             outside_paths: vec![PathBuf::from("/device/private/repo")],
+            managed_paths: Some(vec![PathBuf::from("/device/private/repo")]),
             partial: false,
             access_denied: false,
             causes: Vec::new(),
@@ -1160,6 +1208,7 @@ mod tests {
             managed_repos_outside: 1,
             managed_repos_total: 1,
             outside_paths: vec![PathBuf::from("/device/private/repo")],
+            managed_paths: None,
             partial: false,
             access_denied: false,
             causes: Vec::new(),
