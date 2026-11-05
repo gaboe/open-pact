@@ -10,7 +10,9 @@ mod schedule;
 mod secure_enclave;
 mod ui;
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -170,7 +172,6 @@ struct DeviceStatusResponse {
 enum ApprovalWait {
     Approved,
     Revoked,
-    Interrupted,
 }
 
 #[derive(Clone, Copy)]
@@ -178,7 +179,6 @@ struct JoinOptions {
     insecure_dev: bool,
     no_wait: bool,
     poll_interval: Duration,
-    yes: bool,
 }
 
 #[derive(Debug)]
@@ -261,6 +261,72 @@ enum Response {
 }
 
 struct Home(PathBuf);
+
+tokio::task_local! {
+    static WIZARD_STEP: Cell<u8>;
+}
+
+fn wizard_step(step: u8, title: &str) {
+    let _ = WIZARD_STEP.try_with(|current| current.set(step));
+    ui::step(step, 6, title);
+}
+
+async fn run_wizard<F>(
+    home: &Home,
+    invitation: Option<&str>,
+    no_wait: bool,
+    operation: F,
+) -> Result<ExitCode>
+where
+    F: Future<Output = Result<ExitCode>>,
+{
+    if !wizard_enabled(no_wait) {
+        return operation.await;
+    }
+
+    let initial_step = if home.file("enrolment.json").exists() {
+        4
+    } else {
+        1
+    };
+    WIZARD_STEP
+        .scope(Cell::new(initial_step), async {
+            tokio::select! {
+                signal = tokio::signal::ctrl_c() => match signal {
+                    Ok(()) => {
+                        print_stopped(home, invitation);
+                        Ok(ExitCode::from(130))
+                    }
+                    Err(error) => Err(error.into()),
+                },
+                result = operation => {
+                    if !matches!(&result, Ok(code) if *code == ExitCode::SUCCESS) {
+                        print_stopped(home, invitation);
+                    }
+                    result
+                },
+            }
+        })
+        .await
+}
+
+fn print_stopped(home: &Home, invitation: Option<&str>) {
+    let step = WIZARD_STEP.try_with(Cell::get).unwrap_or(1);
+    let command = client_command(&home.0);
+    let enrolled = home
+        .read_json::<Enrolment>("enrolment.json")
+        .ok()
+        .flatten()
+        .is_some();
+    let continuation = if enrolled {
+        format!("{command} join")
+    } else if let Some(invitation) = invitation {
+        format!("{command} join {invitation}")
+    } else {
+        format!("{command} join <invitation from IT>")
+    };
+    println!("Stopped at [{step}/6]. Continue with: {continuation}");
+}
 
 /// The directory of VPN credential generations, the selected generation, and its files,
 /// CA first.
@@ -980,12 +1046,19 @@ fn print_summary(manifest: &Manifest, company: &PublicKey, os: Os) {
     println!();
 }
 
-fn confirm(question: &str) -> Result<bool> {
+async fn confirm(question: &str) -> Result<bool> {
     print!("{question} [y/N] ");
     std::io::stdout().flush()?;
-    let mut answer = String::new();
-    std::io::stdin().lock().read_line(&mut answer)?;
-    Ok(matches!(answer.trim(), "y" | "Y" | "yes"))
+    let (send, receive) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let result: std::io::Result<bool> = (|| {
+            let mut answer = String::new();
+            std::io::stdin().lock().read_line(&mut answer)?;
+            Ok(matches!(answer.trim(), "y" | "Y" | "yes"))
+        })();
+        let _ = send.send(result);
+    });
+    Ok(receive.await.context("confirmation input stopped")??)
 }
 
 enum LogSync {
@@ -1220,7 +1293,7 @@ fn write_proposal(home: &Home, expected: Option<&[u8]>, proposal: &str) -> Resul
 
 async fn finish(home: &Home, insecure_dev: bool, yes: bool, wizard: bool) -> Result<ExitCode> {
     if wizard {
-        ui::step(5, 6, "Set up this device");
+        wizard_step(5, "Set up this device");
     }
     let path = home.file(device_config::FILE);
     reject_config_symlink(&path)?;
@@ -1247,26 +1320,15 @@ async fn finish(home: &Home, insecure_dev: bool, yes: bool, wizard: bool) -> Res
         print!("{}", unified_diff(existing_text.as_deref(), &proposal));
     }
     if !unchanged && !yes {
-        match confirm("Write open-pact.toml?") {
+        match confirm("Write open-pact.toml?").await {
             Ok(true) => {}
             Ok(false) => {
                 if wizard {
-                    println!(
-                        "Stopped at [5/6]. Continue with: {} join",
-                        client_command(&home.0)
-                    );
+                    print_stopped(home, None);
                 }
                 return Ok(ExitCode::SUCCESS);
             }
-            Err(error) => {
-                if wizard {
-                    println!(
-                        "Stopped at [5/6]. Continue with: {} join",
-                        client_command(&home.0)
-                    );
-                }
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         }
     }
     if !unchanged && let Some(backup) = write_proposal(home, existing_bytes.as_deref(), &proposal)?
@@ -1274,50 +1336,31 @@ async fn finish(home: &Home, insecure_dev: bool, yes: bool, wizard: bool) -> Res
         println!("Backup written to {}", backup.display());
     }
     if wizard {
-        ui::step(6, 6, "First check and claim");
+        wizard_step(6, "First check and claim");
     }
     match check_impl(home, insecure_dev, !wizard).await {
         Ok(code) => Ok(code),
-        Err(error) => {
-            if wizard {
-                println!(
-                    "Stopped at [6/6]. Continue with: {} join",
-                    client_command(&home.0)
-                );
-            }
-            Err(error)
-        }
+        Err(error) => Err(error),
     }
 }
 
-async fn after_approval(
-    home: &Home,
-    insecure_dev: bool,
-    yes: bool,
-    wizard: bool,
-) -> Result<ExitCode> {
+async fn after_approval(home: &Home, insecure_dev: bool, wizard: bool) -> Result<ExitCode> {
     if !wizard {
         print_approved_next_step(&client_command(&home.0));
         return Ok(ExitCode::SUCCESS);
     }
     match wizard_resume(home)? {
-        WizardResume::Finish => return finish(home, insecure_dev, yes, true).await,
+        WizardResume::Finish => return finish(home, insecure_dev, false, true).await,
         WizardResume::Complete => {
             println!("This device setup is complete.");
             return Ok(ExitCode::SUCCESS);
         }
         WizardResume::FirstCheck => {}
     }
-    ui::step(6, 6, "First check and claim");
+    wizard_step(6, "First check and claim");
     match check_impl(home, insecure_dev, false).await {
         Ok(code) => Ok(code),
-        Err(error) => {
-            println!(
-                "Stopped at [6/6]. Continue with: {} join",
-                client_command(&home.0)
-            );
-            Err(error)
-        }
+        Err(error) => Err(error),
     }
 }
 
@@ -1329,13 +1372,51 @@ enum WizardResume {
 }
 
 fn wizard_resume(home: &Home) -> Result<WizardResume> {
-    if !home.file(device_config::FILE).exists() {
+    let configured = home.file(device_config::FILE).exists();
+    let records = match locallog::read(&home.file("claims.jsonl")) {
+        Ok(records) => records,
+        Err(error) => {
+            println!(
+                "warning: could not read claim history; wizard completion cannot be confirmed ({error})"
+            );
+            return Ok(if configured {
+                WizardResume::FirstCheck
+            } else {
+                WizardResume::Finish
+            });
+        }
+    };
+    if !configured {
         return Ok(WizardResume::Finish);
     }
-    if locallog::read(&home.file("claims.jsonl"))?.is_empty() {
-        Ok(WizardResume::FirstCheck)
-    } else {
+    let Some(record) = records.last() else {
+        return Ok(WizardResume::FirstCheck);
+    };
+    if !record
+        .status
+        .is_some_and(|status| (200..300).contains(&status))
+    {
+        return Ok(WizardResume::FirstCheck);
+    }
+    let response = record.response()?;
+    let Ok(Response::Accepted {
+        certificate_pem: Some(certificate),
+        ca_pem,
+        ..
+    }) = serde_json::from_slice::<Response>(&response)
+    else {
+        return Ok(WizardResume::FirstCheck);
+    };
+    let installed_certificate = read_optional_file(&home.file("vpn-cert.pem"))
+        .ok()
+        .flatten();
+    let installed_ca = read_optional_file(&home.file("ca.pem")).ok().flatten();
+    if installed_certificate.as_deref() == Some(certificate.as_bytes())
+        && installed_ca.as_deref() == Some(ca_pem.as_bytes())
+    {
         Ok(WizardResume::Complete)
+    } else {
+        Ok(WizardResume::FirstCheck)
     }
 }
 struct Pins {
@@ -1891,16 +1972,12 @@ async fn wait_for_approval(
     loop {
         if !first_poll {
             tokio::select! {
-                _ = tokio::signal::ctrl_c() => return Ok(Ok(ApprovalWait::Interrupted)),
                 _ = tokio::time::sleep(poll_interval) => {}
             }
         }
         let first = first_poll;
         first_poll = false;
-        let status_result = tokio::select! {
-            result = fetch_device_status(http, home, enrolment) => result,
-            _ = tokio::signal::ctrl_c() => return Ok(Ok(ApprovalWait::Interrupted)),
-        };
+        let status_result = fetch_device_status(http, home, enrolment).await;
         let status = match status_result {
             Ok(status) => status,
             Err(WaitError::Network) => {
@@ -1918,10 +1995,7 @@ async fn wait_for_approval(
             Approval::Pending if !first => print_waiting_line("Waiting for IT approval..."),
             Approval::Pending => {}
             Approval::Approved => {
-                let proof_result = tokio::select! {
-                    result = verify_approval_entry(http, home, enrolment, manifest) => result,
-                    _ = tokio::signal::ctrl_c() => return Ok(Ok(ApprovalWait::Interrupted)),
-                };
+                let proof_result = verify_approval_entry(http, home, enrolment, manifest).await;
                 match proof_result {
                     Err(WaitError::Network) => {
                         if !warning_printed {
@@ -1966,10 +2040,6 @@ fn approval_exit(wait: ApprovalWait, command: &str) -> ExitCode {
             println!("\nThis device was revoked. Contact IT before you continue.");
             ExitCode::FAILURE
         }
-        ApprovalWait::Interrupted => {
-            println!("\nStopped waiting. Run `join` again or `check` to continue.");
-            ExitCode::SUCCESS
-        }
     }
 }
 
@@ -1981,7 +2051,7 @@ async fn wait_after_join(
     options: JoinOptions,
     wizard: bool,
 ) -> Result<ExitCode> {
-    ui::step(4, 6, "Wait for IT approval");
+    wizard_step(4, "Wait for IT approval");
     println!(
         "  {}\n",
         ui::device_code_line(&device_code(&enrolment.device), ui::styled())
@@ -2003,21 +2073,13 @@ async fn wait_after_join(
     match wait_for_approval(http, home, enrolment, manifest, options.poll_interval).await? {
         Ok(ApprovalWait::Approved) if wizard => {
             println!("\n  {}", ui::bold(approval_confirmation(), ui::styled()));
-            after_approval(home, options.insecure_dev, options.yes, true).await
-        }
-        Ok(ApprovalWait::Interrupted) if wizard => {
-            println!("\nStopped at [4/6]. Continue with: {command} join");
-            print_claim_log_status(home, None, Some("approval has not been verified yet"));
-            Ok(ExitCode::SUCCESS)
+            after_approval(home, options.insecure_dev, true).await
         }
         Ok(wait) => {
             let code = approval_exit(wait, &command);
             match wait {
                 ApprovalWait::Approved => {
                     print_claim_log_status(home, None, Some("finish and check have not run yet"))
-                }
-                ApprovalWait::Interrupted => {
-                    print_claim_log_status(home, None, Some("approval has not been verified yet"))
                 }
                 ApprovalWait::Revoked => {
                     print_claim_log_status(home, None, Some("IT revoked this device"));
@@ -2053,7 +2115,7 @@ async fn continue_saved_join(
                 match verify_approval_entry(http, home, enrolment, manifest).await {
                     Ok(true) => {
                         println!("\n  {}", ui::bold(approval_confirmation(), ui::styled()));
-                        return after_approval(home, options.insecure_dev, options.yes, true).await;
+                        return after_approval(home, options.insecure_dev, true).await;
                     }
                     Ok(false) | Err(WaitError::Network) => {}
                     Err(WaitError::Alarm(error)) => {
@@ -2089,7 +2151,6 @@ async fn resume_join(
     insecure_dev: bool,
     no_wait: bool,
     poll_interval: Duration,
-    yes: bool,
 ) -> Result<ExitCode> {
     let enrolment: Enrolment = home
         .read_json("enrolment.json")?
@@ -2101,15 +2162,7 @@ async fn resume_join(
     let published: PublishedManifest =
         match get_json(&http, format!("{}/v1/manifest", base(&enrolment.gateway))).await {
             Ok(published) => published,
-            Err(error) => {
-                if wizard_enabled(no_wait) {
-                    println!(
-                        "Stopped at [4/6]. Continue with: {} join",
-                        client_command(&home.0)
-                    );
-                }
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         };
     let manifest = Manifest::parse(published.toml.as_bytes())?;
     if !published.company.verify(manifest.hash()) {
@@ -2131,15 +2184,7 @@ async fn resume_join(
     .await
     {
         Ok(checkpoint) => checkpoint,
-        Err(error) => {
-            if wizard_enabled(no_wait) {
-                println!(
-                    "Stopped at [4/6]. Continue with: {} join",
-                    client_command(&home.0)
-                );
-            }
-            return Err(error);
-        }
+        Err(error) => return Err(error),
     };
     if let Err(error) = checkpoint {
         report_log(alarm(error), home);
@@ -2155,7 +2200,6 @@ async fn resume_join(
             insecure_dev,
             no_wait,
             poll_interval,
-            yes,
         },
     )
     .await
@@ -2180,8 +2224,10 @@ async fn join(
              root's settings instead of yours and keep its keys in root's home. Run join without \
              sudo, as the account that uses this device."
         );
-        if !yes && !confirm("Continue as root anyway?")? {
-            println!("Stopped. Nothing was sent.");
+        if !yes && !confirm("Continue as root anyway?").await? {
+            if !wizard_enabled(no_wait) {
+                println!("Stopped. Nothing was sent.");
+            }
             return Ok(ExitCode::FAILURE);
         }
     }
@@ -2206,22 +2252,13 @@ async fn join(
         .is_some_and(|saved| saved.gateway == gateway);
     let invitation_step_shown = !same_gateway_enrolment;
     if invitation_step_shown {
-        ui::step(1, 6, "Check the invitation");
+        wizard_step(1, "Check the invitation");
     }
     let http = http_client()?;
-    let wizard = wizard_enabled(no_wait);
     let published: PublishedManifest =
         match get_json(&http, format!("{}/v1/manifest", base(gateway))).await {
             Ok(published) => published,
-            Err(error) => {
-                if wizard {
-                    println!(
-                        "Stopped at [1/6]. Continue with: {} join",
-                        client_command(&home.0)
-                    );
-                }
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         };
     let manifest = Manifest::parse(published.toml.as_bytes())?;
     if !published.company.verify(manifest.hash()) {
@@ -2229,15 +2266,7 @@ async fn join(
     }
     let log = match get_text(&http, format!("{}/v1/log/key", base(gateway))).await {
         Ok(log) => log,
-        Err(error) => {
-            if wizard {
-                println!(
-                    "Stopped at [1/6]. Continue with: {} join",
-                    client_command(&home.0)
-                );
-            }
-            return Err(error);
-        }
+        Err(error) => return Err(error),
     };
     if let Some(mismatch) = wanted.differs(&published.company.key.fingerprint(), &log) {
         bail!(
@@ -2253,7 +2282,7 @@ async fn join(
         .as_ref()
         .is_some_and(|saved| saved.gateway == gateway && saved.manifest == *manifest.hash());
     if !saved_enrolment_matches && !invitation_step_shown {
-        ui::step(1, 6, "Check the invitation");
+        wizard_step(1, "Check the invitation");
     }
     wanted.save(home)?;
     if !saved_enrolment_matches {
@@ -2269,15 +2298,7 @@ async fn join(
     let checkpoint = match sync_checkpoint(&http, home, gateway, manifest.body().log.as_ref()).await
     {
         Ok(checkpoint) => checkpoint,
-        Err(error) => {
-            if wizard {
-                println!(
-                    "Stopped at [1/6]. Continue with: {} join",
-                    client_command(&home.0)
-                );
-            }
-            return Err(error);
-        }
+        Err(error) => return Err(error),
     };
     if let Err(e) = checkpoint {
         report_log(alarm(e), home);
@@ -2298,7 +2319,6 @@ async fn join(
                         insecure_dev,
                         no_wait,
                         poll_interval,
-                        yes,
                     },
                 )
                 .await;
@@ -2317,20 +2337,15 @@ async fn join(
         }
     }
     let os = current_os()?;
-    ui::step(2, 6, "Review and sign the manifest");
+    wizard_step(2, "Review and sign the manifest");
     print_summary(&manifest, &published.company.key, os);
-    if !yes && !confirm("Sign this manifest as the device owner?")? {
-        if wizard {
-            println!(
-                "Stopped at [2/6]. Continue with: {} join <invitation from IT>",
-                client_command(&home.0)
-            );
-        } else {
+    if !yes && !confirm("Sign this manifest as the device owner?").await? {
+        if !wizard_enabled(no_wait) {
             println!("Not signed. Nothing was sent. Run join again when you want to enrol.");
         }
         return Ok(ExitCode::FAILURE);
     }
-    ui::step(3, 6, "Enrol this device");
+    wizard_step(3, "Enrol this device");
     let config = device_config::DeviceConfig::load(home)?;
     if os == Os::Macos
         && manifest
@@ -2344,15 +2359,7 @@ async fn join(
              to a folder, you can deny it."
         );
     }
-    if let Err(error) = scan_repositories(home, &manifest, config.as_ref()) {
-        if wizard {
-            println!(
-                "Stopped at [3/6]. Continue with: {} join <invitation from IT>",
-                client_command(&home.0)
-            );
-        }
-        return Err(error);
-    }
+    scan_repositories(home, &manifest, config.as_ref())?;
     let owner = dev_key::load_or_create(&home.file("owner-dev.pem"))?;
     let device = DeviceKey::load_or_create(&home.0, software_key)?;
     let signed = SignedManifest {
@@ -2374,15 +2381,7 @@ async fn join(
         .await
     {
         Ok(response) => response,
-        Err(error) => {
-            if wizard {
-                println!(
-                    "Stopped at [3/6]. Continue with: {} join <invitation from IT>",
-                    client_command(&home.0)
-                );
-            }
-            return Err(error.into());
-        }
+        Err(error) => return Err(error.into()),
     };
     let status = resp.status();
     let body: Value = resp.json().await?;
@@ -2441,7 +2440,6 @@ async fn join(
                 insecure_dev,
                 no_wait,
                 poll_interval,
-                yes,
             },
         )
         .await;
@@ -2660,6 +2658,18 @@ async fn check_impl(home: &Home, insecure_dev: bool, show_resume_hint: bool) -> 
             );
         }
     }
+    let command = client_command(&home.0);
+    if show_resume_hint {
+        match wizard_resume(home)? {
+            WizardResume::Finish => {
+                println!("Wizard step [5/6] is unfinished. Continue with: {command} join");
+            }
+            WizardResume::FirstCheck => {
+                println!("Wizard step [6/6] is unfinished. Continue with: {command} join");
+            }
+            WizardResume::Complete => {}
+        }
+    }
     let http = http_client()?;
     let sync = match sync_log(&http, home, &manifest, &mut enrolment).await {
         Err(error)
@@ -2672,6 +2682,7 @@ async fn check_impl(home: &Home, insecure_dev: bool, show_resume_hint: bool) -> 
         {
             match status_after_log_denial(&http, home, &enrolment).await? {
                 DeviceStatus::Pending => {
+                    println!("This device waits for IT approval.");
                     println!(
                         "Wizard step [4/6] is unfinished. Continue with: {} join",
                         client_command(&home.0)
@@ -2707,18 +2718,6 @@ async fn check_impl(home: &Home, insecure_dev: bool, show_resume_hint: bool) -> 
             return Ok(ExitCode::from(2));
         }
     };
-    let command = client_command(&home.0);
-    if show_resume_hint {
-        match wizard_resume(home)? {
-            WizardResume::Finish => {
-                println!("Wizard step [5/6] is unfinished. Continue with: {command} join");
-            }
-            WizardResume::FirstCheck => {
-                println!("Wizard step [6/6] is unfinished. Continue with: {command} join");
-            }
-            WizardResume::Complete => {}
-        }
-    }
     let gateway = base(&enrolment.gateway);
     let log_checkpoint = disclosable_checkpoint(&manifest, home.checkpoint()?);
     let nonce: Nonce = http
@@ -2753,8 +2752,14 @@ async fn check_impl(home: &Home, insecure_dev: bool, show_resume_hint: bool) -> 
         .body(sent.clone())
         .send()
         .await?;
+    let status = resp.status();
     let received = resp.bytes().await?;
-    locallog::append(&home.file("claims.jsonl"), &sent, &received)?;
+    locallog::append_with_status(
+        &home.file("claims.jsonl"),
+        &sent,
+        &received,
+        Some(status.as_u16()),
+    )?;
 
     println!(
         "Sent {} results for {}:",
@@ -2773,6 +2778,9 @@ async fn check_impl(home: &Home, insecure_dev: bool, show_resume_hint: bool) -> 
             ca_pem,
             log_checkpoint,
         } => {
+            if !status.is_success() {
+                bail!("claim request failed with HTTP {status}");
+            }
             let checked = match log_checkpoint {
                 None => Ok(Err(CheckpointVerifyError::Alarm(
                     "the accepted claim response has no log checkpoint".into(),
@@ -3163,24 +3171,28 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             no_wait,
         } => match invitation {
             Some(invitation) => {
-                join(
+                run_wizard(
                     &home,
-                    &invitation,
-                    yes,
-                    software_key,
-                    cli.insecure_dev,
+                    Some(&invitation),
                     no_wait,
-                    APPROVAL_POLL_INTERVAL,
+                    join(
+                        &home,
+                        &invitation,
+                        yes,
+                        software_key,
+                        cli.insecure_dev,
+                        no_wait,
+                        APPROVAL_POLL_INTERVAL,
+                    ),
                 )
                 .await
             }
             None => {
-                resume_join(
+                run_wizard(
                     &home,
-                    cli.insecure_dev,
+                    None,
                     no_wait,
-                    APPROVAL_POLL_INTERVAL,
-                    yes,
+                    resume_join(&home, cli.insecure_dev, no_wait, APPROVAL_POLL_INTERVAL),
                 )
                 .await
             }
@@ -3292,7 +3304,7 @@ mod tests {
     }
 
     #[test]
-    fn wizard_resume_uses_the_config_and_last_claim() {
+    fn wizard_resume_requires_a_verified_first_check() {
         let dir = tempfile::tempdir().unwrap();
         let home = Home(dir.path().to_path_buf());
         assert_eq!(wizard_resume(&home).unwrap(), WizardResume::Finish);
@@ -3302,8 +3314,41 @@ mod tests {
         )
         .unwrap();
         assert_eq!(wizard_resume(&home).unwrap(), WizardResume::FirstCheck);
-        locallog::append(&home.file("claims.jsonl"), b"sent", b"accepted").unwrap();
+        locallog::append(&home.file("claims.jsonl"), b"sent", b"upstream unavailable").unwrap();
+        assert_eq!(wizard_resume(&home).unwrap(), WizardResume::FirstCheck);
+
+        let certificate = "fictional certificate";
+        let ca = "fictional certificate authority";
+        let response = serde_json::to_vec(&json!({
+            "status": "accepted",
+            "warnings": [],
+            "certificate_pem": certificate,
+            "ca_pem": ca,
+            "log_checkpoint": "fictional verified checkpoint"
+        }))
+        .unwrap();
+        locallog::append_with_status(
+            &home.file("claims.jsonl"),
+            b"failed HTTP exchange",
+            &response,
+            Some(502),
+        )
+        .unwrap();
+        assert_eq!(wizard_resume(&home).unwrap(), WizardResume::FirstCheck);
+        locallog::append_with_status(
+            &home.file("claims.jsonl"),
+            b"verified claim",
+            &response,
+            Some(200),
+        )
+        .unwrap();
+        assert_eq!(wizard_resume(&home).unwrap(), WizardResume::FirstCheck);
+        fs::write(home.file("vpn-cert.pem"), certificate).unwrap();
+        fs::write(home.file("ca.pem"), ca).unwrap();
         assert_eq!(wizard_resume(&home).unwrap(), WizardResume::Complete);
+
+        fs::write(home.file("claims.jsonl"), b"{\"time\":\n").unwrap();
+        assert_eq!(wizard_resume(&home).unwrap(), WizardResume::FirstCheck);
     }
     use std::fs;
 
@@ -4141,6 +4186,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let gateway_url = format!("{}/api", gateway.url);
             let home = enrolled_home_with(dir.path(), &gateway_url, &company, &toml);
+            fs::write(home.file("claims.jsonl"), b"{\"time\":\n").unwrap();
             assert_eq!(
                 check(&home, true).await.unwrap(),
                 ExitCode::FAILURE,
@@ -4712,7 +4758,7 @@ mod tests {
             !requests.iter().any(|request| request == "POST /v1/claim"),
             "a non-terminal join stops before finish and check"
         );
-        let resumed = resume_join(&home, false, false, Duration::from_millis(1), true)
+        let resumed = resume_join(&home, false, false, Duration::from_millis(1))
             .await
             .unwrap();
         assert_eq!(resumed, ExitCode::SUCCESS);
@@ -4843,7 +4889,6 @@ mod tests {
                 insecure_dev: true,
                 no_wait: true,
                 poll_interval: APPROVAL_POLL_INTERVAL,
-                yes: false,
             },
             false,
         )

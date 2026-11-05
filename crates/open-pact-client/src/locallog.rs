@@ -44,11 +44,21 @@ fn decode(b64: &str, sha256: &str) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+#[cfg(test)]
 pub fn append(path: &Path, sent_bytes: &[u8], response_bytes: &[u8]) -> io::Result<()> {
+    append_with_status(path, sent_bytes, response_bytes, None)
+}
+
+pub fn append_with_status(
+    path: &Path,
+    sent_bytes: &[u8],
+    response_bytes: &[u8],
+    status: Option<u16>,
+) -> io::Result<()> {
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         fs::create_dir_all(dir)?;
     }
-    let record = make_record(sent_bytes, response_bytes, None, false);
+    let record = make_record(sent_bytes, response_bytes, status, false);
     let mut line = serde_json::to_vec(&record).map_err(io::Error::other)?;
     line.push(b'\n');
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
