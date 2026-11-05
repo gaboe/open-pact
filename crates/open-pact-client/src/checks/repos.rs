@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -15,7 +15,7 @@ const PRUNED: &[&str] = &["node_modules", "target", "bin", "obj", ".Trash"];
 /// Folders directly in the user home that hold no repositories. macOS asks for permission
 /// before a program reads the media folders.
 const HOME_PRUNED: &[&str] = &["Library", "Pictures", "Movies", "Music"];
-/// Caches and trash add scan time without expected user repositories.
+/// Tool caches, SDKs, and container storage add scan time without user repositories.
 const HOME_CACHE_PRUNED: &[&str] = &[
     ".bun",
     ".cache",
@@ -25,8 +25,40 @@ const HOME_CACHE_PRUNED: &[&str] = &[
     ".pnpm-store",
     ".gradle",
     ".m2",
+    ".nuget",
+    ".platformio",
+    "OrbStack",
+    ".orbstack",
+    ".docker",
+    ".oh-my-zsh",
+    ".vscode/extensions",
+    ".cursor/extensions",
+    ".android",
+    ".gem",
+    ".pyenv",
+    ".nvm",
+    ".sdkman",
+    "go/pkg",
+    ".local/share/containers",
     ".local/share/Trash",
 ];
+
+pub(crate) fn outside_repo_groups(scan: &RepoScan, home: &Path) -> Vec<(String, usize)> {
+    let mut groups = BTreeMap::<String, usize>::new();
+    let home = fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    for path in &scan.outside_paths {
+        let Some(relative) = path.strip_prefix(&home).ok() else {
+            continue;
+        };
+        let Some(first) = relative.components().next() else {
+            *groups.entry("~/".to_string()).or_default() += 1;
+            continue;
+        };
+        let folder = format!("~/{}", first.as_os_str().to_string_lossy());
+        *groups.entry(folder).or_default() += 1;
+    }
+    groups.into_iter().collect()
+}
 
 pub(crate) fn lower_process_priority() {
     #[cfg(unix)]
@@ -112,7 +144,7 @@ pub(crate) fn scan_and_store(
     let repo_causes = RefCell::new(Vec::new());
     let progress = RefCell::new(ScanProgress::new(root));
     progress.borrow_mut().update(root, 0, 0, true);
-    walk(root, 0, &mut walk_state, &progress, &mut |repo| {
+    walk(root, root, 0, &mut walk_state, &progress, &mut |repo| {
         let urls = match read_remote_urls(repo) {
             Ok(urls) => urls,
             Err(error) => {
@@ -293,6 +325,7 @@ struct WalkState {
 }
 
 fn walk(
+    root: &Path,
     dir: &Path,
     depth: usize,
     state: &mut WalkState,
@@ -349,8 +382,11 @@ fn walk(
         let name = entry.file_name();
         if PRUNED.iter().any(|pruned| name == *pruned)
             || (depth == 0 && HOME_PRUNED.iter().any(|pruned| name == *pruned))
-            || (depth == 0 && HOME_CACHE_PRUNED.iter().any(|pruned| name == *pruned))
-            || (depth == 2 && name == "Trash" && dir.ends_with(".local/share"))
+            || path.strip_prefix(root).is_ok_and(|relative| {
+                HOME_CACHE_PRUNED
+                    .iter()
+                    .any(|pruned| relative == Path::new(pruned))
+            })
             || name.to_string_lossy().ends_with(".photoslibrary")
         {
             continue;
@@ -365,7 +401,7 @@ fn walk(
     }
     if depth < MAX_DEPTH {
         for child in children {
-            walk(&child, depth + 1, state, progress, visit)?;
+            walk(root, &child, depth + 1, state, progress, visit)?;
         }
     }
     Ok(())
@@ -1030,7 +1066,13 @@ mod tests {
     fn skips_every_pruned_folder() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("user");
-        for name in PRUNED {
+        let pruned = PRUNED
+            .iter()
+            .chain(HOME_PRUNED.iter())
+            .chain(HOME_CACHE_PRUNED.iter())
+            .copied()
+            .collect::<Vec<_>>();
+        for name in pruned {
             let repo = root.join(name).join("repo");
             fs::create_dir_all(repo.join(".git")).unwrap();
             fs::write(
@@ -1039,6 +1081,13 @@ mod tests {
             )
             .unwrap();
         }
+        let user_repo = root.join("code/x");
+        fs::create_dir_all(user_repo.join(".git")).unwrap();
+        fs::write(
+            user_repo.join(".git/config"),
+            "[remote \"origin\"]\n url = git@github.com:example-org/app.git\n",
+        )
+        .unwrap();
         let scan = scan_and_store(
             &temp.path().join("client"),
             &root,
@@ -1046,7 +1095,8 @@ mod tests {
             &[pattern("github.com/example-org/")],
         )
         .unwrap();
-        assert_eq!(scan.managed_repos_total, 0);
+        assert_eq!(scan.managed_repos_total, 1);
+        assert_eq!(scan.outside_paths, [fs::canonicalize(user_repo).unwrap()]);
     }
 
     #[test]
