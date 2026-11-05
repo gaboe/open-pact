@@ -3269,7 +3269,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             if manifest.hash() != &enrolment.manifest {
                 bail!("manifest.toml no longer matches the hash you signed");
             }
-            let repo_scan = stored_repo_scan(&home)?;
+            let repo_scan = proposal_repo_scan(&home)?;
             let user_home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
                 .map(PathBuf::from);
             print!(

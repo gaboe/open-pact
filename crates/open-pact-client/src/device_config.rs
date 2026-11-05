@@ -132,23 +132,28 @@ pub(crate) fn example(
     let required = controls
         .iter()
         .filter_map(|control| {
+            if !crate::checks::can_check(os, &control.id) {
+                return None;
+            }
             let requirement = control.required.get(&os)?;
             (requirement.to_string() != "n/a").then_some((control.id.as_str(), requirement))
         })
         .collect::<Vec<_>>();
     let reported = controls
         .iter()
-        .filter(|control| control.required.is_empty())
+        .filter(|control| {
+            crate::checks::can_check(os, &control.id) && !control.required.contains_key(&os)
+        })
         .map(|control| control.id.as_str())
         .collect::<Vec<_>>();
     let not_checked = controls
         .iter()
         .filter(|control| {
-            !control.required.is_empty()
-                && control
+            !crate::checks::can_check(os, &control.id)
+                || control
                     .required
                     .get(&os)
-                    .is_none_or(|requirement| requirement.to_string() == "n/a")
+                    .is_some_and(|requirement| requirement.to_string() == "n/a")
         })
         .map(|control| control.id.as_str())
         .collect::<Vec<_>>();
@@ -218,17 +223,33 @@ fn append_managed_repo_comment(
         output.push_str("# Managed repository locations are unavailable.\n");
         return;
     };
-    let groups = crate::checks::repos::outside_repo_groups(scan, home);
+    let Some(paths) = &scan.managed_paths else {
+        output.push_str("# Managed repository locations are unavailable.\n");
+        return;
+    };
+    let groups = crate::checks::repos::managed_repo_groups(paths, home);
     output.push_str(&format!(
         "# Managed repositories found: {}\n",
-        scan.managed_repos_outside
+        scan.managed_repos_total
     ));
     for (path, count) in groups {
-        output.push_str(&format!("#   {path} ({count})\n"));
+        output.push_str(&format!("#   {} ({count})\n", safe_comment_text(&path)));
     }
     output.push_str(
         "# Add the folders that should hold them to `folders`, for example: folders = [\"~/work\"]\n",
     );
+}
+
+fn safe_comment_text(text: &str) -> String {
+    text.chars()
+        .map(|character| {
+            if character.is_control() {
+                character.escape_default().to_string()
+            } else {
+                character.to_string()
+            }
+        })
+        .collect()
 }
 
 pub(crate) fn print_table(
@@ -336,7 +357,7 @@ witness_quorum = 0
 checkpoint_max_age = "1h"
 
 [[control]]
-id = "required_control"
+id = "firewall"
 source = "company_policy"
 check = "builtin:firewall@1"
 output = ["on", "off", "unknown"]
@@ -344,25 +365,25 @@ required = { macos = "on" }
 grace = "0d"
 
 [[control]]
-id = "report_only_control"
+id = "screen_lock"
 source = "company_policy"
-check = "builtin:firewall@1"
+check = "builtin:screen_lock@1"
 output = ["on", "off", "unknown"]
 required = {}
 grace = "0d"
 
 [[control]]
-id = "not_for_macos"
+id = "disk_encryption"
 source = "company_policy"
-check = "builtin:firewall@1"
+check = "builtin:disk_encryption@1"
 output = ["on", "off", "unknown"]
 required = { linux = "on" }
 grace = "0d"
 
 [[control]]
-id = "not_applicable"
+id = "log_cleared"
 source = "company_policy"
-check = "builtin:firewall@1"
+check = "builtin:log_cleared@1"
 output = ["n/a", "unknown"]
 required = { macos = "n/a" }
 grace = "0d"
@@ -372,11 +393,11 @@ grace = "0d"
         let text = example(&manifest, open_pact_core::Os::Macos, None, None);
         let expected = concat!(
             "# Company requirements on macos:\n",
-            "#   required_control  on\n",
+            "#   firewall  on\n",
             "# Reported only, no requirement:\n",
-            "#   report_only_control\n",
+            "#   screen_lock, disk_encryption\n",
             "# Not checked on macos:\n",
-            "#   not_for_macos, not_applicable\n",
+            "#   log_cleared\n",
         );
         assert!(text.contains(expected), "{text}");
         assert!(!text.contains("# Company requirements on macos:\n#   \n"));
@@ -430,6 +451,76 @@ grace = "0d"
     }
 
     #[test]
+    fn device_config_example_groups_shared_first_level_and_counts_managed_paths() {
+        let manifest =
+            open_pact_core::Manifest::parse(include_bytes!("../../../examples/manifest.toml"))
+                .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        for path in ["code/work/one", "code/personal/two"] {
+            let repo = home.join(path);
+            std::fs::create_dir_all(repo.join(".git")).unwrap();
+            std::fs::write(
+                repo.join(".git/config"),
+                "[remote \"origin\"]\n url = git@github.com:example-org/app.git\n",
+            )
+            .unwrap();
+        }
+        let scan = crate::checks::repos::scan_and_store(
+            &temp.path().join("client"),
+            &home,
+            &[home.join("code")],
+            &["github.com/example-org/".to_string()],
+        )
+        .unwrap();
+        assert_eq!(scan.managed_repos_outside, 0);
+        assert_eq!(scan.managed_repos_total, 2);
+        let text = example(
+            &manifest,
+            open_pact_core::Os::Macos,
+            Some(&scan),
+            Some(&home),
+        );
+        assert!(text.contains(
+            "# Managed repositories found: 2\n#   ~/code/personal (1)\n#   ~/code/work (1)\n"
+        ));
+    }
+
+    #[test]
+    fn device_config_example_escapes_control_characters_in_repository_locations() {
+        let manifest =
+            open_pact_core::Manifest::parse(include_bytes!("../../../examples/manifest.toml"))
+                .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let repo = home.join("work\nunexpected = 1\n#/repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::write(
+            repo.join(".git/config"),
+            "[remote \"origin\"]\n url = git@github.com:example-org/app.git\n",
+        )
+        .unwrap();
+        let scan = crate::checks::repos::scan_and_store(
+            &temp.path().join("client"),
+            &home,
+            &[],
+            &["github.com/example-org/".to_string()],
+        )
+        .unwrap();
+        let text = example(
+            &manifest,
+            open_pact_core::Os::Macos,
+            Some(&scan),
+            Some(&home),
+        );
+        assert!(
+            text.contains("#   ~/work\\nunexpected = 1\\n# (1)\n"),
+            "{text}"
+        );
+        DeviceConfig::parse(&text, Some(&home)).unwrap();
+    }
+
+    #[test]
     fn device_config_example_reports_unavailable_and_partial_repository_scans() {
         let manifest =
             open_pact_core::Manifest::parse(include_bytes!("../../../examples/manifest.toml"))
@@ -442,6 +533,7 @@ grace = "0d"
             managed_repos_outside: 0,
             managed_repos_total: 0,
             outside_paths: Vec::new(),
+            managed_paths: Some(Vec::new()),
             partial: true,
             access_denied: false,
             causes: Vec::new(),
@@ -451,6 +543,25 @@ grace = "0d"
             text.contains("# Managed repository scan was partial; results may be incomplete.\n")
         );
         assert!(!text.contains("# Managed repositories found:"));
+
+        let old = crate::checks::repos::RepoScan {
+            scanned_at: chrono::Utc::now().timestamp(),
+            managed_repos_outside: 0,
+            managed_repos_total: 2,
+            outside_paths: Vec::new(),
+            managed_paths: None,
+            partial: false,
+            access_denied: false,
+            causes: Vec::new(),
+        };
+        let text = example(
+            &manifest,
+            open_pact_core::Os::Macos,
+            Some(&old),
+            Some(Path::new("/home/example")),
+        );
+        assert!(text.contains("# Managed repository locations are unavailable.\n"));
+        assert!(!text.contains("# Managed repositories found: 0"));
     }
 
     #[test]
