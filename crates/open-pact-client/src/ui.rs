@@ -18,7 +18,7 @@ pub fn bold(text: &str, styled: bool) -> String {
     }
 }
 
-/// `[2/4] What you agree to`, preceded by an empty line.
+/// `[2/6] What you agree to`, preceded by an empty line.
 pub fn step(n: u8, of: u8, title: &str) {
     println!("\n{}", bold(&format!("[{n}/{of}] {title}"), styled()));
 }
