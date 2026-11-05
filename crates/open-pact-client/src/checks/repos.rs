@@ -164,22 +164,28 @@ pub(crate) fn scan_and_store(
     };
     fs::create_dir_all(home)?;
     let path = home.join(FILE);
+    let temporary = home.join(format!(".{FILE}.{}.tmp", uuid::Uuid::new_v4()));
     let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options
-        .open(&path)
-        .with_context(|| path.display().to_string())?;
-    file.write_all(&serde_json::to_vec(&scan)?)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    let write_result = (|| -> Result<()> {
+        let mut file = options
+            .open(&temporary)
+            .with_context(|| temporary.display().to_string())?;
+        file.write_all(&serde_json::to_vec(&scan)?)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, &path).with_context(|| path.display().to_string())?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temporary);
     }
+    write_result?;
     progress.borrow_mut().clear();
     Ok(scan)
 }
