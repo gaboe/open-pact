@@ -52,7 +52,7 @@ pub(crate) fn managed_repo_groups(paths: &[PathBuf], home: &Path) -> Vec<(String
         };
         let Some(parent) = relative.parent() else {
             *groups
-                .entry("~".to_string())
+                .entry(String::new())
                 .or_default()
                 .entry(None)
                 .or_default() += 1;
@@ -61,7 +61,7 @@ pub(crate) fn managed_repo_groups(paths: &[PathBuf], home: &Path) -> Vec<(String
         let mut components = parent.components();
         let Some(first) = components.next() else {
             *groups
-                .entry("~".to_string())
+                .entry(String::new())
                 .or_default()
                 .entry(None)
                 .or_default() += 1;
@@ -79,13 +79,24 @@ pub(crate) fn managed_repo_groups(paths: &[PathBuf], home: &Path) -> Vec<(String
         if second_levels >= 2 {
             for (second, count) in children {
                 let path = second.map_or_else(
-                    || format!("~/{first}"),
+                    || {
+                        if first.is_empty() {
+                            "~".to_string()
+                        } else {
+                            format!("~/{first}")
+                        }
+                    },
                     |second| format!("~/{first}/{second}"),
                 );
                 result.push((path, count));
             }
         } else {
-            result.push((format!("~/{first}"), children.values().sum()));
+            let path = if first.is_empty() {
+                "~".to_string()
+            } else {
+                format!("~/{first}")
+            };
+            result.push((path, children.values().sum()));
         }
     }
     result.sort_by(|left, right| left.0.cmp(&right.0));

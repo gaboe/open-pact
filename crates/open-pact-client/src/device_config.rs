@@ -338,8 +338,7 @@ mod tests {
 
     #[test]
     fn device_config_example_groups_required_report_only_and_not_checked_controls() {
-        let manifest = open_pact_core::Manifest::parse(
-            br#"
+        let manifest_text = r#"
 manifest_version = 1
 issuer = "company.example"
 valid_from = "2026-10-01"
@@ -387,9 +386,16 @@ check = "builtin:log_cleared@1"
 output = ["n/a", "unknown"]
 required = { macos = "n/a" }
 grace = "0d"
-"#,
-        )
-        .unwrap();
+
+[[control]]
+id = "powershell_logging"
+source = "company_policy"
+check = "builtin:powershell_logging@1"
+output = ["on", "off", "n/a", "unknown"]
+required = { windows = "on" }
+grace = "0d"
+"#;
+        let manifest = open_pact_core::Manifest::parse(manifest_text.as_bytes()).unwrap();
         let text = example(&manifest, open_pact_core::Os::Macos, None, None);
         let expected = concat!(
             "# Company requirements on macos:\n",
@@ -397,11 +403,60 @@ grace = "0d"
             "# Reported only, no requirement:\n",
             "#   screen_lock, disk_encryption\n",
             "# Not checked on macos:\n",
-            "#   log_cleared\n",
+            "#   log_cleared, powershell_logging\n",
         );
         assert!(text.contains(expected), "{text}");
         assert!(!text.contains("# Company requirements on macos:\n#   \n"));
         assert!(!text.contains("# Not checked on macos:\n#   \n"));
+
+        let required_on_current_os = manifest_text.replace(
+            "required = { windows = \"on\" }",
+            "required = { macos = \"on\" }",
+        );
+        let manifest = open_pact_core::Manifest::parse(required_on_current_os.as_bytes()).unwrap();
+        let text = example(&manifest, open_pact_core::Os::Macos, None, None);
+        assert!(
+            text.contains("# Not checked on macos:\n#   log_cleared, powershell_logging\n"),
+            "{text}"
+        );
+        assert!(!text.contains("# Company requirements on macos:\n#   powershell_logging"));
+    }
+
+    #[test]
+    fn device_config_example_groups_repositories_at_home_as_home() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        for repo in ["app-one", "app-two"] {
+            let git = home.join(repo).join(".git");
+            std::fs::create_dir_all(&git).unwrap();
+            std::fs::write(
+                git.join("config"),
+                "[remote \"origin\"]\n url = git@github.com:example-org/app.git\n",
+            )
+            .unwrap();
+        }
+        let scan = crate::checks::repos::scan_and_store(
+            &temp.path().join("client"),
+            &home,
+            &[],
+            &["github.com/example-org/".to_string()],
+        )
+        .unwrap();
+        let manifest =
+            open_pact_core::Manifest::parse(include_bytes!("../../../examples/manifest.toml"))
+                .unwrap();
+        let proposal = example(
+            &manifest,
+            open_pact_core::Os::Macos,
+            Some(&scan),
+            Some(&home),
+        );
+        assert!(
+            proposal.contains("# Managed repositories found: 2\n#   ~ (2)\n"),
+            "{proposal}"
+        );
+        assert!(!proposal.contains("~/~"));
     }
 
     #[test]
