@@ -170,15 +170,18 @@ pub fn read(path: &Path) -> io::Result<Vec<Record>> {
 }
 
 pub fn read_lenient(path: &Path) -> io::Result<(Vec<Record>, usize)> {
-    let text = match fs::read_to_string(path) {
-        Ok(text) => text,
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
         Err(error) => return Err(error),
     };
     let mut records = Vec::new();
     let mut damaged = 0;
-    for line in text.lines().filter(|line| !line.trim().is_empty()) {
-        let record = serde_json::from_str::<Record>(line)
+    for line in bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
+    {
+        let record = serde_json::from_slice::<Record>(line)
             .ok()
             .filter(|record| record.sent().is_ok() && record.response().is_ok());
         match record {
@@ -252,6 +255,24 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].sent().unwrap(), b"new claim");
         assert_eq!(records[0].response().unwrap(), b"new response");
+    }
+
+    #[test]
+    fn lenient_reader_keeps_valid_records_after_non_utf8_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claims.jsonl");
+        append(&path, b"valid claim", b"valid response").unwrap();
+        let valid = fs::read(&path).unwrap();
+        let mut history = b"\xff\xfe{\"time\":\n".to_vec();
+        history.extend_from_slice(&valid);
+        fs::write(&path, &history).unwrap();
+
+        let (records, damaged) = read_lenient(&path).unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].sent().unwrap(), b"valid claim");
+        assert_eq!(damaged, 1);
+        assert_eq!(fs::read(&path).unwrap(), history);
     }
 
     #[test]

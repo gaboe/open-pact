@@ -2654,11 +2654,23 @@ async fn check_impl(home: &Home, insecure_dev: bool, show_resume_hint: bool) -> 
     if device_config.is_none() && !migrating {
         print!("{}", device_config::example(&manifest, os));
     }
-    let results = collect_results(&manifest, os, device_config.as_ref(), scan.as_ref());
+    let check_manifest = manifest.clone();
+    let check_config = device_config.clone();
+    let check_scan = scan.clone();
+    let virtualization_manifest = manifest.clone();
+    let (results, virtualized) = tokio::task::spawn_blocking(move || {
+        let results = collect_results(
+            &check_manifest,
+            os,
+            check_config.as_ref(),
+            check_scan.as_ref(),
+        );
+        let virtualized = disclosable_virtualized(&virtualization_manifest, virtualized);
+        (results, virtualized)
+    })
+    .await
+    .context("control collection task stopped")?;
     device_config::print_table(&manifest, os, device_config.as_ref(), &results);
-    let virtualized = tokio::task::spawn_blocking(virtualized)
-        .await
-        .context("virtualization probe task stopped")?;
     if let Some(scan) = &scan {
         if scan.partial {
             println!("Repository scan is partial; repository counts are unknown.");
@@ -2766,7 +2778,7 @@ async fn check_impl(home: &Home, insecure_dev: bool, show_resume_hint: bool) -> 
         client: concat!("open-pact-client ", env!("CARGO_PKG_VERSION")).into(),
         os,
         trust_level: device.trust_level(),
-        virtualized: disclosable_virtualized(&manifest, || virtualized),
+        virtualized,
         results,
         csr_sha256: Some(CsrHash::of(&csr_der)),
         log_checkpoint,
