@@ -869,6 +869,12 @@ fn stored_repo_scan(home: &Home) -> Result<Option<checks::repos::RepoScan>> {
     checks::repos::load(&home.0, chrono::Utc::now().timestamp())
 }
 
+fn proposal_repo_scan(home: &Home) -> Result<Option<checks::repos::RepoScan>> {
+    let now = chrono::Utc::now().timestamp();
+    Ok(checks::repos::load_attempt(&home.0)?
+        .filter(|scan| scan.partial || checks::repos::fresh(scan, now)))
+}
+
 fn disclosable(
     manifest: &Manifest,
     _os: Os,
@@ -1316,9 +1322,12 @@ async fn finish(home: &Home, insecure_dev: bool, yes: bool, wizard: bool) -> Res
         .transpose()
         .with_context(|| format!("{} must be UTF-8", path.display()))?;
     let os = current_os()?;
-    let proposal = existing_text
-        .clone()
-        .unwrap_or_else(|| device_config::example(&manifest, os));
+    let repo_scan = proposal_repo_scan(home)?;
+    let user_home =
+        std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from);
+    let proposal = existing_text.clone().unwrap_or_else(|| {
+        device_config::example(&manifest, os, repo_scan.as_ref(), user_home.as_deref())
+    });
     let unchanged = existing_text.as_deref() == Some(proposal.as_str());
     if unchanged {
         println!("No changes to {}.", path.display());
@@ -2652,7 +2661,12 @@ async fn check_impl(home: &Home, insecure_dev: bool, show_resume_hint: bool) -> 
     let os = current_os()?;
 
     if device_config.is_none() && !migrating {
-        print!("{}", device_config::example(&manifest, os));
+        let user_home =
+            std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from);
+        print!(
+            "{}",
+            device_config::example(&manifest, os, scan.as_ref(), user_home.as_deref())
+        );
     }
     let check_manifest = manifest.clone();
     let check_config = device_config.clone();
@@ -3255,7 +3269,18 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             if manifest.hash() != &enrolment.manifest {
                 bail!("manifest.toml no longer matches the hash you signed");
             }
-            print!("{}", device_config::example(&manifest, current_os()?));
+            let repo_scan = stored_repo_scan(&home)?;
+            let user_home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+                .map(PathBuf::from);
+            print!(
+                "{}",
+                device_config::example(
+                    &manifest,
+                    current_os()?,
+                    repo_scan.as_ref(),
+                    user_home.as_deref()
+                )
+            );
             eprintln!(
                 "Next: save the sections you need as {}, then run {} check",
                 std::path::absolute(home.file("open-pact.toml"))?.display(),
@@ -3517,7 +3542,7 @@ mod tests {
         let home = Home(dir.path().to_path_buf());
         let path = home.file(device_config::FILE);
         let manifest = Manifest::parse(include_bytes!("../../../examples/manifest.toml")).unwrap();
-        let proposal = device_config::example(&manifest, Os::Macos);
+        let proposal = device_config::example(&manifest, Os::Macos, None, None);
 
         assert!(write_proposal(&home, None, &proposal).unwrap().is_none());
         assert_eq!(fs::read(&path).unwrap(), proposal.as_bytes());

@@ -119,7 +119,12 @@ impl DeviceConfig {
     }
 }
 
-pub(crate) fn example(manifest: &open_pact_core::Manifest, os: open_pact_core::Os) -> String {
+pub(crate) fn example(
+    manifest: &open_pact_core::Manifest,
+    os: open_pact_core::Os,
+    repo_scan: Option<&crate::checks::repos::RepoScan>,
+    user_home: Option<&Path>,
+) -> String {
     let mut output = String::from(
         "# Review this template. The client writes it only through `finish`, after your confirmation.\n",
     );
@@ -127,10 +132,8 @@ pub(crate) fn example(manifest: &open_pact_core::Manifest, os: open_pact_core::O
     let required = controls
         .iter()
         .filter_map(|control| {
-            control
-                .required
-                .get(&os)
-                .map(|value| (control.id.as_str(), value))
+            let requirement = control.required.get(&os)?;
+            (requirement.to_string() != "n/a").then_some((control.id.as_str(), requirement))
         })
         .collect::<Vec<_>>();
     let reported = controls
@@ -140,22 +143,41 @@ pub(crate) fn example(manifest: &open_pact_core::Manifest, os: open_pact_core::O
         .collect::<Vec<_>>();
     let not_checked = controls
         .iter()
-        .filter(|control| !control.required.is_empty() && !control.required.contains_key(&os))
+        .filter(|control| {
+            !control.required.is_empty()
+                && control
+                    .required
+                    .get(&os)
+                    .is_none_or(|requirement| requirement.to_string() == "n/a")
+        })
         .map(|control| control.id.as_str())
         .collect::<Vec<_>>();
 
-    output.push_str(&format!("# Company requirements on {os}:\n"));
-    let id_width = required.iter().map(|(id, _)| id.len()).max().unwrap_or(0);
-    for (id, value) in required {
-        output.push_str(&format!("#   {id:<id_width$}  {value}\n"));
+    if !required.is_empty() {
+        output.push_str(&format!("# Company requirements on {os}:\n"));
+        let id_width = required.iter().map(|(id, _)| id.len()).max().unwrap_or(0);
+        for (id, value) in required {
+            output.push_str(&format!("#   {id:<id_width$}  {value}\n"));
+        }
     }
     append_comment_list(&mut output, "Reported only, no requirement:", &reported);
     append_comment_list(&mut output, &format!("Not checked on {os}:"), &not_checked);
-    output.push_str(&format!("\n{CONFIG_TEMPLATE}\n"));
+    output.push('\n');
+    let (before_managed_repos, after_managed_repos) = CONFIG_TEMPLATE
+        .split_once("[managed_repos]\n")
+        .expect("configuration template has a managed repository section");
+    output.push_str(before_managed_repos);
+    append_managed_repo_comment(&mut output, repo_scan, user_home);
+    output.push_str("[managed_repos]\n");
+    output.push_str(after_managed_repos);
+    output.push('\n');
     output
 }
 
 fn append_comment_list(output: &mut String, label: &str, ids: &[&str]) {
+    if ids.is_empty() {
+        return;
+    }
     output.push_str(&format!("# {label}\n"));
     let mut line = String::from("#   ");
     for (index, id) in ids.iter().enumerate() {
@@ -177,6 +199,36 @@ fn append_comment_list(output: &mut String, label: &str, ids: &[&str]) {
         output.push_str(&line);
         output.push('\n');
     }
+}
+
+fn append_managed_repo_comment(
+    output: &mut String,
+    scan: Option<&crate::checks::repos::RepoScan>,
+    user_home: Option<&Path>,
+) {
+    let Some(scan) = scan else {
+        output.push_str("# Managed repository scan is unavailable.\n");
+        return;
+    };
+    if scan.partial {
+        output.push_str("# Managed repository scan was partial; results may be incomplete.\n");
+        return;
+    }
+    let Some(home) = user_home else {
+        output.push_str("# Managed repository locations are unavailable.\n");
+        return;
+    };
+    let groups = crate::checks::repos::outside_repo_groups(scan, home);
+    output.push_str(&format!(
+        "# Managed repositories found: {}\n",
+        scan.managed_repos_outside
+    ));
+    for (path, count) in groups {
+        output.push_str(&format!("#   {path} ({count})\n"));
+    }
+    output.push_str(
+        "# Add the folders that should hold them to `folders`, for example: folders = [\"~/work\"]\n",
+    );
 }
 
 pub(crate) fn print_table(
@@ -246,7 +298,7 @@ mod tests {
         let manifest =
             open_pact_core::Manifest::parse(include_bytes!("../../../examples/manifest.toml"))
                 .unwrap();
-        let text = example(&manifest, open_pact_core::Os::Macos);
+        let text = example(&manifest, open_pact_core::Os::Macos, None, None);
         let config = DeviceConfig::parse(&text, Some(Path::new("/home/example"))).unwrap();
         assert!(!config.schedule.unwrap().enabled);
         assert!(text.contains("# Company requirements on macos:"));
@@ -261,6 +313,144 @@ mod tests {
         for control in &manifest.body().controls {
             assert!(text.contains(control.id.as_str()));
         }
+    }
+
+    #[test]
+    fn device_config_example_groups_required_report_only_and_not_checked_controls() {
+        let manifest = open_pact_core::Manifest::parse(
+            br#"
+manifest_version = 1
+issuer = "company.example"
+valid_from = "2026-10-01"
+claim_max_age = "24h"
+claim_retention = "12mo"
+claim_recipients = ["auditor@example.com"]
+disclosed_metadata = ["manifest_hash", "device_pseudonym", "device_key", "nonce", "time", "client_version", "os", "trust_level", "vpn_certificate_request", "virtualized", "log_checkpoint"]
+data_controller = "Company Ltd., dpo@company.example"
+min_trust_level = "L0"
+unknown_grace = "7d"
+
+[log]
+allow_split_views = true
+witness_quorum = 0
+checkpoint_max_age = "1h"
+
+[[control]]
+id = "required_control"
+source = "company_policy"
+check = "builtin:firewall@1"
+output = ["on", "off", "unknown"]
+required = { macos = "on" }
+grace = "0d"
+
+[[control]]
+id = "report_only_control"
+source = "company_policy"
+check = "builtin:firewall@1"
+output = ["on", "off", "unknown"]
+required = {}
+grace = "0d"
+
+[[control]]
+id = "not_for_macos"
+source = "company_policy"
+check = "builtin:firewall@1"
+output = ["on", "off", "unknown"]
+required = { linux = "on" }
+grace = "0d"
+
+[[control]]
+id = "not_applicable"
+source = "company_policy"
+check = "builtin:firewall@1"
+output = ["n/a", "unknown"]
+required = { macos = "n/a" }
+grace = "0d"
+"#,
+        )
+        .unwrap();
+        let text = example(&manifest, open_pact_core::Os::Macos, None, None);
+        let expected = concat!(
+            "# Company requirements on macos:\n",
+            "#   required_control  on\n",
+            "# Reported only, no requirement:\n",
+            "#   report_only_control\n",
+            "# Not checked on macos:\n",
+            "#   not_for_macos, not_applicable\n",
+        );
+        assert!(text.contains(expected), "{text}");
+        assert!(!text.contains("# Company requirements on macos:\n#   \n"));
+        assert!(!text.contains("# Not checked on macos:\n#   \n"));
+    }
+
+    #[test]
+    fn device_config_example_shows_managed_repositories_from_a_fake_home_scan() {
+        let manifest =
+            open_pact_core::Manifest::parse(include_bytes!("../../../examples/manifest.toml"))
+                .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        for path in ["work/one", "work/two", "clients/three"] {
+            let repo = home.join(path);
+            std::fs::create_dir_all(repo.join(".git")).unwrap();
+            std::fs::write(
+                repo.join(".git/config"),
+                "[remote \"origin\"]\n url = git@github.com:example-org/app.git\n",
+            )
+            .unwrap();
+        }
+        let scan = crate::checks::repos::scan_and_store(
+            &temp.path().join("client"),
+            &home,
+            &[],
+            &["github.com/example-org/".to_string()],
+        )
+        .unwrap();
+        let text = example(
+            &manifest,
+            open_pact_core::Os::Macos,
+            Some(&scan),
+            Some(&home),
+        );
+        assert!(
+            text.contains("# Managed repositories found: 3\n#   ~/clients (1)\n#   ~/work (2)\n")
+        );
+        assert!(text.contains(
+            "# Add the folders that should hold them to `folders`, for example: folders = [\"~/work\"]"
+        ));
+        let hint = text
+            .find("# Add the folders that should hold them")
+            .unwrap();
+        let section = text.find("[managed_repos]\n").unwrap();
+        assert!(hint < section);
+        let folder_setting = text[section + "[managed_repos]\n".len()..]
+            .lines()
+            .find(|line| !line.starts_with('#') && !line.is_empty());
+        assert_eq!(folder_setting, Some("folders = []"));
+    }
+
+    #[test]
+    fn device_config_example_reports_unavailable_and_partial_repository_scans() {
+        let manifest =
+            open_pact_core::Manifest::parse(include_bytes!("../../../examples/manifest.toml"))
+                .unwrap();
+        let missing = example(&manifest, open_pact_core::Os::Macos, None, None);
+        assert!(missing.contains("# Managed repository scan is unavailable.\n"));
+
+        let partial = crate::checks::repos::RepoScan {
+            scanned_at: chrono::Utc::now().timestamp(),
+            managed_repos_outside: 0,
+            managed_repos_total: 0,
+            outside_paths: Vec::new(),
+            partial: true,
+            access_denied: false,
+            causes: Vec::new(),
+        };
+        let text = example(&manifest, open_pact_core::Os::Macos, Some(&partial), None);
+        assert!(
+            text.contains("# Managed repository scan was partial; results may be incomplete.\n")
+        );
+        assert!(!text.contains("# Managed repositories found:"));
     }
 
     #[test]
