@@ -156,6 +156,7 @@ enum Adapter {
 
 fn adapter_for(id: &str, os: Os) -> Adapter {
     registry(os)
+        .checks
         .iter()
         .find(|(registered, _)| *registered == id)
         .unwrap_or_else(|| panic!("unregistered contract {id}"));

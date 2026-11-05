@@ -110,9 +110,12 @@ pub fn check_supported(manifest: &Manifest) -> Result<(), String> {
 }
 
 pub(crate) fn can_check(os: Os, id: &str) -> bool {
-    registry(os)
+    let registry = registry(os);
+    registry
+        .checks
         .iter()
         .any(|(registered_id, _)| *registered_id == id)
+        && !registry.not_applicable.contains(&id)
 }
 
 #[allow(dead_code)]
@@ -124,6 +127,11 @@ pub(crate) struct CheckInput<'a> {
 
 type CheckFn = for<'a> fn(&CheckInput<'a>) -> ControlValue;
 type Registry = &'static [(&'static str, CheckFn)];
+
+struct OsRegistry {
+    checks: Registry,
+    not_applicable: &'static [&'static str],
+}
 
 fn managed_repo_value(input: &CheckInput<'_>, outside: bool) -> ControlValue {
     let Some(scan) = input.repo_scan else {
@@ -319,11 +327,32 @@ const WINDOWS: Registry = &[
     }),
 ];
 
-fn registry(os: Os) -> Registry {
+fn registry(os: Os) -> OsRegistry {
     match os {
-        Os::Macos => MACOS,
-        Os::Linux => LINUX,
-        Os::Windows => WINDOWS,
+        Os::Macos => OsRegistry {
+            checks: MACOS,
+            not_applicable: &[
+                "antimalware_active_threats",
+                "antimalware_full_scan_age_days",
+                "log_oldest_record_days",
+                "process_audit",
+                "powershell_logging",
+                "log_cleared",
+            ],
+        },
+        Os::Linux => OsRegistry {
+            checks: LINUX,
+            not_applicable: &[
+                "process_audit",
+                "remote_wipe",
+                "powershell_logging",
+                "log_cleared",
+            ],
+        },
+        Os::Windows => OsRegistry {
+            checks: WINDOWS,
+            not_applicable: &["remote_wipe"],
+        },
     }
 }
 
@@ -437,6 +466,7 @@ pub fn run(
     repo_scan: Option<&repos::RepoScan>,
 ) -> BTreeMap<String, ControlValue> {
     registry(os)
+        .checks
         .iter()
         .filter_map(|(id, check)| {
             let control = controls.iter().find(|control| control.id == *id)?;
@@ -473,9 +503,45 @@ mod tests {
     #[test]
     fn every_builtin_has_a_check_on_every_os() {
         for os in Os::ALL {
-            let ids: Vec<&str> = registry(os).iter().map(|(id, _)| *id).collect();
+            let ids: Vec<&str> = registry(os).checks.iter().map(|(id, _)| *id).collect();
             let builtins: Vec<&str> = BUILTINS.iter().map(|(id, _)| *id).collect();
             assert_eq!(ids, builtins, "{os}");
+        }
+    }
+
+    #[test]
+    fn unavailable_controls_are_not_checkable_on_their_os() {
+        for (os, unavailable) in [
+            (
+                Os::Macos,
+                &[
+                    "antimalware_active_threats",
+                    "antimalware_full_scan_age_days",
+                    "log_oldest_record_days",
+                    "process_audit",
+                    "powershell_logging",
+                    "log_cleared",
+                ][..],
+            ),
+            (
+                Os::Linux,
+                &[
+                    "process_audit",
+                    "remote_wipe",
+                    "powershell_logging",
+                    "log_cleared",
+                ][..],
+            ),
+            (Os::Windows, &["remote_wipe"][..]),
+        ] {
+            for id in unavailable {
+                assert!(!can_check(os, id), "{id} should be unavailable on {os}");
+            }
+            for (id, _) in registry(os).checks {
+                if !unavailable.contains(id) {
+                    assert!(can_check(os, id), "{id} should be checkable on {os}");
+                }
+            }
         }
     }
 
@@ -543,7 +609,7 @@ mod tests {
 
     #[test]
     fn every_os_registers_the_same_checks() {
-        let ids = |os| -> Vec<&str> { registry(os).iter().map(|(id, _)| *id).collect() };
+        let ids = |os| -> Vec<&str> { registry(os).checks.iter().map(|(id, _)| *id).collect() };
         assert_eq!(ids(Os::Macos), ids(Os::Linux));
         assert_eq!(ids(Os::Macos), ids(Os::Windows));
         assert_eq!(ids(Os::Macos).len(), BUILTINS.len());
