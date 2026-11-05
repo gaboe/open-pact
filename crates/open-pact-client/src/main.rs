@@ -295,7 +295,8 @@ where
                 signal = tokio::signal::ctrl_c() => match signal {
                     Ok(()) => {
                         print_stopped(home, invitation);
-                        Ok(ExitCode::from(130))
+                        let _ = std::io::stdout().flush();
+                        std::process::exit(130);
                     }
                     Err(error) => Err(error.into()),
                 },
@@ -321,9 +322,9 @@ fn print_stopped(home: &Home, invitation: Option<&str>) {
     let continuation = if enrolled {
         format!("{command} join")
     } else if let Some(invitation) = invitation {
-        format!("{command} join {invitation}")
+        format!("{command} join {}", shell_quote_arg(invitation))
     } else {
-        format!("{command} join <invitation from IT>")
+        format!("{command} join {}", shell_quote_arg("<invitation from IT>"))
     };
     println!("Stopped at [{step}/6]. Continue with: {continuation}");
 }
@@ -836,7 +837,7 @@ fn collect_results(
     )
 }
 
-fn scan_repositories(
+async fn scan_repositories(
     home: &Home,
     manifest: &Manifest,
     config: Option<&device_config::DeviceConfig>,
@@ -849,14 +850,19 @@ fn scan_repositories(
         .context("user home is not set")?;
     let folders = config
         .and_then(|config| config.managed_repos.as_ref())
-        .map_or(&[][..], |repos| repos.folders.as_slice());
+        .map_or_else(Vec::new, |repos| repos.folders.clone());
     let patterns = manifest
         .body()
         .controls
         .iter()
         .flat_map(|control| control.remotes.iter().map(ToString::to_string))
         .collect::<Vec<_>>();
-    checks::repos::scan_and_store(&home.0, &root, folders, &patterns)
+    let state = home.0.clone();
+    tokio::task::spawn_blocking(move || {
+        checks::repos::scan_and_store(&state, &root, &folders, &patterns)
+    })
+    .await
+    .context("repository scan task stopped")?
 }
 
 fn stored_repo_scan(home: &Home) -> Result<Option<checks::repos::RepoScan>> {
@@ -1373,8 +1379,8 @@ enum WizardResume {
 
 fn wizard_resume(home: &Home) -> Result<WizardResume> {
     let configured = home.file(device_config::FILE).exists();
-    let records = match locallog::read(&home.file("claims.jsonl")) {
-        Ok(records) => records,
+    let (records, damaged) = match locallog::read_lenient(&home.file("claims.jsonl")) {
+        Ok(history) => history,
         Err(error) => {
             println!(
                 "warning: could not read claim history; wizard completion cannot be confirmed ({error})"
@@ -1386,6 +1392,11 @@ fn wizard_resume(home: &Home) -> Result<WizardResume> {
             });
         }
     };
+    if damaged > 0 {
+        println!(
+            "warning: skipped {damaged} damaged claim history record(s); checked valid records for wizard completion"
+        );
+    }
     if !configured {
         return Ok(WizardResume::Finish);
     }
@@ -2359,7 +2370,7 @@ async fn join(
              to a folder, you can deny it."
         );
     }
-    scan_repositories(home, &manifest, config.as_ref())?;
+    scan_repositories(home, &manifest, config.as_ref()).await?;
     let owner = dev_key::load_or_create(&home.file("owner-dev.pem"))?;
     let device = DeviceKey::load_or_create(&home.0, software_key)?;
     let signed = SignedManifest {
@@ -2455,8 +2466,21 @@ fn device_code(device: &Pseudonym) -> String {
 fn client_command(home: &Path) -> String {
     match Home::new(None) {
         Ok(default) if default.0 == home => "open-pact-client".to_string(),
-        _ => format!("open-pact-client --home {}", home.display()),
+        _ => format!(
+            "open-pact-client --home {}",
+            shell_quote_arg(&home.display().to_string())
+        ),
     }
+}
+
+#[cfg(windows)]
+fn shell_quote_arg(argument: &str) -> String {
+    format!("'{}'", argument.replace('\'', "''"))
+}
+
+#[cfg(not(windows))]
+fn shell_quote_arg(argument: &str) -> String {
+    format!("'{}'", argument.replace('\'', "'\\''"))
 }
 
 /// A certificate request for the VPN key with an empty subject and no attributes: it carries the
@@ -2620,7 +2644,7 @@ async fn check_impl(home: &Home, insecure_dev: bool, show_resume_hint: bool) -> 
     checks::check_supported(&manifest)
         .map_err(|e| anyhow::anyhow!("{e}; nothing was run or sent"))?;
     let scan = if can_scan_repositories {
-        Some(scan_repositories(home, &manifest, device_config.as_ref())?)
+        Some(scan_repositories(home, &manifest, device_config.as_ref()).await?)
     } else {
         None
     };
@@ -2632,6 +2656,9 @@ async fn check_impl(home: &Home, insecure_dev: bool, show_resume_hint: bool) -> 
     }
     let results = collect_results(&manifest, os, device_config.as_ref(), scan.as_ref());
     device_config::print_table(&manifest, os, device_config.as_ref(), &results);
+    let virtualized = tokio::task::spawn_blocking(virtualized)
+        .await
+        .context("virtualization probe task stopped")?;
     if let Some(scan) = &scan {
         if scan.partial {
             println!("Repository scan is partial; repository counts are unknown.");
@@ -2739,7 +2766,7 @@ async fn check_impl(home: &Home, insecure_dev: bool, show_resume_hint: bool) -> 
         client: concat!("open-pact-client ", env!("CARGO_PKG_VERSION")).into(),
         os,
         trust_level: device.trust_level(),
-        virtualized: disclosable_virtualized(&manifest, virtualized),
+        virtualized: disclosable_virtualized(&manifest, || virtualized),
         results,
         csr_sha256: Some(CsrHash::of(&csr_der)),
         log_checkpoint,
@@ -3347,8 +3374,46 @@ mod tests {
         fs::write(home.file("ca.pem"), ca).unwrap();
         assert_eq!(wizard_resume(&home).unwrap(), WizardResume::Complete);
 
-        fs::write(home.file("claims.jsonl"), b"{\"time\":\n").unwrap();
-        assert_eq!(wizard_resume(&home).unwrap(), WizardResume::FirstCheck);
+        let valid = fs::read_to_string(home.file("claims.jsonl"))
+            .unwrap()
+            .lines()
+            .last()
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+        let mut bad_hash: Value = serde_json::from_slice(&valid).unwrap();
+        bad_hash["sent_sha256"] = json!("00".repeat(32));
+        let mut history = serde_json::to_vec(&bad_hash).unwrap();
+        history.push(b'\n');
+        history.extend_from_slice(&valid);
+        history.push(b'\n');
+        history.extend_from_slice(b"{\"time\":\n");
+        fs::write(home.file("claims.jsonl"), &history).unwrap();
+        let (valid_records, damaged) = locallog::read_lenient(&home.file("claims.jsonl")).unwrap();
+        assert_eq!(valid_records.len(), 1);
+        assert_eq!(damaged, 2);
+        assert_eq!(wizard_resume(&home).unwrap(), WizardResume::Complete);
+        assert_eq!(fs::read(home.file("claims.jsonl")).unwrap(), history);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn printed_home_argument_survives_posix_shell_parsing() {
+        let path = Path::new("/tmp/client home's;$(fictional)");
+        let quoted = shell_quote_arg(&path.display().to_string());
+        let output = std::process::Command::new("sh")
+            .args(["-c", &format!("printf %s {quoted}")])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let expected = path.to_string_lossy();
+        assert_eq!(output.stdout, expected.as_bytes());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn printed_home_argument_uses_powershell_quoting() {
+        assert_eq!(shell_quote_arg("C:\\client home's"), "'C:\\client home''s'");
     }
     use std::fs;
 

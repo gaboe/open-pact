@@ -1,5 +1,5 @@
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use base64::Engine;
@@ -61,7 +61,19 @@ pub fn append_with_status(
     let record = make_record(sent_bytes, response_bytes, status, false);
     let mut line = serde_json::to_vec(&record).map_err(io::Error::other)?;
     line.push(b'\n');
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .append(true)
+        .open(path)?;
+    if file.metadata()?.len() > 0 {
+        file.seek(SeekFrom::End(-1))?;
+        let mut last = [0];
+        file.read_exact(&mut last)?;
+        if last[0] != b'\n' {
+            file.write_all(b"\n")?;
+        }
+    }
     file.write_all(&line)?;
     file.sync_all()
 }
@@ -157,6 +169,26 @@ pub fn read(path: &Path) -> io::Result<Vec<Record>> {
         .collect())
 }
 
+pub fn read_lenient(path: &Path) -> io::Result<(Vec<Record>, usize)> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
+        Err(error) => return Err(error),
+    };
+    let mut records = Vec::new();
+    let mut damaged = 0;
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let record = serde_json::from_str::<Record>(line)
+            .ok()
+            .filter(|record| record.sent().is_ok() && record.response().is_ok());
+        match record {
+            Some(record) => records.push(record),
+            None => damaged += 1,
+        }
+    }
+    Ok((records, damaged))
+}
+
 pub fn read_with_lines(path: &Path) -> io::Result<Vec<(usize, Record)>> {
     let text = match fs::read_to_string(path) {
         Ok(t) => t,
@@ -202,6 +234,24 @@ mod tests {
             records[1].sent_sha256,
             "16367aacb67a4a017c8da8ab95682ccb390863780f7114dda0a0e0c55644c7c4"
         );
+    }
+
+    #[test]
+    fn append_after_a_truncated_record_keeps_it_separate_and_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claims.jsonl");
+        let damaged = b"{\"time\":";
+        fs::write(&path, damaged).unwrap();
+
+        append_with_status(&path, b"new claim", b"new response", Some(200)).unwrap();
+
+        let bytes = fs::read(&path).unwrap();
+        assert!(bytes.starts_with(&[damaged.as_slice(), b"\n"].concat()));
+        let (records, skipped) = read_lenient(&path).unwrap();
+        assert_eq!(skipped, 1);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].sent().unwrap(), b"new claim");
+        assert_eq!(records[0].response().unwrap(), b"new response");
     }
 
     #[test]
