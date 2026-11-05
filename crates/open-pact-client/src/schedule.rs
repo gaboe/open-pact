@@ -1115,7 +1115,7 @@ async fn run_report(
         if manifest.hash() != &enrolment.manifest {
             bail!("manifest.toml no longer matches the hash you signed");
         }
-        crate::scan_repositories(home, &manifest, device_config)?;
+        crate::scan_repositories(home, &manifest, device_config).await?;
     }
     let events = read_events();
     let (snapshot, compliance) = report::prepare(home)?;
