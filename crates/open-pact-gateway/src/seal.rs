@@ -102,6 +102,15 @@ mod tests {
     }
 
     #[test]
+    fn opens_a_value_sealed_by_aes_gcm_0_10() {
+        let sealed = "kek1:yjJsUtwYf+FR4tlO+IhGzQyzzsRlaFpsRpgFUuUl01XhIjDendz6suQ3/xNtkM+IwLg=";
+        assert_eq!(
+            kek().open("ca_key", sealed).unwrap(),
+            b"fictional sealed value"
+        );
+    }
+
+    #[test]
     fn opens_what_it_sealed_under_the_same_name_only() {
         let sealed = kek().seal("ca_key", b"-----BEGIN PRIVATE KEY-----");
         assert!(SealingKey::is_sealed(&sealed));
