@@ -2197,13 +2197,14 @@ async fn wait_after_join(
     }
 
     let scan = scan_repositories(home, manifest, config.as_ref());
+    let interruptible = !wizard && !options.no_wait;
     let approval = wait_for_approval_with_status(
         http,
         home,
         enrolment,
         manifest,
         options.poll_interval,
-        false,
+        interruptible,
         !wizard,
     );
     tokio::pin!(scan);
@@ -2211,10 +2212,11 @@ async fn wait_after_join(
     let mut early_approval = None;
     let scan = tokio::select! {
         result = &mut approval => {
-            if matches!(&result, Ok(Ok(ApprovalWait::Approved))) {
+            let approved = matches!(&result, Ok(Ok(ApprovalWait::Approved)));
+            early_approval = Some(result);
+            if approved {
                 Some(scan.await?)
             } else {
-                early_approval = Some(result);
                 None
             }
         }
@@ -2258,6 +2260,10 @@ async fn wait_after_join(
         }
         Ok(wait) => {
             let code = approval_exit(wait, &command);
+            if wait == ApprovalWait::Interrupted && !wizard {
+                let _ = std::io::stdout().flush();
+                std::process::exit(130);
+            }
             match wait {
                 ApprovalWait::Approved => {
                     print_claim_log_status(home, None, Some("finish and check have not run yet"))
