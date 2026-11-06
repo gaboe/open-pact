@@ -1541,7 +1541,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "open-pact-client"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -1570,7 +1570,7 @@ dependencies = [
 
 [[package]]
 name = "open-pact-core"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -1588,7 +1588,7 @@ dependencies = [
 
 [[package]]
 name = "open-pact-gateway"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1614,7 +1614,7 @@ dependencies = [
 
 [[package]]
 name = "open-pact-witness"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "anyhow",
  "axum",
