@@ -788,6 +788,39 @@ mod tests {
     }
 
     #[test]
+    fn managed_repo_groups_count_first_home_folders_and_sort_by_count_then_name() {
+        let home = Path::new("/users/example");
+        let paths = [
+            home.join("work/a/x"),
+            home.join("work/b/y"),
+            home.join("work/b/z"),
+            home.join(".tool/w"),
+            home.join("top"),
+        ];
+
+        assert_eq!(
+            managed_repo_groups(&paths, home),
+            vec![
+                ("~/work".into(), 3),
+                ("~".into(), 1),
+                ("~/.tool".into(), 1),
+            ]
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn managed_repo_groups_accept_windows_home_paths_on_any_host() {
+        assert_eq!(
+            managed_repo_groups(
+                &[PathBuf::from(r"C:\Users\x\source\repos\app")],
+                Path::new(r"C:\Users\x"),
+            ),
+            vec![("~/source".into(), 1)]
+        );
+    }
+
+    #[test]
     fn matches_scp_ssh_and_https_urls_by_host_and_path_prefix() {
         let patterns = [pattern("github.com/example-org/")];
         let hosts = SshConfig::default();
