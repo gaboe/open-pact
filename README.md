@@ -240,7 +240,7 @@ Log entries are private. The public `/v1/log/entries` and `/v1/log/proof/inclusi
 
 Public consistency proofs expose leaf hashes for log changes. An outsider who polls checkpoints can count and time changes. The outsider can recognize manifest and retention-purge entries, then identify the remaining changes as device events. Salted commitments stop the outsider from linking a device event to a device. Entry contents remain private. Witnesses verify checkpoint consistency, and each approved device verifies its own entries.
 
-**Checkpoints.** The gateway signs a checkpoint, the C2SP [tlog-checkpoint](https://c2sp.org/tlog-checkpoint) body `<origin>\n<size>\n<base64 root>\n`, in C2SP [signed-note](https://c2sp.org/signed-note) format. The key name is the origin, set by `LOG_ORIGIN` (default `pact.example.com/log`). The log key is ECDSA P-256, signed-note type `0x02` as transparency-dev/formats implements it: a DER signature over SHA-256, and a key ID from the DER public key. Most C2SP tools use Ed25519. P-256 keeps the log key in the same hardware as the other keys.
+**Checkpoints.** The gateway signs a checkpoint, the C2SP [tlog-checkpoint](https://c2sp.org/tlog-checkpoint) body `<origin>\n<size>\n<base64 root>\n`, in C2SP [signed-note](https://c2sp.org/signed-note) format. Set `LOG_ORIGIN` to the gateway's stable log identity before startup. The key name is this origin. The log key is ECDSA P-256, signed-note type `0x02` as transparency-dev/formats implements it: a DER signature over SHA-256, and a key ID from the DER public key. Most C2SP tools use Ed25519. P-256 keeps the log key in the same hardware as the other keys.
 
 **Witnesses.** A witness is a separate service, `open-pact-witness`, with its own Ed25519 key and its own state file. It implements the C2SP [tlog-witness](https://c2sp.org/tlog-witness) `add-checkpoint` call. It keeps the latest checkpoint it cosigned for each log. It cosigns a new checkpoint only with a valid consistency proof from that size, and it refuses forks and rollbacks (422 and 400) and a stale old size (409 with the size it holds). Run one process per witness key, with one state file. At start the witness takes an exclusive lock on the directory `<state>.lockdir` and holds it until it exits, so a second process on the same state refuses to start. A state path that ends in `.lockdir`, or a file where the lock directory belongs, also refuses to start. Before and after each save the witness checks that the lock path still names the directory it locked. If not, it cosigns nothing more. Older versions locked the file `<state>.lock`, and the two locks do not exclude each other: stop the old witness before you start an upgraded one. A leftover `<state>.lock` file is stale and harmless. The lock does not reach other hosts or network file systems: never run one witness key on two hosts. The cosignature is Ed25519 `cosignature/v1` with a timestamp (C2SP [tlog-cosignature](https://c2sp.org/tlog-cosignature)).
 
@@ -414,19 +414,23 @@ After IT approves the device, run `open-pact-client finish`. It prepares `open-p
 
 ```toml
 [report]
-collector = "https://collector.internal.example.org/status"
-# Optional. The default is the collector host and port.
+# Set collector to the address your company gives you before enabling the schedule.
+# collector = "https://collector.example.org/status"
 # vpn_probe = "vpn.example.org:443"
 
 [schedule]
-enabled = true
+enabled = false
 run_as = "user"
 
 [managed_repos]
-folders = ["~/work"]
+# Managed repositories found: 3
+#   ~/projects (2)
+#   ~/source (1)
+# folders = ["~/projects", "~/source"]
+folders = []
 ```
 
-Every section is optional. A scheduled job needs `[report].collector`. Folder paths must be absolute after `~` expands to the user's home. Loading does not inspect the filesystem. Folder paths stay on the device. These folders are reserved for managed repository checks.
+Every section is optional. Set `[report].collector` to the address your company gives you before sending a report or enabling the schedule. Enable the schedule after you set the collector and confirm VPN access. The client lists the folders it found in comments. Uncomment the `# folders` line for the folders you want to include. Folder paths must be absolute after `~` expands to the user's home. Loading does not inspect the filesystem. Folder paths stay on the device. These folders are reserved for managed repository checks.
 
 `check` prints each manifest control, its requirement for this OS, the device setting that feeds it, and the result. A missing or invalid configuration prints what to add or fix. Other controls still run.
 

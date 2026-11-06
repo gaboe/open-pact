@@ -917,7 +917,12 @@ fn foreign_checkpoint(tree: &Tree, cp: &LogCheckpoint) -> Option<String> {
 }
 
 fn log_origin() -> anyhow::Result<String> {
-    let origin = std::env::var("LOG_ORIGIN").unwrap_or_else(|_| "pact.example.com/log".into());
+    parse_log_origin(std::env::var("LOG_ORIGIN").ok())
+}
+
+fn parse_log_origin(origin: Option<String>) -> anyhow::Result<String> {
+    let origin =
+        origin.ok_or_else(|| anyhow::anyhow!("LOG_ORIGIN is required to start the gateway"))?;
     if origin.is_empty() || origin.contains(|c: char| c.is_whitespace() || c == '+') {
         anyhow::bail!("LOG_ORIGIN must be non-empty, without spaces or '+': {origin:?}");
     }
@@ -1876,5 +1881,15 @@ mod tests {
         };
         assert!(foreign_checkpoint(&tree, &beyond).is_some());
         assert!(foreign_checkpoint(&tree, &at(0)).is_some());
+    }
+
+    #[test]
+    fn log_origin_requires_a_configured_origin() {
+        assert_eq!(
+            parse_log_origin(Some("gateway.example.org/log".into())).unwrap(),
+            "gateway.example.org/log"
+        );
+        let error = parse_log_origin(None).unwrap_err().to_string();
+        assert!(error.contains("LOG_ORIGIN is required"), "{error}");
     }
 }

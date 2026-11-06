@@ -12,12 +12,10 @@ const FILE: &str = "repo-scan.json";
 const MAX_DEPTH: usize = 8;
 const MAX_AGE_SECS: i64 = 48 * 60 * 60;
 const CACHE_TEMP_MIN_AGE: Duration = Duration::from_secs(10 * 60);
-const PRUNED: &[&str] = &["node_modules", "target", "bin", "obj", ".Trash"];
-/// Folders directly in the user home that hold no repositories. macOS asks for permission
-/// before a program reads the media folders.
-const HOME_PRUNED: &[&str] = &["Library", "Pictures", "Movies", "Music"];
-/// Tool caches, SDKs, and container storage add scan time without user repositories.
-const HOME_CACHE_PRUNED: &[&str] = &[
+// Generated output holds build products instead of user repositories.
+const GENERATED_PRUNED: &[&str] = &["node_modules", "target", "bin", "obj"];
+// Package and toolchain caches hold downloaded dependencies and tool data.
+const PACKAGE_TOOLCHAIN_PRUNED: &[&str] = &[
     ".bun",
     ".cache",
     ".cargo",
@@ -28,9 +26,6 @@ const HOME_CACHE_PRUNED: &[&str] = &[
     ".m2",
     ".nuget",
     ".platformio",
-    "OrbStack",
-    ".orbstack",
-    ".docker",
     ".oh-my-zsh",
     ".vscode/extensions",
     ".cursor/extensions",
@@ -40,9 +35,18 @@ const HOME_CACHE_PRUNED: &[&str] = &[
     ".nvm",
     ".sdkman",
     "go/pkg",
-    ".local/share/containers",
-    ".local/share/Trash",
 ];
+// Container and VM storage holds images and virtual machine data.
+const CONTAINER_VM_PRUNED: &[&str] = &[
+    "OrbStack",
+    ".orbstack",
+    ".docker",
+    ".local/share/containers",
+];
+// OS media and Library folders can be large and can trigger macOS access prompts.
+const OS_MEDIA_PRUNED: &[&str] = &["Library", "Pictures", "Movies", "Music"];
+// Trash folders hold deleted data rather than active repositories.
+const TRASH_PRUNED: &[&str] = &[".Trash", ".local/share/Trash"];
 
 pub(crate) fn managed_repo_groups(paths: &[PathBuf], home: &Path) -> Vec<(String, usize)> {
     let mut groups = BTreeMap::<String, usize>::new();
@@ -477,11 +481,16 @@ fn walk(
             continue;
         }
         let name = entry.file_name();
-        if PRUNED.iter().any(|pruned| name == *pruned)
-            || (depth == 0 && HOME_PRUNED.iter().any(|pruned| name == *pruned))
+        if GENERATED_PRUNED
+            .iter()
+            .chain(TRASH_PRUNED.iter().filter(|pruned| !pruned.contains('/')))
+            .any(|pruned| name == *pruned)
+            || (depth == 0 && OS_MEDIA_PRUNED.iter().any(|pruned| name == *pruned))
             || path.strip_prefix(root).is_ok_and(|relative| {
-                HOME_CACHE_PRUNED
+                PACKAGE_TOOLCHAIN_PRUNED
                     .iter()
+                    .chain(CONTAINER_VM_PRUNED.iter())
+                    .chain(TRASH_PRUNED.iter().filter(|pruned| pruned.contains('/')))
                     .any(|pruned| relative == Path::new(pruned))
             })
             || name.to_string_lossy().ends_with(".photoslibrary")
@@ -1154,8 +1163,10 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("user");
         let code = root.join("code/x");
-        let mut repos = HOME_CACHE_PRUNED
+        let mut repos = PACKAGE_TOOLCHAIN_PRUNED
             .iter()
+            .chain(CONTAINER_VM_PRUNED.iter())
+            .chain(TRASH_PRUNED.iter())
             .map(|path| root.join(path).join("x"))
             .collect::<Vec<_>>();
         repos.push(code.clone());
@@ -1365,10 +1376,12 @@ mod tests {
     fn skips_every_pruned_folder() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("user");
-        let pruned = PRUNED
+        let pruned = GENERATED_PRUNED
             .iter()
-            .chain(HOME_PRUNED.iter())
-            .chain(HOME_CACHE_PRUNED.iter())
+            .chain(PACKAGE_TOOLCHAIN_PRUNED.iter())
+            .chain(CONTAINER_VM_PRUNED.iter())
+            .chain(OS_MEDIA_PRUNED.iter())
+            .chain(TRASH_PRUNED.iter())
             .copied()
             .collect::<Vec<_>>();
         for name in pruned {
