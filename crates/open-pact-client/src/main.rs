@@ -4030,7 +4030,11 @@ mod tests {
                     if opened == 1 {
                         "[managed_repos\n"
                     } else {
-                        "[managed_repos]\nfolders = [\"/work\"]\n"
+                        if cfg!(windows) {
+                            "[managed_repos]\nfolders = [\"C:/work\"]\n"
+                        } else {
+                            "[managed_repos]\nfolders = [\"/work\"]\n"
+                        }
                     },
                 )
             },
@@ -4046,7 +4050,11 @@ mod tests {
                 .managed_repos
                 .unwrap()
                 .folders,
-            vec![PathBuf::from("/work")]
+            vec![PathBuf::from(if cfg!(windows) {
+                "C:/work"
+            } else {
+                "/work"
+            })]
         );
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("Open open-pact.toml in your editor? [Y/n]"));

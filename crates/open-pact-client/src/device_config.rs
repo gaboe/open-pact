@@ -609,7 +609,11 @@ grace = "0d"
         let manifest =
             open_pact_core::Manifest::parse(include_bytes!("../../../examples/manifest.toml"))
                 .unwrap();
-        let home = Path::new("/home/example");
+        let home = Path::new(if cfg!(windows) {
+            r"C:\Users\example"
+        } else {
+            "/home/example"
+        });
         let scan = crate::checks::repos::RepoScan {
             scanned_at: 0,
             managed_repos_outside: 3,
