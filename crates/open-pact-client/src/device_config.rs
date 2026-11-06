@@ -563,9 +563,7 @@ grace = "0d"
             Some(&scan),
             Some(&home),
         );
-        assert!(text.contains(
-            "# Managed repositories found: 2\n#   ~/code/personal (1)\n#   ~/code/work (1)\n"
-        ));
+        assert!(text.contains("# Managed repositories found: 2\n#   ~/code (2)\n"));
     }
 
     #[cfg(unix)]
