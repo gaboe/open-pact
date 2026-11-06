@@ -1128,7 +1128,9 @@ mod tests {
         fs::write(&stale, b"partial scan").unwrap();
         fs::write(&unrelated, b"keep").unwrap();
         fs::write(&noncanonical, b"keep").unwrap();
-        fs::File::open(&stale)
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&stale)
             .unwrap()
             .set_times(fs::FileTimes::new().set_modified(
                 std::time::SystemTime::now() - CACHE_TEMP_MIN_AGE - Duration::from_secs(1),
