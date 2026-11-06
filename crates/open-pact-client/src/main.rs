@@ -172,6 +172,14 @@ struct DeviceStatusResponse {
 enum ApprovalWait {
     Approved,
     Revoked,
+    Interrupted,
+}
+
+#[derive(Clone, Copy)]
+enum ClaimResult {
+    Accepted,
+    Denied,
+    ResponseUnverified,
 }
 
 #[derive(Clone, Copy)]
@@ -326,7 +334,11 @@ fn print_stopped(home: &Home, invitation: Option<&str>) {
     } else {
         format!("{command} join {}", shell_quote_arg("<invitation from IT>"))
     };
-    println!("Stopped at [{step}/6]. Continue with: {continuation}");
+    println!("{}", stopped_message(step, &continuation));
+}
+
+fn stopped_message(step: u8, continuation: &str) -> String {
+    format!("Stopped at [{step}/6]. Continue with: {continuation}")
 }
 
 /// The directory of VPN credential generations, the selected generation, and its files,
@@ -1985,19 +1997,32 @@ async fn wait_for_approval(
     enrolment: &Enrolment,
     manifest: &Manifest,
     poll_interval: Duration,
+    interruptible: bool,
 ) -> Result<Result<ApprovalWait, String>> {
     print_waiting_line("Waiting for IT approval...");
     let mut warning_printed = false;
     let mut first_poll = true;
     loop {
         if !first_poll {
-            tokio::select! {
-                _ = tokio::time::sleep(poll_interval) => {}
+            if interruptible {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => return Ok(Ok(ApprovalWait::Interrupted)),
+                    _ = tokio::time::sleep(poll_interval) => {}
+                }
+            } else {
+                tokio::time::sleep(poll_interval).await;
             }
         }
         let first = first_poll;
         first_poll = false;
-        let status_result = fetch_device_status(http, home, enrolment).await;
+        let status_result = if interruptible {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => return Ok(Ok(ApprovalWait::Interrupted)),
+                result = fetch_device_status(http, home, enrolment) => result,
+            }
+        } else {
+            fetch_device_status(http, home, enrolment).await
+        };
         let status = match status_result {
             Ok(status) => status,
             Err(WaitError::Network) => {
@@ -2060,6 +2085,10 @@ fn approval_exit(wait: ApprovalWait, command: &str) -> ExitCode {
             println!("\nThis device was revoked. Contact IT before you continue.");
             ExitCode::FAILURE
         }
+        ApprovalWait::Interrupted => {
+            println!("\n{}", stopped_message(4, &format!("{command} join")));
+            ExitCode::from(130)
+        }
     }
 }
 
@@ -2090,7 +2119,16 @@ async fn wait_after_join(
         print_claim_log_status(home, None, Some("IT has not approved this device yet"));
         return Ok(ExitCode::SUCCESS);
     }
-    match wait_for_approval(http, home, enrolment, manifest, options.poll_interval).await? {
+    match wait_for_approval(
+        http,
+        home,
+        enrolment,
+        manifest,
+        options.poll_interval,
+        !wizard,
+    )
+    .await?
+    {
         Ok(ApprovalWait::Approved) if wizard => {
             println!("\n  {}", ui::bold(approval_confirmation(), ui::styled()));
             after_approval(home, options.insecure_dev, true).await
@@ -2104,6 +2142,7 @@ async fn wait_after_join(
                 ApprovalWait::Revoked => {
                     print_claim_log_status(home, None, Some("IT revoked this device"));
                 }
+                ApprovalWait::Interrupted => {}
             }
             Ok(code)
         }
@@ -2130,6 +2169,7 @@ async fn continue_saved_join(
 ) -> Result<ExitCode> {
     let wizard = wizard_enabled(options.no_wait);
     if wizard {
+        wizard_step(4, "Wait for IT approval");
         match fetch_device_status(http, home, enrolment).await {
             Ok(Approval::Approved) => {
                 match verify_approval_entry(http, home, enrolment, manifest).await {
@@ -2856,6 +2896,17 @@ async fn check_impl(home: &Home, insecure_dev: bool, show_resume_hint: bool) -> 
                         )),
                         home,
                     );
+                    print_claim_log_status(
+                        home,
+                        Some((
+                            claim
+                                .time
+                                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                            ClaimResult::ResponseUnverified,
+                            claim.results.len(),
+                        )),
+                        None,
+                    );
                     return Ok(ExitCode::from(2));
                 }
             }
@@ -2894,7 +2945,11 @@ async fn check_impl(home: &Home, insecure_dev: bool, show_resume_hint: bool) -> 
             claim
                 .time
                 .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            accepted,
+            if accepted {
+                ClaimResult::Accepted
+            } else {
+                ClaimResult::Denied
+            },
             claim.results.len(),
         )),
         None,
@@ -2909,22 +2964,30 @@ async fn check_impl(home: &Home, insecure_dev: bool, show_resume_hint: bool) -> 
     })
 }
 
-fn print_claim_log_status(home: &Home, claim: Option<(String, bool, usize)>, reason: Option<&str>) {
+fn print_claim_log_status(
+    home: &Home,
+    claim: Option<(String, ClaimResult, usize)>,
+    reason: Option<&str>,
+) {
     println!("{}", claim_log_status_text(home, claim, reason));
 }
 
 fn claim_log_status_text(
     home: &Home,
-    claim: Option<(String, bool, usize)>,
+    claim: Option<(String, ClaimResult, usize)>,
     reason: Option<&str>,
 ) -> String {
     let path = home.file("claims.jsonl");
     let command = client_command(&home.0);
     let summary = match claim {
-        Some((time, accepted, controls)) => format!(
-            "  Last claim: {time}, {}, {controls} controls.",
-            if accepted { "accepted" } else { "denied" }
-        ),
+        Some((time, result, controls)) => {
+            let outcome = match result {
+                ClaimResult::Accepted => "accepted",
+                ClaimResult::Denied => "denied",
+                ClaimResult::ResponseUnverified => "accepted response not verified",
+            };
+            format!("  Last claim: {time}, {outcome}, {controls} controls.")
+        }
         None => format!(
             "  No claim was sent because {}.",
             reason.unwrap_or("the check stopped before it sent a claim")
@@ -3356,15 +3419,47 @@ mod tests {
     fn local_claim_log_summary_explains_the_file_and_last_claim() {
         let dir = tempfile::tempdir().unwrap();
         let home = Home(dir.path().to_path_buf());
-        let text =
-            claim_log_status_text(&home, Some(("2026-11-05T12:00:00Z".into(), true, 21)), None);
+        let text = claim_log_status_text(
+            &home,
+            Some(("2026-11-05T12:00:00Z".into(), ClaimResult::Accepted, 21)),
+            None,
+        );
         assert!(text.contains(&home.file("claims.jsonl").display().to_string()));
         assert!(text.contains("every claim this device sent"));
         assert!(text.contains("log show"));
         assert!(text.contains("2026-11-05T12:00:00Z, accepted, 21 controls"));
+        let unverified = claim_log_status_text(
+            &home,
+            Some((
+                "2026-11-05T12:00:00Z".into(),
+                ClaimResult::ResponseUnverified,
+                21,
+            )),
+            None,
+        );
+        assert!(unverified.contains("Local claim log:"));
+        assert!(unverified.contains("Show it with:"));
+        assert!(unverified.contains("accepted response not verified"));
+        assert!(!unverified.contains("No claim was sent"));
         let empty =
             claim_log_status_text(&home, None, Some("the device is waiting for IT approval"));
         assert!(empty.contains("No claim was sent because the device is waiting for IT approval."));
+    }
+
+    #[test]
+    fn approval_interruption_uses_the_interrupt_exit_status() {
+        assert_eq!(
+            approval_exit(ApprovalWait::Interrupted, "open-pact-client"),
+            ExitCode::from(130)
+        );
+    }
+
+    #[test]
+    fn approval_interruption_names_step_four_and_its_continuation() {
+        assert_eq!(
+            stopped_message(4, "open-pact-client join"),
+            "Stopped at [4/6]. Continue with: open-pact-client join"
+        );
     }
 
     #[test]
@@ -4468,6 +4563,7 @@ mod tests {
                 &enrolment,
                 &manifest,
                 Duration::from_millis(1),
+                false,
             )
             .await
             .unwrap()
@@ -4512,6 +4608,7 @@ mod tests {
             &enrolment,
             &manifest,
             Duration::from_millis(1),
+            false,
         )
         .await
         .unwrap_err()
@@ -4556,6 +4653,7 @@ mod tests {
             &enrolment,
             &manifest,
             Duration::from_millis(1),
+            false,
         )
         .await
         .unwrap()
@@ -4917,6 +5015,7 @@ mod tests {
             &enrolment,
             &manifest,
             Duration::from_millis(1),
+            false,
         )
         .await
         .unwrap()
@@ -4957,6 +5056,7 @@ mod tests {
             &enrolment,
             &manifest,
             Duration::from_millis(1),
+            false,
         )
         .await
         .unwrap()

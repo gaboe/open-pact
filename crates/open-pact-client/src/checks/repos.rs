@@ -194,7 +194,7 @@ pub(crate) fn scan_and_store(
         let urls = match read_remote_urls(repo) {
             Ok(urls) => urls,
             Err(error) => {
-                if is_partial_error(&error) {
+                if error.kind() != io::ErrorKind::NotFound {
                     repo_partial.set(true);
                     repo_access_denied.set(
                         repo_access_denied.get() || error.kind() == io::ErrorKind::PermissionDenied,
@@ -244,6 +244,7 @@ pub(crate) fn scan_and_store(
         causes: walk_state.causes,
     };
     fs::create_dir_all(home)?;
+    remove_stale_cache_temps(home)?;
     let path = home.join(FILE);
     let temporary = home.join(format!(".{FILE}.{}.tmp", uuid::Uuid::new_v4()));
     let mut options = fs::OpenOptions::new();
@@ -269,6 +270,32 @@ pub(crate) fn scan_and_store(
     write_result?;
     progress.borrow_mut().clear();
     Ok(scan)
+}
+
+fn remove_stale_cache_temps(home: &Path) -> Result<()> {
+    let entries = match fs::read_dir(home) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).with_context(|| home.display().to_string()),
+    };
+    let prefix = format!(".{FILE}.");
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.starts_with(&prefix) && name.ends_with(".tmp") {
+            match fs::remove_file(entry.path()) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| entry.path().display().to_string());
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 struct ScanProgress {
@@ -344,12 +371,7 @@ impl Drop for ScanProgress {
 }
 
 fn record_cause(causes: &mut Vec<ScanCause>, path: PathBuf, error: &io::Error) {
-    if causes.len() < 5
-        && !matches!(
-            error.kind(),
-            io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
-        )
-    {
+    if causes.len() < 5 && error.kind() != io::ErrorKind::NotFound {
         causes.push(ScanCause {
             path,
             kind: format!("{:?}", error.kind()),
@@ -457,7 +479,7 @@ fn walk(
 }
 
 fn mark_partial(state: &mut WalkState, path: PathBuf, error: &io::Error) {
-    if !is_partial_error(error) {
+    if !is_walk_partial_error(error) {
         return;
     }
     state.partial = true;
@@ -465,7 +487,7 @@ fn mark_partial(state: &mut WalkState, path: PathBuf, error: &io::Error) {
     record_cause(&mut state.causes, path, error);
 }
 
-fn is_partial_error(error: &io::Error) -> bool {
+fn is_walk_partial_error(error: &io::Error) -> bool {
     !matches!(
         error.kind(),
         io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
@@ -844,6 +866,30 @@ mod tests {
     }
 
     #[test]
+    fn damaged_git_metadata_not_directory_makes_the_scan_partial() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("user");
+        let repo = root.join("app");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join(".git"), "gitdir: ../metadata").unwrap();
+        fs::write(root.join("metadata"), "not a directory").unwrap();
+
+        let scan = scan_and_store(
+            &temp.path().join("client"),
+            &root,
+            &[],
+            &[pattern("github.com/example-org/")],
+        )
+        .unwrap();
+
+        assert!(scan.partial);
+        assert_eq!(scan.managed_repos_total, 0);
+        assert_eq!(scan.causes.len(), 1);
+        assert_eq!(scan.causes[0].kind, "NotADirectory");
+        assert_eq!(scan.causes[0].path, repo.join(".git/config"));
+    }
+
+    #[test]
     fn counts_matching_repositories_once_and_keeps_paths_local() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("user");
@@ -1035,6 +1081,25 @@ mod tests {
             );
         }
         assert_eq!(causes.len(), 5);
+    }
+
+    #[test]
+    fn next_cache_write_removes_stale_temporary_files_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("client");
+        let root = temp.path().join("user");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        let stale = home.join(".repo-scan.json.interrupted.tmp");
+        let unrelated = home.join(".repo-scan.json.interrupted.other");
+        fs::write(&stale, b"partial scan").unwrap();
+        fs::write(&unrelated, b"keep").unwrap();
+
+        scan_and_store(&home, &root, &[], &[]).unwrap();
+
+        assert!(!stale.exists());
+        assert_eq!(fs::read(unrelated).unwrap(), b"keep");
+        assert!(home.join(FILE).is_file());
     }
 
     #[test]
