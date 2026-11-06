@@ -272,6 +272,7 @@ struct Home(PathBuf);
 
 tokio::task_local! {
     static WIZARD_STEP: Cell<u8>;
+    static WIZARD_APPROVAL_WAIT: Cell<bool>;
 }
 
 fn wizard_step(step: u8, title: &str) {
@@ -298,9 +299,9 @@ where
         1
     };
     WIZARD_STEP
-        .scope(Cell::new(initial_step), async {
+        .scope(Cell::new(initial_step), WIZARD_APPROVAL_WAIT.scope(Cell::new(false), async {
             tokio::select! {
-                signal = tokio::signal::ctrl_c() => match signal {
+                signal = tokio::signal::ctrl_c(), if !WIZARD_APPROVAL_WAIT.try_with(Cell::get).unwrap_or(false) => match signal {
                     Ok(()) => {
                         print_stopped(home, invitation);
                         let _ = std::io::stdout().flush();
@@ -315,7 +316,7 @@ where
                     result
                 },
             }
-        })
+        }))
         .await
 }
 
@@ -2197,62 +2198,74 @@ async fn wait_after_join(
     }
 
     let scan = scan_repositories(home, manifest, config.as_ref());
-    let interruptible = !wizard && !options.no_wait;
     let approval = wait_for_approval_with_status(
         http,
         home,
         enrolment,
         manifest,
         options.poll_interval,
-        interruptible,
+        false,
         !wizard,
     );
     tokio::pin!(scan);
     tokio::pin!(approval);
-    let mut early_approval = None;
-    let scan = tokio::select! {
-        result = &mut approval => {
-            let approved = matches!(&result, Ok(Ok(ApprovalWait::Approved)));
-            early_approval = Some(result);
-            if approved {
-                Some(scan.await?)
+    let _ = WIZARD_APPROVAL_WAIT.try_with(|active| active.set(true));
+    let approval = tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            println!("\n{}", stopped_message(4, &format!("{command} join")));
+            let _ = std::io::stdout().flush();
+            std::process::exit(130);
+        }
+        result = async {
+            let mut early_approval = None;
+            let scan = tokio::select! {
+                result = &mut approval => {
+                    let approved = matches!(&result, Ok(Ok(ApprovalWait::Approved)));
+                    early_approval = Some(result);
+                    if approved {
+                        Some(scan.await?)
+                    } else {
+                        None
+                    }
+                }
+                result = &mut scan => Some(result?),
+            };
+            let approval = if let Some(approval) = early_approval {
+                if let Some(scan) = &scan {
+                    print!(
+                        "{}",
+                        approval_scan_output(scan, &repository_scan_root(home)?, wizard)
+                    );
+                }
+                approval?
             } else {
-                None
-            }
-        }
-        result = &mut scan => Some(result?),
-    };
-    let approval = if let Some(approval) = early_approval {
-        if let Some(scan) = &scan {
-            print!(
-                "{}",
-                approval_scan_output(scan, &repository_scan_root(home)?, wizard)
-            );
-        }
-        approval?
-    } else {
-        tokio::select! {
-            biased;
-            result = &mut approval => {
-                if let Some(scan) = &scan {
-                    print!(
-                        "{}",
-                        approval_scan_output(scan, &repository_scan_root(home)?, wizard)
-                    );
+                tokio::select! {
+                    biased;
+                    result = &mut approval => {
+                        if let Some(scan) = &scan {
+                            print!(
+                                "{}",
+                                approval_scan_output(scan, &repository_scan_root(home)?, wizard)
+                            );
+                        }
+                        result?
+                    },
+                    _ = std::future::ready(()) => {
+                        if let Some(scan) = &scan {
+                            print!(
+                                "{}",
+                                approval_scan_output(scan, &repository_scan_root(home)?, wizard)
+                            );
+                        }
+                        approval.await?
+                    }
                 }
-                result?
-            },
-            _ = std::future::ready(()) => {
-                if let Some(scan) = &scan {
-                    print!(
-                        "{}",
-                        approval_scan_output(scan, &repository_scan_root(home)?, wizard)
-                    );
-                }
-                approval.await?
-            }
-        }
+            };
+            Ok::<_, anyhow::Error>(approval)
+        } => result,
     };
+    let _ = WIZARD_APPROVAL_WAIT.try_with(|active| active.set(false));
+    let approval = approval?;
     match approval {
         Ok(ApprovalWait::Approved) if wizard => {
             println!("\n  {}", ui::bold(approval_confirmation(), ui::styled()));
