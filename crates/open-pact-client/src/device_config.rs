@@ -215,19 +215,22 @@ fn append_managed_repo_comment(
         output.push_str("# Managed repository scan is unavailable.\n");
         return;
     };
-    if scan.partial {
-        output.push_str("# Managed repository scan was partial; results may be incomplete.\n");
-        return;
-    }
-    let Some(home) = user_home else {
-        output.push_str("# Managed repository locations are unavailable.\n");
-        return;
-    };
     let Some(paths) = &scan.managed_paths else {
         output.push_str("# Managed repository locations are unavailable.\n");
+        if scan.partial {
+            output.push_str("# Managed repository scan was partial; results may be incomplete.\n");
+        }
         return;
     };
-    let groups = crate::checks::repos::managed_repo_groups(paths, home);
+    let groups = user_home.map_or_else(
+        || {
+            paths
+                .iter()
+                .map(|path| (path.display().to_string(), 1))
+                .collect()
+        },
+        |home| crate::checks::repos::managed_repo_groups(paths, home),
+    );
     output.push_str(&format!(
         "# Managed repositories found: {}\n",
         scan.managed_repos_total
@@ -235,9 +238,33 @@ fn append_managed_repo_comment(
     for (path, count) in groups {
         output.push_str(&format!("#   {} ({count})\n", safe_comment_text(&path)));
     }
+    if scan.partial {
+        output.push_str("# Managed repository scan was partial; results may be incomplete.\n");
+    }
     output.push_str(
         "# Add the folders that should hold them to `folders`, for example: folders = [\"~/work\"]\n",
     );
+}
+
+pub(crate) fn managed_repo_summary(scan: &crate::checks::repos::RepoScan, home: &Path) -> String {
+    let mut output = String::new();
+    match &scan.managed_paths {
+        Some(paths) if paths.is_empty() => output.push_str("  No managed repositories found.\n"),
+        Some(paths) => {
+            output.push_str(&format!(
+                "  Found {} managed repositories:\n",
+                scan.managed_repos_total
+            ));
+            for (path, count) in crate::checks::repos::managed_repo_groups(paths, home) {
+                output.push_str(&format!("    {} ({count})\n", safe_comment_text(&path)));
+            }
+        }
+        None => output.push_str("  Managed repository locations are unavailable.\n"),
+    }
+    if scan.partial {
+        output.push_str("  Managed repository scan was partial; results may be incomplete.\n");
+    }
+    output
 }
 
 fn safe_comment_text(text: &str) -> String {
@@ -584,21 +611,29 @@ grace = "0d"
         let missing = example(&manifest, open_pact_core::Os::Macos, None, None);
         assert!(missing.contains("# Managed repository scan is unavailable.\n"));
 
+        let home = Path::new("/home/example");
         let partial = crate::checks::repos::RepoScan {
             scanned_at: chrono::Utc::now().timestamp(),
             managed_repos_outside: 0,
-            managed_repos_total: 0,
+            managed_repos_total: 2,
             outside_paths: Vec::new(),
-            managed_paths: Some(Vec::new()),
+            managed_paths: Some(vec![home.join("work/one"), home.join("archive/work/two")]),
             partial: true,
             access_denied: false,
             causes: Vec::new(),
         };
-        let text = example(&manifest, open_pact_core::Os::Macos, Some(&partial), None);
+        let text = example(
+            &manifest,
+            open_pact_core::Os::Macos,
+            Some(&partial),
+            Some(home),
+        );
         assert!(
             text.contains("# Managed repository scan was partial; results may be incomplete.\n")
         );
-        assert!(!text.contains("# Managed repositories found:"));
+        assert!(text.contains(
+            "# Managed repositories found: 2\n#   ~/archive (1)\n#   ~/work (1)\n# Managed repository scan was partial; results may be incomplete.\n"
+        ));
 
         let old = crate::checks::repos::RepoScan {
             scanned_at: chrono::Utc::now().timestamp(),
@@ -618,6 +653,61 @@ grace = "0d"
         );
         assert!(text.contains("# Managed repository locations are unavailable.\n"));
         assert!(!text.contains("# Managed repositories found: 0"));
+    }
+
+    #[test]
+    fn step_four_summary_groups_paths_and_places_the_partial_note_last() {
+        let home = Path::new("/home/example");
+        let scan = crate::checks::repos::RepoScan {
+            scanned_at: chrono::Utc::now().timestamp(),
+            managed_repos_outside: 3,
+            managed_repos_total: 3,
+            outside_paths: Vec::new(),
+            managed_paths: Some(vec![
+                home.join("work/one"),
+                home.join("work/two"),
+                home.join("archive/work/three"),
+            ]),
+            partial: true,
+            access_denied: false,
+            causes: Vec::new(),
+        };
+        let text = managed_repo_summary(&scan, home);
+        assert_eq!(
+            text,
+            concat!(
+                "  Found 3 managed repositories:\n",
+                "    ~/archive (1)\n",
+                "    ~/work (2)\n",
+                "  Managed repository scan was partial; results may be incomplete.\n",
+            )
+        );
+    }
+
+    #[test]
+    fn step_four_summary_reports_no_repositories_and_unavailable_paths() {
+        let empty = crate::checks::repos::RepoScan {
+            scanned_at: chrono::Utc::now().timestamp(),
+            managed_repos_outside: 0,
+            managed_repos_total: 0,
+            outside_paths: Vec::new(),
+            managed_paths: Some(Vec::new()),
+            partial: false,
+            access_denied: false,
+            causes: Vec::new(),
+        };
+        assert_eq!(
+            managed_repo_summary(&empty, Path::new("/home/example")),
+            "  No managed repositories found.\n"
+        );
+        let unavailable = crate::checks::repos::RepoScan {
+            managed_paths: None,
+            ..empty
+        };
+        assert_eq!(
+            managed_repo_summary(&unavailable, Path::new("/home/example")),
+            "  Managed repository locations are unavailable.\n"
+        );
     }
 
     #[test]

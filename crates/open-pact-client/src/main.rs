@@ -854,12 +854,7 @@ async fn scan_repositories(
     manifest: &Manifest,
     config: Option<&device_config::DeviceConfig>,
 ) -> Result<checks::repos::RepoScan> {
-    #[cfg(test)]
-    let root = home.0.clone();
-    #[cfg(not(test))]
-    let root = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
-        .map(PathBuf::from)
-        .context("user home is not set")?;
+    let root = repository_scan_root(home)?;
     let folders = config
         .and_then(|config| config.managed_repos.as_ref())
         .map_or_else(Vec::new, |repos| repos.folders.clone());
@@ -870,11 +865,26 @@ async fn scan_repositories(
         .flat_map(|control| control.remotes.iter().map(ToString::to_string))
         .collect::<Vec<_>>();
     let state = home.0.clone();
-    tokio::task::spawn_blocking(move || {
-        checks::repos::scan_and_store(&state, &root, &folders, &patterns)
-    })
-    .await
-    .context("repository scan task stopped")?
+    let scan_root = root.clone();
+    let scan =
+        tokio::task::spawn_blocking(move || checks::repos::scan(&scan_root, &folders, &patterns))
+            .await
+            .context("repository scan task stopped")??;
+    checks::repos::store(&state, &scan)?;
+    Ok(scan)
+}
+
+fn repository_scan_root(_home: &Home) -> Result<PathBuf> {
+    #[cfg(test)]
+    {
+        Ok(_home.0.clone())
+    }
+    #[cfg(not(test))]
+    {
+        std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+            .map(PathBuf::from)
+            .context("user home is not set")
+    }
 }
 
 fn stored_repo_scan(home: &Home) -> Result<Option<checks::repos::RepoScan>> {
@@ -1991,6 +2001,7 @@ fn print_waiting_line(message: &str) {
     }
 }
 
+#[cfg(test)]
 async fn wait_for_approval(
     http: &reqwest::Client,
     home: &Home,
@@ -1999,7 +2010,30 @@ async fn wait_for_approval(
     poll_interval: Duration,
     interruptible: bool,
 ) -> Result<Result<ApprovalWait, String>> {
-    print_waiting_line("Waiting for IT approval...");
+    wait_for_approval_with_status(
+        http,
+        home,
+        enrolment,
+        manifest,
+        poll_interval,
+        interruptible,
+        true,
+    )
+    .await
+}
+
+async fn wait_for_approval_with_status(
+    http: &reqwest::Client,
+    home: &Home,
+    enrolment: &Enrolment,
+    manifest: &Manifest,
+    poll_interval: Duration,
+    interruptible: bool,
+    show_waiting: bool,
+) -> Result<Result<ApprovalWait, String>> {
+    if show_waiting {
+        print_waiting_line("Waiting for IT approval...");
+    }
     let mut warning_printed = false;
     let mut first_poll = true;
     loop {
@@ -2037,7 +2071,9 @@ async fn wait_for_approval(
         };
         match status {
             Approval::Revoked => return Ok(Ok(ApprovalWait::Revoked)),
-            Approval::Pending if !first => print_waiting_line("Waiting for IT approval..."),
+            Approval::Pending if !first && show_waiting => {
+                print_waiting_line("Waiting for IT approval...")
+            }
             Approval::Pending => {}
             Approval::Approved => {
                 let proof_result = if interruptible {
@@ -2062,9 +2098,10 @@ async fn wait_for_approval(
                     Err(WaitError::Alarm(error)) => return Ok(Err(error)),
                     Err(WaitError::Fatal(error)) => return Err(error),
                     Ok(true) => return Ok(Ok(ApprovalWait::Approved)),
-                    Ok(false) => print_waiting_line(
+                    Ok(false) if show_waiting => print_waiting_line(
                         "IT approved the device. Waiting for the signed log proof...",
                     ),
+                    Ok(false) => {}
                 }
             }
         }
@@ -2082,6 +2119,18 @@ fn approved_next_hint(command: &str) -> String {
 
 fn approval_confirmation() -> &'static str {
     "This device is approved."
+}
+
+fn approval_scan_output(
+    scan: &checks::repos::RepoScan,
+    user_home: &Path,
+    still_waiting: bool,
+) -> String {
+    let mut output = device_config::managed_repo_summary(scan, user_home);
+    if still_waiting {
+        output.push_str("  The client is still waiting for IT approval. Keep this window open.\n");
+    }
+    output
 }
 
 fn approval_exit(wait: ApprovalWait, command: &str) -> ExitCode {
@@ -2117,7 +2166,25 @@ async fn wait_after_join(
     println!("  Read this code to IT. IT approves the device with it.");
     let command = client_command(&home.0);
     let wizard = wizard && !options.no_wait;
+    println!(
+        "  The client now looks for managed repositories in your home folder to prepare the `managed_repos` setup proposal for open-pact.toml."
+    );
+    if current_os()? == Os::Macos
+        && manifest
+            .body()
+            .controls
+            .iter()
+            .any(|control| !control.remotes.is_empty())
+    {
+        println!("  If macOS asks for access to a folder, you can deny it.");
+    }
+    let config = device_config::DeviceConfig::load(home)?;
     if options.no_wait {
+        let scan = scan_repositories(home, manifest, config.as_ref()).await?;
+        print!(
+            "{}",
+            device_config::managed_repo_summary(&scan, &repository_scan_root(home)?)
+        );
         println!("\nNext, after IT approves:");
         println!("  1. {command} config example");
         println!(
@@ -2128,16 +2195,63 @@ async fn wait_after_join(
         print_claim_log_status(home, None, Some("IT has not approved this device yet"));
         return Ok(ExitCode::SUCCESS);
     }
-    match wait_for_approval(
+
+    let scan = scan_repositories(home, manifest, config.as_ref());
+    let approval = wait_for_approval_with_status(
         http,
         home,
         enrolment,
         manifest,
         options.poll_interval,
+        false,
         !wizard,
-    )
-    .await?
-    {
+    );
+    tokio::pin!(scan);
+    tokio::pin!(approval);
+    let mut early_approval = None;
+    let scan = tokio::select! {
+        result = &mut approval => {
+            if matches!(&result, Ok(Ok(ApprovalWait::Approved))) {
+                Some(scan.await?)
+            } else {
+                early_approval = Some(result);
+                None
+            }
+        }
+        result = &mut scan => Some(result?),
+    };
+    let approval = if let Some(approval) = early_approval {
+        if let Some(scan) = &scan {
+            print!(
+                "{}",
+                approval_scan_output(scan, &repository_scan_root(home)?, wizard)
+            );
+        }
+        approval?
+    } else {
+        tokio::select! {
+            biased;
+            result = &mut approval => {
+                if let Some(scan) = &scan {
+                    print!(
+                        "{}",
+                        approval_scan_output(scan, &repository_scan_root(home)?, wizard)
+                    );
+                }
+                result?
+            },
+            _ = std::future::ready(()) => {
+                if let Some(scan) = &scan {
+                    print!(
+                        "{}",
+                        approval_scan_output(scan, &repository_scan_root(home)?, wizard)
+                    );
+                }
+                approval.await?
+            }
+        }
+    };
+    match approval {
         Ok(ApprovalWait::Approved) if wizard => {
             println!("\n  {}", ui::bold(approval_confirmation(), ui::styled()));
             after_approval(home, options.insecure_dev, true).await
@@ -2177,41 +2291,6 @@ async fn continue_saved_join(
     options: JoinOptions,
 ) -> Result<ExitCode> {
     let wizard = wizard_enabled(options.no_wait);
-    if wizard {
-        wizard_step(4, "Wait for IT approval");
-        match fetch_device_status(http, home, enrolment).await {
-            Ok(Approval::Approved) => {
-                match verify_approval_entry(http, home, enrolment, manifest).await {
-                    Ok(true) => {
-                        println!("\n  {}", ui::bold(approval_confirmation(), ui::styled()));
-                        return after_approval(home, options.insecure_dev, true).await;
-                    }
-                    Ok(false) | Err(WaitError::Network) => {}
-                    Err(WaitError::Alarm(error)) => {
-                        eprintln!("\nTRANSPARENCY LOG ALARM: {error}");
-                        print_claim_log_status(
-                            home,
-                            None,
-                            Some("the approval proof did not verify"),
-                        );
-                        return Ok(ExitCode::from(2));
-                    }
-                    Err(WaitError::Fatal(error)) => return Err(error),
-                }
-            }
-            Ok(Approval::Revoked) => {
-                println!("This device was revoked. Contact IT before you continue.");
-                return Ok(ExitCode::FAILURE);
-            }
-            Ok(Approval::Pending) | Err(WaitError::Network) => {}
-            Err(WaitError::Alarm(error)) => {
-                eprintln!("\nTRANSPARENCY LOG ALARM: {error}");
-                print_claim_log_status(home, None, Some("the approval proof did not verify"));
-                return Ok(ExitCode::from(2));
-            }
-            Err(WaitError::Fatal(error)) => return Err(error),
-        }
-    }
     wait_after_join(http, home, enrolment, manifest, options, wizard).await
 }
 
@@ -2415,20 +2494,6 @@ async fn join(
         return Ok(ExitCode::FAILURE);
     }
     wizard_step(3, "Enrol this device");
-    let config = device_config::DeviceConfig::load(home)?;
-    if os == Os::Macos
-        && manifest
-            .body()
-            .controls
-            .iter()
-            .any(|c| !c.remotes.is_empty())
-    {
-        println!(
-            "  Looking for managed repositories in your home folder. If macOS asks for access \
-             to a folder, you can deny it."
-        );
-    }
-    scan_repositories(home, &manifest, config.as_ref()).await?;
     let owner = dev_key::load_or_create(&home.file("owner-dev.pem"))?;
     let device = DeviceKey::load_or_create(&home.0, software_key)?;
     let signed = SignedManifest {
@@ -3469,6 +3534,31 @@ mod tests {
             stopped_message(4, "open-pact-client join"),
             "Stopped at [4/6]. Continue with: open-pact-client join"
         );
+    }
+
+    #[test]
+    fn step_four_prints_scan_summary_before_the_waiting_message() {
+        let home = Path::new("/home/example");
+        let scan = checks::repos::RepoScan {
+            scanned_at: chrono::Utc::now().timestamp(),
+            managed_repos_outside: 2,
+            managed_repos_total: 2,
+            outside_paths: Vec::new(),
+            managed_paths: Some(vec![home.join("work/one"), home.join("work/two")]),
+            partial: true,
+            access_denied: false,
+            causes: Vec::new(),
+        };
+        let output = approval_scan_output(&scan, home, true);
+        let found = output.find("Found 2 managed repositories:").unwrap();
+        let locations = output.find("~/work (2)").unwrap();
+        let partial = output.find("scan was partial").unwrap();
+        let waiting = output.find("still waiting for IT approval").unwrap();
+        assert!(
+            found < locations && locations < partial && partial < waiting,
+            "{output}"
+        );
+        assert!(!approval_scan_output(&scan, home, false).contains("still waiting"));
     }
 
     #[test]

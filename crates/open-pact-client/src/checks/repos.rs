@@ -169,12 +169,19 @@ pub(crate) fn load_attempt(home: &Path) -> Result<Option<RepoScan>> {
     Ok(Some(scan))
 }
 
+#[cfg(test)]
 pub(crate) fn scan_and_store(
     home: &Path,
     root: &Path,
     folders: &[PathBuf],
     patterns: &[String],
 ) -> Result<RepoScan> {
+    let scan = scan(root, folders, patterns)?;
+    store(home, &scan)?;
+    Ok(scan)
+}
+
+pub(crate) fn scan(root: &Path, folders: &[PathBuf], patterns: &[String]) -> Result<RepoScan> {
     let ssh_hosts = fs::read_to_string(root.join(".ssh/config"))
         .map(|text| parse_ssh_hosts(&text))
         .unwrap_or_default();
@@ -244,6 +251,11 @@ pub(crate) fn scan_and_store(
         access_denied: walk_state.access_denied,
         causes: walk_state.causes,
     };
+    progress.borrow_mut().clear();
+    Ok(scan)
+}
+
+pub(crate) fn store(home: &Path, scan: &RepoScan) -> Result<()> {
     fs::create_dir_all(home)?;
     remove_stale_cache_temps(home)?;
     let path = home.join(FILE);
@@ -259,7 +271,7 @@ pub(crate) fn scan_and_store(
         let mut file = options
             .open(&temporary)
             .with_context(|| temporary.display().to_string())?;
-        file.write_all(&serde_json::to_vec(&scan)?)?;
+        file.write_all(&serde_json::to_vec(scan)?)?;
         file.sync_all()?;
         drop(file);
         fs::rename(&temporary, &path).with_context(|| path.display().to_string())?;
@@ -269,8 +281,7 @@ pub(crate) fn scan_and_store(
         let _ = fs::remove_file(&temporary);
     }
     write_result?;
-    progress.borrow_mut().clear();
-    Ok(scan)
+    Ok(())
 }
 
 fn remove_stale_cache_temps(home: &Path) -> Result<()> {
@@ -528,8 +539,8 @@ fn is_walk_partial_error(error: &io::Error) -> bool {
 
 fn read_remote_urls(repo: &Path) -> std::io::Result<Vec<String>> {
     let git = repo.join(".git");
-    let git_dir = match fs::symlink_metadata(&git) {
-        Ok(metadata) if metadata.is_dir() => git,
+    let (git_dir, is_git_file) = match fs::symlink_metadata(&git) {
+        Ok(metadata) if metadata.is_dir() => (git, false),
         Ok(metadata) if metadata.file_type().is_symlink() => return Ok(Vec::new()),
         Ok(_) => {
             let text = fs::read_to_string(&git)?;
@@ -537,25 +548,46 @@ fn read_remote_urls(repo: &Path) -> std::io::Result<Vec<String>> {
                 return Ok(Vec::new());
             };
             let path = repo.join(path.trim());
-            fs::canonicalize(&path).unwrap_or(path)
+            (fs::canonicalize(&path).unwrap_or(path), true)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error),
     };
+    if is_git_file && missing_or_not_directory(&git_dir)? {
+        return Ok(Vec::new());
+    }
     fs::read_dir(&git_dir)?.count();
     let commondir = match fs::read_to_string(git_dir.join("commondir")) {
         Ok(text) => Some(text),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error),
     };
-    let common = commondir.map_or_else(
-        || git_dir.clone(),
-        |text| {
-            let path = git_dir.join(text.trim());
-            fs::canonicalize(&path).unwrap_or(path)
-        },
-    );
+    let common = if let Some(text) = commondir {
+        let path = git_dir.join(text.trim());
+        let common = fs::canonicalize(&path).unwrap_or(path);
+        if is_git_file && missing_or_not_directory(&common)? {
+            return Ok(Vec::new());
+        }
+        common
+    } else {
+        git_dir
+    };
     parse_config(&common.join("config"))
+}
+
+fn missing_or_not_directory(path: &Path) -> std::io::Result<bool> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(!metadata.is_dir()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(true)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn parse_config(path: &Path) -> std::io::Result<Vec<String>> {
@@ -898,13 +930,54 @@ mod tests {
     }
 
     #[test]
-    fn damaged_git_metadata_not_directory_makes_the_scan_partial() {
+    fn stale_worktree_pointers_are_skipped_without_making_the_scan_partial() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("user");
-        let repo = root.join("app");
-        fs::create_dir_all(&repo).unwrap();
-        fs::write(repo.join(".git"), "gitdir: ../metadata").unwrap();
-        fs::write(root.join("metadata"), "not a directory").unwrap();
+        let missing = root.join("missing");
+        let not_directory = root.join("not-directory");
+        let common_missing = root.join("common-missing");
+        let common_not_directory = root.join("common-not-directory");
+        let metadata = root.join("metadata");
+        for path in [
+            &missing,
+            &not_directory,
+            &common_missing,
+            &common_not_directory,
+            &metadata,
+        ] {
+            fs::create_dir_all(path).unwrap();
+        }
+        fs::write(missing.join(".git"), "gitdir: ../missing-metadata\n").unwrap();
+        fs::write(root.join("not-a-directory"), "metadata file").unwrap();
+        fs::write(not_directory.join(".git"), "gitdir: ../not-a-directory\n").unwrap();
+        fs::write(
+            common_missing.join(".git"),
+            "gitdir: ../metadata/worktrees/missing-common\n",
+        )
+        .unwrap();
+        let missing_common = metadata.join("worktrees/missing-common");
+        fs::create_dir_all(&missing_common).unwrap();
+        fs::write(missing_common.join("commondir"), "../../absent-common\n").unwrap();
+        fs::write(
+            common_not_directory.join(".git"),
+            "gitdir: ../metadata/worktrees/not-directory-common\n",
+        )
+        .unwrap();
+        let not_directory_common = metadata.join("worktrees/not-directory-common");
+        fs::create_dir_all(&not_directory_common).unwrap();
+        fs::write(root.join("common-file"), "not a directory").unwrap();
+        fs::write(
+            not_directory_common.join("commondir"),
+            "../../../common-file\n",
+        )
+        .unwrap();
+        let valid = root.join("valid");
+        fs::create_dir_all(valid.join(".git")).unwrap();
+        fs::write(
+            valid.join(".git/config"),
+            "[remote \"origin\"]\n url = git@github.com:example-org/app.git\n",
+        )
+        .unwrap();
 
         let scan = scan_and_store(
             &temp.path().join("client"),
@@ -914,11 +987,15 @@ mod tests {
         )
         .unwrap();
 
-        assert!(scan.partial);
-        assert_eq!(scan.managed_repos_total, 0);
-        assert_eq!(scan.causes.len(), 1);
-        assert_eq!(scan.causes[0].kind, "NotADirectory");
-        assert_eq!(scan.causes[0].path, repo.join(".git/config"));
+        assert!(
+            !scan.partial,
+            "stale pointers must not mark the scan partial"
+        );
+        assert_eq!(scan.managed_repos_total, 1);
+        assert_eq!(
+            scan.managed_paths,
+            Some(vec![fs::canonicalize(valid).unwrap()])
+        );
     }
 
     #[test]
@@ -969,6 +1046,20 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn scan_does_not_write_cache_until_the_caller_stores_its_result() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("client");
+        let root = temp.path().join("user");
+        fs::create_dir_all(&root).unwrap();
+
+        let scan = scan(&root, &[], &[]).unwrap();
+
+        assert!(!state.exists());
+        store(&state, &scan).unwrap();
+        assert!(state.join(FILE).is_file());
     }
 
     #[test]
