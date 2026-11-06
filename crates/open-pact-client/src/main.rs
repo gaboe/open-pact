@@ -13,7 +13,7 @@ mod ui;
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::io::{BufRead, IsTerminal, Write};
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -161,6 +161,27 @@ enum Approval {
     Pending,
     Approved,
     Revoked,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ApprovalProgress {
+    Pending,
+    ProofPending,
+    Approved,
+    Revoked,
+}
+
+struct ApprovalWaitOptions {
+    poll_interval: Duration,
+    interruptible: bool,
+    show_waiting: bool,
+    initial: Option<std::result::Result<ApprovalProgress, WaitError>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JoinOrigin {
+    Enrolled,
+    Resumed,
 }
 
 #[derive(Deserialize)]
@@ -1082,18 +1103,35 @@ fn print_summary(manifest: &Manifest, company: &PublicKey, os: Os) {
 }
 
 async fn confirm(question: &str) -> Result<bool> {
-    print!("{question} [y/N] ");
-    std::io::stdout().flush()?;
+    let question = question.to_string();
     let (send, receive) = tokio::sync::oneshot::channel();
     std::thread::spawn(move || {
-        let result: std::io::Result<bool> = (|| {
-            let mut answer = String::new();
-            std::io::stdin().lock().read_line(&mut answer)?;
-            Ok(matches!(answer.trim(), "y" | "Y" | "yes"))
-        })();
+        let input = std::io::stdin();
+        let mut output = std::io::stdout();
+        let result = confirm_from(question, &mut input.lock(), &mut output);
         let _ = send.send(result);
     });
     Ok(receive.await.context("confirmation input stopped")??)
+}
+
+fn confirm_from(
+    question: String,
+    input: &mut impl std::io::BufRead,
+    output: &mut impl Write,
+) -> std::io::Result<bool> {
+    loop {
+        write!(output, "{question} [y/N] ")?;
+        output.flush()?;
+        let mut answer = String::new();
+        if input.read_line(&mut answer)? == 0 {
+            return Ok(false);
+        }
+        match answer.trim().to_ascii_lowercase().as_str() {
+            "" | "n" | "no" => return Ok(false),
+            "y" | "yes" => return Ok(true),
+            _ => writeln!(output, "Answer y or n.")?,
+        }
+    }
 }
 
 enum LogSync {
@@ -1992,6 +2030,23 @@ async fn verify_approval_entry(
     }))
 }
 
+async fn poll_approval(
+    http: &reqwest::Client,
+    home: &Home,
+    enrolment: &Enrolment,
+    manifest: &Manifest,
+) -> std::result::Result<ApprovalProgress, WaitError> {
+    match fetch_device_status(http, home, enrolment).await? {
+        Approval::Pending => Ok(ApprovalProgress::Pending),
+        Approval::Revoked => Ok(ApprovalProgress::Revoked),
+        Approval::Approved => match verify_approval_entry(http, home, enrolment, manifest).await {
+            Ok(true) => Ok(ApprovalProgress::Approved),
+            Ok(false) => Ok(ApprovalProgress::ProofPending),
+            Err(error) => Err(error),
+        },
+    }
+}
+
 fn print_waiting_line(message: &str) {
     let mut stdout = std::io::stdout().lock();
     if stdout.is_terminal() {
@@ -2016,9 +2071,12 @@ async fn wait_for_approval(
         home,
         enrolment,
         manifest,
-        poll_interval,
-        interruptible,
-        true,
+        ApprovalWaitOptions {
+            poll_interval,
+            interruptible,
+            show_waiting: true,
+            initial: None,
+        },
     )
     .await
 }
@@ -2028,15 +2086,26 @@ async fn wait_for_approval_with_status(
     home: &Home,
     enrolment: &Enrolment,
     manifest: &Manifest,
-    poll_interval: Duration,
-    interruptible: bool,
-    show_waiting: bool,
+    options: ApprovalWaitOptions,
 ) -> Result<Result<ApprovalWait, String>> {
+    let ApprovalWaitOptions {
+        poll_interval,
+        interruptible,
+        show_waiting,
+        initial,
+    } = options;
+    let first_message = match initial.as_ref() {
+        Some(Ok(ApprovalProgress::ProofPending)) => {
+            "IT approved the device. Waiting for the signed log proof..."
+        }
+        _ => "Waiting for IT approval...",
+    };
     if show_waiting {
-        print_waiting_line("Waiting for IT approval...");
+        print_waiting_line(first_message);
     }
     let mut warning_printed = false;
     let mut first_poll = true;
+    let mut initial = initial;
     loop {
         if !first_poll {
             if interruptible {
@@ -2050,16 +2119,18 @@ async fn wait_for_approval_with_status(
         }
         let first = first_poll;
         first_poll = false;
-        let status_result = if interruptible {
+        let progress_result = if let Some(initial) = initial.take() {
+            initial
+        } else if interruptible {
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => return Ok(Ok(ApprovalWait::Interrupted)),
-                result = fetch_device_status(http, home, enrolment) => result,
+                result = poll_approval(http, home, enrolment, manifest) => result,
             }
         } else {
-            fetch_device_status(http, home, enrolment).await
+            poll_approval(http, home, enrolment, manifest).await
         };
-        let status = match status_result {
-            Ok(status) => status,
+        let progress = match progress_result {
+            Ok(progress) => progress,
             Err(WaitError::Network) => {
                 if !warning_printed {
                     eprintln!("warning: could not reach the gateway for IT approval; retrying");
@@ -2070,41 +2141,17 @@ async fn wait_for_approval_with_status(
             Err(WaitError::Alarm(error)) => return Ok(Err(error)),
             Err(WaitError::Fatal(error)) => return Err(error),
         };
-        match status {
-            Approval::Revoked => return Ok(Ok(ApprovalWait::Revoked)),
-            Approval::Pending if !first && show_waiting => {
+        match progress {
+            ApprovalProgress::Revoked => return Ok(Ok(ApprovalWait::Revoked)),
+            ApprovalProgress::Approved => return Ok(Ok(ApprovalWait::Approved)),
+            ApprovalProgress::Pending if !first && show_waiting => {
                 print_waiting_line("Waiting for IT approval...")
             }
-            Approval::Pending => {}
-            Approval::Approved => {
-                let proof_result = if interruptible {
-                    tokio::select! {
-                        _ = tokio::signal::ctrl_c() => {
-                            return Ok(Ok(ApprovalWait::Interrupted));
-                        }
-                        result = verify_approval_entry(http, home, enrolment, manifest) => result,
-                    }
-                } else {
-                    verify_approval_entry(http, home, enrolment, manifest).await
-                };
-                match proof_result {
-                    Err(WaitError::Network) => {
-                        if !warning_printed {
-                            eprintln!(
-                                "warning: could not reach the gateway for IT approval; retrying"
-                            );
-                            warning_printed = true;
-                        }
-                    }
-                    Err(WaitError::Alarm(error)) => return Ok(Err(error)),
-                    Err(WaitError::Fatal(error)) => return Err(error),
-                    Ok(true) => return Ok(Ok(ApprovalWait::Approved)),
-                    Ok(false) if show_waiting => print_waiting_line(
-                        "IT approved the device. Waiting for the signed log proof...",
-                    ),
-                    Ok(false) => {}
-                }
+            ApprovalProgress::Pending => {}
+            ApprovalProgress::ProofPending if show_waiting => {
+                print_waiting_line("IT approved the device. Waiting for the signed log proof...")
             }
+            ApprovalProgress::ProofPending => {}
         }
     }
 }
@@ -2122,14 +2169,24 @@ fn approval_confirmation() -> &'static str {
     "This device is approved."
 }
 
+fn step_four_intro(progress: Option<ApprovalProgress>, device_code: &str) -> String {
+    match progress {
+        Some(ApprovalProgress::Approved) => "  This device is already approved.\n".to_string(),
+        Some(ApprovalProgress::ProofPending) => String::new(),
+        _ => format!(
+            "  {device_code}\n\n  Read this code to IT. IT approves the device with it.\n  The client now looks for managed repositories in your home folder to prepare the `managed_repos` setup proposal for open-pact.toml.\n"
+        ),
+    }
+}
+
 fn approval_scan_output(
     scan: &checks::repos::RepoScan,
     user_home: &Path,
-    still_waiting: bool,
+    wait_message: Option<&str>,
 ) -> String {
     let mut output = device_config::managed_repo_summary(scan, user_home);
-    if still_waiting {
-        output.push_str("  The client is still waiting for IT approval. Keep this window open.\n");
+    if let Some(message) = wait_message {
+        output.push_str(&format!("  {message}\n"));
     }
     output
 }
@@ -2158,18 +2215,58 @@ async fn wait_after_join(
     manifest: &Manifest,
     options: JoinOptions,
     wizard: bool,
+    origin: JoinOrigin,
 ) -> Result<ExitCode> {
-    wizard_step(4, "Wait for IT approval");
-    println!(
-        "  {}\n",
-        ui::device_code_line(&device_code(&enrolment.device), ui::styled())
-    );
-    println!("  Read this code to IT. IT approves the device with it.");
     let command = client_command(&home.0);
     let wizard = wizard && !options.no_wait;
-    println!(
-        "  The client now looks for managed repositories in your home folder to prepare the `managed_repos` setup proposal for open-pact.toml."
-    );
+    let mut initial = None;
+    if origin == JoinOrigin::Resumed && wizard {
+        let _ = WIZARD_APPROVAL_WAIT.try_with(|active| active.set(true));
+        initial = Some(tokio::select! {
+            signal = tokio::signal::ctrl_c() => {
+                if let Err(error) = signal {
+                    return Err(error.into());
+                }
+                println!("\n{}", stopped_message(4, &format!("{command} join")));
+                let _ = std::io::stdout().flush();
+                std::process::exit(130);
+            }
+            result = poll_approval(http, home, enrolment, manifest) => result,
+        });
+        let _ = WIZARD_APPROVAL_WAIT.try_with(|active| active.set(false));
+    }
+    let initial_progress = initial
+        .as_ref()
+        .and_then(|result| result.as_ref().ok().copied());
+    if matches!(initial.as_ref(), Some(Ok(ApprovalProgress::Approved))) {
+        wizard_step(4, "Review managed repositories");
+        print!("{}", step_four_intro(initial_progress, ""));
+        let config = device_config::DeviceConfig::load(home)?;
+        let scan = scan_repositories(home, manifest, config.as_ref()).await?;
+        print!(
+            "{}",
+            device_config::managed_repo_summary(&scan, &repository_scan_root(home)?)
+        );
+        return after_approval(home, options.insecure_dev, true).await;
+    }
+    let wait_message = if wizard {
+        Some(match initial_progress {
+            Some(ApprovalProgress::ProofPending) => {
+                "IT approved the device. Waiting for the signed log proof..."
+            }
+            _ => "The client is still waiting for IT approval. Keep this window open.",
+        })
+    } else {
+        None
+    };
+    if matches!(initial_progress, Some(ApprovalProgress::ProofPending)) {
+        wizard_step(4, "Wait for signed approval proof");
+        print!("{}", step_four_intro(initial_progress, ""));
+    } else {
+        wizard_step(4, "Wait for IT approval");
+        let code = ui::device_code_line(&device_code(&enrolment.device), ui::styled());
+        print!("{}", step_four_intro(initial_progress, &code));
+    }
     if current_os()? == Os::Macos
         && manifest
             .body()
@@ -2203,9 +2300,12 @@ async fn wait_after_join(
         home,
         enrolment,
         manifest,
-        options.poll_interval,
-        false,
-        !wizard,
+        ApprovalWaitOptions {
+            poll_interval: options.poll_interval,
+            interruptible: false,
+            show_waiting: !wizard,
+            initial,
+        },
     );
     tokio::pin!(scan);
     tokio::pin!(approval);
@@ -2234,7 +2334,7 @@ async fn wait_after_join(
                 if let Some(scan) = &scan {
                     print!(
                         "{}",
-                        approval_scan_output(scan, &repository_scan_root(home)?, wizard)
+                        approval_scan_output(scan, &repository_scan_root(home)?, wait_message)
                     );
                 }
                 approval?
@@ -2245,7 +2345,7 @@ async fn wait_after_join(
                         if let Some(scan) = &scan {
                             print!(
                                 "{}",
-                                approval_scan_output(scan, &repository_scan_root(home)?, wizard)
+                                approval_scan_output(scan, &repository_scan_root(home)?, wait_message)
                             );
                         }
                         result?
@@ -2254,7 +2354,7 @@ async fn wait_after_join(
                         if let Some(scan) = &scan {
                             print!(
                                 "{}",
-                                approval_scan_output(scan, &repository_scan_root(home)?, wizard)
+                                approval_scan_output(scan, &repository_scan_root(home)?, wait_message)
                             );
                         }
                         approval.await?
@@ -2308,9 +2408,10 @@ async fn continue_saved_join(
     enrolment: &Enrolment,
     manifest: &Manifest,
     options: JoinOptions,
+    origin: JoinOrigin,
 ) -> Result<ExitCode> {
     let wizard = wizard_enabled(options.no_wait);
-    wait_after_join(http, home, enrolment, manifest, options, wizard).await
+    wait_after_join(http, home, enrolment, manifest, options, wizard, origin).await
 }
 
 async fn resume_join(
@@ -2368,6 +2469,7 @@ async fn resume_join(
             no_wait,
             poll_interval,
         },
+        JoinOrigin::Resumed,
     )
     .await
 }
@@ -2487,6 +2589,7 @@ async fn join(
                         no_wait,
                         poll_interval,
                     },
+                    JoinOrigin::Resumed,
                 )
                 .await;
             }
@@ -2594,6 +2697,7 @@ async fn join(
                 no_wait,
                 poll_interval,
             },
+            JoinOrigin::Enrolled,
         )
         .await;
     }
@@ -3509,6 +3613,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn confirmation_reprompts_until_it_gets_a_valid_yes_or_no() {
+        let mut input = std::io::Cursor::new(b"  asi y  \n YES \n".as_slice());
+        let mut output = Vec::new();
+
+        assert!(confirm_from("Write open-pact.toml?".into(), &mut input, &mut output).unwrap());
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(output.matches("Write open-pact.toml? [y/N] ").count(), 2);
+        assert_eq!(output.matches("Answer y or n.\n").count(), 1);
+    }
+
+    #[test]
+    fn confirmation_accepts_no_and_keeps_empty_input_as_the_default() {
+        for (answer, expected) in [(" N \n", false), ("No\n", false), ("\n", false)] {
+            let mut input = std::io::Cursor::new(answer.as_bytes());
+            let mut output = Vec::new();
+            assert_eq!(
+                confirm_from("Write open-pact.toml?".into(), &mut input, &mut output).unwrap(),
+                expected,
+                "{answer:?}"
+            );
+            assert!(
+                !String::from_utf8(output)
+                    .unwrap()
+                    .contains("Answer y or n.")
+            );
+        }
+    }
+
+    #[test]
     fn local_claim_log_summary_explains_the_file_and_last_claim() {
         let dir = tempfile::tempdir().unwrap();
         let home = Home(dir.path().to_path_buf());
@@ -3568,7 +3701,11 @@ mod tests {
             access_denied: false,
             causes: Vec::new(),
         };
-        let output = approval_scan_output(&scan, home, true);
+        let output = approval_scan_output(
+            &scan,
+            home,
+            Some("The client is still waiting for IT approval. Keep this window open."),
+        );
         let found = output.find("Found 2 managed repositories:").unwrap();
         let locations = output.find("~/work (2)").unwrap();
         let partial = output.find("scan was partial").unwrap();
@@ -3577,7 +3714,19 @@ mod tests {
             found < locations && locations < partial && partial < waiting,
             "{output}"
         );
-        assert!(!approval_scan_output(&scan, home, false).contains("still waiting"));
+        assert!(!approval_scan_output(&scan, home, None).contains("still waiting"));
+    }
+
+    #[test]
+    fn step_four_intro_distinguishes_approved_resume_from_pending_approval() {
+        let approved = step_four_intro(Some(ApprovalProgress::Approved), "CODE");
+        assert!(approved.contains("This device is already approved."));
+        assert!(!approved.contains("Read this code to IT"));
+        assert!(!approved.contains("Keep this window open"));
+
+        let pending = step_four_intro(Some(ApprovalProgress::Pending), "CODE");
+        assert!(pending.contains("CODE"));
+        assert!(pending.contains("Read this code to IT. IT approves the device with it."));
     }
 
     #[test]
@@ -5093,6 +5242,86 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn approved_resume_checks_status_before_output_and_skips_pending_guidance() {
+        let company = Company::new();
+        let witness = Witness::new();
+        let toml = witnessed_manifest(&witness);
+        let dir = tempfile::tempdir().unwrap();
+        let home = enrolled_home_with(dir.path(), "", &company, &toml);
+        let (manifest, mut enrolment, entries, _, approved_checkpoint) =
+            approval_fixture(&home, &company, &witness);
+        let response = my_entries_response(&approved_checkpoint, &entries, 3);
+        let entries_for_log = entries.clone();
+        let log_key = company.log.vkey();
+        let gateway = FakeGateway::start(move |line, _| match line {
+            "GET /v1/log/key" => (200, format!("{log_key}\n")),
+            "GET /v1/log/checkpoint" => (200, approved_checkpoint.clone()),
+            "POST /v1/nonce" => (200, json!({"nonce":"resume"}).to_string()),
+            "POST /v1/device/status" => (200, json!({"state":"approved"}).to_string()),
+            "POST /v1/log/mine" => (200, response.clone()),
+            _ => serve_log(&entries_for_log, line).unwrap_or_else(not_found),
+        })
+        .await;
+        put_gateway_in_enrolment(&home, &mut enrolment, &gateway.url);
+        home.write(
+            device_config::FILE,
+            b"[report]\ncollector = \"https://collector.example.org/status\"\n",
+        )
+        .unwrap();
+        let accepted_claim = serde_json::to_vec(&json!({
+            "status": "accepted",
+            "warnings": [],
+            "certificate_pem": "earlier certificate",
+            "ca_pem": "earlier CA",
+            "log_checkpoint": "fictional verified checkpoint"
+        }))
+        .unwrap();
+        locallog::append_with_status(
+            &home.file("claims.jsonl"),
+            b"completed setup",
+            &accepted_claim,
+            Some(200),
+        )
+        .unwrap();
+        assert_eq!(wizard_resume(&home).unwrap(), WizardResume::Complete);
+
+        let code = wait_after_join(
+            &http_client().unwrap(),
+            &home,
+            &enrolment,
+            &manifest,
+            JoinOptions {
+                insecure_dev: true,
+                no_wait: false,
+                poll_interval: APPROVAL_POLL_INTERVAL,
+            },
+            true,
+            JoinOrigin::Resumed,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        let requests = gateway.requests();
+        let status = requests
+            .iter()
+            .position(|request| request == "POST /v1/device/status")
+            .unwrap();
+        let proof = requests
+            .iter()
+            .position(|request| request == "POST /v1/log/mine")
+            .unwrap();
+        assert!(status < proof, "status is checked before its signed proof");
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.as_str() == "POST /v1/device/status")
+                .count(),
+            1
+        );
+    }
+
     #[test]
     fn join_invitation_argument_is_optional_for_a_saved_enrolment() {
         let cli = Cli::try_parse_from(["open-pact-client", "join"]).unwrap();
@@ -5211,6 +5440,7 @@ mod tests {
                 poll_interval: APPROVAL_POLL_INTERVAL,
             },
             false,
+            JoinOrigin::Enrolled,
         )
         .await
         .unwrap();

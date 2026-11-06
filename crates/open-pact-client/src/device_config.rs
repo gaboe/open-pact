@@ -224,10 +224,12 @@ fn append_managed_repo_comment(
     };
     let groups = user_home.map_or_else(
         || {
-            paths
+            let mut groups = paths
                 .iter()
                 .map(|path| (path.display().to_string(), 1))
-                .collect()
+                .collect::<Vec<_>>();
+            groups.sort_by(|left, right| left.0.cmp(&right.0));
+            groups
         },
         |home| crate::checks::repos::managed_repo_groups(paths, home),
     );
@@ -235,15 +237,18 @@ fn append_managed_repo_comment(
         "# Managed repositories found: {}\n",
         scan.managed_repos_total
     ));
-    for (path, count) in groups {
-        output.push_str(&format!("#   {} ({count})\n", safe_comment_text(&path)));
+    for (path, count) in &groups {
+        output.push_str(&format!("#   {} ({count})\n", safe_comment_text(path)));
     }
     if scan.partial {
         output.push_str("# Managed repository scan was partial; results may be incomplete.\n");
     }
-    output.push_str(
-        "# Add the folders that should hold them to `folders`, for example: folders = [\"~/work\"]\n",
-    );
+    output.push_str("# Add the folders that should hold them to `folders`");
+    if let Some((path, _)) = groups.first() {
+        let path = serde_json::to_string(path).expect("a string serializes to JSON");
+        output.push_str(&format!(", for example: folders = [{path}]"));
+    }
+    output.push_str(".\n");
 }
 
 pub(crate) fn managed_repo_summary(scan: &crate::checks::repos::RepoScan, home: &Path) -> String {
@@ -516,7 +521,7 @@ grace = "0d"
             Some(&home),
         );
         assert!(
-            text.contains("# Managed repositories found: 3\n#   ~/clients (1)\n#   ~/work (2)\n")
+            text.contains("# Managed repositories found: 3\n#   ~/work (2)\n#   ~/clients (1)\n")
         );
         assert!(text.contains(
             "# Add the folders that should hold them to `folders`, for example: folders = [\"~/work\"]"
@@ -564,6 +569,62 @@ grace = "0d"
             Some(&home),
         );
         assert!(text.contains("# Managed repositories found: 2\n#   ~/code (2)\n"));
+    }
+
+    #[test]
+    fn device_config_example_suggests_the_largest_group_with_toml_escaping() {
+        let manifest =
+            open_pact_core::Manifest::parse(include_bytes!("../../../examples/manifest.toml"))
+                .unwrap();
+        let home = Path::new("/home/example");
+        let scan = crate::checks::repos::RepoScan {
+            scanned_at: 0,
+            managed_repos_outside: 3,
+            managed_repos_total: 3,
+            outside_paths: Vec::new(),
+            managed_paths: Some(vec![
+                home.join("large\"group/a"),
+                home.join("large\"group/b"),
+                home.join("small/c"),
+            ]),
+            partial: false,
+            access_denied: false,
+            causes: Vec::new(),
+        };
+
+        let text = example(
+            &manifest,
+            open_pact_core::Os::Macos,
+            Some(&scan),
+            Some(home),
+        );
+
+        assert!(text.contains(
+            "# Add the folders that should hold them to `folders`, for example: folders = [\"~/large\\\"group\"].\n"
+        ), "{text}");
+        assert!(text.contains("#   ~/large\"group (2)\n#   ~/small (1)\n"));
+    }
+
+    #[test]
+    fn device_config_example_omits_folder_example_when_no_groups_exist() {
+        let manifest =
+            open_pact_core::Manifest::parse(include_bytes!("../../../examples/manifest.toml"))
+                .unwrap();
+        let scan = crate::checks::repos::RepoScan {
+            scanned_at: 0,
+            managed_repos_outside: 0,
+            managed_repos_total: 0,
+            outside_paths: Vec::new(),
+            managed_paths: Some(Vec::new()),
+            partial: false,
+            access_denied: false,
+            causes: Vec::new(),
+        };
+
+        let text = example(&manifest, open_pact_core::Os::Macos, Some(&scan), None);
+
+        assert!(text.contains("# Add the folders that should hold them to `folders`.\n"));
+        assert!(!text.contains("for example: folders"));
     }
 
     #[cfg(unix)]
@@ -675,8 +736,8 @@ grace = "0d"
             text,
             concat!(
                 "  Found 3 managed repositories:\n",
-                "    ~/archive (1)\n",
                 "    ~/work (2)\n",
+                "    ~/archive (1)\n",
                 "  Managed repository scan was partial; results may be incomplete.\n",
             )
         );

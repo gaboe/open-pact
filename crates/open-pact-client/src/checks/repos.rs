@@ -45,63 +45,46 @@ const HOME_CACHE_PRUNED: &[&str] = &[
 ];
 
 pub(crate) fn managed_repo_groups(paths: &[PathBuf], home: &Path) -> Vec<(String, usize)> {
-    let mut groups = BTreeMap::<String, BTreeMap<Option<String>, usize>>::new();
+    let mut groups = BTreeMap::<String, usize>::new();
     let home = fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
     for path in paths {
-        let Some(relative) = path.strip_prefix(&home).ok() else {
+        let Some(relative) = relative_to_home(path, &home) else {
             continue;
         };
-        let Some(parent) = relative.parent() else {
-            *groups
-                .entry(String::new())
-                .or_default()
-                .entry(None)
-                .or_default() += 1;
-            continue;
-        };
-        let mut components = parent.components();
-        let Some(first) = components.next() else {
-            *groups
-                .entry(String::new())
-                .or_default()
-                .entry(None)
-                .or_default() += 1;
-            continue;
-        };
-        let first = first.as_os_str().to_string_lossy().to_string();
-        let second = components
-            .next()
-            .map(|part| part.as_os_str().to_string_lossy().to_string());
-        *groups.entry(first).or_default().entry(second).or_default() += 1;
+        let group = relative
+            .parent()
+            .and_then(|parent| parent.components().next())
+            .map(|first| format!("~/{}", first.as_os_str().to_string_lossy()))
+            .unwrap_or_else(|| "~".to_string());
+        *groups.entry(group).or_default() += 1;
     }
-    let mut result = Vec::new();
-    for (first, children) in groups {
-        let second_levels = children.keys().filter(|second| second.is_some()).count();
-        if second_levels >= 2 {
-            for (second, count) in children {
-                let path = second.map_or_else(
-                    || {
-                        if first.is_empty() {
-                            "~".to_string()
-                        } else {
-                            format!("~/{first}")
-                        }
-                    },
-                    |second| format!("~/{first}/{second}"),
-                );
-                result.push((path, count));
-            }
-        } else {
-            let path = if first.is_empty() {
-                "~".to_string()
-            } else {
-                format!("~/{first}")
-            };
-            result.push((path, children.values().sum()));
-        }
-    }
-    result.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut result = groups.into_iter().collect::<Vec<_>>();
+    result.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
     result
+}
+
+fn relative_to_home(path: &Path, home: &Path) -> Option<PathBuf> {
+    #[cfg(not(windows))]
+    if is_windows_drive_path(home) && is_windows_drive_path(path) {
+        let path = path.to_string_lossy().replace('\\', "/");
+        let home = home.to_string_lossy().replace('\\', "/");
+        return Path::new(&path)
+            .strip_prefix(Path::new(&home))
+            .ok()
+            .map(Path::to_path_buf);
+    }
+
+    path.strip_prefix(home).ok().map(Path::to_path_buf)
+}
+
+#[cfg(not(windows))]
+fn is_windows_drive_path(path: &Path) -> bool {
+    let path = path.as_os_str().to_string_lossy();
+    path.as_bytes().get(1) == Some(&b':')
+        && path
+            .as_bytes()
+            .get(2)
+            .is_some_and(|byte| *byte == b'\\' || *byte == b'/')
 }
 
 pub(crate) fn lower_process_priority() {
@@ -800,11 +783,7 @@ mod tests {
 
         assert_eq!(
             managed_repo_groups(&paths, home),
-            vec![
-                ("~/work".into(), 3),
-                ("~".into(), 1),
-                ("~/.tool".into(), 1),
-            ]
+            vec![("~/work".into(), 3), ("~".into(), 1), ("~/.tool".into(), 1),]
         );
     }
 
