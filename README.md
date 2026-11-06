@@ -427,10 +427,9 @@ run_as = "user"
 #   ~/projects (2)
 #   ~/source (1)
 # folders = ["~/projects", "~/source"]
-folders = []
 ```
 
-Every section is optional. Set `[report].collector` to the address your company gives you before sending a report or enabling the schedule. Enable the schedule after you set the collector and confirm VPN access. The client lists the folders it found in comments. Uncomment the `# folders` line for the folders you want to include. Folder paths must be absolute after `~` expands to the user's home. Loading does not inspect the filesystem. Folder paths stay on the device. These folders are reserved for managed repository checks.
+Every section is optional. Set `[report].collector` to the address your company gives you before sending a report or enabling the schedule. Enable the schedule after you set the collector and confirm VPN access. The client lists the folders it found in comments. To include suggested folders, remove only `# ` from the `folders` line. Edit the list if you want to include only some folders. Folder paths must be absolute after `~` expands to the user's home. Loading does not inspect the filesystem. Folder paths stay on the device. These folders are reserved for managed repository checks.
 
 `check` prints each manifest control, its requirement for this OS, the device setting that feeds it, and the result. A missing or invalid configuration prints what to add or fix. Other controls still run.
 

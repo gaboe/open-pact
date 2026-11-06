@@ -71,6 +71,7 @@ pub(crate) enum RunAs {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ManagedRepos {
+    #[serde(default)]
     pub(crate) folders: Vec<PathBuf>,
 }
 
@@ -184,8 +185,10 @@ pub(crate) fn example(
         .split_once("folders = []\n")
         .expect("configuration template has a folders setting");
     output.push_str(managed_repo_comments);
-    append_managed_repo_comment(&mut output, repo_scan, user_home);
-    output.push_str("folders = []\n");
+    let has_folder_suggestion = append_managed_repo_comment(&mut output, repo_scan, user_home);
+    if !has_folder_suggestion {
+        output.push_str("folders = []\n");
+    }
     output.push_str(folder_setting);
     output.push('\n');
     output
@@ -222,17 +225,17 @@ fn append_managed_repo_comment(
     output: &mut String,
     scan: Option<&crate::checks::repos::RepoScan>,
     user_home: Option<&Path>,
-) {
+) -> bool {
     let Some(scan) = scan else {
         output.push_str("# Managed repository scan is unavailable.\n");
-        return;
+        return false;
     };
     let Some(paths) = &scan.managed_paths else {
         output.push_str("# Managed repository locations are unavailable.\n");
         if scan.partial {
             output.push_str("# Managed repository scan was partial; results may be incomplete.\n");
         }
-        return;
+        return false;
     };
     let groups = user_home.map_or_else(
         || {
@@ -263,8 +266,12 @@ fn append_managed_repo_comment(
         .collect::<Vec<_>>();
     if !suggested_paths.is_empty() {
         output.push_str(&format!("# folders = [{}]\n", suggested_paths.join(", ")));
+        true
     } else if groups.is_empty() {
         output.push_str("# Add the folders that should hold them to `folders`.\n");
+        false
+    } else {
+        false
     }
 }
 
@@ -560,7 +567,7 @@ grace = "0d"
             .lines()
             .find(|line| !line.starts_with('#') && !line.is_empty());
         assert!(fixed_comments < summary && summary < folders_hint);
-        assert_eq!(folder_setting, Some("folders = []"));
+        assert_eq!(folder_setting, None);
     }
 
     #[test]
@@ -633,19 +640,27 @@ grace = "0d"
             "#   ~/work (2)\n",
             "#   ~/.tool (1)\n",
             "# folders = [\"~/work\", \"~/.tool\"]\n",
-            "folders = []\n",
         );
         assert!(text.contains(block), "{text}");
 
-        let uncommented = text.replace(
-            "# folders = [\"~/work\", \"~/.tool\"]\nfolders = []",
+        let uncommented = text.replacen(
+            "# folders = [\"~/work\", \"~/.tool\"]",
             "folders = [\"~/work\", \"~/.tool\"]",
+            1,
         );
         let config = DeviceConfig::parse(&uncommented, Some(home)).unwrap();
         assert_eq!(
             config.managed_repos.unwrap().folders,
             vec![home.join("work"), home.join(".tool")]
         );
+    }
+
+    #[test]
+    fn missing_managed_repo_folders_loads_as_an_empty_list() {
+        let config =
+            DeviceConfig::parse("[managed_repos]\n", Some(Path::new("/home/example"))).unwrap();
+
+        assert_eq!(config.managed_repos.unwrap().folders, Vec::<PathBuf>::new());
     }
 
     #[test]
