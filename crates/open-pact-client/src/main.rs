@@ -2219,65 +2219,20 @@ async fn wait_after_join(
 ) -> Result<ExitCode> {
     let command = client_command(&home.0);
     let wizard = wizard && !options.no_wait;
-    let mut initial = None;
-    if origin == JoinOrigin::Resumed && wizard {
-        let _ = WIZARD_APPROVAL_WAIT.try_with(|active| active.set(true));
-        initial = Some(tokio::select! {
-            signal = tokio::signal::ctrl_c() => {
-                if let Err(error) = signal {
-                    return Err(error.into());
-                }
-                println!("\n{}", stopped_message(4, &format!("{command} join")));
-                let _ = std::io::stdout().flush();
-                std::process::exit(130);
-            }
-            result = poll_approval(http, home, enrolment, manifest) => result,
-        });
-        let _ = WIZARD_APPROVAL_WAIT.try_with(|active| active.set(false));
-    }
-    let initial_progress = initial
-        .as_ref()
-        .and_then(|result| result.as_ref().ok().copied());
-    if matches!(initial.as_ref(), Some(Ok(ApprovalProgress::Approved))) {
-        wizard_step(4, "Review managed repositories");
-        print!("{}", step_four_intro(initial_progress, ""));
-        let config = device_config::DeviceConfig::load(home)?;
-        let scan = scan_repositories(home, manifest, config.as_ref()).await?;
-        print!(
-            "{}",
-            device_config::managed_repo_summary(&scan, &repository_scan_root(home)?)
-        );
-        return after_approval(home, options.insecure_dev, true).await;
-    }
-    let wait_message = if wizard {
-        Some(match initial_progress {
-            Some(ApprovalProgress::ProofPending) => {
-                "IT approved the device. Waiting for the signed log proof..."
-            }
-            _ => "The client is still waiting for IT approval. Keep this window open.",
-        })
-    } else {
-        None
-    };
-    if matches!(initial_progress, Some(ApprovalProgress::ProofPending)) {
-        wizard_step(4, "Wait for signed approval proof");
-        print!("{}", step_four_intro(initial_progress, ""));
-    } else {
+    if options.no_wait {
         wizard_step(4, "Wait for IT approval");
         let code = ui::device_code_line(&device_code(&enrolment.device), ui::styled());
-        print!("{}", step_four_intro(initial_progress, &code));
-    }
-    if current_os()? == Os::Macos
-        && manifest
-            .body()
-            .controls
-            .iter()
-            .any(|control| !control.remotes.is_empty())
-    {
-        println!("  If macOS asks for access to a folder, you can deny it.");
-    }
-    let config = device_config::DeviceConfig::load(home)?;
-    if options.no_wait {
+        print!("{}", step_four_intro(None, &code));
+        if current_os()? == Os::Macos
+            && manifest
+                .body()
+                .controls
+                .iter()
+                .any(|control| !control.remotes.is_empty())
+        {
+            println!("  If macOS asks for access to a folder, you can deny it.");
+        }
+        let config = device_config::DeviceConfig::load(home)?;
         let scan = scan_repositories(home, manifest, config.as_ref()).await?;
         print!(
             "{}",
@@ -2294,70 +2249,118 @@ async fn wait_after_join(
         return Ok(ExitCode::SUCCESS);
     }
 
-    let scan = scan_repositories(home, manifest, config.as_ref());
-    let approval = wait_for_approval_with_status(
-        http,
-        home,
-        enrolment,
-        manifest,
-        ApprovalWaitOptions {
-            poll_interval: options.poll_interval,
-            interruptible: false,
-            show_waiting: !wizard,
-            initial,
+    let resumed = origin == JoinOrigin::Resumed;
+    let _ = WIZARD_APPROVAL_WAIT.try_with(|active| active.set(true));
+    wizard_step(
+        4,
+        if resumed {
+            "Review managed repositories"
+        } else {
+            "Wait for IT approval"
         },
     );
+    let config = device_config::DeviceConfig::load(home)?;
+    let scan = scan_repositories(home, manifest, config.as_ref());
     tokio::pin!(scan);
-    tokio::pin!(approval);
-    let _ = WIZARD_APPROVAL_WAIT.try_with(|active| active.set(true));
-    let approval = tokio::select! {
+    let result = tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             println!("\n{}", stopped_message(4, &format!("{command} join")));
             let _ = std::io::stdout().flush();
             std::process::exit(130);
         }
         result = async {
-            let mut early_approval = None;
-            let scan = tokio::select! {
-                result = &mut approval => {
-                    let approved = matches!(&result, Ok(Ok(ApprovalWait::Approved)));
-                    early_approval = Some(result);
-                    if approved {
-                        Some(scan.await?)
-                    } else {
-                        None
+            let mut completed_scan = None;
+            let initial = if resumed {
+                Some(tokio::select! {
+                    result = poll_approval(http, home, enrolment, manifest) => result,
+                    result = &mut scan => {
+                        completed_scan = Some(result?);
+                        poll_approval(http, home, enrolment, manifest).await
                     }
-                }
-                result = &mut scan => Some(result?),
+                })
+            } else {
+                None
             };
-            let approval = if let Some(approval) = early_approval {
-                if let Some(scan) = &scan {
-                    print!(
-                        "{}",
-                        approval_scan_output(scan, &repository_scan_root(home)?, wait_message)
-                    );
+            let initial_progress = initial
+                .as_ref()
+                .and_then(|result| result.as_ref().ok().copied());
+            let code = ui::device_code_line(&device_code(&enrolment.device), ui::styled());
+            let intro_code = if matches!(
+                initial_progress,
+                Some(ApprovalProgress::Approved | ApprovalProgress::ProofPending)
+            ) {
+                ""
+            } else {
+                &code
+            };
+            print!(
+                "{}",
+                step_four_intro(initial_progress, intro_code)
+            );
+            if current_os()? == Os::Macos
+                && manifest
+                    .body()
+                    .controls
+                    .iter()
+                    .any(|control| !control.remotes.is_empty())
+            {
+                println!("  If macOS asks for access to a folder, you can deny it.");
+            }
+            let wait_message = if wizard {
+                match initial_progress {
+                    Some(ApprovalProgress::Approved | ApprovalProgress::Revoked) => None,
+                    Some(ApprovalProgress::ProofPending) => {
+                        Some("IT approved the device. Waiting for the signed log proof...")
+                    }
+                    _ => Some("The client is still waiting for IT approval. Keep this window open."),
                 }
-                approval?
+            } else {
+                None
+            };
+
+            let approval = wait_for_approval_with_status(
+                http,
+                home,
+                enrolment,
+                manifest,
+                ApprovalWaitOptions {
+                    poll_interval: options.poll_interval,
+                    interruptible: false,
+                    show_waiting: !wizard
+                        && !matches!(
+                            initial_progress,
+                            Some(ApprovalProgress::Approved | ApprovalProgress::Revoked)
+                        ),
+                    initial,
+                },
+            );
+            tokio::pin!(approval);
+            let approval = if let Some(scan) = completed_scan {
+                print!(
+                    "{}",
+                    approval_scan_output(&scan, &repository_scan_root(home)?, wait_message)
+                );
+                approval.await?
             } else {
                 tokio::select! {
-                    biased;
-                    result = &mut approval => {
-                        if let Some(scan) = &scan {
-                            print!(
-                                "{}",
-                                approval_scan_output(scan, &repository_scan_root(home)?, wait_message)
-                            );
-                        }
-                        result?
-                    },
-                    _ = std::future::ready(()) => {
-                        if let Some(scan) = &scan {
-                            print!(
-                                "{}",
-                                approval_scan_output(scan, &repository_scan_root(home)?, wait_message)
-                            );
-                        }
+                    result = &mut scan => {
+                        let scan = result?;
+                        print!(
+                            "{}",
+                            approval_scan_output(&scan, &repository_scan_root(home)?, wait_message)
+                        );
                         approval.await?
+                    }
+                    result = &mut approval => {
+                        let result = result?;
+                        if matches!(&result, Ok(ApprovalWait::Approved)) {
+                            let scan = scan.await?;
+                            print!(
+                                "{}",
+                                approval_scan_output(&scan, &repository_scan_root(home)?, wait_message)
+                            );
+                        }
+                        result
                     }
                 }
             };
@@ -2365,7 +2368,7 @@ async fn wait_after_join(
         } => result,
     };
     let _ = WIZARD_APPROVAL_WAIT.try_with(|active| active.set(false));
-    let approval = approval?;
+    let approval = result?;
     match approval {
         Ok(ApprovalWait::Approved) if wizard => {
             println!("\n  {}", ui::bold(approval_confirmation(), ui::styled()));
@@ -5243,7 +5246,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approved_resume_checks_status_before_output_and_skips_pending_guidance() {
+    async fn approved_resume_checks_status_when_wizard_is_disabled() {
         let company = Company::new();
         let witness = Witness::new();
         let toml = witnessed_manifest(&witness);
@@ -5296,7 +5299,7 @@ mod tests {
                 no_wait: false,
                 poll_interval: APPROVAL_POLL_INTERVAL,
             },
-            true,
+            false,
             JoinOrigin::Resumed,
         )
         .await
