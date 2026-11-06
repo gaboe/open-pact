@@ -55,11 +55,12 @@ impl SealingKey {
 
     pub fn seal(&self, name: &str, plaintext: &[u8]) -> String {
         let nonce: [u8; NONCE_LEN] = rand::random();
+        let nonce = Nonce::try_from(&nonce[..]).expect("nonce is exactly 12 bytes");
         let mut out = nonce.to_vec();
         out.extend(
             self.0
                 .encrypt(
-                    Nonce::from_slice(&nonce),
+                    &nonce,
                     Payload {
                         msg: plaintext,
                         aad: name.as_bytes(),
@@ -79,9 +80,10 @@ impl SealingKey {
             bail!("{name} is too short");
         }
         let (nonce, ciphertext) = bytes.split_at(NONCE_LEN);
+        let nonce = Nonce::try_from(nonce).expect("nonce length was checked");
         self.0
             .decrypt(
-                Nonce::from_slice(nonce),
+                &nonce,
                 Payload {
                     msg: ciphertext,
                     aad: name.as_bytes(),
