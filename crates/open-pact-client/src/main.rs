@@ -347,6 +347,10 @@ where
 
 fn print_stopped(home: &Home, invitation: Option<&str>) {
     let step = WIZARD_STEP.try_with(Cell::get).unwrap_or(1);
+    print_stopped_at(home, invitation, step);
+}
+
+fn print_stopped_at(home: &Home, invitation: Option<&str>, step: u8) {
     let command = client_command(&home.0);
     let enrolled = home
         .read_json::<Enrolment>("enrolment.json")
@@ -1230,13 +1234,13 @@ fn editor_os() -> EditorOs {
     }
 }
 
-async fn review_config(home: &Home) -> Result<bool> {
+async fn review_config(home: &Home, step: u8) -> Result<bool> {
     let home = home.0.clone();
     let (send, receive) = tokio::sync::oneshot::channel();
     std::thread::spawn(move || {
         let input = std::io::stdin();
         let mut output = std::io::stdout();
-        let result = review_config_from(&Home(home), &mut input.lock(), &mut output);
+        let result = review_config_from(&Home(home), &mut input.lock(), &mut output, step);
         let _ = send.send(result);
     });
     receive.await.context("configuration review stopped")?
@@ -1246,13 +1250,39 @@ fn review_config_from(
     home: &Home,
     input: &mut impl std::io::BufRead,
     output: &mut impl Write,
+    step: u8,
 ) -> Result<bool> {
     let command = EditorCommand::select(
         std::env::var("VISUAL").ok().as_deref(),
         std::env::var("EDITOR").ok().as_deref(),
         editor_os(),
     );
-    review_config_with(home, input, output, &command, |path| command.run(path))
+    review_config_with(home, input, output, &command, step, |path| {
+        command.run(path)
+    })
+}
+
+fn open_editor_for_review(
+    path: &Path,
+    input: &mut impl std::io::BufRead,
+    output: &mut impl Write,
+    command: &EditorCommand,
+    open_editor: &mut impl FnMut(&Path) -> std::io::Result<()>,
+) -> Result<()> {
+    match open_editor(path) {
+        Ok(()) if !command.blocks() => {
+            writeln!(output, "Save the file, then press Enter to continue.")?;
+            wait_for_enter(input)?;
+        }
+        Ok(()) => {}
+        Err(error) => {
+            writeln!(output, "Could not open the editor: {error}")?;
+            writeln!(output, "Edit {} by hand.", path.display())?;
+            writeln!(output, "Save the file, then press Enter to continue.")?;
+            wait_for_enter(input)?;
+        }
+    }
+    Ok(())
 }
 
 fn review_config_with(
@@ -1260,6 +1290,7 @@ fn review_config_with(
     input: &mut impl std::io::BufRead,
     output: &mut impl Write,
     command: &EditorCommand,
+    step: u8,
     mut open_editor: impl FnMut(&Path) -> std::io::Result<()>,
 ) -> Result<bool> {
     let path = home.file(device_config::FILE);
@@ -1267,40 +1298,22 @@ fn review_config_with(
     writeln!(output, "Review {} before the first report.", path.display())?;
     writeln!(output, "For example, add repository folders to `folders`.")?;
     if confirm_yes_by_default_from("Open open-pact.toml in your editor?", input, output)? {
-        match open_editor(&path) {
-            Ok(()) if !command.blocks() => {
-                writeln!(output, "Save the file, then press Enter to continue.")?;
-                wait_for_enter(input)?;
-            }
-            Ok(()) => {}
-            Err(error) => {
-                writeln!(output, "Could not open the editor: {error}")?;
-                writeln!(output, "Edit {} by hand.", path.display())?;
-                writeln!(output, "Save the file, then press Enter to continue.")?;
-                wait_for_enter(input)?;
-            }
-        }
+        open_editor_for_review(&path, input, output, command, &mut open_editor)?;
     }
 
     loop {
         reject_config_symlink(&path)?;
-        match device_config::DeviceConfig::load(home) {
+        match device_config::DeviceConfig::load(home).and_then(|config| {
+            config.ok_or_else(|| anyhow::anyhow!("{} is missing", path.display()))
+        }) {
             Ok(_) => break,
             Err(error) => {
                 writeln!(output, "{error:#}")?;
                 if !confirm_yes_by_default_from("Open it again?", input, output)? {
-                    print_stopped(home, None);
+                    print_stopped_at(home, None, step);
                     return Ok(false);
                 }
-                match open_editor(&path) {
-                    Ok(()) => {}
-                    Err(error) => {
-                        writeln!(output, "Could not open the editor: {error}")?;
-                        writeln!(output, "Edit {} by hand.", path.display())?;
-                        writeln!(output, "Save the file, then press Enter to continue.")?;
-                        wait_for_enter(input)?;
-                    }
-                }
+                open_editor_for_review(&path, input, output, command, &mut open_editor)?;
             }
         }
     }
@@ -1308,7 +1321,7 @@ fn review_config_with(
     if confirm_yes_by_default_from("Send the first report now?", input, output)? {
         Ok(true)
     } else {
-        print_stopped(home, None);
+        print_stopped_at(home, None, step);
         Ok(false)
     }
 }
@@ -1601,7 +1614,7 @@ async fn finish(home: &Home, insecure_dev: bool, yes: bool, wizard: bool) -> Res
     if review_wizard {
         set_wizard_step(6);
     }
-    if review_wizard && !review_config(home).await? {
+    if review_wizard && !review_config(home, 6).await? {
         return Ok(ExitCode::SUCCESS);
     }
     if wizard {
@@ -1629,7 +1642,7 @@ async fn after_approval(home: &Home, insecure_dev: bool, wizard: bool) -> Result
     set_wizard_step(6);
     if std::io::stdin().is_terminal()
         && std::io::stdout().is_terminal()
-        && !review_config(home).await?
+        && !review_config(home, 6).await?
     {
         return Ok(ExitCode::SUCCESS);
     }
@@ -2459,7 +2472,11 @@ async fn wait_after_join(
             "Wait for IT approval"
         },
     );
-    let config = device_config::DeviceConfig::load(home)?;
+    let config = match device_config::DeviceConfig::load(home) {
+        Ok(config) => config,
+        Err(_) if resumed && wizard => None,
+        Err(error) => return Err(error),
+    };
     let scan = scan_repositories(home, manifest, config.as_ref());
     tokio::pin!(scan);
     let result = tokio::select! {
@@ -3924,6 +3941,7 @@ mod tests {
             &mut input,
             &mut output,
             &EditorCommand::Shell("fake-editor".into()),
+            6,
             |path| {
                 opened += 1;
                 fs::write(
@@ -3954,6 +3972,61 @@ mod tests {
         assert!(output.contains("Answer y or n."));
         assert!(output.contains("Open it again? [Y/n]"));
         assert!(output.contains("Send the first report now? [Y/n]"));
+    }
+
+    #[test]
+    fn review_waits_after_a_nonblocking_retry_editor() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+        fs::write(home.file(device_config::FILE), "[managed_repos\n").unwrap();
+        let mut input = std::io::Cursor::new(b"n\ny\n\nn\n".as_slice());
+        let mut output = Vec::new();
+        let command = EditorCommand::MacOpen;
+        let mut opened = 0;
+        let send = review_config_with(&home, &mut input, &mut output, &command, 6, |path| {
+            opened += 1;
+            fs::write(path, "[managed_repos]\nfolders = []\n")
+        })
+        .unwrap();
+
+        assert!(!send);
+        assert_eq!(opened, 1);
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(output.matches("Save the file, then press Enter").count(), 1);
+        assert!(output.contains("Send the first report now? [Y/n]"));
+    }
+
+    #[test]
+    fn review_does_not_send_when_the_config_is_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+        let path = home.file(device_config::FILE);
+        fs::write(&path, "[managed_repos]\nfolders = []\n").unwrap();
+        let mut input = std::io::Cursor::new(b"\nn\n".as_slice());
+        let mut output = Vec::new();
+        let send = review_config_with(
+            &home,
+            &mut input,
+            &mut output,
+            &EditorCommand::Shell("fake-editor".into()),
+            6,
+            |path| fs::remove_file(path),
+        )
+        .unwrap();
+
+        assert!(!send);
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains(&format!("{} is missing", path.display())));
+        assert!(output.contains("Open it again? [Y/n]"));
+        assert!(!output.contains("Send the first report now? [Y/n]"));
+    }
+
+    #[test]
+    fn review_stop_message_names_step_six() {
+        assert_eq!(
+            stopped_message(6, "open-pact-client join"),
+            "Stopped at [6/6]. Continue with: open-pact-client join"
+        );
     }
 
     #[test]
