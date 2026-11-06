@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 const FILE: &str = "repo-scan.json";
 const MAX_DEPTH: usize = 8;
 const MAX_AGE_SECS: i64 = 48 * 60 * 60;
+const CACHE_TEMP_MIN_AGE: Duration = Duration::from_secs(10 * 60);
 const PRUNED: &[&str] = &["node_modules", "target", "bin", "obj", ".Trash"];
 /// Folders directly in the user home that hold no repositories. macOS asks for permission
 /// before a program reads the media folders.
@@ -285,14 +286,45 @@ fn remove_stale_cache_temps(home: &Path) -> Result<()> {
         let Some(name) = name.to_str() else {
             continue;
         };
-        if name.starts_with(&prefix) && name.ends_with(".tmp") {
-            match fs::remove_file(entry.path()) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(error).with_context(|| entry.path().display().to_string());
-                }
+        let Some(uuid) = name
+            .strip_prefix(&prefix)
+            .and_then(|name| name.strip_suffix(".tmp"))
+        else {
+            continue;
+        };
+        let Ok(uuid) = uuid::Uuid::parse_str(uuid) else {
+            continue;
+        };
+        if uuid.hyphenated().to_string() != name[prefix.len()..name.len() - 4] {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.file_type().is_file() {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.uid() != unsafe { libc::geteuid() } {
+                continue;
             }
+        }
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        if !modified
+            .elapsed()
+            .is_ok_and(|age| age >= CACHE_TEMP_MIN_AGE)
+        {
+            continue;
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).with_context(|| path.display().to_string()),
         }
     }
     Ok(())
@@ -1084,22 +1116,60 @@ mod tests {
     }
 
     #[test]
-    fn next_cache_write_removes_stale_temporary_files_only() {
+    fn next_cache_write_removes_only_old_owned_uuid_temporary_files() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("client");
         let root = temp.path().join("user");
         fs::create_dir_all(&root).unwrap();
         fs::create_dir_all(&home).unwrap();
-        let stale = home.join(".repo-scan.json.interrupted.tmp");
-        let unrelated = home.join(".repo-scan.json.interrupted.other");
+        let stale = home.join(".repo-scan.json.11111111-1111-4111-8111-111111111111.tmp");
+        let unrelated = home.join(".repo-scan.json.notes.tmp");
+        let noncanonical = home.join(".repo-scan.json.11111111111141118111111111111111.tmp");
         fs::write(&stale, b"partial scan").unwrap();
         fs::write(&unrelated, b"keep").unwrap();
+        fs::write(&noncanonical, b"keep").unwrap();
+        fs::File::open(&stale)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(
+                std::time::SystemTime::now() - CACHE_TEMP_MIN_AGE - Duration::from_secs(1),
+            ))
+            .unwrap();
+
+        #[cfg(unix)]
+        let (link, target) = {
+            let target = home.join("keep-target");
+            let link = home.join(".repo-scan.json.22222222-2222-4222-8222-222222222222.tmp");
+            fs::write(&target, b"keep target").unwrap();
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            (link, target)
+        };
 
         scan_and_store(&home, &root, &[], &[]).unwrap();
 
         assert!(!stale.exists());
         assert_eq!(fs::read(unrelated).unwrap(), b"keep");
+        assert_eq!(fs::read(noncanonical).unwrap(), b"keep");
+        #[cfg(unix)]
+        {
+            assert!(link.is_symlink());
+            assert_eq!(fs::read(target).unwrap(), b"keep target");
+        }
         assert!(home.join(FILE).is_file());
+    }
+
+    #[test]
+    fn next_cache_write_keeps_a_fresh_matching_temporary_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("client");
+        let root = temp.path().join("user");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        let active = home.join(".repo-scan.json.11111111-1111-4111-8111-111111111111.tmp");
+        fs::write(&active, b"active scan").unwrap();
+
+        scan_and_store(&home, &root, &[], &[]).unwrap();
+
+        assert_eq!(fs::read(active).unwrap(), b"active scan");
     }
 
     #[test]
