@@ -2040,7 +2040,16 @@ async fn wait_for_approval(
             Approval::Pending if !first => print_waiting_line("Waiting for IT approval..."),
             Approval::Pending => {}
             Approval::Approved => {
-                let proof_result = verify_approval_entry(http, home, enrolment, manifest).await;
+                let proof_result = if interruptible {
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => {
+                            return Ok(Ok(ApprovalWait::Interrupted));
+                        }
+                        result = verify_approval_entry(http, home, enrolment, manifest) => result,
+                    }
+                } else {
+                    verify_approval_entry(http, home, enrolment, manifest).await
+                };
                 match proof_result {
                     Err(WaitError::Network) => {
                         if !warning_printed {
