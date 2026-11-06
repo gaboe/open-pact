@@ -122,6 +122,8 @@ If private log access is denied, `check` asks for this device's status. A pendin
 
 Run `open-pact-client log head` to show the last verified checkpoint. Run `open-pact-client log prove` to verify the inclusion proof for this device's enrolment. Run `open-pact-client log show` to print claims and gateway responses. Run `open-pact-client log reports` to print report requests and collector responses from the last 90 days. It combines home and SYSTEM history, sorts records by time, and labels each source. On Windows, an elevated prompt includes protected SYSTEM history. Without elevation, the command prints readable home history and says how to include SYSTEM history.
 
+Run `open-pact-client manifest show` to review the signed manifest stored on this device. It checks that `manifest.toml` still matches the hash in `enrolment.json`, then prints the manifest summary, signed hash, and file path. It also prints the manifest's transparency log entry index when the client has it. If the index is not stored, use `open-pact-client log prove` to verify the entries available to this device. This command reads local files and does not contact the gateway.
+
 ## Declare the device configuration
 
 After IT approves the device outside the interactive `join` wizard, run `open-pact-client finish`. With no `open-pact.toml`, it shows and writes the same template as `config example`. With an existing file, it reports no changes and keeps your text. It then runs `check`. Use `--yes` to skip the confirmation. Run `open-pact-client config example` to print a template without writing a file. When the company gives you a collector address, write it in `[report].collector` in `open-pact.toml`.

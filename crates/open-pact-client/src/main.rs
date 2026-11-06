@@ -23,10 +23,12 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use clap::{Parser, Subcommand};
 use device_key::DeviceKey;
+#[cfg(test)]
+use open_pact_core::PublicKey;
 use open_pact_core::{
     Checkpoint, Claim, CsrHash, Endorsement, EnrolRequest, Entry, EntryKind, Invitation,
     LogCheckpoint, LogHash, LogKey, LogPolicy, Manifest, ManifestHash, Metadata, Note, Os,
-    Pseudonym, PublicKey, SignedManifest, Virtualized, dev_key, verify_claim, verify_consistency,
+    Pseudonym, SignedManifest, Virtualized, dev_key, verify_claim, verify_consistency,
     verify_cosignatures, verify_inclusion,
 };
 use open_pact_core::{
@@ -93,6 +95,11 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Show the manifest this device signed
+    Manifest {
+        #[command(subcommand)]
+        command: ManifestCommand,
+    },
     /// Internal scheduled report commands
     Schedule {
         #[command(subcommand)]
@@ -113,6 +120,12 @@ enum Command {
 enum ConfigCommand {
     /// Print a commented open-pact.toml template for the enrolled manifest
     Example,
+}
+
+#[derive(Subcommand)]
+enum ManifestCommand {
+    /// Show the signed manifest stored on this device
+    Show,
 }
 
 #[derive(Subcommand)]
@@ -1020,48 +1033,63 @@ async fn get_json<T: for<'de> Deserialize<'de>>(http: &reqwest::Client, url: Str
         .with_context(|| format!("GET {url}"))
 }
 
-fn print_summary(manifest: &Manifest, company: &PublicKey, os: Os) {
+fn write_summary(
+    output: &mut impl Write,
+    manifest: &Manifest,
+    company_fingerprint: &str,
+    os: Os,
+) -> std::io::Result<()> {
     let b = manifest.body();
     let list = |set: &mut dyn Iterator<Item = String>| set.collect::<Vec<_>>().join(", ");
-    println!("  Issuer       {}, valid from {}", b.issuer, b.valid_from);
-    println!("  Controller   {}", b.data_controller);
-    println!(
+    writeln!(
+        output,
+        "  Issuer       {}, valid from {}",
+        b.issuer, b.valid_from
+    )?;
+    writeln!(output, "  Controller   {}", b.data_controller)?;
+    writeln!(
+        output,
         "  Recipients   {}",
         list(&mut b.claim_recipients.iter().cloned())
-    );
-    println!("  Retention    claims kept {}", b.claim_retention);
-    println!(
+    )?;
+    writeln!(output, "  Retention    claims kept {}", b.claim_retention)?;
+    writeln!(
+        output,
         "  Metadata     {}",
         list(&mut b.disclosed_metadata.iter().map(ToString::to_string))
-    );
-    println!(
+    )?;
+    writeln!(
+        output,
         "  Claims       valid {}, unknown results tolerated for {}, minimum trust {:?}",
         b.claim_max_age, b.unknown_grace, b.min_trust_level
-    );
-    println!("  Manifest     {}", manifest.hash());
-    println!(
+    )?;
+    writeln!(output, "  Manifest     {}", manifest.hash())?;
+    writeln!(
+        output,
         "  Company key  {}  (matches your invitation)",
-        company.fingerprint()
-    );
+        company_fingerprint
+    )?;
     if let Some(policy) = &b.log {
         let witnesses = list(&mut policy.witnesses.iter().map(|w| w.name.clone()));
-        println!(
+        writeln!(
+            output,
             "  Witnesses    {}",
             if witnesses.is_empty() {
                 "none"
             } else {
                 &witnesses
             }
-        );
-        println!("  Quorum       {}", policy.witness_quorum);
-        println!(
+        )?;
+        writeln!(output, "  Quorum       {}", policy.witness_quorum)?;
+        writeln!(
+            output,
             "  Split views  {}",
             if policy.allow_split_views {
                 "allowed"
             } else {
                 "not allowed"
             }
-        );
+        )?;
     }
     let required = |c: &&open_pact_core::Control| c.required.get(&os).map(ToString::to_string);
     let (not_applicable, applicable): (Vec<_>, Vec<_>) = b
@@ -1072,42 +1100,75 @@ fn print_summary(manifest: &Manifest, company: &PublicKey, os: Os) {
         applicable.into_iter().partition(|c| required(c).is_some());
     let width = b.controls.iter().map(|c| c.id.len()).max().unwrap_or(0);
     let ui = ui::styled();
-    let show = |title: String, controls: &[&open_pact_core::Control]| {
+    let mut show = |title: String, controls: &[&open_pact_core::Control]| -> std::io::Result<()> {
         if controls.is_empty() {
-            return;
+            return Ok(());
         }
-        println!("\n  {}", ui::bold(&title, ui));
+        writeln!(output, "\n  {}", ui::bold(&title, ui))?;
         for c in controls {
             let rule = required(c).map_or(String::new(), |r| format!("must be {r}, "));
-            println!("    {:<width$}  {rule}grace {}", c.id, c.grace);
+            writeln!(output, "    {:<width$}  {rule}grace {}", c.id, c.grace)?;
             for pattern in &c.remotes {
-                println!("    {:<width$}  counts repositories from {pattern}", "");
+                writeln!(
+                    output,
+                    "    {:<width$}  counts repositories from {pattern}",
+                    ""
+                )?;
             }
             if let Some(why) = &c.rationale {
-                println!("    {:<width$}  why: {why}", "");
+                writeln!(output, "    {:<width$}  why: {why}", "")?;
             }
-            println!("    {:<width$}  reports: {}", "", c.output);
+            writeln!(output, "    {:<width$}  reports: {}", "", c.output)?;
         }
+        Ok(())
     };
     show(
         format!("Required on this {os} device ({})", enforced.len()),
         &enforced,
-    );
+    )?;
     show(
         format!("Reported, not required ({})", reported.len()),
         &reported,
-    );
+    )?;
     if !not_applicable.is_empty() {
-        println!(
+        writeln!(
+            output,
             "\n  {}\n    {}",
             ui::bold(
                 &format!("Not checked on {os}, always n/a ({})", not_applicable.len()),
                 ui
             ),
             list(&mut not_applicable.iter().map(|c| c.id.clone()))
-        );
+        )?;
     }
-    println!();
+    writeln!(output)?;
+    Ok(())
+}
+
+fn manifest_show(home: &Home) -> Result<String> {
+    let enrolment = home.enrolment()?;
+    let manifest_path = home.file("manifest.toml");
+    let manifest = Manifest::parse(&read_home_file(&manifest_path)?)?;
+    if manifest.hash() != &enrolment.manifest {
+        bail!("manifest.toml no longer matches the hash you signed");
+    }
+    let company = home.read_text(COMPANY_KEY)?.context(
+        "this device has no pinned company key; run `open-pact-client join <invitation from IT>`",
+    )?;
+    let mut output = Vec::new();
+    write_summary(&mut output, &manifest, company.trim(), current_os()?)?;
+    writeln!(output, "Signed hash  {}", enrolment.manifest)?;
+    writeln!(output, "Manifest     {}", manifest_path.display())?;
+    if let Some(index) = enrolment.log_entries.map(|entries| entries.manifest) {
+        writeln!(output, "Transparency log entry  #{index}")?;
+    } else {
+        writeln!(
+            output,
+            "Transparency log entry index is not stored locally. Verify it with: {} log prove",
+            client_command(&home.0)
+        )?;
+    }
+    Ok(String::from_utf8(output)?)
 }
 
 async fn confirm(question: &str) -> Result<bool> {
@@ -2828,7 +2889,12 @@ async fn join(
     }
     let os = current_os()?;
     wizard_step(2, "Review and sign the manifest");
-    print_summary(&manifest, &published.company.key, os);
+    write_summary(
+        &mut std::io::stdout().lock(),
+        &manifest,
+        &published.company.key.fingerprint(),
+        os,
+    )?;
     if !yes && !confirm("Sign this manifest as the device owner?").await? {
         if !wizard_enabled(no_wait) {
             println!("Not signed. Nothing was sent. Run join again when you want to enrol.");
@@ -3689,12 +3755,21 @@ async fn run(cli: Cli) -> Result<ExitCode> {
     }
     let home = Home::new(cli.home)?;
     #[cfg(windows)]
-    match home.recover_vpn_at_startup() {
-        Ok(true) => {}
-        Ok(false) => {
-            eprintln!("warning: VPN recovery skipped because another process holds the VPN lock")
+    if !matches!(
+        &cli.command,
+        Command::Manifest {
+            command: ManifestCommand::Show
         }
-        Err(error) => eprintln!("warning: VPN recovery failed: {error:#}"),
+    ) {
+        match home.recover_vpn_at_startup() {
+            Ok(true) => {}
+            Ok(false) => {
+                eprintln!(
+                    "warning: VPN recovery skipped because another process holds the VPN lock"
+                )
+            }
+            Err(error) => eprintln!("warning: VPN recovery failed: {error:#}"),
+        }
     }
     match cli.command {
         Command::Join {
@@ -3770,6 +3845,12 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 std::path::absolute(home.file("open-pact.toml"))?.display(),
                 client_command(&home.0)
             );
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Manifest {
+            command: ManifestCommand::Show,
+        } => {
+            print!("{}", manifest_show(&home)?);
             Ok(ExitCode::SUCCESS)
         }
         Command::Apply { dry_run } => {
@@ -4965,6 +5046,82 @@ mod tests {
                 .kind(),
             std::io::ErrorKind::NotFound
         );
+    }
+
+    #[test]
+    fn manifest_show_prints_the_signed_summary_and_does_not_change_the_home() {
+        let company = Company::new();
+        let dir = tempfile::tempdir().unwrap();
+        let home = enrolled_home(dir.path(), "https://gateway.example", &company);
+        let output_without_index = manifest_show(&home).unwrap();
+        assert!(output_without_index.contains("log prove"));
+        let mut enrolment = home.enrolment().unwrap();
+        enrolment.log_entries = Some(OwnEntries {
+            manifest: 12,
+            enrolment: 13,
+        });
+        home.write("enrolment.json", &serde_json::to_vec(&enrolment).unwrap())
+            .unwrap();
+        let before = home_files(&home);
+
+        let output = manifest_show(&home).unwrap();
+
+        assert!(output.contains("Issuer       company.example"));
+        assert!(output.contains("Company key  "));
+        assert!(output.contains(&format!("Signed hash  {}", enrolment.manifest)));
+        assert!(output.contains(&format!(
+            "Manifest     {}",
+            home.file("manifest.toml").display()
+        )));
+        assert!(output.contains("Transparency log entry  #12"));
+        assert_eq!(home_files(&home), before);
+    }
+
+    #[test]
+    fn manifest_show_rejects_a_manifest_that_differs_from_the_signed_hash() {
+        let company = Company::new();
+        let dir = tempfile::tempdir().unwrap();
+        let home = enrolled_home(dir.path(), "https://gateway.example", &company);
+        let changed =
+            DEMO_MANIFEST.replace("issuer = \"company.example\"", "issuer = \"other.example\"");
+        assert_ne!(
+            Manifest::parse(changed.as_bytes()).unwrap().hash(),
+            &home.enrolment().unwrap().manifest
+        );
+        fs::write(home.file("manifest.toml"), changed).unwrap();
+
+        let error = manifest_show(&home).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("manifest.toml no longer matches the hash you signed")
+        );
+    }
+
+    #[test]
+    fn manifest_show_without_enrolment_points_to_join() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+
+        let error = manifest_show(&home).unwrap_err();
+
+        assert!(error.to_string().contains("run `open-pact-client join"));
+    }
+
+    fn home_files(home: &Home) -> Vec<(String, Vec<u8>)> {
+        let mut files = fs::read_dir(&home.0)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (
+                    path.file_name().unwrap().to_string_lossy().into_owned(),
+                    fs::read(path).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        files.sort_by(|left, right| left.0.cmp(&right.0));
+        files
     }
 
     #[cfg(windows)]
