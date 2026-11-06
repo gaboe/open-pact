@@ -5247,6 +5247,33 @@ mod tests {
 
     #[tokio::test]
     async fn approved_resume_checks_status_when_wizard_is_disabled() {
+        const CHILD: &str = "OPEN_PACT_APPROVED_RESUME_TEST_CHILD";
+
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::approved_resume_checks_status_when_wizard_is_disabled",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(output.status.success(), "{stdout}");
+            assert!(
+                stdout.contains("This device is already approved."),
+                "{stdout}"
+            );
+            assert!(!stdout.contains("Read this code to IT"), "{stdout}");
+            assert!(
+                stdout.contains("Next: open-pact-client --home "),
+                "{stdout}"
+            );
+            assert!(stdout.contains("Local claim log:"), "{stdout}");
+            return;
+        }
+
         let company = Company::new();
         let witness = Witness::new();
         let toml = witnessed_manifest(&witness);
@@ -5322,6 +5349,91 @@ mod tests {
                 .filter(|request| request.as_str() == "POST /v1/device/status")
                 .count(),
             1
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resumed_join_scans_while_first_status_response_is_pending() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let company = Company::new();
+        let witness = Witness::new();
+        let toml = witnessed_manifest(&witness);
+        let dir = tempfile::tempdir().unwrap();
+        let home = enrolled_home_with(dir.path(), "", &company, &toml);
+        let (manifest, mut enrolment, entries, _, approved_checkpoint) =
+            approval_fixture(&home, &company, &witness);
+        let entries_for_log = entries.clone();
+        let log_key = company.log.vkey();
+        let started = Arc::new(AtomicBool::new(false));
+        let pending = Arc::new(AtomicBool::new(false));
+        let handler_started = started.clone();
+        let handler_pending = pending.clone();
+        let gateway = FakeGateway::start(move |line, nth| match line {
+            "GET /v1/log/key" => (200, format!("{log_key}\n")),
+            "GET /v1/log/checkpoint" => (200, approved_checkpoint.clone()),
+            "POST /v1/nonce" => (200, json!({"nonce":format!("delayed-{nth}")}).to_string()),
+            "POST /v1/device/status" if nth == 0 => {
+                handler_pending.store(true, Ordering::Release);
+                handler_started.store(true, Ordering::Release);
+                std::thread::sleep(Duration::from_millis(400));
+                handler_pending.store(false, Ordering::Release);
+                (200, json!({"state":"pending"}).to_string())
+            }
+            "POST /v1/device/status" => (200, json!({"state":"revoked"}).to_string()),
+            _ => serve_log(&entries_for_log, line).unwrap_or_else(not_found),
+        })
+        .await;
+        put_gateway_in_enrolment(&home, &mut enrolment, &gateway.url);
+
+        let scan_file = home.file("repo-scan.json");
+        let monitor_started = started.clone();
+        let monitor_pending = pending.clone();
+        let scan_monitor = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while !monitor_started.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            while monitor_pending.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+                if scan_file.is_file() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            false
+        });
+        let http = http_client().unwrap();
+        let result = wait_after_join(
+            &http,
+            &home,
+            &enrolment,
+            &manifest,
+            JoinOptions {
+                insecure_dev: true,
+                no_wait: false,
+                poll_interval: Duration::from_millis(1),
+            },
+            true,
+            JoinOrigin::Resumed,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, ExitCode::FAILURE);
+        assert!(
+            scan_monitor.join().unwrap(),
+            "the scan cache appears before the delayed status response returns"
+        );
+        assert_eq!(
+            gateway
+                .requests()
+                .iter()
+                .filter(|request| request.as_str() == "POST /v1/device/status")
+                .count(),
+            2
         );
     }
 
