@@ -301,6 +301,10 @@ fn wizard_step(step: u8, title: &str) {
     ui::step(step, 6, title);
 }
 
+fn set_wizard_step(step: u8) {
+    let _ = WIZARD_STEP.try_with(|current| current.set(step));
+}
+
 async fn run_wizard<F>(
     home: &Home,
     invitation: Option<&str>,
@@ -1134,6 +1138,187 @@ fn confirm_from(
     }
 }
 
+fn confirm_yes_by_default_from(
+    question: &str,
+    input: &mut impl std::io::BufRead,
+    output: &mut impl Write,
+) -> std::io::Result<bool> {
+    loop {
+        write!(output, "{question} [Y/n] ")?;
+        output.flush()?;
+        let mut answer = String::new();
+        if input.read_line(&mut answer)? == 0 {
+            return Ok(false);
+        }
+        match answer.trim().to_ascii_lowercase().as_str() {
+            "" | "y" | "yes" => return Ok(true),
+            "n" | "no" => return Ok(false),
+            _ => writeln!(output, "Answer y or n.")?,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum EditorCommand {
+    Shell(String),
+    MacOpen,
+    LinuxOpen,
+    WindowsNotepad,
+}
+
+impl EditorCommand {
+    fn select(visual: Option<&str>, editor: Option<&str>, os: EditorOs) -> Self {
+        if let Some(command) = visual.filter(|command| !command.trim().is_empty()) {
+            return Self::Shell(command.to_owned());
+        }
+        if let Some(command) = editor.filter(|command| !command.trim().is_empty()) {
+            return Self::Shell(command.to_owned());
+        }
+        match os {
+            EditorOs::Macos => Self::MacOpen,
+            EditorOs::Linux => Self::LinuxOpen,
+            EditorOs::Windows => Self::WindowsNotepad,
+        }
+    }
+
+    fn blocks(&self) -> bool {
+        matches!(self, Self::Shell(_) | Self::WindowsNotepad)
+    }
+
+    fn run(&self, path: &Path) -> std::io::Result<()> {
+        use std::process::Command;
+
+        let status = match self {
+            Self::Shell(command) if cfg!(windows) => Command::new("cmd")
+                .arg("/C")
+                .arg(format!("{command} \"{}\"", path.display()))
+                .status()?,
+            Self::Shell(command) => Command::new("sh")
+                .arg("-c")
+                .arg(format!("{command} \"$@\""))
+                .arg(command)
+                .arg(path)
+                .status()?,
+            Self::MacOpen => Command::new("open").arg("-t").arg(path).status()?,
+            Self::LinuxOpen => Command::new("xdg-open").arg(path).status()?,
+            Self::WindowsNotepad => Command::new("notepad.exe").arg(path).status()?,
+        };
+        if status.success() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(format!(
+                "editor exited with {status}"
+            )))
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EditorOs {
+    Macos,
+    Linux,
+    Windows,
+}
+
+fn editor_os() -> EditorOs {
+    if cfg!(windows) {
+        EditorOs::Windows
+    } else if cfg!(target_os = "macos") {
+        EditorOs::Macos
+    } else {
+        EditorOs::Linux
+    }
+}
+
+async fn review_config(home: &Home) -> Result<bool> {
+    let home = home.0.clone();
+    let (send, receive) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let input = std::io::stdin();
+        let mut output = std::io::stdout();
+        let result = review_config_from(&Home(home), &mut input.lock(), &mut output);
+        let _ = send.send(result);
+    });
+    receive.await.context("configuration review stopped")?
+}
+
+fn review_config_from(
+    home: &Home,
+    input: &mut impl std::io::BufRead,
+    output: &mut impl Write,
+) -> Result<bool> {
+    let command = EditorCommand::select(
+        std::env::var("VISUAL").ok().as_deref(),
+        std::env::var("EDITOR").ok().as_deref(),
+        editor_os(),
+    );
+    review_config_with(home, input, output, &command, |path| command.run(path))
+}
+
+fn review_config_with(
+    home: &Home,
+    input: &mut impl std::io::BufRead,
+    output: &mut impl Write,
+    command: &EditorCommand,
+    mut open_editor: impl FnMut(&Path) -> std::io::Result<()>,
+) -> Result<bool> {
+    let path = home.file(device_config::FILE);
+    reject_config_symlink(&path)?;
+    writeln!(output, "Review {} before the first report.", path.display())?;
+    writeln!(output, "For example, add repository folders to `folders`.")?;
+    if confirm_yes_by_default_from("Open open-pact.toml in your editor?", input, output)? {
+        match open_editor(&path) {
+            Ok(()) if !command.blocks() => {
+                writeln!(output, "Save the file, then press Enter to continue.")?;
+                wait_for_enter(input)?;
+            }
+            Ok(()) => {}
+            Err(error) => {
+                writeln!(output, "Could not open the editor: {error}")?;
+                writeln!(output, "Edit {} by hand.", path.display())?;
+                writeln!(output, "Save the file, then press Enter to continue.")?;
+                wait_for_enter(input)?;
+            }
+        }
+    }
+
+    loop {
+        reject_config_symlink(&path)?;
+        match device_config::DeviceConfig::load(home) {
+            Ok(_) => break,
+            Err(error) => {
+                writeln!(output, "{error:#}")?;
+                if !confirm_yes_by_default_from("Open it again?", input, output)? {
+                    print_stopped(home, None);
+                    return Ok(false);
+                }
+                match open_editor(&path) {
+                    Ok(()) => {}
+                    Err(error) => {
+                        writeln!(output, "Could not open the editor: {error}")?;
+                        writeln!(output, "Edit {} by hand.", path.display())?;
+                        writeln!(output, "Save the file, then press Enter to continue.")?;
+                        wait_for_enter(input)?;
+                    }
+                }
+            }
+        }
+    }
+
+    if confirm_yes_by_default_from("Send the first report now?", input, output)? {
+        Ok(true)
+    } else {
+        print_stopped(home, None);
+        Ok(false)
+    }
+}
+
+fn wait_for_enter(input: &mut impl std::io::BufRead) -> std::io::Result<()> {
+    let mut line = String::new();
+    input.read_line(&mut line)?;
+    Ok(())
+}
+
 enum LogSync {
     Verified(Checkpoint, OwnEntries),
     Alarm(String),
@@ -1411,6 +1596,14 @@ async fn finish(home: &Home, insecure_dev: bool, yes: bool, wizard: bool) -> Res
     {
         println!("Backup written to {}", backup.display());
     }
+    let review_wizard =
+        wizard && !yes && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    if review_wizard {
+        set_wizard_step(6);
+    }
+    if review_wizard && !review_config(home).await? {
+        return Ok(ExitCode::SUCCESS);
+    }
     if wizard {
         wizard_step(6, "First check and claim");
     }
@@ -1432,6 +1625,13 @@ async fn after_approval(home: &Home, insecure_dev: bool, wizard: bool) -> Result
             return Ok(ExitCode::SUCCESS);
         }
         WizardResume::FirstCheck => {}
+    }
+    set_wizard_step(6);
+    if std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal()
+        && !review_config(home).await?
+    {
+        return Ok(ExitCode::SUCCESS);
     }
     wizard_step(6, "First check and claim");
     match check_impl(home, insecure_dev, false).await {
@@ -3642,6 +3842,114 @@ mod tests {
                     .contains("Answer y or n.")
             );
         }
+    }
+
+    #[test]
+    fn editor_selection_prefers_visual_and_keeps_editor_arguments() {
+        assert_eq!(
+            EditorCommand::select(
+                Some("visual --wait"),
+                Some("editor --quiet"),
+                EditorOs::Linux
+            ),
+            EditorCommand::Shell("visual --wait".into())
+        );
+        assert_eq!(
+            EditorCommand::select(None, Some("editor --quiet"), EditorOs::Linux),
+            EditorCommand::Shell("editor --quiet".into())
+        );
+    }
+
+    #[test]
+    fn editor_selection_uses_the_platform_fallback() {
+        assert_eq!(
+            EditorCommand::select(None, None, EditorOs::Macos),
+            EditorCommand::MacOpen
+        );
+        assert_eq!(
+            EditorCommand::select(None, None, EditorOs::Linux),
+            EditorCommand::LinuxOpen
+        );
+        assert_eq!(
+            EditorCommand::select(None, None, EditorOs::Windows),
+            EditorCommand::WindowsNotepad
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn editor_command_passes_the_config_path_after_arguments() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let received = dir.path().join("received.txt");
+        let script = dir.path().join("fake-editor");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s|%s' \"$1\" \"$2\" > '{}'\n",
+                received.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+        let config = dir.path().join("open-pact.toml");
+        EditorCommand::Shell(format!("{} --wait", script.display()))
+            .run(&config)
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(received).unwrap(),
+            format!("--wait|{}", config.display())
+        );
+    }
+
+    #[test]
+    fn review_repairs_invalid_config_then_can_decline_the_first_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+        let path = home.file(device_config::FILE);
+        fs::write(&path, "[managed_repos\n").unwrap();
+        let mut input = std::io::Cursor::new(b"maybe\n\n\nn\n".as_slice());
+        let mut output = Vec::new();
+        let mut opened = 0;
+        let send = review_config_with(
+            &home,
+            &mut input,
+            &mut output,
+            &EditorCommand::Shell("fake-editor".into()),
+            |path| {
+                opened += 1;
+                fs::write(
+                    path,
+                    if opened == 1 {
+                        "[managed_repos\n"
+                    } else {
+                        "[managed_repos]\nfolders = [\"/work\"]\n"
+                    },
+                )
+            },
+        )
+        .unwrap();
+
+        assert!(!send);
+        assert_eq!(opened, 2);
+        assert_eq!(
+            device_config::DeviceConfig::load(&home)
+                .unwrap()
+                .unwrap()
+                .managed_repos
+                .unwrap()
+                .folders,
+            vec![PathBuf::from("/work")]
+        );
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("Open open-pact.toml in your editor? [Y/n]"));
+        assert!(output.contains("Answer y or n."));
+        assert!(output.contains("Open it again? [Y/n]"));
+        assert!(output.contains("Send the first report now? [Y/n]"));
     }
 
     #[test]

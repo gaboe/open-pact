@@ -100,9 +100,11 @@ open-pact-client join 'opi1:replace-with-your-invitation'
 
 The client checks the gateway keys and transparency checkpoint before it displays the manifest. Read the manifest before you approve the signature prompt. The owner key signs the manifest hash and the device enrolment statement. The gateway leaves the device pending until an operator approves its device code. After it prints the code, `join` checks for approval every 10 seconds. It reports approval only after it verifies the device's `device_approved` entry in the signed log. Press Ctrl+C to stop waiting. The enrolment stays on disk, so run `join` again or run `check` later. Pass `--no-wait` to print the code and exit without polling.
 
+After an interactive `join` verifies approval, the wizard writes or keeps `open-pact.toml` and asks you to review it before the first claim. Open the file in your editor and add the repository folders for managed repository checks. The wizard validates the saved file, then asks whether to send the first report. If you stop, run `join` again to resume.
+
 On macOS, `join` reuses an existing device key. It creates a Secure Enclave key only when no key exists and creation succeeds. If creation fails, the client warns and uses a software key. Pass `--software-key` to select a software key for a new device. On Windows, an elevated administrator join tries a TPM key. A non-elevated join or an unavailable provider uses a software key. Marker write and key ACL failures stop join. Linux uses software keys. The owner key and the VPN certificate key are software keys on every platform.
 
-After the operator approves the device, check it:
+To run a later check after device approval, use:
 
 ```sh
 open-pact-client check
@@ -122,7 +124,7 @@ Run `open-pact-client log head` to show the last verified checkpoint. Run `open-
 
 ## Declare the device configuration
 
-After IT approves the device, run `open-pact-client finish`. With no `open-pact.toml`, it shows and writes the same template as `config example`. With an existing file, it reports no changes and keeps your text. It then runs `check`. Use `--yes` to skip the confirmation. Run `open-pact-client config example` to print a template without writing a file. When the company gives you a collector address, write it in `[report].collector` in `open-pact.toml`.
+After IT approves the device outside the interactive `join` wizard, run `open-pact-client finish`. With no `open-pact.toml`, it shows and writes the same template as `config example`. With an existing file, it reports no changes and keeps your text. It then runs `check`. Use `--yes` to skip the confirmation. Run `open-pact-client config example` to print a template without writing a file. When the company gives you a collector address, write it in `[report].collector` in `open-pact.toml`.
 
 ```toml
 [report]
