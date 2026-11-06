@@ -1397,7 +1397,7 @@ pub(crate) fn migration_example(home: &Home) -> Result<bool> {
     };
     let example = DeviceConfig {
         report: Some(crate::device_config::Report {
-            collector: config.collector,
+            collector: Some(config.collector),
             vpn_probe: Some(config.vpn_probe),
         }),
         schedule: Some(crate::device_config::Schedule {
@@ -1483,8 +1483,11 @@ pub(crate) async fn apply(home: &Home, dry_run: bool) -> Result<()> {
         let report = config.report.context(
             "open-pact.toml [report].collector is required when [schedule].enabled = true",
         )?;
+        let collector = report.collector.context(
+            "open-pact.toml [report].collector is required when [schedule].enabled = true",
+        )?;
         Some(Applied {
-            report: Config::new(report.collector, report.vpn_probe)?,
+            report: Config::new(collector, report.vpn_probe)?,
             run_as: schedule.run_as,
             executable: std::env::current_exe()?,
         })
@@ -1632,7 +1635,11 @@ async fn operate(home: &Home, command: Operation, home_locked: bool) -> Result<(
                 .report
                 .as_ref()
                 .context("open-pact.toml [report].collector is required")?;
-            let config = Config::new(report.collector.clone(), report.vpn_probe.clone())?;
+            let collector = report
+                .collector
+                .as_deref()
+                .context("open-pact.toml [report].collector is required")?;
+            let config = Config::new(collector.to_owned(), report.vpn_probe.clone())?;
             run_report(
                 &home,
                 &state_home,
@@ -1815,6 +1822,37 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     #[ignore = "requires a built OPEN_PACT_CLIENT_BIN; all scheduler commands use a fixture mock"]
+    fn config_example_prints_a_template_for_the_fictional_home() {
+        let binary = std::env::var_os("OPEN_PACT_CLIENT_BIN")
+            .expect("build the client and set OPEN_PACT_CLIENT_BIN");
+        let root = tempfile::Builder::new()
+            .prefix("open-pact-example-")
+            .tempdir()
+            .unwrap();
+        let user = root.path().join("home");
+        let path = user.join(".config/open-pact");
+        std::fs::create_dir_all(&path).unwrap();
+        let _home = enrolled_home(&path);
+        let output = std::process::Command::new(binary)
+            .args(["config", "example"])
+            .env("HOME", &user)
+            .output()
+            .unwrap();
+        let template = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let config = DeviceConfig::parse(&template, Some(&user)).unwrap();
+        assert_eq!(config.report.unwrap().collector, None);
+        assert!(!config.schedule.unwrap().enabled);
+        println!("{template}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires a built OPEN_PACT_CLIENT_BIN; all scheduler commands use a fixture mock"]
     fn declarative_cli_with_mock_scheduler() {
         use std::os::unix::fs::PermissionsExt;
         let binary = std::env::var_os("OPEN_PACT_CLIENT_BIN")
@@ -1878,7 +1916,12 @@ esac
         };
         let before = std::fs::read_dir(&path).unwrap().count();
         let example = run(&["config", "example"], true, "[managed_repos]");
-        DeviceConfig::parse(&example, Some(&user)).unwrap();
+        let template = example
+            .lines()
+            .take_while(|line| !line.starts_with("Next:"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        DeviceConfig::parse(&template, Some(&user)).unwrap();
         assert_eq!(std::fs::read_dir(&path).unwrap().count(), before);
         let write = |collector: &str, schedule: &str| {
             std::fs::write(home.file(crate::device_config::FILE), format!("[report]\ncollector = '{collector}'\n{schedule}\n[managed_repos]\nfolders = ['~/work']\n")).unwrap();
@@ -3216,6 +3259,48 @@ Write-Output 'refused'
         let disconnected: State = home.read_json(STATE).unwrap().unwrap();
         assert!(!disconnected.vpn_up);
         assert_eq!(disconnected.last_success, connected.last_success);
+    }
+
+    #[tokio::test]
+    async fn apply_requires_a_collector_only_when_the_schedule_is_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+        std::fs::write(
+            home.file(crate::device_config::FILE),
+            "[report]\n[schedule]\nenabled = false\nrun_as = 'user'\n",
+        )
+        .unwrap();
+        DeviceConfig::load(&home).unwrap().unwrap();
+
+        std::fs::write(
+            home.file(crate::device_config::FILE),
+            "[report]\n[schedule]\nenabled = true\nrun_as = 'user'\n",
+        )
+        .unwrap();
+        let error = apply(&home, true).await.unwrap_err();
+        assert!(
+            error.to_string().contains("[report].collector is required"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduled_run_requires_a_collector_when_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+        std::fs::write(
+            home.file(crate::device_config::FILE),
+            "[report]\n[schedule]\nenabled = true\nrun_as = 'user'\n",
+        )
+        .unwrap();
+
+        let error = run(&home, Command::Run { system: false })
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("[report].collector is required"),
+            "{error:#}"
+        );
     }
 
     #[tokio::test]

@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 pub(crate) const FILE: &str = "open-pact.toml";
 
 const CONFIG_TEMPLATE: &str = r#"[report]
-collector = "https://collector.example.org/status"
+# Set collector to the address your company gives you before enabling the schedule.
+# collector = "https://collector.example.org/status"
 # vpn_probe defaults to the collector host and port.
 # vpn_probe = "vpn.example.org:443"
 
@@ -34,19 +35,21 @@ pub(crate) struct DeviceConfig {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Report {
-    pub(crate) collector: String,
+    pub(crate) collector: Option<String>,
     pub(crate) vpn_probe: Option<String>,
 }
 
 impl Report {
-    pub(crate) fn probe(&self) -> String {
-        self.vpn_probe.clone().unwrap_or_else(|| {
-            let url = report::collector_url(&self.collector).expect("validated collector");
-            format!(
-                "{}:{}",
-                url.host().unwrap(),
-                url.port_or_known_default().unwrap()
-            )
+    pub(crate) fn probe(&self) -> Option<String> {
+        self.vpn_probe.clone().or_else(|| {
+            self.collector.as_deref().map(|collector| {
+                let url = report::collector_url(collector).expect("validated collector");
+                format!(
+                    "{}:{}",
+                    url.host().unwrap(),
+                    url.port_or_known_default().unwrap()
+                )
+            })
         })
     }
 }
@@ -91,8 +94,12 @@ impl DeviceConfig {
     pub(crate) fn parse(text: &str, user_home: Option<&Path>) -> Result<Self> {
         let mut config: Self = toml::from_str(text).context("section/key")?;
         if let Some(report) = &config.report {
-            report::collector_url(&report.collector).context("[report].collector")?;
-            schedule::probe_address(&report.probe()).context("[report].vpn_probe")?;
+            if let Some(collector) = &report.collector {
+                report::collector_url(collector).context("[report].collector")?;
+            }
+            if let Some(probe) = report.probe() {
+                schedule::probe_address(&probe).context("[report].vpn_probe")?;
+            }
         }
         if let Some(schedule) = &config.schedule
             && schedule.run_as == RunAs::System
@@ -364,6 +371,10 @@ mod tests {
         let text = example(&manifest, open_pact_core::Os::Macos, None, None);
         let config = DeviceConfig::parse(&text, Some(Path::new("/home/example"))).unwrap();
         assert!(!config.schedule.unwrap().enabled);
+        assert_eq!(config.report.unwrap().collector, None);
+        assert!(text.contains(
+            "# Set collector to the address your company gives you before enabling the schedule.\n# collector = \"https://collector.example.org/status\"\n"
+        ));
         assert!(text.contains("# Company requirements on macos:"));
         assert!(text.contains("# Reported only, no requirement:"));
         assert!(text.contains("# Not checked on macos:"));
@@ -824,7 +835,10 @@ folders = ['~/missing', '{}']
             absolute.display()
         );
         let config = DeviceConfig::parse(&text, Some(user_home)).unwrap();
-        assert_eq!(config.report.unwrap().probe(), "collector.example.org:443");
+        assert_eq!(
+            config.report.unwrap().probe().as_deref(),
+            Some("collector.example.org:443")
+        );
         assert_eq!(
             config.managed_repos.unwrap().folders,
             [user_home.join("missing"), absolute]
@@ -869,7 +883,20 @@ folders = ['~/missing', '{}']
         ] {
             let config =
                 DeviceConfig::parse(&format!("[report]\ncollector = '{collector}'"), None).unwrap();
-            assert_eq!(config.report.unwrap().probe(), expected);
+            assert_eq!(config.report.unwrap().probe().as_deref(), Some(expected));
         }
+    }
+
+    #[test]
+    fn report_without_collector_is_valid_until_a_report_is_required() {
+        let config = DeviceConfig::parse("[report]\n", None).unwrap();
+        assert_eq!(config.report.unwrap().collector, None);
+
+        let config =
+            DeviceConfig::parse("[report]\nvpn_probe = 'vpn.example.org:443'", None).unwrap();
+        assert_eq!(
+            config.report.unwrap().probe().as_deref(),
+            Some("vpn.example.org:443")
+        );
     }
 }

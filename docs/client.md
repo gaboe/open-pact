@@ -128,19 +128,23 @@ After IT approves the device outside the interactive `join` wizard, run `open-pa
 
 ```toml
 [report]
-collector = "https://collector.example.org/status"
-# Optional. Defaults to the collector host and port.
+# Set collector to the address your company gives you before enabling the schedule.
+# collector = "https://collector.example.org/status"
 # vpn_probe = "vpn.example.org:443"
 
 [schedule]
-enabled = true
+enabled = false
 run_as = "user"
 
 [managed_repos]
-folders = ["~/work"]
+# Managed repositories found: 3
+#   ~/projects (2)
+#   ~/source (1)
+# folders = ["~/projects", "~/source"]
+folders = []
 ```
 
-Every section is optional. Only `finish` writes this file, after your confirmation. Unknown sections or keys cause an error that names the file and key. Folder entries must be absolute after `~` expands to your user home. The loader does not inspect those paths. Folder paths stay on the device. These folders are reserved for managed repository checks.
+Every section is optional. Only `finish` writes this file, after your confirmation. Unknown sections or keys cause an error that names the file and key. Set `[report].collector` to the address your company gives you before sending a report or enabling the schedule. Enable the schedule after you set the collector and confirm VPN access. The client lists the folders it found in comments. Uncomment the `# folders` line for the folders you want to include. Folder entries must be absolute after `~` expands to your user home. The loader does not inspect those paths. Folder paths stay on the device. These folders are reserved for managed repository checks.
 
 Run `check` to see one row per manifest control. Each row shows the requirement for your OS, the device setting that feeds it, and the result. A missing or invalid configuration prints what to add or fix. Other controls still run.
 

@@ -3721,7 +3721,11 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             let report = config
                 .report
                 .context("open-pact.toml [report].collector is required")?;
-            report::run(&home, &report.collector, dry_run).await?;
+            let collector = report
+                .collector
+                .as_deref()
+                .context("open-pact.toml [report].collector is required")?;
+            report::run(&home, collector, dry_run).await?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Config {
