@@ -105,6 +105,7 @@ fn v31_example_declares_exact_fields_and_reported_only_controls() {
         "managed_repos_total",
         "work_account",
         "uptime_days",
+        "password_min_length",
     ];
     expected.sort_unstable();
     assert_eq!(ids, expected);

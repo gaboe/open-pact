@@ -22,6 +22,7 @@ const COMPLIANT: &[(&str, &[&str])] = &[
     ("remote_wipe", &["on", "n/a"]),
     ("powershell_logging", &["on", "n/a"]),
     ("log_cleared", &["null", "n/a"]),
+    ("password_min_length", &[]),
 ];
 
 pub fn fix_hint(check: &str, value: &str, os: Os) -> Option<&'static str> {
@@ -106,6 +107,15 @@ pub fn fix_hint(check: &str, value: &str, os: Os) -> Option<&'static str> {
         ("os_patch_age_days", Os::Windows) => Some("Install updates: Settings > Windows Update."),
         ("os_patch_age_days", Os::Linux) => Some(
             "Install updates: run 'sudo apt update && sudo apt upgrade' or 'sudo dnf upgrade'.",
+        ),
+        ("password_min_length", Os::Macos) => Some(
+            "Ask IT to push a password policy with a minimum length, then run the check again.",
+        ),
+        ("password_min_length", Os::Windows) => Some(
+            "Set a minimum password length: run 'secpol.msc' > Account Policies > Password Policy > Minimum password length.",
+        ),
+        ("password_min_length", Os::Linux) => Some(
+            "Set 'minlen' in /etc/security/pwquality.conf and make sure PAM uses pam_pwquality.",
         ),
         ("password_set", Os::Macos) => {
             Some("Set a login password: System Settings > Users & Groups > Change Password.")

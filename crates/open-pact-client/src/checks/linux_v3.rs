@@ -248,6 +248,68 @@ fn parse_uptime(text: &str) -> ControlValue {
         )
 }
 
+const PWQUALITY_CONF: &str = "/etc/security/pwquality.conf";
+const PWQUALITY_DIR: &str = "/etc/security/pwquality.conf.d";
+
+pub fn password_min_length() -> ControlValue {
+    let mut texts = Vec::new();
+    match std::fs::read_to_string(PWQUALITY_CONF) {
+        Ok(text) => texts.push(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return "unknown".into(),
+    }
+    match std::fs::read_dir(PWQUALITY_DIR) {
+        Ok(entries) => {
+            let mut paths = Vec::new();
+            for entry in entries {
+                let Ok(entry) = entry else {
+                    return "unknown".into();
+                };
+                let path = entry.path();
+                if path.extension().is_some_and(|e| e == "conf") {
+                    paths.push(path);
+                }
+            }
+            paths.sort();
+            for path in paths {
+                match std::fs::read_to_string(path) {
+                    Ok(text) => texts.push(text),
+                    Err(_) => return "unknown".into(),
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return "unknown".into(),
+    }
+    parse_pwquality_minlen(&texts)
+}
+
+/// `texts` holds the main file, then the drop-in files by name. The last `minlen` wins.
+fn parse_pwquality_minlen(texts: &[String]) -> ControlValue {
+    let mut minlen = None;
+    for line in texts.iter().flat_map(|text| text.lines()) {
+        let line = line.split('#').next().unwrap_or_default();
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "minlen" {
+            continue;
+        }
+        let value = value.trim();
+        if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+            return "unknown".into();
+        }
+        let Ok(length) = value.parse::<i32>() else {
+            return "unknown".into();
+        };
+        minlen = Some(length);
+    }
+    match minlen {
+        None | Some(0) => "none".into(),
+        Some(length) => length.into(),
+    }
+}
+
 pub fn antimalware_signature_age_days() -> ControlValue {
     for root in ["/var/lib/clamav", "/usr/local/share/clamav"] {
         let mut dates = vec![];

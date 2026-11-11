@@ -351,6 +351,7 @@ All checks are read-only. macOS and Linux checks run as the device owner. Window
 | `antimalware_active_threats` | `n/a` | `unknown` |
 | `work_account` | Current account membership in `admin` | Current account membership in `sudo` or `wheel` |
 | `uptime_days` | Whole days since `kern.boottime` | Whole days from `/proc/uptime` |
+| `password_min_length` | Largest length rule in `pwpolicy getaccountpolicies`; `none` without a rule | `minlen` from `pwquality.conf` and its drop-in files; `none` without one |
 | `preboot_auth` | FileVault on means `user_secret`, off means `none` | No encryption means `none`; an unverified LUKS unlock method means `unknown` |
 | `antimalware_active` | XProtect bundle and Remediator executable present, scan service registered and enabled | Existing ClamAV service check |
 | `antimalware_signature_age_days` | Whole days since the receipt for the installed XProtect definitions version | Age of the daily ClamAV CVD or CLD embedded timestamp in standard database directories |
@@ -370,6 +371,7 @@ Windows collects the controls in one cached PowerShell batch. A missing source, 
 | `antimalware_active_threats` | Count of `Get-MpThreat` results with `IsActive` | Defender threat read access |
 | `work_account` | Administrators SID in token groups, including UAC deny-only groups. SYSTEM uses the active console user token | Own token, or SYSTEM for the console token |
 | `uptime_days` | Whole days since `Win32_OperatingSystem.LastBootUpTime` | CIM read access |
+| `password_min_length` | `MinPasswordLength` of the local account policy through ADSI; 0 means `none` | Device user |
 | `preboot_auth` | OS-volume BitLocker protection and numeric key-protector types; recovery passwords do not establish the startup method | SYSTEM or elevated administrator |
 | `antimalware_signature_age_days` | Defender `AntivirusSignatureLastUpdated` | Defender status read access |
 | `antimalware_full_scan_age_days` | Defender `FullScanEndTime`; absent date means `unknown` | Defender status read access |

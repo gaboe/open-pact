@@ -82,6 +82,7 @@ const BUILTINS: &[(&str, u32)] = &[
     ("log_cleared", 1),
     ("managed_repos_outside", 1),
     ("managed_repos_total", 1),
+    ("password_min_length", 1),
 ];
 
 fn implements(control: &Control) -> bool {
@@ -210,6 +211,10 @@ const MACOS: Registry = &[
     ("managed_repos_total", |input| {
         managed_repo_value(input, false)
     }),
+    (
+        "password_min_length",
+        ignore_input!(macos_v3::password_min_length),
+    ),
 ];
 
 const LINUX: Registry = &[
@@ -269,6 +274,10 @@ const LINUX: Registry = &[
     ("managed_repos_total", |input| {
         managed_repo_value(input, false)
     }),
+    (
+        "password_min_length",
+        ignore_input!(linux_v3::password_min_length),
+    ),
 ];
 
 const WINDOWS: Registry = &[
@@ -325,6 +334,10 @@ const WINDOWS: Registry = &[
     ("managed_repos_total", |input| {
         managed_repo_value(input, false)
     }),
+    (
+        "password_min_length",
+        ignore_input!(windows::password_min_length),
+    ),
 ];
 
 fn registry(os: Os) -> OsRegistry {
@@ -388,6 +401,7 @@ fn legacy_registry(os: Os) -> LegacyRegistry {
         ("remote_wipe", macos_v3::remote_wipe),
         ("powershell_logging", macos_v3::not_applicable),
         ("log_cleared", macos_v3::not_applicable),
+        ("password_min_length", macos_v3::password_min_length),
     ];
     const LINUX: LegacyRegistry = &[
         ("os_auto_updates", linux_v3::os_auto_updates),
@@ -416,6 +430,7 @@ fn legacy_registry(os: Os) -> LegacyRegistry {
         ("remote_wipe", macos_v3::not_applicable),
         ("powershell_logging", macos_v3::not_applicable),
         ("log_cleared", macos_v3::not_applicable),
+        ("password_min_length", linux_v3::password_min_length),
     ];
     const WINDOWS: LegacyRegistry = &[
         ("os_auto_updates", windows::os_auto_updates),
@@ -450,6 +465,7 @@ fn legacy_registry(os: Os) -> LegacyRegistry {
         ("remote_wipe", macos_v3::not_applicable),
         ("powershell_logging", windows::powershell_logging),
         ("log_cleared", windows::log_cleared),
+        ("password_min_length", windows::password_min_length),
     ];
     match os {
         Os::Macos => MACOS,

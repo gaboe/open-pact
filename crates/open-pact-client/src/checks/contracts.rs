@@ -178,6 +178,7 @@ fn adapter_for(id: &str, os: Os) -> Adapter {
             | "antimalware_realtime"
             | "work_account"
             | "uptime_days"
+            | "password_min_length"
             | "preboot_auth"
             | "antimalware_active"
             | "antimalware_signature_age_days"
@@ -189,6 +190,7 @@ fn adapter_for(id: &str, os: Os) -> Adapter {
             | "antimalware_realtime"
             | "work_account"
             | "uptime_days"
+            | "password_min_length"
             | "antimalware_signature_age_days"
             | "log_oldest_record_days",
         ) => Adapter::LinuxV3,

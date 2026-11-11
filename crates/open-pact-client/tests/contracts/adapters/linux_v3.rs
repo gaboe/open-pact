@@ -5,6 +5,13 @@ use open_pact_core::ControlValue;
 pub(crate) fn run(id: &str, case: &Case) -> ControlValue {
     let text = case.text(0);
     match id {
+        "password_min_length" => {
+            if case.input.iter().any(Option::is_none) {
+                return "unknown".into();
+            }
+            let texts: Vec<String> = case.input.iter().flatten().cloned().collect();
+            parse_pwquality_minlen(&texts)
+        }
         "os_auto_updates" => {
             assert_eq!(
                 case.input.len(),

@@ -295,6 +295,14 @@ RunSection {
 }
 RunSection {
     try {
+        $raw = ([ADSI]"WinNT://$env:COMPUTERNAME").MinPasswordLength
+        if ($raw -is [System.DirectoryServices.PropertyValueCollection]) { $raw = $raw.Value }
+        if ($null -eq $raw -or $raw -isnot [int] -or $raw -lt 0) { throw 'Unreadable minimum length' }
+        Emit 'password_min_length' ($raw.ToString([Globalization.CultureInfo]::InvariantCulture))
+    } catch { Emit 'password_min_length' 'unknown' }
+}
+RunSection {
+    try {
         $account = $identity
         if ($identity.IsSystem) {
             Add-Type -TypeDefinition @'
