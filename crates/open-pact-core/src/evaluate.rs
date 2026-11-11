@@ -353,6 +353,7 @@ mod tests {
                 ("powershell_logging".into(), "n/a".into()),
                 ("log_cleared".into(), "n/a".into()),
                 ("managed_repos_outside".into(), 0.into()),
+                ("password_min_length".into(), 12.into()),
             ]
             .into_iter()
             .chain(results.iter().map(|(k, v)| (k.to_string(), (*v).into())))

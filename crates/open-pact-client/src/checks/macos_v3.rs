@@ -164,6 +164,61 @@ fn parse_boot_time(text: &str, now: i64) -> ControlValue {
         )
 }
 
+pub fn password_min_length() -> ControlValue {
+    command("/usr/bin/pwpolicy", &["getaccountpolicies"])
+        .map_or_else(|| "unknown".into(), |text| parse_pwpolicy_min_length(&text))
+}
+
+/// Reads the global account policy plist. Each `policyAttributePassword matches '.{N,}'` rule
+/// requires N characters, and every rule must hold, so the largest N is the enforced minimum.
+/// A length rule in a shape this parser does not know makes the result `unknown`.
+fn parse_pwpolicy_min_length(text: &str) -> ControlValue {
+    const RULE: &str = "policyAttributePassword matches ";
+    if !text.contains("<plist") || !text.contains("</plist>") {
+        return "unknown".into();
+    }
+    if ["minchars", "minimumlength"]
+        .iter()
+        .any(|key| text.to_ascii_lowercase().contains(key))
+    {
+        return "unknown".into();
+    }
+    let mut longest = 0;
+    for line in text.lines() {
+        let Some((_, rule)) = line.split_once(RULE) else {
+            continue;
+        };
+        let rule = rule.split("</string>").next().unwrap_or_default();
+        let rule = rule.replace("&apos;", "'").replace("&#39;", "'");
+        let Some(pattern) = rule
+            .trim()
+            .strip_prefix('\'')
+            .and_then(|r| r.strip_suffix('\''))
+        else {
+            return "unknown".into();
+        };
+        let pattern = pattern.trim_start_matches('^').trim_end_matches('$');
+        if !pattern.starts_with(".{") {
+            continue;
+        }
+        let Some(length) = pattern
+            .strip_prefix(".{")
+            .and_then(|r| r.strip_suffix('}').or_else(|| r.strip_suffix("}+")))
+            .and_then(|r| r.split_once(','))
+            .filter(|(_, max)| max.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|(min, _)| min.parse::<i32>().ok())
+        else {
+            return "unknown".into();
+        };
+        longest = longest.max(length);
+    }
+    if longest == 0 {
+        "none".into()
+    } else {
+        longest.into()
+    }
+}
+
 pub fn preboot_auth() -> ControlValue {
     command("/usr/bin/fdesetup", &["status"])
         .map_or("unknown", |s| parse_preboot(&s))

@@ -29,6 +29,15 @@ pub fn work_account() -> ControlValue {
 pub fn uptime_days() -> ControlValue {
     number("uptime_days", i32::MAX, false)
 }
+pub fn password_min_length() -> ControlValue {
+    parse_min_length(value("password_min_length").unwrap_or_default())
+}
+fn parse_min_length(text: &str) -> ControlValue {
+    match parse_number(text, i32::MAX, false) {
+        ControlValue::Integer(0) => "none".into(),
+        other => other,
+    }
+}
 pub fn antimalware_active_threats() -> ControlValue {
     number("antimalware_active_threats", i32::MAX, false)
 }
@@ -759,6 +768,7 @@ mod tests {
             "antimalware_active_threats",
             "work_account",
             "uptime_days",
+            "password_min_length",
             "security_log_cleared_epoch",
             "antimalware_detection_epoch",
             "log_retention",
@@ -1279,6 +1289,25 @@ mod v31_tests {
                     expected
                 );
             }
+        }
+    }
+    #[test]
+    fn minimum_password_length_parses_batch_values() {
+        let values = parse_values("password_min_length\t12\r\n");
+        assert_eq!(
+            parse_min_length(&values["password_min_length"]),
+            ControlValue::Integer(12)
+        );
+        for (text, expected) in [
+            ("8", ControlValue::Integer(8)),
+            ("0", ControlValue::from("none")),
+            ("", ControlValue::from("unknown")),
+            ("unknown", ControlValue::from("unknown")),
+            ("-1", ControlValue::from("unknown")),
+            ("1x", ControlValue::from("unknown")),
+            ("99999999999", ControlValue::from("unknown")),
+        ] {
+            assert_eq!(parse_min_length(text), expected, "{text:?}");
         }
     }
     #[test]

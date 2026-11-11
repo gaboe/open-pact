@@ -1403,6 +1403,7 @@ mod tests {
                 ("os_patch_age_days".into(), 14.into()),
                 ("antimalware_signature_age_days".into(), 0.into()),
                 ("managed_repos_outside".into(), 0.into()),
+                ("password_min_length".into(), 12.into()),
             ])
             .collect(),
             csr_sha256: None,

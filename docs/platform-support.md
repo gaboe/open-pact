@@ -14,6 +14,7 @@ This page lists the built-in controls in `crates/open-pact-client/src/checks/mod
 | `antimalware_active_threats` | `n/a` | Integer active Defender threat count or `unknown` | `unknown` | Defender threat read access. |
 | `work_account` | Current account in `admin` | Current token in Administrators, including UAC-filtered tokens; SYSTEM uses console user | Current account in `sudo` or `wheel` | Own token or groups; SYSTEM for Windows console token. |
 | `uptime_days` | Whole days since boot | Whole days since boot | Whole days since boot | Device user with sysctl, CIM, or proc read access. |
+| `password_min_length` | Integer characters from the global account policy, `none`, or `unknown` | Integer characters from the local account policy, `none`, or `unknown` | Integer `minlen` from pwquality configuration, `none`, or `unknown` | Device user. macOS and Linux read the policy without root. |
 | `password_set` | `unknown` | `unknown` | `unknown` | No supported password check. |
 | `auto_login` | `on`, `off`, or `unknown` | `on`, `off`, or `unknown` | `on`, `off`, or `unknown` | Run as the device user. |
 | `secure_boot` | `unknown` | `on`, `off`, or `unknown` | `on`, `off`, or `unknown` | Run as the device user. |

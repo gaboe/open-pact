@@ -42,6 +42,7 @@ fn claim(m: &Manifest, value: ControlValue) -> Claim {
             ("powershell_logging", "n/a".into()),
             ("log_cleared", "n/a".into()),
             ("managed_repos_outside", 0.into()),
+            ("password_min_length", 12.into()),
         ]
         .into_iter()
         .map(|(k, v)| (k.into(), v))
@@ -88,6 +89,42 @@ fn integer_limits_and_unknown_use_existing_grace_rules() {
             Decision::Deny { .. }
         ));
     }
+}
+
+fn with_password_min_length(m: &Manifest, value: ControlValue) -> Claim {
+    let mut c = claim(m, 14.into());
+    c.results.insert("password_min_length".into(), value);
+    c
+}
+
+#[test]
+fn password_min_length_requires_the_signed_minimum_and_none_never_satisfies_it() {
+    let m = manifest(DEMO);
+    for n in [10, 12, 128] {
+        let c = with_password_min_length(&m, n.into());
+        assert_eq!(
+            evaluate(&m, &c, c.time, &FirstFailures::new()).decision,
+            Decision::Allow { warnings: vec![] },
+            "{n}"
+        );
+    }
+    for value in [0.into(), 9.into(), "none".into(), "unknown".into()] {
+        let c = with_password_min_length(&m, value);
+        let e = evaluate(&m, &c, c.time, &FirstFailures::new());
+        assert!(matches!(e.decision, Decision::Allow { warnings } if warnings.len() == 1));
+        assert!(e.first_failures.contains_key("password_min_length"));
+        let mut later = c.clone();
+        later.time = c.time + chrono::TimeDelta::days(8);
+        assert!(matches!(
+            evaluate(&m, &later, later.time, &e.first_failures).decision,
+            Decision::Deny { .. }
+        ));
+    }
+    let c = with_password_min_length(&m, "short".into());
+    assert!(matches!(
+        evaluate(&m, &c, c.time, &FirstFailures::new()).decision,
+        Decision::Deny { reasons } if reasons.iter().any(|r| r.breaks_disclosure_contract())
+    ));
 }
 
 #[test]

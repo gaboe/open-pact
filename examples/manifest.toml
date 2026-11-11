@@ -195,6 +195,14 @@ output = { integer = { min = 0, max = 2147483647 } }
 required = {}
 grace = "1d"
 
+[[control]]
+id = "password_min_length"
+source = "company_policy"
+check = "builtin:password_min_length@1"
+output = { integer = { min = 0, max = 2147483647 }, values = ["none"] }
+required = { macos = { min = 10 }, windows = { min = 10 }, linux = { min = 10 } }
+grace = "1d"
+
 [log]
 # Demo only: this witness key comes from a public seed, so anyone can forge its cosignatures.
 # A real deployment lists witnesses run by someone other than the gateway operator.
