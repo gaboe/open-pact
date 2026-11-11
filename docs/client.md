@@ -20,13 +20,13 @@ scoop install gaboe/open-pact
 For Debian or Ubuntu, download the `.deb` from the [client releases](https://github.com/gaboe/open-pact/releases), then run:
 
 ```sh
-sudo apt install ./open-pact-client_0.4.6_amd64.deb
+sudo apt install ./open-pact-client_0.4.7_amd64.deb
 ```
 
 For Fedora, download the `.rpm` from the [client releases](https://github.com/gaboe/open-pact/releases), then run:
 
 ```sh
-sudo dnf install ./open-pact-client-0.4.6-1.x86_64.rpm
+sudo dnf install ./open-pact-client-0.4.7-1.x86_64.rpm
 ```
 
 Homebrew and Scoop check the SHA-256 value recorded in their formula or manifest. They do not verify the Cosign signature. The Linux commands install local files, so verify them with the release steps below before you install them. Run `brew upgrade` or `scoop update open-pact` to update an installed client. For APT or DNF, download and install each new release when you choose to update.
@@ -36,7 +36,7 @@ Homebrew and Scoop check the SHA-256 value recorded in their formula or manifest
 Run the verification script with a release tag:
 
 ```sh
-scripts/verify-client-release.sh v0.4.6
+scripts/verify-client-release.sh v0.4.7
 ```
 
 The script checks every checksum and Sigstore bundle. It keeps the verified files in a private temporary directory when verification succeeds. It removes the directory if verification fails. It prints the directory path on the last line. Copy that path for the install command.
@@ -84,8 +84,8 @@ The script needs GitHub CLI, Cosign, and `sha256sum` or `shasum`. Set `GH_REPO` 
 The verified directory includes the `.deb` and `.rpm` packages. Install them with the matching package manager:
 
 ```sh
-sudo apt install "$verified_dir/open-pact-client_0.4.6_amd64.deb"
-sudo dnf install "$verified_dir/open-pact-client-0.4.6-1.x86_64.rpm"
+sudo apt install "$verified_dir/open-pact-client_0.4.7_amd64.deb"
+sudo dnf install "$verified_dir/open-pact-client-0.4.7-1.x86_64.rpm"
 ```
 
 ## Join and check the gateway
