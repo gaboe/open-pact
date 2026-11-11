@@ -9,7 +9,7 @@ PLATFORM="$platform" python3 tests/linux-docker/cache-regression.py
 systemd_result="not run"
 for distro in ${DISTROS:-ubuntu fedora}; do
     image="open-pact-linux-v31-$distro"
-    docker build --network host --platform "$platform" --target "$distro" -f tests/linux-docker/Dockerfile -t "$image" .
+    docker build --platform "$platform" --target "$distro" -f tests/linux-docker/Dockerfile -t "$image" .
     docker run --rm --platform "$platform" "$image"
     if [[ "$distro" == ubuntu && ${SYSTEMD:-1} == 1 ]]; then
         systemd_output=$(python3 tests/linux-docker/systemd.py "$image" "$platform")
