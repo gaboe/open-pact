@@ -464,23 +464,12 @@ fn walk(
                 continue;
             }
         };
-        let path = entry.path();
-        let kind = match fs::symlink_metadata(&path) {
-            Ok(meta) => meta.file_type(),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                mark_partial(state, path, &error);
-                continue;
-            }
-        };
-        if path.file_name().is_some_and(|name| name == ".git") {
+        let name = entry.file_name();
+        if name == ".git" {
             has_git = true;
             continue;
         }
-        if !kind.is_dir() {
-            continue;
-        }
-        let name = entry.file_name();
+        let path = entry.path();
         if GENERATED_PRUNED
             .iter()
             .chain(TRASH_PRUNED.iter().filter(|pruned| !pruned.contains('/')))
@@ -497,7 +486,14 @@ fn walk(
         {
             continue;
         }
-        children.push(path);
+        // DirEntry::file_type does not follow symlinks. It reads the type from the directory
+        // listing and falls back to an lstat only where the file system leaves it unknown.
+        match entry.file_type() {
+            Ok(kind) if kind.is_dir() => children.push(path),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => mark_partial(state, path, &error),
+        }
     }
     if has_git {
         let canonical = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
@@ -548,7 +544,8 @@ fn read_remote_urls(repo: &Path) -> std::io::Result<Vec<String>> {
     if is_git_file && missing_or_not_directory(&git_dir)? {
         return Ok(Vec::new());
     }
-    fs::read_dir(&git_dir)?.count();
+    // An unreadable git directory fails this read with an error other than NotFound,
+    // so the scan becomes partial instead of reporting a repository without remotes.
     let commondir = match fs::read_to_string(git_dir.join("commondir")) {
         Ok(text) => Some(text),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
