@@ -19,6 +19,7 @@ pub type Respond = dyn Fn(&str, usize) -> (u16, String) + Send + Sync;
 pub struct FakeGateway {
     pub url: String,
     requests: Arc<Mutex<Vec<String>>>,
+    bodies: Arc<Mutex<Vec<(String, String)>>>,
 }
 
 impl FakeGateway {
@@ -28,18 +29,21 @@ impl FakeGateway {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let requests = Arc::new(Mutex::new(Vec::new()));
+        let bodies = Arc::new(Mutex::new(Vec::new()));
         let respond: Arc<Respond> = Arc::new(respond);
         let seen = requests.clone();
+        let sent = bodies.clone();
         tokio::spawn(async move {
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     return;
                 };
-                let (seen, respond) = (seen.clone(), respond.clone());
+                let (seen, sent, respond) = (seen.clone(), sent.clone(), respond.clone());
                 tokio::spawn(async move {
-                    let Some(line) = read_request(&mut stream).await else {
+                    let Some((line, body)) = read_request(&mut stream).await else {
                         return;
                     };
+                    sent.lock().unwrap().push((line.clone(), body));
                     let nth = {
                         let mut seen = seen.lock().unwrap();
                         let nth = seen.iter().filter(|l| **l == line).count();
@@ -59,11 +63,26 @@ impl FakeGateway {
                 });
             }
         });
-        FakeGateway { url, requests }
+        FakeGateway {
+            url,
+            requests,
+            bodies,
+        }
     }
 
     pub fn requests(&self) -> Vec<String> {
         self.requests.lock().unwrap().clone()
+    }
+
+    /// The bodies of every request with this request line, in order.
+    pub fn bodies(&self, line: &str) -> Vec<String> {
+        self.bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(l, _)| l == line)
+            .map(|(_, body)| body.clone())
+            .collect()
     }
 
     /// Every request that is not a GET, i.e. everything that sends data to the gateway.
@@ -75,8 +94,8 @@ impl FakeGateway {
     }
 }
 
-/// The request line without the HTTP version, after reading headers and body.
-async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<String> {
+/// The request line without the HTTP version, and the body.
+async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<(String, String)> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
     let header_end = loop {
@@ -106,7 +125,8 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<String> {
         buf.extend_from_slice(&chunk[..n]);
     }
     let first = head.lines().next()?;
-    Some(first.rsplit_once(' ')?.0.to_string())
+    let body = String::from_utf8_lossy(&buf[header_end..]).into_owned();
+    Some((first.rsplit_once(' ')?.0.to_string(), body))
 }
 
 /// The company and log keys of an honest gateway, and what it publishes.

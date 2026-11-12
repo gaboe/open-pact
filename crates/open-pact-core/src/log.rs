@@ -44,6 +44,8 @@ pub enum EntryKind {
     DeviceEnrolled,
     DeviceApproved,
     DeviceRevoked,
+    /// The owner accepted a changed manifest for an enrolled device.
+    ManifestAccepted,
     RetentionPurge,
 }
 
@@ -54,6 +56,7 @@ impl EntryKind {
             EntryKind::DeviceEnrolled => "device_enrolled",
             EntryKind::DeviceApproved => "device_approved",
             EntryKind::DeviceRevoked => "device_revoked",
+            EntryKind::ManifestAccepted => "manifest_accepted",
             EntryKind::RetentionPurge => "retention_purge",
         }
     }

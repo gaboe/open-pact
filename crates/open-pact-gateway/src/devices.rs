@@ -94,6 +94,38 @@ pub async fn lock(
     state.as_deref().map(State::parse).transpose()
 }
 
+/// An enrolment of one device: the manifest its owner signed, its state and its salt.
+pub struct Enrolment {
+    pub manifest: String,
+    pub state: State,
+    pub salt: String,
+}
+
+/// The enrolment `device` uses: the one under `current` if it has one, else its newest. A device
+/// enrolled under an earlier manifest keeps that enrolment until its owner accepts `current`.
+pub async fn bound(
+    conn: &mut PgConnection,
+    device: &Pseudonym,
+    current: &str,
+) -> anyhow::Result<Option<Enrolment>> {
+    let row: Option<(String, String, String)> = sqlx::query_as(
+        "SELECT manifest_hash, state, salt FROM devices WHERE pseudonym = $1 \
+         ORDER BY manifest_hash = $2 DESC, enrolled_at DESC LIMIT 1",
+    )
+    .bind(device.as_str())
+    .bind(current)
+    .fetch_optional(conn)
+    .await?;
+    row.map(|(manifest, state, salt)| {
+        Ok(Enrolment {
+            manifest,
+            state: State::parse(&state)?,
+            salt,
+        })
+    })
+    .transpose()
+}
+
 pub async fn revoked_anywhere(conn: &mut PgConnection, device: &Pseudonym) -> anyhow::Result<bool> {
     Ok(sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM devices WHERE pseudonym = $1 AND state = 'revoked')",
