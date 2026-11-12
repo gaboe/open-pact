@@ -10,7 +10,7 @@ open-pact-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["process", "sync"] }
-clap = { version = "4", default-features = false, features = ["derive", "std", "help", "usage", "error-context"] }
+clap = { version = "4", features = ["derive"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 anyhow = "1"
