@@ -919,6 +919,7 @@ async fn scan_repositories(
     config: Option<&device_config::DeviceConfig>,
 ) -> Result<Option<checks::repos::RepoScan>> {
     if !scans_repositories(manifest) {
+        checks::repos::forget(&home.0)?;
         return Ok(None);
     }
     let root = repository_scan_root(home)?;
@@ -4635,6 +4636,7 @@ mod tests {
         assert!(!scans_repositories(&without_controls));
         assert!(!step_four_intro(None, "CODE", false).contains("looks for managed repositories"));
 
+        fs::write(home.file("repo-scan.json"), "{}").unwrap();
         assert!(
             scan_repositories(&home, &without_controls, None)
                 .await
