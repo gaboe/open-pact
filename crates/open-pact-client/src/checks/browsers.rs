@@ -1,9 +1,13 @@
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 use std::fs;
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 use std::io::ErrorKind;
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 use super::exec::run_status;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -23,11 +27,13 @@ fn merge(states: &[Protection]) -> Protection {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 fn parse_json(text: &str) -> Result<Value, ()> {
     let json: Value = serde_json::from_str(text).map_err(|_| ())?;
     if json.is_object() { Ok(json) } else { Err(()) }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 fn optional_json(path: &Path, plist: bool) -> Result<Value, ()> {
     match fs::metadata(path) {
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Value::Object(Map::new())),
@@ -46,6 +52,7 @@ fn optional_json(path: &Path, plist: bool) -> Result<Value, ()> {
     parse_json(&text)
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn required_json(path: &Path) -> Result<Value, ()> {
     parse_json(&fs::read_to_string(path).map_err(|_| ())?)
 }
@@ -105,6 +112,7 @@ fn chromium_with_recommendation(
     chromium(prefs, policy, recommended.unwrap_or(&empty), edge)
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn merge_chromium_profiles(states: &[Protection]) -> Protection {
     if states.contains(&Protection::Off) {
         Protection::Off
@@ -115,6 +123,7 @@ fn merge_chromium_profiles(states: &[Protection]) -> Protection {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn chromium_without_profiles(
     policy: &Value,
     recommended: Option<&Value>,
@@ -144,6 +153,7 @@ fn protection_level(value: &Value) -> Protection {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 fn profiles(root: &Path, firefox: bool) -> Result<Vec<PathBuf>, ()> {
     let entries = match fs::read_dir(root) {
         Ok(entries) => entries,
@@ -196,6 +206,7 @@ fn profiles(root: &Path, firefox: bool) -> Result<Vec<PathBuf>, ()> {
     Ok(found)
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn managed(domain: &str, home: &Path) -> Result<Value, ()> {
     let mut result = Map::new();
     let mut files = vec![PathBuf::from(format!(
@@ -221,6 +232,7 @@ fn managed(domain: &str, home: &Path) -> Result<Value, ()> {
     Ok(Value::Object(result))
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn recommended(domain: &str, home: &Path) -> Result<Value, ()> {
     let mut result = optional_json(
         &PathBuf::from(format!("/Library/Preferences/{domain}.plist")),
@@ -236,6 +248,7 @@ fn recommended(domain: &str, home: &Path) -> Result<Value, ()> {
     Ok(result)
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn chromium_browser(home: &Path, data: &str, domain: &str, edge: bool) -> Protection {
     let Ok(policy) = managed(domain, home) else {
         return Protection::Unknown;
@@ -338,6 +351,7 @@ fn firefox_flag(value: Option<&Value>) -> Protection {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn standard_firefox_profiles(ini: &str) -> bool {
     ini.lines()
         .map(str::trim)
@@ -345,6 +359,7 @@ fn standard_firefox_profiles(ini: &str) -> bool {
         .all(|path| path.starts_with("Profiles/") && !path.split('/').any(|part| part == ".."))
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn firefox(home: &Path, app: &Path) -> Protection {
     match fs::read_to_string(home.join("Library/Application Support/Firefox/profiles.ini")) {
         Ok(ini) if !standard_firefox_profiles(&ini) => return Protection::Unknown,
@@ -397,6 +412,7 @@ fn firefox(home: &Path, app: &Path) -> Protection {
     merge(&states)
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 fn web_protection(states: &[Protection]) -> &'static str {
     if states.is_empty() {
         return "n/a";
@@ -408,6 +424,7 @@ fn web_protection(states: &[Protection]) -> &'static str {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn linux_policy(root: &Path) -> Result<Value, ()> {
     let files = match fs::read_dir(root) {
         Ok(files) => files,
@@ -431,6 +448,7 @@ fn linux_policy(root: &Path) -> Result<Value, ()> {
     Ok(Value::Object(policy))
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn linux_chromium(data: &Path, policy_root: &Path) -> Protection {
     let Ok(policy) = linux_policy(&policy_root.join("managed")) else {
         return Protection::Unknown;
@@ -480,6 +498,7 @@ fn linux_chromium(data: &Path, policy_root: &Path) -> Protection {
     merge(&states)
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn linux_firefox(root: &Path, app: &Path, system_policy: &Path) -> Protection {
     let Ok(system) = optional_json(system_policy, false) else {
         return Protection::Unknown;
@@ -533,6 +552,7 @@ fn linux_firefox(root: &Path, app: &Path, system_policy: &Path) -> Protection {
     merge(&states)
 }
 
+#[cfg(any(target_os = "linux", test))]
 pub fn linux() -> &'static str {
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
         return "unknown";
@@ -546,6 +566,7 @@ pub fn linux() -> &'static str {
     linux_at(&home, &config, Path::new("/"))
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn linux_at(home: &Path, config: &Path, root: &Path) -> &'static str {
     let mut states = Vec::new();
     for (binary, data, policy) in [
@@ -605,6 +626,7 @@ fn linux_at(home: &Path, config: &Path, root: &Path) -> &'static str {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 pub fn macos() -> &'static str {
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
         return "unknown";
@@ -654,6 +676,7 @@ pub fn macos() -> &'static str {
     web_protection(&states)
 }
 
+#[cfg(any(target_os = "windows", test))]
 fn smartscreen(text: &str) -> Protection {
     let Some((policy, local)) = text.split_once('|') else {
         return Protection::Unknown;
@@ -670,6 +693,7 @@ fn smartscreen(text: &str) -> Protection {
     }
 }
 
+#[cfg(any(target_os = "windows", test))]
 fn windows_browser(browser: &Value) -> Protection {
     let Some(policy) = browser.get("policy").filter(|v| v.is_object()) else {
         return Protection::Unknown;
@@ -721,6 +745,7 @@ fn windows_browser(browser: &Value) -> Protection {
     }
 }
 
+#[cfg(any(target_os = "windows", test))]
 pub fn windows(screen: &str, text: &str) -> &'static str {
     let mut states = vec![smartscreen(screen)];
     match serde_json::from_str::<Value>(text) {

@@ -25,7 +25,7 @@ pub(crate) fn run(id: &str, case: &Case) -> ControlValue {
             let Some(admins) = parse_admin_gids(case.text(1)) else {
                 return "unknown".into();
             };
-            crate::checks::macos_v3::parse_groups(text, &admins)
+            crate::checks::common::parse_groups(text, &admins)
         }
         "uptime_days" => parse_uptime(text),
         "antimalware_signature_age_days" => parse_cvd_header(text.as_bytes()).map_or_else(

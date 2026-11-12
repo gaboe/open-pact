@@ -164,8 +164,8 @@ fn adapter_for(id: &str, os: Os) -> Adapter {
         .iter()
         .find(|(registered, _)| *registered == id)
         .map(|(_, check)| *check)
-        && (std::ptr::fn_addr_eq(check, macos_v3::unknown as fn() -> ControlValue)
-            || std::ptr::fn_addr_eq(check, macos_v3::not_applicable as fn() -> ControlValue))
+        && (std::ptr::fn_addr_eq(check, common::unknown as fn() -> ControlValue)
+            || std::ptr::fn_addr_eq(check, common::not_applicable as fn() -> ControlValue))
     {
         return Adapter::Registry;
     }
@@ -209,11 +209,8 @@ fn run_case(id: &str, case: &Case) -> ControlValue {
                 .unwrap()
                 .1;
             assert!(
-                std::ptr::fn_addr_eq(check, macos_v3::unknown as fn() -> ControlValue)
-                    || std::ptr::fn_addr_eq(
-                        check,
-                        macos_v3::not_applicable as fn() -> ControlValue,
-                    ),
+                std::ptr::fn_addr_eq(check, common::unknown as fn() -> ControlValue)
+                    || std::ptr::fn_addr_eq(check, common::not_applicable as fn() -> ControlValue,),
                 "registry adapter only runs platform constants"
             );
             check()
