@@ -7139,8 +7139,9 @@ grace = "1d"
 
     #[test]
     fn manifest_changes_list_controls_and_consent_terms() {
-        let old = Manifest::parse(DEMO_MANIFEST.replace(PASSWORD_RULE, "").as_bytes()).unwrap();
-        let new_toml = DEMO_MANIFEST
+        let demo = DEMO_MANIFEST.replace("\r\n", "\n");
+        let old = Manifest::parse(demo.replace(PASSWORD_RULE, "").as_bytes()).unwrap();
+        let new_toml = demo
             .replace(
                 "required = { macos = { max = 30 }, windows = { max = 30 }, linux = { max = 30 } }\ngrace = \"1d\"",
                 "required = { macos = { max = 14 }, windows = { max = 14 }, linux = { max = 14 } }\ngrace = \"1d\"",
