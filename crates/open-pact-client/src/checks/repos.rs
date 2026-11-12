@@ -242,6 +242,14 @@ pub(crate) fn scan(root: &Path, folders: &[PathBuf], patterns: &[String]) -> Res
     Ok(scan)
 }
 
+/// Removes the stored scan, so a manifest without repository controls shows no stale result.
+pub(crate) fn forget(home: &Path) -> Result<()> {
+    match fs::remove_file(home.join(FILE)) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+        _ => Ok(()),
+    }
+}
+
 pub(crate) fn store(home: &Path, scan: &RepoScan) -> Result<()> {
     fs::create_dir_all(home)?;
     remove_stale_cache_temps(home)?;
