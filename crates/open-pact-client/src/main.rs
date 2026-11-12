@@ -486,17 +486,9 @@ impl Home {
     /// Replaces `name` in one step: the bytes go to a synced temporary file beside it, which is
     /// renamed over it. A crash leaves the old file or the new one, never a part of either.
     fn write(&self, name: &str, bytes: &[u8]) -> Result<PathBuf> {
-        std::fs::create_dir_all(&self.0)?;
         let path = self.file(name);
-        let temp = self.file(&format!(".{name}.{}.tmp", std::process::id()));
-        let written = (|| -> std::io::Result<()> {
-            let mut file = std::fs::File::create(&temp)?;
-            file.write_all(bytes)?;
-            file.sync_all()?;
-            drop(file);
-            std::fs::rename(&temp, &path)
-        })();
-        if let Err(error) = written {
+        let temp = write_temporary(&path, bytes, None)?;
+        if let Err(error) = std::fs::rename(&temp, &path) {
             let _ = std::fs::remove_file(&temp);
             return Err(error).with_context(|| format!("{}", path.display()));
         }
@@ -2132,7 +2124,15 @@ fn verify_my_entries(
         return Err(alarm("the gateway returned another device's entry".into()));
     }
     if !signed_manifest_entry(enrolment)(&response.manifest.entry) {
-        let accepted_elsewhere = response.manifest.entry.kind == EntryKind::ManifestPublished
+        // The operator's publish alone does not show an owner signed the enforced manifest. Only
+        // this device's acceptance in the log does.
+        let accepted_for_this_device = response.device.iter().any(|item| {
+            item.entry.kind == EntryKind::ManifestAccepted
+                && item.entry.data["commitment"] == commitment
+                && item.entry.data["manifest"] == enforced.as_str()
+        });
+        let accepted_elsewhere = accepted_for_this_device
+            && response.manifest.entry.kind == EntryKind::ManifestPublished
             && response.manifest.entry.data["manifest"] == enforced.as_str();
         return Err(if accepted_elsewhere {
             OwnEntriesError::AcceptPending
@@ -2156,8 +2156,8 @@ fn verify_my_entries(
 enum OwnEntriesError {
     /// A fault the owner must see as a transparency log alarm.
     Alarm(String),
-    /// The gateway holds an acceptance of the manifest it enforces that this device has not signed.
-    /// The log is intact; the device is behind.
+    /// The log holds an owner's acceptance of the manifest the gateway enforces, and this device has
+    /// not signed it. The log is intact; the device is behind.
     AcceptPending,
 }
 
@@ -7013,6 +7013,85 @@ grace = "1d"
             gateway.posts(),
             ["POST /v1/nonce", "POST /v1/log/mine"],
             "no claim is sent under the manifest the gateway no longer enforces"
+        );
+        assert_eq!(home.enrolment().unwrap().manifest, enrolment.manifest);
+        assert_eq!(
+            std::fs::read_to_string(home.file("manifest.toml")).unwrap(),
+            old
+        );
+    }
+
+    /// The gateway enforces a manifest this device has not signed, and the log holds no acceptance
+    /// of it for this device. No owner accepted it, so `check` raises the log alarm, not the notice
+    /// to run `accept`, and sends no claim.
+    #[tokio::test]
+    async fn check_alarms_when_the_enforced_manifest_has_no_acceptance_for_this_device() {
+        let company = Company::new();
+        let witness = Witness::new();
+        let old = witnessed_manifest(&witness);
+        let new_toml = with_password_rule(&old);
+        let new_hash = ManifestHash::of(new_toml.as_bytes());
+        let dir = tempfile::tempdir().unwrap();
+        let home = enrolled_home_with(dir.path(), "", &company, &old);
+        let mut enrolment = home.enrolment().unwrap();
+        let mine = commitment(&enrolment).unwrap();
+        let entries = vec![
+            Entry {
+                index: 0,
+                kind: EntryKind::ManifestPublished,
+                data: json!({"manifest": new_hash}),
+            },
+            Entry {
+                index: 1,
+                kind: EntryKind::DeviceEnrolled,
+                data: json!({"commitment": mine}),
+            },
+        ];
+        let leaves: Vec<_> = entries.iter().map(Entry::leaf_hash).collect();
+        let mut note = company.sign(&checkpoint_of(company.log.origin(), &entries, 2));
+        witness.cosign(
+            &mut note,
+            u64::try_from(chrono::Utc::now().timestamp()).unwrap(),
+        );
+        let checkpoint = note.to_string();
+        let response = serde_json::to_string(&MyEntries {
+            checkpoint: checkpoint.clone(),
+            manifest: open_pact_core::EntryWithProof {
+                entry: entries[0].clone(),
+                proof: open_pact_core::inclusion_proof(&leaves, 0).unwrap(),
+            },
+            device: entries[1..]
+                .iter()
+                .map(|entry| open_pact_core::EntryWithProof {
+                    entry: entry.clone(),
+                    proof: open_pact_core::inclusion_proof(&leaves, entry.index).unwrap(),
+                })
+                .collect(),
+        })
+        .unwrap();
+        let published = Company::published(&new_toml, &company.key);
+        let log = company.log.vkey();
+        let gateway = FakeGateway::start(move |line, _| match line {
+            "GET /v1/manifest" => (200, published.clone()),
+            "GET /v1/log/key" => (200, log.clone()),
+            "GET /v1/log/checkpoint" => (200, checkpoint.clone()),
+            "POST /v1/nonce" => (200, json!({"nonce":"no-acceptance"}).to_string()),
+            "POST /v1/log/mine" => (200, response.clone()),
+            _ => not_found(),
+        })
+        .await;
+        enrolment.gateway = gateway.url.clone();
+        home.write(
+            "enrolment.json",
+            &serde_json::to_vec_pretty(&enrolment).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(check(&home, true).await.unwrap(), ExitCode::from(2));
+        assert_eq!(
+            gateway.posts(),
+            ["POST /v1/nonce", "POST /v1/log/mine"],
+            "no claim is sent under a manifest no owner accepted"
         );
         assert_eq!(home.enrolment().unwrap().manifest, enrolment.manifest);
         assert_eq!(
