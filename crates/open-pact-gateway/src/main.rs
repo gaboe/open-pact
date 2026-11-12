@@ -1,5 +1,7 @@
 mod claims;
-use open_pact_core::{DeviceAuthPurpose, EntryWithProof, MyEntries, MyEntriesRequest};
+use open_pact_core::{
+    AcceptRequest, DeviceAuthPurpose, EntryWithProof, MyEntries, MyEntriesRequest, evaluate_under,
+};
 mod devices;
 mod grace;
 mod invitations;
@@ -29,8 +31,8 @@ use clap::{Parser, Subcommand};
 use open_pact_core::{
     Checkpoint, Claim, CsrHash, Decision, Endorsement, EnrolRequest, Entry, EntryKind, Evaluation,
     FirstFailures, Invitation, LogCheckpoint, LogHash, LogKey, Manifest, Note, NoteSignature,
-    Pseudonym, PublicKey, Reason, SigningKey, Span, consistency_proof, evaluate, inclusion_proof,
-    root, verified_trust_level, verify_claim,
+    Pseudonym, PublicKey, Reason, SigningKey, Span, consistency_proof, inclusion_proof, root,
+    verified_trust_level, verify_claim,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -155,6 +157,10 @@ struct ClaimRequest {
     /// Travels outside the JWS so the stored claim holds only its hash, `csr_sha256`.
     #[serde(default)]
     csr_pem: Option<String>,
+    /// The manifest the device signed, sent while the gateway enforces another one. The gateway
+    /// keeps no earlier manifest text, so it learns the consented terms from the device.
+    #[serde(default)]
+    manifest_toml: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -619,14 +625,84 @@ async fn device_status(
 ) -> Result<Json<Value>, Reply> {
     let Json(request) = body.map_err(|_| device_denied())?;
     authenticate_device(&app, &request, DeviceAuthPurpose::DeviceStatus).await?;
-    let state: Option<String> =
-        sqlx::query_scalar("SELECT state FROM devices WHERE pseudonym = $1 AND manifest_hash = $2")
-            .bind(request.pseudonym.as_str())
-            .bind(app.manifest.hash().as_str())
-            .fetch_optional(&app.db)
-            .await
-            .map_err(internal)?;
-    Ok(Json(json!({"state": state.ok_or_else(device_denied)?})))
+    let enrolment = devices::bound(
+        &mut *app.conn().await?,
+        &request.pseudonym,
+        app.manifest.hash().as_str(),
+    )
+    .await
+    .map_err(internal)?
+    .ok_or_else(device_denied)?;
+    Ok(Json(json!({"state": enrolment.state.as_str()})))
+}
+
+/// Moves an enrolled device to the manifest the gateway enforces, once its owner and device both
+/// signed the acceptance. The state, salt and grace clocks stay. A repeat answers the same.
+async fn accept_manifest(
+    State(app): State<App>,
+    body: Result<Json<AcceptRequest>, JsonRejection>,
+) -> Result<Json<Value>, Reply> {
+    let Json(req) = body.map_err(|e| denied(vec![e.body_text()]))?;
+    req.verify().map_err(|e| denied(vec![e.to_string()]))?;
+    let current = app.manifest.hash();
+    if &req.manifest != current {
+        return Err(denied(vec![format!(
+            "owner accepted {}, gateway enforces {current}",
+            req.manifest
+        )]));
+    }
+    consume_nonce(&app, &req.nonce).await?;
+    let owner_key = serde_json::to_value(&req.owner.key).map_err(internal)?;
+    let mut tx = app.db.begin().await.map_err(internal)?;
+    translog::lock(&mut tx).await.map_err(internal)?;
+    let rows: Vec<(String, Value, String, String)> = sqlx::query_as(
+        "SELECT manifest_hash, owner_key, state, salt FROM devices \
+         WHERE pseudonym = $1 AND manifest_hash = ANY($2) FOR UPDATE",
+    )
+    .bind(req.pseudonym.as_str())
+    .bind(vec![current.to_string(), req.previous.to_string()])
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(internal)?;
+    let row = |hash: &str| rows.iter().find(|r| r.0 == hash);
+    let (manifest, stored_owner, state, salt) = row(current.as_str())
+        .or_else(|| row(req.previous.as_str()))
+        .ok_or_else(device_denied)?;
+    if *stored_owner != owner_key {
+        return Err(denied(vec![
+            "the owner key differs from the one that enrolled this device".into(),
+        ]));
+    }
+    if manifest != current.as_str() {
+        sqlx::query(
+            "UPDATE devices SET manifest_hash = $1, owner_signature = $2, \
+             accept_owner_signature = $3, accept_device_signature = $4 \
+             WHERE pseudonym = $5 AND manifest_hash = $6",
+        )
+        .bind(current.as_str())
+        .bind(String::from(req.owner.signature.clone()))
+        .bind(String::from(req.owner_signature.clone()))
+        .bind(String::from(req.device_signature.clone()))
+        .bind(req.pseudonym.as_str())
+        .bind(manifest)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal)?;
+        translog::append(
+            &mut tx,
+            EntryKind::ManifestAccepted,
+            json!({
+                "commitment": commitment(salt, req.pseudonym.as_str()).map_err(internal)?,
+                "manifest": current,
+            }),
+        )
+        .await
+        .map_err(internal)?;
+    }
+    tx.commit().await.map_err(internal)?;
+    Ok(Json(
+        json!({"status": "accepted", "state": state, "manifest": current}),
+    ))
 }
 
 async fn log_mine(
@@ -638,30 +714,17 @@ async fn log_mine(
     let checkpoint = app.checkpoint().await?;
     let cp = Checkpoint::parse(&checkpoint.text).map_err(internal)?;
     let tree = app.tree().await?;
-    let device = sqlx::query_as::<_, (String, String)>(
-        "SELECT state, salt FROM devices WHERE pseudonym = $1 AND manifest_hash = $2",
-    )
-    .bind(request.pseudonym.as_str())
-    .bind(app.manifest.hash().as_str())
-    .fetch_optional(&app.db)
-    .await
-    .map_err(internal)?;
-    let Some((state, salt)) = device else {
-        return Err(device_denied());
-    };
-    if state != devices::State::Approved.as_str() {
-        return Err(device_denied());
-    }
-    let commitment = devices::commitment(&salt, request.pseudonym.as_str()).map_err(internal)?;
     let mut conn = app.conn().await?;
-    let entries = translog::mine(
-        &mut conn,
-        cp.size,
-        app.manifest.hash().as_str(),
-        &commitment,
-    )
-    .await
-    .map_err(internal)?;
+    let enrolment = devices::bound(&mut conn, &request.pseudonym, app.manifest.hash().as_str())
+        .await
+        .map_err(internal)?
+        .filter(|e| e.state == DeviceState::Approved)
+        .ok_or_else(device_denied)?;
+    let commitment =
+        devices::commitment(&enrolment.salt, request.pseudonym.as_str()).map_err(internal)?;
+    let entries = translog::mine(&mut conn, cp.size, &enrolment.manifest, &commitment)
+        .await
+        .map_err(internal)?;
     let with_proof = |entry: Entry| -> Result<EntryWithProof, Reply> {
         let proof = inclusion_proof(tree.prefix(cp.size), entry.index).map_err(internal)?;
         Ok(EntryWithProof { entry, proof })
@@ -686,9 +749,14 @@ async fn claim(
     State(app): State<App>,
     body: Result<Json<ClaimRequest>, JsonRejection>,
 ) -> Result<Json<Value>, Reply> {
-    let Ok(Json(ClaimRequest { jws, csr_pem })) = body else {
+    let Ok(Json(ClaimRequest {
+        jws,
+        csr_pem,
+        manifest_toml,
+    })) = body
+    else {
         return Err(denied(vec![
-            "body must be {\"jws\": \"<compact JWS>\", \"csr_pem\": \"<PEM>\"}, csr_pem optional"
+            "body must be {\"jws\": \"<compact JWS>\", \"csr_pem\": \"<PEM>\", \"manifest_toml\": \"<TOML>\"}, csr_pem and manifest_toml optional"
                 .into(),
         ]));
     };
@@ -699,11 +767,19 @@ async fn claim(
         Some(cp) => foreign_checkpoint(&app.tree().await?, cp),
         None => None,
     };
-    let manifest_hash = app.manifest.hash().as_str();
+    let manifest_hash = claim.manifest.as_str();
     let mut tx = app.db.begin().await.map_err(internal)?;
     let state = devices::lock(&mut tx, &claim.device, manifest_hash)
         .await
         .map_err(internal)?;
+    let consented = if state.is_some() && &claim.manifest != app.manifest.hash() {
+        Arc::new(
+            consented_manifest(&app.manifest, &claim.manifest, manifest_toml.as_deref())
+                .map_err(|reason| denied(vec![reason]))?,
+        )
+    } else {
+        app.manifest.clone()
+    };
     let now = chrono::Utc::now();
     let enrolled = state.is_some();
     let first_failures = if enrolled {
@@ -717,7 +793,7 @@ async fn claim(
     let Evaluation {
         decision,
         first_failures,
-    } = evaluate(&app.manifest, claim, now, &first_failures);
+    } = evaluate_under(&consented, &app.manifest, claim, now, &first_failures);
     let oversharing = matches!(&decision, Decision::Deny { reasons } if reasons.iter().any(Reason::breaks_disclosure_contract));
     let strings = |rs: &[Reason]| rs.iter().map(ToString::to_string).collect::<Vec<_>>();
     let (warnings, mut reasons) = match &decision {
@@ -779,7 +855,7 @@ async fn claim(
         claims::store(
             &mut tx,
             &app.kek,
-            &app.manifest.body().claim_retention,
+            &consented.body().claim_retention,
             now,
             &claim.device,
             &payload,
@@ -794,7 +870,7 @@ async fn claim(
         && !oversharing
         && let Some(exporter) = &app.siem
     {
-        exporter.submit(siem::event(&app.manifest, claim, &reasons, &warnings));
+        exporter.submit(siem::event(&consented, claim, &reasons, &warnings));
     }
     if !reasons.is_empty() {
         return Err(denied(reasons));
@@ -807,6 +883,32 @@ async fn claim(
         "ca_pem": app.keys.ca.cert_pem,
         "log_checkpoint": checkpoint.to_string(),
     })))
+}
+
+/// The manifest a device enrolled under `signed` consented to, while the gateway enforces
+/// `enforced`. The device row holds only the hash, and the gateway set that hash only after it
+/// checked the company signature at enrolment, so text with the same hash is that manifest.
+fn consented_manifest(
+    enforced: &Manifest,
+    signed: &open_pact_core::ManifestHash,
+    toml: Option<&str>,
+) -> Result<Manifest, String> {
+    let run_accept = format!(
+        "this device signed manifest {signed}, the gateway now enforces {}; \
+         run `open-pact-client accept`",
+        enforced.hash()
+    );
+    let toml = toml.ok_or_else(|| {
+        format!("{run_accept}; update open-pact-client if it does not send its signed manifest")
+    })?;
+    let manifest = Manifest::parse(toml.as_bytes()).map_err(|e| format!("manifest_toml: {e}"))?;
+    if manifest.hash() != signed {
+        return Err(format!(
+            "manifest_toml is {}, not the manifest this device signed; {run_accept}",
+            manifest.hash()
+        ));
+    }
+    Ok(manifest)
 }
 
 /// The claim as the company keeps it, with the fingerprint of the certificate issued for it. The
@@ -1015,6 +1117,7 @@ fn router(app: App) -> Router {
         .route("/v1/claim", post(claim))
         .route("/v1/log/mine", post(log_mine))
         .route("/v1/device/status", post(device_status))
+        .route("/v1/device/accept", post(accept_manifest))
         .with_state(app)
 }
 
@@ -1369,11 +1472,18 @@ mod tests {
     async fn enrolled_claim(app: &Router, db: &PgPool, toml: &str) -> (SigningKey, Claim) {
         let manifest = Manifest::parse(toml.as_bytes()).unwrap();
         let key = open_pact_core::dev_key::generate();
-        let device_key = PublicKey::from(&key);
-        let device = Pseudonym::of(&device_key);
+        let device = Pseudonym::of(&PublicKey::from(&key));
         testdb::enrolled_device(db, device.as_str(), manifest.hash().as_str()).await;
+        let claim = fresh_claim(app, &key, &manifest).await;
+        (key, claim)
+    }
+
+    /// A compliant claim under the demo manifest from `key`, made for `manifest`, with a fresh nonce.
+    async fn fresh_claim(app: &Router, key: &SigningKey, manifest: &Manifest) -> Claim {
+        let device_key = PublicKey::from(key);
+        let device = Pseudonym::of(&device_key);
         let (_, nonce) = post_json(app, "/v1/nonce", &Value::Null).await;
-        let claim = Claim {
+        Claim {
             manifest: manifest.hash().clone(),
             device,
             device_key,
@@ -1408,8 +1518,7 @@ mod tests {
             .collect(),
             csr_sha256: None,
             log_checkpoint: None,
-        };
-        (key, claim)
+        }
     }
 
     async fn auth_request(app: &Router, key: &SigningKey, purpose: DeviceAuthPurpose) -> Value {
@@ -1640,6 +1749,362 @@ mod tests {
                 post_json(&app, path, &request).await.0,
                 StatusCode::FORBIDDEN
             );
+        }
+    }
+
+    const PASSWORD_RULE: &str = r#"[[control]]
+id = "password_min_length"
+source = "company_policy"
+check = "builtin:password_min_length@1"
+output = { integer = { min = 0, max = 2147483647 }, values = ["none"] }
+required = { macos = { min = 10 }, windows = { min = 10 }, linux = { min = 10 } }
+grace = "1d"
+"#;
+
+    /// Manifest A: the demo before IT added the password rule, with claims kept for 6 months.
+    fn manifest_a() -> String {
+        let toml = DEMO
+            .replace(PASSWORD_RULE, "")
+            .replace(r#"claim_retention = "12mo""#, r#"claim_retention = "6mo""#);
+        assert!(!toml.contains("password_min_length") && toml.contains(r#""6mo""#));
+        toml
+    }
+
+    struct Owned {
+        device: SigningKey,
+        owner: SigningKey,
+        pseudonym: Pseudonym,
+    }
+
+    /// An approved device enrolled under `toml` by a real owner key.
+    async fn device_on(db: &PgPool, toml: &str) -> Owned {
+        let (device, owner) = (
+            open_pact_core::dev_key::generate(),
+            open_pact_core::dev_key::generate(),
+        );
+        let pseudonym = Pseudonym::of(&PublicKey::from(&device));
+        let hash = Manifest::parse(toml.as_bytes()).unwrap().hash().clone();
+        sqlx::query(
+            "INSERT INTO devices (pseudonym, manifest_hash, owner_key, owner_signature, salt, state) \
+             VALUES ($1, $2, $3, $4, '00', 'approved')",
+        )
+        .bind(pseudonym.as_str())
+        .bind(hash.as_str())
+        .bind(serde_json::to_value(PublicKey::from(&owner)).unwrap())
+        .bind(String::from(Endorsement::sign(&owner, &hash).signature))
+        .execute(db)
+        .await
+        .unwrap();
+        Owned {
+            device,
+            owner,
+            pseudonym,
+        }
+    }
+
+    /// A claim under manifest `toml` that reports only the controls `toml` lists.
+    async fn claim_under(app: &Router, device: &SigningKey, toml: &str) -> Claim {
+        let manifest = Manifest::parse(toml.as_bytes()).unwrap();
+        let mut claim = fresh_claim(app, device, &manifest).await;
+        claim
+            .results
+            .retain(|id, _| manifest.body().control(id).is_some());
+        claim
+    }
+
+    async fn send_claim(
+        app: &Router,
+        device: &SigningKey,
+        claim: &Claim,
+        toml: Option<&str>,
+    ) -> (StatusCode, Value) {
+        let jws = open_pact_core::sign_claim(claim, device).unwrap();
+        post_json(
+            app,
+            "/v1/claim",
+            &json!({"jws": jws, "manifest_toml": toml}),
+        )
+        .await
+    }
+
+    async fn accept_request(app: &Router, owned: &Owned, previous: &str) -> AcceptRequest {
+        let (_, nonce) = post_json(app, "/v1/nonce", &Value::Null).await;
+        AcceptRequest::sign_with(
+            Manifest::parse(previous.as_bytes()).unwrap().hash().clone(),
+            Manifest::parse(DEMO.as_bytes()).unwrap().hash().clone(),
+            nonce["nonce"].as_str().unwrap().into(),
+            &owned.owner,
+            &PublicKey::from(&owned.device),
+            |s| Ok::<_, open_pact_core::Error>(open_pact_core::Signature::sign(&owned.device, s)),
+        )
+        .unwrap()
+    }
+
+    async fn post_accept(app: &Router, req: &AcceptRequest) -> (StatusCode, Value) {
+        post_json(
+            app,
+            "/v1/device/accept",
+            &serde_json::to_value(req).unwrap(),
+        )
+        .await
+    }
+
+    async fn bound_hash(db: &PgPool, device: &Pseudonym) -> (String, String) {
+        sqlx::query_as("SELECT manifest_hash, state FROM devices WHERE pseudonym = $1")
+            .bind(device.as_str())
+            .fetch_one(db)
+            .await
+            .unwrap()
+    }
+
+    /// The gateway runs B, which adds a required control with grace 1d, and holds no copy of A.
+    /// A device approved under A keeps working inside the grace, is denied after it, and after its
+    /// owner accepts B it is on B, still approved, and compliant without a warning.
+    #[tokio::test]
+    #[ignore = "needs TEST_DATABASE_URL"]
+    async fn an_approved_device_keeps_working_across_a_manifest_change_until_its_owner_accepts() {
+        let (a, b) = (manifest_a(), Manifest::parse(DEMO.as_bytes()).unwrap());
+        let (app, db) = test_app_with(DEMO, 10, 100).await;
+        let owned = device_on(&db, &a).await;
+
+        let claim = claim_under(&app, &owned.device, &a).await;
+        let (status, body) = send_claim(&app, &owned.device, &claim, Some(&a)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let warnings = body["warnings"].to_string();
+        for part in [
+            "password_min_length",
+            "open-pact-client accept",
+            "access ends in",
+        ] {
+            assert!(warnings.contains(part), "{part} missing from {warnings}");
+        }
+        let (received, delete_after): (
+            chrono::DateTime<chrono::Utc>,
+            chrono::DateTime<chrono::Utc>,
+        ) = sqlx::query_as("SELECT received_at, delete_after FROM claims")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        let kept = (delete_after - received).num_days();
+        assert!(
+            (180..=185).contains(&kept),
+            "a claim under A keeps A's 6mo retention, not B's 12mo: {kept} days"
+        );
+
+        sqlx::query("UPDATE control_failures SET first_failed_at = now() - interval '2 days'")
+            .execute(&db)
+            .await
+            .unwrap();
+        let claim = claim_under(&app, &owned.device, &a).await;
+        let (status, body) = send_claim(&app, &owned.device, &claim, Some(&a)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(
+            body["reasons"].to_string().contains(
+                "password_min_length is required by a new manifest that waits for your acceptance; run `open-pact-client accept`, grace 1d ended"
+            ),
+            "{body}"
+        );
+        assert!(body.get("certificate_pem").is_none());
+
+        let (status, body) = post_accept(&app, &accept_request(&app, &owned, &a).await).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            bound_hash(&db, &owned.pseudonym).await,
+            (b.hash().to_string(), "approved".into())
+        );
+        let accepted: Vec<Value> =
+            sqlx::query_scalar("SELECT data FROM log_entries WHERE kind = 'manifest_accepted'")
+                .fetch_all(&db)
+                .await
+                .unwrap();
+        assert_eq!(
+            accepted,
+            [json!({
+                "commitment": devices::commitment("00", owned.pseudonym.as_str()).unwrap(),
+                "manifest": b.hash(),
+            })]
+        );
+
+        let claim = fresh_claim(&app, &owned.device, &b).await;
+        let (status, body) = send_claim(&app, &owned.device, &claim, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["warnings"], json!([]));
+    }
+
+    /// Item 8: the gateway holds no copy of A. The device's copy works only if its hash is A's.
+    /// Status and the private log answer for the device on A, with A's log entry.
+    #[tokio::test]
+    #[ignore = "needs TEST_DATABASE_URL"]
+    async fn a_device_on_an_unknown_earlier_manifest_is_judged_by_the_text_it_signed() {
+        let a = manifest_a();
+        let (app, db) = test_app_with(DEMO, 10, 100).await;
+        let owned = device_on(&db, &a).await;
+        for (toml, expected) in [
+            (None, "run `open-pact-client accept`"),
+            (
+                Some(DEMO.to_string()),
+                "not the manifest this device signed",
+            ),
+            (
+                Some(format!("{a}\n")),
+                "not the manifest this device signed",
+            ),
+        ] {
+            let claim = claim_under(&app, &owned.device, &a).await;
+            let (status, body) = send_claim(&app, &owned.device, &claim, toml.as_deref()).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            assert!(body["reasons"].to_string().contains(expected), "{body}");
+        }
+        assert_eq!(stored_text(&db).await.len(), 0);
+
+        let a_hash = Manifest::parse(a.as_bytes()).unwrap().hash().clone();
+        let mut tx = db.begin().await.unwrap();
+        translog::append(
+            &mut tx,
+            EntryKind::ManifestPublished,
+            json!({"manifest": a_hash.as_str()}),
+        )
+        .await
+        .unwrap();
+        let commitment = devices::commitment("00", owned.pseudonym.as_str()).unwrap();
+        for kind in [EntryKind::DeviceEnrolled, EntryKind::DeviceApproved] {
+            translog::append(&mut tx, kind, json!({"commitment": commitment}))
+                .await
+                .unwrap();
+        }
+        tx.commit().await.unwrap();
+        let request = auth_request(&app, &owned.device, DeviceAuthPurpose::DeviceStatus).await;
+        let (status, body) = post_json(&app, "/v1/device/status", &request).await;
+        assert_eq!(
+            (status, body),
+            (StatusCode::OK, json!({"state": "approved"}))
+        );
+        let request = auth_request(&app, &owned.device, DeviceAuthPurpose::LogMine).await;
+        let (status, body) = post_json(&app, "/v1/log/mine", &request).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let mine: MyEntries = serde_json::from_value(body).unwrap();
+        assert_eq!(mine.manifest.entry.data["manifest"], a_hash.as_str());
+        assert_eq!(mine.device.len(), 2);
+    }
+
+    /// Item 10: a control A collects and B tightens fails under B with its own grace, and is not
+    /// reported as missing.
+    #[tokio::test]
+    #[ignore = "needs TEST_DATABASE_URL"]
+    async fn a_tightened_control_fails_under_the_new_manifest_with_its_grace() {
+        let tightened = DEMO.replace(
+            "required = { macos = { max = 30 }, windows = { max = 30 }, linux = { max = 30 } }\ngrace = \"1d\"",
+            "required = { macos = { max = 14 }, windows = { max = 14 }, linux = { max = 14 } }\ngrace = \"1d\"",
+        );
+        assert_ne!(tightened, DEMO);
+        let (app, db) = test_app_with(&tightened, 10, 100).await;
+        let owned = device_on(&db, DEMO).await;
+        let mut claim = claim_under(&app, &owned.device, DEMO).await;
+        claim.results.insert("os_patch_age_days".into(), 20.into());
+        let (status, body) = send_claim(&app, &owned.device, &claim, Some(DEMO)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["warnings"],
+            json!(["os_patch_age_days = 20, <= 14 required, access ends in 24h"])
+        );
+    }
+
+    /// An acceptance from another device key, with another owner key, a forged owner signature, or
+    /// a join or status signature in place of the acceptance signature leaves the device on A.
+    #[tokio::test]
+    #[ignore = "needs TEST_DATABASE_URL"]
+    async fn an_acceptance_with_a_wrong_device_key_or_owner_signature_is_refused() {
+        let a = manifest_a();
+        let (app, db) = test_app_with(DEMO, 10, 100).await;
+        let owned = device_on(&db, &a).await;
+        let a_hash = bound_hash(&db, &owned.pseudonym).await.0;
+
+        let stranger = Owned {
+            device: open_pact_core::dev_key::generate(),
+            owner: owned.owner.clone(),
+            pseudonym: owned.pseudonym.clone(),
+        };
+        let mut other_device = accept_request(&app, &stranger, &a).await;
+        other_device.pseudonym = owned.pseudonym.clone();
+        let unknown_device = accept_request(&app, &stranger, &a).await;
+        let other_owner = accept_request(
+            &app,
+            &Owned {
+                device: owned.device.clone(),
+                owner: open_pact_core::dev_key::generate(),
+                pseudonym: owned.pseudonym.clone(),
+            },
+            &a,
+        )
+        .await;
+        let mut forged_owner = accept_request(&app, &owned, &a).await;
+        forged_owner.owner_signature =
+            open_pact_core::Signature::sign(&open_pact_core::dev_key::generate(), b"accept");
+        let mut status_signature = accept_request(&app, &owned, &a).await;
+        status_signature.device_signature = open_pact_core::Signature::sign(
+            &owned.device,
+            &open_pact_core::device_auth_statement(
+                DeviceAuthPurpose::DeviceStatus,
+                &owned.pseudonym,
+                &status_signature.nonce,
+            ),
+        );
+        let mut join_signature = accept_request(&app, &owned, &a).await;
+        let join = open_pact_core::enrol_statement(
+            &join_signature.manifest,
+            &open_pact_core::InvitationCode::from_bytes([3; 32]).hash(),
+            &join_signature.owner.key,
+            &join_signature.device_key,
+        );
+        join_signature.device_signature = open_pact_core::Signature::sign(&owned.device, &join);
+        join_signature.owner_signature = open_pact_core::Signature::sign(&owned.owner, &join);
+        for (case, req) in [
+            ("another device key", other_device),
+            ("a device that is not enrolled", unknown_device),
+            ("another owner key", other_owner),
+            ("a forged owner signature", forged_owner),
+            ("a device status signature", status_signature),
+            ("a join signature", join_signature),
+        ] {
+            let (status, body) = post_accept(&app, &req).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{case}: {body}");
+            assert_eq!(
+                bound_hash(&db, &owned.pseudonym).await,
+                (a_hash.clone(), "approved".into()),
+                "{case}"
+            );
+        }
+
+        for _ in 0..2 {
+            let (status, body) = post_accept(&app, &accept_request(&app, &owned, &a).await).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        let accepted: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM log_entries WHERE kind = 'manifest_accepted'")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(accepted, 1, "a repeated acceptance changes nothing");
+    }
+
+    /// Item 7: acceptance moves only the hash; a pending or revoked device stays so.
+    #[tokio::test]
+    #[ignore = "needs TEST_DATABASE_URL"]
+    async fn acceptance_keeps_a_pending_or_revoked_state() {
+        let a = manifest_a();
+        let (app, db) = test_app_with(DEMO, 10, 100).await;
+        for state in ["pending", "revoked"] {
+            let owned = device_on(&db, &a).await;
+            sqlx::query("UPDATE devices SET state = $1 WHERE pseudonym = $2")
+                .bind(state)
+                .bind(owned.pseudonym.as_str())
+                .execute(&db)
+                .await
+                .unwrap();
+            let (status, body) = post_accept(&app, &accept_request(&app, &owned, &a).await).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["state"], state);
+            assert_eq!(bound_hash(&db, &owned.pseudonym).await.1, state);
         }
     }
 

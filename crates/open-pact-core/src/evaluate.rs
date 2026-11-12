@@ -111,6 +111,11 @@ pub enum Reason {
     UndisclosedValue { id: String, value: String },
     #[error("{id} missing, required on {os}")]
     Missing { id: String, os: Os },
+    #[error(
+        "{id} is required by a new manifest that waits for your acceptance; run `open-pact-client accept`{}",
+        .grace.describe("grace")
+    )]
+    NotAccepted { id: String, grace: Grace },
     #[error("{id} = {value}, {required} required{}", .grace.describe("grace"))]
     Failed {
         id: String,
@@ -189,7 +194,22 @@ pub fn evaluate(
     now: DateTime<Utc>,
     first_failures: &FirstFailures,
 ) -> Evaluation {
-    let body = manifest.body();
+    evaluate_under(manifest, manifest, claim, now, first_failures)
+}
+
+/// Evaluates a claim made under `consented`, the manifest the owner signed, while the gateway
+/// enforces `enforced`. `consented` decides what the claim may disclose; `enforced` decides the
+/// verdict. A required control of `enforced` that `consented` does not collect fails with its own
+/// grace until the owner accepts `enforced`.
+pub fn evaluate_under(
+    consented: &Manifest,
+    enforced: &Manifest,
+    claim: &Claim,
+    now: DateTime<Utc>,
+    first_failures: &FirstFailures,
+) -> Evaluation {
+    let signed = consented.body();
+    let body = enforced.body();
     let mut deny = Vec::new();
     let mut warn = Vec::new();
 
@@ -200,14 +220,14 @@ pub fn evaluate(
         (Metadata::Virtualized, claim.virtualized.is_some()),
         (Metadata::LogCheckpoint, claim.log_checkpoint.is_some()),
     ] {
-        if sent && !body.discloses(field) {
+        if sent && !signed.discloses(field) {
             deny.push(Reason::UndisclosedMetadata(field));
         }
     }
-    if &claim.manifest != manifest.hash() {
+    if &claim.manifest != consented.hash() {
         deny.push(Reason::WrongManifest {
             claimed: claim.manifest.clone(),
-            enforced: manifest.hash().clone(),
+            enforced: consented.hash().clone(),
         });
     }
     if claim.time > now + TimeDelta::minutes(5) {
@@ -235,7 +255,7 @@ pub fn evaluate(
         });
     }
     for (id, value) in &claim.results {
-        match body.control(id) {
+        match signed.control(id) {
             None => deny.push(Reason::UnknownControl { id: id.clone() }),
             Some(c) if !c.output.contains(value) => deny.push(Reason::UndisclosedValue {
                 id: id.clone(),
@@ -254,14 +274,26 @@ pub fn evaluate(
         let id = control.id.clone();
         let required = required.clone();
         let since = first_failures.get(&id).copied();
+        let collected = signed.control(&id);
         let Some(value) = claim.results.get(&control.id) else {
+            if collected.is_none() {
+                let since = since.unwrap_or(now);
+                next.insert(id.clone(), since);
+                let grace = Grace::of(&control.grace, since, now);
+                if grace.denies() {
+                    deny.push(Reason::NotAccepted { id, grace });
+                } else {
+                    warn.push(Reason::NotAccepted { id, grace });
+                }
+                continue;
+            }
             if let Some(since) = since {
                 next.insert(id.clone(), since);
             }
             deny.push(Reason::Missing { id, os: claim.os });
             continue;
         };
-        if required.contains(value) || !control.output.contains(value) {
+        if required.contains(value) || !collected.is_some_and(|c| c.output.contains(value)) {
             continue;
         }
         let since = since.unwrap_or(now);
@@ -794,6 +826,119 @@ mod tests {
         assert_eq!(
             reasons(decide(&manifest(), &c, now())),
             ["claim time 2026-10-12 09:06:00 UTC is more than 5 minutes in the future"]
+        );
+    }
+
+    const PASSWORD_RULE: &str = r#"[[control]]
+id = "password_min_length"
+source = "company_policy"
+check = "builtin:password_min_length@1"
+output = { integer = { min = 0, max = 2147483647 }, values = ["none"] }
+required = { macos = { min = 10 }, windows = { min = 10 }, linux = { min = 10 } }
+grace = "1d"
+"#;
+
+    /// The manifest an owner signed before IT added the password rule.
+    fn before_password_rule() -> Manifest {
+        let toml = DEMO.replace(PASSWORD_RULE, "");
+        assert_ne!(toml, DEMO);
+        Manifest::parse(toml.as_bytes()).unwrap()
+    }
+
+    fn claim_under(consented: &Manifest) -> Claim {
+        let mut c = claim(&PASSING);
+        c.manifest = consented.hash().clone();
+        c.results.remove("password_min_length");
+        c
+    }
+
+    #[test]
+    fn a_control_the_signed_manifest_does_not_collect_runs_on_its_own_grace() {
+        let (old, new) = (before_password_rule(), manifest());
+        let c = claim_under(&old);
+        let first = evaluate_under(&old, &new, &c, now(), &FirstFailures::new());
+        let Decision::Allow { warnings } = &first.decision else {
+            panic!("{:?}", first.decision);
+        };
+        assert_eq!(
+            texts(warnings),
+            [
+                "password_min_length is required by a new manifest that waits for your acceptance; \
+                 run `open-pact-client accept`, access ends in 24h"
+            ]
+        );
+        assert_eq!(
+            first.first_failures,
+            FirstFailures::from([("password_min_length".into(), now())])
+        );
+
+        let later = now() + TimeDelta::hours(25);
+        let mut late = c.clone();
+        late.time = later;
+        let ended = evaluate_under(&old, &new, &late, later, &first.first_failures);
+        assert_eq!(
+            reasons(ended.decision),
+            [
+                "password_min_length is required by a new manifest that waits for your acceptance; \
+                 run `open-pact-client accept`, grace 1d ended"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_tightened_control_fails_under_the_enforced_manifest() {
+        let old = before_password_rule();
+        let tightened = DEMO.replace(
+            "required = { macos = { max = 30 }, windows = { max = 30 }, linux = { max = 30 } }\ngrace = \"1d\"",
+            "required = { macos = { max = 14 }, windows = { max = 14 }, linux = { max = 14 } }\ngrace = \"1d\"",
+        );
+        assert_ne!(tightened, DEMO);
+        let new = Manifest::parse(tightened.as_bytes()).unwrap();
+        let mut c = claim_under(&old);
+        c.results.insert("os_patch_age_days".into(), 20.into());
+        assert_eq!(
+            evaluate(&old, &c, now(), &FirstFailures::new()).decision,
+            Decision::Allow { warnings: vec![] },
+            "20 days meets the signed max 30"
+        );
+        let Decision::Allow { warnings } =
+            evaluate_under(&old, &new, &c, now(), &FirstFailures::new()).decision
+        else {
+            panic!("inside grace");
+        };
+        let warnings = texts(&warnings);
+        assert!(
+            warnings.contains(&"os_patch_age_days = 20, <= 14 required, access ends in 24h".into()),
+            "{warnings:?}"
+        );
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.starts_with("os_patch_age_days is required")),
+            "a control the signed manifest collects is not missing: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn the_signed_manifest_decides_what_a_claim_may_disclose() {
+        let old = manifest();
+        let narrower = DEMO
+            .replace(PASSWORD_RULE, "")
+            .replace(r#""virtualized", "log_checkpoint"]"#, "]");
+        let new = Manifest::parse(narrower.as_bytes()).unwrap();
+        let mut c = claim(&PASSING);
+        c.manifest = old.hash().clone();
+        assert_eq!(
+            evaluate_under(&old, &new, &c, now(), &FirstFailures::new()).decision,
+            Decision::Allow { warnings: vec![] },
+            "a result and metadata the owner agreed to share are not oversharing"
+        );
+        c.manifest = new.hash().clone();
+        assert!(
+            reasons(evaluate_under(&old, &new, &c, now(), &FirstFailures::new()).decision)
+                .iter()
+                .any(|r| r.starts_with("claim is for manifest")),
+            "the claim must name the manifest the owner signed"
         );
     }
 }

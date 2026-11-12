@@ -26,13 +26,14 @@ use device_key::DeviceKey;
 #[cfg(test)]
 use open_pact_core::PublicKey;
 use open_pact_core::{
+    AcceptRequest, DeviceAuthPurpose, DeviceStatus, MyEntries, MyEntriesRequest,
+    device_auth_statement,
+};
+use open_pact_core::{
     Checkpoint, Claim, CsrHash, Endorsement, EnrolRequest, Entry, EntryKind, Invitation,
     LogCheckpoint, LogHash, LogKey, LogPolicy, Manifest, ManifestHash, Metadata, Note, Os,
     Pseudonym, SignedManifest, Virtualized, dev_key, verify_claim, verify_consistency,
     verify_cosignatures, verify_inclusion,
-};
-use open_pact_core::{
-    DeviceAuthPurpose, DeviceStatus, MyEntries, MyEntriesRequest, device_auth_statement,
 };
 use rcgen::{CertificateParams, DistinguishedName, KeyPair};
 use serde::{Deserialize, Serialize};
@@ -74,6 +75,12 @@ enum Command {
     },
     /// Run the manifest's checks, send a signed claim and fetch a VPN certificate
     Check,
+    /// Review a changed manifest from the gateway, sign it and move this device to it
+    Accept {
+        /// Sign without asking
+        #[arg(long)]
+        yes: bool,
+    },
     /// Prepare open-pact.toml from the signed manifest, then run the checks
     Finish {
         /// Write without asking for confirmation
@@ -2101,7 +2108,10 @@ fn verify_my_entries(
     if response.device.iter().any(|item| {
         !matches!(
             item.entry.kind,
-            EntryKind::DeviceEnrolled | EntryKind::DeviceApproved | EntryKind::DeviceRevoked
+            EntryKind::DeviceEnrolled
+                | EntryKind::DeviceApproved
+                | EntryKind::DeviceRevoked
+                | EntryKind::ManifestAccepted
         ) || item.entry.data["commitment"] != commitment
     }) {
         return Err("the gateway returned another device's entry".into());
@@ -3169,7 +3179,9 @@ async fn check_impl(home: &Home, insecure_dev: bool, show_resume_hint: bool) -> 
         print_log_upgrade(home);
         return Ok(ExitCode::FAILURE);
     }
-    let manifest = Manifest::parse(&std::fs::read(home.file("manifest.toml"))?)?;
+    let manifest_toml = String::from_utf8(std::fs::read(home.file("manifest.toml"))?)
+        .context("manifest.toml is not UTF-8")?;
+    let manifest = Manifest::parse(manifest_toml.as_bytes())?;
     if manifest.hash() != &enrolment.manifest {
         bail!("manifest.toml no longer matches the hash you signed");
     }
@@ -3247,6 +3259,9 @@ async fn check_impl(home: &Home, insecure_dev: bool, show_resume_hint: bool) -> 
         }
     }
     let http = http_client()?;
+    let enforced = enforced_manifest(&http, &enrolment.gateway).await?;
+    let changed =
+        (enforced != enrolment.manifest).then(|| manifest_change_notice(&enforced, &command));
     let sync = match sync_log(&http, home, &manifest, &mut enrolment).await {
         Err(error)
             if error.downcast_ref::<reqwest::Error>().is_some_and(|error| {
@@ -3256,7 +3271,19 @@ async fn check_impl(home: &Home, insecure_dev: bool, show_resume_hint: bool) -> 
                         .is_some_and(|url| url.path().ends_with("/v1/log/mine"))
             }) =>
         {
-            match status_after_log_denial(&http, home, &enrolment).await? {
+            let state = match (
+                status_after_log_denial(&http, home, &enrolment).await,
+                &changed,
+            ) {
+                (Ok(state), _) => state,
+                (Err(_), Some(notice)) => {
+                    println!("{notice}");
+                    print_claim_log_status(home, None, Some("the manifest changed"));
+                    return Ok(ExitCode::FAILURE);
+                }
+                (Err(error), None) => return Err(error),
+            };
+            match state {
                 DeviceStatus::Pending => {
                     println!("This device waits for IT approval.");
                     println!(
@@ -3320,8 +3347,11 @@ async fn check_impl(home: &Home, insecure_dev: bool, show_resume_hint: bool) -> 
         csr_sha256: Some(CsrHash::of(&csr_der)),
         log_checkpoint,
     };
-    let sent =
-        serde_json::to_vec(&json!({ "jws": device.sign_claim(&claim)?, "csr_pem": csr_pem }))?;
+    let mut request = json!({ "jws": device.sign_claim(&claim)?, "csr_pem": csr_pem });
+    if changed.is_some() {
+        request["manifest_toml"] = manifest_toml.into();
+    }
+    let sent = serde_json::to_vec(&request)?;
     let resp = http
         .post(format!("{gateway}/v1/claim"))
         .header("content-type", "application/json")
@@ -3437,6 +3467,9 @@ async fn check_impl(home: &Home, insecure_dev: bool, show_resume_hint: bool) -> 
         )),
         None,
     );
+    if let Some(notice) = &changed {
+        println!("\n{notice}");
+    }
     if !accepted {
         println!("\nNext: fix the items above, then run {command} check again.");
     }
@@ -3445,6 +3478,180 @@ async fn check_impl(home: &Home, insecure_dev: bool, show_resume_hint: bool) -> 
     } else {
         ExitCode::FAILURE
     })
+}
+
+/// The hash of the manifest the gateway enforces now.
+async fn enforced_manifest(http: &reqwest::Client, gateway: &str) -> Result<ManifestHash> {
+    let published: PublishedManifest =
+        get_json(http, format!("{}/v1/manifest", base(gateway))).await?;
+    Ok(ManifestHash::of(published.toml.as_bytes()))
+}
+
+fn manifest_change_notice(enforced: &ManifestHash, command: &str) -> String {
+    format!(
+        "The manifest changed: the gateway now enforces {enforced}. Run `{command} accept` to \
+         review and sign it. Until then, controls it adds count as failing after their grace."
+    )
+}
+
+/// What `new` changes against `old`, the manifest this device signed, one line per change.
+fn manifest_changes(old: &Manifest, new: &Manifest, os: Os) -> Vec<String> {
+    let (was, now) = (old.body(), new.body());
+    let rule = |c: &open_pact_core::Control| match c.required.get(&os) {
+        Some(required) => format!(
+            "must be {required}, grace {}, reports {}",
+            c.grace, c.output
+        ),
+        None => format!("reported, not required, reports {}", c.output),
+    };
+    let mut changes = Vec::new();
+    for c in &now.controls {
+        match was.control(&c.id) {
+            None => changes.push(format!("added control {}: {}", c.id, rule(c))),
+            Some(before) if before != c => changes.push(format!(
+                "changed control {}: {} (was {})",
+                c.id,
+                rule(c),
+                rule(before)
+            )),
+            Some(_) => {}
+        }
+    }
+    for c in &was.controls {
+        if now.control(&c.id).is_none() {
+            changes.push(format!("removed control {}", c.id));
+        }
+    }
+    let list = |items: Vec<String>| items.join(", ");
+    let mut term = |name: &str, before: String, after: String| {
+        if before != after {
+            changes.push(format!("{name}: {after} (was {before})"));
+        }
+    };
+    term(
+        "disclosed metadata",
+        list(
+            was.disclosed_metadata
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+        ),
+        list(
+            now.disclosed_metadata
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+        ),
+    );
+    term(
+        "claim retention",
+        was.claim_retention.to_string(),
+        now.claim_retention.to_string(),
+    );
+    term(
+        "claim recipients",
+        list(was.claim_recipients.iter().cloned().collect()),
+        list(now.claim_recipients.iter().cloned().collect()),
+    );
+    term(
+        "data controller",
+        was.data_controller.clone(),
+        now.data_controller.clone(),
+    );
+    changes
+}
+
+/// Shows the manifest the gateway enforces and what it changes, asks the owner, and sends the
+/// owner's and the device's signatures. The device keeps its approval; no invitation is needed.
+async fn accept(home: &Home, yes: bool, insecure_dev: bool) -> Result<ExitCode> {
+    let mut enrolment = home.enrolment()?;
+    check_scheme(&enrolment.gateway, insecure_dev)?;
+    let gateway = base(&enrolment.gateway).to_string();
+    let command = client_command(&home.0);
+    let http = http_client()?;
+    let published: PublishedManifest = get_json(&http, format!("{gateway}/v1/manifest")).await?;
+    let new = Manifest::parse(published.toml.as_bytes())?;
+    if !published.company.verify(new.hash()) {
+        bail!("the company signature does not match this manifest; refusing to show it");
+    }
+    let log = get_text(&http, format!("{gateway}/v1/log/key")).await?;
+    let company = published.company.key.fingerprint();
+    if let Some(changed) = Pins::load(home)?.differs(&company, &log) {
+        report_log(alarm(changed), home);
+        return Ok(ExitCode::from(2));
+    }
+    if new.hash() == &enrolment.manifest {
+        println!(
+            "This device already signed the manifest the gateway enforces ({}). Nothing to accept.",
+            new.hash()
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    let old = Manifest::parse(&read_home_file(&home.file("manifest.toml"))?)?;
+    // A stored new manifest means an earlier accept stopped after the gateway confirmed it.
+    let resumed = old.hash() == new.hash();
+    if old.hash() != &enrolment.manifest && !resumed {
+        bail!("manifest.toml no longer matches the hash you signed");
+    }
+    checks::check_supported(&new).map_err(|e| {
+        anyhow::anyhow!("{e}; refusing to show or sign this manifest. Nothing was sent")
+    })?;
+    if !resumed {
+        let os = current_os()?;
+        println!("The gateway now enforces a new manifest:\n");
+        write_summary(&mut std::io::stdout().lock(), &new, &company, os)?;
+        println!("Changes against the manifest you signed ({}):", old.hash());
+        let changes = manifest_changes(&old, &new, os);
+        if changes.is_empty() {
+            println!("  none in controls, disclosed metadata, retention, recipients or controller");
+        }
+        for change in changes {
+            println!("  {change}");
+        }
+        println!();
+        if !yes && !confirm("Sign the new manifest as the device owner?").await? {
+            println!("Not signed. Nothing was sent. Run {command} accept when you are ready.");
+            return Ok(ExitCode::FAILURE);
+        }
+    }
+    let owner = dev_key::load(&home.file("owner-dev.pem"))?;
+    let device = DeviceKey::load(&home.0)?;
+    let nonce: Nonce = http
+        .post(format!("{gateway}/v1/nonce"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let request = AcceptRequest::sign_with(
+        enrolment.manifest.clone(),
+        new.hash().clone(),
+        nonce.nonce,
+        &owner,
+        &device.public_key(),
+        |statement| device.sign(statement),
+    )?;
+    let response = http
+        .post(format!("{gateway}/v1/device/accept"))
+        .json(&request)
+        .send()
+        .await?;
+    let status = response.status();
+    let body: Value = response.json().await.unwrap_or(Value::Null);
+    if !status.is_success() {
+        println!("Acceptance refused ({status}): {body}");
+        return Ok(ExitCode::FAILURE);
+    }
+    home.write("manifest.toml", published.toml.as_bytes())?;
+    enrolment.manifest = new.hash().clone();
+    enrolment.log_entries = None;
+    home.write("enrolment.json", &serde_json::to_vec_pretty(&enrolment)?)?;
+    println!("  Signed       {}  (the manifest above)", new.hash());
+    if let Some(state) = body["state"].as_str() {
+        println!("  Device       {state}");
+    }
+    println!("Next: run {command} check to send a claim under the new manifest.");
+    Ok(ExitCode::SUCCESS)
 }
 
 fn print_claim_log_status(
@@ -3806,6 +4013,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             }
         },
         Command::Check => check(&home, cli.insecure_dev).await,
+        Command::Accept { yes } => accept(&home, yes, cli.insecure_dev).await,
         Command::Finish { yes } => finish(&home, cli.insecure_dev, yes, false).await,
         Command::Report { dry_run } => {
             let config = device_config::DeviceConfig::load(&home)?
@@ -6218,6 +6426,25 @@ mod tests {
         BTreeMap<String, Vec<u8>>,
         VpnPair,
     ) {
+        let (code, before, after, pair, _) =
+            check_under(|signed| signed.to_string(), response, pair, device_config).await;
+        (code, before, after, pair)
+    }
+
+    /// `check_with_response_checkpoint` for a gateway that enforces `enforced(signed manifest)`.
+    /// Also returns the body of the claim request.
+    async fn check_under(
+        enforced: impl FnOnce(&str) -> String,
+        response: impl FnOnce(&Company, &Witness, &[Entry], u64) -> Option<String>,
+        pair: impl FnOnce(&KeyPair) -> VpnPair,
+        device_config: Option<&str>,
+    ) -> (
+        Result<ExitCode>,
+        BTreeMap<String, Vec<u8>>,
+        BTreeMap<String, Vec<u8>>,
+        VpnPair,
+        String,
+    ) {
         let (company, witness) = (Company::new(), Witness::new());
         let toml = witnessed_manifest(&witness);
         let manifest = Manifest::parse(toml.as_bytes()).unwrap();
@@ -6264,7 +6491,10 @@ mod tests {
         if let Some(text) = response(&company, &witness, &entries, now) {
             claim["log_checkpoint"] = text.into();
         }
-        let (published, log) = (Company::published(&toml, &company.key), company.log.vkey());
+        let (published, log) = (
+            Company::published(&enforced(&toml), &company.key),
+            company.log.vkey(),
+        );
         let (claim, stored) = (claim.to_string(), before_claim.clone());
         let leaves: Vec<_> = entries[..2].iter().map(Entry::leaf_hash).collect();
         let mine_response = serde_json::to_string(&MyEntries {
@@ -6317,7 +6547,204 @@ mod tests {
             ],
             "the claim was sent"
         );
-        (code, before, snapshot(dir.path()), pair)
+        let claim = gateway.bodies("POST /v1/claim").remove(0);
+        (code, before, snapshot(dir.path()), pair, claim)
+    }
+
+    const PASSWORD_RULE: &str = r#"[[control]]
+id = "password_min_length"
+source = "company_policy"
+check = "builtin:password_min_length@1"
+output = { integer = { min = 0, max = 2147483647 }, values = ["none"] }
+required = { macos = { min = 10 }, windows = { min = 10 }, linux = { min = 10 } }
+grace = "1d"
+"#;
+
+    /// `toml` with the password rule added before its log section.
+    fn with_password_rule(toml: &str) -> String {
+        let at = toml.find("[log]").unwrap();
+        format!("{}{PASSWORD_RULE}\n{}", &toml[..at], &toml[at..])
+    }
+
+    #[tokio::test]
+    async fn check_sends_the_signed_manifest_and_names_accept_when_the_gateway_enforces_another() {
+        let (code, _, _, _, claim) =
+            check_under(with_password_rule, grown_checkpoint, valid_pair, None).await;
+        assert_eq!(code.unwrap(), ExitCode::SUCCESS);
+        let claim: Value = serde_json::from_str(&claim).unwrap();
+        let signed = claim["manifest_toml"].as_str().expect("manifest_toml sent");
+        let jws = verify_claim(claim["jws"].as_str().unwrap()).unwrap();
+        assert_eq!(&jws.claim().manifest, &ManifestHash::of(signed.as_bytes()));
+        assert!(!signed.contains("password_min_length"));
+        assert!(!jws.claim().results.contains_key("password_min_length"));
+
+        let (code, _, _, _, claim) = check_under(
+            |signed| signed.to_string(),
+            grown_checkpoint,
+            valid_pair,
+            None,
+        )
+        .await;
+        assert_eq!(code.unwrap(), ExitCode::SUCCESS);
+        assert!(
+            serde_json::from_str::<Value>(&claim).unwrap()["manifest_toml"].is_null(),
+            "an unchanged manifest is not sent"
+        );
+    }
+
+    /// A gateway that refuses status for this device must not end `check` with a bare HTTP 403
+    /// when the manifest changed: the owner learns to run accept.
+    #[tokio::test]
+    async fn check_names_accept_instead_of_an_http_error_when_the_manifest_changed() {
+        let company = Company::new();
+        let witness = Witness::new();
+        let toml = witnessed_manifest(&witness);
+        let published = Company::published(&with_password_rule(&toml), &company.key);
+        let log = company.log.vkey();
+        let mut checkpoint = Note::parse(&company.empty_checkpoint()).unwrap();
+        witness.cosign(
+            &mut checkpoint,
+            u64::try_from(chrono::Utc::now().timestamp()).unwrap(),
+        );
+        let checkpoint = checkpoint.to_string();
+        let gateway = FakeGateway::start(move |line, _| match line {
+            "GET /v1/manifest" => (200, published.clone()),
+            "GET /v1/log/key" => (200, log.clone()),
+            "GET /v1/log/checkpoint" => (200, checkpoint.clone()),
+            "POST /v1/nonce" => (200, json!({"nonce":"n"}).to_string()),
+            "POST /v1/log/mine" | "POST /v1/device/status" => {
+                (403, json!({"status":"denied"}).to_string())
+            }
+            _ => not_found(),
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let home = enrolled_home_with(dir.path(), &gateway.url, &company, &toml);
+        assert_eq!(check(&home, true).await.unwrap(), ExitCode::FAILURE);
+        assert_eq!(
+            gateway.posts(),
+            [
+                "POST /v1/nonce",
+                "POST /v1/log/mine",
+                "POST /v1/nonce",
+                "POST /v1/device/status"
+            ]
+        );
+        let enforced = ManifestHash::of(with_password_rule(&toml).as_bytes());
+        let notice = manifest_change_notice(&enforced, "open-pact-client");
+        assert!(notice.contains(enforced.as_str()), "{notice}");
+        assert!(notice.contains("Run `open-pact-client accept`"), "{notice}");
+    }
+
+    fn accept_home(
+        gateway: &str,
+        company: &Company,
+        toml: &str,
+    ) -> (tempfile::TempDir, open_pact_core::SigningKey) {
+        let dir = tempfile::tempdir().unwrap();
+        enrolled_home_with(dir.path(), gateway, company, toml);
+        let owner = dev_key::generate();
+        dev_key::save(&dir.path().join("owner-dev.pem"), &owner).unwrap();
+        (dir, owner)
+    }
+
+    #[tokio::test]
+    async fn accept_signs_the_new_manifest_and_moves_the_enrolment() {
+        let company = Company::new();
+        let old = DEMO_MANIFEST.replace(PASSWORD_RULE, "");
+        assert_ne!(old, DEMO_MANIFEST);
+        let published = Company::published(DEMO_MANIFEST, &company.key);
+        let new = Manifest::parse(DEMO_MANIFEST.as_bytes()).unwrap();
+        let log = company.log.vkey();
+        let reply =
+            json!({"status":"accepted","state":"approved","manifest": new.hash()}).to_string();
+        let gateway = FakeGateway::start(move |line, _| match line {
+            "GET /v1/manifest" => (200, published.clone()),
+            "GET /v1/log/key" => (200, format!("{log}\n")),
+            "POST /v1/nonce" => (200, json!({"nonce":"accept-nonce"}).to_string()),
+            "POST /v1/device/accept" => (200, reply.clone()),
+            _ => not_found(),
+        })
+        .await;
+        let (dir, owner) = accept_home(&gateway.url, &company, &old);
+        let home = Home(dir.path().to_path_buf());
+        let device = DeviceKey::load(&home.0).unwrap();
+
+        assert_eq!(accept(&home, true, false).await.unwrap(), ExitCode::SUCCESS);
+        assert_eq!(
+            gateway.posts(),
+            ["POST /v1/nonce", "POST /v1/device/accept"]
+        );
+        let sent: AcceptRequest =
+            serde_json::from_str(&gateway.bodies("POST /v1/device/accept")[0]).unwrap();
+        sent.verify().unwrap();
+        assert_eq!(sent.previous, ManifestHash::of(old.as_bytes()));
+        assert_eq!(&sent.manifest, new.hash());
+        assert_eq!(sent.nonce, "accept-nonce");
+        assert_eq!(sent.owner.key, PublicKey::from(&owner));
+        assert_eq!(sent.device_key, device.public_key());
+        assert_eq!(
+            std::fs::read_to_string(home.file("manifest.toml")).unwrap(),
+            DEMO_MANIFEST
+        );
+        let enrolment = home.enrolment().unwrap();
+        assert_eq!(&enrolment.manifest, new.hash());
+        assert!(enrolment.log_entries.is_none());
+
+        assert_eq!(accept(&home, true, false).await.unwrap(), ExitCode::SUCCESS);
+        assert_eq!(gateway.posts().len(), 2, "nothing is left to accept");
+    }
+
+    #[tokio::test]
+    async fn a_refused_acceptance_keeps_the_signed_manifest() {
+        let company = Company::new();
+        let old = DEMO_MANIFEST.replace(PASSWORD_RULE, "");
+        let published = Company::published(DEMO_MANIFEST, &company.key);
+        let log = company.log.vkey();
+        let gateway = FakeGateway::start(move |line, _| match line {
+            "GET /v1/manifest" => (200, published.clone()),
+            "GET /v1/log/key" => (200, log.clone()),
+            "POST /v1/nonce" => (200, json!({"nonce":"n"}).to_string()),
+            "POST /v1/device/accept" => (403, json!({"status":"denied"}).to_string()),
+            _ => not_found(),
+        })
+        .await;
+        let (dir, _) = accept_home(&gateway.url, &company, &old);
+        let before = snapshot(dir.path());
+        let home = Home(dir.path().to_path_buf());
+        assert_eq!(accept(&home, true, false).await.unwrap(), ExitCode::FAILURE);
+        assert_eq!(snapshot(dir.path()), before);
+    }
+
+    #[test]
+    fn manifest_changes_list_controls_and_consent_terms() {
+        let old = Manifest::parse(DEMO_MANIFEST.replace(PASSWORD_RULE, "").as_bytes()).unwrap();
+        let new_toml = DEMO_MANIFEST
+            .replace(
+                "required = { macos = { max = 30 }, windows = { max = 30 }, linux = { max = 30 } }\ngrace = \"1d\"",
+                "required = { macos = { max = 14 }, windows = { max = 14 }, linux = { max = 14 } }\ngrace = \"1d\"",
+            )
+            .replace(r#"claim_retention = "12mo""#, r#"claim_retention = "18mo""#)
+            .replace(r#", "virtualized", "log_checkpoint"]"#, r#", "log_checkpoint"]"#)
+            .replace(r#""Company IT security", "#, "")
+            .replace("Company Ltd.,", "Company Group Ltd.,");
+        let start = new_toml.find("[[control]]\nid = \"uptime_days\"").unwrap();
+        let end = start + new_toml[start..].find("\n\n").unwrap() + 2;
+        let new_toml = format!("{}{}", &new_toml[..start], &new_toml[end..]);
+        let new = Manifest::parse(new_toml.as_bytes()).unwrap();
+        assert_eq!(
+            manifest_changes(&old, &new, Os::Linux),
+            [
+                "changed control os_patch_age_days: must be <= 14, grace 1d, reports integer 0..=3650, unknown (was must be <= 30, grace 1d, reports integer 0..=3650, unknown)",
+                "added control password_min_length: must be >= 10, grace 1d, reports integer 0..=2147483647, unknown, none",
+                "removed control uptime_days",
+                "disclosed metadata: manifest_hash, device_pseudonym, device_key, nonce, time, client_version, os, trust_level, vpn_certificate_request, log_checkpoint (was manifest_hash, device_pseudonym, device_key, nonce, time, client_version, os, trust_level, vpn_certificate_request, virtualized, log_checkpoint)",
+                "claim retention: 18mo (was 12mo)",
+                "claim recipients: auditor on request (was Company IT security, auditor on request)",
+                "data controller: Company Group Ltd., dpo@company.example (was Company Ltd., dpo@company.example)",
+            ]
+        );
+        assert!(manifest_changes(&new, &new, Os::Linux).is_empty());
     }
 
     /// A VPN certificate and the CA a claim response carries.

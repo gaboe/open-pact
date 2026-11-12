@@ -47,11 +47,18 @@ Compose uses `DEV_INSECURE_KEK=1`, a local HTTP URL, and a public demo witness s
 
 Write the manifest as TOML. Include the check IDs and output types that the client supports. Declare the required values, grace periods, `claim_retention`, `claim_recipients`, `data_controller`, and `disclosed_metadata`. The gateway signs and publishes the manifest. During `join`, the owner reviews it and signs its hash.
 
-The gateway publishes the enforced manifest and appends its hash to the transparency log. A changed manifest has a new hash. Enrol the device again with a new invitation. Approve the device again. Approval applies to one manifest hash.
+The gateway publishes the enforced manifest and appends its hash to the transparency log. A changed manifest has a new hash. To roll it out, set the new manifest and restart the gateway. Do not send new invitations. Do not approve devices again.
+
+A device enrolled under an earlier manifest keeps its approval and keeps working. Its client sends the manifest that its owner signed beside each claim. The gateway accepts that text only when its hash equals the hash stored for the device, so the operator does not keep earlier manifests in the configuration. The signed manifest decides what the claim may disclose and how long the gateway keeps it: `disclosed_metadata`, `claim_retention`, and `claim_recipients` stay those of the signed manifest. The new manifest decides the verdict. Every required control of the new manifest counts:
+
+- A control that the signed manifest does not collect fails with its own `grace`. The grace starts at the first claim without it. Inside the grace, the claim is accepted with a warning that names the control, the time left, and `open-pact-client accept`. After the grace, the claim is denied and gets no VPN certificate.
+- A control that both manifests collect is judged by the new requirement. A tightened requirement fails with that control's own `grace`, like any other failing control.
+
+The owner runs `open-pact-client accept`. The client shows the new manifest and its changes, and the owner and the device sign a statement that names both hashes and a gateway nonce. The gateway checks the signatures, the device key, and the owner key from enrolment. It then moves the device to the new hash and appends a `manifest_accepted` entry to the log. The device keeps its state: approved, pending, and revoked devices stay so. Its grace clocks move with it. A client older than this release does not send its signed manifest, so its claims are denied until the owner updates the client and runs `accept`.
 
 Give the collector address to the device owner. The owner writes it in `[report]` in local `open-pact.toml`. The collector address does not belong in the public manifest.
 
-The core library can validate whether a manifest change is a narrowing under the old owner signature. The current client and gateway do not apply that capability when they check an enrolled device. Every changed manifest needs a new join, a new owner signature, and operator approval. The owner signs the new manifest hash during the join.
+The core library can validate whether a manifest change is a narrowing under the old owner signature. The current client and gateway do not apply that capability. The owner signs every changed manifest with `accept`, without a new invitation or operator approval.
 
 Review retention before each rollout. PostgreSQL stores encrypted claims until the manifest deadline. A backup can keep a deleted claim readable while it still contains the month key and the KEK. Expire database backups and WAL archives in line with the retention that owners accepted.
 

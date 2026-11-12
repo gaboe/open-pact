@@ -29,7 +29,7 @@ pub async fn mine(
     sqlx::query_as::<_, Row>(
         "SELECT idx, kind, data FROM log_entries WHERE idx < $1 AND \
          ((kind = 'manifest_published' AND data->>'manifest' = $2) OR \
-         (kind IN ('device_enrolled', 'device_approved', 'device_revoked') \
+         (kind IN ('device_enrolled', 'device_approved', 'device_revoked', 'manifest_accepted') \
          AND data->>'commitment' = $3)) ORDER BY idx",
     )
     .bind(i64::try_from(size)?)

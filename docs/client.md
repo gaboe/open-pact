@@ -122,6 +122,16 @@ If private log access is denied, `check` asks for this device's status. A pendin
 
 Run `open-pact-client log head` to show the last verified checkpoint. Run `open-pact-client log prove` to verify the inclusion proof for this device's enrolment. Run `open-pact-client log show` to print claims and gateway responses. Run `open-pact-client log reports` to print report requests and collector responses from the last 90 days. It combines home and SYSTEM history, sorts records by time, and labels each source. On Windows, an elevated prompt includes protected SYSTEM history. Without elevation, the command prints readable home history and says how to include SYSTEM history.
 
+### Accept a changed manifest
+
+When the company changes the manifest, `check` prints a line that names the new hash and asks you to run `accept`. The device keeps its approval and VPN access meanwhile. A control that the new manifest adds counts as failing until you accept. The gateway accepts claims for the length of that control's grace and warns you. After the grace, it denies them.
+
+```sh
+open-pact-client accept
+```
+
+The client fetches the new manifest and checks its company signature and the pinned keys. It shows the manifest and what changed against the one you signed: added, removed, and changed controls, `disclosed_metadata`, `claim_retention`, `claim_recipients`, and `data_controller`. If you confirm, the owner key and the device key sign the new hash. The gateway moves the device to the new manifest without a new invitation or approval. The client then stores the new manifest, and the next `check` runs its checks. Pass `--yes` to sign without the prompt.
+
 Run `open-pact-client manifest show` to review the signed manifest stored on this device. It checks that `manifest.toml` still matches the hash in `enrolment.json`, then prints the manifest summary, signed hash, and file path. It also prints the manifest's transparency log entry index when the client has it. If the index is not stored, use `open-pact-client log prove` to verify the entries available to this device. This command reads local files and does not contact the gateway.
 
 ## Declare the device configuration
@@ -207,7 +217,9 @@ Limited Windows operations leave orphaned protected state and the shared binary 
 
 `join` sends the invitation, signed manifest, owner and device public keys, and signatures that bind the owner, device, invitation, and manifest. It sends no private keys.
 
-`check` sends the signed claim fields that the manifest permits. These include control results and permitted device metadata. The VPN certificate request travels beside the claim. Its private key stays on the device. The client stores claims and responses in `claims.jsonl`.
+`accept` sends the new manifest hash, the owner public key, and signatures by the owner and device keys over both manifest hashes and a gateway nonce.
+
+`check` sends the signed claim fields that the manifest permits. When the gateway enforces another manifest, `check` also sends the manifest text that you signed, so the gateway can apply its terms. These include control results and permitted device metadata. The VPN certificate request travels beside the claim. Its private key stays on the device. The client stores claims and responses in `claims.jsonl`.
 
 `report` sends a signed payload to the HTTPS collector. It contains report metadata and control results. It contains no raw system logs, public key, or folder paths. The client stores each non-dry-run `report` command and scheduled report that receives an HTTP response in `reports.jsonl`.
 
@@ -219,7 +231,7 @@ Each record keeps the exact signed request, response body, and HTTP status. If t
 | --- | --- |
 | Release verification fails | Get `scripts/verify-client-release.sh` from the matching repository tag or its source archive. Check that GitHub CLI and Cosign are installed. Run the script with a release tag. Install the matching binary from the printed directory after the script succeeds. |
 | `join` refuses the gateway | Confirm the invitation URL, company key fingerprint, HTTPS certificate, and pinned log key with the gateway operator. |
-| `check` reports a manifest hash mismatch | Get a new invitation for the current manifest. Run `join` with that invitation. Review the manifest. Sign its hash during `join`. Ask the gateway operator to approve the device again for the current manifest. `join` reuses the existing device key, so the device code stays the same. |
+| `check` reports that the manifest changed | Run `open-pact-client accept`. Review the changes and sign the new manifest. You need no new invitation or approval. |
 | `check` says the device is pending | Give the device code to the gateway operator. Wait for approval. |
 | A check returns `unknown` on Windows | Run the task as an elevated administrator when the control needs machine-wide access. Set `run_as = "system"` in `open-pact.toml`, then run `apply` as an administrator. |
 | Windows event reports do not trigger | Check Event Log Readers access for the limited task user. Check that Defender history can be read. |

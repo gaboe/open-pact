@@ -1,3 +1,4 @@
+mod accept;
 mod claim;
 mod crypto;
 pub mod dev_key;
@@ -11,6 +12,7 @@ mod note;
 mod own_entries;
 mod witness;
 
+pub use accept::{AcceptRequest, accept_statement};
 pub use claim::{
     Claim, LogCheckpoint, VerifiedClaim, Virtualized, sign_claim, sign_claim_with, verify_claim,
 };
@@ -20,7 +22,7 @@ pub use crypto::{
 pub use enrol::{EnrolRequest, enrol_statement};
 pub use evaluate::{
     Decision, Evaluation, FirstFailures, Grace, Reason, control_compliance, evaluate,
-    verified_trust_level,
+    evaluate_under, verified_trust_level,
 };
 pub use invitation::{InvalidInvitation, Invitation, InvitationCode, InvitationHash};
 pub use log::{
