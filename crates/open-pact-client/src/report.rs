@@ -193,7 +193,11 @@ pub(crate) fn prepare(home: &Home) -> Result<(Report, BTreeMap<String, bool>)> {
     let enrolment = home.enrolment()?;
     let manifest = Manifest::parse(&crate::read_home_file(&home.file("manifest.toml"))?)?;
     if manifest.hash() != &enrolment.manifest {
-        bail!("manifest.toml no longer matches the hash you signed");
+        return Err(crate::stored_manifest_mismatch(
+            home,
+            manifest.hash(),
+            &enrolment.manifest,
+        ));
     }
     checks::check_supported(&manifest).map_err(anyhow::Error::msg)?;
     let key = DeviceKey::load(&home.0)?;
