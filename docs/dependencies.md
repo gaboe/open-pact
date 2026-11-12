@@ -26,7 +26,7 @@ Rule for a change: a new direct dependency needs a line in this file. A security
 | `serde`, `serde_json`, `toml` | Local config, reports, local log and the example manifest. |
 | `tokio` | Runtime, `process` (run OS probes), `signal` (Ctrl-C), `time`, `net` (loopback probe), `sync` (oneshot). `sync` is now listed explicitly instead of coming in through `reqwest`. |
 | `reqwest` | HTTPS client for the gateway. `rustls-tls` only, no default features, redirects off. |
-| `clap` | Command line. Features: `derive`, `std`, `help`, `usage`, `error-context`. Colour and "did you mean" suggestions are off. |
+| `clap` | Command line. Features: `derive` plus defaults; colour and "did you mean" suggestions stay on for owners. |
 | `chrono` | Timestamps in reports and local log. Features: `clock` only. |
 | `anyhow` | Error context in the binary. |
 | `uuid` | Random report ids and temporary file names (`v4`). |
@@ -43,7 +43,6 @@ Dev-only (not in the release graph): `p256`, `ed25519-dalek`, `tempfile`.
 
 - `url` from `open-pact-core`: unused in the crate. `reqwest` still pulls `url` in transitively.
 - `rcgen` feature `x509-parser`: no call site used it.
-- `clap` default features `color` and `suggestions`: drops `anstream`, `anstyle*`, `colorchoice`, `is_terminal_polyfill` and `strsim`.
 
 ## Duplicate versions
 
@@ -62,7 +61,7 @@ Command: `cargo tree -p open-pact-client -e normal --target <t> --prefix none | 
 
 | Target | Before | After |
 | --- | --- | --- |
-| x86_64-apple-darwin | 251 | 243 |
-| aarch64-apple-darwin | 250 | 242 |
-| x86_64-unknown-linux-musl | 245 | 237 |
-| x86_64-pc-windows-msvc | 247 | 237 |
+| x86_64-apple-darwin | 251 | 250 |
+| aarch64-apple-darwin | 250 | 249 |
+| x86_64-unknown-linux-musl | 245 | 244 |
+| x86_64-pc-windows-msvc | 247 | 246 |
