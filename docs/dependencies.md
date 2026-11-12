@@ -55,13 +55,15 @@ Dev-only (not in the release graph): `p256`, `ed25519-dalek`, `tempfile`.
 | `getrandom` | 0.2, 0.4 | `ring` on 0.2, `uuid` and the RustCrypto 0.11 line on 0.4. |
 | `syn` | 2, 3 | Proc-macro crates only. Build time, not binary size. |
 
-## Normal dependency count per release target
+## Crates in the release graph per target
 
-Command: `cargo tree -p open-pact-client -e normal --target <t> --prefix none | sort -u | wc -l`
+Command: `cargo tree -p open-pact-client -e normal --target <t> --prefix none | sed 's/ (\*)$//' | sort -u | wc -l`
 
-| Target | Before | After |
-| --- | --- | --- |
-| x86_64-apple-darwin | 251 | 250 |
-| aarch64-apple-darwin | 250 | 249 |
-| x86_64-unknown-linux-musl | 245 | 244 |
-| x86_64-pc-windows-msvc | 247 | 246 |
+| Target | Crates |
+| --- | --- |
+| x86_64-apple-darwin | 193 |
+| aarch64-apple-darwin | 192 |
+| x86_64-unknown-linux-musl | 189 |
+| x86_64-pc-windows-msvc | 190 |
+
+The audit did not change these counts. `url` stays in the graph through `reqwest`, and the client still uses `x509-parser` directly. The audit removes unused declarations and features, not crates from the shipped binary.
