@@ -115,7 +115,9 @@ This project is licensed under the Apache License, Version 2.0. See [LICENSE](LI
 | `GET /v1/manifest` | `{toml, company}`: the enforced manifest and the company's signature over its hash |
 | `POST /v1/enroll {signed_manifest, device_key, invitation_code, owner_signature, device_signature}` | `{status: "enrolled", device, state, salt, log_index, manifest_log_index, log_checkpoint}`. See [Enrolment](#enrolment). `state` is `pending` until IT approves. |
 | `POST /v1/nonce` | `{nonce}`, single use, valid 5 minutes; 429 after `NONCE_MAX_PER_WINDOW` (default 600) nonces in `NONCE_WINDOW_SECS` (default 60) from one address, IPv6 per /64; 503 while `NONCE_MAX_OUTSTANDING` (default 10000) unexpired nonces exist. Expired nonces are deleted every minute |
-| `POST /v1/claim {jws}` | `{status: "accepted", warnings, certificate_pem, ca_pem, log_checkpoint}`, or 403 `{status: "denied", reasons}` |
+| `POST /v1/claim {jws, csr_pem?, manifest_toml?}` | `{status: "accepted", warnings, certificate_pem, ca_pem, log_checkpoint}`, or 403 `{status: "denied", reasons}`. `manifest_toml` is the manifest the device signed, sent while the gateway enforces another; the gateway accepts it only when its hash is the one the device signed |
+| `POST /v1/device/status {pseudonym, nonce, device_key, signature}` | `{state}` of this device's enrolment in use, signed with the device key; 403 for any other device |
+| `POST /v1/device/accept {pseudonym, device_key, nonce, previous, manifest, owner, owner_signature, device_signature}` | `{status: "accepted", state, manifest}`. Moves the device to the enforced manifest and keeps its state. The owner and device sign the statement. A repeat answers the same |
 | `POST /v1/log/mine {pseudonym, nonce, signature}` | Approved device only; `{checkpoint, manifest, device}`, each entry with an inclusion proof |
 | `GET /v1/log/key` | the log verifier key, `<origin>+<key id>+<base64 key>` |
 | `GET /v1/log/checkpoint` | the signed checkpoint note, with stored witness cosignatures |
