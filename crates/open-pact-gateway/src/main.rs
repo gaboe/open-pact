@@ -1867,9 +1867,21 @@ grace = "1d"
         let (app, db) = test_app_with(DEMO, 10, 100).await;
         let owned = device_on(&db, &a).await;
 
-        let claim = claim_under(&app, &owned.device, &a).await;
-        let (status, body) = send_claim(&app, &owned.device, &claim, Some(&a)).await;
+        let mut claim = claim_under(&app, &owned.device, &a).await;
+        let (pem, der) = bare_csr();
+        claim.csr_sha256 = Some(CsrHash::of(&der));
+        let jws = open_pact_core::sign_claim(&claim, &owned.device).unwrap();
+        let (status, body) = post_json(
+            &app,
+            "/v1/claim",
+            &json!({"jws": jws, "csr_pem": pem, "manifest_toml": a}),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            body["certificate_pem"].is_string(),
+            "a VPN certificate inside the grace"
+        );
         let warnings = body["warnings"].to_string();
         for part in [
             "password_min_length",
@@ -1895,8 +1907,16 @@ grace = "1d"
             .execute(&db)
             .await
             .unwrap();
-        let claim = claim_under(&app, &owned.device, &a).await;
-        let (status, body) = send_claim(&app, &owned.device, &claim, Some(&a)).await;
+        let mut claim = claim_under(&app, &owned.device, &a).await;
+        let (pem, der) = bare_csr();
+        claim.csr_sha256 = Some(CsrHash::of(&der));
+        let jws = open_pact_core::sign_claim(&claim, &owned.device).unwrap();
+        let (status, body) = post_json(
+            &app,
+            "/v1/claim",
+            &json!({"jws": jws, "csr_pem": pem, "manifest_toml": a}),
+        )
+        .await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
         assert!(
             body["reasons"].to_string().contains(
@@ -1904,7 +1924,10 @@ grace = "1d"
             ),
             "{body}"
         );
-        assert!(body.get("certificate_pem").is_none());
+        assert!(
+            body.get("certificate_pem").is_none(),
+            "no VPN certificate after the grace"
+        );
 
         let (status, body) = post_accept(&app, &accept_request(&app, &owned, &a).await).await;
         assert_eq!(status, StatusCode::OK, "{body}");
