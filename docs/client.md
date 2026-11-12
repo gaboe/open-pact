@@ -124,13 +124,13 @@ Run `open-pact-client log head` to show the last verified checkpoint. Run `open-
 
 ### Accept a changed manifest
 
-When the company changes the manifest, `check` prints a line that names the new hash and asks you to run `accept`. The device keeps its approval and VPN access meanwhile. A control that the new manifest adds counts as failing until you accept. The gateway accepts claims for the length of that control's grace and warns you. After the grace, it denies them.
+When the company changes the manifest, `check` prints a line that names the new hash and asks you to run `accept`. The device keeps its approval and VPN access meanwhile. Controls that the new manifest adds or tightens fail now. The gateway accepts claims for the length of each control's grace and warns you. When the grace runs out, access ends.
 
 ```sh
 open-pact-client accept
 ```
 
-The client fetches the new manifest and checks its company signature and the pinned keys. It shows the manifest and what changed against the one you signed: added, removed, and changed controls, `disclosed_metadata`, `claim_retention`, `claim_recipients`, and `data_controller`. If you confirm, the owner key and the device key sign the new hash. The gateway moves the device to the new manifest without a new invitation or approval. The client then stores the new manifest, and the next `check` runs its checks. Pass `--yes` to sign without the prompt.
+The client fetches the new manifest and checks its company signature, the pinned keys and the log checkpoint under the new manifest's log policy. It shows the manifest and what changed against the one you signed: added, removed, and changed controls, `disclosed_metadata`, `claim_retention`, `claim_recipients`, `data_controller`, the minimum trust level, `unknown_grace`, `claim_max_age`, the issuer, the validity date and the log policy. A changed control shows its requirement for each operating system that differs. If you confirm, the owner key and the device key sign the new hash. The gateway moves the device to the new manifest without a new invitation or approval. The client then stores the new manifest, and the next `check` runs its checks. Pass `--yes` to sign without the prompt.
 
 Run `open-pact-client manifest show` to review the signed manifest stored on this device. It checks that `manifest.toml` still matches the hash in `enrolment.json`, then prints the manifest summary, signed hash, and file path. It also prints the manifest's transparency log entry index when the client has it. If the index is not stored, use `open-pact-client log prove` to verify the entries available to this device. This command reads local files and does not contact the gateway.
 
