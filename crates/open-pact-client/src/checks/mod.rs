@@ -1,13 +1,20 @@
 mod browsers;
 mod buckets;
+mod common;
 mod exec;
 mod hints;
+#[cfg(any(target_os = "linux", test))]
 mod linux;
+#[cfg(any(target_os = "linux", test))]
 mod linux_luks;
+#[cfg(any(target_os = "linux", test))]
 mod linux_v3;
+#[cfg(any(target_os = "macos", test))]
 mod macos;
+#[cfg(any(target_os = "macos", test))]
 mod macos_v3;
 pub(crate) mod repos;
+#[cfg(any(target_os = "windows", test))]
 mod windows;
 
 use std::collections::BTreeMap;
@@ -26,7 +33,7 @@ pub(crate) struct EventMarkers {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "windows", target_os = "linux")), allow(dead_code))]
 pub(crate) enum EventMarkerRead {
     #[default]
     Unknown,
@@ -154,6 +161,7 @@ macro_rules! ignore_input {
     };
 }
 
+#[cfg(any(target_os = "macos", test))]
 const MACOS: Registry = &[
     ("os_auto_updates", ignore_input!(macos_v3::os_auto_updates)),
     (
@@ -162,7 +170,7 @@ const MACOS: Registry = &[
     ),
     (
         "antimalware_active_threats",
-        ignore_input!(macos_v3::not_applicable),
+        ignore_input!(common::not_applicable),
     ),
     ("work_account", ignore_input!(macos_v3::work_account)),
     ("uptime_days", ignore_input!(macos_v3::uptime_days)),
@@ -177,9 +185,9 @@ const MACOS: Registry = &[
         ignore_input!(|| macos::os_supported().into()),
     ),
     ("os_patch_age_days", ignore_input!(macos::os_patch_age_days)),
-    ("password_set", ignore_input!(macos_v3::unknown)),
+    ("password_set", ignore_input!(common::unknown)),
     ("auto_login", ignore_input!(|| macos::auto_login().into())),
-    ("secure_boot", ignore_input!(macos_v3::unknown)),
+    ("secure_boot", ignore_input!(common::unknown)),
     (
         "antimalware_active",
         ignore_input!(|| macos::antimalware_active().into()),
@@ -191,20 +199,17 @@ const MACOS: Registry = &[
     ),
     (
         "antimalware_full_scan_age_days",
-        ignore_input!(macos_v3::not_applicable),
+        ignore_input!(common::not_applicable),
     ),
     ("web_protection", ignore_input!(macos_v3::web_protection)),
     (
         "log_oldest_record_days",
-        ignore_input!(macos_v3::not_applicable),
+        ignore_input!(common::not_applicable),
     ),
-    ("process_audit", ignore_input!(macos_v3::not_applicable)),
+    ("process_audit", ignore_input!(common::not_applicable)),
     ("remote_wipe", ignore_input!(macos_v3::remote_wipe)),
-    (
-        "powershell_logging",
-        ignore_input!(macos_v3::not_applicable),
-    ),
-    ("log_cleared", ignore_input!(macos_v3::not_applicable)),
+    ("powershell_logging", ignore_input!(common::not_applicable)),
+    ("log_cleared", ignore_input!(common::not_applicable)),
     ("managed_repos_outside", |input| {
         managed_repo_value(input, true)
     }),
@@ -217,16 +222,14 @@ const MACOS: Registry = &[
     ),
 ];
 
+#[cfg(any(target_os = "linux", test))]
 const LINUX: Registry = &[
     ("os_auto_updates", ignore_input!(linux_v3::os_auto_updates)),
     (
         "antimalware_realtime",
         ignore_input!(linux_v3::antimalware_realtime),
     ),
-    (
-        "antimalware_active_threats",
-        ignore_input!(macos_v3::unknown),
-    ),
+    ("antimalware_active_threats", ignore_input!(common::unknown)),
     ("work_account", ignore_input!(linux_v3::work_account)),
     ("uptime_days", ignore_input!(linux_v3::uptime_days)),
     (
@@ -240,7 +243,7 @@ const LINUX: Registry = &[
         ignore_input!(|| linux::os_supported().into()),
     ),
     ("os_patch_age_days", ignore_input!(linux::os_patch_age_days)),
-    ("password_set", ignore_input!(macos_v3::unknown)),
+    ("password_set", ignore_input!(common::unknown)),
     ("auto_login", ignore_input!(|| linux::auto_login().into())),
     ("secure_boot", ignore_input!(|| linux::secure_boot().into())),
     (
@@ -254,20 +257,17 @@ const LINUX: Registry = &[
     ),
     (
         "antimalware_full_scan_age_days",
-        ignore_input!(macos_v3::unknown),
+        ignore_input!(common::unknown),
     ),
     ("web_protection", ignore_input!(|| browsers::linux().into())),
     (
         "log_oldest_record_days",
         ignore_input!(linux_v3::log_oldest_record_days),
     ),
-    ("process_audit", ignore_input!(macos_v3::not_applicable)),
-    ("remote_wipe", ignore_input!(macos_v3::not_applicable)),
-    (
-        "powershell_logging",
-        ignore_input!(macos_v3::not_applicable),
-    ),
-    ("log_cleared", ignore_input!(macos_v3::not_applicable)),
+    ("process_audit", ignore_input!(common::not_applicable)),
+    ("remote_wipe", ignore_input!(common::not_applicable)),
+    ("powershell_logging", ignore_input!(common::not_applicable)),
+    ("log_cleared", ignore_input!(common::not_applicable)),
     ("managed_repos_outside", |input| {
         managed_repo_value(input, true)
     }),
@@ -280,6 +280,7 @@ const LINUX: Registry = &[
     ),
 ];
 
+#[cfg(any(target_os = "windows", test))]
 const WINDOWS: Registry = &[
     ("os_auto_updates", ignore_input!(windows::os_auto_updates)),
     (
@@ -300,7 +301,7 @@ const WINDOWS: Registry = &[
         "os_patch_age_days",
         ignore_input!(windows::os_patch_age_days),
     ),
-    ("password_set", ignore_input!(macos_v3::unknown)),
+    ("password_set", ignore_input!(common::unknown)),
     ("auto_login", ignore_input!(windows::auto_login)),
     ("secure_boot", ignore_input!(windows::secure_boot)),
     (
@@ -322,7 +323,7 @@ const WINDOWS: Registry = &[
         ignore_input!(windows::log_oldest_record_days),
     ),
     ("process_audit", ignore_input!(windows::process_audit)),
-    ("remote_wipe", ignore_input!(macos_v3::not_applicable)),
+    ("remote_wipe", ignore_input!(common::not_applicable)),
     (
         "powershell_logging",
         ignore_input!(windows::powershell_logging),
@@ -342,6 +343,7 @@ const WINDOWS: Registry = &[
 
 fn registry(os: Os) -> OsRegistry {
     match os {
+        #[cfg(any(target_os = "macos", test))]
         Os::Macos => OsRegistry {
             checks: MACOS,
             not_applicable: &[
@@ -353,6 +355,7 @@ fn registry(os: Os) -> OsRegistry {
                 "log_cleared",
             ],
         },
+        #[cfg(any(target_os = "linux", test))]
         Os::Linux => OsRegistry {
             checks: LINUX,
             not_applicable: &[
@@ -362,9 +365,16 @@ fn registry(os: Os) -> OsRegistry {
                 "log_cleared",
             ],
         },
+        #[cfg(any(target_os = "windows", test))]
         Os::Windows => OsRegistry {
             checks: WINDOWS,
             not_applicable: &["remote_wipe"],
+        },
+        // A release binary carries only its own OS checks; a foreign OS has none.
+        #[cfg(not(test))]
+        _ => OsRegistry {
+            checks: &[],
+            not_applicable: &[],
         },
     }
 }
@@ -377,7 +387,7 @@ fn legacy_registry(os: Os) -> LegacyRegistry {
     const MACOS: LegacyRegistry = &[
         ("os_auto_updates", macos_v3::os_auto_updates),
         ("antimalware_realtime", macos_v3::antimalware_realtime),
-        ("antimalware_active_threats", macos_v3::not_applicable),
+        ("antimalware_active_threats", common::not_applicable),
         ("work_account", macos_v3::work_account),
         ("uptime_days", macos_v3::uptime_days),
         ("disk_encryption", || macos::disk_encryption().into()),
@@ -385,28 +395,28 @@ fn legacy_registry(os: Os) -> LegacyRegistry {
         ("screen_lock", || macos::screen_lock().into()),
         ("os_supported", || macos::os_supported().into()),
         ("os_patch_age_days", macos::os_patch_age_days),
-        ("password_set", macos_v3::unknown),
+        ("password_set", common::unknown),
         ("auto_login", || macos::auto_login().into()),
-        ("secure_boot", macos_v3::unknown),
+        ("secure_boot", common::unknown),
         ("antimalware_active", || macos::antimalware_active().into()),
         ("preboot_auth", macos_v3::preboot_auth),
         (
             "antimalware_signature_age_days",
             macos_v3::antimalware_signature_age_days,
         ),
-        ("antimalware_full_scan_age_days", macos_v3::not_applicable),
+        ("antimalware_full_scan_age_days", common::not_applicable),
         ("web_protection", macos_v3::web_protection),
-        ("log_oldest_record_days", macos_v3::not_applicable),
-        ("process_audit", macos_v3::not_applicable),
+        ("log_oldest_record_days", common::not_applicable),
+        ("process_audit", common::not_applicable),
         ("remote_wipe", macos_v3::remote_wipe),
-        ("powershell_logging", macos_v3::not_applicable),
-        ("log_cleared", macos_v3::not_applicable),
+        ("powershell_logging", common::not_applicable),
+        ("log_cleared", common::not_applicable),
         ("password_min_length", macos_v3::password_min_length),
     ];
     const LINUX: LegacyRegistry = &[
         ("os_auto_updates", linux_v3::os_auto_updates),
         ("antimalware_realtime", linux_v3::antimalware_realtime),
-        ("antimalware_active_threats", macos_v3::unknown),
+        ("antimalware_active_threats", common::unknown),
         ("work_account", linux_v3::work_account),
         ("uptime_days", linux_v3::uptime_days),
         ("disk_encryption", || linux::disk_encryption().into()),
@@ -414,7 +424,7 @@ fn legacy_registry(os: Os) -> LegacyRegistry {
         ("screen_lock", || linux::screen_lock().into()),
         ("os_supported", || linux::os_supported().into()),
         ("os_patch_age_days", linux::os_patch_age_days),
-        ("password_set", macos_v3::unknown),
+        ("password_set", common::unknown),
         ("auto_login", || linux::auto_login().into()),
         ("secure_boot", || linux::secure_boot().into()),
         ("antimalware_active", || linux::antimalware_active().into()),
@@ -423,13 +433,13 @@ fn legacy_registry(os: Os) -> LegacyRegistry {
             "antimalware_signature_age_days",
             linux_v3::antimalware_signature_age_days,
         ),
-        ("antimalware_full_scan_age_days", macos_v3::unknown),
+        ("antimalware_full_scan_age_days", common::unknown),
         ("web_protection", || browsers::linux().into()),
         ("log_oldest_record_days", linux_v3::log_oldest_record_days),
-        ("process_audit", macos_v3::not_applicable),
-        ("remote_wipe", macos_v3::not_applicable),
-        ("powershell_logging", macos_v3::not_applicable),
-        ("log_cleared", macos_v3::not_applicable),
+        ("process_audit", common::not_applicable),
+        ("remote_wipe", common::not_applicable),
+        ("powershell_logging", common::not_applicable),
+        ("log_cleared", common::not_applicable),
         ("password_min_length", linux_v3::password_min_length),
     ];
     const WINDOWS: LegacyRegistry = &[
@@ -446,7 +456,7 @@ fn legacy_registry(os: Os) -> LegacyRegistry {
         ("screen_lock", windows::screen_lock),
         ("os_supported", windows::os_supported),
         ("os_patch_age_days", windows::os_patch_age_days),
-        ("password_set", macos_v3::unknown),
+        ("password_set", common::unknown),
         ("auto_login", windows::auto_login),
         ("secure_boot", windows::secure_boot),
         ("antimalware_active", windows::antimalware_active),
@@ -462,7 +472,7 @@ fn legacy_registry(os: Os) -> LegacyRegistry {
         ("web_protection", windows::web_protection),
         ("log_oldest_record_days", windows::log_oldest_record_days),
         ("process_audit", windows::process_audit),
-        ("remote_wipe", macos_v3::not_applicable),
+        ("remote_wipe", common::not_applicable),
         ("powershell_logging", windows::powershell_logging),
         ("log_cleared", windows::log_cleared),
         ("password_min_length", windows::password_min_length),

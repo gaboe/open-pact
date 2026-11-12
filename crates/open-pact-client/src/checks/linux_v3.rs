@@ -5,8 +5,8 @@ use chrono::{DateTime, Utc};
 use open_pact_core::ControlValue;
 use serde_json::Value;
 
+use super::common::bounded_age;
 use super::exec::run_status;
-use super::macos_v3::bounded_age;
 
 pub fn os_auto_updates() -> ControlValue {
     let units = [
@@ -217,7 +217,7 @@ pub fn work_account() -> ControlValue {
     };
     run_status("id", &["-G"]).filter(|r| r.success).map_or_else(
         || "unknown".into(),
-        |r| super::macos_v3::parse_groups(&r.text, &admins),
+        |r| super::common::parse_groups(&r.text, &admins),
     )
 }
 fn parse_admin_gids(text: &str) -> Option<Vec<u32>> {
@@ -379,7 +379,6 @@ fn parse_journal_age(text: &str, now: DateTime<Utc>) -> ControlValue {
     bounded_age((now - oldest).num_days(), i32::MAX)
 }
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(super) fn event_markers() -> super::EventMarkerReads {
     let detection = super::exec::capture(
         "journalctl",
@@ -407,7 +406,6 @@ pub(super) fn event_markers() -> super::EventMarkerReads {
     }
 }
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn parse_detection_status(
     code: Option<i32>,
     text: &str,
@@ -420,7 +418,6 @@ fn parse_detection_status(
     }
 }
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn parse_detection_journal(text: &str, now: DateTime<Utc>) -> super::EventMarkerRead {
     use super::EventMarkerRead::{Read, Unknown};
     if text.trim().is_empty() {
@@ -565,11 +562,11 @@ mod v31_tests {
         let admins = parse_admin_gids("sudo:x:27:\nwheel:x:10:\nroot:x:0:\n").unwrap();
         // These IDs belong to nogroup and the unrelated group named project sudo.
         assert_eq!(
-            super::super::macos_v3::parse_groups("65534 12345", &admins),
+            super::super::common::parse_groups("65534 12345", &admins),
             "standard"
         );
         assert_eq!(
-            super::super::macos_v3::parse_groups("1000 27 12345", &admins),
+            super::super::common::parse_groups("1000 27 12345", &admins),
             "admin"
         );
         assert!(parse_admin_gids("project sudo:x:12345:").is_none());
@@ -592,7 +589,7 @@ mod v31_tests {
             ("", "unknown"),
         ] {
             assert_eq!(
-                super::super::macos_v3::parse_groups(groups, &[27, 10]),
+                super::super::common::parse_groups(groups, &[27, 10]),
                 expected
             );
         }

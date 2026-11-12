@@ -4,21 +4,25 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 pub const TIMEOUT: Duration = Duration::from_secs(3);
 
 type Captured = Arc<Mutex<Vec<u8>>>;
 
 /// Output of a command that exited before the timeout, with stdout and stderr together.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 pub struct Ran {
     pub success: bool,
     pub text: String,
 }
 
 /// The output of `program`, whatever its exit status. `None` when it cannot start or times out.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 pub fn run(program: &str, args: &[&str]) -> Option<String> {
     run_status(program, args).map(|ran| ran.text)
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 pub fn run_status(program: &str, args: &[&str]) -> Option<Ran> {
     run_status_with_timeout(program, args, TIMEOUT)
 }
@@ -28,6 +32,7 @@ pub fn run_with_timeout(program: &str, args: &[&str], timeout: Duration) -> Opti
     run_status_with_timeout(program, args, timeout).map(|ran| ran.text)
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 fn run_status_with_timeout(program: &str, args: &[&str], timeout: Duration) -> Option<Ran> {
     let output = capture(program, args, timeout).ok()?;
     if output.timed_out {
@@ -43,6 +48,7 @@ fn run_status_with_timeout(program: &str, args: &[&str], timeout: Duration) -> O
 pub struct CapturedOutput {
     pub status: Option<ExitStatus>,
     pub timed_out: bool,
+    #[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
     pub elapsed: Duration,
     pub stdout: String,
     pub stderr: String,

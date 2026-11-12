@@ -1,8 +1,10 @@
-use chrono::{DateTime, NaiveDate, Utc};
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+use chrono::NaiveDate;
 
+#[cfg(any(target_os = "linux", test))]
 pub fn elapsed_age_days(
-    last: DateTime<Utc>,
-    now: DateTime<Utc>,
+    last: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
     max: i32,
 ) -> open_pact_core::ControlValue {
     let days = (now - last).num_days();
@@ -13,6 +15,7 @@ pub fn elapsed_age_days(
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 pub fn patch_age(last: NaiveDate, today: NaiveDate) -> open_pact_core::ControlValue {
     match (today - last).num_days() {
         days @ 0..=3650 => open_pact_core::ControlValue::Integer(days as i32),
