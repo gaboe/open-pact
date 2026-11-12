@@ -1,6 +1,6 @@
 use anyhow::{Context, bail};
 use open_pact_core::{EntryKind, Pseudonym};
-use serde_json::json;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{PgConnection, PgPool};
 
@@ -94,36 +94,55 @@ pub async fn lock(
     state.as_deref().map(State::parse).transpose()
 }
 
-/// An enrolment of one device: the manifest its owner signed, its state and its salt.
+/// An enrolment of one device: the manifest its owner signed, its state, its salt and its owner.
 pub struct Enrolment {
     pub manifest: String,
     pub state: State,
     pub salt: String,
+    pub owner_key: Value,
 }
 
 /// The enrolment `device` uses: the one under `current` if it has one, else its newest. A device
 /// enrolled under an earlier manifest keeps that enrolment until its owner accepts `current`.
+const BOUND: &str = "SELECT manifest_hash, state, salt, owner_key FROM devices WHERE pseudonym = $1 \
+     ORDER BY manifest_hash = $2 DESC, enrolled_at DESC LIMIT 1";
+
+fn enrolment(row: (String, String, String, Value)) -> anyhow::Result<Enrolment> {
+    let (manifest, state, salt, owner_key) = row;
+    Ok(Enrolment {
+        manifest,
+        state: State::parse(&state)?,
+        salt,
+        owner_key,
+    })
+}
+
 pub async fn bound(
     conn: &mut PgConnection,
     device: &Pseudonym,
     current: &str,
 ) -> anyhow::Result<Option<Enrolment>> {
-    let row: Option<(String, String, String)> = sqlx::query_as(
-        "SELECT manifest_hash, state, salt FROM devices WHERE pseudonym = $1 \
-         ORDER BY manifest_hash = $2 DESC, enrolled_at DESC LIMIT 1",
-    )
-    .bind(device.as_str())
-    .bind(current)
-    .fetch_optional(conn)
-    .await?;
-    row.map(|(manifest, state, salt)| {
-        Ok(Enrolment {
-            manifest,
-            state: State::parse(&state)?,
-            salt,
-        })
-    })
-    .transpose()
+    let row = sqlx::query_as(BOUND)
+        .bind(device.as_str())
+        .bind(current)
+        .fetch_optional(conn)
+        .await?;
+    row.map(enrolment).transpose()
+}
+
+/// `bound`, with its row locked until the transaction ends. A claim or an acceptance decides on
+/// the enrolment it locked, so two requests for one device cannot both pass.
+pub async fn lock_bound(
+    conn: &mut PgConnection,
+    device: &Pseudonym,
+    current: &str,
+) -> anyhow::Result<Option<Enrolment>> {
+    let row = sqlx::query_as(&format!("{BOUND} FOR UPDATE"))
+        .bind(device.as_str())
+        .bind(current)
+        .fetch_optional(conn)
+        .await?;
+    row.map(enrolment).transpose()
 }
 
 pub async fn revoked_anywhere(conn: &mut PgConnection, device: &Pseudonym) -> anyhow::Result<bool> {
