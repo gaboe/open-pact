@@ -904,11 +904,23 @@ fn collect_results(
     )
 }
 
+/// Manifest validation allows remotes only on repository controls and requires them there.
+fn scans_repositories(manifest: &Manifest) -> bool {
+    manifest
+        .body()
+        .controls
+        .iter()
+        .any(|control| !control.remotes.is_empty())
+}
+
 async fn scan_repositories(
     home: &Home,
     manifest: &Manifest,
     config: Option<&device_config::DeviceConfig>,
-) -> Result<checks::repos::RepoScan> {
+) -> Result<Option<checks::repos::RepoScan>> {
+    if !scans_repositories(manifest) {
+        return Ok(None);
+    }
     let root = repository_scan_root(home)?;
     let folders = config
         .and_then(|config| config.managed_repos.as_ref())
@@ -926,7 +938,7 @@ async fn scan_repositories(
             .await
             .context("repository scan task stopped")??;
     checks::repos::store(&state, &scan)?;
-    Ok(scan)
+    Ok(Some(scan))
 }
 
 fn repository_scan_root(_home: &Home) -> Result<PathBuf> {
@@ -2522,22 +2534,31 @@ fn approval_confirmation() -> &'static str {
     "This device is approved."
 }
 
-fn step_four_intro(progress: Option<ApprovalProgress>, device_code: &str) -> String {
+fn step_four_intro(
+    progress: Option<ApprovalProgress>,
+    device_code: &str,
+    scans_repositories: bool,
+) -> String {
     match progress {
         Some(ApprovalProgress::Approved) => "  This device is already approved.\n".to_string(),
         Some(ApprovalProgress::ProofPending) => String::new(),
-        _ => format!(
+        _ if scans_repositories => format!(
             "  {device_code}\n\n  Read this code to IT. IT approves the device with it.\n  The client now looks for managed repositories in your home folder to prepare the `managed_repos` setup proposal for open-pact.toml.\n"
         ),
+        _ => {
+            format!("  {device_code}\n\n  Read this code to IT. IT approves the device with it.\n")
+        }
     }
 }
 
 fn approval_scan_output(
-    scan: &checks::repos::RepoScan,
+    scan: Option<&checks::repos::RepoScan>,
     user_home: &Path,
     wait_message: Option<&str>,
 ) -> String {
-    let mut output = device_config::managed_repo_summary(scan, user_home);
+    let mut output = scan.map_or_else(String::new, |scan| {
+        device_config::managed_repo_summary(scan, user_home)
+    });
     if let Some(message) = wait_message {
         output.push_str(&format!("  {message}\n"));
     }
@@ -2575,22 +2596,20 @@ async fn wait_after_join(
     if options.no_wait {
         wizard_step(4, "Wait for IT approval");
         let code = ui::device_code_line(&device_code(&enrolment.device), ui::styled());
-        print!("{}", step_four_intro(None, &code));
-        if current_os()? == Os::Macos
-            && manifest
-                .body()
-                .controls
-                .iter()
-                .any(|control| !control.remotes.is_empty())
-        {
+        print!(
+            "{}",
+            step_four_intro(None, &code, scans_repositories(manifest))
+        );
+        if current_os()? == Os::Macos && scans_repositories(manifest) {
             println!("  If macOS asks for access to a folder, you can deny it.");
         }
         let config = device_config::DeviceConfig::load(home)?;
-        let scan = scan_repositories(home, manifest, config.as_ref()).await?;
-        print!(
-            "{}",
-            device_config::managed_repo_summary(&scan, &repository_scan_root(home)?)
-        );
+        if let Some(scan) = scan_repositories(home, manifest, config.as_ref()).await? {
+            print!(
+                "{}",
+                device_config::managed_repo_summary(&scan, &repository_scan_root(home)?)
+            );
+        }
         println!("\nNext, after IT approves:");
         println!("  1. {command} config example");
         println!(
@@ -2652,15 +2671,9 @@ async fn wait_after_join(
             };
             print!(
                 "{}",
-                step_four_intro(initial_progress, intro_code)
+                step_four_intro(initial_progress, intro_code, scans_repositories(manifest))
             );
-            if current_os()? == Os::Macos
-                && manifest
-                    .body()
-                    .controls
-                    .iter()
-                    .any(|control| !control.remotes.is_empty())
-            {
+            if current_os()? == Os::Macos && scans_repositories(manifest) {
                 println!("  If macOS asks for access to a folder, you can deny it.");
             }
             let wait_message = if wizard {
@@ -2695,7 +2708,7 @@ async fn wait_after_join(
             let approval = if let Some(scan) = completed_scan {
                 print!(
                     "{}",
-                    approval_scan_output(&scan, &repository_scan_root(home)?, wait_message)
+                    approval_scan_output(scan.as_ref(), &repository_scan_root(home)?, wait_message)
                 );
                 approval.await?
             } else {
@@ -2704,7 +2717,7 @@ async fn wait_after_join(
                         let scan = result?;
                         print!(
                             "{}",
-                            approval_scan_output(&scan, &repository_scan_root(home)?, wait_message)
+                            approval_scan_output(scan.as_ref(), &repository_scan_root(home)?, wait_message)
                         );
                         approval.await?
                     }
@@ -2714,7 +2727,7 @@ async fn wait_after_join(
                             let scan = scan.await?;
                             print!(
                                 "{}",
-                                approval_scan_output(&scan, &repository_scan_root(home)?, wait_message)
+                                approval_scan_output(scan.as_ref(), &repository_scan_root(home)?, wait_message)
                             );
                         }
                         result
@@ -3261,7 +3274,7 @@ async fn check_impl(home: &Home, insecure_dev: bool, show_resume_hint: bool) -> 
     checks::check_supported(&manifest)
         .map_err(|e| anyhow::anyhow!("{e}; nothing was run or sent"))?;
     let scan = if can_scan_repositories {
-        Some(scan_repositories(home, &manifest, device_config.as_ref()).await?)
+        scan_repositories(home, &manifest, device_config.as_ref()).await?
     } else {
         None
     };
@@ -4572,7 +4585,7 @@ mod tests {
             causes: Vec::new(),
         };
         let output = approval_scan_output(
-            &scan,
+            Some(&scan),
             home,
             Some("The client is still waiting for IT approval. Keep this window open."),
         );
@@ -4584,19 +4597,59 @@ mod tests {
             found < locations && locations < partial && partial < waiting,
             "{output}"
         );
-        assert!(!approval_scan_output(&scan, home, None).contains("still waiting"));
+        assert!(!approval_scan_output(Some(&scan), home, None).contains("still waiting"));
     }
 
     #[test]
     fn step_four_intro_distinguishes_approved_resume_from_pending_approval() {
-        let approved = step_four_intro(Some(ApprovalProgress::Approved), "CODE");
+        let approved = step_four_intro(Some(ApprovalProgress::Approved), "CODE", true);
         assert!(approved.contains("This device is already approved."));
         assert!(!approved.contains("Read this code to IT"));
         assert!(!approved.contains("Keep this window open"));
 
-        let pending = step_four_intro(Some(ApprovalProgress::Pending), "CODE");
+        let pending = step_four_intro(Some(ApprovalProgress::Pending), "CODE", true);
         assert!(pending.contains("CODE"));
         assert!(pending.contains("Read this code to IT. IT approves the device with it."));
+    }
+
+    #[tokio::test]
+    async fn manifest_without_repository_controls_skips_the_repository_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+        let repo = dir.path().join("work/app");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::write(
+            repo.join(".git/config"),
+            "[remote \"origin\"]\n url = git@github.com:example-org/app.git\n",
+        )
+        .unwrap();
+        let with_controls = include_str!("../../../examples/manifest.toml").replace("\r\n", "\n");
+        let without_controls = ["managed_repos_outside", "managed_repos_total"]
+            .iter()
+            .fold(with_controls.clone(), |toml, id| {
+                let start = toml.find(&format!("[[control]]\nid = \"{id}\"\n")).unwrap();
+                let end = start + toml[start..].find("\n\n").unwrap() + 2;
+                format!("{}{}", &toml[..start], &toml[end..])
+            });
+        let without_controls = Manifest::parse(without_controls.as_bytes()).unwrap();
+        assert!(!scans_repositories(&without_controls));
+        assert!(!step_four_intro(None, "CODE", false).contains("looks for managed repositories"));
+
+        assert!(
+            scan_repositories(&home, &without_controls, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(!home.file("repo-scan.json").exists());
+
+        let with_controls = Manifest::parse(with_controls.as_bytes()).unwrap();
+        let scan = scan_repositories(&home, &with_controls, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(scan.managed_repos_total, 1);
+        assert!(home.file("repo-scan.json").is_file());
     }
 
     #[test]
@@ -6311,7 +6364,11 @@ mod tests {
 
         let company = Company::new();
         let witness = Witness::new();
-        let toml = witnessed_manifest(&witness);
+        let toml = witnessed_manifest(&witness).replacen(
+            "[log]",
+            "[[control]]\nid = \"managed_repos_total\"\nsource = \"company_policy\"\ncheck = \"builtin:managed_repos_total@1\"\nremotes = [\"github.com/example-org/\"]\noutput = { integer = { min = 0, max = 2147483647 } }\nrequired = {}\ngrace = \"1d\"\n\n[log]",
+            1,
+        );
         let dir = tempfile::tempdir().unwrap();
         let home = enrolled_home_with(dir.path(), "", &company, &toml);
         let (manifest, mut enrolment, entries, _, approved_checkpoint) =
