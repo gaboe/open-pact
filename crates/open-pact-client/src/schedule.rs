@@ -1108,7 +1108,6 @@ async fn run_report(
     let due = checks::repos::load_attempt(&home.0)?
         .is_none_or(|scan| now.saturating_sub(scan.scanned_at) >= 24 * 60 * 60);
     if due {
-        checks::repos::lower_process_priority();
         let enrolment = home.enrolment()?;
         let manifest =
             open_pact_core::Manifest::parse(&crate::read_home_file(&home.file("manifest.toml"))?)?;
@@ -1119,7 +1118,10 @@ async fn run_report(
                 &enrolment.manifest,
             ));
         }
-        crate::scan_repositories(home, &manifest, device_config).await?;
+        if crate::scans_repositories(&manifest) {
+            checks::repos::lower_process_priority();
+            crate::scan_repositories(home, &manifest, device_config).await?;
+        }
     }
     let events = read_events();
     let (snapshot, compliance) = report::prepare(home)?;
