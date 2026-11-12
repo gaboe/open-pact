@@ -483,10 +483,23 @@ impl Home {
         }
     }
 
+    /// Replaces `name` in one step: the bytes go to a synced temporary file beside it, which is
+    /// renamed over it. A crash leaves the old file or the new one, never a part of either.
     fn write(&self, name: &str, bytes: &[u8]) -> Result<PathBuf> {
         std::fs::create_dir_all(&self.0)?;
         let path = self.file(name);
-        std::fs::write(&path, bytes).with_context(|| format!("{}", path.display()))?;
+        let temp = self.file(&format!(".{name}.{}.tmp", std::process::id()));
+        let written = (|| -> std::io::Result<()> {
+            let mut file = std::fs::File::create(&temp)?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&temp, &path)
+        })();
+        if let Err(error) = written {
+            let _ = std::fs::remove_file(&temp);
+            return Err(error).with_context(|| format!("{}", path.display()));
+        }
         Ok(path)
     }
 
@@ -1402,6 +1415,9 @@ fn wait_for_enter(input: &mut impl std::io::BufRead) -> std::io::Result<()> {
 
 enum LogSync {
     Verified(Checkpoint, OwnEntries),
+    /// The gateway holds the acceptance of the manifest it enforces, which this device has not
+    /// signed yet. The owner runs `accept`; nothing is wrong with the log.
+    AcceptPending(ManifestHash),
     Alarm(String),
 }
 
@@ -2088,13 +2104,12 @@ fn verify_my_entries(
     enrolment: &Enrolment,
     commitment: &str,
     cp: &Checkpoint,
-) -> Result<OwnEntries, String> {
-    if !signed_manifest_entry(enrolment)(&response.manifest.entry) {
-        return Err("the gateway returned a different manifest entry".into());
-    }
+    enforced: &ManifestHash,
+) -> Result<OwnEntries, OwnEntriesError> {
+    let alarm = |error: String| OwnEntriesError::Alarm(error);
     for item in std::iter::once(&response.manifest).chain(&response.device) {
         if item.entry.index >= cp.size {
-            return Err("own entry is outside the checkpoint".into());
+            return Err(alarm("own entry is outside the checkpoint".into()));
         }
         verify_inclusion(
             &item.entry.leaf_hash(),
@@ -2103,7 +2118,7 @@ fn verify_my_entries(
             &item.proof,
             &cp.root,
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| alarm(e.to_string()))?;
     }
     if response.device.iter().any(|item| {
         !matches!(
@@ -2114,26 +2129,58 @@ fn verify_my_entries(
                 | EntryKind::ManifestAccepted
         ) || item.entry.data["commitment"] != commitment
     }) {
-        return Err("the gateway returned another device's entry".into());
+        return Err(alarm("the gateway returned another device's entry".into()));
+    }
+    if !signed_manifest_entry(enrolment)(&response.manifest.entry) {
+        let accepted_elsewhere = response.manifest.entry.kind == EntryKind::ManifestPublished
+            && response.manifest.entry.data["manifest"] == enforced.as_str();
+        return Err(if accepted_elsewhere {
+            OwnEntriesError::AcceptPending
+        } else {
+            alarm("the gateway returned a different manifest entry".into())
+        });
     }
     let enrolled = response
         .device
         .iter()
         .find(|item| own_enrolment_entry(commitment)(&item.entry))
-        .ok_or_else(|| "the log has no entry for this device's enrolment".to_string())?;
+        .ok_or_else(|| alarm("the log has no entry for this device's enrolment".into()))?;
     Ok(OwnEntries {
         manifest: response.manifest.entry.index,
         enrolment: enrolled.entry.index,
     })
 }
 
-/// Verifies this device's entries against an authenticated checkpoint.
+/// Why this device's own log entries did not verify.
+#[derive(Debug)]
+enum OwnEntriesError {
+    /// A fault the owner must see as a transparency log alarm.
+    Alarm(String),
+    /// The gateway holds an acceptance of the manifest it enforces that this device has not signed.
+    /// The log is intact; the device is behind.
+    AcceptPending,
+}
+
+impl std::fmt::Display for OwnEntriesError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OwnEntriesError::Alarm(error) => f.write_str(error),
+            OwnEntriesError::AcceptPending => {
+                f.write_str("the gateway holds an acceptance of the manifest it enforces")
+            }
+        }
+    }
+}
+
+/// Verifies this device's entries against an authenticated checkpoint. `enforced` is the manifest
+/// the gateway enforces; it differs from the signed one while an owner has not accepted it yet.
 async fn check_own_entries(
     http: &reqwest::Client,
     home: &Home,
     enrolment: &mut Enrolment,
+    enforced: &ManifestHash,
     cp: &mut Checkpoint,
-) -> Result<Result<OwnEntries, String>> {
+) -> Result<Result<OwnEntries, OwnEntriesError>> {
     let response = fetch_my_entries(http, home, enrolment).await?;
     let pins = Pins::load(home)?;
     let manifest = Manifest::parse(&read_home_file(&home.file("manifest.toml"))?)?;
@@ -2149,9 +2196,15 @@ async fn check_own_entries(
     .await?
     {
         Ok(next) => next,
-        Err(error) => return Ok(Err(error.alarm_text())),
+        Err(error) => return Ok(Err(OwnEntriesError::Alarm(error.alarm_text()))),
     };
-    let own = match verify_my_entries(&response, enrolment, &commitment(enrolment)?, &next) {
+    let own = match verify_my_entries(
+        &response,
+        enrolment,
+        &commitment(enrolment)?,
+        &next,
+        enforced,
+    ) {
         Ok(own) => own,
         Err(error) => return Ok(Err(error)),
     };
@@ -2159,9 +2212,9 @@ async fn check_own_entries(
         .log_entries
         .is_some_and(|stored| stored.manifest != own.manifest || stored.enrolment != own.enrolment)
     {
-        return Ok(Err(
-            "the gateway changed this device's log entry indexes".into()
-        ));
+        return Ok(Err(OwnEntriesError::Alarm(
+            "the gateway changed this device's log entry indexes".into(),
+        )));
     }
     *cp = next;
     enrolment.log_entries = Some(own);
@@ -2170,10 +2223,12 @@ async fn check_own_entries(
 }
 
 /// Verifies the new checkpoint against the stored one, then this enrolment's entries in it.
+/// `enforced` is the manifest the gateway enforces now.
 async fn sync_log(
     http: &reqwest::Client,
     home: &Home,
     manifest: &Manifest,
+    enforced: &ManifestHash,
     enrolment: &mut Enrolment,
 ) -> Result<LogSync> {
     let gateway = enrolment.gateway.clone();
@@ -2183,9 +2238,10 @@ async fn sync_log(
         Err(e) => return Ok(alarm(e)),
     };
     Ok(
-        match check_own_entries(http, home, enrolment, &mut cp).await? {
+        match check_own_entries(http, home, enrolment, enforced, &mut cp).await? {
             Ok(own) => LogSync::Verified(cp, own),
-            Err(e) => alarm(e),
+            Err(OwnEntriesError::Alarm(e)) => alarm(e),
+            Err(OwnEntriesError::AcceptPending) => LogSync::AcceptPending(enforced.clone()),
         },
     )
 }
@@ -2209,6 +2265,13 @@ fn report_log(sync: LogSync, home: &Home) -> bool {
                 own.manifest, own.enrolment
             );
             true
+        }
+        LogSync::AcceptPending(enforced) => {
+            println!(
+                "{}",
+                manifest_change_notice(&enforced, &client_command(&home.0))
+            );
+            false
         }
         LogSync::Alarm(e) => {
             let bar = "!".repeat(72);
@@ -2306,8 +2369,14 @@ async fn verify_approval_entry(
         Err(CheckpointVerifyError::Alarm(error)) => return Err(WaitError::Alarm(error)),
     };
     let commitment = commitment(enrolment).map_err(WaitError::Fatal)?;
-    if let Err(error) = verify_my_entries(&response, enrolment, &commitment, &checkpoint) {
-        return Err(WaitError::Alarm(error));
+    if let Err(error) = verify_my_entries(
+        &response,
+        enrolment,
+        &commitment,
+        &checkpoint,
+        &enrolment.manifest,
+    ) {
+        return Err(WaitError::Alarm(error.to_string()));
     }
     Ok(response.device.iter().any(|item| {
         item.entry.kind == EntryKind::DeviceApproved && item.entry.data["commitment"] == commitment
@@ -3183,7 +3252,11 @@ async fn check_impl(home: &Home, insecure_dev: bool, show_resume_hint: bool) -> 
         .context("manifest.toml is not UTF-8")?;
     let manifest = Manifest::parse(manifest_toml.as_bytes())?;
     if manifest.hash() != &enrolment.manifest {
-        bail!("manifest.toml no longer matches the hash you signed");
+        return Err(stored_manifest_mismatch(
+            home,
+            manifest.hash(),
+            &enrolment.manifest,
+        ));
     }
     checks::check_supported(&manifest)
         .map_err(|e| anyhow::anyhow!("{e}; nothing was run or sent"))?;
@@ -3262,7 +3335,7 @@ async fn check_impl(home: &Home, insecure_dev: bool, show_resume_hint: bool) -> 
     let enforced = enforced_manifest(&http, &enrolment.gateway).await?;
     let changed =
         (enforced != enrolment.manifest).then(|| manifest_change_notice(&enforced, &command));
-    let sync = match sync_log(&http, home, &manifest, &mut enrolment).await {
+    let sync = match sync_log(&http, home, &manifest, &enforced, &mut enrolment).await {
         Err(error)
             if error.downcast_ref::<reqwest::Error>().is_some_and(|error| {
                 error.status() == Some(reqwest::StatusCode::FORBIDDEN)
@@ -3295,6 +3368,9 @@ async fn check_impl(home: &Home, insecure_dev: bool, show_resume_hint: bool) -> 
                         None,
                         Some("the device is waiting for IT approval"),
                     );
+                    if let Some(notice) = &changed {
+                        println!("\n{notice}");
+                    }
                 }
                 DeviceStatus::Revoked => {
                     println!("IT revoked this device.");
@@ -3315,6 +3391,11 @@ async fn check_impl(home: &Home, insecure_dev: bool, show_resume_hint: bool) -> 
     };
     let (mut verified, own) = match sync {
         LogSync::Verified(cp, own) => (cp, own),
+        pending @ LogSync::AcceptPending(_) => {
+            report_log(pending, home);
+            print_claim_log_status(home, None, Some("the manifest changed"));
+            return Ok(ExitCode::FAILURE);
+        }
         alarm => {
             report_log(alarm, home);
             print_claim_log_status(home, None, Some("log verification did not complete"));
@@ -3490,30 +3571,64 @@ async fn enforced_manifest(http: &reqwest::Client, gateway: &str) -> Result<Mani
 fn manifest_change_notice(enforced: &ManifestHash, command: &str) -> String {
     format!(
         "The manifest changed: the gateway now enforces {enforced}. Run `{command} accept` to \
-         review and sign it. Until then, controls it adds count as failing after their grace."
+         review and sign it. Controls the new manifest adds or tightens fail now, and access ends \
+         when their grace runs out."
     )
 }
 
+/// The error when `manifest.toml` is not the text `enrolment.json` signed. An accept that stopped
+/// after it wrote one of the two files leaves exactly this state.
+pub(crate) fn stored_manifest_mismatch(
+    home: &Home,
+    stored: &ManifestHash,
+    signed: &ManifestHash,
+) -> anyhow::Error {
+    anyhow::anyhow!(
+        "manifest.toml ({stored}) and enrolment.json (signed {signed}) disagree. An accept may have \
+         stopped part way. Run `{} accept` to finish it.",
+        client_command(&home.0)
+    )
+}
+
+/// The requirement of a control on every operating system, its grace and its output. Operating
+/// systems with the same requirement share one clause.
+fn control_rule(c: &open_pact_core::Control) -> String {
+    let mut clauses: Vec<(String, Vec<String>)> = Vec::new();
+    for os in Os::ALL {
+        let requirement = match c.required.get(&os) {
+            Some(required) => format!("must be {required}"),
+            None => "not required".into(),
+        };
+        match clauses.iter_mut().find(|(text, _)| *text == requirement) {
+            Some((_, systems)) => systems.push(os.to_string()),
+            None => clauses.push((requirement, vec![os.to_string()])),
+        }
+    }
+    let clauses = clauses
+        .iter()
+        .map(|(text, systems)| format!("{text} on {}", systems.join(", ")))
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!("{clauses} (grace {}, reports {})", c.grace, c.output)
+}
+
 /// What `new` changes against `old`, the manifest this device signed, one line per change.
-fn manifest_changes(old: &Manifest, new: &Manifest, os: Os) -> Vec<String> {
+fn manifest_changes(old: &Manifest, new: &Manifest) -> Vec<String> {
     let (was, now) = (old.body(), new.body());
-    let rule = |c: &open_pact_core::Control| match c.required.get(&os) {
-        Some(required) => format!(
-            "must be {required}, grace {}, reports {}",
-            c.grace, c.output
-        ),
-        None => format!("reported, not required, reports {}", c.output),
-    };
     let mut changes = Vec::new();
     for c in &now.controls {
         match was.control(&c.id) {
-            None => changes.push(format!("added control {}: {}", c.id, rule(c))),
-            Some(before) if before != c => changes.push(format!(
-                "changed control {}: {} (was {})",
-                c.id,
-                rule(c),
-                rule(before)
-            )),
+            None => changes.push(format!("added control {}: {}", c.id, control_rule(c))),
+            Some(before) if control_rule(before) != control_rule(c) || before.check != c.check => {
+                let mut line = format!("changed control {}:", c.id);
+                if control_rule(before) != control_rule(c) {
+                    line += &format!(" {} (was {})", control_rule(c), control_rule(before));
+                }
+                if before.check != c.check {
+                    line += &format!(" check {} (was {})", c.check, before.check);
+                }
+                changes.push(line);
+            }
             Some(_) => {}
         }
     }
@@ -3558,6 +3673,62 @@ fn manifest_changes(old: &Manifest, new: &Manifest, os: Os) -> Vec<String> {
         was.data_controller.clone(),
         now.data_controller.clone(),
     );
+    term("issuer", was.issuer.clone(), now.issuer.clone());
+    term(
+        "valid from",
+        was.valid_from.to_string(),
+        now.valid_from.to_string(),
+    );
+    term(
+        "claims valid for",
+        was.claim_max_age.to_string(),
+        now.claim_max_age.to_string(),
+    );
+    term(
+        "unknown results tolerated for",
+        was.unknown_grace.to_string(),
+        now.unknown_grace.to_string(),
+    );
+    term(
+        "minimum trust level",
+        format!("{:?}", was.min_trust_level),
+        format!("{:?}", now.min_trust_level),
+    );
+    // A parsed manifest always has its log policy.
+    let (was_log, now_log) = (
+        was.log
+            .as_ref()
+            .expect("a parsed manifest has a log policy"),
+        now.log
+            .as_ref()
+            .expect("a parsed manifest has a log policy"),
+    );
+    let witnesses = |log: &open_pact_core::LogPolicy| {
+        log.witnesses
+            .iter()
+            .map(|w| w.name.clone())
+            .collect::<Vec<_>>()
+    };
+    term(
+        "log witnesses",
+        list(witnesses(was_log)),
+        list(witnesses(now_log)),
+    );
+    term(
+        "log witness quorum",
+        was_log.witness_quorum.to_string(),
+        now_log.witness_quorum.to_string(),
+    );
+    term(
+        "log allows split views",
+        was_log.allow_split_views.to_string(),
+        now_log.allow_split_views.to_string(),
+    );
+    term(
+        "log checkpoint max age",
+        was_log.checkpoint_max_age.to_string(),
+        now_log.checkpoint_max_age.to_string(),
+    );
     changes
 }
 
@@ -3596,12 +3767,18 @@ async fn accept(home: &Home, yes: bool, insecure_dev: bool) -> Result<ExitCode> 
     checks::check_supported(&new).map_err(|e| {
         anyhow::anyhow!("{e}; refusing to show or sign this manifest. Nothing was sent")
     })?;
+    let checkpoint =
+        sync_checkpoint(&http, home, &enrolment.gateway, new.body().log.as_ref()).await?;
+    if let Err(error) = checkpoint {
+        report_log(alarm(error), home);
+        return Ok(ExitCode::from(2));
+    }
     if !resumed {
         let os = current_os()?;
         println!("The gateway now enforces a new manifest:\n");
         write_summary(&mut std::io::stdout().lock(), &new, &company, os)?;
         println!("Changes against the manifest you signed ({}):", old.hash());
-        let changes = manifest_changes(&old, &new, os);
+        let changes = manifest_changes(&old, &new);
         if changes.is_empty() {
             println!("  none in controls, disclosed metadata, retention, recipients or controller");
         }
@@ -3723,7 +3900,8 @@ async fn log_prove(home: &Home, index: Option<u64>, insecure_dev: bool) -> Resul
         bail!("manifest.toml no longer matches the hash you signed");
     }
     let http = http_client()?;
-    let sync = sync_log(&http, home, &manifest, &mut enrolment).await?;
+    let enforced = enrolment.manifest.clone();
+    let sync = sync_log(&http, home, &manifest, &enforced, &mut enrolment).await?;
     let LogSync::Verified(cp, own) = sync else {
         report_log(sync, home);
         return Ok(ExitCode::from(2));
@@ -3748,8 +3926,15 @@ async fn log_prove(home: &Home, index: Option<u64>, insecure_dev: bool) -> Resul
             return Ok(ExitCode::from(2));
         }
     };
-    if let Err(error) = verify_my_entries(&response, &enrolment, &commitment(&enrolment)?, &cp) {
-        report_log(alarm(error), home);
+    let signed = enrolment.manifest.clone();
+    if let Err(error) = verify_my_entries(
+        &response,
+        &enrolment,
+        &commitment(&enrolment)?,
+        &cp,
+        &signed,
+    ) {
+        report_log(alarm(error.to_string()), home);
         return Ok(ExitCode::from(2));
     }
     let item = std::iter::once(&response.manifest)
@@ -5556,9 +5741,16 @@ mod tests {
             })
             .await;
             enrolment.gateway = gateway.url.clone();
-            let result = check_own_entries(&http_client().unwrap(), &home, &mut enrolment, &mut cp)
-                .await
-                .unwrap();
+            let enforced = enrolment.manifest.clone();
+            let result = check_own_entries(
+                &http_client().unwrap(),
+                &home,
+                &mut enrolment,
+                &enforced,
+                &mut cp,
+            )
+            .await
+            .unwrap();
             assert_eq!(result.is_ok(), !corrupt, "{result:?}");
             assert_eq!(gateway.requests(), ["POST /v1/nonce", "POST /v1/log/mine"]);
             assert_eq!(enrolment.log_entries.is_some(), !corrupt);
@@ -6342,9 +6534,16 @@ mod tests {
         .await;
         enrolment.gateway = gateway.url.clone();
 
-        let error = check_own_entries(&http_client().unwrap(), &home, &mut enrolment, &mut cp)
-            .await
-            .unwrap_err();
+        let enforced = enrolment.manifest.clone();
+        let error = check_own_entries(
+            &http_client().unwrap(),
+            &home,
+            &mut enrolment,
+            &enforced,
+            &mut cp,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(
             error.to_string(),
             "The gateway does not support this client version. Ask IT to update the gateway to 0.4.0 or later."
@@ -6648,19 +6847,33 @@ grace = "1d"
         (dir, owner)
     }
 
+    /// A checkpoint of the empty log that `witness` has cosigned, as the gateway serves it.
+    fn cosigned_empty_checkpoint(company: &Company, witness: &Witness) -> String {
+        let mut checkpoint = Note::parse(&company.empty_checkpoint()).unwrap();
+        witness.cosign(
+            &mut checkpoint,
+            u64::try_from(chrono::Utc::now().timestamp()).unwrap(),
+        );
+        checkpoint.to_string()
+    }
+
     #[tokio::test]
     async fn accept_signs_the_new_manifest_and_moves_the_enrolment() {
         let company = Company::new();
-        let old = DEMO_MANIFEST.replace(PASSWORD_RULE, "");
-        assert_ne!(old, DEMO_MANIFEST);
-        let published = Company::published(DEMO_MANIFEST, &company.key);
-        let new = Manifest::parse(DEMO_MANIFEST.as_bytes()).unwrap();
+        let witness = Witness::new();
+        let old = witnessed_manifest(&witness);
+        let new_toml = with_password_rule(&old);
+        assert_ne!(old, new_toml);
+        let published = Company::published(&new_toml, &company.key);
+        let new = Manifest::parse(new_toml.as_bytes()).unwrap();
         let log = company.log.vkey();
+        let checkpoint = cosigned_empty_checkpoint(&company, &witness);
         let reply =
             json!({"status":"accepted","state":"approved","manifest": new.hash()}).to_string();
         let gateway = FakeGateway::start(move |line, _| match line {
             "GET /v1/manifest" => (200, published.clone()),
             "GET /v1/log/key" => (200, format!("{log}\n")),
+            "GET /v1/log/checkpoint" => (200, checkpoint.clone()),
             "POST /v1/nonce" => (200, json!({"nonce":"accept-nonce"}).to_string()),
             "POST /v1/device/accept" => (200, reply.clone()),
             _ => not_found(),
@@ -6685,7 +6898,7 @@ grace = "1d"
         assert_eq!(sent.device_key, device.public_key());
         assert_eq!(
             std::fs::read_to_string(home.file("manifest.toml")).unwrap(),
-            DEMO_MANIFEST
+            new_toml
         );
         let enrolment = home.enrolment().unwrap();
         assert_eq!(&enrolment.manifest, new.hash());
@@ -6698,12 +6911,15 @@ grace = "1d"
     #[tokio::test]
     async fn a_refused_acceptance_keeps_the_signed_manifest() {
         let company = Company::new();
-        let old = DEMO_MANIFEST.replace(PASSWORD_RULE, "");
-        let published = Company::published(DEMO_MANIFEST, &company.key);
+        let witness = Witness::new();
+        let old = witnessed_manifest(&witness);
+        let published = Company::published(&with_password_rule(&old), &company.key);
         let log = company.log.vkey();
+        let checkpoint = cosigned_empty_checkpoint(&company, &witness);
         let gateway = FakeGateway::start(move |line, _| match line {
             "GET /v1/manifest" => (200, published.clone()),
             "GET /v1/log/key" => (200, log.clone()),
+            "GET /v1/log/checkpoint" => (200, checkpoint.clone()),
             "POST /v1/nonce" => (200, json!({"nonce":"n"}).to_string()),
             "POST /v1/device/accept" => (403, json!({"status":"denied"}).to_string()),
             _ => not_found(),
@@ -6713,7 +6929,133 @@ grace = "1d"
         let before = snapshot(dir.path());
         let home = Home(dir.path().to_path_buf());
         assert_eq!(accept(&home, true, false).await.unwrap(), ExitCode::FAILURE);
-        assert_eq!(snapshot(dir.path()), before);
+        // The checkpoint the gateway signed is verified and kept whatever the owner decides.
+        let mut after = snapshot(dir.path());
+        after.remove("log-checkpoint.txt");
+        let mut before = before;
+        before.remove("log-checkpoint.txt");
+        assert_eq!(after, before);
+    }
+
+    /// F2: the gateway committed an acceptance whose response was lost, so this device still holds
+    /// the manifest it signed before. `check` names `accept` and returns the notice exit code, not
+    /// the log alarm, and sends no claim.
+    #[tokio::test]
+    async fn check_names_accept_when_the_gateway_already_moved_the_device() {
+        let company = Company::new();
+        let witness = Witness::new();
+        let old = witnessed_manifest(&witness);
+        let new_toml = with_password_rule(&old);
+        let new_hash = ManifestHash::of(new_toml.as_bytes());
+        let dir = tempfile::tempdir().unwrap();
+        let home = enrolled_home_with(dir.path(), "", &company, &old);
+        let mut enrolment = home.enrolment().unwrap();
+        let mine = commitment(&enrolment).unwrap();
+        let entries = vec![
+            Entry {
+                index: 0,
+                kind: EntryKind::ManifestPublished,
+                data: json!({"manifest": new_hash}),
+            },
+            Entry {
+                index: 1,
+                kind: EntryKind::DeviceEnrolled,
+                data: json!({"commitment": mine}),
+            },
+            Entry {
+                index: 2,
+                kind: EntryKind::ManifestAccepted,
+                data: json!({"commitment": mine, "manifest": new_hash}),
+            },
+        ];
+        let leaves: Vec<_> = entries.iter().map(Entry::leaf_hash).collect();
+        let mut note = company.sign(&checkpoint_of(company.log.origin(), &entries, 3));
+        witness.cosign(
+            &mut note,
+            u64::try_from(chrono::Utc::now().timestamp()).unwrap(),
+        );
+        let checkpoint = note.to_string();
+        let response = serde_json::to_string(&MyEntries {
+            checkpoint: checkpoint.clone(),
+            manifest: open_pact_core::EntryWithProof {
+                entry: entries[0].clone(),
+                proof: open_pact_core::inclusion_proof(&leaves, 0).unwrap(),
+            },
+            device: entries[1..]
+                .iter()
+                .map(|entry| open_pact_core::EntryWithProof {
+                    entry: entry.clone(),
+                    proof: open_pact_core::inclusion_proof(&leaves, entry.index).unwrap(),
+                })
+                .collect(),
+        })
+        .unwrap();
+        let published = Company::published(&new_toml, &company.key);
+        let log = company.log.vkey();
+        let gateway = FakeGateway::start(move |line, _| match line {
+            "GET /v1/manifest" => (200, published.clone()),
+            "GET /v1/log/key" => (200, log.clone()),
+            "GET /v1/log/checkpoint" => (200, checkpoint.clone()),
+            "POST /v1/nonce" => (200, json!({"nonce":"lost-response"}).to_string()),
+            "POST /v1/log/mine" => (200, response.clone()),
+            _ => not_found(),
+        })
+        .await;
+        enrolment.gateway = gateway.url.clone();
+        home.write(
+            "enrolment.json",
+            &serde_json::to_vec_pretty(&enrolment).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(check(&home, true).await.unwrap(), ExitCode::FAILURE);
+        assert_eq!(
+            gateway.posts(),
+            ["POST /v1/nonce", "POST /v1/log/mine"],
+            "no claim is sent under the manifest the gateway no longer enforces"
+        );
+        assert_eq!(home.enrolment().unwrap().manifest, enrolment.manifest);
+        assert_eq!(
+            std::fs::read_to_string(home.file("manifest.toml")).unwrap(),
+            old
+        );
+    }
+
+    /// F2: an acceptance stopped after it wrote manifest.toml and before it wrote enrolment.json.
+    /// `check` names `accept` as the way to finish it.
+    #[tokio::test]
+    async fn check_names_accept_when_manifest_toml_and_enrolment_disagree() {
+        let company = Company::new();
+        let witness = Witness::new();
+        let old = witnessed_manifest(&witness);
+        let new_toml = with_password_rule(&old);
+        let dir = tempfile::tempdir().unwrap();
+        let home = enrolled_home_with(dir.path(), "http://127.0.0.1:9", &company, &old);
+        home.write("manifest.toml", new_toml.as_bytes()).unwrap();
+
+        let error = format!("{:#}", check(&home, true).await.unwrap_err());
+        assert!(
+            error.contains("disagree") && error.contains("accept` to finish it"),
+            "{error}"
+        );
+        assert!(error.contains("open-pact-client"), "{error}");
+    }
+
+    #[test]
+    fn home_write_replaces_a_file_and_leaves_no_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+        home.write("enrolment.json", b"first").unwrap();
+        home.write("enrolment.json", b"second").unwrap();
+        assert_eq!(
+            std::fs::read(home.file("enrolment.json")).unwrap(),
+            b"second"
+        );
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["enrolment.json"]);
     }
 
     #[test]
@@ -6727,24 +7069,54 @@ grace = "1d"
             .replace(r#"claim_retention = "12mo""#, r#"claim_retention = "18mo""#)
             .replace(r#", "virtualized", "log_checkpoint"]"#, r#", "log_checkpoint"]"#)
             .replace(r#""Company IT security", "#, "")
-            .replace("Company Ltd.,", "Company Group Ltd.,");
+            .replace("Company Ltd.,", "Company Group Ltd.,")
+            .replace(r#"min_trust_level = "L0""#, r#"min_trust_level = "L1""#);
         let start = new_toml.find("[[control]]\nid = \"uptime_days\"").unwrap();
         let end = start + new_toml[start..].find("\n\n").unwrap() + 2;
         let new_toml = format!("{}{}", &new_toml[..start], &new_toml[end..]);
         let new = Manifest::parse(new_toml.as_bytes()).unwrap();
         assert_eq!(
-            manifest_changes(&old, &new, Os::Linux),
+            manifest_changes(&old, &new),
             [
-                "changed control os_patch_age_days: must be <= 14, grace 1d, reports integer 0..=3650, unknown (was must be <= 30, grace 1d, reports integer 0..=3650, unknown)",
-                "added control password_min_length: must be >= 10, grace 1d, reports integer 0..=2147483647, unknown, none",
+                "changed control os_patch_age_days: must be <= 14 on macos, windows, linux (grace 1d, reports integer 0..=3650, unknown) (was must be <= 30 on macos, windows, linux (grace 1d, reports integer 0..=3650, unknown))",
+                "added control password_min_length: must be >= 10 on macos, windows, linux (grace 1d, reports integer 0..=2147483647, unknown, none)",
                 "removed control uptime_days",
                 "disclosed metadata: manifest_hash, device_pseudonym, device_key, nonce, time, client_version, os, trust_level, vpn_certificate_request, log_checkpoint (was manifest_hash, device_pseudonym, device_key, nonce, time, client_version, os, trust_level, vpn_certificate_request, virtualized, log_checkpoint)",
                 "claim retention: 18mo (was 12mo)",
                 "claim recipients: auditor on request (was Company IT security, auditor on request)",
                 "data controller: Company Group Ltd., dpo@company.example (was Company Ltd., dpo@company.example)",
+                "minimum trust level: L1 (was L0)",
             ]
         );
-        assert!(manifest_changes(&new, &new, Os::Linux).is_empty());
+        assert!(manifest_changes(&new, &new).is_empty());
+        // A requirement that differs on one system names that system, and the others it shares.
+        let demo = Manifest::parse(DEMO_MANIFEST.as_bytes()).unwrap();
+        let windows_only = Manifest::parse(
+            DEMO_MANIFEST.replace(
+                "required = { macos = { max = 30 }, windows = { max = 30 }, linux = { max = 30 } }",
+                "required = { macos = { max = 30 }, windows = { max = 14 }, linux = { max = 30 } }",
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            manifest_changes(&demo, &windows_only),
+            [
+                "changed control os_patch_age_days: must be <= 30 on macos, linux; must be <= 14 on windows (grace 1d, reports integer 0..=3650, unknown) (was must be <= 30 on macos, windows, linux (grace 1d, reports integer 0..=3650, unknown))"
+            ]
+        );
+        // Wording that changes no requirement, grace, output or check is not a change.
+        let reworded = Manifest::parse(
+            DEMO_MANIFEST
+                .replace(
+                    "rationale = \"A lost laptop must not expose client data.\"",
+                    "rationale = \"Reworded for clarity.\"",
+                )
+                .as_bytes(),
+        )
+        .unwrap();
+        assert_ne!(reworded.hash(), demo.hash());
+        assert!(manifest_changes(&demo, &reworded).is_empty());
     }
 
     /// A VPN certificate and the CA a claim response carries.

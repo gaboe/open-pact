@@ -1113,7 +1113,11 @@ async fn run_report(
         let manifest =
             open_pact_core::Manifest::parse(&crate::read_home_file(&home.file("manifest.toml"))?)?;
         if manifest.hash() != &enrolment.manifest {
-            bail!("manifest.toml no longer matches the hash you signed");
+            return Err(crate::stored_manifest_mismatch(
+                home,
+                manifest.hash(),
+                &enrolment.manifest,
+            ));
         }
         crate::scan_repositories(home, &manifest, device_config).await?;
     }
