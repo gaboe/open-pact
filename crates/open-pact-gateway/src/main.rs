@@ -637,7 +637,8 @@ async fn device_status(
 }
 
 /// Moves an enrolled device to the manifest the gateway enforces, once its owner and device both
-/// signed the acceptance. The state, salt and grace clocks stay. A repeat answers the same.
+/// signed the acceptance. The state, salt and grace clocks stay. Every other enrolment of the
+/// device goes, so one row remains. A repeat answers the same, and a lost response can be retried.
 async fn accept_manifest(
     State(app): State<App>,
     body: Result<Json<AcceptRequest>, JsonRejection>,
@@ -655,25 +656,29 @@ async fn accept_manifest(
     let owner_key = serde_json::to_value(&req.owner.key).map_err(internal)?;
     let mut tx = app.db.begin().await.map_err(internal)?;
     translog::lock(&mut tx).await.map_err(internal)?;
-    let rows: Vec<(String, Value, String, String)> = sqlx::query_as(
-        "SELECT manifest_hash, owner_key, state, salt FROM devices \
-         WHERE pseudonym = $1 AND manifest_hash = ANY($2) FOR UPDATE",
-    )
-    .bind(req.pseudonym.as_str())
-    .bind(vec![current.to_string(), req.previous.to_string()])
-    .fetch_all(&mut *tx)
-    .await
-    .map_err(internal)?;
-    let row = |hash: &str| rows.iter().find(|r| r.0 == hash);
-    let (manifest, stored_owner, state, salt) = row(current.as_str())
-        .or_else(|| row(req.previous.as_str()))
+    let bound = devices::lock_bound(&mut tx, &req.pseudonym, current.as_str())
+        .await
+        .map_err(internal)?
         .ok_or_else(device_denied)?;
-    if *stored_owner != owner_key {
+    if bound.owner_key != owner_key {
         return Err(denied(vec![
             "the owner key differs from the one that enrolled this device".into(),
         ]));
     }
-    if manifest != current.as_str() {
+    let repeat = bound.manifest == current.as_str();
+    if !repeat && req.previous.as_str() != bound.manifest {
+        return Err(denied(vec![format!(
+            "the acceptance names {}, but this device's enrolment in use is {}",
+            req.previous, bound.manifest
+        )]));
+    }
+    sqlx::query("DELETE FROM devices WHERE pseudonym = $1 AND manifest_hash <> $2")
+        .bind(req.pseudonym.as_str())
+        .bind(&bound.manifest)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal)?;
+    if !repeat {
         sqlx::query(
             "UPDATE devices SET manifest_hash = $1, owner_signature = $2, \
              accept_owner_signature = $3, accept_device_signature = $4 \
@@ -684,7 +689,7 @@ async fn accept_manifest(
         .bind(String::from(req.owner_signature.clone()))
         .bind(String::from(req.device_signature.clone()))
         .bind(req.pseudonym.as_str())
-        .bind(manifest)
+        .bind(&bound.manifest)
         .execute(&mut *tx)
         .await
         .map_err(internal)?;
@@ -692,7 +697,7 @@ async fn accept_manifest(
             &mut tx,
             EntryKind::ManifestAccepted,
             json!({
-                "commitment": commitment(salt, req.pseudonym.as_str()).map_err(internal)?,
+                "commitment": commitment(&bound.salt, req.pseudonym.as_str()).map_err(internal)?,
                 "manifest": current,
             }),
         )
@@ -701,7 +706,7 @@ async fn accept_manifest(
     }
     tx.commit().await.map_err(internal)?;
     Ok(Json(
-        json!({"status": "accepted", "state": state, "manifest": current}),
+        json!({"status": "accepted", "state": bound.state.as_str(), "manifest": current}),
     ))
 }
 
@@ -769,19 +774,41 @@ async fn claim(
     };
     let manifest_hash = claim.manifest.as_str();
     let mut tx = app.db.begin().await.map_err(internal)?;
-    let state = devices::lock(&mut tx, &claim.device, manifest_hash)
+    let bound = devices::lock_bound(&mut tx, &claim.device, app.manifest.hash().as_str())
         .await
         .map_err(internal)?;
-    let consented = if state.is_some() && &claim.manifest != app.manifest.hash() {
-        Arc::new(
-            consented_manifest(&app.manifest, &claim.manifest, manifest_toml.as_deref())
-                .map_err(|reason| denied(vec![reason]))?,
-        )
+    let own = devices::lock(&mut tx, &claim.device, manifest_hash)
+        .await
+        .map_err(internal)?;
+    let enrolled = own.is_some();
+    let state = bound.as_ref().filter(|_| enrolled).map(|b| b.state);
+    let mut reasons: Vec<String> = match state {
+        None => vec!["device not enrolled".into()],
+        Some(state) => state.denial().map(str::to_string).into_iter().collect(),
+    };
+    // A device can hold one enrolment per manifest it joined under. Only the enrolment in use
+    // counts, so a claim under an older one cannot take a fresh grace clock or dodge the denial
+    // of the enrolment in use.
+    if let (true, Some(bound)) = (enrolled, &bound)
+        && bound.manifest != manifest_hash
+    {
+        reasons.push(format!(
+            "the claim is under {manifest_hash}, but this device's enrolment in use is {}",
+            bound.manifest
+        ));
+    }
+    let consented = if enrolled && &claim.manifest != app.manifest.hash() {
+        match consented_manifest(&app.manifest, &claim.manifest, manifest_toml.as_deref()) {
+            Ok(manifest) => Arc::new(manifest),
+            Err(reason) => {
+                reasons.push(reason);
+                return Err(denied(reasons));
+            }
+        }
     } else {
         app.manifest.clone()
     };
     let now = chrono::Utc::now();
-    let enrolled = state.is_some();
     let first_failures = if enrolled {
         grace::load(&mut tx, &claim.device, manifest_hash)
             .await
@@ -796,15 +823,11 @@ async fn claim(
     } = evaluate_under(&consented, &app.manifest, claim, now, &first_failures);
     let oversharing = matches!(&decision, Decision::Deny { reasons } if reasons.iter().any(Reason::breaks_disclosure_contract));
     let strings = |rs: &[Reason]| rs.iter().map(ToString::to_string).collect::<Vec<_>>();
-    let (warnings, mut reasons) = match &decision {
+    let (warnings, decision_reasons) = match &decision {
         Decision::Allow { warnings } => (strings(warnings), vec![]),
         Decision::Deny { reasons } => (vec![], strings(reasons)),
     };
-    match state.map(DeviceState::denial) {
-        None => reasons.insert(0, "device not enrolled".into()),
-        Some(Some(why)) => reasons.insert(0, why.into()),
-        Some(None) => {}
-    }
+    reasons.extend(decision_reasons);
     reasons.extend(foreign);
     let csr = match (&claim.csr_sha256, &csr_pem) {
         (None, None) => None,
@@ -2129,6 +2152,182 @@ grace = "1d"
             assert_eq!(body["state"], state);
             assert_eq!(bound_hash(&db, &owned.pseudonym).await.1, state);
         }
+    }
+
+    fn hash_of(toml: &str) -> String {
+        Manifest::parse(toml.as_bytes()).unwrap().hash().to_string()
+    }
+
+    /// Manifest A with another claim retention, so it has a hash of its own.
+    fn manifest_a_with_retention(retention: &str) -> String {
+        let toml = manifest_a().replace(
+            r#"claim_retention = "6mo""#,
+            &format!(r#"claim_retention = "{retention}""#),
+        );
+        assert!(toml.contains(retention));
+        toml
+    }
+
+    /// A second enrolment of the device of `owned` under `toml`, enrolled `hours_ago` hours before
+    /// the first. It copies the owner, state and salt of the row under `from`, as a join under
+    /// another manifest does.
+    async fn another_enrolment(db: &PgPool, owned: &Owned, from: &str, toml: &str, hours_ago: i32) {
+        let hash = Manifest::parse(toml.as_bytes()).unwrap().hash().clone();
+        sqlx::query(
+            "INSERT INTO devices (pseudonym, manifest_hash, owner_key, owner_signature, salt, state, enrolled_at) \
+             SELECT pseudonym, $2, owner_key, owner_signature, salt, state, now() - make_interval(hours => $4) \
+             FROM devices WHERE pseudonym = $1 AND manifest_hash = $3",
+        )
+        .bind(owned.pseudonym.as_str())
+        .bind(hash.as_str())
+        .bind(from)
+        .bind(hours_ago)
+        .execute(db)
+        .await
+        .unwrap();
+    }
+
+    /// Ends the grace of every control that failed so far.
+    async fn end_graces(db: &PgPool) {
+        sqlx::query("UPDATE control_failures SET first_failed_at = now() - interval '2 days'")
+            .execute(db)
+            .await
+            .unwrap();
+    }
+
+    /// F1: a device with an approved enrolment under A1 in use and one under A2, older. The gateway
+    /// runs C. A claim under A1 is judged by A1's grace. A claim under A2 is refused as not the
+    /// enrolment in use, even though A2 has no grace left to lose.
+    #[tokio::test]
+    #[ignore = "needs TEST_DATABASE_URL"]
+    async fn a_claim_under_an_enrolment_not_in_use_is_refused() {
+        let (a1, a2) = (manifest_a(), manifest_a_with_retention("3mo"));
+        let (app, db) = test_app_with(DEMO, 10, 100).await;
+        let owned = device_on(&db, &a1).await;
+        another_enrolment(&db, &owned, &hash_of(&a1), &a2, 1).await;
+
+        let claim = claim_under(&app, &owned.device, &a1).await;
+        let (status, body) = send_claim(&app, &owned.device, &claim, Some(&a1)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        end_graces(&db).await;
+
+        let claim = claim_under(&app, &owned.device, &a1).await;
+        let (status, body) = send_claim(&app, &owned.device, &claim, Some(&a1)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(
+            body["reasons"].to_string().contains("grace 1d ended"),
+            "{body}"
+        );
+
+        let claim = claim_under(&app, &owned.device, &a2).await;
+        let (status, body) = send_claim(&app, &owned.device, &claim, Some(&a2)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(
+            body["reasons"].to_string().contains(&format!(
+                "this device's enrolment in use is {}",
+                hash_of(&a1)
+            )),
+            "{body}"
+        );
+        assert!(body.get("certificate_pem").is_none());
+    }
+
+    /// F1: a device approved under A and under B, with the gateway on B. B's grace has ended. A claim
+    /// under A, which does not require the control, must not pass in B's place.
+    #[tokio::test]
+    #[ignore = "needs TEST_DATABASE_URL"]
+    async fn a_claim_under_an_older_approved_enrolment_cannot_stand_in_for_the_one_in_use() {
+        let a = manifest_a();
+        let (app, db) = test_app_with(DEMO, 10, 100).await;
+        let owned = device_on(&db, DEMO).await;
+        another_enrolment(&db, &owned, &hash_of(DEMO), &a, 1).await;
+        let short_password = |claim: &mut Claim| {
+            claim.results.insert("password_min_length".into(), 5.into());
+        };
+        let mut claim = claim_under(&app, &owned.device, DEMO).await;
+        short_password(&mut claim);
+        let (status, body) = send_claim(&app, &owned.device, &claim, Some(DEMO)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        end_graces(&db).await;
+
+        let mut claim = claim_under(&app, &owned.device, DEMO).await;
+        short_password(&mut claim);
+        let (status, body) = send_claim(&app, &owned.device, &claim, Some(DEMO)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(
+            body["reasons"].to_string().contains("grace 1d ended"),
+            "{body}"
+        );
+
+        let claim = claim_under(&app, &owned.device, &a).await;
+        let (status, body) = send_claim(&app, &owned.device, &claim, Some(&a)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(
+            body["reasons"].to_string().contains("enrolment in use is"),
+            "{body}"
+        );
+    }
+
+    /// F1: an acceptance leaves one enrolment of the device. An acceptance that names an enrolment
+    /// other than the one in use is refused, and a repeat of the accepted one still answers.
+    #[tokio::test]
+    #[ignore = "needs TEST_DATABASE_URL"]
+    async fn an_acceptance_leaves_exactly_one_enrolment() {
+        let a1 = manifest_a();
+        let a2 = manifest_a_with_retention("3mo");
+        let (app, db) = test_app_with(DEMO, 10, 100).await;
+        let owned = device_on(&db, &a1).await;
+        another_enrolment(&db, &owned, &hash_of(&a1), &a2, 1).await;
+
+        let (status, body) = post_accept(&app, &accept_request(&app, &owned, &a2).await).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(
+            body["reasons"].to_string().contains("enrolment in use is"),
+            "{body}"
+        );
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM devices WHERE pseudonym = $1")
+            .bind(owned.pseudonym.as_str())
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(rows, 2, "a refused acceptance changes nothing");
+
+        let (status, body) = post_accept(&app, &accept_request(&app, &owned, &a1).await).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = post_accept(&app, &accept_request(&app, &owned, &a1).await).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT manifest_hash, state FROM devices WHERE pseudonym = $1")
+                .bind(owned.pseudonym.as_str())
+                .fetch_all(&db)
+                .await
+                .unwrap();
+        assert_eq!(rows, [(hash_of(DEMO), "approved".to_string())]);
+    }
+
+    /// S1: a pending device whose manifest changed hears its state before the request to accept.
+    #[tokio::test]
+    #[ignore = "needs TEST_DATABASE_URL"]
+    async fn a_pending_device_is_told_its_state_before_the_accept_notice() {
+        let a = manifest_a();
+        let (app, db) = test_app_with(DEMO, 10, 100).await;
+        let owned = device_on(&db, &a).await;
+        sqlx::query("UPDATE devices SET state = 'pending' WHERE pseudonym = $1")
+            .bind(owned.pseudonym.as_str())
+            .execute(&db)
+            .await
+            .unwrap();
+        let claim = claim_under(&app, &owned.device, &a).await;
+        let (status, body) = send_claim(&app, &owned.device, &claim, None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        let reasons = body["reasons"].as_array().unwrap();
+        assert_eq!(reasons[0], "device awaiting IT approval", "{body}");
+        assert!(
+            body["reasons"]
+                .to_string()
+                .contains("run `open-pact-client accept`"),
+            "{body}"
+        );
     }
 
     fn bare_csr() -> (String, Vec<u8>) {
