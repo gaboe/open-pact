@@ -2717,8 +2717,125 @@ grace = "1d"
         );
     }
 
+    fn gateway_main_in_owned_child(test_name: &str) -> bool {
+        use std::process::{Child, Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        const MARKER: &str = "OPEN_PACT_PRIVATE_GATEWAY_TEST_CHILD";
+        if std::env::var(MARKER).as_deref() == Ok(test_name) {
+            return false;
+        }
+
+        struct TempDir(std::path::PathBuf);
+
+        impl Drop for TempDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        struct OwnedChild(Option<Child>);
+
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                if let Some(child) = self.0.as_mut() {
+                    if child.try_wait().ok().flatten().is_some() {
+                        return;
+                    }
+                    match child.kill() {
+                        Ok(()) => {
+                            child.wait().expect("reap the killed fixture child");
+                        }
+                        Err(error) => {
+                            assert!(
+                                child.try_wait().ok().flatten().is_some(),
+                                "could not stop the fixture child: {error}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        let directory = std::env::temp_dir().join(format!(
+            "open-pact-gateway-fixture-{:032x}",
+            rand::random::<u128>()
+        ));
+        std::fs::create_dir(&directory).expect("create private fixture directory");
+        let directory = TempDir(directory);
+        let home = directory.0.join("home");
+        let temporary = directory.0.join("tmp");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir(&temporary).unwrap();
+        let stdout_path = directory.0.join("stdout");
+        let stderr_path = directory.0.join("stderr");
+        let stdout = std::fs::File::create(&stdout_path).unwrap();
+        let stderr = std::fs::File::create(&stderr_path).unwrap();
+        let exact_name = format!("tests::{test_name}");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut child = OwnedChild(Some(
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &exact_name, "--nocapture", "--format=pretty"])
+                .env_clear()
+                .env(MARKER, test_name)
+                .env("HOME", &home)
+                .env("TMPDIR", &temporary)
+                .env("PGUSER", "fictional")
+                .env("PGHOSTADDR", "127.0.0.1")
+                .env("PGHOST", "fictional.invalid")
+                .env("PGPORT", "1")
+                .env("PGDATABASE", "fictional")
+                .env("PGPASSWORD", "fictional")
+                .stdin(Stdio::null())
+                .stdout(stdout)
+                .stderr(stderr)
+                .spawn()
+                .expect("start the isolated fixture child"),
+        ));
+        let (status, timed_out) = loop {
+            if let Some(status) = child.0.as_mut().unwrap().try_wait().unwrap() {
+                child.0 = None;
+                break (status, false);
+            }
+            if Instant::now() >= deadline {
+                let process = child.0.as_mut().unwrap();
+                process.kill().expect("stop the timed out fixture child");
+                let status = process.wait().expect("reap the timed out fixture child");
+                child.0 = None;
+                break (status, true);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let stdout = std::fs::read(&stdout_path).unwrap();
+        let stderr = std::fs::read(&stderr_path).unwrap();
+        let stdout = String::from_utf8_lossy(&stdout);
+        let stderr = String::from_utf8_lossy(&stderr);
+        assert!(
+            !timed_out && status.success(),
+            "fixture child: {status}, timed out: {timed_out}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(stdout.lines().any(|line| line == "running 1 test"), "{stdout}");
+        let passed = format!("test {exact_name} ... ok");
+        assert!(
+            stdout.lines().any(|line| line == passed),
+            "{stdout}"
+        );
+        assert!(
+            stdout.lines().any(|line| line.starts_with(
+                "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; "
+            )),
+            "{stdout}"
+        );
+        true
+    }
+
     #[tokio::test]
     async fn gateway_main_semantics_invite_rejects_disallowed_scheme_before_database() {
+        if gateway_main_in_owned_child(
+            "gateway_main_semantics_invite_rejects_disallowed_scheme_before_database",
+        ) {
+            return;
+        }
         let db = PgPoolOptions::new()
             .connect_lazy("postgres://fictional:fictional@127.0.0.1:1/fictional")
             .unwrap();
@@ -2742,6 +2859,9 @@ grace = "1d"
 
     #[tokio::test]
     async fn gateway_main_semantics_log_entries_rejects_range_overflow() {
+        if gateway_main_in_owned_child("gateway_main_semantics_log_entries_rejects_range_overflow") {
+            return;
+        }
         let db = PgPoolOptions::new()
             .connect_lazy("postgres://fictional:fictional@127.0.0.1:1/fictional")
             .unwrap();
