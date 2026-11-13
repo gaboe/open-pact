@@ -209,6 +209,18 @@ mod tests {
     }
 
     #[test]
+    fn invitation_hash_rejects_short_hex() {
+        assert!(InvitationHash::try_from("sha256:0".to_string()).is_err());
+    }
+
+    #[test]
+    fn invitation_hash_display_preserves_text() {
+        let expected = "sha256:66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925";
+        let hash = InvitationHash::try_from(expected.to_string()).unwrap();
+        assert_eq!(hash.to_string(), expected);
+    }
+
+    #[test]
     fn describe_leaves_out_the_code() {
         let inv = invitation();
         assert!(!inv.describe().contains(&String::from(inv.code.clone())));
