@@ -2580,4 +2580,180 @@ grace = "1d"
         let error = parse_log_origin(None).unwrap_err().to_string();
         assert!(error.contains("LOG_ORIGIN is required"), "{error}");
     }
+
+    #[test]
+    fn gateway_main_semantics_internal_reply_hides_details() {
+        let (status, body) = internal("FICTIONAL secret");
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body.0, json!({"status": "error"}));
+    }
+
+    #[test]
+    fn gateway_main_semantics_bad_request_reply_includes_reason() {
+        let (status, body) = bad_request("FICTIONAL bad input");
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body.0,
+            json!({"status": "error", "reason": "FICTIONAL bad input"})
+        );
+    }
+
+    #[test]
+    fn gateway_main_semantics_denied_reply_includes_reasons() {
+        let (status, body) = denied(vec!["first".into(), "second".into()]);
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            body.0,
+            json!({"status": "denied", "reasons": ["first", "second"]})
+        );
+    }
+
+    #[test]
+    fn gateway_main_semantics_invalid_invitation_reply() {
+        let (status, body) = invalid_invitation();
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            body.0,
+            json!({"status": "denied", "reasons": ["invalid or used invitation"]})
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_main_semantics_legacy_log_reply() {
+        let (status, body) = legacy_log().await;
+
+        assert_eq!(status, StatusCode::GONE);
+        assert_eq!(
+            body.0,
+            json!({
+                "status": "gone",
+                "reason": "the transparency log is now a Merkle tree with signed checkpoints; update open-pact-client and run join again"
+            })
+        );
+    }
+
+    #[test]
+    fn gateway_main_semantics_rate_limit_reply() {
+        let (status, body) = too_many("FICTIONAL limit");
+
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            body.0,
+            json!({"status": "denied", "reasons": ["FICTIONAL limit"]})
+        );
+    }
+
+    #[test]
+    fn gateway_main_semantics_device_denied_reply() {
+        let (status, body) = device_denied();
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            body.0,
+            json!({"status": "denied", "reasons": ["device access denied"]})
+        );
+    }
+
+    #[test]
+    fn gateway_main_semantics_manifest_consent_matches_signed_manifest() {
+        let enforced = Manifest::parse(DEMO.as_bytes()).unwrap();
+        let signed_toml = manifest_a();
+        let signed = Manifest::parse(signed_toml.as_bytes()).unwrap();
+
+        let accepted = consented_manifest(&enforced, signed.hash(), Some(&signed_toml)).unwrap();
+        assert_eq!(accepted.hash(), signed.hash());
+
+        let error = consented_manifest(&enforced, signed.hash(), Some(DEMO))
+            .err()
+            .expect("a different manifest must require consent");
+        assert_eq!(
+            error,
+            format!(
+                "manifest_toml is {}, not the manifest this device signed; this device signed manifest {}, the gateway now enforces {}; run `open-pact-client accept`",
+                enforced.hash(),
+                signed.hash(),
+                enforced.hash()
+            )
+        );
+    }
+
+    #[test]
+    fn gateway_main_semantics_log_origin_rejects_empty_value() {
+        let error = parse_log_origin(Some(String::new()))
+            .err()
+            .expect("an empty log origin is invalid");
+
+        assert_eq!(
+            error.to_string(),
+            "LOG_ORIGIN must be non-empty, without spaces or '+': \"\""
+        );
+    }
+
+    #[test]
+    fn gateway_main_semantics_log_origin_rejects_invalid_characters() {
+        for (origin, expected) in [
+            (
+                "fictional+log",
+                "LOG_ORIGIN must be non-empty, without spaces or '+': \"fictional+log\"",
+            ),
+            (
+                "fictional log",
+                "LOG_ORIGIN must be non-empty, without spaces or '+': \"fictional log\"",
+            ),
+        ] {
+            let error = parse_log_origin(Some(origin.into()))
+                .err()
+                .expect("invalid log origin characters must be rejected");
+            assert_eq!(error.to_string(), expected);
+        }
+
+        assert_eq!(
+            parse_log_origin(Some("fictional.example/log".into())).unwrap(),
+            "fictional.example/log"
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_main_semantics_invite_rejects_disallowed_scheme_before_database() {
+        let db = PgPoolOptions::new()
+            .connect_lazy("postgres://fictional:fictional@127.0.0.1:1/fictional")
+            .unwrap();
+        db.close().await;
+
+        let error = invite(
+            &db,
+            "ftp://fictional.example/path",
+            chrono::Duration::hours(1),
+            "FICTIONAL",
+        )
+        .await
+        .err()
+        .expect("a disallowed URL scheme must be rejected");
+
+        assert_eq!(
+            error.to_string(),
+            "--url must be an http(s) URL, got \"ftp://fictional.example/path\""
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_main_semantics_log_entries_rejects_range_overflow() {
+        let db = PgPoolOptions::new()
+            .connect_lazy("postgres://fictional:fictional@127.0.0.1:1/fictional")
+            .unwrap();
+        db.close().await;
+        let mut output = vec![b'X'];
+
+        let error = log_entries(&db, u64::MAX, 1, &mut output)
+            .await
+            .err()
+            .expect("an overflowing log range must be rejected");
+
+        assert_eq!(error.to_string(), "from + limit exceeds the log index range");
+        assert_eq!(output, [b'X']);
+    }
 }
