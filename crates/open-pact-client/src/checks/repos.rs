@@ -1586,4 +1586,309 @@ mod tests {
         );
         println!("scan elapsed: {:?}", started.elapsed());
     }
+
+    #[test]
+    fn fresh_uses_literal_48_hour_boundaries() {
+        let scan = RepoScan {
+            scanned_at: 100,
+            managed_repos_outside: 0,
+            managed_repos_total: 0,
+            outside_paths: Vec::new(),
+            managed_paths: None,
+            partial: false,
+            access_denied: false,
+            causes: Vec::new(),
+        };
+
+        assert!(fresh(&scan, 172_900));
+        assert!(!fresh(&scan, 172_901));
+        assert!(!fresh(&scan, 99));
+    }
+
+    #[test]
+    fn cleanup_keeps_temporary_files_younger_than_ten_minutes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(
+            ".repo-scan.json.11111111-1111-4111-8111-111111111111.tmp",
+        );
+        fs::write(&path, b"keep").unwrap();
+        fs::File::open(&path)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new()
+                    .set_modified(std::time::SystemTime::now() - Duration::from_secs(300)),
+            )
+            .unwrap();
+
+        remove_stale_cache_temps(temp.path()).unwrap();
+
+        assert_eq!(fs::read(path).unwrap(), b"keep");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn windows_drive_path_predicates_require_both_drive_separators() {
+        assert_eq!(
+            relative_to_home(Path::new(r"C:\repo"), Path::new("C:")),
+            None
+        );
+        assert!(!is_windows_drive_path(Path::new("relative")));
+        assert!(!is_windows_drive_path(Path::new("x:")));
+        assert!(!is_windows_drive_path(Path::new("ab/repo")));
+        assert!(!is_windows_drive_path(Path::new("C:x")));
+        assert!(is_windows_drive_path(Path::new(r"C:\repo")));
+        assert!(is_windows_drive_path(Path::new("C:/repo")));
+    }
+
+    #[test]
+    fn load_attempt_reports_an_io_error_for_a_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join(FILE)).unwrap();
+
+        assert!(load_attempt(temp.path()).is_err());
+    }
+
+    #[test]
+    fn cleanup_accepts_missing_directories_and_reports_non_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing");
+        let not_directory = temp.path().join("not-dir");
+        fs::write(&not_directory, b"x").unwrap();
+
+        assert!(remove_stale_cache_temps(&missing).is_ok());
+        assert!(remove_stale_cache_temps(&not_directory).is_err());
+    }
+
+    #[test]
+    fn progress_counts_each_visited_folder_and_repository() {
+        let mut progress = ScanProgress {
+            root: PathBuf::from("fixture"),
+            terminal: false,
+            last_update: None,
+            folders: 0,
+            repositories: 0,
+        };
+        let path = Path::new("fixture/a");
+
+        progress.visited(path);
+        progress.visited(path);
+        assert_eq!(progress.folders, 2);
+        assert_eq!(progress.repositories, 0);
+
+        progress.found_repository(path);
+        assert_eq!(progress.folders, 2);
+        assert_eq!(progress.repositories, 1);
+    }
+
+    #[test]
+    fn terminal_progress_update_forces_counts_and_time_state() {
+        let mut progress = ScanProgress {
+            root: PathBuf::from("fixture"),
+            terminal: true,
+            last_update: None,
+            folders: 0,
+            repositories: 0,
+        };
+
+        progress.update(Path::new("fixture/a"), 7, 3, true);
+
+        assert_eq!((progress.folders, progress.repositories), (7, 3));
+        assert!(progress.last_update.is_some());
+        progress.clear();
+    }
+
+    #[test]
+    fn non_terminal_progress_update_keeps_counts_and_time_state() {
+        let mut progress = ScanProgress {
+            root: PathBuf::from("fixture"),
+            terminal: false,
+            last_update: None,
+            folders: 1,
+            repositories: 2,
+        };
+
+        progress.update(Path::new("fixture/a"), 7, 3, true);
+
+        assert_eq!((progress.folders, progress.repositories), (1, 2));
+        assert_eq!(progress.last_update, None);
+    }
+
+    #[test]
+    fn progress_clear_resets_time_only_when_terminal_output_was_active() {
+        let mut terminal_progress = ScanProgress {
+            root: PathBuf::from("fixture"),
+            terminal: true,
+            last_update: Some(Instant::now()),
+            folders: 1,
+            repositories: 2,
+        };
+        terminal_progress.clear();
+        assert_eq!(terminal_progress.last_update, None);
+
+        let mut non_terminal_progress = ScanProgress {
+            root: PathBuf::from("fixture"),
+            terminal: false,
+            last_update: Some(Instant::now()),
+            folders: 1,
+            repositories: 2,
+        };
+        non_terminal_progress.clear();
+        assert!(non_terminal_progress.last_update.is_some());
+        non_terminal_progress.last_update = None;
+    }
+
+    #[test]
+    fn absolute_keeps_an_absolute_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = fs::canonicalize(temp.path()).unwrap();
+
+        assert_eq!(absolute(&path), path);
+    }
+
+    #[test]
+    fn walk_accepts_depth_eight_and_rejects_depth_ten() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+
+        let mut state = WalkState::default();
+        let progress = RefCell::new(ScanProgress {
+            root: temp.path().to_path_buf(),
+            terminal: false,
+            last_update: None,
+            folders: 0,
+            repositories: 0,
+        });
+        let mut visits = Vec::new();
+        walk(temp.path(), &repo, 8, &mut state, &progress, &mut |path| {
+            visits.push(path.to_path_buf())
+        })
+        .unwrap();
+        assert_eq!(visits, vec![repo.clone()]);
+        assert!(!state.partial);
+
+        let mut too_deep_state = WalkState::default();
+        let too_deep_progress = RefCell::new(ScanProgress {
+            root: temp.path().to_path_buf(),
+            terminal: false,
+            last_update: None,
+            folders: 0,
+            repositories: 0,
+        });
+        let mut too_deep_visits = Vec::new();
+        walk(
+            temp.path(),
+            &repo,
+            10,
+            &mut too_deep_state,
+            &too_deep_progress,
+            &mut |path| too_deep_visits.push(path.to_path_buf()),
+        )
+        .unwrap();
+        assert!(too_deep_visits.is_empty());
+        assert!(too_deep_state.seen.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_does_not_follow_a_symlink_directory() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("real");
+        let alias = temp.path().join("alias");
+        fs::create_dir_all(real.join(".git")).unwrap();
+        symlink(&real, &alias).unwrap();
+        let mut state = WalkState::default();
+        let progress = RefCell::new(ScanProgress {
+            root: temp.path().to_path_buf(),
+            terminal: false,
+            last_update: None,
+            folders: 0,
+            repositories: 0,
+        });
+        let mut visits = Vec::new();
+
+        walk(temp.path(), &alias, 0, &mut state, &progress, &mut |path| {
+            visits.push(path.to_path_buf())
+        })
+        .unwrap();
+
+        assert!(visits.is_empty());
+        assert!(state.seen.is_empty());
+        assert!(!state.partial);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_metadata_symlink_is_ignored_and_metadata_errors_are_reported() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let metadata = temp.path().join("metadata");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&metadata).unwrap();
+        fs::write(repo.join("git-pointer"), "gitdir: ../metadata\n").unwrap();
+        fs::write(
+            metadata.join("config"),
+            "[remote \"origin\"]\nurl = ssh://git@code.invalid/team/app.git\n",
+        )
+        .unwrap();
+        symlink(repo.join("git-pointer"), repo.join(".git")).unwrap();
+        assert!(read_remote_urls(&repo).unwrap().is_empty());
+
+        let absent_repo = temp.path().join("absent-repo");
+        fs::create_dir(&absent_repo).unwrap();
+        assert!(read_remote_urls(&absent_repo).unwrap().is_empty());
+
+        let commondir_repo = temp.path().join("commondir-repo");
+        let git_dir = commondir_repo.join(".git");
+        fs::create_dir_all(&git_dir).unwrap();
+        fs::create_dir(git_dir.join("commondir")).unwrap();
+        assert!(read_remote_urls(&commondir_repo).is_err());
+
+        let file = temp.path().join("file");
+        fs::write(&file, b"x").unwrap();
+        assert!(read_remote_urls(&file.join("child")).is_err());
+    }
+
+    #[test]
+    fn missing_metadata_accepts_absent_and_non_directory_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let absent = temp.path().join("absent");
+        let file = temp.path().join("file");
+        fs::write(&file, b"x").unwrap();
+
+        assert!(missing_or_not_directory(&absent).unwrap());
+        assert!(missing_or_not_directory(&file).unwrap());
+        assert!(!missing_or_not_directory(temp.path()).unwrap());
+    }
+
+    #[test]
+    fn config_parser_handles_missing_files_and_malformed_section_lines() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing-config");
+        assert!(parse_config(&missing).unwrap().is_empty());
+
+        let config = temp.path().join("config");
+        fs::write(
+            &config,
+            "[remote \"origin\"]\nurl = ssh://git@code.invalid/team/one.git\n[core\nurl = ssh://git@code.invalid/team/two.git\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            parse_config(&config).unwrap(),
+            vec![
+                "ssh://git@code.invalid/team/one.git",
+                "ssh://git@code.invalid/team/two.git"
+            ]
+        );
+    }
+
+    #[test]
+    fn wildcard_match_accepts_a_trailing_star_after_a_full_match() {
+        assert!(wildcard_matches("ab", "ab*"));
+    }
 }
