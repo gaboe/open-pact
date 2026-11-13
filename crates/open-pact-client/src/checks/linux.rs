@@ -2512,6 +2512,266 @@ vda2         part  0 0 ext4 /boot
 ";
         assert_eq!(parse_lsblk_inverse(out), "full");
     }
+
+    #[test]
+    fn system_reads_owned_files_and_reports_missing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index");
+        std::fs::write(&path, "fictional-list\n").unwrap();
+        assert_eq!(
+            System.read(path.to_str().unwrap()),
+            Some("fictional-list\n".to_string())
+        );
+        assert_eq!(
+            System.read(dir.path().join("missing").to_str().unwrap()),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn system_runs_a_literal_local_command() {
+        let ran = System
+            .run("/bin/sh", &["-c", "printf '%s' fictional-output"])
+            .expect("the local shell command should run");
+        assert!(ran.success);
+        assert_eq!(ran.text, "fictional-output");
+    }
+
+    #[test]
+    fn system_lists_owned_files_and_reports_missing_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("alpha"), "a").unwrap();
+        std::fs::write(dir.path().join("beta"), "b").unwrap();
+        let mut paths = System.list(dir.path().to_str().unwrap()).unwrap();
+        paths.sort();
+        let mut expected = vec![
+            dir.path().join("alpha").to_str().unwrap().to_string(),
+            dir.path().join("beta").to_str().unwrap().to_string(),
+        ];
+        expected.sort();
+        assert_eq!(paths, expected);
+        assert_eq!(
+            System.list(dir.path().join("missing").to_str().unwrap()),
+            None
+        );
+    }
+
+    #[test]
+    fn system_hashes_raw_file_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index");
+        std::fs::write(&path, b"abc").unwrap();
+        let digest = System
+            .digest(path.to_str().unwrap(), false, Hash::Sha256)
+            .unwrap();
+        assert_eq!(digest.size, 3);
+        assert_eq!(
+            digest.hash,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn system_stamps_owned_directories_and_reports_missing_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            System.stamp(dir.path().to_str().unwrap()),
+            Some("directory".to_string())
+        );
+        assert_eq!(
+            System.stamp(dir.path().join("missing").to_str().unwrap()),
+            None
+        );
+    }
+
+    struct FiniteReader {
+        outcomes: std::collections::VecDeque<
+            Result<&'static [u8], std::io::ErrorKind>,
+        >,
+    }
+
+    impl std::io::Read for FiniteReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if buffer.is_empty() {
+                return Ok(0);
+            }
+            match self.outcomes.pop_front().unwrap_or(Ok(&[])) {
+                Ok(bytes) => {
+                    buffer[..bytes.len()].copy_from_slice(bytes);
+                    Ok(bytes.len())
+                }
+                Err(kind) => Err(std::io::Error::from(kind)),
+            }
+        }
+    }
+
+    #[test]
+    fn hash_retries_interrupted_reads_and_stops_on_other_errors() {
+        let interrupted = FiniteReader {
+            outcomes: [
+                Err(std::io::ErrorKind::Interrupted),
+                Ok(&b"abc"[..]),
+            ]
+            .into(),
+        };
+        let digest = hash_with::<sha2::Sha256>(interrupted).unwrap();
+        assert_eq!(digest.size, 3);
+        assert_eq!(
+            digest.hash,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+
+        let denied = FiniteReader {
+            outcomes: [Err(std::io::ErrorKind::PermissionDenied), Ok(&b"abc"[..])].into(),
+        };
+        assert!(hash_with::<sha2::Sha256>(denied).is_none());
+    }
+
+    #[test]
+    fn apt_file_names_escape_control_and_utf8_boundary_bytes() {
+        assert_eq!(
+            apt_file_name("main/\0\u{1f} \u{7f}\u{80}z"),
+            "main_%00%1f%20%7f%c2%80z"
+        );
+    }
+
+    #[test]
+    fn index_targets_mark_only_deb_packages_as_packages() {
+        for (target_of, identifier, packages) in [
+            ("deb", "Packages", true),
+            ("deb-src", "Packages", false),
+            ("deb", "Sources", false),
+        ] {
+            let input = format!(
+                "MetaKey: main/binary-amd64/Packages\nFilename: /fictional/cache/Packages\nTarget-Of: {target_of}\nIdentifier: {identifier}\n"
+            );
+            let targets = parse_index_targets(&input).unwrap();
+            assert_eq!(targets.len(), 1);
+            assert_eq!(targets[0].meta_key, "main/binary-amd64/Packages");
+            assert_eq!(targets[0].filename, "/fictional/cache/Packages");
+            assert_eq!(targets[0].packages, packages);
+        }
+    }
+
+    #[test]
+    fn unrelated_non_package_target_does_not_fail_apt_cache_validation() {
+        let host = apt_host(&[SECURITY_LISTS, RELEASE_POCKET], Some((true, APT_CLEAR)));
+        let mut config = AptConfig::read(&host).unwrap();
+        config.targets.push(IndexTarget {
+            meta_key: "main/source/Sources".to_string(),
+            filename: "/var/lib/apt/lists/unmatched".to_string(),
+            packages: false,
+            architecture: None,
+        });
+        assert!(apt_security_lists_current(&host, &config, now()));
+        config.targets.last_mut().unwrap().packages = true;
+        assert!(!apt_security_lists_current(&host, &config, now()));
+    }
+
+    #[test]
+    fn apt_security_summary_requires_both_counts() {
+        assert!(matches!(
+            parse_apt_security("0 upgraded, unavailable\n"),
+            SecurityUpdates::Unknown
+        ));
+        assert!(matches!(
+            parse_apt_security("0 newly installed\n"),
+            SecurityUpdates::Unknown
+        ));
+        assert!(matches!(
+            parse_apt_security("0 upgraded, 0 newly installed\n"),
+            SecurityUpdates::Clear
+        ));
+    }
+
+    #[test]
+    fn dnf_advisory_rows_need_a_complete_id_and_description() {
+        assert!(matches!(
+            parse_dnf_security("FICTIONAL-2026\n"),
+            SecurityUpdates::Unknown
+        ));
+        assert!(matches!(
+            parse_dnf_security("FICTIONAL-ID Important/Sec. fictional-lib\n"),
+            SecurityUpdates::Unknown
+        ));
+        assert!(matches!(
+            parse_dnf_security("FICTIONAL-2026-0001 Important/Sec. fictional-lib\n"),
+            SecurityUpdates::Pending
+        ));
+    }
+
+    #[test]
+    fn rotated_apt_logs_read_plain_then_gzip_fallback() {
+        let plain = FakeHost {
+            files: BTreeMap::new(),
+            commands: vec![],
+        }
+        .with(
+            "/var/log/apt/history.log.2",
+            "fictional rotated transaction\n",
+        );
+        assert_eq!(
+            read_rotated_apt_log(&plain, 2),
+            Some("fictional rotated transaction\n".to_string())
+        );
+
+        let compressed = FakeHost {
+            files: BTreeMap::new(),
+            commands: vec![(
+                "gzip -dc /var/log/apt/history.log.2.gz",
+                Some((true, "fictional compressed transaction\n".to_string())),
+            )],
+        };
+        assert_eq!(
+            read_rotated_apt_log(&compressed, 2),
+            Some("fictional compressed transaction\n".to_string())
+        );
+
+        let missing = FakeHost {
+            files: BTreeMap::new(),
+            commands: vec![],
+        };
+        assert_eq!(read_rotated_apt_log(&missing, 2), None);
+    }
+
+    #[test]
+    fn lsblk_counts_swap_filesystems_and_mounts() {
+        assert_eq!(
+            parse_lsblk_inverse("root crypt 0 0 ext4 /\nswapdev part 0 0 swap\n"),
+            "partial"
+        );
+        assert_eq!(
+            parse_lsblk_inverse("root crypt 0 0 ext4 /\nswapdev part 0 0 [SWAP]\n"),
+            "partial"
+        );
+    }
+
+    #[test]
+    fn lsblk_accepts_root_mount_without_a_filesystem_field() {
+        assert_eq!(parse_lsblk_inverse("root crypt 0 0 /\n"), "full");
+        assert_eq!(
+            parse_lsblk_row("0 0 [SWAP]".split_whitespace()),
+            Some((false, false, String::new(), "[SWAP]".to_string()))
+        );
+    }
+
+    #[test]
+    fn lsblk_strips_standalone_unicode_tree_bars() {
+        let out = "root lvm 0 0 ext4 /\n├─vol lvm 0 0\n│ └─secret crypt 0 0\n└─secret2 crypt 0 0\n";
+        assert_eq!(parse_lsblk_inverse(out), "full");
+    }
+
+    #[test]
+    fn autologin_accepts_only_enabled_values() {
+        assert!(!parse_autologin(
+            "[daemon]\nAutomaticLoginEnable=false\n"
+        ));
+        assert!(!parse_autologin("[daemon]\nAutomaticLoginEnable=0\n"));
+        assert!(parse_autologin("[daemon]\nAutomaticLoginEnable=TRUE\n"));
+        assert!(parse_autologin("[daemon]\nAutomaticLoginEnable=1\n"));
+    }
 }
 
 #[cfg(test)]
