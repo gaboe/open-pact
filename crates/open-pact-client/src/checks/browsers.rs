@@ -1494,3 +1494,231 @@ mod linux_package_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod missed_mutant_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn write(path: &Path, contents: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn owned_non_directory_paths_are_errors() {
+        let root = tempfile::tempdir().unwrap();
+        let blocker = root.path().join("blocker");
+        fs::write(&blocker, "fixture").unwrap();
+        let child = blocker.join("child");
+
+        assert!(optional_json(&child, false).is_err());
+        assert!(profiles(&blocker, false).is_err());
+        assert!(linux_policy(&blocker).is_err());
+    }
+
+    #[test]
+    fn missing_linux_policy_is_empty() {
+        let root = tempfile::tempdir().unwrap();
+
+        assert_eq!(
+            linux_policy(&root.path().join("missing")),
+            Ok(json!({}))
+        );
+    }
+
+    #[test]
+    fn named_directories_are_profiles_without_preferences() {
+        for (name, firefox, expected) in [
+            ("Default", false, true),
+            ("Profile 1", false, true),
+            ("Guest Profile", false, true),
+            ("Other", false, false),
+            ("Other", true, true),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let profile = root.path().join(name);
+            fs::create_dir(&profile).unwrap();
+
+            assert_eq!(
+                profiles(root.path(), firefox),
+                Ok(if expected { vec![profile] } else { vec![] })
+            );
+        }
+    }
+
+    #[test]
+    fn custom_directory_preferences_make_a_profile() {
+        let root = tempfile::tempdir().unwrap();
+        let profile = root.path().join("Custom");
+        fs::create_dir(&profile).unwrap();
+        write(&profile.join("Preferences"), "{}");
+
+        assert_eq!(profiles(root.path(), false), Ok(vec![profile]));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn named_symlinks_are_profiles_without_preferences() {
+        for (name, firefox, expected) in [
+            ("Default", false, true),
+            ("Profile 1", false, true),
+            ("Guest Profile", false, true),
+            ("Other", false, false),
+            ("Other", true, true),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let inner = root.path().join("Storage/inner");
+            fs::create_dir_all(&inner).unwrap();
+            let link = root.path().join(name);
+            std::os::unix::fs::symlink("Storage/inner", &link).unwrap();
+
+            assert_eq!(
+                profiles(root.path(), firefox),
+                Ok(if expected { vec![link] } else { vec![] })
+            );
+        }
+    }
+
+    #[test]
+    fn commented_firefox_preference_does_not_disable_protection() {
+        let text = "// user_pref(\"browser.safebrowsing.malware.enabled\", false);";
+
+        assert_eq!(firefox_prefs(text), Ok(Map::new()));
+        assert_eq!(
+            firefox_state(&firefox_prefs(text).unwrap(), &json!({})),
+            Protection::On
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unrelated_dangling_symlink_does_not_make_chromium_unknown() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("data");
+        fs::create_dir(&data).unwrap();
+        std::os::unix::fs::symlink("absent-cookie", data.join("SingletonCookie")).unwrap();
+
+        assert_eq!(
+            linux_chromium(&data, &root.path().join("policy")),
+            Protection::On
+        );
+    }
+
+    #[test]
+    fn ordinary_profile_uses_enabled_default() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("data/Default");
+        write(&data.join("Preferences"), "{}");
+
+        assert_eq!(
+            linux_chromium(&root.path().join("data"), &root.path().join("policy")),
+            Protection::On
+        );
+    }
+
+    #[test]
+    fn mandatory_policy_does_not_require_recommendation_for_profile() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("data/Default");
+        write(&data.join("Preferences"), "{}");
+        write(
+            &root.path().join("policy/managed/a.json"),
+            r#"{"SafeBrowsingEnabled":true}"#,
+        );
+        write(
+            &root.path().join("policy/recommended/a.json"),
+            "{broken",
+        );
+
+        assert_eq!(
+            linux_chromium(&root.path().join("data"), &root.path().join("policy")),
+            Protection::On
+        );
+    }
+
+    #[test]
+    fn one_linux_firefox_policy_provider_is_supported() {
+        for (system, local) in [(false, true), (true, false)] {
+            let root = tempfile::tempdir().unwrap();
+            let profiles = root.path().join("profiles");
+            let app = root.path().join("app");
+            let system_policy = root.path().join("system-policy.json");
+            write(
+                &profiles.join("profiles.ini"),
+                "[Profile0]\nPath=fictional\nIsRelative=1\n",
+            );
+            let policy = r#"{"policies":{"Preferences":{"browser.safebrowsing.malware.enabled":{"Value":false,"Status":"locked"}}}}"#;
+            if local {
+                write(&app.join("distribution/policies.json"), policy);
+            }
+            if system {
+                write(&system_policy, policy);
+            }
+
+            assert_eq!(
+                linux_firefox(&profiles, &app, &system_policy),
+                Protection::Off
+            );
+        }
+    }
+
+    #[test]
+    fn parent_relative_linux_firefox_profile_is_unknown() {
+        let root = tempfile::tempdir().unwrap();
+        let profiles = root.path().join("profiles");
+        let app = root.path().join("app");
+        let system_policy = root.path().join("system-policy.json");
+        fs::create_dir_all(&profiles).unwrap();
+        fs::create_dir(root.path().join("outside")).unwrap();
+        write(
+            &profiles.join("profiles.ini"),
+            "[Profile0]\nPath=../outside\nIsRelative=1\n",
+        );
+
+        assert_eq!(
+            linux_firefox(&profiles, &app, &system_policy),
+            Protection::Unknown
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn non_notfound_firefox_preference_error_is_unknown() {
+        let root = tempfile::tempdir().unwrap();
+        let profiles = root.path().join("profiles");
+        let profile = profiles.join("fictional");
+        let app = root.path().join("app");
+        let system_policy = root.path().join("system-policy.json");
+        fs::create_dir_all(&profile).unwrap();
+        write(
+            &profiles.join("profiles.ini"),
+            "[Profile0]\nPath=fictional\nIsRelative=1\n",
+        );
+        std::os::unix::fs::symlink("prefs.js", profile.join("prefs.js")).unwrap();
+
+        assert_eq!(
+            linux_firefox(&profiles, &app, &system_policy),
+            Protection::Unknown
+        );
+    }
+
+    #[test]
+    fn each_sandbox_package_keeps_linux_result_unknown() {
+        for marker in ["home/.var/app", "snap/firefox", "snap/chromium"] {
+            let root = tempfile::tempdir().unwrap();
+            let home = root.path().join("home/fictional");
+            let config = home.join(".config");
+            write(&root.path().join("opt/google/chrome/chrome"), "");
+            write(
+                &root.path().join("etc/opt/chrome/policies/managed/a.json"),
+                r#"{"SafeBrowsingEnabled":true}"#,
+            );
+
+            assert_eq!(linux_at(&home, &config, root.path()), "on");
+            fs::create_dir_all(root.path().join(marker)).unwrap();
+            assert_eq!(linux_at(&home, &config, root.path()), "unknown");
+        }
+    }
+}
