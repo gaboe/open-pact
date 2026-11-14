@@ -1,397 +1,164 @@
 use std::path::{Path, PathBuf};
 
-use crate::{Home, schedule};
+use crate::Home;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-pub(crate) const FILE: &str = "open-pact.toml";
+/// The owner's own choices, kept by the client. The owner changes them through the wizard and the
+/// `schedule` and `folders` commands, never by editing the file.
+pub(crate) const FILE: &str = "device.json";
+/// The settings file of an earlier client. It is read only to explain where its values went and to
+/// offer its repository folders.
+pub(crate) const LEGACY_FILE: &str = "open-pact.toml";
 
-const CONFIG_TEMPLATE: &str = r#"[schedule]
-# The scheduled job sends the same claim as `open-pact-client check`, only while vpn_probe
-# connects. Set enabled to true, then run open-pact-client apply.
-enabled = false
-# Use system only on Windows, from an elevated PowerShell prompt.
-run_as = "user"
-mode = "vpn"
-# vpn_probe is a host:port that answers only on the company VPN. The job sends nothing while
-# it does not connect, so never use an address that answers off the VPN.
-# vpn_probe = "10.20.0.1:443"
-
-[managed_repos]
-# Use absolute paths or ~/ paths. Paths stay on this device.
-# These folders are reserved for managed repository checks.
-folders = []
-"#;
-
-#[derive(Clone, Debug, Default, PartialEq)]
-pub(crate) struct DeviceConfig {
-    pub(crate) schedule: Option<Schedule>,
-    pub(crate) managed_repos: Option<ManagedRepos>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawConfig {
-    report: Option<RawReport>,
-    schedule: Option<RawSchedule>,
-    managed_repos: Option<ManagedRepos>,
-}
-
-/// The table that sent status reports to a collector. Only the old probe is read, to name it in
-/// the error.
-#[derive(Deserialize)]
-struct RawReport {
-    vpn_probe: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawSchedule {
-    enabled: bool,
-    run_as: RunAs,
-    mode: Option<String>,
-    vpn_probe: Option<String>,
-    vpn_probe_name: Option<String>,
-}
-
-/// The scheduled job: who runs it, and when and where it sends a claim.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct Schedule {
-    pub(crate) run_as: RunAs,
-    /// `None` when the schedule is off. `Some` always carries what the job needs to send.
-    pub(crate) send: Option<SendPolicy>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "mode", rename_all = "lowercase")]
-pub(crate) enum SendPolicy {
-    /// Send only while the probe connects. With `name`, the probe also needs a TLS certificate
-    /// that is valid for `name`.
-    Vpn {
-        probe: ProbeAddress,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        name: Option<ProbeName>,
-    },
-}
-
-/// A `host:port`, checked once.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub(crate) struct ProbeAddress(String);
-
-impl ProbeAddress {
-    pub(crate) fn parse(raw: &str) -> Result<Self> {
-        schedule::probe_address(raw)?;
-        Ok(Self(raw.to_owned()))
-    }
-
-    pub(crate) fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-/// The DNS name that the probe's TLS certificate must carry, checked once.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub(crate) struct ProbeName(String);
-
-impl ProbeName {
-    pub(crate) fn parse(raw: &str) -> Result<Self> {
-        if raw.is_empty() {
-            bail!("must not be empty; set it to a DNS name such as \"vpn.example.org\"");
-        }
-        let labels: Vec<&str> = raw.split('.').collect();
-        let label_ok = |label: &&str| {
-            (1..=63).contains(&label.len())
-                && label
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-                && !label.starts_with('-')
-                && !label.ends_with('-')
-        };
-        // An all-digit last label makes an IP address, which a certificate name cannot be here.
-        let numeric_last = labels
-            .last()
-            .is_some_and(|label| label.bytes().all(|byte| byte.is_ascii_digit()));
-        if raw.len() > 253 || !labels.iter().all(label_ok) || numeric_last {
-            bail!(
-                "must be a DNS name such as \"vpn.example.org\", not an IP address, a value with spaces, or a trailing dot: {raw:?}"
-            );
-        }
-        Ok(Self(raw.to_owned()))
-    }
-
-    pub(crate) fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl RawSchedule {
-    fn parse(self) -> Result<Schedule> {
-        if self.run_as == RunAs::System && !cfg!(windows) {
-            bail!("[schedule].run_as: system is available only on Windows");
-        }
-        let probe = self
-            .vpn_probe
-            .as_deref()
-            .map(ProbeAddress::parse)
-            .transpose()
-            .context("[schedule].vpn_probe")?;
-        let name = self
-            .vpn_probe_name
-            .as_deref()
-            .map(ProbeName::parse)
-            .transpose()
-            .context("[schedule].vpn_probe_name")?;
-        match self.mode.as_deref() {
-            None | Some("vpn") => {}
-            Some("always") => bail!(
-                "[schedule].mode = \"always\" is not available: the scheduled job sends only while vpn_probe connects. Use mode = \"vpn\""
-            ),
-            Some(other) => bail!("[schedule].mode must be \"vpn\", not {other:?}"),
-        }
-        let send = if self.enabled {
-            if self.mode.is_none() {
-                bail!("[schedule].mode is required when enabled = true; set mode = \"vpn\"");
-            }
-            let probe = probe.context(
-                "[schedule].vpn_probe is required when enabled = true: set it to a host:port that answers only on the company VPN",
-            )?;
-            Some(SendPolicy::Vpn { probe, name })
-        } else {
-            None
-        };
-        Ok(Schedule {
-            run_as: self.run_as,
-            send,
-        })
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum RunAs {
+    #[default]
     User,
     System,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+/// Where the notice about the ignored `open-pact.toml` was already shown.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
+struct LegacyNoticeGiven {
+    #[serde(default)]
+    check: bool,
+    #[serde(default)]
+    job: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Surface {
+    Check,
+    Job,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ManagedRepos {
+pub(crate) struct DeviceConfig {
+    /// The owner agreed to the automatic sending that the signed manifest describes.
+    #[serde(default)]
+    pub(crate) auto_send: bool,
+    /// Windows only: who runs the scheduled job.
+    #[serde(default)]
+    pub(crate) run_as: RunAs,
+    /// Absolute folders that hold the owner's managed repositories.
     #[serde(default)]
     pub(crate) folders: Vec<PathBuf>,
+    #[serde(default)]
+    legacy_notice: LegacyNoticeGiven,
 }
 
 impl DeviceConfig {
-    pub(crate) fn load(home: &Home) -> Result<Option<Self>> {
-        Self::load_for(home, None)
+    /// No file means no choices yet.
+    pub(crate) fn load(home: &Home) -> Result<Self> {
+        Ok(home.read_json(FILE)?.unwrap_or_default())
     }
 
-    /// Reads the file and expands `~` to `user_home`, or to the profile of the current process.
-    pub(crate) fn load_for(home: &Home, user_home: Option<&Path>) -> Result<Option<Self>> {
-        let path = home.file(FILE);
-        let text = match crate::read_home_file(&path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
-        };
-        let text =
-            String::from_utf8(text).with_context(|| format!("{} must be UTF-8", path.display()))?;
-        let own_home;
-        let user_home = match user_home {
-            Some(user_home) => Some(user_home),
-            None => {
-                own_home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
-                    .map(PathBuf::from);
-                own_home.as_deref()
-            }
-        };
-        Self::parse(&text, user_home)
-            .with_context(|| format!("{}", path.display()))
-            .map(Some)
+    pub(crate) fn save(&self, home: &Home) -> Result<()> {
+        home.write(FILE, &serde_json::to_vec_pretty(self)?)?;
+        Ok(())
     }
 
-    pub(crate) fn parse(text: &str, user_home: Option<&Path>) -> Result<Self> {
-        let raw: RawConfig = toml::from_str(text).context("section/key")?;
-        if let Some(report) = raw.report {
-            let probe = match report.vpn_probe {
-                Some(probe) => format!("`vpn_probe = {probe:?}`"),
-                None => "`vpn_probe` with an address that answers only on the company VPN".into(),
-            };
-            bail!(
-                "[report] was removed: the gateway now receives claims. Move {probe} into [schedule], add `mode = \"vpn\"`, and delete [report]"
-            );
+    /// Adds a folder. Returns `false` when it was already listed.
+    pub(crate) fn add_folder(&mut self, folder: PathBuf) -> bool {
+        if self.folders.contains(&folder) {
+            return false;
         }
-        let schedule = raw.schedule.map(RawSchedule::parse).transpose()?;
-        let mut managed_repos = raw.managed_repos;
-        if let Some(repos) = &mut managed_repos {
-            for folder in &mut repos.folders {
-                if folder == Path::new("~") || folder.starts_with("~/") {
-                    let home = user_home
-                        .context("[managed_repos].folders: cannot expand ~ without a user home")?;
-                    *folder = home.join(folder.strip_prefix("~").unwrap());
-                }
-                if !folder.is_absolute() {
-                    bail!(
-                        "[managed_repos].folders: {} must be absolute after ~ expansion",
-                        folder.display()
-                    );
-                }
-            }
-        }
-        Ok(Self {
-            schedule,
-            managed_repos,
-        })
-    }
-}
-
-pub(crate) fn example(
-    manifest: &open_pact_core::Manifest,
-    os: open_pact_core::Os,
-    repo_scan: Option<&crate::checks::repos::RepoScan>,
-    user_home: Option<&Path>,
-) -> String {
-    let mut output = String::from(
-        "# Review this template. The client writes it only through `finish`, after your confirmation.\n",
-    );
-    let controls = &manifest.body().controls;
-    let required = controls
-        .iter()
-        .filter_map(|control| {
-            if !crate::checks::can_check(os, &control.id) {
-                return None;
-            }
-            let requirement = control.required.get(&os)?;
-            (requirement.to_string() != "n/a").then_some((control.id.as_str(), requirement))
-        })
-        .collect::<Vec<_>>();
-    let reported = controls
-        .iter()
-        .filter(|control| {
-            crate::checks::can_check(os, &control.id) && !control.required.contains_key(&os)
-        })
-        .map(|control| control.id.as_str())
-        .collect::<Vec<_>>();
-    let not_checked = controls
-        .iter()
-        .filter(|control| {
-            !crate::checks::can_check(os, &control.id)
-                || control
-                    .required
-                    .get(&os)
-                    .is_some_and(|requirement| requirement.to_string() == "n/a")
-        })
-        .map(|control| control.id.as_str())
-        .collect::<Vec<_>>();
-
-    if !required.is_empty() {
-        output.push_str(&format!("# Company requirements on {os}:\n"));
-        let id_width = required.iter().map(|(id, _)| id.len()).max().unwrap_or(0);
-        for (id, value) in required {
-            output.push_str(&format!("#   {id:<id_width$}  {value}\n"));
-        }
-    }
-    append_comment_list(&mut output, "Reported only, no requirement:", &reported);
-    append_comment_list(&mut output, &format!("Not checked on {os}:"), &not_checked);
-    output.push('\n');
-    let (before_managed_repos, managed_repo_section) = CONFIG_TEMPLATE
-        .split_once("[managed_repos]\n")
-        .expect("configuration template has a managed repository section");
-    output.push_str(before_managed_repos);
-    output.push_str("[managed_repos]\n");
-    let (managed_repo_comments, folder_setting) = managed_repo_section
-        .split_once("folders = []\n")
-        .expect("configuration template has a folders setting");
-    output.push_str(managed_repo_comments);
-    let has_folder_suggestion = append_managed_repo_comment(&mut output, repo_scan, user_home);
-    if !has_folder_suggestion {
-        output.push_str("folders = []\n");
-    }
-    output.push_str(folder_setting);
-    output.push('\n');
-    output
-}
-
-fn append_comment_list(output: &mut String, label: &str, ids: &[&str]) {
-    if ids.is_empty() {
-        return;
-    }
-    output.push_str(&format!("# {label}\n"));
-    let mut line = String::from("#   ");
-    for (index, id) in ids.iter().enumerate() {
-        let item = if index == 0 {
-            (*id).to_string()
-        } else {
-            format!(", {id}")
-        };
-        if line.len() + item.len() > 80 && line.len() > 4 {
-            output.push_str(&line);
-            output.push('\n');
-            line = String::from("#   ");
-            line.push_str(id);
-        } else {
-            line.push_str(&item);
-        }
-    }
-    if line.len() > 4 {
-        output.push_str(&line);
-        output.push('\n');
-    }
-}
-
-fn append_managed_repo_comment(
-    output: &mut String,
-    scan: Option<&crate::checks::repos::RepoScan>,
-    user_home: Option<&Path>,
-) -> bool {
-    let Some(scan) = scan else {
-        output.push_str("# Managed repository scan is unavailable.\n");
-        return false;
-    };
-    let Some(paths) = &scan.managed_paths else {
-        output.push_str("# Managed repository locations are unavailable.\n");
-        if scan.partial {
-            output.push_str("# Managed repository scan was partial; results may be incomplete.\n");
-        }
-        return false;
-    };
-    let groups = user_home.map_or_else(
-        || {
-            let mut groups = paths
-                .iter()
-                .map(|path| (path.display().to_string(), 1))
-                .collect::<Vec<_>>();
-            groups.sort_by(|left, right| left.0.cmp(&right.0));
-            groups
-        },
-        |home| crate::checks::repos::managed_repo_groups(paths, home),
-    );
-    output.push_str(&format!(
-        "# Managed repositories found: {}\n",
-        scan.managed_repos_total
-    ));
-    for (path, count) in &groups {
-        output.push_str(&format!("#   {} ({count})\n", safe_comment_text(path)));
-    }
-    if scan.partial {
-        output.push_str("# Managed repository scan was partial; results may be incomplete.\n");
-    }
-    let suggested_paths = groups
-        .iter()
-        .map(|(path, _)| path)
-        .filter(|path| safe_comment_text(path) == path.as_str())
-        .map(|path| serde_json::to_string(path).expect("a string serializes to JSON"))
-        .collect::<Vec<_>>();
-    if !suggested_paths.is_empty() {
-        output.push_str(&format!("# folders = [{}]\n", suggested_paths.join(", ")));
+        self.folders.push(folder);
         true
-    } else if groups.is_empty() {
-        output.push_str("# Add the folders that should hold them to `folders`.\n");
-        false
-    } else {
-        false
     }
+
+    /// Removes a folder. Returns `false` when it was not listed.
+    pub(crate) fn remove_folder(&mut self, folder: &Path) -> bool {
+        let before = self.folders.len();
+        self.folders.retain(|listed| listed != folder);
+        self.folders.len() != before
+    }
+}
+
+/// Turns what the owner typed into an absolute folder: `~` is the owner's home and a relative path
+/// starts at the current directory.
+pub(crate) fn absolute_folder(raw: &Path, user_home: Option<&Path>) -> Result<PathBuf> {
+    if raw == Path::new("~") || raw.starts_with("~/") {
+        let home = user_home.context("cannot expand ~ without a user home")?;
+        return Ok(home.join(raw.strip_prefix("~").expect("checked prefix")));
+    }
+    if raw.as_os_str().is_empty() {
+        bail!("a folder must not be empty");
+    }
+    std::path::absolute(raw).with_context(|| format!("make {} absolute", raw.display()))
+}
+
+fn legacy_value(home: &Home) -> Option<toml::Value> {
+    let bytes = crate::read_home_file(&home.file(LEGACY_FILE)).ok()?;
+    Some(toml::Value::Table(
+        String::from_utf8(bytes)
+            .ok()
+            .and_then(|text| toml::from_str::<toml::Table>(&text).ok())
+            .unwrap_or_default(),
+    ))
+}
+
+/// What to tell the owner, once per surface, when an `open-pact.toml` still sits in the home.
+pub(crate) fn legacy_notice(home: &Home, surface: Surface, command: &str) -> Option<String> {
+    let value = legacy_value(home)?;
+    let mut config = DeviceConfig::load(home).ok()?;
+    let given = match surface {
+        Surface::Check => &mut config.legacy_notice.check,
+        Surface::Job => &mut config.legacy_notice.job,
+    };
+    if *given {
+        return None;
+    }
+    *given = true;
+    let _ = config.save(home);
+    let has = |table: &str, key: &str| value.get(table).and_then(|table| table.get(key)).is_some();
+    let mut lines = vec![format!(
+        "{LEGACY_FILE} is ignored now. This client keeps your choices in {FILE}, and the company's signed manifest holds the rest:"
+    )];
+    if has("schedule", "enabled") || has("schedule", "run_as") {
+        lines.push(format!(
+            "  [schedule] enabled, run_as: `{command} schedule on` asks for them"
+        ));
+    }
+    if has("schedule", "mode") || has("schedule", "vpn_probe") || has("schedule", "vpn_probe_name")
+    {
+        lines.push(
+            "  [schedule] mode, vpn_probe, vpn_probe_name: the company sets them in the signed manifest"
+                .into(),
+        );
+    }
+    if has("managed_repos", "folders") {
+        lines.push(format!(
+            "  [managed_repos] folders: run `{command} folders add <path>`; the setup wizard offers to import them"
+        ));
+    }
+    if value.get("report").is_some() {
+        lines.push("  [report]: removed; the gateway receives claims".into());
+    }
+    lines.push(format!(
+        "The file stays where it is. Delete it when you no longer need it: {}",
+        home.file(LEGACY_FILE).display()
+    ));
+    Some(lines.join("\n"))
+}
+
+/// The repository folders of an earlier `open-pact.toml`, as absolute paths.
+pub(crate) fn legacy_folders(home: &Home, user_home: Option<&Path>) -> Vec<PathBuf> {
+    let Some(value) = legacy_value(home) else {
+        return Vec::new();
+    };
+    value
+        .get("managed_repos")
+        .and_then(|table| table.get("folders"))
+        .and_then(toml::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(toml::Value::as_str)
+        .filter_map(|folder| absolute_folder(Path::new(folder), user_home).ok())
+        .collect()
 }
 
 pub(crate) fn managed_repo_summary(scan: &crate::checks::repos::RepoScan, home: &Path) -> String {
@@ -415,7 +182,7 @@ pub(crate) fn managed_repo_summary(scan: &crate::checks::repos::RepoScan, home: 
     output
 }
 
-fn safe_comment_text(text: &str) -> String {
+pub(crate) fn safe_comment_text(text: &str) -> String {
     text.chars()
         .map(|character| {
             if character.is_control() {
@@ -445,8 +212,7 @@ pub(crate) fn print_table(
             "managed_repos_outside" | "managed_repos_total"
         ) {
             config
-                .and_then(|config| config.managed_repos.as_ref())
-                .map(|repos| format!("managed_repos.folders = {:?}", repos.folders))
+                .map(|config| format!("folders = {:?}", config.folders))
                 .unwrap_or_else(|| "-".into())
         } else {
             "-".into()
@@ -457,8 +223,8 @@ pub(crate) fn print_table(
             .unwrap_or_else(|| "-".into());
         println!("{} | {requirement} | {setting} | {result}", control.id);
     }
-    if let Some(repos) = config.and_then(|config| config.managed_repos.as_ref()) {
-        println!("managed_repos.folders = {:?}", repos.folders);
+    if let Some(config) = config.filter(|config| !config.folders.is_empty()) {
+        println!("repository folders = {:?}", config.folders);
     }
 }
 
@@ -466,440 +232,112 @@ pub(crate) fn print_table(
 mod tests {
     use super::*;
 
-    #[test]
-    fn device_config_load_names_the_file_section_and_key() {
+    fn home() -> (tempfile::TempDir, Home) {
         let dir = tempfile::tempdir().unwrap();
         let home = Home(dir.path().to_owned());
-        assert!(DeviceConfig::load(&home).unwrap().is_none());
-        std::fs::write(
-            home.file(FILE),
-            "[schedule]\nenabled = true\nrun_as = 'user'\nmode = 'vpn'",
-        )
-        .unwrap();
+        (dir, home)
+    }
+
+    #[test]
+    fn a_missing_file_means_no_choices_yet() {
+        let (_dir, home) = home();
+        assert_eq!(DeviceConfig::load(&home).unwrap(), DeviceConfig::default());
+        assert!(!DeviceConfig::default().auto_send);
+    }
+
+    #[test]
+    fn choices_survive_a_save_and_load() {
+        let (_dir, home) = home();
+        let mut config = DeviceConfig {
+            auto_send: true,
+            run_as: RunAs::System,
+            ..DeviceConfig::default()
+        };
+        assert!(config.add_folder(PathBuf::from("/work")));
+        assert!(!config.add_folder(PathBuf::from("/work")));
+        config.save(&home).unwrap();
+        assert_eq!(DeviceConfig::load(&home).unwrap(), config);
+        assert!(config.remove_folder(Path::new("/work")));
+        assert!(!config.remove_folder(Path::new("/work")));
+    }
+
+    #[test]
+    fn a_damaged_file_names_itself() {
+        let (_dir, home) = home();
+        std::fs::write(home.file(FILE), "{\"unknown\": 1}").unwrap();
         let error = format!("{:#}", DeviceConfig::load(&home).unwrap_err());
-        assert!(
-            error.contains(FILE) && error.contains("[schedule].vpn_probe"),
-            "{error}"
+        assert!(error.contains(FILE), "{error}");
+    }
+
+    #[test]
+    fn folders_become_absolute() {
+        let user_home = Path::new("/home/example");
+        assert_eq!(
+            absolute_folder(Path::new("~/work"), Some(user_home)).unwrap(),
+            PathBuf::from("/home/example/work")
         );
+        assert_eq!(
+            absolute_folder(Path::new("~"), Some(user_home)).unwrap(),
+            PathBuf::from("/home/example")
+        );
+        assert!(absolute_folder(Path::new("~/work"), None).is_err());
+        assert!(absolute_folder(Path::new(""), None).is_err());
+        assert!(
+            absolute_folder(Path::new("work"), None)
+                .unwrap()
+                .is_absolute()
+        );
+    }
+
+    #[test]
+    fn the_ignored_toml_is_explained_once_per_surface() {
+        let (_dir, home) = home();
+        assert_eq!(legacy_notice(&home, Surface::Check, "client"), None);
         std::fs::write(
-            home.file(FILE),
-            "[schedule]\nenabled = false\nrun_as = 'user'",
+            home.file(LEGACY_FILE),
+            "[schedule]\nenabled = true\nrun_as = 'user'\nmode = 'vpn'\nvpn_probe = '10.0.0.1:443'\n[managed_repos]\nfolders = ['/work']\n[report]\ncollector = 'https://collector.example.org'\n",
+        )
+        .unwrap();
+        let notice = legacy_notice(&home, Surface::Check, "client").unwrap();
+        for expected in [
+            "open-pact.toml is ignored now",
+            "[schedule] enabled, run_as: `client schedule on`",
+            "[schedule] mode, vpn_probe, vpn_probe_name: the company sets them",
+            "[managed_repos] folders: run `client folders add <path>`",
+            "[report]: removed",
+        ] {
+            assert!(notice.contains(expected), "{notice}");
+        }
+        assert_eq!(legacy_notice(&home, Surface::Check, "client"), None);
+        assert!(legacy_notice(&home, Surface::Job, "client").is_some());
+        assert_eq!(legacy_notice(&home, Surface::Job, "client"), None);
+        assert!(home.file(LEGACY_FILE).exists(), "the owner's file stays");
+    }
+
+    #[test]
+    fn an_unparseable_toml_is_still_ignored_with_a_notice() {
+        let (_dir, home) = home();
+        std::fs::write(home.file(LEGACY_FILE), "[managed_repos\n").unwrap();
+        let notice = legacy_notice(&home, Surface::Check, "client").unwrap();
+        assert!(notice.contains("ignored now") && !notice.contains("folders add"));
+        assert!(legacy_folders(&home, None).is_empty());
+    }
+
+    #[test]
+    fn the_old_repository_folders_can_be_imported() {
+        let (_dir, home) = home();
+        std::fs::write(
+            home.file(LEGACY_FILE),
+            "[managed_repos]\nfolders = ['~/work', '/srv/code']\n",
         )
         .unwrap();
         assert_eq!(
-            DeviceConfig::load(&home).unwrap().unwrap().schedule,
-            Some(Schedule {
-                run_as: RunAs::User,
-                send: None
-            })
+            legacy_folders(&home, Some(Path::new("/home/example"))),
+            vec![
+                PathBuf::from("/home/example/work"),
+                PathBuf::from("/srv/code")
+            ]
         );
-    }
-
-    #[test]
-    fn device_config_example_is_valid_and_names_every_manifest_control() {
-        let manifest =
-            open_pact_core::Manifest::parse(include_bytes!("../../../examples/manifest.toml"))
-                .unwrap();
-        let text = example(&manifest, open_pact_core::Os::Macos, None, None);
-        let config = DeviceConfig::parse(&text, Some(Path::new("/home/example"))).unwrap();
-        assert_eq!(config.schedule.unwrap().send, None);
-        assert!(text.contains("mode = \"vpn\"\n"));
-        assert!(text.contains("# vpn_probe = \"10.20.0.1:443\"\n"));
-        assert!(!text.contains("[report]") && !text.contains("collector"));
-        assert!(text.contains("# Company requirements on macos:"));
-        assert!(text.contains("# Reported only, no requirement:"));
-        assert!(text.contains("# Not checked on macos:"));
-        assert!(!text.contains(" requires "));
-        let grouped = text
-            .lines()
-            .skip_while(|line| !line.starts_with("# Company requirements"))
-            .take_while(|line| !line.is_empty());
-        assert!(grouped.into_iter().all(|line| line.len() <= 80));
-        for control in &manifest.body().controls {
-            assert!(text.contains(control.id.as_str()));
-        }
-    }
-
-    #[test]
-    fn device_config_example_groups_required_report_only_and_not_checked_controls() {
-        let manifest_text = r#"
-manifest_version = 1
-issuer = "company.example"
-valid_from = "2026-10-01"
-claim_max_age = "24h"
-claim_retention = "12mo"
-claim_recipients = ["auditor@example.com"]
-disclosed_metadata = ["manifest_hash", "device_pseudonym", "device_key", "nonce", "time", "client_version", "os", "trust_level", "vpn_certificate_request", "virtualized", "log_checkpoint"]
-data_controller = "Company Ltd., dpo@company.example"
-min_trust_level = "L0"
-unknown_grace = "7d"
-
-[log]
-allow_split_views = true
-witness_quorum = 0
-checkpoint_max_age = "1h"
-
-[[control]]
-id = "firewall"
-source = "company_policy"
-check = "builtin:firewall@1"
-output = ["on", "off", "unknown"]
-required = { macos = "on" }
-grace = "0d"
-
-[[control]]
-id = "screen_lock"
-source = "company_policy"
-check = "builtin:screen_lock@1"
-output = ["on", "off", "unknown"]
-required = {}
-grace = "0d"
-
-[[control]]
-id = "disk_encryption"
-source = "company_policy"
-check = "builtin:disk_encryption@1"
-output = ["on", "off", "unknown"]
-required = { linux = "on" }
-grace = "0d"
-
-[[control]]
-id = "log_cleared"
-source = "company_policy"
-check = "builtin:log_cleared@1"
-output = ["n/a", "unknown"]
-required = { macos = "n/a" }
-grace = "0d"
-
-[[control]]
-id = "powershell_logging"
-source = "company_policy"
-check = "builtin:powershell_logging@1"
-output = ["on", "off", "n/a", "unknown"]
-required = { windows = "on" }
-grace = "0d"
-"#;
-        let manifest = open_pact_core::Manifest::parse(manifest_text.as_bytes()).unwrap();
-        let text = example(&manifest, open_pact_core::Os::Macos, None, None);
-        let expected = concat!(
-            "# Company requirements on macos:\n",
-            "#   firewall  on\n",
-            "# Reported only, no requirement:\n",
-            "#   screen_lock, disk_encryption\n",
-            "# Not checked on macos:\n",
-            "#   log_cleared, powershell_logging\n",
-        );
-        assert!(text.contains(expected), "{text}");
-        assert!(!text.contains("# Company requirements on macos:\n#   \n"));
-        assert!(!text.contains("# Not checked on macos:\n#   \n"));
-
-        let required_on_current_os = manifest_text.replace(
-            "required = { windows = \"on\" }",
-            "required = { macos = \"on\" }",
-        );
-        let manifest = open_pact_core::Manifest::parse(required_on_current_os.as_bytes()).unwrap();
-        let text = example(&manifest, open_pact_core::Os::Macos, None, None);
-        assert!(
-            text.contains("# Not checked on macos:\n#   log_cleared, powershell_logging\n"),
-            "{text}"
-        );
-        assert!(!text.contains("# Company requirements on macos:\n#   powershell_logging"));
-    }
-
-    #[test]
-    fn device_config_example_groups_repositories_at_home_as_home() {
-        let temp = tempfile::tempdir().unwrap();
-        let home = temp.path().join("home");
-        std::fs::create_dir_all(&home).unwrap();
-        for repo in ["app-one", "app-two"] {
-            let git = home.join(repo).join(".git");
-            std::fs::create_dir_all(&git).unwrap();
-            std::fs::write(
-                git.join("config"),
-                "[remote \"origin\"]\n url = git@github.com:example-org/app.git\n",
-            )
-            .unwrap();
-        }
-        let scan = crate::checks::repos::scan_and_store(
-            &temp.path().join("client"),
-            &home,
-            &[],
-            &["github.com/example-org/".to_string()],
-        )
-        .unwrap();
-        let manifest =
-            open_pact_core::Manifest::parse(include_bytes!("../../../examples/manifest.toml"))
-                .unwrap();
-        let proposal = example(
-            &manifest,
-            open_pact_core::Os::Macos,
-            Some(&scan),
-            Some(&home),
-        );
-        assert!(
-            proposal.contains("# Managed repositories found: 2\n#   ~ (2)\n"),
-            "{proposal}"
-        );
-        assert!(!proposal.contains("~/~"));
-    }
-
-    #[test]
-    fn device_config_example_shows_managed_repositories_from_a_fake_home_scan() {
-        let manifest =
-            open_pact_core::Manifest::parse(include_bytes!("../../../examples/manifest.toml"))
-                .unwrap();
-        let temp = tempfile::tempdir().unwrap();
-        let home = temp.path().join("home");
-        for path in ["work/one", "work/two", "clients/three"] {
-            let repo = home.join(path);
-            std::fs::create_dir_all(repo.join(".git")).unwrap();
-            std::fs::write(
-                repo.join(".git/config"),
-                "[remote \"origin\"]\n url = git@github.com:example-org/app.git\n",
-            )
-            .unwrap();
-        }
-        let scan = crate::checks::repos::scan_and_store(
-            &temp.path().join("client"),
-            &home,
-            &[],
-            &["github.com/example-org/".to_string()],
-        )
-        .unwrap();
-        let text = example(
-            &manifest,
-            open_pact_core::Os::Macos,
-            Some(&scan),
-            Some(&home),
-        );
-        assert!(
-            text.contains("# Managed repositories found: 3\n#   ~/work (2)\n#   ~/clients (1)\n")
-        );
-        assert!(text.contains("# folders = [\"~/work\", \"~/clients\"]\n"));
-        let section = text.find("[managed_repos]\n").unwrap();
-        let managed_repo_block = &text[section..];
-        let fixed_comments = managed_repo_block
-            .find("# These folders are reserved")
-            .unwrap();
-        let summary = managed_repo_block
-            .find("# Managed repositories found:")
-            .unwrap();
-        let folders_hint = managed_repo_block.find("# folders =").unwrap();
-        let folder_setting = managed_repo_block
-            .strip_prefix("[managed_repos]\n")
-            .unwrap()
-            .lines()
-            .find(|line| !line.starts_with('#') && !line.is_empty());
-        assert!(fixed_comments < summary && summary < folders_hint);
-        assert_eq!(folder_setting, None);
-    }
-
-    #[test]
-    fn device_config_example_groups_shared_first_level_and_counts_managed_paths() {
-        let manifest =
-            open_pact_core::Manifest::parse(include_bytes!("../../../examples/manifest.toml"))
-                .unwrap();
-        let temp = tempfile::tempdir().unwrap();
-        let home = temp.path().join("home");
-        for path in ["code/work/one", "code/personal/two"] {
-            let repo = home.join(path);
-            std::fs::create_dir_all(repo.join(".git")).unwrap();
-            std::fs::write(
-                repo.join(".git/config"),
-                "[remote \"origin\"]\n url = git@github.com:example-org/app.git\n",
-            )
-            .unwrap();
-        }
-        let scan = crate::checks::repos::scan_and_store(
-            &temp.path().join("client"),
-            &home,
-            &[home.join("code")],
-            &["github.com/example-org/".to_string()],
-        )
-        .unwrap();
-        assert_eq!(scan.managed_repos_outside, 0);
-        assert_eq!(scan.managed_repos_total, 2);
-        let text = example(
-            &manifest,
-            open_pact_core::Os::Macos,
-            Some(&scan),
-            Some(&home),
-        );
-        assert!(text.contains("# Managed repositories found: 2\n#   ~/code (2)\n"));
-    }
-
-    #[test]
-    fn device_config_example_lists_all_groups_in_a_loadable_folders_line() {
-        let manifest =
-            open_pact_core::Manifest::parse(include_bytes!("../../../examples/manifest.toml"))
-                .unwrap();
-        let home = Path::new(if cfg!(windows) {
-            r"C:\Users\example"
-        } else {
-            "/home/example"
-        });
-        let scan = crate::checks::repos::RepoScan {
-            scanned_at: 0,
-            managed_repos_outside: 3,
-            managed_repos_total: 3,
-            outside_paths: Vec::new(),
-            managed_paths: Some(vec![
-                home.join("work/one"),
-                home.join("work/two"),
-                home.join(".tool/three"),
-            ]),
-            partial: false,
-            access_denied: false,
-            causes: Vec::new(),
-        };
-
-        let text = example(
-            &manifest,
-            open_pact_core::Os::Macos,
-            Some(&scan),
-            Some(home),
-        );
-
-        let block = concat!(
-            "[managed_repos]\n",
-            "# Use absolute paths or ~/ paths. Paths stay on this device.\n",
-            "# These folders are reserved for managed repository checks.\n",
-            "# Managed repositories found: 3\n",
-            "#   ~/work (2)\n",
-            "#   ~/.tool (1)\n",
-            "# folders = [\"~/work\", \"~/.tool\"]\n",
-        );
-        assert!(text.contains(block), "{text}");
-
-        let uncommented = text.replacen(
-            "# folders = [\"~/work\", \"~/.tool\"]",
-            "folders = [\"~/work\", \"~/.tool\"]",
-            1,
-        );
-        let config = DeviceConfig::parse(&uncommented, Some(home)).unwrap();
-        assert_eq!(
-            config.managed_repos.unwrap().folders,
-            vec![home.join("work"), home.join(".tool")]
-        );
-    }
-
-    #[test]
-    fn missing_managed_repo_folders_loads_as_an_empty_list() {
-        let config =
-            DeviceConfig::parse("[managed_repos]\n", Some(Path::new("/home/example"))).unwrap();
-
-        assert_eq!(config.managed_repos.unwrap().folders, Vec::<PathBuf>::new());
-    }
-
-    #[test]
-    fn device_config_example_omits_folder_example_when_no_groups_exist() {
-        let manifest =
-            open_pact_core::Manifest::parse(include_bytes!("../../../examples/manifest.toml"))
-                .unwrap();
-        let scan = crate::checks::repos::RepoScan {
-            scanned_at: 0,
-            managed_repos_outside: 0,
-            managed_repos_total: 0,
-            outside_paths: Vec::new(),
-            managed_paths: Some(Vec::new()),
-            partial: false,
-            access_denied: false,
-            causes: Vec::new(),
-        };
-
-        let text = example(&manifest, open_pact_core::Os::Macos, Some(&scan), None);
-
-        assert!(text.contains("# Add the folders that should hold them to `folders`.\n"));
-        assert!(!text.contains("# folders ="));
-        assert!(!text.contains("for example: folders"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn device_config_example_escapes_control_characters_in_repository_locations() {
-        let manifest =
-            open_pact_core::Manifest::parse(include_bytes!("../../../examples/manifest.toml"))
-                .unwrap();
-        let temp = tempfile::tempdir().unwrap();
-        let home = temp.path().join("home");
-        let repo = home.join("work\nunexpected = 1\n#/repo");
-        std::fs::create_dir_all(repo.join(".git")).unwrap();
-        std::fs::write(
-            repo.join(".git/config"),
-            "[remote \"origin\"]\n url = git@github.com:example-org/app.git\n",
-        )
-        .unwrap();
-        let scan = crate::checks::repos::scan_and_store(
-            &temp.path().join("client"),
-            &home,
-            &[],
-            &["github.com/example-org/".to_string()],
-        )
-        .unwrap();
-        let text = example(
-            &manifest,
-            open_pact_core::Os::Macos,
-            Some(&scan),
-            Some(&home),
-        );
-        assert!(
-            text.contains("#   ~/work\\nunexpected = 1\\n# (1)\n"),
-            "{text}"
-        );
-        assert!(!text.contains("# folders ="), "{text}");
-        DeviceConfig::parse(&text, Some(&home)).unwrap();
-    }
-
-    #[test]
-    fn device_config_example_reports_unavailable_and_partial_repository_scans() {
-        let manifest =
-            open_pact_core::Manifest::parse(include_bytes!("../../../examples/manifest.toml"))
-                .unwrap();
-        let missing = example(&manifest, open_pact_core::Os::Macos, None, None);
-        assert!(missing.contains("# Managed repository scan is unavailable.\n"));
-
-        let home = Path::new("/home/example");
-        let partial = crate::checks::repos::RepoScan {
-            scanned_at: chrono::Utc::now().timestamp(),
-            managed_repos_outside: 0,
-            managed_repos_total: 2,
-            outside_paths: Vec::new(),
-            managed_paths: Some(vec![home.join("work/one"), home.join("archive/work/two")]),
-            partial: true,
-            access_denied: false,
-            causes: Vec::new(),
-        };
-        let text = example(
-            &manifest,
-            open_pact_core::Os::Macos,
-            Some(&partial),
-            Some(home),
-        );
-        assert!(
-            text.contains("# Managed repository scan was partial; results may be incomplete.\n")
-        );
-        assert!(text.contains(
-            "# Managed repositories found: 2\n#   ~/archive (1)\n#   ~/work (1)\n# Managed repository scan was partial; results may be incomplete.\n# folders = [\"~/archive\", \"~/work\"]\n"
-        ));
-
-        let old = crate::checks::repos::RepoScan {
-            scanned_at: chrono::Utc::now().timestamp(),
-            managed_repos_outside: 0,
-            managed_repos_total: 2,
-            outside_paths: Vec::new(),
-            managed_paths: None,
-            partial: false,
-            access_denied: false,
-            causes: Vec::new(),
-        };
-        let text = example(
-            &manifest,
-            open_pact_core::Os::Macos,
-            Some(&old),
-            Some(Path::new("/home/example")),
-        );
-        assert!(text.contains("# Managed repository locations are unavailable.\n"));
-        assert!(!text.contains("# Managed repositories found: 0"));
     }
 
     #[test]
@@ -954,186 +392,6 @@ grace = "0d"
         assert_eq!(
             managed_repo_summary(&unavailable, Path::new("/home/example")),
             "  Managed repository locations are unavailable.\n"
-        );
-    }
-
-    #[test]
-    fn device_config_sections_and_expansion_need_no_filesystem() {
-        let user_home = if cfg!(windows) {
-            Path::new(r"C:\Users\example")
-        } else {
-            Path::new("/home/example")
-        };
-        let absolute = user_home.join("work");
-        let text = format!(
-            r#"
-[schedule]
-enabled = true
-run_as = "user"
-mode = "vpn"
-vpn_probe = "10.20.0.1:443"
-[managed_repos]
-folders = ['~/missing', '{}']
-"#,
-            absolute.display()
-        );
-        let config = DeviceConfig::parse(&text, Some(user_home)).unwrap();
-        assert_eq!(
-            config.schedule.unwrap().send,
-            Some(SendPolicy::Vpn {
-                probe: ProbeAddress::parse("10.20.0.1:443").unwrap(),
-                name: None,
-            })
-        );
-        assert_eq!(
-            config.managed_repos.unwrap().folders,
-            [user_home.join("missing"), absolute]
-        );
-        assert_eq!(
-            DeviceConfig::parse("", None).unwrap(),
-            DeviceConfig::default()
-        );
-    }
-
-    #[test]
-    fn device_config_rejects_unknown_keys_and_bad_values() {
-        for (text, key) in [
-            ("other = 1", "other"),
-            (
-                "[schedule]\nenabled = true\nrun_as = 'user'\nmode = 'vpn'\nvpn_probe = 'bad'",
-                "vpn_probe",
-            ),
-            ("[schedule]\nenabled = true\nrun_as = 'root'", "run_as"),
-            (
-                "[schedule]\nenabled = true\nrun_as = 'user'\nextra = 1",
-                "extra",
-            ),
-            ("[managed_repos]\nfolders = ['relative']", "folders"),
-            ("[managed_repos]\nfolders = []\nextra = 1", "extra"),
-        ] {
-            let error = format!("{:#}", DeviceConfig::parse(text, None).unwrap_err());
-            assert!(error.contains(key), "{error}");
-        }
-    }
-
-    #[test]
-    fn an_enabled_schedule_needs_a_vpn_mode_and_a_probe() {
-        for (text, key) in [
-            ("[schedule]\nenabled = true\nrun_as = 'user'", "mode"),
-            (
-                "[schedule]\nenabled = true\nrun_as = 'user'\nmode = 'vpn'",
-                "vpn_probe",
-            ),
-            (
-                "[schedule]\nenabled = true\nrun_as = 'user'\nvpn_probe = '10.20.0.1:443'",
-                "mode",
-            ),
-        ] {
-            let error = format!("{:#}", DeviceConfig::parse(text, None).unwrap_err());
-            assert!(
-                error.contains(&format!("[schedule].{key} is required")),
-                "{error}"
-            );
-        }
-        let config = DeviceConfig::parse(
-            "[schedule]\nenabled = true\nrun_as = 'user'\nmode = 'vpn'\nvpn_probe = '[::1]:8443'",
-            None,
-        )
-        .unwrap();
-        assert_eq!(
-            config.schedule.unwrap().send,
-            Some(SendPolicy::Vpn {
-                probe: ProbeAddress::parse("[::1]:8443").unwrap(),
-                name: None,
-            })
-        );
-    }
-
-    #[test]
-    fn vpn_probe_name_is_parsed_and_checked() {
-        let text = "[schedule]\nenabled = true\nrun_as = 'user'\nmode = 'vpn'\nvpn_probe = '10.0.0.1:443'\nvpn_probe_name = 'vpn.example.org'";
-        assert_eq!(
-            DeviceConfig::parse(text, None)
-                .unwrap()
-                .schedule
-                .unwrap()
-                .send,
-            Some(SendPolicy::Vpn {
-                probe: ProbeAddress::parse("10.0.0.1:443").unwrap(),
-                name: Some(ProbeName::parse("vpn.example.org").unwrap()),
-            })
-        );
-        for bad in [
-            "",
-            "10.0.0.1",
-            "[::1]",
-            "vpn.example.org.",
-            "vpn example.org",
-            "-vpn.example.org",
-            "a..example.org",
-        ] {
-            let text = format!(
-                "[schedule]\nenabled = true\nrun_as = 'user'\nmode = 'vpn'\nvpn_probe = '10.0.0.1:443'\nvpn_probe_name = '{bad}'"
-            );
-            let error = format!("{:#}", DeviceConfig::parse(&text, None).unwrap_err());
-            assert!(
-                error.contains("[schedule].vpn_probe_name") && error.contains("DNS name"),
-                "{bad:?}: {error}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_schedule_mode_other_than_vpn_is_rejected() {
-        for (mode, hint) in [
-            ("always", "\"always\" is not available"),
-            ("sometimes", "must be \"vpn\""),
-        ] {
-            for enabled in [false, true] {
-                let text = format!(
-                    "[schedule]\nenabled = {enabled}\nrun_as = 'user'\nmode = '{mode}'\nvpn_probe = '10.20.0.1:443'"
-                );
-                let error = format!("{:#}", DeviceConfig::parse(&text, None).unwrap_err());
-                assert!(
-                    error.contains("[schedule].mode") && error.contains(hint),
-                    "{error}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn a_schedule_off_needs_no_probe_and_keeps_the_keys_it_has() {
-        let config = DeviceConfig::parse(
-            "[schedule]\nenabled = false\nrun_as = 'user'\nmode = 'vpn'",
-            None,
-        )
-        .unwrap();
-        assert_eq!(config.schedule.unwrap().send, None);
-    }
-
-    #[test]
-    fn an_old_report_table_names_how_to_move_the_probe() {
-        let error = DeviceConfig::parse(
-            "[report]\ncollector = 'https://collector.example.org/status'\nvpn_probe = '10.20.0.1:443'\n[schedule]\nenabled = true\nrun_as = 'user'",
-            None,
-        )
-        .unwrap_err()
-        .to_string();
-        assert_eq!(
-            error,
-            "[report] was removed: the gateway now receives claims. Move `vpn_probe = \"10.20.0.1:443\"` into [schedule], add `mode = \"vpn\"`, and delete [report]"
-        );
-        let error = DeviceConfig::parse(
-            "[report]\ncollector = 'https://collector.example.org/status'",
-            None,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(
-            error.contains("[report] was removed")
-                && error.contains("answers only on the company VPN"),
-            "{error}"
         );
     }
 }

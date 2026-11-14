@@ -84,28 +84,17 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// Prepare open-pact.toml from the signed manifest, then run the checks
-    Finish {
-        /// Write without asking for confirmation
-        #[arg(long)]
-        yes: bool,
-    },
-    /// Reconcile the scheduled claim job with open-pact.toml
-    Apply {
-        #[arg(long)]
-        dry_run: bool,
-    },
-    /// Print a device configuration template
-    Config {
+    /// Choose the folders that hold your repositories, for the manifest's repository checks
+    Folders {
         #[command(subcommand)]
-        command: ConfigCommand,
+        command: FoldersCommand,
     },
-    /// Show the manifest this device signed
+    /// Show the manifest this device signed and where its full text is
     Manifest {
         #[command(subcommand)]
         command: ManifestCommand,
     },
-    /// Internal scheduled claim commands
+    /// Turn automatic sending of claims on or off, or show its state
     Schedule {
         #[command(subcommand)]
         command: schedule::Command,
@@ -122,9 +111,13 @@ enum Command {
 }
 
 #[derive(Subcommand)]
-enum ConfigCommand {
-    /// Print a commented open-pact.toml template for the enrolled manifest
-    Example,
+enum FoldersCommand {
+    /// Show the folders
+    List,
+    /// Add a folder that holds repositories. `~` is your home folder
+    Add { path: PathBuf },
+    /// Remove a folder
+    Remove { path: PathBuf },
 }
 
 #[derive(Subcommand)]
@@ -284,6 +277,26 @@ fn is_retryable_http_error(error: &reqwest::Error) -> bool {
 const LOG_KEY: &str = "log-key.txt";
 const COMPANY_KEY: &str = "company-key.txt";
 const LOG_CHECKPOINT: &str = "log-checkpoint.txt";
+/// The manifest the owner reads before signing: the one `join` shows, or the one `accept` shows.
+const PENDING_MANIFEST: &str = "manifest-to-sign.toml";
+
+/// A copy of a manifest in the home, so the owner can open and read all of it while the client
+/// waits for a yes. It is removed when the question is answered.
+struct ReadingCopy(PathBuf);
+
+impl ReadingCopy {
+    fn write(home: &Home, toml: &str) -> Result<Self> {
+        Ok(Self(std::path::absolute(
+            home.write(PENDING_MANIFEST, toml.as_bytes())?,
+        )?))
+    }
+}
+
+impl Drop for ReadingCopy {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
 const LEGACY_LOG_HEAD: &str = "log-head.json";
 
 #[derive(Deserialize)]
@@ -855,6 +868,20 @@ impl Home {
         self.file(LEGACY_LOG_HEAD).exists() && !self.file(LOG_CHECKPOINT).exists()
     }
 
+    /// The manifest this owner signed: the stored text, checked against the signed hash.
+    fn signed_manifest(&self) -> Result<Manifest> {
+        let enrolment = self.enrolment()?;
+        let manifest = Manifest::parse(&read_home_file(&self.file("manifest.toml"))?)?;
+        if manifest.hash() != &enrolment.manifest {
+            return Err(stored_manifest_mismatch(
+                self,
+                manifest.hash(),
+                &enrolment.manifest,
+            ));
+        }
+        Ok(manifest)
+    }
+
     fn enrolment(&self) -> Result<Enrolment> {
         self.read_json("enrolment.json")?
             .context("not enrolled; run `open-pact-client join <invitation from IT>` first")
@@ -936,9 +963,7 @@ async fn scan_repositories_from(
         Some(root) => root.to_path_buf(),
         None => repository_scan_root(home)?,
     };
-    let folders = config
-        .and_then(|config| config.managed_repos.as_ref())
-        .map_or_else(Vec::new, |repos| repos.folders.clone());
+    let folders = config.map_or_else(Vec::new, |config| config.folders.clone());
     let patterns = manifest
         .body()
         .controls
@@ -1114,6 +1139,13 @@ fn write_summary(
         b.claim_max_age, b.unknown_grace, b.min_trust_level
     )?;
     writeln!(output, "  Manifest     {}", manifest.hash())?;
+    match &b.schedule {
+        Some(schedule) => writeln!(output, "  {schedule}")?,
+        None => writeln!(
+            output,
+            "  Automatic claims: none. You send claims by hand with `check`"
+        )?,
+    }
     writeln!(
         output,
         "  Company key  {}  (matches your invitation)",
@@ -1197,18 +1229,19 @@ fn write_summary(
 
 fn manifest_show(home: &Home) -> Result<String> {
     let enrolment = home.enrolment()?;
-    let manifest_path = home.file("manifest.toml");
-    let manifest = Manifest::parse(&read_home_file(&manifest_path)?)?;
-    if manifest.hash() != &enrolment.manifest {
-        bail!("manifest.toml no longer matches the hash you signed");
-    }
+    let manifest_path = std::path::absolute(home.file("manifest.toml"))?;
+    let manifest = home.signed_manifest()?;
     let company = home.read_text(COMPANY_KEY)?.context(
         "this device has no pinned company key; run `open-pact-client join <invitation from IT>`",
     )?;
     let mut output = Vec::new();
     write_summary(&mut output, &manifest, company.trim(), current_os()?)?;
     writeln!(output, "Signed hash  {}", enrolment.manifest)?;
-    writeln!(output, "Manifest     {}", manifest_path.display())?;
+    writeln!(
+        output,
+        "Full text    {}  (open it and read all of it)",
+        manifest_path.display()
+    )?;
     if let Some(index) = enrolment.log_entries.map(|entries| entries.manifest) {
         writeln!(output, "Transparency log entry  #{index}")?;
     } else {
@@ -1219,6 +1252,18 @@ fn manifest_show(home: &Home) -> Result<String> {
         )?;
     }
     Ok(String::from_utf8(output)?)
+}
+
+async fn confirm_yes_by_default(question: &str) -> Result<bool> {
+    let question = question.to_string();
+    let (send, receive) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let input = std::io::stdin();
+        let mut output = std::io::stdout();
+        let result = confirm_yes_by_default_from(&question, &mut input.lock(), &mut output);
+        let _ = send.send(result);
+    });
+    Ok(receive.await.context("confirmation input stopped")??)
 }
 
 async fn confirm(question: &str) -> Result<bool> {
@@ -1273,180 +1318,6 @@ fn confirm_yes_by_default_from(
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum EditorCommand {
-    Shell(String),
-    MacOpen,
-    LinuxOpen,
-    WindowsNotepad,
-}
-
-impl EditorCommand {
-    fn select(visual: Option<&str>, editor: Option<&str>, os: EditorOs) -> Self {
-        if let Some(command) = visual.filter(|command| !command.trim().is_empty()) {
-            return Self::Shell(command.to_owned());
-        }
-        if let Some(command) = editor.filter(|command| !command.trim().is_empty()) {
-            return Self::Shell(command.to_owned());
-        }
-        match os {
-            EditorOs::Macos => Self::MacOpen,
-            EditorOs::Linux => Self::LinuxOpen,
-            EditorOs::Windows => Self::WindowsNotepad,
-        }
-    }
-
-    fn blocks(&self) -> bool {
-        matches!(self, Self::Shell(_) | Self::WindowsNotepad)
-    }
-
-    fn run(&self, path: &Path) -> std::io::Result<()> {
-        use std::process::Command;
-
-        let status = match self {
-            Self::Shell(command) if cfg!(windows) => Command::new("cmd")
-                .arg("/C")
-                .arg(format!("{command} \"{}\"", path.display()))
-                .status()?,
-            Self::Shell(command) => Command::new("sh")
-                .arg("-c")
-                .arg(format!("{command} \"$@\""))
-                .arg(command)
-                .arg(path)
-                .status()?,
-            Self::MacOpen => Command::new("open").arg("-t").arg(path).status()?,
-            Self::LinuxOpen => Command::new("xdg-open").arg(path).status()?,
-            Self::WindowsNotepad => Command::new("notepad.exe").arg(path).status()?,
-        };
-        if status.success() {
-            Ok(())
-        } else {
-            Err(std::io::Error::other(format!(
-                "editor exited with {status}"
-            )))
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum EditorOs {
-    Macos,
-    Linux,
-    Windows,
-}
-
-fn editor_os() -> EditorOs {
-    if cfg!(windows) {
-        EditorOs::Windows
-    } else if cfg!(target_os = "macos") {
-        EditorOs::Macos
-    } else {
-        EditorOs::Linux
-    }
-}
-
-async fn review_config(home: &Home, step: u8) -> Result<bool> {
-    let home = home.0.clone();
-    let (send, receive) = tokio::sync::oneshot::channel();
-    std::thread::spawn(move || {
-        let input = std::io::stdin();
-        let mut output = std::io::stdout();
-        let result = review_config_from(&Home(home), &mut input.lock(), &mut output, step);
-        let _ = send.send(result);
-    });
-    receive.await.context("configuration review stopped")?
-}
-
-fn review_config_from(
-    home: &Home,
-    input: &mut impl std::io::BufRead,
-    output: &mut impl Write,
-    step: u8,
-) -> Result<bool> {
-    let command = EditorCommand::select(
-        std::env::var("VISUAL").ok().as_deref(),
-        std::env::var("EDITOR").ok().as_deref(),
-        editor_os(),
-    );
-    review_config_with(home, input, output, &command, step, |path| {
-        command.run(path)
-    })
-}
-
-fn open_editor_for_review(
-    path: &Path,
-    input: &mut impl std::io::BufRead,
-    output: &mut impl Write,
-    command: &EditorCommand,
-    open_editor: &mut impl FnMut(&Path) -> std::io::Result<()>,
-) -> Result<()> {
-    match open_editor(path) {
-        Ok(()) if !command.blocks() => {
-            writeln!(output, "Save the file, then press Enter to continue.")?;
-            wait_for_enter(input)?;
-        }
-        Ok(()) => {}
-        Err(error) => {
-            writeln!(output, "Could not open the editor: {error}")?;
-            writeln!(output, "Edit {} by hand.", path.display())?;
-            writeln!(output, "Save the file, then press Enter to continue.")?;
-            wait_for_enter(input)?;
-        }
-    }
-    Ok(())
-}
-
-fn review_config_with(
-    home: &Home,
-    input: &mut impl std::io::BufRead,
-    output: &mut impl Write,
-    command: &EditorCommand,
-    step: u8,
-    mut open_editor: impl FnMut(&Path) -> std::io::Result<()>,
-) -> Result<bool> {
-    let path = home.file(device_config::FILE);
-    reject_config_symlink(&path)?;
-    writeln!(output, "Review {} before the first claim.", path.display())?;
-    writeln!(output, "For example, add repository folders to `folders`.")?;
-    writeln!(
-        output,
-        "The scheduled job stays off until you enable [schedule] and run `apply`."
-    )?;
-    if confirm_yes_by_default_from("Open open-pact.toml in your editor?", input, output)? {
-        open_editor_for_review(&path, input, output, command, &mut open_editor)?;
-    }
-
-    loop {
-        reject_config_symlink(&path)?;
-        match device_config::DeviceConfig::load(home).and_then(|config| {
-            config.ok_or_else(|| anyhow::anyhow!("{} is missing", path.display()))
-        }) {
-            Ok(_) => break,
-            Err(error) => {
-                writeln!(output, "{error:#}")?;
-                if !confirm_yes_by_default_from("Open it again?", input, output)? {
-                    print_stopped_at(home, None, step);
-                    return Ok(false);
-                }
-                open_editor_for_review(&path, input, output, command, &mut open_editor)?;
-            }
-        }
-    }
-
-    if confirm_yes_by_default_from("Send the first claim now?", input, output)? {
-        Ok(true)
-    } else {
-        print_stopped_at(home, None, step);
-        Ok(false)
-    }
-}
-
-fn wait_for_enter(input: &mut impl std::io::BufRead) -> std::io::Result<()> {
-    let mut line = String::new();
-    input.read_line(&mut line)?;
-    Ok(())
-}
-
 enum LogSync {
     Verified(Checkpoint, OwnEntries),
     /// The gateway holds the acceptance of the manifest it enforces, which this device has not
@@ -1465,29 +1336,6 @@ fn read_optional_file(path: &Path) -> Result<Option<Vec<u8>>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
     }
-}
-
-fn unified_diff(old: Option<&str>, new: &str) -> String {
-    let old_lines: Vec<_> = old.unwrap_or_default().lines().collect();
-    let new_lines: Vec<_> = new.lines().collect();
-    let mut diff = format!(
-        "--- open-pact.toml\n+++ open-pact.toml (proposal)\n@@ -1,{} +1,{} @@\n",
-        old_lines.len(),
-        new_lines.len()
-    );
-    diff.push_str(
-        &old_lines
-            .iter()
-            .map(|line| format!("-{line}\n"))
-            .collect::<String>(),
-    );
-    diff.push_str(
-        &new_lines
-            .iter()
-            .map(|line| format!("+{line}\n"))
-            .collect::<String>(),
-    );
-    diff
 }
 
 fn write_temporary(
@@ -1529,219 +1377,284 @@ fn write_temporary(
     result
 }
 
-fn reject_config_symlink(path: &Path) -> Result<()> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            bail!(
-                "open-pact.toml is a symbolic link. finish does not change it. Edit the target file by hand."
+/// The folder of the user's own profile, where `~` points.
+fn user_profile() -> Option<PathBuf> {
+    std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from)
+}
+
+/// What the owner chose in wizard step 5.
+#[derive(Debug, PartialEq)]
+struct SetupChoices {
+    auto_send: bool,
+    run_as: device_config::RunAs,
+    folders: Vec<PathBuf>,
+}
+
+/// What step 5 knows before it asks.
+struct SetupContext {
+    manifest: Manifest,
+    os: Os,
+    current: device_config::DeviceConfig,
+    /// What the repository scan found, in words, or nothing.
+    overview: String,
+    /// Folders that hold the repositories the scan found.
+    suggested: Vec<PathBuf>,
+    /// Folders from an `open-pact.toml` of an earlier client.
+    legacy: Vec<PathBuf>,
+    user_home: Option<PathBuf>,
+}
+
+fn folder_list(folders: &[PathBuf]) -> String {
+    folders
+        .iter()
+        .map(|folder| folder.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The owner's choices: automatic sending (only when the manifest defines it), who runs the job
+/// (Windows only), and repository folders (only when the manifest has a repository control).
+fn setup_questions(
+    context: &SetupContext,
+    input: &mut impl std::io::BufRead,
+    output: &mut impl Write,
+) -> Result<SetupChoices> {
+    let mut auto_send = false;
+    let mut run_as = context.current.run_as;
+    if let Some(schedule) = &context.manifest.body().schedule {
+        writeln!(output, "  {schedule}")?;
+        let question = match schedule.policy {
+            open_pact_core::SendPolicy::Vpn { .. } => {
+                "Send claims automatically while on the company VPN?"
+            }
+            open_pact_core::SendPolicy::Always => "Send claims automatically as the manifest says?",
+        };
+        auto_send = confirm_yes_by_default_from(question, input, output)?;
+        if auto_send && context.os == Os::Windows {
+            run_as = if confirm_from(
+                "Run the job as SYSTEM instead of as you? SYSTEM needs an elevated PowerShell prompt"
+                    .into(),
+                input,
+                output,
+            )? {
+                device_config::RunAs::System
+            } else {
+                device_config::RunAs::User
+            };
+        }
+    } else {
+        writeln!(
+            output,
+            "  The company did not define automatic sending. You send claims by hand with `check`."
+        )?;
+    }
+    let mut folders = context.current.folders.clone();
+    if scans_repositories(&context.manifest) {
+        writeln!(
+            output,
+            "\n  The manifest counts repositories by their remote. It needs the folders that hold them."
+        )?;
+        write!(output, "{}", context.overview)?;
+        if !folders.is_empty() {
+            writeln!(output, "  Your folders now: {}", folder_list(&folders))?;
+        }
+        let new_in = |folders: &[PathBuf], candidates: &[PathBuf]| {
+            candidates
+                .iter()
+                .filter(|folder| !folders.contains(folder))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let legacy = new_in(&folders, &context.legacy);
+        if !legacy.is_empty()
+            && confirm_yes_by_default_from(
+                &format!(
+                    "Import these folders from {}: {}?",
+                    device_config::LEGACY_FILE,
+                    folder_list(&legacy)
+                ),
+                input,
+                output,
+            )?
+        {
+            folders.extend(legacy);
+        }
+        let suggested = new_in(&folders, &context.suggested);
+        if !suggested.is_empty()
+            && confirm_yes_by_default_from(
+                &format!(
+                    "Use these folders for the repository checks: {}?",
+                    folder_list(&suggested)
+                ),
+                input,
+                output,
+            )?
+        {
+            folders.extend(suggested);
+        }
+        loop {
+            write!(
+                output,
+                "Another folder that holds repositories (empty line to finish): "
+            )?;
+            output.flush()?;
+            let mut line = String::new();
+            if input.read_line(&mut line)? == 0 || line.trim().is_empty() {
+                break;
+            }
+            match device_config::absolute_folder(
+                Path::new(line.trim()),
+                context.user_home.as_deref(),
+            ) {
+                Ok(folder) if folders.contains(&folder) => {
+                    writeln!(output, "{} is already listed.", folder.display())?
+                }
+                Ok(folder) => folders.push(folder),
+                Err(error) => writeln!(output, "{error:#}")?,
+            }
+        }
+    }
+    Ok(SetupChoices {
+        auto_send,
+        run_as,
+        folders,
+    })
+}
+
+/// Saves the choices and installs or removes the job to match.
+async fn apply_setup(home: &Home, choices: SetupChoices) -> Result<()> {
+    let was_on = {
+        let _claim_lock = claim::lock(home).await?;
+        let mut config = device_config::DeviceConfig::load(home)?;
+        let was_on = config.auto_send;
+        config.folders = choices.folders;
+        config.run_as = choices.run_as;
+        config.save(home)?;
+        was_on
+    };
+    if choices.auto_send {
+        if let Err(error) = schedule::turn_on(home, Some(choices.run_as), false).await {
+            println!(
+                "The job was not installed: {error:#}\nRun `{} schedule on` when you can.",
+                client_command(&home.0)
             );
         }
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).with_context(|| format!("inspect {}", path.display())),
+    } else if was_on {
+        schedule::turn_off(home, false).await?;
     }
+    Ok(())
 }
 
-fn create_backup(
-    path: &Path,
-    bytes: &[u8],
-    permissions: Option<std::fs::Permissions>,
-) -> Result<PathBuf> {
-    create_backup_at(
-        path,
-        bytes,
-        permissions,
-        &chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string(),
-    )
-}
-
-fn create_backup_at(
-    path: &Path,
-    bytes: &[u8],
-    permissions: Option<std::fs::Permissions>,
-    timestamp: &str,
-) -> Result<PathBuf> {
-    use std::fs::OpenOptions;
-
-    let name = path
-        .file_name()
-        .context("file has no name")?
-        .to_string_lossy();
-    let prefix = format!("{name}.bak-{timestamp}");
-    let mut attempt = 1u32;
-    loop {
-        let candidate = if attempt == 1 {
-            prefix.clone()
-        } else {
-            format!("{prefix}-{attempt}")
-        };
-        let backup = path.with_file_name(candidate);
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = match options.open(&backup) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                attempt = attempt
-                    .checked_add(1)
-                    .context("backup name suffix overflow")?;
-                continue;
-            }
-            Err(error) => {
-                return Err(error).with_context(|| format!("create {}", backup.display()));
-            }
-        };
-        let result = (|| -> Result<()> {
-            if let Some(permissions) = permissions {
-                file.set_permissions(permissions)?;
-            }
-            file.write_all(bytes)?;
-            file.sync_all()?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = std::fs::remove_file(&backup);
-        }
-        result?;
-        return Ok(backup);
-    }
-}
-
-#[cfg(test)]
-thread_local! {
-    static FINISH_WRITE_HOOK: std::cell::Cell<Option<fn(&Path)>> = const { std::cell::Cell::new(None) };
-}
-
-fn before_finish_rename(path: &Path) {
-    #[cfg(test)]
-    FINISH_WRITE_HOOK.with(|hook| {
-        if let Some(hook) = hook.take() {
-            hook(path);
-        }
-    });
-    #[cfg(not(test))]
-    let _ = path;
-}
-
-fn write_proposal(home: &Home, expected: Option<&[u8]>, proposal: &str) -> Result<Option<PathBuf>> {
-    let path = home.file(device_config::FILE);
-    reject_config_symlink(&path)?;
-    let current = read_optional_file(&path)?;
-    if current.as_deref() != expected {
-        bail!("open-pact.toml changed while finish ran. Run finish again.");
-    }
-    if current.as_deref() == Some(proposal.as_bytes()) {
-        return Ok(None);
-    }
-    let permissions = match std::fs::metadata(&path) {
-        Ok(metadata) => Some(metadata.permissions()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => {
-            return Err(error).with_context(|| format!("read permissions for {}", path.display()));
-        }
-    };
-    let temporary = write_temporary(&path, proposal.as_bytes(), permissions.clone())?;
-    let backup = match &current {
-        Some(bytes) => match create_backup(&path, bytes, permissions) {
-            Ok(backup) => Some(backup),
-            Err(error) => {
-                let _ = std::fs::remove_file(&temporary);
-                return Err(error);
-            }
-        },
-        None => None,
-    };
-    before_finish_rename(&path);
-    let check = reject_config_symlink(&path).and_then(|()| read_optional_file(&path));
-    let unchanged = matches!(check.as_ref(), Ok(bytes) if bytes.as_deref() == expected);
-    if !unchanged {
-        let _ = std::fs::remove_file(&temporary);
-        if let Some(backup) = &backup {
-            let _ = std::fs::remove_file(backup);
-        }
-        check?;
-        bail!("open-pact.toml changed while finish ran. Run finish again.");
-    }
-    let result = std::fs::rename(&temporary, &path)
-        .with_context(|| format!("rename {} to {}", temporary.display(), path.display()));
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-        if let Some(backup) = &backup {
-            let _ = std::fs::remove_file(backup);
-        }
-    }
-    result?;
-    #[cfg(unix)]
-    std::fs::File::open(path.parent().context("file has no parent directory")?)?.sync_all()?;
-    Ok(backup)
-}
-
-async fn finish(home: &Home, insecure_dev: bool, yes: bool, wizard: bool) -> Result<ExitCode> {
-    if wizard {
-        wizard_step(5, "Set up this device");
-    }
-    let path = home.file(device_config::FILE);
-    reject_config_symlink(&path)?;
-    let enrolment = home.enrolment()?;
-    let manifest_path = home.file("manifest.toml");
-    let manifest = Manifest::parse(&read_home_file(&manifest_path)?)?;
-    if manifest.hash() != &enrolment.manifest {
-        bail!("manifest.toml no longer matches the hash you signed");
-    }
-    let existing_bytes = read_optional_file(&path)?;
-    let existing_text = existing_bytes
-        .as_deref()
-        .map(|bytes| String::from_utf8(bytes.to_vec()))
-        .transpose()
-        .with_context(|| format!("{} must be UTF-8", path.display()))?;
+/// Wizard step 5: the owner's few choices, then the first check.
+async fn setup_device(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
+    wizard_step(5, "Set up this device");
+    let manifest = home.signed_manifest()?;
     let os = current_os()?;
-    let repo_scan = proposal_repo_scan(home)?;
-    let user_home =
-        std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from);
-    let proposal = existing_text.clone().unwrap_or_else(|| {
-        device_config::example(&manifest, os, repo_scan.as_ref(), user_home.as_deref())
+    let user_home = user_profile();
+    let scan = proposal_repo_scan(home)?;
+    let context = SetupContext {
+        os,
+        current: device_config::DeviceConfig::load(home)?,
+        overview: scan
+            .as_ref()
+            .zip(user_home.as_deref())
+            .map_or_else(String::new, |(scan, user_home)| {
+                device_config::managed_repo_summary(scan, user_home)
+            }),
+        suggested: scan
+            .as_ref()
+            .and_then(|scan| scan.managed_paths.as_ref())
+            .zip(user_home.as_deref())
+            .map_or_else(Vec::new, |(paths, user_home)| {
+                checks::repos::managed_repo_groups(paths, user_home)
+                    .into_iter()
+                    .filter_map(|(group, _)| {
+                        let folder = match group.strip_prefix("~/") {
+                            Some(rest) => user_home.join(rest),
+                            None => user_home.to_path_buf(),
+                        };
+                        (device_config::safe_comment_text(&folder.display().to_string())
+                            == folder.display().to_string())
+                        .then_some(folder)
+                    })
+                    .collect()
+            }),
+        legacy: device_config::legacy_folders(home, user_home.as_deref()),
+        manifest,
+        user_home,
+    };
+    let (send, receive) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let input = std::io::stdin();
+        let mut output = std::io::stdout();
+        let _ = send.send(setup_questions(&context, &mut input.lock(), &mut output));
     });
-    let unchanged = existing_text.as_deref() == Some(proposal.as_str());
-    if unchanged {
-        println!("No changes to {}.", path.display());
-    } else {
-        print!("{}", unified_diff(existing_text.as_deref(), &proposal));
-    }
-    if !unchanged && !yes {
-        match confirm("Write open-pact.toml?").await {
-            Ok(true) => {}
-            Ok(false) => {
-                if wizard {
-                    print_stopped(home, None);
-                }
-                return Ok(ExitCode::SUCCESS);
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    if !unchanged && let Some(backup) = write_proposal(home, existing_bytes.as_deref(), &proposal)?
-    {
-        println!("Backup written to {}", backup.display());
-    }
-    let review_wizard =
-        wizard && !yes && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-    if review_wizard {
-        set_wizard_step(6);
-    }
-    if review_wizard && !review_config(home, 6).await? {
+    let choices = receive.await.context("setup questions stopped")??;
+    apply_setup(home, choices).await?;
+    first_claim(home, insecure_dev).await
+}
+
+/// Wizard step 6: ask once more, then run the first check.
+async fn first_claim(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
+    set_wizard_step(6);
+    if !confirm_yes_by_default("Send the first claim now?").await? {
+        print_stopped_at(home, None, 6);
         return Ok(ExitCode::SUCCESS);
     }
-    if wizard {
-        wizard_step(6, "First check and claim");
+    wizard_step(6, "First check and claim");
+    check_impl(home, insecure_dev, false).await
+}
+
+/// \`folders list|add|remove\`: the owner's repository folders.
+async fn folders(home: &Home, command: FoldersCommand) -> Result<ExitCode> {
+    let user_home = user_profile();
+    let mut config = device_config::DeviceConfig::load(home)?;
+    if let FoldersCommand::List = command {
+        if config.folders.is_empty() {
+            println!(
+                "No folders. Add one with `{} folders add <path>`.",
+                client_command(&home.0)
+            );
+        }
+        for folder in &config.folders {
+            println!("{}", folder.display());
+        }
+        return Ok(ExitCode::SUCCESS);
     }
-    match check_impl(home, insecure_dev, !wizard).await {
-        Ok(code) => Ok(code),
-        Err(error) => Err(error),
+    let _claim_lock = claim::lock(home).await?;
+    config = device_config::DeviceConfig::load(home)?;
+    match command {
+        FoldersCommand::List => unreachable!("handled above"),
+        FoldersCommand::Add { path } => {
+            let folder = device_config::absolute_folder(&path, user_home.as_deref())?;
+            if !folder.is_dir() {
+                println!("note: {} is not an existing folder yet.", folder.display());
+            }
+            if config.add_folder(folder.clone()) {
+                config.save(home)?;
+                println!("Added {}.", folder.display());
+            } else {
+                println!("{} is already listed.", folder.display());
+            }
+            if home
+                .signed_manifest()
+                .is_ok_and(|manifest| !scans_repositories(&manifest))
+            {
+                println!(
+                    "The manifest you signed has no repository control, so no check uses folders now."
+                );
+            }
+        }
+        FoldersCommand::Remove { path } => {
+            let folder = device_config::absolute_folder(&path, user_home.as_deref())?;
+            if !config.remove_folder(&folder) {
+                bail!("{} is not listed", folder.display());
+            }
+            config.save(home)?;
+            println!("Removed {}.", folder.display());
+        }
     }
+    Ok(ExitCode::SUCCESS)
 }
 
 async fn after_approval(home: &Home, insecure_dev: bool, wizard: bool) -> Result<ExitCode> {
@@ -1750,35 +1663,25 @@ async fn after_approval(home: &Home, insecure_dev: bool, wizard: bool) -> Result
         return Ok(ExitCode::SUCCESS);
     }
     match wizard_resume(home)? {
-        WizardResume::Finish => return finish(home, insecure_dev, false, true).await,
+        WizardResume::Setup => return setup_device(home, insecure_dev).await,
         WizardResume::Complete => {
             println!("This device setup is complete.");
             return Ok(ExitCode::SUCCESS);
         }
         WizardResume::FirstCheck => {}
     }
-    set_wizard_step(6);
-    if std::io::stdin().is_terminal()
-        && std::io::stdout().is_terminal()
-        && !review_config(home, 6).await?
-    {
-        return Ok(ExitCode::SUCCESS);
-    }
-    wizard_step(6, "First check and claim");
-    match check_impl(home, insecure_dev, false).await {
-        Ok(code) => Ok(code),
-        Err(error) => Err(error),
-    }
+    first_claim(home, insecure_dev).await
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WizardResume {
-    Finish,
+    Setup,
     FirstCheck,
     Complete,
 }
 
 fn wizard_resume(home: &Home) -> Result<WizardResume> {
+    // Step 5 always saves the owner's choices, so the file marks it as done.
     let configured = home.file(device_config::FILE).exists();
     let (records, damaged) = match locallog::read_lenient(&home.file("claims.jsonl")) {
         Ok(history) => history,
@@ -1789,7 +1692,7 @@ fn wizard_resume(home: &Home) -> Result<WizardResume> {
             return Ok(if configured {
                 WizardResume::FirstCheck
             } else {
-                WizardResume::Finish
+                WizardResume::Setup
             });
         }
     };
@@ -1799,7 +1702,7 @@ fn wizard_resume(home: &Home) -> Result<WizardResume> {
         );
     }
     if !configured {
-        return Ok(WizardResume::Finish);
+        return Ok(WizardResume::Setup);
     }
     let Some(record) = records.last() else {
         return Ok(WizardResume::FirstCheck);
@@ -2572,7 +2475,9 @@ fn print_approved_next_step(command: &str) {
 }
 
 fn approved_next_hint(command: &str) -> String {
-    format!("Next: {command} finish")
+    format!(
+        "Next: {command} check\nThen, if the company allows automatic sending: {command} schedule on"
+    )
 }
 
 fn approval_confirmation() -> &'static str {
@@ -2588,7 +2493,7 @@ fn step_four_intro(
         Some(ApprovalProgress::Approved) => "  This device is already approved.\n".to_string(),
         Some(ApprovalProgress::ProofPending) => String::new(),
         _ if scans_repositories => format!(
-            "  {device_code}\n\n  Read this code to IT. IT approves the device with it.\n  The client now looks for managed repositories in your home folder to prepare the `managed_repos` setup proposal for open-pact.toml.\n"
+            "  {device_code}\n\n  Read this code to IT. IT approves the device with it.\n  The client now looks for managed repositories in your home folder to suggest folders for the repository checks.\n"
         ),
         _ => {
             format!("  {device_code}\n\n  Read this code to IT. IT approves the device with it.\n")
@@ -2649,19 +2554,15 @@ async fn wait_after_join(
             println!("  If macOS asks for access to a folder, you can deny it.");
         }
         let config = device_config::DeviceConfig::load(home)?;
-        if let Some(scan) = scan_repositories(home, manifest, config.as_ref()).await? {
+        if let Some(scan) = scan_repositories(home, manifest, Some(&config)).await? {
             print!(
                 "{}",
                 device_config::managed_repo_summary(&scan, &repository_scan_root(home)?)
             );
         }
         println!("\nNext, after IT approves:");
-        println!("  1. {command} config example");
-        println!(
-            "  2. Save the sections you need as {}",
-            home.file("open-pact.toml").display()
-        );
-        println!("  3. {command} check");
+        println!("  1. {command} join, which asks your few choices and sends the first claim");
+        println!("  or, without the wizard: {command} check, then {command} schedule on");
         print_claim_log_status(home, None, Some("IT has not approved this device yet"));
         return Ok(ExitCode::SUCCESS);
     }
@@ -2677,7 +2578,7 @@ async fn wait_after_join(
         },
     );
     let config = match device_config::DeviceConfig::load(home) {
-        Ok(config) => config,
+        Ok(config) => Some(config),
         Err(_) if resumed && wizard => None,
         Err(error) => return Err(error),
     };
@@ -2797,7 +2698,7 @@ async fn wait_after_join(
             }
             match wait {
                 ApprovalWait::Approved => {
-                    print_claim_log_status(home, None, Some("finish and check have not run yet"))
+                    print_claim_log_status(home, None, Some("setup and check have not run yet"))
                 }
                 ApprovalWait::Revoked => {
                     print_claim_log_status(home, None, Some("IT revoked this device"));
@@ -3026,18 +2927,24 @@ async fn join(
     }
     let os = current_os()?;
     wizard_step(2, "Review and sign the manifest");
+    let reading = ReadingCopy::write(home, &published.toml)?;
     write_summary(
         &mut std::io::stdout().lock(),
         &manifest,
         &published.company.key.fingerprint(),
         os,
     )?;
+    println!(
+        "  Read the whole manifest before you sign: {}\n",
+        reading.0.display()
+    );
     if !yes && !confirm("Sign this manifest as the device owner?").await? {
         if !wizard_enabled(no_wait) {
             println!("Not signed. Nothing was sent. Run join again when you want to enrol.");
         }
         return Ok(ExitCode::FAILURE);
     }
+    drop(reading);
     wizard_step(3, "Enrol this device");
     let owner = dev_key::load_or_create(&home.file("owner-dev.pem"))?;
     let device = DeviceKey::load_or_create(&home.0, software_key)?;
@@ -3329,16 +3236,18 @@ async fn check_impl(home: &Home, insecure_dev: bool, show_resume_hint: bool) -> 
         }
         Err(error) => return Err(error),
     };
-    let user_home =
-        std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from);
-    if let Some(template) = prepared.missing_config_template(user_home.as_deref()) {
-        print!("{template}");
+    if let Some(notice) = device_config::legacy_notice(
+        home,
+        device_config::Surface::Check,
+        &client_command(&home.0),
+    ) {
+        println!("{notice}\n");
     }
     prepared.print_local_report();
     if show_resume_hint {
         let command = client_command(&home.0);
         match wizard_resume(home)? {
-            WizardResume::Finish => {
+            WizardResume::Setup => {
                 println!("Wizard step [5/6] is unfinished. Continue with: {command} join");
             }
             WizardResume::FirstCheck => {
@@ -3484,6 +3393,18 @@ fn manifest_changes(old: &Manifest, new: &Manifest) -> Vec<String> {
         format!("{:?}", was.min_trust_level),
         format!("{:?}", now.min_trust_level),
     );
+    let schedule_words = |manifest: &open_pact_core::ManifestBody| {
+        manifest.schedule.as_ref().map_or_else(
+            || "none".to_owned(),
+            |schedule| {
+                let text = schedule.to_string();
+                text.strip_prefix("Automatic claims: ")
+                    .unwrap_or(&text)
+                    .to_owned()
+            },
+        )
+    };
+    term("automatic claims", schedule_words(was), schedule_words(now));
     // A parsed manifest always has its log policy.
     let (was_log, now_log) = (
         was.log
@@ -3564,19 +3485,27 @@ async fn accept(home: &Home, yes: bool, insecure_dev: bool) -> Result<ExitCode> 
         report_log(alarm(error), home);
         return Ok(ExitCode::from(2));
     }
+    let _reading;
     if !resumed {
         let os = current_os()?;
+        let reading = ReadingCopy::write(home, &published.toml)?;
         println!("The gateway now enforces a new manifest:\n");
         write_summary(&mut std::io::stdout().lock(), &new, &company, os)?;
         println!("Changes against the manifest you signed ({}):", old.hash());
         let changes = manifest_changes(&old, &new);
         if changes.is_empty() {
-            println!("  none in controls, disclosed metadata, retention, recipients or controller");
+            println!(
+                "  none in controls, disclosed metadata, retention, recipients, controller or automatic claims"
+            );
         }
         for change in changes {
             println!("  {change}");
         }
-        println!();
+        println!(
+            "Read the whole new manifest before you sign: {}\n",
+            reading.0.display()
+        );
+        _reading = reading;
         if !yes && !confirm("Sign the new manifest as the device owner?").await? {
             println!("Not signed. Nothing was sent. Run {command} accept when you are ready.");
             return Ok(ExitCode::FAILURE);
@@ -3836,42 +3765,11 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Command::Check { dry_run: false } => check(&home, cli.insecure_dev).await,
         Command::Check { dry_run: true } => check_dry_run(&home, cli.insecure_dev).await,
         Command::Accept { yes } => accept(&home, yes, cli.insecure_dev).await,
-        Command::Finish { yes } => finish(&home, cli.insecure_dev, yes, false).await,
-        Command::Config {
-            command: ConfigCommand::Example,
-        } => {
-            let enrolment = home.enrolment()?;
-            let manifest = Manifest::parse(&read_home_file(&home.file("manifest.toml"))?)?;
-            if manifest.hash() != &enrolment.manifest {
-                bail!("manifest.toml no longer matches the hash you signed");
-            }
-            let repo_scan = proposal_repo_scan(&home)?;
-            let user_home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
-                .map(PathBuf::from);
-            print!(
-                "{}",
-                device_config::example(
-                    &manifest,
-                    current_os()?,
-                    repo_scan.as_ref(),
-                    user_home.as_deref()
-                )
-            );
-            eprintln!(
-                "Next: save the sections you need as {}, then run {} check",
-                std::path::absolute(home.file("open-pact.toml"))?.display(),
-                client_command(&home.0)
-            );
-            Ok(ExitCode::SUCCESS)
-        }
+        Command::Folders { command } => folders(&home, command).await,
         Command::Manifest {
             command: ManifestCommand::Show,
         } => {
             print!("{}", manifest_show(&home)?);
-            Ok(ExitCode::SUCCESS)
-        }
-        Command::Apply { dry_run } => {
-            schedule::apply(&home, dry_run).await?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Schedule { command } => {
@@ -3894,8 +3792,8 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         }
         Command::Stop => {
             println!(
-                "Set [schedule].enabled = false in open-pact.toml, then run `{}` to stop the scheduled claims.",
-                schedule::apply_command(&home.0)
+                "Run `{} schedule off` to stop the scheduled claims.",
+                client_command(&home.0)
             );
             println!(
                 "Before deleting the home or binary, run `open-pact-client delete-device-key` with the same --home."
@@ -3952,170 +3850,6 @@ mod tests {
                     .contains("Answer y or n.")
             );
         }
-    }
-
-    #[test]
-    fn editor_selection_prefers_visual_and_keeps_editor_arguments() {
-        assert_eq!(
-            EditorCommand::select(
-                Some("visual --wait"),
-                Some("editor --quiet"),
-                EditorOs::Linux
-            ),
-            EditorCommand::Shell("visual --wait".into())
-        );
-        assert_eq!(
-            EditorCommand::select(None, Some("editor --quiet"), EditorOs::Linux),
-            EditorCommand::Shell("editor --quiet".into())
-        );
-    }
-
-    #[test]
-    fn editor_selection_uses_the_platform_fallback() {
-        assert_eq!(
-            EditorCommand::select(None, None, EditorOs::Macos),
-            EditorCommand::MacOpen
-        );
-        assert_eq!(
-            EditorCommand::select(None, None, EditorOs::Linux),
-            EditorCommand::LinuxOpen
-        );
-        assert_eq!(
-            EditorCommand::select(None, None, EditorOs::Windows),
-            EditorCommand::WindowsNotepad
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn editor_command_passes_the_config_path_after_arguments() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempfile::tempdir().unwrap();
-        let received = dir.path().join("received.txt");
-        let script = dir.path().join("fake-editor");
-        fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\nprintf '%s|%s' \"$1\" \"$2\" > '{}'\n",
-                received.display()
-            ),
-        )
-        .unwrap();
-        let mut permissions = fs::metadata(&script).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script, permissions).unwrap();
-        let config = dir.path().join("open-pact.toml");
-        EditorCommand::Shell(format!("{} --wait", script.display()))
-            .run(&config)
-            .unwrap();
-
-        assert_eq!(
-            fs::read_to_string(received).unwrap(),
-            format!("--wait|{}", config.display())
-        );
-    }
-
-    #[test]
-    fn review_repairs_invalid_config_then_can_decline_the_first_report() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = Home(dir.path().to_path_buf());
-        let path = home.file(device_config::FILE);
-        fs::write(&path, "[managed_repos\n").unwrap();
-        let mut input = std::io::Cursor::new(b"maybe\n\n\nn\n".as_slice());
-        let mut output = Vec::new();
-        let mut opened = 0;
-        let send = review_config_with(
-            &home,
-            &mut input,
-            &mut output,
-            &EditorCommand::Shell("fake-editor".into()),
-            6,
-            |path| {
-                opened += 1;
-                fs::write(
-                    path,
-                    if opened == 1 {
-                        "[managed_repos\n"
-                    } else {
-                        if cfg!(windows) {
-                            "[managed_repos]\nfolders = [\"C:/work\"]\n"
-                        } else {
-                            "[managed_repos]\nfolders = [\"/work\"]\n"
-                        }
-                    },
-                )
-            },
-        )
-        .unwrap();
-
-        assert!(!send);
-        assert_eq!(opened, 2);
-        assert_eq!(
-            device_config::DeviceConfig::load(&home)
-                .unwrap()
-                .unwrap()
-                .managed_repos
-                .unwrap()
-                .folders,
-            vec![PathBuf::from(if cfg!(windows) {
-                "C:/work"
-            } else {
-                "/work"
-            })]
-        );
-        let output = String::from_utf8(output).unwrap();
-        assert!(output.contains("Open open-pact.toml in your editor? [Y/n]"));
-        assert!(output.contains("Answer y or n."));
-        assert!(output.contains("Open it again? [Y/n]"));
-        assert!(output.contains("Send the first claim now? [Y/n]"));
-    }
-
-    #[test]
-    fn review_waits_after_a_nonblocking_retry_editor() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = Home(dir.path().to_path_buf());
-        fs::write(home.file(device_config::FILE), "[managed_repos\n").unwrap();
-        let mut input = std::io::Cursor::new(b"n\ny\n\nn\n".as_slice());
-        let mut output = Vec::new();
-        let command = EditorCommand::MacOpen;
-        let mut opened = 0;
-        let send = review_config_with(&home, &mut input, &mut output, &command, 6, |path| {
-            opened += 1;
-            fs::write(path, "[managed_repos]\nfolders = []\n")
-        })
-        .unwrap();
-
-        assert!(!send);
-        assert_eq!(opened, 1);
-        let output = String::from_utf8(output).unwrap();
-        assert_eq!(output.matches("Save the file, then press Enter").count(), 1);
-        assert!(output.contains("Send the first claim now? [Y/n]"));
-    }
-
-    #[test]
-    fn review_does_not_send_when_the_config_is_deleted() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = Home(dir.path().to_path_buf());
-        let path = home.file(device_config::FILE);
-        fs::write(&path, "[managed_repos]\nfolders = []\n").unwrap();
-        let mut input = std::io::Cursor::new(b"\nn\n".as_slice());
-        let mut output = Vec::new();
-        let send = review_config_with(
-            &home,
-            &mut input,
-            &mut output,
-            &EditorCommand::Shell("fake-editor".into()),
-            6,
-            |path| fs::remove_file(path),
-        )
-        .unwrap();
-
-        assert!(!send);
-        let output = String::from_utf8(output).unwrap();
-        assert!(output.contains(&format!("{} is missing", path.display())));
-        assert!(output.contains("Open it again? [Y/n]"));
-        assert!(!output.contains("Send the first claim now? [Y/n]"));
     }
 
     #[test]
@@ -4259,12 +3993,8 @@ mod tests {
     fn wizard_resume_requires_a_verified_first_check() {
         let dir = tempfile::tempdir().unwrap();
         let home = Home(dir.path().to_path_buf());
-        assert_eq!(wizard_resume(&home).unwrap(), WizardResume::Finish);
-        fs::write(
-            home.file(device_config::FILE),
-            "[schedule]\nenabled = false\nrun_as = \"user\"\n",
-        )
-        .unwrap();
+        assert_eq!(wizard_resume(&home).unwrap(), WizardResume::Setup);
+        fs::write(home.file(device_config::FILE), "{}").unwrap();
         assert_eq!(wizard_resume(&home).unwrap(), WizardResume::FirstCheck);
         locallog::append(&home.file("claims.jsonl"), b"sent", b"upstream unavailable").unwrap();
         assert_eq!(wizard_resume(&home).unwrap(), WizardResume::FirstCheck);
@@ -4341,159 +4071,6 @@ mod tests {
         assert_eq!(shell_quote_arg("C:\\client home's"), "'C:\\client home''s'");
     }
     use std::fs;
-
-    #[test]
-    fn finish_writer_does_not_rewrite_an_unchanged_owner_config() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = Home(dir.path().to_path_buf());
-        let path = home.file(device_config::FILE);
-        let original = b"# owner note\n[schedule]\nenabled = false\nrun_as = \"user\"\n";
-        let old_backup = home.file("open-pact.toml.bak");
-        fs::write(&old_backup, b"older owner config").unwrap();
-        fs::write(&path, original).unwrap();
-        let proposal = std::str::from_utf8(original).unwrap();
-        assert!(
-            write_proposal(&home, Some(original), proposal)
-                .unwrap()
-                .is_none()
-        );
-        let written = fs::read(&path).unwrap();
-        assert_eq!(written, original);
-        assert_eq!(fs::read(&old_backup).unwrap(), b"older owner config");
-        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
-    }
-
-    #[test]
-    fn finish_creates_the_config_example_once_when_no_file_exists() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = Home(dir.path().to_path_buf());
-        let path = home.file(device_config::FILE);
-        let manifest = Manifest::parse(include_bytes!("../../../examples/manifest.toml")).unwrap();
-        let proposal = device_config::example(&manifest, Os::Macos, None, None);
-
-        assert!(write_proposal(&home, None, &proposal).unwrap().is_none());
-        assert_eq!(fs::read(&path).unwrap(), proposal.as_bytes());
-        let written = fs::read(&path).unwrap();
-        assert!(
-            write_proposal(&home, Some(&written), &proposal)
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(fs::read(&path).unwrap(), written);
-        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
-    }
-
-    #[test]
-    fn finish_write_creates_a_timestamped_backup_without_replacing_old_backups() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = Home(dir.path().to_path_buf());
-        let path = home.file(device_config::FILE);
-        let original = b"owner config\n";
-        fs::write(&path, original).unwrap();
-        let old_backup = home.file("open-pact.toml.bak");
-        fs::write(&old_backup, b"older owner config").unwrap();
-
-        let backup = write_proposal(&home, Some(original), "updated config\n")
-            .unwrap()
-            .unwrap();
-        assert_eq!(fs::read(&path).unwrap(), b"updated config\n");
-        assert_eq!(fs::read(&backup).unwrap(), original);
-        assert_eq!(fs::read(&old_backup).unwrap(), b"older owner config");
-        assert!(
-            backup
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .starts_with("open-pact.toml.bak-")
-        );
-        assert!(fs::read_dir(dir.path()).unwrap().all(|entry| {
-            !entry
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .ends_with(".tmp")
-        }));
-    }
-
-    #[test]
-    fn finish_write_uses_a_suffix_when_the_timestamped_backup_exists() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = dir.path().join("open-pact.toml");
-        let first = create_backup_at(&config, b"older", None, "20261102T120000Z").unwrap();
-        let second = create_backup_at(&config, b"current", None, "20261102T120000Z").unwrap();
-        assert_eq!(
-            first.file_name().unwrap(),
-            "open-pact.toml.bak-20261102T120000Z"
-        );
-        assert_eq!(
-            second.file_name().unwrap(),
-            "open-pact.toml.bak-20261102T120000Z-2"
-        );
-        assert_eq!(fs::read(first).unwrap(), b"older");
-        assert_eq!(fs::read(second).unwrap(), b"current");
-    }
-
-    #[test]
-    fn finish_write_rejects_a_concurrent_owner_edit_without_writing() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = Home(dir.path().to_path_buf());
-        let path = home.file(device_config::FILE);
-        let original = b"[schedule]\nenabled = false\nrun_as = 'user'\n";
-        fs::write(&path, original).unwrap();
-        FINISH_WRITE_HOOK.with(|hook| hook.set(Some(simulate_concurrent_owner_edit)));
-        let error = write_proposal(
-            &home,
-            Some(original),
-            "[schedule]\nenabled = false\nrun_as = 'user'\nmode = 'vpn'\n",
-        )
-        .unwrap_err()
-        .to_string();
-        assert_eq!(
-            error,
-            "open-pact.toml changed while finish ran. Run finish again."
-        );
-        assert!(
-            fs::read_to_string(&path)
-                .unwrap()
-                .contains("# concurrent edit")
-        );
-        assert!(fs::read_dir(dir.path()).unwrap().all(|entry| {
-            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
-            !name.ends_with(".tmp") && !name.starts_with("open-pact.toml.bak-")
-        }));
-    }
-
-    fn simulate_concurrent_owner_edit(path: &Path) {
-        fs::write(
-            path,
-            b"[schedule]\nenabled = false\nrun_as = 'user'\n# concurrent edit\n",
-        )
-        .unwrap();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn finish_refuses_a_dangling_config_symlink_before_writing() {
-        use std::os::unix::fs::symlink;
-
-        let dir = tempfile::tempdir().unwrap();
-        let home = Home(dir.path().to_path_buf());
-        let path = home.file(device_config::FILE);
-        symlink("missing-target", &path).unwrap();
-        let error = write_proposal(
-            &home,
-            None,
-            "[schedule]\nenabled = false\nrun_as = 'user'\n",
-        )
-        .unwrap_err()
-        .to_string();
-        assert_eq!(
-            error,
-            "open-pact.toml is a symbolic link. finish does not change it. Edit the target file by hand."
-        );
-        assert!(fs::read_link(&path).unwrap().ends_with("missing-target"));
-        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
-    }
 
     #[test]
     fn plain_http_only_to_this_machine_unless_insecure_dev() {
@@ -4838,9 +4415,14 @@ mod tests {
         assert!(output.contains("Company key  "));
         assert!(output.contains(&format!("Signed hash  {}", enrolment.manifest)));
         assert!(output.contains(&format!(
-            "Manifest     {}",
-            home.file("manifest.toml").display()
+            "Full text    {}  (open it and read all of it)",
+            std::path::absolute(home.file("manifest.toml"))
+                .unwrap()
+                .display()
         )));
+        assert!(output.contains(
+            "Automatic claims: only while vpn.example.org answers at 10.0.0.1:443, at most every 55m"
+        ));
         assert!(output.contains("Transparency log entry  #12"));
         assert_eq!(home_files(&home), before);
     }
@@ -4861,9 +4443,8 @@ mod tests {
         let error = manifest_show(&home).unwrap_err();
 
         assert!(
-            error
-                .to_string()
-                .contains("manifest.toml no longer matches the hash you signed")
+            error.to_string().contains("disagree") && error.to_string().contains("accept"),
+            "{error}"
         );
     }
 
@@ -5511,7 +5092,7 @@ mod tests {
         assert_eq!(approval_confirmation(), "This device is approved.");
         assert_eq!(
             approved_next_hint("open-pact-client"),
-            "Next: open-pact-client finish"
+            "Next: open-pact-client check\nThen, if the company allows automatic sending: open-pact-client schedule on"
         );
         let requests = gateway.requests();
         assert!(!requests.iter().any(|request| request == "POST /v1/enroll"));
@@ -5611,11 +5192,7 @@ mod tests {
         })
         .await;
         put_gateway_in_enrolment(&home, &mut enrolment, &gateway.url);
-        home.write(
-            device_config::FILE,
-            b"[schedule]\nenabled = false\nrun_as = \"user\"\n",
-        )
-        .unwrap();
+        home.write(device_config::FILE, b"{}").unwrap();
         let accepted_claim = serde_json::to_vec(&json!({
             "status": "accepted",
             "warnings": [],
@@ -6052,9 +5629,14 @@ mod tests {
         response: impl FnOnce(&Company, &Witness, &[Entry], u64) -> Option<String>,
         pair: impl FnOnce(&KeyPair) -> VpnPair,
         device_config: Option<&str>,
+        schedule: Option<&str>,
     ) -> ClaimFixture {
         let (company, witness) = (Company::new(), Witness::new());
         let toml = witnessed_manifest(&witness);
+        let toml = match schedule {
+            Some(table) => with_schedule(&toml, table),
+            None => toml,
+        };
         let manifest = Manifest::parse(toml.as_bytes()).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let device = DeviceKey::load_or_create(dir.path(), true).unwrap();
@@ -6165,7 +5747,7 @@ mod tests {
             home,
             gateway,
             pair,
-        } = claim_fixture_replying(None, enforced, response, pair, device_config).await;
+        } = claim_fixture_replying(None, enforced, response, pair, device_config, None).await;
         let previewed = if preview {
             let before_preview = snapshot(dir.path());
             let claim::Preview::Request(request) = check_preview(&home, false).await.unwrap()
@@ -6264,11 +5846,23 @@ mod tests {
         ["ca.pem", "vpn-cert.pem"].map(|name| std::fs::read(fixture.home.file(name)).unwrap())
     }
 
-    fn vpn_policy(probe: &str) -> device_config::SendPolicy {
-        device_config::SendPolicy::Vpn {
-            probe: device_config::ProbeAddress::parse(probe).unwrap(),
-            name: None,
+    /// `toml` with its `[schedule]` table replaced by `table`.
+    fn with_schedule(toml: &str, table: &str) -> String {
+        format!("{}\n{table}\n", &toml[..toml.find("\n[schedule]").unwrap()])
+    }
+
+    fn every_55_minutes(policy: open_pact_core::SendPolicy) -> open_pact_core::Schedule {
+        open_pact_core::Schedule {
+            policy,
+            interval: open_pact_core::Interval::try_from("55m".to_owned()).unwrap(),
         }
+    }
+
+    fn vpn_schedule(probe: &str) -> open_pact_core::Schedule {
+        every_55_minutes(open_pact_core::SendPolicy::Vpn {
+            probe: open_pact_core::ProbeAddress::try_from(probe.to_owned()).unwrap(),
+            name: None,
+        })
     }
 
     /// An address that accepts connections while the listener lives.
@@ -6286,18 +5880,23 @@ mod tests {
         (socket, address)
     }
 
-    fn schedule_config(probe: &str) -> String {
-        format!(
-            "[schedule]\nenabled = true\nrun_as = 'user'\nmode = 'vpn'\nvpn_probe = '{probe}'\n"
-        )
+    /// The owner's saved agreement to automatic sending.
+    const AGREED: &str = r#"{"auto_send": true}"#;
+
+    fn vpn_table(probe: &str) -> String {
+        format!("[schedule]\nmode = \"vpn\"\nvpn_probe = \"{probe}\"\ninterval = \"55m\"")
     }
 
     async fn tick_once(fixture: &ClaimFixture, probe: &str) -> Result<()> {
+        tick_under(fixture, &vpn_schedule(probe)).await
+    }
+
+    async fn tick_under(fixture: &ClaimFixture, schedule: &open_pact_core::Schedule) -> Result<()> {
         schedule::tick(
             &fixture.home,
             &Home(fixture.dir.path().to_path_buf()),
             None,
-            &vpn_policy(probe),
+            schedule,
             checks::EventMarkerReads::default,
         )
         .await
@@ -6329,7 +5928,7 @@ mod tests {
         enforced: impl FnOnce(&str) -> String,
         response: impl FnOnce(&Company, &Witness, &[Entry], u64) -> Option<String>,
     ) -> ClaimFixture {
-        claim_fixture_replying(reply, enforced, response, valid_pair, None).await
+        claim_fixture_replying(reply, enforced, response, valid_pair, None, None).await
     }
 
     fn unchanged(signed: &str) -> String {
@@ -6398,7 +5997,8 @@ mod tests {
             unchanged,
             grown_checkpoint,
             valid_pair,
-            Some(&schedule_config(&address)),
+            Some(AGREED),
+            Some(&vpn_table(&address)),
         )
         .await;
         let run = || {
@@ -6469,7 +6069,8 @@ mod tests {
             unchanged,
             grown_checkpoint,
             valid_pair,
-            Some(&schedule_config(&address)),
+            Some(AGREED),
+            Some(&vpn_table(&address)),
         )
         .await;
         let (_socket, refused) = refused_probe();
@@ -7197,7 +6798,7 @@ grace = "1d"
         let (code, _, after, _) = check_with_response_checkpoint(
             grown_checkpoint,
             valid_pair,
-            Some("[managed_repos]\nfolders = ['relative-private-folder']"),
+            Some("{\"folders\": \"not a list\"}"),
         )
         .await;
         assert_eq!(code.unwrap(), ExitCode::SUCCESS);
@@ -7213,11 +6814,7 @@ grace = "1d"
             claim["results"].as_object().unwrap().len(),
             manifest.body().controls.len()
         );
-        assert!(
-            !String::from_utf8(bytes)
-                .unwrap()
-                .contains("relative-private-folder")
-        );
+        assert!(!String::from_utf8(bytes).unwrap().contains("not a list"));
     }
 
     #[tokio::test]
@@ -7808,5 +7405,377 @@ grace = "1d"
             disclosable_virtualized(&unlisted, || panic!("probed")),
             None
         );
+    }
+
+    fn demo_manifest() -> String {
+        DEMO_MANIFEST.replace("\r\n", "\n")
+    }
+
+    fn without_repository_controls() -> String {
+        ["managed_repos_outside", "managed_repos_total"]
+            .iter()
+            .fold(demo_manifest(), |toml, id| {
+                let start = toml.find(&format!("[[control]]\nid = \"{id}\"\n")).unwrap();
+                let end = start + toml[start..].find("\n\n").unwrap() + 2;
+                format!("{}{}", &toml[..start], &toml[end..])
+            })
+    }
+
+    fn without_schedule() -> String {
+        let toml = demo_manifest();
+        toml[..toml.find("\n[schedule]").unwrap()].to_owned()
+    }
+
+    fn always_schedule() -> String {
+        with_schedule(
+            &demo_manifest(),
+            "[schedule]\nmode = \"always\"\ninterval = \"1h\"",
+        )
+    }
+
+    fn setup_context(toml: &str, os: Os) -> SetupContext {
+        SetupContext {
+            manifest: Manifest::parse(toml.as_bytes()).unwrap(),
+            os,
+            current: device_config::DeviceConfig::default(),
+            overview: "  No managed repositories found.\n".into(),
+            suggested: Vec::new(),
+            legacy: Vec::new(),
+            user_home: Some(PathBuf::from("/home/example")),
+        }
+    }
+
+    fn answer(context: &SetupContext, input: &str) -> (SetupChoices, String) {
+        let mut output = Vec::new();
+        let choices = setup_questions(context, &mut input.as_bytes(), &mut output).unwrap();
+        (choices, String::from_utf8(output).unwrap())
+    }
+
+    #[test]
+    fn step_five_asks_about_a_vpn_schedule_and_repository_folders() {
+        let context = setup_context(&demo_manifest(), Os::Macos);
+        let (choices, output) = answer(&context, "\n~/work\n\n");
+        assert_eq!(
+            choices,
+            SetupChoices {
+                auto_send: true,
+                run_as: device_config::RunAs::User,
+                folders: vec![PathBuf::from("/home/example/work")],
+            }
+        );
+        assert!(output.contains(
+            "Automatic claims: only while vpn.example.org answers at 10.0.0.1:443, at most every 55m"
+        ));
+        assert!(output.contains("Send claims automatically while on the company VPN? [Y/n] "));
+        assert!(output.contains("No managed repositories found."));
+        assert!(output.contains("Another folder that holds repositories"));
+        assert!(!output.contains("SYSTEM"), "macOS has no SYSTEM job");
+    }
+
+    #[test]
+    fn step_five_reads_the_policy_line_before_it_asks_for_always() {
+        let context = setup_context(&always_schedule(), Os::Linux);
+        let (choices, output) = answer(&context, "n\n\n");
+        assert!(!choices.auto_send);
+        let policy = output
+            .find("Automatic claims: every 1h on any network")
+            .unwrap();
+        let question = output
+            .find("Send claims automatically as the manifest says? [Y/n] ")
+            .unwrap();
+        assert!(policy < question);
+    }
+
+    #[test]
+    fn step_five_does_not_ask_about_a_schedule_the_manifest_lacks() {
+        let context = setup_context(&without_schedule(), Os::Macos);
+        let (choices, output) = answer(&context, "~/work\n\n");
+        assert!(!choices.auto_send);
+        assert_eq!(choices.folders, [PathBuf::from("/home/example/work")]);
+        assert!(!output.contains("Send claims automatically"));
+        assert!(output.contains("The company did not define automatic sending"));
+    }
+
+    #[test]
+    fn step_five_does_not_ask_for_folders_without_a_repository_control() {
+        let context = setup_context(&without_repository_controls(), Os::Macos);
+        let (choices, output) = answer(&context, "\n");
+        assert!(choices.auto_send && choices.folders.is_empty());
+        assert!(!output.contains("folder"));
+        let context = setup_context(
+            &with_schedule(&without_repository_controls(), ""),
+            Os::Macos,
+        );
+        let (choices, output) = answer(&context, "");
+        assert_eq!(
+            choices,
+            SetupChoices {
+                auto_send: false,
+                run_as: device_config::RunAs::User,
+                folders: Vec::new(),
+            }
+        );
+        assert!(!output.contains("folder") && !output.contains("Send claims"));
+    }
+
+    #[test]
+    fn step_five_asks_who_runs_the_job_only_on_windows_and_only_after_a_yes() {
+        let context = setup_context(&demo_manifest(), Os::Windows);
+        let (choices, output) = answer(&context, "y\ny\n\n");
+        assert!(choices.auto_send);
+        assert_eq!(choices.run_as, device_config::RunAs::System);
+        assert!(output.contains("Run the job as SYSTEM instead of as you?"));
+        let (choices, _) = answer(&context, "y\n\n\n");
+        assert_eq!(
+            choices.run_as,
+            device_config::RunAs::User,
+            "the default is you"
+        );
+        let (choices, output) = answer(&context, "n\n\n");
+        assert!(!choices.auto_send && !output.contains("SYSTEM"));
+    }
+
+    #[test]
+    fn step_five_offers_old_and_found_folders_and_keeps_the_owners_no() {
+        let mut context = setup_context(&demo_manifest(), Os::Macos);
+        context.legacy = vec![PathBuf::from("/srv/code")];
+        context.suggested = vec![PathBuf::from("/home/example/work")];
+        let (choices, output) = answer(&context, "y\ny\ny\n\n");
+        assert_eq!(
+            choices.folders,
+            [
+                PathBuf::from("/srv/code"),
+                PathBuf::from("/home/example/work")
+            ]
+        );
+        assert!(output.contains("Import these folders from open-pact.toml: /srv/code? [Y/n] "));
+        assert!(
+            output.contains(
+                "Use these folders for the repository checks: /home/example/work? [Y/n] "
+            )
+        );
+        let (choices, _) = answer(&context, "n\nn\nn\n\n");
+        assert!(!choices.auto_send && choices.folders.is_empty());
+        let (choices, output) = answer(&context, "y\nn\nn\n~/work\n~/work\n\n");
+        assert_eq!(choices.folders, [PathBuf::from("/home/example/work")]);
+        assert!(output.contains("is already listed"));
+    }
+
+    #[test]
+    fn step_five_keeps_the_folders_the_owner_already_chose() {
+        let mut context = setup_context(&demo_manifest(), Os::Macos);
+        context.current.folders = vec![PathBuf::from("/srv/code")];
+        context.suggested = vec![PathBuf::from("/srv/code")];
+        let (choices, output) = answer(&context, "y\n\n");
+        assert_eq!(choices.folders, [PathBuf::from("/srv/code")]);
+        assert!(output.contains("Your folders now: /srv/code"));
+        assert!(!output.contains("Use these folders"));
+    }
+
+    #[tokio::test]
+    async fn step_five_saves_the_choices_and_counts_as_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+        assert_eq!(wizard_resume(&home).unwrap(), WizardResume::Setup);
+        apply_setup(
+            &home,
+            SetupChoices {
+                auto_send: false,
+                run_as: device_config::RunAs::User,
+                folders: vec![PathBuf::from("/srv/code")],
+            },
+        )
+        .await
+        .unwrap();
+        let config = device_config::DeviceConfig::load(&home).unwrap();
+        assert_eq!(config.folders, [PathBuf::from("/srv/code")]);
+        assert!(!config.auto_send);
+        assert_eq!(wizard_resume(&home).unwrap(), WizardResume::FirstCheck);
+    }
+
+    #[tokio::test]
+    async fn the_folders_command_lists_adds_and_removes() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().join("client"));
+        fs::create_dir_all(&home.0).unwrap();
+        let work = dir.path().join("work");
+        let add = |path: &Path| FoldersCommand::Add { path: path.into() };
+        assert_eq!(folders(&home, add(&work)).await.unwrap(), ExitCode::SUCCESS);
+        assert_eq!(
+            device_config::DeviceConfig::load(&home).unwrap().folders,
+            std::slice::from_ref(&work)
+        );
+        let _ = folders(&home, add(&work)).await.unwrap();
+        assert_eq!(
+            device_config::DeviceConfig::load(&home)
+                .unwrap()
+                .folders
+                .len(),
+            1
+        );
+        let _ = folders(&home, FoldersCommand::List).await.unwrap();
+        let _ = folders(&home, FoldersCommand::Remove { path: work.clone() })
+            .await
+            .unwrap();
+        assert!(
+            device_config::DeviceConfig::load(&home)
+                .unwrap()
+                .folders
+                .is_empty()
+        );
+        let error = folders(&home, FoldersCommand::Remove { path: work })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("is not listed"));
+    }
+
+    #[test]
+    fn accept_lists_a_schedule_change_like_any_other_change() {
+        let old = Manifest::parse(demo_manifest().as_bytes()).unwrap();
+        let faster = Manifest::parse(
+            demo_manifest()
+                .replace("interval = \"55m\"", "interval = \"30m\"")
+                .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            manifest_changes(&old, &faster),
+            [
+                "automatic claims: only while vpn.example.org answers at 10.0.0.1:443, at most every 30m (was only while vpn.example.org answers at 10.0.0.1:443, at most every 55m)"
+            ]
+        );
+        let none = Manifest::parse(without_schedule().as_bytes()).unwrap();
+        assert_eq!(
+            manifest_changes(&none, &old),
+            [
+                "automatic claims: only while vpn.example.org answers at 10.0.0.1:443, at most every 55m (was none)"
+            ]
+        );
+        assert_eq!(
+            manifest_changes(&old, &none),
+            [
+                "automatic claims: none (was only while vpn.example.org answers at 10.0.0.1:443, at most every 55m)"
+            ]
+        );
+        assert!(manifest_changes(&old, &old).is_empty());
+    }
+
+    #[test]
+    fn the_review_summary_states_the_automatic_claims_in_plain_words() {
+        let summary = |toml: &str| {
+            let manifest = Manifest::parse(toml.as_bytes()).unwrap();
+            let mut output = Vec::new();
+            write_summary(&mut output, &manifest, "sha256:fictional", Os::Macos).unwrap();
+            String::from_utf8(output).unwrap()
+        };
+        assert!(summary(&demo_manifest()).contains(
+            "  Automatic claims: only while vpn.example.org answers at 10.0.0.1:443, at most every 55m\n"
+        ));
+        assert!(
+            summary(&always_schedule()).contains("  Automatic claims: every 1h on any network\n")
+        );
+        assert!(
+            summary(&without_schedule())
+                .contains("  Automatic claims: none. You send claims by hand with `check`\n")
+        );
+    }
+
+    #[test]
+    fn the_reading_copy_is_in_the_home_until_the_question_is_answered() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+        let copy = ReadingCopy::write(&home, "manifest_version = 1\n").unwrap();
+        assert!(copy.0.is_absolute());
+        assert_eq!(
+            fs::read_to_string(&copy.0).unwrap(),
+            "manifest_version = 1\n"
+        );
+        let path = copy.0.clone();
+        drop(copy);
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn a_scheduled_run_follows_the_signed_manifest_while_an_accept_is_pending() {
+        let (_probe, open) = open_probe();
+        let (_closed, refused) = refused_probe();
+        let refused_table = vpn_table(&refused);
+        let fixture = claim_fixture_replying(
+            None,
+            |signed| with_schedule(&with_password_rule(signed), &refused_table),
+            grown_checkpoint,
+            valid_pair,
+            Some(AGREED),
+            Some(&vpn_table(&open)),
+        )
+        .await;
+        let stored = std::fs::read(fixture.home.file("manifest.toml")).unwrap();
+        schedule::run(
+            &fixture.home,
+            schedule::Command::Run {
+                system: false,
+                user_home: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            claim_posts(&fixture),
+            1,
+            "the probe of the signed manifest answers, the probe of the pending one does not"
+        );
+        let log = job_log_text(&fixture);
+        assert!(
+            log.contains("The manifest changed") && log.contains("accept"),
+            "{log}"
+        );
+        assert_eq!(
+            std::fs::read(fixture.home.file("manifest.toml")).unwrap(),
+            stored,
+            "only accept replaces the signed manifest"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_scheduled_tick_under_always_sends_without_a_probe() {
+        let fixture = scheduled_fixture(None, unchanged, grown_checkpoint).await;
+        tick_under(
+            &fixture,
+            &every_55_minutes(open_pact_core::SendPolicy::Always),
+        )
+        .await
+        .unwrap();
+        assert_eq!(claim_posts(&fixture), 1);
+        assert!(schedule_state(&fixture)["last_success"].is_number());
+        tick_under(
+            &fixture,
+            &every_55_minutes(open_pact_core::SendPolicy::Always),
+        )
+        .await
+        .unwrap();
+        assert_eq!(claim_posts(&fixture), 1, "the interval has not passed");
+    }
+
+    #[tokio::test]
+    async fn the_job_reads_always_from_the_signed_manifest() {
+        let fixture = claim_fixture_replying(
+            None,
+            unchanged,
+            grown_checkpoint,
+            valid_pair,
+            Some(AGREED),
+            Some("[schedule]\nmode = \"always\"\ninterval = \"1h\""),
+        )
+        .await;
+        schedule::run(
+            &fixture.home,
+            schedule::Command::Run {
+                system: false,
+                user_home: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(claim_posts(&fixture), 1);
     }
 }

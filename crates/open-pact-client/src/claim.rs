@@ -143,13 +143,12 @@ pub(crate) async fn prepare(
     insecure_dev: bool,
 ) -> Result<Prepared> {
     let mut can_scan_repositories = true;
-    let device_config = match DeviceConfig::load_for(home, user_home) {
-        Ok(Some(config)) => Some(config),
-        Ok(None) => None,
+    let device_config = match DeviceConfig::load(home) {
+        Ok(config) => Some(config),
         Err(error) => {
             can_scan_repositories = false;
             eprintln!(
-                "{error:#}\nCorrect this section and key in open-pact.toml. Other controls will still run."
+                "{error:#}\nThis file holds your choices and is not meant for hand editing. Delete it and answer again with `schedule on` and `folders add`. Other controls will still run."
             );
             None
         }
@@ -304,13 +303,6 @@ const CSR_PLACEHOLDER: &str = "<certificate request for the VPN key>";
 impl Prepared {
     pub(crate) fn compliance(&self) -> &BTreeMap<String, bool> {
         &self.compliance
-    }
-
-    /// The template `open-pact.toml` for this manifest, when the file is missing.
-    pub(crate) fn missing_config_template(&self, user_home: Option<&Path>) -> Option<String> {
-        self.device_config
-            .is_none()
-            .then(|| device_config::example(&self.manifest, self.os, self.scan.as_ref(), user_home))
     }
 
     /// The table of results, and what the repository scan could not read.

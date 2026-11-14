@@ -204,7 +204,7 @@ mod tests {
             Ok(())
         );
         let without = DEMO.find("\n[schedule]").unwrap();
-        let old = Manifest::parse(DEMO[..without].as_bytes()).unwrap();
+        let old = Manifest::parse(&DEMO.as_bytes()[..without]).unwrap();
         let new = Manifest::parse(DEMO.as_bytes()).unwrap();
         assert_eq!(
             is_narrowing(&old, &new),

@@ -748,7 +748,7 @@ impl TryFrom<String> for Interval {
 
 impl fmt::Display for Interval {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.minutes % 60 == 0 {
+        if self.minutes.is_multiple_of(60) {
             write!(f, "{}h", self.minutes / 60)
         } else {
             write!(f, "{}m", self.minutes)
@@ -1287,7 +1287,7 @@ mod tests {
     #[test]
     fn a_manifest_without_a_schedule_has_none() {
         let start = DEMO.find("\n[schedule]").unwrap();
-        let manifest = Manifest::parse(DEMO[..start].as_bytes()).unwrap();
+        let manifest = Manifest::parse(&DEMO.as_bytes()[..start]).unwrap();
         assert!(manifest.body().schedule.is_none());
     }
 
