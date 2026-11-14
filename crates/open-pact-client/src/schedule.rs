@@ -2730,6 +2730,10 @@ Write-Output 'refused'
         assert_eq!(windows_powershell(&script).unwrap(), "refused");
     }
 
+    /// A probe that never answers, so native job runs in CI never send.
+    #[cfg(any(target_os = "linux", windows))]
+    const LOOPBACK_SCHEDULE: &str = "[schedule]\nmode = \"vpn\"\nvpn_probe = \"127.0.0.1:9\"\ninterval = \"55m\"";
+
     fn enrolled_home(dir: &Path) -> Home {
         enrolled_home_with_schedule(dir, None)
     }
@@ -2777,7 +2781,7 @@ Write-Output 'refused'
     fn prepare_linux_schedule_home() {
         let path = PathBuf::from(std::env::var_os("OPEN_PACT_SCHEDULE_FIXTURE").unwrap());
         std::fs::create_dir_all(&path).unwrap();
-        enrolled_home(&path);
+        enrolled_home_with_schedule(&path, Some(LOOPBACK_SCHEDULE));
     }
 
     #[cfg(windows)]
@@ -2788,7 +2792,7 @@ Write-Output 'refused'
         for name in ["limited", "system", "missing", "retry"] {
             let path = root.join(name);
             std::fs::create_dir_all(&path).unwrap();
-            enrolled_home(&path);
+            enrolled_home_with_schedule(&path, Some(LOOPBACK_SCHEDULE));
         }
     }
 
