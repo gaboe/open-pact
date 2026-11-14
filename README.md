@@ -7,7 +7,7 @@ Status: proof of concept, not for production. On macOS, `join` tries a Secure En
 ## Layout
 
 - `crates/open-pact-core` manifest, signatures, narrowing, claims (RFC 8785 + JWS), evaluation, the Merkle transparency log and signed checkpoints
-- `crates/open-pact-client` CLI: `join <invitation>`, `check`, `log head`, `log prove`, `log show`, `stop`
+- `crates/open-pact-client` CLI: `join <invitation>`, `check`, `accept`, `manifest show`, `schedule on|off|status`, `folders list|add|remove`, `log head`, `log prove`, `log show`, `stop`
 - `crates/open-pact-gateway` HTTP gateway, small CA and transparency log, backed by PostgreSQL; admin commands `invite` and `devices`
 - `deploy/helm/open-pact` Helm chart (values use placeholders)
 
@@ -68,7 +68,7 @@ On Windows, `vpn/current` is a text pointer, not a directory. A pair reader read
 
 Windows replaces the flat copies sequentially, so they can briefly differ. The selected pair stays complete because readers use `vpn/current` and `vpn/<generation>/`. If a program holds a flat copy open, replacement can fail. The client keeps the new generation selected, marks the flat copies stale, and reports the locked file. Close the program that holds it and run `check` again. Every later start retries the flat-copy refresh. Startup recovery tries the VPN lock without waiting. If another process holds it, recovery warns and continues. `schedule` and `log` never wait for the VPN lock. `install` and `check` take the lock. New Windows files and directories inherit the home ACL. The client does not preserve an explicit ACL from a replaced file.
 
-No scheduled job runs until you enable a schedule in `open-pact.toml` and run `open-pact-client apply`. Before you delete the binary or client home, set `[schedule].enabled = false` and run `apply`. To remove the device key, run `open-pact-client --home <home> delete-device-key` before you delete the home.
+No scheduled job runs until the signed manifest defines `[schedule]` and you run `open-pact-client schedule on` or answer yes in the join wizard. Before you delete the binary or client home, run `open-pact-client schedule off`. To remove the device key, run `open-pact-client --home <home> delete-device-key` before you delete the home.
 
 ## Install the client
 
@@ -256,7 +256,17 @@ witness_quorum = 1          # cosignatures a client requires
 checkpoint_max_age = "1h"   # oldest cosignature a client accepts
 ```
 
-The manifest does not contain the VPN probe address. The VPN probe address that the scheduled job uses stays on the device, in the `[schedule]` table of `open-pact.toml`. `finish` creates the `config example` text when that file does not exist. It leaves an existing file unchanged.
+The optional `[schedule]` table tells devices when to send claims automatically. It is part of the signed manifest and of its hash:
+
+```toml
+[schedule]
+mode = "vpn"                     # or "always"
+vpn_probe = "10.0.0.1:443"       # host:port that answers only on the company VPN; required with vpn, rejected with always
+vpn_probe_name = "vpn.example.org" # optional TLS name that the probe must present
+interval = "55m"                 # 5m to 24h between periodic claims
+```
+
+Without `[schedule]`, devices send claims only by hand with `check`. The owner turns automatic sending on or off on the device. The client shows the table in plain words, such as `Automatic claims: only while vpn.example.org answers at 10.0.0.1:443, at most every 55 minutes` or `Automatic claims: every 55 minutes on any network`. Every change of the manifest, the schedule included, needs the owner's `accept`; until then the job keeps the policy the owner signed. Anyone who can reach `GET /v1/manifest` can read the probe address, so choose an address that is no secret.
 
 `witness_quorum` must be more than half of the listed witnesses: 1 of 1, 2 of 2 or 3, 3 of 4. Any two sets that large share a witness, and that witness cosigns only one history, so two clients cannot accept checkpoints from different histories. A manifest with 1 of 2 or 2 of 4 does not parse. Every manifest needs a `[log]` section. To run without witnesses, set `allow_split_views = true` with `witnesses = []` and `witness_quorum = 0`; the client then prints a loud warning on every `join` and `check`.
 
@@ -387,7 +397,7 @@ Windows collects the controls in one cached PowerShell batch. A missing source, 
 
 Defender metrics require Defender in Normal mode with its antivirus and service enabled. Other antivirus providers return `unknown` for these metrics. Active threat counts describe Defender threats that are still active. Standard users get `unknown` for the controls that enforce elevation. Access failures also return `unknown`.
 
-On Windows, `preboot_auth`, `log_oldest_record_days`, `process_audit`, and `log_cleared` need SYSTEM or an elevated administrator. The `web_protection` check also needs SYSTEM to read browser settings for other user profiles. Set `[schedule].run_as = "system"` in `open-pact.toml` and run `apply` from an elevated PowerShell prompt to run these checks as SYSTEM. The task reads Windows settings and reports their values. It does not change those settings.
+On Windows, `preboot_auth`, `log_oldest_record_days`, `process_audit`, and `log_cleared` need SYSTEM or an elevated administrator. The `web_protection` check also needs SYSTEM to read browser settings for other user profiles. Answer yes to the SYSTEM question in the join wizard, or run `schedule on --system` from an elevated PowerShell prompt, to run these checks as SYSTEM. The task reads Windows settings and reports their values. It does not change those settings.
 
 Windows `screen_lock` uses a machine inactivity limit first. Otherwise it reads the effective screen-saver policy before local desktop settings. It requires a positive timer, secure mode, and an existing `.scr` file. As SYSTEM, it reads the HKU hives of interactive users. The weakest readable user setting decides. Missing users, unloaded hives, and unreadable evidence return `unknown`.
 
@@ -415,30 +425,26 @@ The ClamAV parser uses the [documented database header](https://docs.clamav.net/
 
 ## Configure the device
 
-After IT approves the device, run `open-pact-client finish`. It prepares `open-pact.toml` beside the enrolled `manifest.toml`, shows the proposed changes, and writes the file only after you confirm. Existing values stay in place. When it changes an existing file, it creates `open-pact.toml.bak-YYYYMMDDTHHMMSSZ`. It adds a numeric suffix if that name exists. The command prints the backup path. Run `open-pact-client config example` to print a template without writing a file.
+You edit no settings file. The company's rules are in the signed manifest. `join` prints the absolute path of a file with the whole manifest, and `accept` and `manifest show` do the same, so you can read all of it before you sign. After IT approves the device, the join wizard asks only for your own choices:
 
-```toml
-[schedule]
-# The scheduled job sends the same claim as `open-pact-client check`, only while vpn_probe
-# connects. Set enabled to true, then run open-pact-client apply.
-enabled = false
-run_as = "user"
-mode = "vpn"
-# vpn_probe is a host:port that answers only on the company VPN.
-# vpn_probe = "10.20.0.1:443"
+- whether to send claims automatically, only when the manifest has `[schedule]`;
+- on Windows, whether the job runs as you or as SYSTEM;
+- the folders that hold your repositories, only when the manifest counts repositories.
 
-[managed_repos]
-# Managed repositories found: 3
-#   ~/projects (2)
-#   ~/source (1)
-# folders = ["~/projects", "~/source"]
+The client keeps the answers in `device.json` in the client home. It writes the file atomically and does not expect you to edit it. Change the answers later with commands:
+
+```sh
+open-pact-client schedule on
+open-pact-client schedule off
+open-pact-client schedule status
+open-pact-client folders list
+open-pact-client folders add ~/projects
+open-pact-client folders remove ~/projects
 ```
 
-Every section is optional. Enable the schedule after you confirm VPN access and choose a `vpn_probe` that connects only on the VPN. The client lists the folders it found in comments. To include suggested folders, remove only `# ` from the `folders` line. Edit the list if you want to include only some folders. Folder paths must be absolute after `~` expands to the user's home. Loading does not inspect the filesystem. Folder paths stay on the device. These folders are reserved for managed repository checks.
+An `open-pact.toml` from an earlier client is ignored. `check` and the job print once that it is ignored and where each value went, and the wizard offers to import its folders. The client never deletes the file. The commands `apply`, `finish` and `config example` no longer exist. `~` expands to your user home, folder paths stay on the device, and the folders feed the managed repository checks.
 
-`check` prints each manifest control, its requirement for this OS, the device setting that feeds it, and the result. A missing or invalid configuration prints what to add or fix. Other controls still run.
-
-A `[report]` table from an earlier client is an error. It names the old `vpn_probe` and tells you to move it into `[schedule]`, add `mode = "vpn"`, and delete `[report]`. The gateway is now the only server: the client sends no separate report to a collector.
+`check` prints each manifest control, its requirement for this OS, the device setting that feeds it, and the result.
 
 ### See what a claim sends
 
@@ -450,46 +456,27 @@ open-pact-client check --dry-run
 
 The command runs the same local checks and prints the claim as JSON. It adds `manifest_toml` when the gateway enforces another manifest than the one you signed. It sends only GET requests, for the enforced manifest, the log keys, the checkpoint, and its consistency proof. It sends no nonce request and no claim, and it writes no file, so it does not change `repo-scan.json`, the stored checkpoint, or `claims.jsonl`. The nonce, the time of sending, and the VPN certificate request appear as placeholders, because the client creates them when it sends. The scheduled job sends this same claim.
 
-## Send claims while the VPN is connected
+## Send claims automatically
 
-The scheduled job runs the claim pipeline of `check` on its own. It sends the claim only while the device is on the company VPN. Set `[schedule]` in `open-pact.toml`, then reconcile the job:
-
-```toml
-[schedule]
-enabled = true
-run_as = "user"
-mode = "vpn"
-vpn_probe = "10.20.0.1:443"
-```
+The scheduled job runs the claim pipeline of `check` on its own. The company chooses the policy in `[schedule]` of the signed manifest: `mode = "vpn"` sends only while the device is on the company VPN, and `mode = "always"` sends on any network. You choose whether the job runs:
 
 ```sh
-open-pact-client apply --dry-run
-open-pact-client apply
-open-pact-client apply
+open-pact-client schedule on --dry-run
+open-pact-client schedule on
+open-pact-client schedule on
 ```
 
-An enabled schedule needs `mode = "vpn"` and `vpn_probe`. The mode `always` is not available. The first apply prints `schedule: install`. The second prints `no changes`. A probe or run-as change prints `schedule: update`. Dry run prints the planned change and writes nothing. Keep the binary at its installed path. macOS uses a launchd LaunchAgent. Linux uses a systemd user timer and needs a running user manager. Windows uses Task Scheduler. No separate client daemon is needed.
+`schedule on` refuses when the manifest has no `[schedule]`. It prints the policy line. The first run prints `schedule: install`. The second prints `no changes`. A changed executable path prints `schedule: update`. Dry run prints the planned change and writes nothing. Keep the binary at its installed path. macOS uses a launchd LaunchAgent. Linux uses a systemd user timer and needs a running user manager. Windows uses Task Scheduler. No separate client daemon is needed.
 
-Use the same absolute `--home` for each apply. The scheduled run reads `[schedule]` from `open-pact.toml` every time. To stop the job, set `enabled = false` or remove `[schedule]`, then run `apply`. The command removes the job and its state. Keep the configuration file until removal succeeds. If the entire client home is already missing, apply removes the remaining job without recreating that home.
+Use the same absolute `--home` for each command. The scheduled run reads the policy from the manifest you signed every time. When the company changes the manifest and you have not yet run `accept`, the job keeps the policy you signed and writes the accept notice to `schedule.log`. To stop the job, run `open-pact-client schedule off`. The command removes the job and its state and records your no. If the entire client home is already missing, it removes the remaining job without recreating that home.
 
-On Windows, set `run_as = "system"` and run `apply` from an elevated PowerShell prompt. Without elevation, apply prints the exact command and changes nothing. Other operating systems reject this run-as value. The installer copies the client into `%ProgramFiles%\open-pact\open-pact-client.exe` and refuses a directory that non-administrators can write. The SYSTEM job runs with `--system --user-home <profile>`. It reads the selected user's absolute `--home`, expands `~` in `open-pact.toml` against that profile, and refuses reparse-point files. It keeps its state under `%ProgramData%\open-pact\system\<home hash>`, with access limited to SYSTEM and Administrators. Choose a home path without `%`.
+On Windows, choose SYSTEM in the wizard or run `schedule on --system` from an elevated PowerShell prompt. Without elevation, the command prints the exact command and changes nothing. Other operating systems reject `--system`. The installer copies the client into `%ProgramFiles%\open-pact\open-pact-client.exe` and refuses a directory that non-administrators can write. The SYSTEM job runs with `--system --user-home <profile>`. It reads the selected user's absolute `--home`, expands `~` in the folders of `device.json` against that profile, and refuses reparse-point files. It keeps its state under `%ProgramData%\open-pact\system\<home hash>`, with access limited to SYSTEM and Administrators. Choose a home path without `%`.
 
-`vpn_probe` must be a `host:port` that connects only on the company VPN. The job sends nothing while it does not connect, so an address that also answers off the VPN makes the job send off the VPN. A probe can succeed just before the VPN disconnects.
+With `mode = "vpn"`, `vpn_probe` must be a `host:port` that connects only on the company VPN. The job sends nothing while it does not connect, so an address that also answers off the VPN makes the job send off the VPN. A probe can succeed just before the VPN disconnects.
 
-A private address such as `10.0.0.1:443` can also exist on other networks, such as hotel or home routers, so a TCP connection alone can match the wrong network. Set `vpn_probe_name` to prove the right host:
+A private address such as `10.0.0.1:443` can also exist on other networks, such as hotel or home routers, so a TCP connection alone can match the wrong network. With `vpn_probe_name` in the manifest, the probe connects to `vpn_probe` without a DNS lookup of the name. It needs a TLS certificate that is valid for the name and chains to a root that the client trusts for its HTTPS requests. Any HTTP status counts as an answer. The probe has five seconds in total and does not use a proxy. An empty value or an IP address for `vpn_probe_name` does not parse.
 
-```toml
-[schedule]
-enabled = true
-run_as = "user"
-mode = "vpn"
-vpn_probe = "10.0.0.1:443"
-vpn_probe_name = "vpn.example.org"
-```
-
-With the name set, the probe connects to `vpn_probe` without a DNS lookup of the name. It needs a TLS certificate that is valid for the name and chains to a root that the client trusts for its HTTPS requests. Any HTTP status counts as an answer. The probe has five seconds in total and does not use a proxy. An empty value or an IP address for `vpn_probe_name` is an error.
-
-Every five minutes, the job tries a TCP connection to `vpn_probe`, with a two-second timeout that includes name resolution. With `vpn_probe_name`, it tries the TLS probe instead. Use brackets around IPv6 addresses. A successful connection records connectivity for this check. The job sends on the first observed connection and then when at least 55 minutes have passed since the last claim that the gateway answered. The job checks the probe again after it prepares the claim and before it sends the first POST. It sends nothing if either probe fails. DNS runs in a child process that the parent kills at the deadline: two seconds for TCP, five seconds with `vpn_probe_name`. A disconnect and reconnect entirely between two probes is not observed. A failed send retries on a later run. If the clock moves behind the last answer time, the next connected run retries and resets that time.
+With `mode = "vpn"`, the job tries a TCP connection to `vpn_probe` every five minutes, with a two-second timeout that includes name resolution. With `vpn_probe_name`, it tries the TLS probe instead. Use brackets around IPv6 addresses. A successful connection records connectivity for this check. The job sends on the first observed connection and then when at least `interval` has passed since the last claim that the gateway answered. The job checks the probe again after it prepares the claim and before it sends the first POST. It sends nothing if either probe fails. DNS runs in a child process that the parent kills at the deadline: two seconds for TCP, five seconds with `vpn_probe_name`. A disconnect and reconnect entirely between two probes is not observed. A failed send retries on a later run. If the clock moves behind the last answer time, the next connected run retries and resets that time. With `mode = "always"`, the job does not probe and sends when `interval` has passed since the last answered claim.
 
 The job takes the same lock as `check` and `accept`. When one of them runs, the job skips that run. The job scans repositories at most once a day and uses the stored counts in `repo-scan.json` between scans. A claim that the gateway accepts or denies counts as sent, and a denied claim waits for the next trigger like an accepted one.
 
@@ -497,13 +484,13 @@ Every run evaluates the collected results against this OS's requirements in the 
 
 On Windows, Security event 1102 and any new Defender detection also trigger an extra claim, even if the threat is already resolved. The task user needs `Event Log Readers` access or SYSTEM access to read the Security log. The first successful read of each event source sets its baseline. Later marker advances are saved only after the gateway answers.
 
-The job sends at most one claim per five-minute run and sends nothing off VPN. It holds detected events and compliance failures while the VPN is down, even if the control recovers before reconnecting. The next detected connection sends a claim with current results. Only an answer from the gateway clears the pending event. Events before the first successful baseline read are part of that baseline.
+The job sends at most one claim per five-minute run and, with `mode = "vpn"`, sends nothing off VPN. It holds detected events and compliance failures while the VPN is down, even if the control recovers before reconnecting. The next detected connection sends a claim with current results. Only an answer from the gateway clears the pending event. Events before the first successful baseline read are part of that baseline.
 
 The job cannot ask you anything. When only you can fix a problem, it writes one dated line to `schedule.log` in the client home: a changed manifest (run `accept`), a gateway denial with its reasons, a device that waits for approval or was revoked, a transparency log alarm, or an error. The log keeps two files of at most 256 KiB each. A log alarm installs no VPN certificate. Read the file after a missed VPN login. Run `check` to see the full result. `claims.jsonl` keeps every claim and response, as for `check`.
 
-The client home holds the user-authored `open-pact.toml`, an applied-settings receipt in `schedule-applied.json`, `report-schedule.lock`, `claim.lock`, and `schedule.log`. Limited jobs keep `report-state.json` there. Windows SYSTEM jobs keep their state in the protected SYSTEM directory and use a sibling `<home hash>.lock` file. State records connectivity, answered claims, compliance, and pending events. A lock prevents overlapping commands. Each client home has its own job name. Updates reset the job state.
+The client home holds `device.json` with your choices, an applied-settings receipt in `schedule-applied.json`, `report-schedule.lock`, `claim.lock`, and `schedule.log`. `manifest-to-sign.toml` exists only while `join` or `accept` waits for your answer. Limited jobs keep `report-state.json` there. Windows SYSTEM jobs keep their state in the protected SYSTEM directory and use a sibling `<home hash>.lock` file. State records connectivity, answered claims, compliance, and pending events. A lock prevents overlapping commands. Each client home has its own job name. Updates reset the job state.
 
-Limited Windows operations leave orphaned protected state and the shared binary unchanged. Set `run_as = "system"` with `enabled = false` and run apply elevated to remove those leftovers. Elevated removal uses the existing SYSTEM cleanup path when a SYSTEM task or protected state remains. It requires elevation. A held state lock stops removal before the task changes and asks you to retry. Cleanup keeps the shared binary while another SYSTEM task uses it. Otherwise, it queues the binary for deletion at reboot. Incomplete cleanup returns an error and lists the remaining files. Retry `apply` from an elevated prompt after the client stops or Windows restarts. Lock files remain. `stop` prints the declarative removal instructions. On Unix, new scheduler homes use mode `0700`. State files use mode `0600` or keep stricter owner permissions.
+Limited Windows operations leave orphaned protected state and the shared binary unchanged. Run `schedule off` from an elevated prompt to remove those leftovers. Elevated removal uses the existing SYSTEM cleanup path when a SYSTEM task or protected state remains. It requires elevation. A held state lock stops removal before the task changes and asks you to retry. Cleanup keeps the shared binary while another SYSTEM task uses it. Otherwise, it queues the binary for deletion at reboot. Incomplete cleanup returns an error and lists the remaining files. Retry `schedule off` from an elevated prompt after the client stops or Windows restarts. Lock files remain. `stop` prints the removal instructions. On Unix, new scheduler homes use mode `0700`. State files use mode `0600` or keep stricter owner permissions.
 
 ### Windows device keys
 
