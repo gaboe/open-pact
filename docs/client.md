@@ -166,7 +166,7 @@ Inspect the claim that `check` would send now:
 open-pact-client check --dry-run
 ```
 
-The command runs the same local checks as `check` and prints the claim as JSON. It adds `manifest_toml` when the gateway enforces a different manifest. It makes GET requests for the manifest, log key, checkpoint, and any needed consistency proof. It sends no nonce request or signed POST. It writes no file. The dry run suppresses the claim when the gateway manifest differs from the accepted hash or the saved device status is pending or revoked. It cannot verify private log entries or current device status because those checks need a signed request. When the dry run prints a claim, it also prints this line: `check also asks the gateway whether this device may send; the dry run skips that signed request.` The nonce, time, and VPN certificate request appear as placeholders. The scheduled job sends the same claim.
+The command runs the same local checks as `check` and prints the claim as JSON. It adds `manifest_toml` when the gateway enforces a different manifest. It makes GET requests for the manifest, log key, checkpoint, and any needed consistency proof. It sends no nonce request or signed POST. It writes no file. The dry run never suppresses the claim. When the saved device status is pending or revoked, it prints one `Last known status` line after the claim, because `check` asks the gateway again. It cannot verify private log entries or current device status because those checks need a signed request. When the dry run prints a claim, it also prints this line: `check also asks the gateway whether this device may send; the dry run skips that signed request.` The nonce, time, and VPN certificate request appear as placeholders. The scheduled job sends the same claim.
 
 ## Send claims automatically
 
@@ -234,7 +234,7 @@ Limited Windows operations leave orphaned protected state and the shared binary 
 
 `accept` sends the new manifest hash, the owner public key, and signatures by the owner and device keys over both manifest hashes and a gateway nonce.
 
-`check` and the scheduled job send the signed claim fields that the manifest permits. When the gateway enforces another manifest, they also send the manifest text that you signed, so the gateway can apply its terms. These include control results and permitted device metadata. The VPN certificate request travels beside the claim. Its private key stays on the device. The client stores claims and responses in `claims.jsonl`. `check --dry-run` makes GET requests only, prints the claim when local and GET evidence do not prove that it would be refused, and sends no claim.
+`check` and the scheduled job send the signed claim fields that the manifest permits. When the gateway enforces another manifest, they also send the manifest text that you signed, so the gateway can apply its terms. These include control results and permitted device metadata. The VPN certificate request travels beside the claim. Its private key stays on the device. The client stores claims and responses in `claims.jsonl`. `check --dry-run` makes GET requests only, prints the claim that `check` would send, and sends no claim.
 
 ## Troubleshoot common failures
 
