@@ -5,7 +5,6 @@ mod device_key;
 #[cfg(test)]
 mod fake_gateway;
 mod locallog;
-mod report;
 mod schedule;
 #[cfg(target_os = "macos")]
 mod secure_enclave;
@@ -20,8 +19,6 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use clap::{Parser, Subcommand};
 use device_key::DeviceKey;
 use open_pact_core::{
@@ -93,12 +90,7 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// Send a signed status report to an HTTPS collector
-    Report {
-        #[arg(long)]
-        dry_run: bool,
-    },
-    /// Reconcile the scheduled report job with open-pact.toml
+    /// Reconcile the scheduled claim job with open-pact.toml
     Apply {
         #[arg(long)]
         dry_run: bool,
@@ -113,7 +105,7 @@ enum Command {
         #[command(subcommand)]
         command: ManifestCommand,
     },
-    /// Internal scheduled report commands
+    /// Internal scheduled claim commands
     Schedule {
         #[command(subcommand)]
         command: schedule::Command,
@@ -149,8 +141,6 @@ enum LogCommand {
     Prove { index: Option<u64> },
     /// Print every claim this device sent and the gateway's response
     Show,
-    /// Print report requests and collector responses
-    Reports,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1416,7 +1406,7 @@ fn review_config_with(
 ) -> Result<bool> {
     let path = home.file(device_config::FILE);
     reject_config_symlink(&path)?;
-    writeln!(output, "Review {} before the first report.", path.display())?;
+    writeln!(output, "Review {} before the first claim.", path.display())?;
     writeln!(output, "For example, add repository folders to `folders`.")?;
     if confirm_yes_by_default_from("Open open-pact.toml in your editor?", input, output)? {
         open_editor_for_review(&path, input, output, command, &mut open_editor)?;
@@ -1439,7 +1429,7 @@ fn review_config_with(
         }
     }
 
-    if confirm_yes_by_default_from("Send the first report now?", input, output)? {
+    if confirm_yes_by_default_from("Send the first claim now?", input, output)? {
         Ok(true)
     } else {
         print_stopped_at(home, None, step);
@@ -3327,7 +3317,6 @@ async fn check_preview(home: &Home, insecure_dev: bool) -> Result<claim::Preview
 
 async fn check_impl(home: &Home, insecure_dev: bool, show_resume_hint: bool) -> Result<ExitCode> {
     let _claim_lock = claim::lock(home).await?;
-    let migrating = schedule::migration_example(home)?;
     let prepared = match claim::prepare(home, None, claim::ScanPolicy::Always, insecure_dev).await {
         Ok(prepared) => prepared,
         Err(error) if error.is::<claim::LegacyLogHead>() => {
@@ -3336,12 +3325,10 @@ async fn check_impl(home: &Home, insecure_dev: bool, show_resume_hint: bool) -> 
         }
         Err(error) => return Err(error),
     };
-    if !migrating {
-        let user_home =
-            std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from);
-        if let Some(template) = prepared.missing_config_template(user_home.as_deref()) {
-            print!("{template}");
-        }
+    let user_home =
+        std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from);
+    if let Some(template) = prepared.missing_config_template(user_home.as_deref()) {
+        print!("{template}");
     }
     prepared.print_local_report();
     if show_resume_hint {
@@ -3782,161 +3769,6 @@ fn log_show(path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Copy)]
-struct ReportLogFile<'a> {
-    path: &'a Path,
-    source: &'static str,
-    system_state: bool,
-}
-
-fn system_history_warning(reason: &str, warnings: &mut impl Write) -> Result<()> {
-    writeln!(
-        warnings,
-        "SYSTEM history was not included: {reason}; run from an elevated prompt to include it."
-    )?;
-    Ok(())
-}
-
-fn system_discovery_reason(error: &anyhow::Error) -> &'static str {
-    let detail = format!("{error:#}").to_ascii_lowercase();
-    if [
-        "acl",
-        "reparse point",
-        "non-admin owner",
-        "permissions are unsafe",
-    ]
-    .iter()
-    .any(|marker| detail.contains(marker))
-    {
-        "protected directory permissions are unsafe"
-    } else if [
-        "access denied",
-        "access is denied",
-        "permission denied",
-        "unauthorizedaccess",
-    ]
-    .iter()
-    .any(|marker| detail.contains(marker))
-    {
-        "access denied"
-    } else {
-        "protected SYSTEM history could not be discovered"
-    }
-}
-
-fn log_reports(
-    files: &[ReportLogFile<'_>],
-    output: &mut impl Write,
-    warnings: &mut impl Write,
-) -> Result<()> {
-    let mut records = Vec::new();
-    let mut system_unreadable = None;
-    for file in files {
-        match locallog::read_with_lines(file.path) {
-            Ok(file_records) => records.extend(
-                file_records
-                    .into_iter()
-                    .map(|(line, record)| (*file, line, record)),
-            ),
-            Err(error) if file.system_state && error.kind() != std::io::ErrorKind::InvalidData => {
-                system_unreadable = Some(if error.kind() == std::io::ErrorKind::PermissionDenied {
-                    "access denied"
-                } else {
-                    "protected history could not be read"
-                });
-            }
-            Err(error) => {
-                return Err(
-                    anyhow::Error::new(error).context(format!("{} report history", file.source))
-                );
-            }
-        }
-    }
-    records.sort_by(|(_, _, left), (_, _, right)| left.time.cmp(&right.time));
-    if let Some(reason) = system_unreadable {
-        system_history_warning(reason, warnings)?;
-    }
-    if records.is_empty() {
-        writeln!(output, "No reports sent yet.")?;
-    }
-    for (file, line, record) in &records {
-        let location = format!("{} line {line}", file.source);
-        let sent = record
-            .sent()
-            .with_context(|| format!("{location}: invalid sent report"))?;
-        let jws = std::str::from_utf8(&sent)
-            .with_context(|| format!("{location}: report JWS is not UTF-8"))?;
-        let mut parts = jws.split('.');
-        let _header = parts.next();
-        let payload = parts
-            .next()
-            .context("report JWS payload is missing")
-            .with_context(|| location.clone())?;
-        if parts.next().is_none() || parts.next().is_some() {
-            bail!("{location}: report JWS must have three segments");
-        }
-        let payload = URL_SAFE_NO_PAD
-            .decode(payload)
-            .with_context(|| format!("{location}: invalid report JWS payload"))?;
-        let value: Value = serde_json::from_slice(&payload)
-            .with_context(|| format!("{location}: report payload is not JSON"))?;
-        let report_id = value["report_id"].as_str().unwrap_or("unknown");
-        let report_type = value["report_type"].as_str().unwrap_or("unknown");
-        writeln!(
-            output,
-            "== {}  source:{}  status:{}  report_id:{}  report_type:{}",
-            record.time,
-            file.source,
-            record
-                .status
-                .map_or_else(|| "unknown".into(), |status| status.to_string()),
-            report_id,
-            report_type
-        )?;
-        writeln!(output, "{}", serde_json::to_string_pretty(&value)?)?;
-        if record.response_incomplete {
-            writeln!(output, "-- response (response incomplete)")?;
-        } else {
-            writeln!(output, "-- response")?;
-        }
-        let response = record.response()?;
-        match String::from_utf8(response) {
-            Ok(response) => writeln!(output, "{response}\n")?,
-            Err(error) => writeln!(
-                output,
-                "{} response bytes (not UTF-8)\n",
-                error.as_bytes().len()
-            )?,
-        }
-    }
-    Ok(())
-}
-
-fn log_reports_with_discovery(
-    home: &Home,
-    discover: impl FnOnce(&Home) -> Result<Vec<(PathBuf, bool)>>,
-    output: &mut impl Write,
-    warnings: &mut impl Write,
-) -> Result<()> {
-    let canonical_home = Home(schedule::report_log_home_path(home)?);
-    let paths = match discover(&canonical_home) {
-        Ok(paths) => paths,
-        Err(error) => {
-            system_history_warning(system_discovery_reason(&error), warnings)?;
-            vec![(canonical_home.file("reports.jsonl"), false)]
-        }
-    };
-    let files = paths
-        .iter()
-        .map(|(path, system_state)| ReportLogFile {
-            path,
-            source: if *system_state { "system" } else { "home" },
-            system_state: *system_state,
-        })
-        .collect::<Vec<_>>();
-    log_reports(&files, output, warnings)
-}
-
 async fn run(cli: Cli) -> Result<ExitCode> {
     if let Command::Schedule {
         command: schedule::Command::Probe { address },
@@ -4001,19 +3833,6 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Command::Check { dry_run: true } => check_dry_run(&home, cli.insecure_dev).await,
         Command::Accept { yes } => accept(&home, yes, cli.insecure_dev).await,
         Command::Finish { yes } => finish(&home, cli.insecure_dev, yes, false).await,
-        Command::Report { dry_run } => {
-            let config = device_config::DeviceConfig::load(&home)?
-                .context("open-pact.toml is missing; run `config example`")?;
-            let report = config
-                .report
-                .context("open-pact.toml [report].collector is required")?;
-            let collector = report
-                .collector
-                .as_deref()
-                .context("open-pact.toml [report].collector is required")?;
-            report::run(&home, collector, dry_run).await?;
-            Ok(ExitCode::SUCCESS)
-        }
         Command::Config {
             command: ConfigCommand::Example,
         } => {
@@ -4064,15 +3883,6 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Command::Log {
             command: LogCommand::Show,
         } => log_show(&home.file("claims.jsonl")).map(|()| ExitCode::SUCCESS),
-        Command::Log {
-            command: LogCommand::Reports,
-        } => log_reports_with_discovery(
-            &home,
-            schedule::report_log_paths,
-            &mut std::io::stdout().lock(),
-            &mut std::io::stderr().lock(),
-        )
-        .map(|()| ExitCode::SUCCESS),
         Command::DeleteDeviceKey => {
             DeviceKey::delete(&home.0)?;
             println!("Device key deleted.");
@@ -4080,7 +3890,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         }
         Command::Stop => {
             println!(
-                "Set [schedule].enabled = false in open-pact.toml, then run `{}` to stop scheduled reports.",
+                "Set [schedule].enabled = false in open-pact.toml, then run `{}` to stop the scheduled claims.",
                 schedule::apply_command(&home.0)
             );
             println!(
@@ -4254,7 +4064,7 @@ mod tests {
         assert!(output.contains("Open open-pact.toml in your editor? [Y/n]"));
         assert!(output.contains("Answer y or n."));
         assert!(output.contains("Open it again? [Y/n]"));
-        assert!(output.contains("Send the first report now? [Y/n]"));
+        assert!(output.contains("Send the first claim now? [Y/n]"));
     }
 
     #[test]
@@ -4276,7 +4086,7 @@ mod tests {
         assert_eq!(opened, 1);
         let output = String::from_utf8(output).unwrap();
         assert_eq!(output.matches("Save the file, then press Enter").count(), 1);
-        assert!(output.contains("Send the first report now? [Y/n]"));
+        assert!(output.contains("Send the first claim now? [Y/n]"));
     }
 
     #[test]
@@ -4301,7 +4111,7 @@ mod tests {
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains(&format!("{} is missing", path.display())));
         assert!(output.contains("Open it again? [Y/n]"));
-        assert!(!output.contains("Send the first report now? [Y/n]"));
+        assert!(!output.contains("Send the first claim now? [Y/n]"));
     }
 
     #[test]
@@ -4448,7 +4258,7 @@ mod tests {
         assert_eq!(wizard_resume(&home).unwrap(), WizardResume::Finish);
         fs::write(
             home.file(device_config::FILE),
-            "[report]\ncollector = \"https://collector.example.org/status\"\n",
+            "[schedule]\nenabled = false\nrun_as = \"user\"\n",
         )
         .unwrap();
         assert_eq!(wizard_resume(&home).unwrap(), WizardResume::FirstCheck);
@@ -4529,72 +4339,11 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn log_reports_keeps_home_history_when_system_discovery_fails() {
-        use base64::Engine;
-
-        let dir = tempfile::tempdir().unwrap();
-        let home = Home(dir.path().to_path_buf());
-        let payload = serde_json::json!({
-            "report_id": "home-row",
-            "report_type": "periodic",
-        });
-        let jws = format!(
-            "e30.{}.signature",
-            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap())
-        );
-        locallog::append_report_retained(
-            &home.file("reports.jsonl"),
-            &home.file("report-state.json"),
-            jws.as_bytes(),
-            b"ok",
-            200,
-            false,
-        )
-        .unwrap();
-
-        let mut output = Vec::new();
-        let mut warnings = Vec::new();
-        log_reports_with_discovery(
-            &home,
-            |_| Err(anyhow::anyhow!("access denied")),
-            &mut output,
-            &mut warnings,
-        )
-        .unwrap();
-
-        let output = String::from_utf8(output).unwrap();
-        assert!(output.contains("report_id:home-row"));
-        assert!(!output.contains("SYSTEM history was not included"));
-        let warnings = String::from_utf8(warnings).unwrap();
-        assert_eq!(warnings.lines().count(), 1);
-        assert!(warnings.contains("SYSTEM history was not included"));
-        assert!(warnings.contains("access denied"));
-        assert!(warnings.contains("elevated prompt"));
-
-        let mut unsafe_warning = Vec::new();
-        log_reports_with_discovery(
-            &home,
-            |_| {
-                Err(anyhow::anyhow!(
-                    "Protected path ACL grants write to a non-admin principal"
-                ))
-            },
-            &mut Vec::new(),
-            &mut unsafe_warning,
-        )
-        .unwrap();
-        let unsafe_warning = String::from_utf8(unsafe_warning).unwrap();
-        assert_eq!(unsafe_warning.lines().count(), 1);
-        assert!(unsafe_warning.contains("protected directory permissions are unsafe"));
-    }
-
-    #[test]
     fn finish_writer_does_not_rewrite_an_unchanged_owner_config() {
         let dir = tempfile::tempdir().unwrap();
         let home = Home(dir.path().to_path_buf());
         let path = home.file(device_config::FILE);
-        let original =
-            b"# owner note\n[report]\ncollector = \"https://owner.example.org/status\"\n";
+        let original = b"# owner note\n[schedule]\nenabled = false\nrun_as = \"user\"\n";
         let old_backup = home.file("open-pact.toml.bak");
         fs::write(&old_backup, b"older owner config").unwrap();
         fs::write(&path, original).unwrap();
@@ -4685,13 +4434,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let home = Home(dir.path().to_path_buf());
         let path = home.file(device_config::FILE);
-        let original = b"[report]\ncollector = 'https://owner.example.org/status'\n";
+        let original = b"[schedule]\nenabled = false\nrun_as = 'user'\n";
         fs::write(&path, original).unwrap();
         FINISH_WRITE_HOOK.with(|hook| hook.set(Some(simulate_concurrent_owner_edit)));
         let error = write_proposal(
             &home,
             Some(original),
-            "[report]\ncollector = 'https://company.example.org/status'\n",
+            "[schedule]\nenabled = false\nrun_as = 'user'\nmode = 'vpn'\n",
         )
         .unwrap_err()
         .to_string();
@@ -4713,7 +4462,7 @@ mod tests {
     fn simulate_concurrent_owner_edit(path: &Path) {
         fs::write(
             path,
-            b"[report]\ncollector = 'https://owner.example.org/status'\n# concurrent edit\n",
+            b"[schedule]\nenabled = false\nrun_as = 'user'\n# concurrent edit\n",
         )
         .unwrap();
     }
@@ -4727,247 +4476,19 @@ mod tests {
         let home = Home(dir.path().to_path_buf());
         let path = home.file(device_config::FILE);
         symlink("missing-target", &path).unwrap();
-        let error = write_proposal(&home, None, "[report]\n")
-            .unwrap_err()
-            .to_string();
+        let error = write_proposal(
+            &home,
+            None,
+            "[schedule]\nenabled = false\nrun_as = 'user'\n",
+        )
+        .unwrap_err()
+        .to_string();
         assert_eq!(
             error,
             "open-pact.toml is a symbolic link. finish does not change it. Edit the target file by hand."
         );
         assert!(fs::read_link(&path).unwrap().ends_with("missing-target"));
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
-    }
-
-    #[test]
-    fn log_reports_prints_records_oldest_first_with_payload_and_response() {
-        use base64::Engine;
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("reports.jsonl");
-        let state = dir.path().join("report-state.json");
-        for (id, kind, response, status) in [
-            ("first", "periodic", b"ok".as_slice(), 200),
-            ("second", "event", b"\xff".as_slice(), 503),
-        ] {
-            let payload = serde_json::json!({
-                "report_id": id,
-                "report_type": kind,
-                "results": {"firewall": "on"},
-            });
-            let jws = format!(
-                "e30.{}.signature",
-                URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap())
-            );
-            locallog::append_report_retained(
-                &path,
-                &state,
-                jws.as_bytes(),
-                response,
-                status,
-                false,
-            )
-            .unwrap();
-        }
-        let mut records = locallog::read(&path).unwrap();
-        records[0].time = "2026-01-01T00:00:00Z".into();
-        records[1].time = "2026-01-02T00:00:00Z".into();
-        records[1].response_incomplete = true;
-        fs::write(
-            &path,
-            records
-                .iter()
-                .map(serde_json::to_string)
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .unwrap()
-                .join("\n")
-                + "\n",
-        )
-        .unwrap();
-        let mut output = Vec::new();
-        log_reports(
-            &[ReportLogFile {
-                path: &path,
-                source: "home",
-                system_state: false,
-            }],
-            &mut output,
-            &mut Vec::new(),
-        )
-        .unwrap();
-        let output = String::from_utf8(output).unwrap();
-        assert!(output.find("report_id:first").unwrap() < output.find("report_id:second").unwrap());
-        assert!(output.contains("status:200"));
-        assert!(output.contains("report_type:periodic"));
-        assert!(output.contains("\"firewall\": \"on\""));
-        assert!(output.contains("ok"));
-        assert!(output.contains("1 response bytes (not UTF-8)"));
-        assert!(output.contains("response incomplete"));
-    }
-
-    #[test]
-    fn log_reports_reads_home_and_system_history() {
-        use base64::Engine;
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().join("home-reports.jsonl");
-        let system = dir.path().join("system-reports.jsonl");
-        let state = dir.path().join("report-state.json");
-        for (path, id, time) in [
-            (&system, "system-row", "2026-01-01T00:00:00Z"),
-            (&home, "home-row", "2026-01-02T00:00:00Z"),
-        ] {
-            let payload = serde_json::json!({
-                "report_id": id,
-                "report_type": "periodic",
-            });
-            let jws = format!(
-                "e30.{}.signature",
-                URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap())
-            );
-            locallog::append_report_retained(path, &state, jws.as_bytes(), b"ok", 200, false)
-                .unwrap();
-            let mut record = locallog::read(path).unwrap().remove(0);
-            record.time = time.into();
-            fs::write(path, serde_json::to_vec(&record).unwrap()).unwrap();
-        }
-        let files = [
-            ReportLogFile {
-                path: &home,
-                source: "home",
-                system_state: false,
-            },
-            ReportLogFile {
-                path: &system,
-                source: "system",
-                system_state: true,
-            },
-        ];
-        let mut output = Vec::new();
-        let mut warnings = Vec::new();
-
-        log_reports(&files, &mut output, &mut warnings).unwrap();
-
-        let output = String::from_utf8(output).unwrap();
-        assert!(output.contains("source:home"));
-        assert!(output.contains("source:system"));
-        assert!(
-            output.find("report_id:system-row").unwrap()
-                < output.find("report_id:home-row").unwrap()
-        );
-
-        let unreadable_system = dir.path().join("unreadable-system");
-        fs::create_dir(&unreadable_system).unwrap();
-        let unreadable_files = [
-            ReportLogFile {
-                path: &home,
-                source: "home",
-                system_state: false,
-            },
-            ReportLogFile {
-                path: &unreadable_system,
-                source: "system",
-                system_state: true,
-            },
-        ];
-        let mut fallback = Vec::new();
-        let mut warnings = Vec::new();
-        log_reports(&unreadable_files, &mut fallback, &mut warnings).unwrap();
-        let fallback = String::from_utf8(fallback).unwrap();
-        assert!(fallback.contains("report_id:home-row"));
-        let warnings = String::from_utf8(warnings).unwrap();
-        assert_eq!(warnings.lines().count(), 1);
-        assert!(warnings.contains("SYSTEM history was not included"));
-        assert!(warnings.contains("elevated prompt"));
-    }
-
-    #[test]
-    fn report_errors_name_physical_file_lines() {
-        use base64::Engine;
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-
-        let dir = tempfile::tempdir().unwrap();
-        let state = dir.path().join("report-state.json");
-        let hash_path = dir.path().join("hash-reports.jsonl");
-        locallog::append_report_retained(&hash_path, &state, b"first", b"ok", 200, false).unwrap();
-        locallog::append_report_retained(&hash_path, &state, b"second", b"ok", 200, false).unwrap();
-        let mut lines = fs::read_to_string(&hash_path)
-            .unwrap()
-            .lines()
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        let mut bad_hash: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
-        bad_hash["sent_sha256"] = serde_json::Value::String("0".repeat(64));
-        lines[1] = serde_json::to_string(&bad_hash).unwrap();
-        fs::write(&hash_path, format!("{}\n\n{}\n", lines[0], lines[1])).unwrap();
-        let hash_error = log_reports(
-            &[ReportLogFile {
-                path: &hash_path,
-                source: "home",
-                system_state: false,
-            }],
-            &mut Vec::new(),
-            &mut Vec::new(),
-        )
-        .unwrap_err();
-        assert!(
-            format!("{hash_error:#}").contains("line 3"),
-            "{hash_error:#}"
-        );
-
-        let sorted_path = dir.path().join("sorted-reports.jsonl");
-        let valid_payload = serde_json::json!({
-            "report_id": "newer",
-            "report_type": "periodic",
-        });
-        let valid_jws = format!(
-            "e30.{}.signature",
-            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&valid_payload).unwrap())
-        );
-        locallog::append_report_retained(
-            &sorted_path,
-            &state,
-            valid_jws.as_bytes(),
-            b"ok",
-            200,
-            false,
-        )
-        .unwrap();
-        locallog::append_report_retained(
-            &sorted_path,
-            &state,
-            b"e30.*.signature",
-            b"ok",
-            200,
-            false,
-        )
-        .unwrap();
-        let mut records = locallog::read(&sorted_path).unwrap();
-        records[0].time = "2026-01-02T00:00:00Z".into();
-        records[1].time = "2026-01-01T00:00:00Z".into();
-        fs::write(
-            &sorted_path,
-            records
-                .iter()
-                .map(serde_json::to_string)
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .unwrap()
-                .join("\n")
-                + "\n",
-        )
-        .unwrap();
-        let jws_error = log_reports(
-            &[ReportLogFile {
-                path: &sorted_path,
-                source: "home",
-                system_state: false,
-            }],
-            &mut Vec::new(),
-            &mut Vec::new(),
-        )
-        .unwrap_err();
-        assert!(jws_error.to_string().contains("line 2"), "{jws_error:#}");
     }
 
     #[test]
@@ -6088,7 +5609,7 @@ mod tests {
         put_gateway_in_enrolment(&home, &mut enrolment, &gateway.url);
         home.write(
             device_config::FILE,
-            b"[report]\ncollector = \"https://collector.example.org/status\"\n",
+            b"[schedule]\nenabled = false\nrun_as = \"user\"\n",
         )
         .unwrap();
         let accepted_claim = serde_json::to_vec(&json!({
@@ -6512,22 +6033,22 @@ mod tests {
         (code, before, after, pair, claim)
     }
 
-    /// `check_under`, which also runs `check --dry-run` first when `preview` is set. The dry run
-    /// must post nothing and leave the home as it was. Returns its request as the last value.
-    async fn check_under_previewed(
-        preview: bool,
+    /// A device enrolled at a gateway with an honest, witnessed log. The claim sits in the gateway's
+    /// reply to `POST /v1/claim` unless `reply` gives another body.
+    struct ClaimFixture {
+        dir: tempfile::TempDir,
+        home: Home,
+        gateway: FakeGateway,
+        pair: VpnPair,
+    }
+
+    async fn claim_fixture_replying(
+        reply: Option<&str>,
         enforced: impl FnOnce(&str) -> String,
         response: impl FnOnce(&Company, &Witness, &[Entry], u64) -> Option<String>,
         pair: impl FnOnce(&KeyPair) -> VpnPair,
         device_config: Option<&str>,
-    ) -> (
-        Result<ExitCode>,
-        BTreeMap<String, Vec<u8>>,
-        BTreeMap<String, Vec<u8>>,
-        VpnPair,
-        String,
-        Option<Value>,
-    ) {
+    ) -> ClaimFixture {
         let (company, witness) = (Company::new(), Witness::new());
         let toml = witnessed_manifest(&witness);
         let manifest = Manifest::parse(toml.as_bytes()).unwrap();
@@ -6578,7 +6099,10 @@ mod tests {
             Company::published(&enforced(&toml), &company.key),
             company.log.vkey(),
         );
-        let (claim, stored) = (claim.to_string(), before_claim.clone());
+        let (claim, stored) = (
+            reply.map_or_else(|| claim.to_string(), str::to_owned),
+            before_claim.clone(),
+        );
         let leaves: Vec<_> = entries[..2].iter().map(Entry::leaf_hash).collect();
         let mine_response = serde_json::to_string(&MyEntries {
             checkpoint: before_claim.clone(),
@@ -6608,6 +6132,36 @@ mod tests {
             home.write(crate::device_config::FILE, config.as_bytes())
                 .unwrap();
         }
+        ClaimFixture {
+            dir,
+            home,
+            gateway,
+            pair,
+        }
+    }
+
+    /// `check_under`, which also runs `check --dry-run` first when `preview` is set. The dry run
+    /// must post nothing and leave the home as it was. Returns its request as the last value.
+    async fn check_under_previewed(
+        preview: bool,
+        enforced: impl FnOnce(&str) -> String,
+        response: impl FnOnce(&Company, &Witness, &[Entry], u64) -> Option<String>,
+        pair: impl FnOnce(&KeyPair) -> VpnPair,
+        device_config: Option<&str>,
+    ) -> (
+        Result<ExitCode>,
+        BTreeMap<String, Vec<u8>>,
+        BTreeMap<String, Vec<u8>>,
+        VpnPair,
+        String,
+        Option<Value>,
+    ) {
+        let ClaimFixture {
+            dir,
+            home,
+            gateway,
+            pair,
+        } = claim_fixture_replying(None, enforced, response, pair, device_config).await;
         let previewed = if preview {
             let before_preview = snapshot(dir.path());
             let claim::Preview::Request(request) = check_preview(&home, false).await.unwrap()
@@ -6698,6 +6252,269 @@ mod tests {
             assert_eq!(preview.get("manifest_toml").is_some(), manifest_changed);
             assert!(preview.get("jws").is_none());
         }
+    }
+
+    const EARLIER_PAIR: [&[u8]; 2] = [b"earlier CA", b"earlier certificate"];
+
+    fn earlier_pair(fixture: &ClaimFixture) -> [Vec<u8>; 2] {
+        ["ca.pem", "vpn-cert.pem"].map(|name| std::fs::read(fixture.home.file(name)).unwrap())
+    }
+
+    fn vpn_policy(probe: &str) -> device_config::SendPolicy {
+        device_config::SendPolicy::Vpn {
+            probe: device_config::ProbeAddress::parse(probe).unwrap(),
+        }
+    }
+
+    /// An address that accepts connections while the listener lives.
+    fn open_probe() -> (std::net::TcpListener, String) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        (listener, address)
+    }
+
+    /// An address that refuses connections while the socket lives.
+    fn refused_probe() -> (tokio::net::TcpSocket, String) {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let address = socket.local_addr().unwrap().to_string();
+        (socket, address)
+    }
+
+    fn schedule_config(probe: &str) -> String {
+        format!(
+            "[schedule]\nenabled = true\nrun_as = 'user'\nmode = 'vpn'\nvpn_probe = '{probe}'\n"
+        )
+    }
+
+    async fn tick_once(fixture: &ClaimFixture, probe: &str) -> Result<()> {
+        schedule::tick(
+            &fixture.home,
+            &Home(fixture.dir.path().to_path_buf()),
+            None,
+            &vpn_policy(probe),
+            checks::EventMarkerReads::default,
+        )
+        .await
+    }
+
+    fn schedule_state(fixture: &ClaimFixture) -> Value {
+        fixture
+            .home
+            .read_json("report-state.json")
+            .unwrap()
+            .expect("the tick saved its state")
+    }
+
+    fn claim_posts(fixture: &ClaimFixture) -> usize {
+        fixture
+            .gateway
+            .posts()
+            .iter()
+            .filter(|line| *line == "POST /v1/claim")
+            .count()
+    }
+
+    fn job_log_text(fixture: &ClaimFixture) -> String {
+        std::fs::read_to_string(fixture.home.file("schedule.log")).unwrap_or_default()
+    }
+
+    async fn scheduled_fixture(
+        reply: Option<&str>,
+        enforced: impl FnOnce(&str) -> String,
+        response: impl FnOnce(&Company, &Witness, &[Entry], u64) -> Option<String>,
+    ) -> ClaimFixture {
+        claim_fixture_replying(reply, enforced, response, valid_pair, None).await
+    }
+
+    fn unchanged(signed: &str) -> String {
+        signed.to_string()
+    }
+
+    #[tokio::test]
+    async fn a_scheduled_tick_on_the_vpn_sends_one_claim_and_installs_the_pair() {
+        let fixture = scheduled_fixture(None, unchanged, grown_checkpoint).await;
+        let (_probe, address) = open_probe();
+        tick_once(&fixture, &address).await.unwrap();
+        assert_eq!(claim_posts(&fixture), 1);
+        assert_eq!(
+            locallog::read(&fixture.home.file("claims.jsonl"))
+                .unwrap()
+                .len(),
+            1
+        );
+        let [ca, cert] = earlier_pair(&fixture);
+        assert_eq!(ca, fixture.pair.ca.as_bytes());
+        assert_eq!(cert, fixture.pair.cert.as_deref().unwrap().as_bytes());
+        let state = schedule_state(&fixture);
+        assert!(state["last_success"].is_number());
+        assert_eq!(state["reconnect_pending"], false);
+        assert_eq!(job_log_text(&fixture), "", "nothing needs the owner");
+
+        tick_once(&fixture, &address).await.unwrap();
+        assert_eq!(claim_posts(&fixture), 1, "no trigger is due again so soon");
+    }
+
+    #[tokio::test]
+    async fn a_scheduled_tick_off_the_vpn_contacts_no_gateway() {
+        let fixture = scheduled_fixture(None, unchanged, grown_checkpoint).await;
+        let (_socket, address) = refused_probe();
+        tick_once(&fixture, &address).await.unwrap();
+        assert_eq!(fixture.gateway.requests(), Vec::<String>::new());
+        assert!(!fixture.home.file("claims.jsonl").exists());
+        assert!(schedule_state(&fixture)["last_success"].is_null());
+    }
+
+    #[tokio::test]
+    async fn a_scheduled_tick_sends_nothing_when_the_vpn_drops_before_the_post() {
+        let fixture = scheduled_fixture(None, unchanged, grown_checkpoint).await;
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = probe.local_addr().unwrap().to_string();
+        let close = std::thread::spawn(move || {
+            let (stream, _) = probe.accept().unwrap();
+            drop(stream);
+            drop(probe);
+        });
+        tick_once(&fixture, &address).await.unwrap();
+        close.join().unwrap();
+        assert_eq!(claim_posts(&fixture), 0);
+        assert!(!fixture.home.file("claims.jsonl").exists());
+        assert_eq!(earlier_pair(&fixture), EARLIER_PAIR);
+        let state = schedule_state(&fixture);
+        assert_eq!(state["vpn_up"], false);
+        assert_eq!(state["reconnect_pending"], true, "the reconnect stays due");
+    }
+
+    #[tokio::test]
+    async fn a_scheduled_run_skips_its_tick_while_another_command_holds_the_claim_lock() {
+        let (_probe, address) = open_probe();
+        let fixture = claim_fixture_replying(
+            None,
+            unchanged,
+            grown_checkpoint,
+            valid_pair,
+            Some(&schedule_config(&address)),
+        )
+        .await;
+        let run = || {
+            schedule::run(
+                &fixture.home,
+                schedule::Command::Run {
+                    system: false,
+                    user_home: None,
+                },
+            )
+        };
+        let held = claim::try_lock(&fixture.home).unwrap().unwrap();
+        run().await.unwrap();
+        assert_eq!(fixture.gateway.requests(), Vec::<String>::new());
+        assert!(!fixture.home.file("report-state.json").exists());
+        drop(held);
+        run().await.unwrap();
+        assert_eq!(claim_posts(&fixture), 1);
+    }
+
+    #[tokio::test]
+    async fn a_denied_scheduled_claim_counts_as_delivered_and_tells_the_owner() {
+        let reply = r#"{"status":"denied","reasons":["firewall must be on"]}"#;
+        let fixture = scheduled_fixture(Some(reply), unchanged, grown_checkpoint).await;
+        let (_probe, address) = open_probe();
+        tick_once(&fixture, &address).await.unwrap();
+        assert_eq!(claim_posts(&fixture), 1);
+        assert!(schedule_state(&fixture)["last_success"].is_number());
+        assert_eq!(earlier_pair(&fixture), EARLIER_PAIR);
+        let log = job_log_text(&fixture);
+        assert!(
+            log.contains("denied") && log.contains("firewall must be on"),
+            "{log}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_scheduled_claim_under_a_changed_manifest_tells_the_owner_to_accept() {
+        let fixture = scheduled_fixture(None, with_password_rule, grown_checkpoint).await;
+        let (_probe, address) = open_probe();
+        tick_once(&fixture, &address).await.unwrap();
+        assert_eq!(claim_posts(&fixture), 1);
+        let log = job_log_text(&fixture);
+        assert!(
+            log.contains("The manifest changed") && log.contains("accept"),
+            "{log}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_scheduled_log_alarm_is_noted_and_installs_nothing() {
+        let fixture = scheduled_fixture(None, unchanged, |_, _, _, _| None).await;
+        let (_probe, address) = open_probe();
+        tick_once(&fixture, &address).await.unwrap();
+        assert_eq!(earlier_pair(&fixture), EARLIER_PAIR);
+        let state = schedule_state(&fixture);
+        assert!(state["last_success"].is_null());
+        assert_eq!(state["reconnect_pending"], true, "the claim is retried");
+        let log = job_log_text(&fixture);
+        assert!(log.contains("TRANSPARENCY LOG ALARM"), "{log}");
+    }
+
+    #[tokio::test]
+    async fn a_scheduled_run_that_cannot_reach_the_gateway_keeps_the_trigger_and_logs_the_error() {
+        let (_probe, address) = open_probe();
+        let fixture = claim_fixture_replying(
+            None,
+            unchanged,
+            grown_checkpoint,
+            valid_pair,
+            Some(&schedule_config(&address)),
+        )
+        .await;
+        let (_socket, refused) = refused_probe();
+        let mut enrolment: Enrolment = fixture.home.enrolment().unwrap();
+        enrolment.gateway = format!("http://{refused}");
+        fixture
+            .home
+            .write("enrolment.json", &serde_json::to_vec(&enrolment).unwrap())
+            .unwrap();
+        let error = schedule::run(
+            &fixture.home,
+            schedule::Command::Run {
+                system: false,
+                user_home: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("/v1/manifest"), "{error:#}");
+        let state = schedule_state(&fixture);
+        assert!(state["last_success"].is_null());
+        assert_eq!(state["reconnect_pending"], true);
+        assert!(job_log_text(&fixture).contains("error:"));
+    }
+
+    #[tokio::test]
+    async fn a_scan_reads_the_given_user_home_and_not_the_client_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().join("client"));
+        let profile = dir.path().join("profile");
+        let repo = profile.join("work/app");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::write(
+            repo.join(".git/config"),
+            "[remote \"origin\"]\n url = git@github.com:example-org/app.git\n",
+        )
+        .unwrap();
+        fs::create_dir_all(&home.0).unwrap();
+        let manifest =
+            Manifest::parse(include_str!("../../../examples/manifest.toml").as_bytes()).unwrap();
+        let own = scan_repositories(&home, &manifest, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(own.managed_repos_total, 0);
+        let given = scan_repositories_from(&home, Some(&profile), &manifest, None, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(given.managed_repos_total, 1);
     }
 
     const PASSWORD_RULE: &str = r#"[[control]]

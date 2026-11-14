@@ -199,6 +199,7 @@ impl DeviceKey {
         }
     }
 
+    #[cfg(all(test, windows))]
     pub fn protection(&self) -> &'static str {
         match self {
             Self::Software(_) => "os_permissions",

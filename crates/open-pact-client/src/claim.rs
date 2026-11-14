@@ -112,7 +112,9 @@ pub(crate) struct LegacyLogHead;
 
 impl std::fmt::Display for LegacyLogHead {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("the transparency log head is in the old hash-chain format")
+        f.write_str(
+            "the transparency log head is in the old hash-chain format; run `open-pact-client join` again to pin the new log",
+        )
     }
 }
 
@@ -251,7 +253,6 @@ pub(crate) async fn prepare(
 /// How a claim went, after the pipeline printed what happened.
 pub(crate) enum Outcome {
     Accepted {
-        warnings: Vec<String>,
         changed: Option<ManifestHash>,
     },
     Denied {
@@ -555,7 +556,7 @@ impl Prepared {
         let sent_at = claim
             .time
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let (result, warnings, reasons) = match serde_json::from_slice::<Response>(&received)
+        let (result, reasons) = match serde_json::from_slice::<Response>(&received)
             .with_context(|| String::from_utf8_lossy(&received).into_owned())?
         {
             Response::Accepted {
@@ -625,7 +626,7 @@ impl Prepared {
                     home.file("vpn-cert.pem").display(),
                 );
                 println!("VPN CA          {}", home.file("ca.pem").display());
-                (ClaimResult::Accepted, warnings, Vec::new())
+                (ClaimResult::Accepted, Vec::new())
             }
             Response::Denied { reasons } => {
                 println!("{}", crate::ui::bold("DENIED", crate::ui::styled()));
@@ -633,7 +634,7 @@ impl Prepared {
                     println!("  {r}");
                 }
                 crate::print_hints(manifest, &claim.results, os);
-                (ClaimResult::Denied, Vec::new(), reasons)
+                (ClaimResult::Denied, reasons)
             }
         };
         crate::report_log(LogSync::Verified(verified, own), home);
@@ -646,7 +647,7 @@ impl Prepared {
             println!("\nNext: fix the items above, then run {command} check again.");
         }
         Ok(if accepted {
-            Outcome::Accepted { warnings, changed }
+            Outcome::Accepted { changed }
         } else {
             Outcome::Denied { reasons, changed }
         })

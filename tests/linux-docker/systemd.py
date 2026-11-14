@@ -62,12 +62,11 @@ try:
     execute(*user_args, f"OPEN_PACT_SCHEDULE_FIXTURE={home}", "open-pact-checks", "prepare_linux_schedule_home", "--ignored", "--nocapture")
     def write_schedule(enabled):
         config = (
-            "[report]\n"
-            'collector = "https://collector.example.org/status"\n'
-            'vpn_probe = "127.0.0.1:9"\n\n'
             "[schedule]\n"
             f"enabled = {str(enabled).lower()}\n"
             'run_as = "user"\n'
+            'mode = "vpn"\n'
+            'vpn_probe = "127.0.0.1:9"\n'
         )
         code = f"from pathlib import Path; Path({home!r}, 'open-pact.toml').write_text({config!r})"
         execute(*user_args, "python3", "-c", code)

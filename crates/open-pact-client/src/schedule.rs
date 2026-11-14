@@ -8,20 +8,33 @@ use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::device_config::{DeviceConfig, RunAs};
-use crate::{Home, checks, report};
+use crate::claim::{self, NotSent, Outcome, ScanPolicy};
+use crate::device_config::{DeviceConfig, RunAs, SendPolicy};
+use crate::{Home, checks};
 
-const CONFIG: &str = "report-schedule.json";
 const STATE: &str = "report-state.json";
-const HOME_LEFTOVER_FILES: &[&str] = &[CONFIG, STATE, "reports.jsonl", "reports.jsonl.tmp"];
+/// What the job tells the owner: manifest changes, denials, log alarms and errors. The OS also
+/// sends the job's output here where it can.
+const JOB_LOG: &str = "schedule.log";
+const JOB_LOG_LIMIT: u64 = 256 * 1024;
+/// Files an earlier client left. `apply` removes them.
+const HOME_LEFTOVER_FILES: &[&str] = &[
+    "report-schedule.json",
+    STATE,
+    "reports.jsonl",
+    "reports.jsonl.tmp",
+];
 const HOME_REMOVE_FILES: &[&str] = &[
-    CONFIG,
+    "report-schedule.json",
     STATE,
     "report-state.json.tmp",
     "report-schedule.json.tmp",
     "reports.jsonl",
     "reports.jsonl.tmp",
+    JOB_LOG,
+    "schedule.log.1",
 ];
+const REPO_SCAN_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const LOCK: &str = "report-schedule.lock";
 
 #[derive(Subcommand)]
@@ -30,6 +43,9 @@ pub(crate) enum Command {
     Run {
         #[arg(long)]
         system: bool,
+        /// The profile whose repositories and `~` paths count, when the job does not run as that user
+        #[arg(long)]
+        user_home: Option<PathBuf>,
     },
     #[command(hide = true)]
     Probe {
@@ -40,39 +56,34 @@ pub(crate) enum Command {
 
 enum Operation {
     Install {
-        collector: String,
-        vpn_probe: Option<String>,
+        send: SendPolicy,
         system: bool,
+        user_home: Option<PathBuf>,
     },
     Uninstall {
         system: bool,
     },
     Run {
         system: bool,
+        user_home: Option<PathBuf>,
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-struct Config {
-    collector: String,
-    vpn_probe: String,
+/// Why a scheduled run sends a claim. It never leaves the device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Trigger {
+    Connect,
+    Event,
+    Periodic,
 }
 
-impl Config {
-    fn new(collector: String, vpn_probe: Option<String>) -> Result<Self> {
-        let url = report::collector_url(&collector)?;
-        let vpn_probe = vpn_probe.unwrap_or_else(|| {
-            format!(
-                "{}:{}",
-                url.host().unwrap(),
-                url.port_or_known_default().unwrap()
-            )
-        });
-        probe_address(&vpn_probe)?;
-        Ok(Self {
-            collector,
-            vpn_probe,
-        })
+impl Trigger {
+    fn name(self) -> &'static str {
+        match self {
+            Trigger::Connect => "connect",
+            Trigger::Event => "event",
+            Trigger::Periodic => "periodic",
+        }
     }
 }
 
@@ -144,15 +155,15 @@ impl State {
         self.last_observed_compliance = Some(current.clone());
     }
 
-    fn report_type(&self, now: i64) -> Option<report::ReportType> {
+    fn due(&self, now: i64) -> Option<Trigger> {
         if !self.vpn_up {
             None
         } else if self.reconnect_pending {
-            Some(report::ReportType::Connect)
+            Some(Trigger::Connect)
         } else if self.event_pending {
-            Some(report::ReportType::Event)
+            Some(Trigger::Event)
         } else if self.should_send(now) {
-            Some(report::ReportType::Periodic)
+            Some(Trigger::Periodic)
         } else {
             None
         }
@@ -433,6 +444,9 @@ fn windows_arg(raw: &str) -> String {
 struct Job {
     id: String,
     argv: Vec<String>,
+    /// Where the OS sends the job's output. Task Scheduler cannot, so the job also writes its own
+    /// notes there.
+    log: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -468,7 +482,19 @@ impl Job {
                 "schedule".into(),
                 "run".into(),
             ],
+            log: text(&home.join(JOB_LOG))?.into(),
         })
+    }
+
+    /// The job runs as SYSTEM, so repositories and `~` paths come from `user_home`, not from the
+    /// SYSTEM profile.
+    fn for_system(mut self, user_home: &Path) -> Result<Self> {
+        self.argv.extend([
+            "--system".into(),
+            "--user-home".into(),
+            text(user_home)?.into(),
+        ]);
+        Ok(self)
     }
 
     fn plist(&self) -> String {
@@ -486,9 +512,12 @@ impl Job {
 <key>ProgramArguments</key><array>{args}</array>
 <key>StartInterval</key><integer>300</integer>
 <key>RunAtLoad</key><true/>
+<key>StandardOutPath</key><string>{log}</string>
+<key>StandardErrorPath</key><string>{log}</string>
 </dict></plist>
 "#,
-            self.id
+            self.id,
+            log = xml(&self.log)
         )
     }
 
@@ -507,14 +536,15 @@ impl Job {
             })
             .collect::<Vec<_>>()
             .join(" ");
+        let log = self.log.replace('%', "%%");
         format!(
-            "[Unit]\nDescription=Open-pact signed status report\n[Service]\nType=oneshot\nExecStart={args}\n"
+            "[Unit]\nDescription=Open-pact scheduled claim\n[Service]\nType=oneshot\nStandardOutput=append:{log}\nStandardError=append:{log}\nExecStart={args}\n"
         )
     }
 
     fn timer(&self) -> String {
         format!(
-            "[Unit]\nDescription=Check VPN for open-pact reports every five minutes\n[Timer]\nOnStartupSec=1min\nOnUnitActiveSec=5min\nAccuracySec=1s\nUnit={}.service\n[Install]\nWantedBy=timers.target\n",
+            "[Unit]\nDescription=Check VPN for open-pact claims every five minutes\n[Timer]\nOnStartupSec=1min\nOnUnitActiveSec=5min\nAccuracySec=1s\nUnit={}.service\n[Install]\nWantedBy=timers.target\n",
             self.id
         )
     }
@@ -1094,53 +1124,39 @@ fn validate_system_install(system: bool, os: open_pact_core::Os) -> Result<()> {
     Ok(())
 }
 
-async fn run_report(
+/// One scheduled run: note whether the VPN probe connects, collect the results, and send a claim
+/// when a trigger is due and the probe still connects.
+pub(crate) async fn tick(
     home: &Home,
     state_home: &Home,
-    config: &Config,
-    device_config: Option<&DeviceConfig>,
+    user_home: Option<&Path>,
+    policy: &SendPolicy,
     read_events: impl FnOnce() -> checks::EventMarkerReads,
 ) -> Result<()> {
+    let SendPolicy::Vpn { probe } = policy;
     let mut state: State = state_home.read_json(STATE)?.unwrap_or_default();
-    state.observe(vpn_up(&config.vpn_probe).await);
+    state.observe(vpn_up(probe.as_str()).await);
     save(state_home, STATE, &state)?;
-    let now = chrono::Utc::now().timestamp();
-    let due = checks::repos::load_attempt(&home.0)?
-        .is_none_or(|scan| now.saturating_sub(scan.scanned_at) >= 24 * 60 * 60);
-    if due {
-        let enrolment = home.enrolment()?;
-        let manifest =
-            open_pact_core::Manifest::parse(&crate::read_home_file(&home.file("manifest.toml"))?)?;
-        if manifest.hash() != &enrolment.manifest {
-            return Err(crate::stored_manifest_mismatch(
-                home,
-                manifest.hash(),
-                &enrolment.manifest,
-            ));
-        }
-        if crate::scans_repositories(&manifest) {
-            checks::repos::lower_process_priority();
-            crate::scan_repositories(home, &manifest, device_config).await?;
-        }
-    }
+    let prepared = claim::prepare(
+        home,
+        user_home,
+        ScanPolicy::OlderThan(REPO_SCAN_INTERVAL),
+        false,
+    )
+    .await?;
     let events = read_events();
-    let (snapshot, compliance) = report::prepare(home)?;
+    let compliance = prepared.compliance().clone();
     state.observe_compliance(&compliance);
     state.event_pending |= state.new_events(events);
     let now = chrono::Utc::now().timestamp();
-    if let Some(report_type) = state.report_type(now) {
+    if let Some(trigger) = state.due(now) {
         save(state_home, STATE, &state)?;
-        let acknowledged = report::run_scheduled(
-            home,
-            state_home,
-            &config.collector,
-            &config.vpn_probe,
-            snapshot,
-            report_type,
-        )
-        .await?;
+        let outcome = prepared
+            .send(home, async || vpn_up(probe.as_str()).await)
+            .await?;
+        note_outcome(home, trigger, &outcome);
         state.sent(
-            acknowledged,
+            outcome.delivered(),
             chrono::Utc::now().timestamp(),
             events,
             compliance,
@@ -1152,34 +1168,105 @@ async fn run_report(
     Ok(())
 }
 
-fn report_log_paths_for(home: &Home, system_state: Option<PathBuf>) -> Vec<(PathBuf, bool)> {
-    let mut paths = vec![(home.file("reports.jsonl"), false)];
-    if let Some(state) = system_state {
-        paths.push((state.join("reports.jsonl"), true));
+/// Tells the owner what only the owner can fix: a changed manifest, a denial, an alarm.
+fn note_outcome(home: &Home, trigger: Trigger, outcome: &Outcome) {
+    let command = crate::client_command(&home.0);
+    let changed = |hash: &open_pact_core::ManifestHash| {
+        job_log(home, &crate::manifest_change_notice(hash, &command));
+    };
+    match outcome {
+        Outcome::Accepted { changed: hash, .. } => {
+            if let Some(hash) = hash {
+                changed(hash);
+            }
+        }
+        Outcome::Denied {
+            reasons,
+            changed: hash,
+        } => {
+            job_log(
+                home,
+                &format!(
+                    "The gateway denied the {} claim: {}. Run `{command} check` to see what to fix.",
+                    trigger.name(),
+                    reasons.join("; ")
+                ),
+            );
+            if let Some(hash) = hash {
+                changed(hash);
+            }
+        }
+        Outcome::NotSent(NotSent::AcceptPending(hash)) => changed(hash),
+        Outcome::NotSent(NotSent::Pending) => {
+            job_log(
+                home,
+                "This device waits for IT approval. No claim was sent.",
+            );
+        }
+        Outcome::NotSent(NotSent::Revoked) => {
+            job_log(home, "IT revoked this device. No claim was sent.");
+        }
+        Outcome::NotSent(NotSent::OffVpn) => {}
+        Outcome::Alarm(text) => job_log(
+            home,
+            &format!(
+                "TRANSPARENCY LOG ALARM: {text}. Run `{command} check` and tell IT. No VPN certificate was installed."
+            ),
+        ),
     }
-    paths
 }
 
-pub(crate) fn report_log_paths(home: &Home) -> Result<Vec<(PathBuf, bool)>> {
-    let home = Home(report_log_home_path(home)?);
-    #[cfg(windows)]
-    let system_state = windows_existing_system_state(&home.0)?;
-    #[cfg(not(windows))]
-    let system_state = None;
-    Ok(report_log_paths_for(&home, system_state))
+/// Appends a dated line to the job log. The log keeps the last two files of at most
+/// `JOB_LOG_LIMIT` bytes each. A failed write is only reported: it must not stop the job.
+fn job_log(home: &Home, line: &str) {
+    if let Err(error) = append_job_log(home, line) {
+        eprintln!(
+            "warning: could not write {}: {error}",
+            home.file(JOB_LOG).display()
+        );
+    }
 }
 
-pub(crate) fn report_log_home_path(home: &Home) -> Result<PathBuf> {
-    schedule_home(&home.0, true)
+fn append_job_log(home: &Home, line: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let path = home.file(JOB_LOG);
+    if std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() >= JOB_LOG_LIMIT) {
+        std::fs::rename(&path, home.file("schedule.log.1"))?;
+    }
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    writeln!(
+        options.open(&path)?,
+        "{} {line}",
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    )
 }
 
 const APPLIED: &str = "schedule-applied.json";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct Applied {
-    report: Config,
+    send: SendPolicy,
     run_as: RunAs,
     executable: PathBuf,
+    /// The profile a SYSTEM job reads. Only a SYSTEM job has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    user_home: Option<PathBuf>,
+}
+
+/// What `schedule-applied.json` records. A file an earlier client wrote has another shape and
+/// reads as nothing, so `apply` replaces the job.
+fn read_applied(home: &Home) -> Result<Option<Applied>> {
+    let path = home.file(APPLIED);
+    let Some(text) = read_text_if_exists(&path)? else {
+        return Ok(None);
+    };
+    Ok(serde_json::from_str(&text).ok())
 }
 
 #[derive(Debug, Default)]
@@ -1300,8 +1387,15 @@ fn observe(home: &Home, desired: Option<&Applied>, inspect_protected: bool) -> R
         executable
     };
     let mut job = Job::new(&executable, &home.0)?;
-    if desired.is_some_and(|settings| settings.run_as == RunAs::System) {
-        job.argv.push("--system".into());
+    if let Some(settings) = desired
+        && settings.run_as == RunAs::System
+    {
+        job = job.for_system(
+            settings
+                .user_home
+                .as_deref()
+                .context("a SYSTEM schedule needs the user home it reads")?,
+        )?;
     }
     let leftovers = home_schedule_has_leftovers(home);
     Ok(match crate::current_os()? {
@@ -1389,37 +1483,6 @@ fn observe(home: &Home, desired: Option<&Applied>, inspect_protected: bool) -> R
     })
 }
 
-pub(crate) fn migration_example(home: &Home) -> Result<bool> {
-    if home.file(crate::device_config::FILE).exists() {
-        return Ok(false);
-    }
-    let Some(config) = home.read_json::<Config>(CONFIG)? else {
-        return Ok(false);
-    };
-    let system = if crate::current_os()? == open_pact_core::Os::Windows {
-        observe(home, None, false)?.system
-    } else {
-        false
-    };
-    let example = DeviceConfig {
-        report: Some(crate::device_config::Report {
-            collector: Some(config.collector),
-            vpn_probe: Some(config.vpn_probe),
-        }),
-        schedule: Some(crate::device_config::Schedule {
-            enabled: true,
-            run_as: if system { RunAs::System } else { RunAs::User },
-        }),
-        managed_repos: None,
-    };
-    println!(
-        "Create {} with this content to preserve the existing job. No changes were made.\n{}",
-        home.file(crate::device_config::FILE).display(),
-        toml::to_string_pretty(&example)?
-    );
-    Ok(true)
-}
-
 pub(crate) fn apply_command(home: &Path) -> String {
     #[cfg(windows)]
     {
@@ -1468,9 +1531,6 @@ if (Test-Path -LiteralPath $install) {{
 }
 
 pub(crate) async fn apply(home: &Home, dry_run: bool) -> Result<()> {
-    if migration_example(home)? {
-        return Ok(());
-    }
     let home_exists = home.0.try_exists()?;
     let config = match DeviceConfig::load(home)? {
         Some(config) => config,
@@ -1485,20 +1545,23 @@ pub(crate) async fn apply(home: &Home, dry_run: bool) -> Result<()> {
         .as_ref()
         .is_some_and(|schedule| schedule.run_as == RunAs::System);
     let home = Home(schedule_home(&home.0, true)?);
-    let desired = if let Some(schedule) = config.schedule.filter(|schedule| schedule.enabled) {
-        let report = config.report.context(
-            "open-pact.toml [report].collector is required when [schedule].enabled = true",
-        )?;
-        let collector = report.collector.context(
-            "open-pact.toml [report].collector is required when [schedule].enabled = true",
-        )?;
-        Some(Applied {
-            report: Config::new(collector, report.vpn_probe)?,
-            run_as: schedule.run_as,
+    let desired = match config.schedule {
+        Some(crate::device_config::Schedule {
+            run_as,
+            send: Some(send),
+        }) => Some(Applied {
+            send,
+            run_as,
             executable: std::env::current_exe()?,
-        })
-    } else {
-        None
+            user_home: (run_as == RunAs::System)
+                .then(|| {
+                    std::env::var_os("USERPROFILE").map(PathBuf::from).context(
+                        "USERPROFILE is not set; a SYSTEM job needs the profile whose repositories it scans",
+                    )
+                })
+                .transpose()?,
+        }),
+        _ => None,
     };
     let elevated =
         crate::current_os()? == open_pact_core::Os::Windows && windows_require_elevation().is_ok();
@@ -1527,7 +1590,7 @@ pub(crate) async fn apply(home: &Home, dry_run: bool) -> Result<()> {
     } else {
         observe(&home, desired.as_ref(), elevated)?
     };
-    let applied = home.read_json::<Applied>(APPLIED)?;
+    let applied = read_applied(&home)?;
     let change = reconcile(desired.as_ref(), applied.as_ref(), &observed);
     match change {
         Change::None => println!("no changes"),
@@ -1547,9 +1610,9 @@ pub(crate) async fn apply(home: &Home, dry_run: bool) -> Result<()> {
             operate(
                 &home,
                 Operation::Install {
-                    collector: desired.report.collector.clone(),
-                    vpn_probe: Some(desired.report.vpn_probe.clone()),
+                    send: desired.send.clone(),
                     system: desired.run_as == RunAs::System,
+                    user_home: desired.user_home.clone(),
                 },
                 true,
             )
@@ -1562,13 +1625,14 @@ pub(crate) async fn apply(home: &Home, dry_run: bool) -> Result<()> {
         }
         Change::None => {}
     }
-    remove_if_exists(&home.file(CONFIG))?;
     Ok(())
 }
 
 pub(crate) async fn run(home: &Home, command: Command) -> Result<()> {
     match command {
-        Command::Run { system } => operate(home, Operation::Run { system }, false).await,
+        Command::Run { system, user_home } => {
+            operate(home, Operation::Run { system, user_home }, false).await
+        }
         Command::Probe { address } => probe_blocking(&address),
     }
 }
@@ -1580,7 +1644,7 @@ async fn operate(home: &Home, command: Operation, home_locked: bool) -> Result<(
     {
         validate_system_install(true, os)?;
     }
-    let system_run = matches!(&command, Operation::Run { system: true });
+    let system_run = matches!(&command, Operation::Run { system: true, .. });
     if system_run {
         validate_system_install(true, os)?;
     }
@@ -1589,15 +1653,19 @@ async fn operate(home: &Home, command: Operation, home_locked: bool) -> Result<(
     let home = Home(absolute);
     let system_install = matches!(&command, Operation::Install { system: true, .. });
     if let Operation::Install {
-        collector,
-        vpn_probe,
         system: true,
+        user_home,
+        ..
     } = &command
     {
-        Config::new(collector.clone(), vpn_probe.clone())?;
         home.enrolment()?;
         crate::DeviceKey::load(&home.0)?;
         validate_windows_home(&home.0)?;
+        validate_windows_home(
+            user_home
+                .as_deref()
+                .context("a SYSTEM install needs the user home")?,
+        )?;
     }
     let system_uninstall = matches!(&command, Operation::Uninstall { system: true });
     if system_uninstall {
@@ -1627,43 +1695,36 @@ async fn operate(home: &Home, command: Operation, home_locked: bool) -> Result<(
         None
     };
     match command {
-        Operation::Run { .. } => {
-            let Some(_claim_lock) = crate::claim::try_lock(&home)? else {
+        Operation::Run { user_home, .. } => {
+            let Some(_claim_lock) = claim::try_lock(&home)? else {
                 return Ok(());
             };
-            let device_config = DeviceConfig::load(&home)?
-                .context("open-pact.toml is missing; run `config example`")?;
-            if !device_config
-                .schedule
-                .as_ref()
-                .is_some_and(|schedule| schedule.enabled)
-            {
-                return Ok(());
+            let result = async {
+                let device_config = DeviceConfig::load_for(&home, user_home.as_deref())?
+                    .context("open-pact.toml is missing; run `config example`")?;
+                let Some(policy) = device_config.schedule.and_then(|schedule| schedule.send) else {
+                    return Ok(());
+                };
+                tick(
+                    &home,
+                    &state_home,
+                    user_home.as_deref(),
+                    &policy,
+                    checks::event_markers,
+                )
+                .await
             }
-            let report = device_config
-                .report
-                .as_ref()
-                .context("open-pact.toml [report].collector is required")?;
-            let collector = report
-                .collector
-                .as_deref()
-                .context("open-pact.toml [report].collector is required")?;
-            let config = Config::new(collector.to_owned(), report.vpn_probe.clone())?;
-            run_report(
-                &home,
-                &state_home,
-                &config,
-                Some(&device_config),
-                checks::event_markers,
-            )
-            .await?;
+            .await;
+            if let Err(error) = &result {
+                job_log(&home, &format!("error: {error:#}"));
+            }
+            result?;
         }
         Operation::Install {
-            collector,
-            vpn_probe,
+            send,
             system,
+            user_home,
         } => {
-            Config::new(collector, vpn_probe)?;
             home.enrolment()?;
             crate::DeviceKey::load(&home.0)?;
             if os == open_pact_core::Os::Windows {
@@ -1682,7 +1743,11 @@ async fn operate(home: &Home, command: Operation, home_locked: bool) -> Result<(
             }
             let mut job = Job::new(&executable, &home.0)?;
             if system {
-                job.argv.push("--system".into());
+                job = job.for_system(
+                    user_home
+                        .as_deref()
+                        .context("a SYSTEM install needs the user home")?,
+                )?;
             }
             save(&install_state, STATE, &State::default())?;
             let run_as = if system {
@@ -1691,9 +1756,12 @@ async fn operate(home: &Home, command: Operation, home_locked: bool) -> Result<(
                 TaskRunAs::CurrentUser
             };
             register(&job, RegistrationAction::Install(run_as))?;
+            let SendPolicy::Vpn { probe } = &send;
             println!(
-                "Installed {}. The OS checks VPN connectivity every five minutes.",
-                job.id
+                "Installed {}. The OS runs it every five minutes. It sends the same claim as `check`, only while {} connects. It writes what needs your attention to {}.",
+                job.id,
+                probe.as_str(),
+                job.log
             );
         }
         Operation::Uninstall { system } => {
@@ -1714,7 +1782,7 @@ async fn operate(home: &Home, command: Operation, home_locked: bool) -> Result<(
                 remove_home_schedule_files(&home)?;
             }
             if home_exists {
-                println!("Removed {} and its report configuration and state.", job.id);
+                println!("Removed {} and its schedule state and log.", job.id);
             } else {
                 println!("Removed {}. The home directory does not exist.", job.id);
             }
@@ -1854,8 +1922,7 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         let config = DeviceConfig::parse(&template, Some(&user)).unwrap();
-        assert_eq!(config.report.unwrap().collector, None);
-        assert!(!config.schedule.unwrap().enabled);
+        assert_eq!(config.schedule.unwrap().send, None);
         println!("{template}");
     }
 
@@ -1932,18 +1999,36 @@ esac
             .join("\n");
         DeviceConfig::parse(&template, Some(&user)).unwrap();
         assert_eq!(std::fs::read_dir(&path).unwrap().count(), before);
-        let write = |collector: &str, schedule: &str| {
-            std::fs::write(home.file(crate::device_config::FILE), format!("[report]\ncollector = '{collector}'\n{schedule}\n[managed_repos]\nfolders = ['~/work']\n")).unwrap();
+        let write = |schedule: &str| {
+            std::fs::write(
+                home.file(crate::device_config::FILE),
+                format!("{schedule}\n[managed_repos]\nfolders = ['~/work']\n"),
+            )
+            .unwrap();
         };
-        let enabled = "[schedule]\nenabled = true\nrun_as = 'user'";
-        write("https://collector.example.org/status", enabled);
+        let enabled = |probe: &str| {
+            format!(
+                "[schedule]\nenabled = true\nrun_as = 'user'\nmode = 'vpn'\nvpn_probe = '{probe}'"
+            )
+        };
+        write(&enabled("10.20.0.1:443"));
         run(&["apply", "--dry-run"], true, "schedule: install");
         assert!(!root.path().join("changes").exists());
         run(&["apply"], true, "schedule: install");
-        assert!(!home.file(CONFIG).exists());
-        let report = run(&["report", "--dry-run"], true, "spec_version");
-        assert!(!report.contains("~/work"));
-        assert!(!report.contains(user.join("work").to_str().unwrap()));
+        let plist = std::fs::read_to_string(
+            user.join("Library/LaunchAgents")
+                .read_dir()
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path(),
+        )
+        .unwrap();
+        assert!(plist.contains(&format!(
+            "<key>StandardOutPath</key><string>{}</string>",
+            std::fs::canonicalize(&path).unwrap().join(JOB_LOG).display()
+        )));
         let changes = std::fs::read(root.path().join("changes")).unwrap();
         run(&["apply"], true, "no changes");
         assert_eq!(std::fs::read(root.path().join("changes")).unwrap(), changes);
@@ -1953,24 +2038,21 @@ esac
         assert!(root.path().join("loaded").exists());
         assert_eq!(std::fs::read(root.path().join("changes")).unwrap(), changes);
         std::fs::write(home.file(crate::device_config::FILE), configuration).unwrap();
-        write("https://other.example.org/status", enabled);
+        write(&enabled("10.20.0.2:443"));
         run(&["apply"], true, "schedule: update");
         run(&["apply"], true, "no changes");
         std::fs::remove_file(root.path().join("loaded")).unwrap();
         run(&["apply"], true, "schedule: update");
-        write(
-            "https://other.example.org/status",
-            "[schedule]\nenabled = false\nrun_as = 'user'",
-        );
+        write("[schedule]\nenabled = false\nrun_as = 'user'\nmode = 'vpn'");
         run(&["apply"], true, "schedule: remove");
         assert!(!home.file(STATE).exists());
         assert!(!home.file(APPLIED).exists());
         run(&["apply"], true, "no changes");
-        write("https://collector.example.org/status", enabled);
+        write(&enabled("10.20.0.1:443"));
         run(&["apply"], true, "schedule: install");
-        write("https://collector.example.org/status", "");
+        write("");
         run(&["apply"], true, "schedule: remove");
-        write("https://collector.example.org/status", enabled);
+        write(&enabled("10.20.0.1:443"));
         std::fs::write(
             home.file(crate::device_config::FILE),
             "[schedule]\nenabled = true\nrun_as = 'user'\nextra = 1",
@@ -1981,22 +2063,22 @@ esac
         assert_eq!(std::fs::read(root.path().join("changes")).unwrap(), changes);
         run(&["check"], false, "Other controls will still run");
         std::fs::remove_file(home.file(crate::device_config::FILE)).unwrap();
-        let check = run(&["check"], false, "Create ");
+        let check = run(&["check"], false, "# Review this template");
         assert!(check.contains("control | manifest requirement | device setting | result"));
         assert!(check.contains("firewall |"));
-        save(
-            &home,
-            CONFIG,
-            &Config::new("https://legacy.example.org/status".into(), None).unwrap(),
+        std::fs::write(
+            home.file(crate::device_config::FILE),
+            "[report]\ncollector = 'https://collector.example.org/status'\nvpn_probe = '10.20.0.1:443'\n",
         )
         .unwrap();
-        let legacy = std::fs::read(home.file(CONFIG)).unwrap();
-        run(&["apply"], true, "https://legacy.example.org/status");
-        assert_eq!(std::fs::read(home.file(CONFIG)).unwrap(), legacy);
-        run(&["check"], false, "https://legacy.example.org/status");
+        run(
+            &["apply"],
+            false,
+            "Move `vpn_probe = \"10.20.0.1:443\"` into [schedule]",
+        );
+        run(&["check"], false, "[report] was removed");
         assert_eq!(std::fs::read(root.path().join("changes")).unwrap(), changes);
-        std::fs::remove_file(home.file(CONFIG)).unwrap();
-        write("https://collector.example.org/status", enabled);
+        write(&enabled("10.20.0.1:443"));
         run(&["apply"], true, "schedule: install");
         std::fs::remove_dir_all(&path).unwrap();
         run(&["apply"], true, "schedule: remove");
@@ -2020,18 +2102,27 @@ esac
             ],
             vec!["client", "schedule", "uninstall"],
             vec!["client", "report", "--collector", "https://example.org"],
+            vec!["client", "report", "--dry-run"],
+            vec!["client", "log", "reports"],
         ] {
             assert!(crate::Cli::try_parse_from(args).is_err());
         }
-        assert!(crate::Cli::try_parse_from(["client", "report", "--dry-run"]).is_ok());
+        assert!(crate::Cli::try_parse_from(["client", "check", "--dry-run"]).is_ok());
+    }
+
+    fn vpn(probe: &str) -> SendPolicy {
+        SendPolicy::Vpn {
+            probe: crate::device_config::ProbeAddress::parse(probe).unwrap(),
+        }
     }
 
     #[test]
     fn schedule_reconcile_covers_install_update_remove_and_retry() {
         let settings = Applied {
-            report: Config::new("https://collector.example.org/status".into(), None).unwrap(),
+            send: vpn("10.20.0.1:443"),
             run_as: RunAs::User,
             executable: PathBuf::from("/opt/example/client"),
+            user_home: None,
         };
         let missing = Observed::default();
         let matching = Observed {
@@ -2063,7 +2154,7 @@ esac
         );
         for changed in [
             Applied {
-                report: Config::new("https://other.example.org/status".into(), None).unwrap(),
+                send: vpn("10.20.0.2:443"),
                 ..settings.clone()
             },
             Applied {
@@ -2092,9 +2183,10 @@ esac
     #[test]
     fn windows_reconcile_repairs_disabled_or_wrong_triggers() {
         let settings = Applied {
-            report: Config::new("https://collector.example.org/status".into(), None).unwrap(),
+            send: vpn("10.20.0.1:443"),
             run_as: RunAs::User,
             executable: PathBuf::from("C:\\Program Files\\open-pact\\open-pact-client.exe"),
+            user_home: None,
         };
         let applied = Some(&settings);
         let disabled = Observed {
@@ -2128,9 +2220,10 @@ esac
     #[test]
     fn windows_reconcile_repairs_missing_or_stale_system_binary() {
         let settings = Applied {
-            report: Config::new("https://collector.example.org/status".into(), None).unwrap(),
+            send: vpn("10.20.0.1:443"),
             run_as: RunAs::System,
             executable: PathBuf::from("C:\\example\\open-pact-client.exe"),
+            user_home: Some(PathBuf::from("C:\\Users\\example")),
         };
         let applied = Some(&settings);
         for protected_binary in [
@@ -2201,32 +2294,6 @@ esac
         assert_eq!(install_home, uninstall_home);
         assert_eq!(install_job.id, uninstall_job.id);
         assert!(!home_path.exists());
-    }
-
-    #[cfg(not(windows))]
-    #[test]
-    fn report_log_paths_use_the_canonical_schedule_home() {
-        let dir = tempfile::tempdir().unwrap();
-        let home_path = dir.path().join("client-home");
-        std::fs::create_dir(&home_path).unwrap();
-        let alternate = dir.path().join("parent").join("..").join("client-home");
-        let expected = std::fs::canonicalize(&home_path).unwrap();
-
-        let (path, _) = report_log_paths(&Home(alternate)).unwrap().remove(0);
-
-        assert_eq!(path, expected.join("reports.jsonl"));
-    }
-
-    #[test]
-    fn report_log_paths_include_home_and_protected_history() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = Home(dir.path().join("home"));
-        let state = dir.path().join("protected-state");
-
-        let paths = report_log_paths_for(&home, Some(state.clone()));
-
-        assert_eq!(paths[0], (home.file("reports.jsonl"), false));
-        assert_eq!(paths[1], (state.join("reports.jsonl"), true));
     }
 
     fn jobs_before_and_after_home_removal() -> (Job, Job) {
@@ -2541,58 +2608,6 @@ Write-Output 'refused'
         }
     }
 
-    #[tokio::test]
-    async fn send_error_hides_collector_query_token() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = enrolled_home(dir.path());
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let collector = format!(
-            "https://{}/status?token=fictional-secret",
-            listener.local_addr().unwrap()
-        );
-        drop(listener);
-        let error = report::run(&home, &collector, false).await.unwrap_err();
-        let logged = format!("error: {error:#}");
-        println!("{logged}");
-        assert!(logged.contains("send report to collector"), "{logged}");
-        assert!(!logged.contains("fictional-secret"));
-    }
-
-    #[tokio::test]
-    async fn vpn_disconnect_during_preparation_prevents_send() {
-        use std::sync::{
-            Arc,
-            atomic::{AtomicBool, Ordering},
-        };
-        let dir = tempfile::tempdir().unwrap();
-        let home = enrolled_home(dir.path());
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let probe_address = probe.local_addr().unwrap().to_string();
-        let collector_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let collector = format!(
-            "https://{}/status",
-            collector_listener.local_addr().unwrap()
-        );
-        drop(collector_listener);
-        let went_down = Arc::new(AtomicBool::new(false));
-        let observed = went_down.clone();
-        let close = std::thread::spawn(move || {
-            let (stream, _) = probe.accept().unwrap();
-            drop(stream);
-            drop(probe);
-            observed.store(true, Ordering::SeqCst);
-        });
-        std::fs::write(home.file(crate::device_config::FILE), format!("[report]\ncollector = '{collector}'\nvpn_probe = '{probe_address}'\n[schedule]\nenabled = true\nrun_as = 'user'\n")).unwrap();
-        let result = run(&home, Command::Run { system: false }).await;
-        close.join().unwrap();
-        assert!(went_down.load(Ordering::SeqCst));
-        assert!(!vpn_up(&probe_address).await);
-        assert!(result.is_ok(), "{result:?}");
-        let state: State = home.read_json(STATE).unwrap().unwrap();
-        assert!(!state.vpn_up);
-        assert!(state.reconnect_pending);
-    }
-
     #[cfg(unix)]
     #[test]
     fn apply_command_preserves_shell_metacharacters() {
@@ -2673,20 +2688,20 @@ Write-Output 'refused'
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let home = Home(dir.path().to_path_buf());
-        save(&home, CONFIG, &"fictional-token").unwrap();
+        save(&home, APPLIED, &"fictional-token").unwrap();
         assert_eq!(
-            std::fs::metadata(home.file(CONFIG))
+            std::fs::metadata(home.file(APPLIED))
                 .unwrap()
                 .permissions()
                 .mode()
                 & 0o777,
             0o600
         );
-        std::fs::set_permissions(home.file(CONFIG), std::fs::Permissions::from_mode(0o400))
+        std::fs::set_permissions(home.file(APPLIED), std::fs::Permissions::from_mode(0o400))
             .unwrap();
-        save(&home, CONFIG, &"fictional-token").unwrap();
+        save(&home, APPLIED, &"fictional-token").unwrap();
         assert_eq!(
-            std::fs::metadata(home.file(CONFIG))
+            std::fs::metadata(home.file(APPLIED))
                 .unwrap()
                 .permissions()
                 .mode()
@@ -2702,6 +2717,40 @@ Write-Output 'refused'
                 & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn job_log_keeps_the_last_two_files_of_bounded_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+        job_log(&home, "first");
+        assert!(
+            std::fs::read_to_string(home.file(JOB_LOG))
+                .unwrap()
+                .ends_with(" first\n")
+        );
+        std::fs::write(home.file(JOB_LOG), vec![b'x'; JOB_LOG_LIMIT as usize]).unwrap();
+        job_log(&home, "second");
+        let current = std::fs::read_to_string(home.file(JOB_LOG)).unwrap();
+        assert!(current.ends_with(" second\n") && current.lines().count() == 1);
+        assert_eq!(
+            std::fs::metadata(home.file("schedule.log.1"))
+                .unwrap()
+                .len(),
+            JOB_LOG_LIMIT
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(home.file(JOB_LOG))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
     }
 
     #[test]
@@ -2817,7 +2866,7 @@ Write-Output 'refused'
             ..state
         };
         assert!(offline.new_events(reads(Read(Some(101)), Read(Some(200)))));
-        assert_eq!(offline.report_type(600), None);
+        assert_eq!(offline.due(600), None);
         assert!(!offline.should_send(600));
     }
 
@@ -2859,32 +2908,14 @@ Write-Output 'refused'
     }
 
     #[test]
-    fn report_type_decision_table() {
+    fn trigger_decision_table() {
         for (up, reconnect, event, last, expected) in [
             (false, true, true, None, None),
-            (
-                true,
-                true,
-                true,
-                Some(100),
-                Some(report::ReportType::Connect),
-            ),
-            (
-                true,
-                false,
-                true,
-                Some(100),
-                Some(report::ReportType::Event),
-            ),
-            (true, false, false, None, Some(report::ReportType::Periodic)),
+            (true, true, true, Some(100), Some(Trigger::Connect)),
+            (true, false, true, Some(100), Some(Trigger::Event)),
+            (true, false, false, None, Some(Trigger::Periodic)),
             (true, false, false, Some(100), None),
-            (
-                true,
-                false,
-                false,
-                Some(0),
-                Some(report::ReportType::Periodic),
-            ),
+            (true, false, false, Some(0), Some(Trigger::Periodic)),
         ] {
             let state = State {
                 vpn_up: up,
@@ -2893,7 +2924,7 @@ Write-Output 'refused'
                 last_success: last,
                 ..State::default()
             };
-            assert_eq!(state.report_type(3300), expected);
+            assert_eq!(state.due(3300), expected);
         }
     }
 
@@ -2915,10 +2946,7 @@ Write-Output 'refused'
             };
             state.observe_compliance(&map(current));
             assert_eq!(state.event_pending, expected);
-            assert_eq!(
-                state.report_type(101),
-                expected.then_some(report::ReportType::Event)
-            );
+            assert_eq!(state.due(101), expected.then_some(Trigger::Event));
             state.sent(
                 false,
                 101,
@@ -2945,15 +2973,15 @@ Write-Output 'refused'
         };
 
         state.observe_compliance(&map(false));
-        assert_eq!(state.report_type(101), Some(report::ReportType::Event));
+        assert_eq!(state.due(101), Some(Trigger::Event));
         state.sent(true, 101, checks::EventMarkerReads::default(), map(false));
         assert!(!state.event_pending);
 
         state.observe_compliance(&map(true));
-        assert_eq!(state.report_type(102), None);
+        assert_eq!(state.due(102), None);
         state = serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
         state.observe_compliance(&map(false));
-        assert_eq!(state.report_type(103), Some(report::ReportType::Event));
+        assert_eq!(state.due(103), Some(Trigger::Event));
     }
 
     #[test]
@@ -2965,9 +2993,9 @@ Write-Output 'refused'
         let failing = BTreeMap::from([("required_control".into(), false)]);
 
         state.observe_compliance(&compliant);
-        assert_eq!(state.report_type(101), None);
+        assert_eq!(state.due(101), None);
         state.observe_compliance(&failing);
-        assert_eq!(state.report_type(102), Some(report::ReportType::Event));
+        assert_eq!(state.due(102), Some(Trigger::Event));
     }
 
     #[test]
@@ -2995,9 +3023,9 @@ Write-Output 'refused'
                 serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
             pending.event_pending |= pending.new_events(events);
             assert!(pending.event_pending);
-            assert_eq!(pending.report_type(101), None);
+            assert_eq!(pending.due(101), None);
             pending.observe(true);
-            assert_eq!(pending.report_type(102), Some(report::ReportType::Connect));
+            assert_eq!(pending.due(102), Some(Trigger::Connect));
             pending.sent(false, 102, events, BTreeMap::new());
             assert!(pending.event_pending);
             assert_eq!(pending.last_events, state.last_events);
@@ -3010,9 +3038,9 @@ Write-Output 'refused'
         assert!(state.event_pending);
         let mut restored: State =
             serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
-        assert_eq!(restored.report_type(101), None);
+        assert_eq!(restored.due(101), None);
         restored.observe(true);
-        assert_eq!(restored.report_type(102), Some(report::ReportType::Connect));
+        assert_eq!(restored.due(102), Some(Trigger::Connect));
     }
 
     #[test]
@@ -3055,6 +3083,11 @@ Write-Output 'refused'
         assert!(plist.contains("<string>/home/example/pact &amp; data</string>"));
         assert!(plist.contains("<string>schedule</string>\n<string>run</string>"));
         assert!(plist.contains("<key>RunAtLoad</key><true/>"));
+        for key in ["StandardOutPath", "StandardErrorPath"] {
+            assert!(plist.contains(&format!(
+                "<key>{key}</key><string>/home/example/pact &amp; data/schedule.log</string>"
+            )));
+        }
         assert_eq!(xml("<>'\"&"), "&lt;&gt;&apos;&quot;&amp;");
     }
 
@@ -3067,6 +3100,11 @@ Write-Output 'refused'
                 .contains(&format!("Unit={}.service", job().id))
         );
         assert!(job().service().contains(r#"ExecStart="/opt/Example App/open-pact-client" "--home" "/home/example/pact & data" "schedule" "run""#));
+        for stream in ["StandardOutput", "StandardError"] {
+            assert!(job().service().contains(&format!(
+                "{stream}=append:/home/example/pact & data/schedule.log\n"
+            )));
+        }
         assert_eq!(systemd_arg("a%$\"\\b"), r#""a%%$$\"\\b""#);
     }
 
@@ -3105,6 +3143,8 @@ Write-Output 'refused'
             Path::new(r"C:\Example App\open-pact-client.exe"),
             Path::new(r"C:\Example User\pact"),
         )
+        .unwrap()
+        .for_system(Path::new(r"C:\Users\example user"))
         .unwrap();
         assert_eq!(
             job.schtasks_install(TaskRunAs::System),
@@ -3117,7 +3157,7 @@ Write-Output 'refused'
                 "/MO",
                 "5",
                 "/TR",
-                r#""C:\Example App\open-pact-client.exe" "--home" "C:\Example User\pact" "schedule" "run""#,
+                r#""C:\Example App\open-pact-client.exe" "--home" "C:\Example User\pact" "schedule" "run" "--system" "--user-home" "C:\Users\example user""#,
                 "/RU",
                 "SYSTEM",
                 "/RL",
@@ -3184,10 +3224,11 @@ Write-Output 'refused'
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let refused = tokio::net::TcpSocket::new_v4().unwrap();
         refused.bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let config = Config {
-            collector: format!("https://{}/status", refused.local_addr().unwrap()),
-            vpn_probe: listener.local_addr().unwrap().to_string(),
-        };
+        let mut enrolment: crate::Enrolment = home.enrolment().unwrap();
+        enrolment.gateway = format!("http://{}", refused.local_addr().unwrap());
+        home.write("enrolment.json", &serde_json::to_vec(&enrolment).unwrap())
+            .unwrap();
+        let policy = vpn(&listener.local_addr().unwrap().to_string());
         save(
             &state_home,
             STATE,
@@ -3202,7 +3243,7 @@ Write-Output 'refused'
             security_log_cleared: checks::EventMarkerRead::Read(Some(timestamp)),
             antimalware_detection: checks::EventMarkerRead::Unknown,
         };
-        run_report(&home, &state_home, &config, None, || events(100))
+        tick(&home, &state_home, None, &policy, || events(100))
             .await
             .unwrap();
         let baseline: State = state_home.read_json(STATE).unwrap().unwrap();
@@ -3210,13 +3251,10 @@ Write-Output 'refused'
             baseline.last_events.unwrap().security_log_cleared,
             Some(100)
         );
-        let error = run_report(&home, &state_home, &config, None, || events(101))
+        let error = tick(&home, &state_home, None, &policy, || events(101))
             .await
             .unwrap_err();
-        assert!(
-            format!("{error:#}").contains("send report to collector"),
-            "{error:#}"
-        );
+        assert!(format!("{error:#}").contains("/v1/manifest"), "{error:#}");
         let pending: State = state_home.read_json(STATE).unwrap().unwrap();
         assert_eq!(pending.last_events, baseline.last_events);
         assert_eq!(pending.last_compliance, baseline.last_compliance);
@@ -3232,7 +3270,7 @@ Write-Output 'refused'
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let probe = listener.local_addr().unwrap().to_string();
         let write_config = |probe: &str| {
-            std::fs::write(home.file(crate::device_config::FILE), format!("[report]\ncollector = 'https://collector.example.org/status'\nvpn_probe = '{probe}'\n[schedule]\nenabled = true\nrun_as = 'user'\n")).unwrap();
+            std::fs::write(home.file(crate::device_config::FILE), format!("[schedule]\nenabled = true\nrun_as = 'user'\nmode = 'vpn'\nvpn_probe = '{probe}'\n")).unwrap();
         };
         write_config(&probe);
         save(
@@ -3249,8 +3287,16 @@ Write-Output 'refused'
         )
         .unwrap();
         assert!(
-            run(&home, Command::Run { system: false }).await.is_err(),
-            "no enrolment for report"
+            run(
+                &home,
+                Command::Run {
+                    system: false,
+                    user_home: None,
+                },
+            )
+            .await
+            .is_err(),
+            "no enrolment"
         );
         let connected: State = home.read_json(STATE).unwrap().unwrap();
         assert!(connected.vpn_up);
@@ -3262,7 +3308,15 @@ Write-Output 'refused'
         let refused = reserved.local_addr().unwrap().to_string();
         write_config(&refused);
         assert!(
-            run(&home, Command::Run { system: false }).await.is_err(),
+            run(
+                &home,
+                Command::Run {
+                    system: false,
+                    user_home: None,
+                },
+            )
+            .await
+            .is_err(),
             "no enrolment for local evaluation"
         );
         let disconnected: State = home.read_json(STATE).unwrap().unwrap();
@@ -3271,43 +3325,37 @@ Write-Output 'refused'
     }
 
     #[tokio::test]
-    async fn apply_requires_a_collector_only_when_the_schedule_is_enabled() {
+    async fn apply_and_run_require_a_probe_when_the_schedule_is_enabled() {
         let dir = tempfile::tempdir().unwrap();
         let home = Home(dir.path().to_path_buf());
         std::fs::write(
             home.file(crate::device_config::FILE),
-            "[report]\n[schedule]\nenabled = false\nrun_as = 'user'\n",
+            "[schedule]\nenabled = false\nrun_as = 'user'\nmode = 'vpn'\n",
         )
         .unwrap();
         DeviceConfig::load(&home).unwrap().unwrap();
 
         std::fs::write(
             home.file(crate::device_config::FILE),
-            "[report]\n[schedule]\nenabled = true\nrun_as = 'user'\n",
+            "[schedule]\nenabled = true\nrun_as = 'user'\nmode = 'vpn'\n",
         )
         .unwrap();
         let error = apply(&home, true).await.unwrap_err();
         assert!(
-            error.to_string().contains("[report].collector is required"),
+            format!("{error:#}").contains("[schedule].vpn_probe is required"),
             "{error:#}"
         );
-    }
-
-    #[tokio::test]
-    async fn scheduled_run_requires_a_collector_when_enabled() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = Home(dir.path().to_path_buf());
-        std::fs::write(
-            home.file(crate::device_config::FILE),
-            "[report]\n[schedule]\nenabled = true\nrun_as = 'user'\n",
+        let error = run(
+            &home,
+            Command::Run {
+                system: false,
+                user_home: None,
+            },
         )
-        .unwrap();
-
-        let error = run(&home, Command::Run { system: false })
-            .await
-            .unwrap_err();
+        .await
+        .unwrap_err();
         assert!(
-            error.to_string().contains("[report].collector is required"),
+            format!("{error:#}").contains("[schedule].vpn_probe is required"),
             "{error:#}"
         );
     }
@@ -3351,30 +3399,6 @@ Write-Output 'refused'
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-    }
-
-    #[test]
-    fn default_probe_uses_collector_host_and_port() {
-        for (collector, expected) in [
-            (
-                "https://collector.example.org/status",
-                "collector.example.org:443",
-            ),
-            (
-                "https://collector.example.org:8443/status",
-                "collector.example.org:8443",
-            ),
-            ("https://[::1]:8443/status", "[::1]:8443"),
-        ] {
-            let config = Config::new(collector.into(), None).unwrap();
-            assert_eq!(config.vpn_probe, expected);
-        }
-        let config = Config::new(
-            "https://collector.example.org/status".into(),
-            Some("vpn.example.org:9443".into()),
-        )
-        .unwrap();
-        assert_eq!(config.vpn_probe, "vpn.example.org:9443");
     }
 
     #[test]
