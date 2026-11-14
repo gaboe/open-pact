@@ -116,6 +116,14 @@ struct State {
     #[serde(default)]
     reconnect_pending: bool,
     last_success: Option<i64>,
+    /// The last time the gateway answered an attempt, with a verdict or without one (waiting for
+    /// approval, revoked, accept pending). No periodic or connect claim comes sooner than
+    /// `interval` after it.
+    #[serde(default)]
+    last_attempt: Option<i64>,
+    /// What the job log last said about the outcome, so the same news is written once.
+    #[serde(default)]
+    last_note: Option<String>,
     #[serde(default)]
     last_events: Option<checks::EventMarkers>,
     #[serde(default)]
@@ -142,12 +150,16 @@ impl State {
         self.vpn_up = vpn_up;
     }
 
+    /// The last answered attempt is older than the interval, or there is none, or the clock ran
+    /// back past it.
+    fn interval_elapsed(&self, now: i64, interval: i64) -> bool {
+        self.last_attempt
+            .max(self.last_success)
+            .is_none_or(|last| now < last || now.saturating_sub(last) >= interval)
+    }
+
     fn should_send(&self, now: i64, interval: i64) -> bool {
-        self.vpn_up
-            && (self.reconnect_pending
-                || self
-                    .last_success
-                    .is_none_or(|last| now < last || now.saturating_sub(last) >= interval))
+        self.vpn_up && self.interval_elapsed(now, interval)
     }
 
     fn new_events(&self, current: checks::EventMarkerReads) -> bool {
@@ -181,12 +193,14 @@ impl State {
     fn due(&self, now: i64, interval: i64) -> Option<Trigger> {
         if !self.vpn_up {
             None
-        } else if self.reconnect_pending {
-            Some(Trigger::Connect)
         } else if self.event_pending {
             Some(Trigger::Event)
         } else if self.should_send(now, interval) {
-            Some(Trigger::Periodic)
+            Some(if self.reconnect_pending {
+                Trigger::Connect
+            } else {
+                Trigger::Periodic
+            })
         } else {
             None
         }
@@ -194,8 +208,41 @@ impl State {
 
     fn acknowledged(&mut self, now: i64, events: checks::EventMarkerReads) {
         self.last_success = Some(now);
+        self.last_attempt = Some(now);
         self.reconnect_pending = false;
         self.merge_events(events);
+    }
+
+    /// The gateway answered without a verdict on the claim: the device waits for approval, IT
+    /// revoked it, or the manifest awaits `accept`. That counts as the attempt, so the job asks
+    /// again only after the interval.
+    fn attempted(
+        &mut self,
+        now: i64,
+        events: checks::EventMarkerReads,
+        compliance: BTreeMap<String, bool>,
+    ) {
+        self.last_attempt = Some(now);
+        self.reconnect_pending = false;
+        self.merge_events(events);
+        self.last_compliance = Some(compliance);
+        self.event_pending = false;
+    }
+
+    /// What a finished attempt does to the state. No answer at all (a network error) never gets
+    /// here, so the next run tries again.
+    fn record(
+        &mut self,
+        outcome: &Outcome,
+        now: i64,
+        events: checks::EventMarkerReads,
+        compliance: BTreeMap<String, bool>,
+    ) {
+        match outcome {
+            Outcome::NotSent(NotSent::OffVpn) => self.sent(false, now, events, compliance),
+            outcome if outcome.delivered() => self.sent(true, now, events, compliance),
+            _ => self.attempted(now, events, compliance),
+        }
     }
 
     fn sent(
@@ -1229,6 +1276,11 @@ pub(crate) async fn tick(
     let mut state: State = state_home.read_json(STATE)?.unwrap_or_default();
     state.observe(may_send(policy).await);
     save(state_home, STATE, &state)?;
+    // The scan can take long. It runs before the claim lock, which `check` and `accept` wait for.
+    claim::scan_if_due(home, user_home, REPO_SCAN_INTERVAL).await?;
+    let Some(_claim_lock) = claim::try_lock(home)? else {
+        return Ok(());
+    };
     let prepared = claim::prepare(
         home,
         user_home,
@@ -1244,13 +1296,8 @@ pub(crate) async fn tick(
     if let Some(trigger) = state.due(now, schedule.interval.as_secs()) {
         save(state_home, STATE, &state)?;
         let outcome = prepared.send(home, async || may_send(policy).await).await?;
-        note_outcome(home, trigger, &outcome);
-        state.sent(
-            outcome.delivered(),
-            chrono::Utc::now().timestamp(),
-            events,
-            compliance,
-        );
+        note_outcome(home, &mut state, trigger, &outcome);
+        state.record(&outcome, chrono::Utc::now().timestamp(), events, compliance);
     } else if !state.baseline().security_log_cleared || !state.baseline().antimalware_detection {
         state.establish_baseline(events);
     }
@@ -1258,52 +1305,62 @@ pub(crate) async fn tick(
     Ok(())
 }
 
-/// Tells the owner what only the owner can fix: a changed manifest, a denial, an alarm.
-fn note_outcome(home: &Home, trigger: Trigger, outcome: &Outcome) {
+/// Tells the owner what only the owner can fix: a changed manifest, a denial, an alarm. Each piece
+/// of news is written once, when it changes, and not on every run.
+fn note_outcome(home: &Home, state: &mut State, trigger: Trigger, outcome: &Outcome) {
     let command = crate::client_command(&home.0);
-    let changed = |hash: &open_pact_core::ManifestHash| {
-        job_log(home, &crate::manifest_change_notice(hash, &command));
-    };
-    match outcome {
-        Outcome::Accepted { changed: hash, .. } => {
-            if let Some(hash) = hash {
-                changed(hash);
-            }
+    let changed =
+        |hash: &open_pact_core::ManifestHash| crate::manifest_change_notice(hash, &command);
+    let (key, lines) = match outcome {
+        Outcome::Accepted { changed: None } => {
+            state.last_note = None;
+            return;
         }
+        Outcome::Accepted {
+            changed: Some(hash),
+        } => (format!("changed {hash}"), vec![changed(hash)]),
         Outcome::Denied {
             reasons,
             changed: hash,
         } => {
-            job_log(
-                home,
-                &format!(
-                    "The gateway denied the {} claim: {}. Run `{command} check` to see what to fix.",
-                    trigger.name(),
-                    reasons.join("; ")
-                ),
-            );
+            let mut key = format!("denied {}", reasons.join("; "));
+            let mut lines = vec![format!(
+                "The gateway denied the {} claim: {}. Run `{command} check` to see what to fix.",
+                trigger.name(),
+                reasons.join("; ")
+            )];
             if let Some(hash) = hash {
-                changed(hash);
+                key.push_str(&format!(" changed {hash}"));
+                lines.push(changed(hash));
             }
+            (key, lines)
         }
-        Outcome::NotSent(NotSent::AcceptPending(hash)) => changed(hash),
-        Outcome::NotSent(NotSent::Pending) => {
-            job_log(
-                home,
-                "This device waits for IT approval. No claim was sent.",
-            );
+        Outcome::NotSent(NotSent::AcceptPending(hash)) => {
+            (format!("changed {hash}"), vec![changed(hash)])
         }
-        Outcome::NotSent(NotSent::Revoked) => {
-            job_log(home, "IT revoked this device. No claim was sent.");
-        }
-        Outcome::NotSent(NotSent::OffVpn) => {}
-        Outcome::Alarm(text) => job_log(
-            home,
-            &format!(
-                "TRANSPARENCY LOG ALARM: {text}. Run `{command} check` and tell IT. No VPN certificate was installed."
-            ),
+        Outcome::NotSent(NotSent::Pending) => (
+            "pending".to_owned(),
+            vec!["This device waits for IT approval. No claim was sent.".to_owned()],
         ),
+        Outcome::NotSent(NotSent::Revoked) => (
+            "revoked".to_owned(),
+            vec!["IT revoked this device. No claim was sent.".to_owned()],
+        ),
+        Outcome::NotSent(NotSent::OffVpn) => return,
+        Outcome::Alarm(text) => (
+            format!("alarm {text}"),
+            vec![format!(
+                "TRANSPARENCY LOG ALARM: {text}. Run `{command} check` and tell IT. No VPN certificate was installed."
+            )],
+        ),
+    };
+    if state.last_note.as_deref() == Some(key.as_str()) {
+        return;
     }
+    for line in lines {
+        job_log(home, &line);
+    }
+    state.last_note = Some(key);
 }
 
 /// Appends a dated line to the job log. The log keeps the last two files of at most
@@ -1317,12 +1374,20 @@ fn job_log(home: &Home, line: &str) {
     }
 }
 
-fn append_job_log(home: &Home, line: &str) -> std::io::Result<()> {
-    use std::io::Write;
+/// Moves a job log of `JOB_LOG_LIMIT` bytes or more to `schedule.log.1`, which replaces the older
+/// copy. The OS appends the job's output to the log too, and only the job can bound that.
+fn rotate_job_log(home: &Home) -> std::io::Result<()> {
     let path = home.file(JOB_LOG);
     if std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() >= JOB_LOG_LIMIT) {
         std::fs::rename(&path, home.file("schedule.log.1"))?;
     }
+    Ok(())
+}
+
+fn append_job_log(home: &Home, line: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let path = home.file(JOB_LOG);
+    rotate_job_log(home)?;
     let mut options = OpenOptions::new();
     options.create(true).append(true);
     #[cfg(unix)]
@@ -1337,7 +1402,7 @@ fn append_job_log(home: &Home, line: &str) -> std::io::Result<()> {
     )
 }
 
-const APPLIED: &str = "schedule-applied.json";
+pub(crate) const APPLIED: &str = "schedule-applied.json";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct Applied {
@@ -1731,14 +1796,14 @@ pub(crate) async fn turn_on(home: &Home, run_as: Option<RunAs>, dry_run: bool) -
             crate::client_command(&home.0)
         );
     };
-    let mut config = DeviceConfig::load(home)?;
+    let mut config = DeviceConfig::load_or_migrate(home, crate::user_profile().as_deref(), false)?;
     let run_as = run_as.unwrap_or(config.run_as);
     validate_system_install(run_as == RunAs::System, crate::current_os()?)?;
     println!("{schedule}");
     change_job(home, Wanted::On(run_as), dry_run).await?;
     if !dry_run {
         let _claim_lock = claim::lock(home).await?;
-        config = DeviceConfig::load(home)?;
+        config = DeviceConfig::load_or_migrate(home, crate::user_profile().as_deref(), true)?;
         config.auto_send = true;
         config.run_as = run_as;
         config.save(home)?;
@@ -1762,7 +1827,7 @@ pub(crate) async fn turn_off(home: &Home, dry_run: bool) -> Result<()> {
 
 /// `schedule status`: the owner's choice, the company's policy and the state of the job.
 async fn status(home: &Home) -> Result<()> {
-    let config = DeviceConfig::load(home)?;
+    let config = DeviceConfig::load_or_migrate(home, crate::user_profile().as_deref(), false)?;
     match home.signed_manifest() {
         Ok(manifest) => match &manifest.body().schedule {
             Some(schedule) => println!("{schedule}"),
@@ -1844,19 +1909,34 @@ pub(crate) async fn run(home: &Home, command: Command) -> Result<()> {
 /// One run of the job. The policy comes from the manifest the owner signed, never from a manifest
 /// that waits for acceptance.
 async fn run_tick(home: &Home, state_home: &Home, user_home: Option<&Path>) -> Result<()> {
-    let command = crate::client_command(&home.0);
-    if let Some(notice) = device_config::legacy_notice(home, device_config::Surface::Job, &command)
-    {
-        job_log(home, &notice);
-    }
-    if !DeviceConfig::load(home)?.auto_send {
-        return Ok(());
-    }
-    let manifest = home.signed_manifest()?;
-    let Some(schedule) = &manifest.body().schedule else {
-        return Ok(());
+    let schedule = {
+        let Some(_claim_lock) = claim::try_lock(home)? else {
+            return Ok(());
+        };
+        let config = DeviceConfig::load_or_migrate(home, user_home, true)?;
+        let command = crate::client_command(&home.0);
+        if let Some(notice) =
+            device_config::legacy_notice(home, device_config::Surface::Job, &command, &config)
+        {
+            job_log(home, &notice);
+        }
+        if !config.auto_send {
+            return Ok(());
+        }
+        let manifest = home.signed_manifest()?;
+        let Some(schedule) = manifest.body().schedule.clone() else {
+            return Ok(());
+        };
+        schedule
     };
-    tick(home, state_home, user_home, schedule, checks::event_markers).await
+    tick(
+        home,
+        state_home,
+        user_home,
+        &schedule,
+        checks::event_markers,
+    )
+    .await
 }
 
 async fn operate(home: &Home, command: Operation, home_locked: bool) -> Result<()> {
@@ -1918,9 +1998,12 @@ async fn operate(home: &Home, command: Operation, home_locked: bool) -> Result<(
     };
     match command {
         Operation::Run { user_home, .. } => {
-            let Some(_claim_lock) = claim::try_lock(&home)? else {
-                return Ok(());
-            };
+            if let Err(error) = rotate_job_log(&home) {
+                eprintln!(
+                    "warning: could not rotate {}: {error}",
+                    home.file(JOB_LOG).display()
+                );
+            }
             let result = run_tick(&home, &state_home, user_home.as_deref()).await;
             if let Err(error) = &result {
                 job_log(&home, &format!("error: {error:#}"));
@@ -2964,7 +3047,8 @@ Write-Output 'refused'
         for (up, pending, minutes, expected) in [
             (false, false, 55, false),
             (false, true, 55, false),
-            (true, true, 1, true),
+            (true, true, 1, false),
+            (true, true, 55, true),
             (true, false, 54, false),
             (true, false, 55, true),
         ] {
@@ -2987,11 +3071,15 @@ Write-Output 'refused'
         assert!(state.should_send(now + 55 * 60, 55 * 60));
         state.observe(false);
         state.observe(true);
-        assert!(state.should_send(now + 60, 55 * 60));
-        state.observe(true);
         assert!(
-            state.should_send(now + 120, 55 * 60),
-            "failed first send must retry"
+            !state.should_send(now + 60, 55 * 60),
+            "a reconnect does not shorten the interval"
+        );
+        assert_eq!(state.due(now + 60, 55 * 60), None);
+        assert_eq!(
+            state.due(now + 55 * 60, 55 * 60),
+            Some(Trigger::Connect),
+            "the reconnect is sent once the interval has passed"
         );
         state.acknowledged(now + 120, checks::EventMarkerReads::default());
         assert!(!state.should_send(now + 121, 55 * 60));
@@ -3106,8 +3194,11 @@ Write-Output 'refused'
     fn trigger_decision_table() {
         for (up, reconnect, event, last, expected) in [
             (false, true, true, None, None),
-            (true, true, true, Some(100), Some(Trigger::Connect)),
+            (true, true, true, Some(100), Some(Trigger::Event)),
             (true, false, true, Some(100), Some(Trigger::Event)),
+            (true, true, false, Some(100), None),
+            (true, true, false, Some(0), Some(Trigger::Connect)),
+            (true, true, false, None, Some(Trigger::Connect)),
             (true, false, false, None, Some(Trigger::Periodic)),
             (true, false, false, Some(100), None),
             (true, false, false, Some(0), Some(Trigger::Periodic)),
@@ -3220,7 +3311,7 @@ Write-Output 'refused'
             assert!(pending.event_pending);
             assert_eq!(pending.due(101, 55 * 60), None);
             pending.observe(true);
-            assert_eq!(pending.due(102, 55 * 60), Some(Trigger::Connect));
+            assert_eq!(pending.due(102, 55 * 60), Some(Trigger::Event));
             pending.sent(false, 102, events, BTreeMap::new());
             assert!(pending.event_pending);
             assert_eq!(pending.last_events, state.last_events);
@@ -3235,7 +3326,7 @@ Write-Output 'refused'
             serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
         assert_eq!(restored.due(101, 55 * 60), None);
         restored.observe(true);
-        assert_eq!(restored.due(102, 55 * 60), Some(Trigger::Connect));
+        assert_eq!(restored.due(102, 55 * 60), Some(Trigger::Event));
     }
 
     #[test]
@@ -3273,6 +3364,7 @@ Write-Output 'refused'
 
     #[test]
     fn launchd_arguments_and_interval_are_encoded() {
+        let log = Path::new("/home/example/pact & data").join(JOB_LOG);
         let plist = job().plist();
         assert!(plist.contains("<key>StartInterval</key><integer>300</integer>"));
         assert!(plist.contains("<string>/home/example/pact &amp; data</string>"));
@@ -3280,7 +3372,8 @@ Write-Output 'refused'
         assert!(plist.contains("<key>RunAtLoad</key><true/>"));
         for key in ["StandardOutPath", "StandardErrorPath"] {
             assert!(plist.contains(&format!(
-                "<key>{key}</key><string>/home/example/pact &amp; data/schedule.log</string>"
+                "<key>{key}</key><string>{}</string>",
+                xml(&log.to_string_lossy())
             )));
         }
         assert_eq!(xml("<>'\"&"), "&lt;&gt;&apos;&quot;&amp;");
@@ -3295,10 +3388,13 @@ Write-Output 'refused'
                 .contains(&format!("Unit={}.service", job().id))
         );
         assert!(job().service().contains(r#"ExecStart="/opt/Example App/open-pact-client" "--home" "/home/example/pact & data" "schedule" "run""#));
+        let log = Path::new("/home/example/pact & data").join(JOB_LOG);
         for stream in ["StandardOutput", "StandardError"] {
-            assert!(job().service().contains(&format!(
-                "{stream}=append:/home/example/pact & data/schedule.log\n"
-            )));
+            assert!(
+                job()
+                    .service()
+                    .contains(&format!("{stream}=append:{}\n", log.to_string_lossy()))
+            );
         }
         assert_eq!(systemd_arg("a%$\"\\b"), r#""a%%$$\"\\b""#);
     }
@@ -3582,7 +3678,7 @@ Write-Output 'refused'
             &State {
                 vpn_up: false,
                 reconnect_pending: false,
-                last_success: Some(chrono::Utc::now().timestamp()),
+                last_success: Some(chrono::Utc::now().timestamp() - 2 * 3600),
                 last_events: None,
                 event_baseline: None,
                 ..State::default()
@@ -3779,5 +3875,248 @@ Write-Output 'refused'
         assert!(state.should_send(1_000 + 55 * 60, 55 * 60));
         assert_eq!(state.due(1_000 + 5 * 60, 5 * 60), Some(Trigger::Periodic));
         assert_eq!(state.due(1_000 + 5 * 60, 55 * 60), None);
+    }
+
+    #[test]
+    fn alternating_probes_never_send_more_often_than_the_interval() {
+        let interval = 55 * 60;
+        let mut state = State::default();
+        let mut now = 100_000;
+        let mut sent = vec![];
+        for round in 0..24 {
+            state.observe(round % 2 == 0);
+            if state.due(now, interval).is_some() {
+                sent.push(now);
+                state.sent(
+                    true,
+                    now,
+                    checks::EventMarkerReads::default(),
+                    BTreeMap::new(),
+                );
+            }
+            now += 5 * 60;
+        }
+        assert!(sent.len() >= 2, "the periodic claim still goes: {sent:?}");
+        for pair in sent.windows(2) {
+            assert!(pair[1] - pair[0] >= interval, "{sent:?}");
+        }
+    }
+
+    #[test]
+    fn a_compliance_change_sends_at_once_even_after_a_reconnect() {
+        let map = |value| BTreeMap::from([("required_control".into(), value)]);
+        let mut state = State {
+            vpn_up: true,
+            last_success: Some(1_000),
+            last_attempt: Some(1_000),
+            last_compliance: Some(map(true)),
+            ..State::default()
+        };
+        state.observe(false);
+        state.observe(true);
+        assert_eq!(state.due(1_060, 55 * 60), None);
+        state.observe_compliance(&map(false));
+        assert_eq!(state.due(1_120, 55 * 60), Some(Trigger::Event));
+    }
+
+    #[test]
+    fn an_answer_without_a_verdict_counts_as_the_attempt() {
+        let interval = 55 * 60;
+        for outcome in [
+            Outcome::NotSent(NotSent::Pending),
+            Outcome::NotSent(NotSent::Revoked),
+            Outcome::NotSent(NotSent::AcceptPending(open_pact_core::ManifestHash::of(
+                b"fictional",
+            ))),
+            Outcome::Alarm("fictional alarm".into()),
+        ] {
+            let mut state = State {
+                vpn_up: true,
+                reconnect_pending: true,
+                event_pending: true,
+                ..State::default()
+            };
+            state.record(
+                &outcome,
+                10_000,
+                checks::EventMarkerReads::default(),
+                BTreeMap::new(),
+            );
+            assert_eq!(state.last_success, None, "nothing was accepted or denied");
+            assert_eq!(state.due(10_000 + 5 * 60, interval), None);
+            state.observe(false);
+            state.observe(true);
+            assert_eq!(
+                state.due(10_000 + 10 * 60, interval),
+                None,
+                "a reconnect does not bring the next attempt closer"
+            );
+            assert_eq!(
+                state.due(10_000 + interval, interval),
+                Some(Trigger::Connect)
+            );
+        }
+    }
+
+    #[test]
+    fn the_vpn_dropping_is_no_attempt() {
+        let mut state = State {
+            vpn_up: true,
+            reconnect_pending: true,
+            ..State::default()
+        };
+        state.record(
+            &Outcome::NotSent(NotSent::OffVpn),
+            10_000,
+            checks::EventMarkerReads::default(),
+            BTreeMap::new(),
+        );
+        assert!(!state.vpn_up && state.reconnect_pending);
+        assert_eq!(state.last_attempt, None);
+    }
+
+    #[test]
+    fn the_job_log_gets_one_line_per_state_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+        let mut state = State::default();
+        let lines = |home: &Home| {
+            std::fs::read_to_string(home.file(JOB_LOG))
+                .unwrap_or_default()
+                .lines()
+                .count()
+        };
+        for _ in 0..3 {
+            note_outcome(
+                &home,
+                &mut state,
+                Trigger::Periodic,
+                &Outcome::NotSent(NotSent::Revoked),
+            );
+        }
+        assert_eq!(lines(&home), 1, "a revoked device is reported once");
+        note_outcome(
+            &home,
+            &mut state,
+            Trigger::Periodic,
+            &Outcome::NotSent(NotSent::Pending),
+        );
+        assert_eq!(lines(&home), 2, "a new state is a new line");
+        let denied = Outcome::Denied {
+            reasons: vec!["firewall must be on".into()],
+            changed: None,
+        };
+        for trigger in [Trigger::Connect, Trigger::Periodic, Trigger::Event] {
+            note_outcome(&home, &mut state, trigger, &denied);
+        }
+        assert_eq!(lines(&home), 3, "the same denial is not repeated");
+        note_outcome(
+            &home,
+            &mut state,
+            Trigger::Periodic,
+            &Outcome::NotSent(NotSent::OffVpn),
+        );
+        assert_eq!(lines(&home), 3, "an off-VPN run says nothing");
+        note_outcome(
+            &home,
+            &mut state,
+            Trigger::Periodic,
+            &Outcome::Accepted { changed: None },
+        );
+        note_outcome(&home, &mut state, Trigger::Periodic, &denied);
+        assert_eq!(
+            lines(&home),
+            4,
+            "a denial after an acceptance is news again"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_job_rotates_a_log_over_the_limit_at_the_start_of_each_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = enrolled_home(dir.path());
+        let _gateway = unreachable_gateway(&home);
+        std::fs::write(home.file(JOB_LOG), vec![b'x'; JOB_LOG_LIMIT as usize + 1]).unwrap();
+        run(&home, run_job()).await.unwrap();
+        assert_eq!(
+            std::fs::metadata(home.file("schedule.log.1"))
+                .unwrap()
+                .len(),
+            JOB_LOG_LIMIT + 1
+        );
+        assert!(
+            !home.file(JOB_LOG).exists(),
+            "the next write starts a fresh log"
+        );
+
+        std::fs::write(home.file(JOB_LOG), b"short").unwrap();
+        run(&home, run_job()).await.unwrap();
+        assert_eq!(std::fs::read(home.file(JOB_LOG)).unwrap(), b"short");
+        assert_eq!(
+            std::fs::metadata(home.file("schedule.log.1"))
+                .unwrap()
+                .len(),
+            JOB_LOG_LIMIT + 1,
+            "a small log keeps the old copy as it is"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_scan_runs_before_the_claim_lock_and_the_gateway_part_needs_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let probe = listener.local_addr().unwrap().to_string();
+        let home = enrolled_home_with_schedule(dir.path(), Some(&vpn_table(&probe)));
+        let _gateway = unreachable_gateway(&home);
+        let repo = dir.path().join("work/app");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::write(
+            repo.join(".git/config"),
+            "[remote \"origin\"]\n url = git@github.com:example-org/app.git\n",
+        )
+        .unwrap();
+        let schedule = home
+            .signed_manifest()
+            .unwrap()
+            .body()
+            .schedule
+            .clone()
+            .unwrap();
+
+        let held = claim::try_lock(&home).unwrap().unwrap();
+        tick(
+            &home,
+            &home,
+            None,
+            &schedule,
+            checks::EventMarkerReads::default,
+        )
+        .await
+        .unwrap();
+        assert!(
+            home.file("repo-scan.json").is_file(),
+            "the scan finished while another command held the claim lock"
+        );
+        let state: State = home.read_json(STATE).unwrap().unwrap();
+        assert_eq!(
+            state.last_attempt, None,
+            "the gateway part waited for the lock"
+        );
+        drop(held);
+
+        let error = tick(
+            &home,
+            &home,
+            None,
+            &schedule,
+            checks::EventMarkerReads::default,
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("/v1/manifest"), "{error:#}");
+        assert!(
+            claim::try_lock(&home).unwrap().is_some(),
+            "the job released the lock when its tick ended"
+        );
     }
 }

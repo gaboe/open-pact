@@ -19,7 +19,10 @@ pub(crate) enum RunAs {
     System,
 }
 
-/// Where the notice about the ignored `open-pact.toml` was already shown.
+/// Where the notice about the ignored `open-pact.toml` was already shown. It has its own file, so a
+/// notice never writes the owner's choices.
+const NOTICE_FILE: &str = "legacy-notice.json";
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
 struct LegacyNoticeGiven {
     #[serde(default)]
@@ -46,14 +49,53 @@ pub(crate) struct DeviceConfig {
     /// Absolute folders that hold the owner's managed repositories.
     #[serde(default)]
     pub(crate) folders: Vec<PathBuf>,
+    /// The owner went through wizard step 5, so `join` does not ask again. A file that an import
+    /// or a command created leaves it false.
     #[serde(default)]
-    legacy_notice: LegacyNoticeGiven,
+    pub(crate) setup_answered: bool,
 }
 
 impl DeviceConfig {
     /// No file means no choices yet.
     pub(crate) fn load(home: &Home) -> Result<Self> {
         Ok(home.read_json(FILE)?.unwrap_or_default())
+    }
+
+    /// `load`, and on the first read of a home without `device.json` it carries over what an
+    /// earlier client kept: the repository folders in `open-pact.toml` (the owner's own choice)
+    /// and a SYSTEM job on Windows. `persist` saves the result; a preview leaves the home alone.
+    pub(crate) fn load_or_migrate(
+        home: &Home,
+        user_home: Option<&Path>,
+        persist: bool,
+    ) -> Result<Self> {
+        Self::migrate(home, user_home, persist, cfg!(windows))
+    }
+
+    fn migrate(
+        home: &Home,
+        user_home: Option<&Path>,
+        persist: bool,
+        windows: bool,
+    ) -> Result<Self> {
+        if let Some(config) = home.read_json(FILE)? {
+            return Ok(config);
+        }
+        let profile = crate::user_profile();
+        let folders = legacy_folders(home, user_home.or(profile.as_deref()));
+        let system = windows && installed_system_job(home);
+        let mut config = Self::default();
+        if folders.is_empty() && !system {
+            return Ok(config);
+        }
+        config.folders = folders;
+        if system {
+            config.run_as = RunAs::System;
+        }
+        if persist {
+            config.save(home)?;
+        }
+        Ok(config)
     }
 
     pub(crate) fn save(&self, home: &Home) -> Result<()> {
@@ -101,26 +143,55 @@ fn legacy_value(home: &Home) -> Option<toml::Value> {
     ))
 }
 
+/// A SYSTEM job that an earlier client installed: its `schedule-applied.json` or its settings file
+/// says so.
+fn installed_system_job(home: &Home) -> bool {
+    let applied = home
+        .read_json::<serde_json::Value>(crate::schedule::APPLIED)
+        .ok()
+        .flatten();
+    applied.is_some_and(|applied| applied["run_as"] == "system")
+        || legacy_value(home).is_some_and(|value| {
+            value
+                .get("schedule")
+                .and_then(|table| table.get("run_as"))
+                .and_then(toml::Value::as_str)
+                == Some("system")
+        })
+}
+
 /// What to tell the owner, once per surface, when an `open-pact.toml` still sits in the home.
-pub(crate) fn legacy_notice(home: &Home, surface: Surface, command: &str) -> Option<String> {
+/// `config` is what the client read of the owner's choices after it carried the old ones over.
+pub(crate) fn legacy_notice(
+    home: &Home,
+    surface: Surface,
+    command: &str,
+    config: &DeviceConfig,
+) -> Option<String> {
     let value = legacy_value(home)?;
-    let mut config = DeviceConfig::load(home).ok()?;
-    let given = match surface {
-        Surface::Check => &mut config.legacy_notice.check,
-        Surface::Job => &mut config.legacy_notice.job,
+    let mut given: LegacyNoticeGiven = home
+        .read_json(NOTICE_FILE)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let flag = match surface {
+        Surface::Check => &mut given.check,
+        Surface::Job => &mut given.job,
     };
-    if *given {
+    if *flag {
         return None;
     }
-    *given = true;
-    let _ = config.save(home);
+    *flag = true;
+    if let Ok(bytes) = serde_json::to_vec(&given) {
+        let _ = home.write(NOTICE_FILE, &bytes);
+    }
     let has = |table: &str, key: &str| value.get(table).and_then(|table| table.get(key)).is_some();
     let mut lines = vec![format!(
         "{LEGACY_FILE} is ignored now. This client keeps your choices in {FILE}, and the company's signed manifest holds the rest:"
     )];
     if has("schedule", "enabled") || has("schedule", "run_as") {
         lines.push(format!(
-            "  [schedule] enabled, run_as: `{command} schedule on` asks for them"
+            "  [schedule] enabled, run_as: turn automatic sending on with `{command} schedule on`; on Windows add `--user` or `--system`"
         ));
     }
     if has("schedule", "mode") || has("schedule", "vpn_probe") || has("schedule", "vpn_probe_name")
@@ -131,8 +202,20 @@ pub(crate) fn legacy_notice(home: &Home, surface: Surface, command: &str) -> Opt
         );
     }
     if has("managed_repos", "folders") {
+        lines.push(if config.folders.is_empty() {
+            format!(
+                "  [managed_repos] folders: run `{command} folders add <path>` for each; the setup wizard offers to import them"
+            )
+        } else {
+            format!(
+                "  [managed_repos] folders: imported into {FILE} because they were your choice; `{command} folders list` shows them and `{command} folders remove <path>` drops one"
+            )
+        });
+    }
+    if config.run_as == RunAs::System {
         lines.push(format!(
-            "  [managed_repos] folders: run `{command} folders add <path>`; the setup wizard offers to import them"
+            "  An installed SYSTEM job was found. It keeps running the old client copy until you replace it. From an elevated PowerShell prompt run:\n    {}",
+            crate::schedule::apply_command(&home.0, "schedule on --system")
         ));
     }
     if value.get("report").is_some() {
@@ -180,6 +263,28 @@ pub(crate) fn managed_repo_summary(scan: &crate::checks::repos::RepoScan, home: 
         output.push_str("  Managed repository scan was partial; results may be incomplete.\n");
     }
     output
+}
+
+/// The folders that hold the managed repositories a scan found. A folder whose name needs escaping
+/// is left out, so it never reaches a prompt as something the owner did not type.
+pub(crate) fn suggested_folders(
+    scan: &crate::checks::repos::RepoScan,
+    user_home: &Path,
+) -> Vec<PathBuf> {
+    let Some(paths) = &scan.managed_paths else {
+        return Vec::new();
+    };
+    crate::checks::repos::managed_repo_groups(paths, user_home)
+        .into_iter()
+        .filter_map(|(group, _)| {
+            let folder = match group.strip_prefix("~/") {
+                Some(rest) => user_home.join(rest),
+                None => user_home.to_path_buf(),
+            };
+            (safe_comment_text(&folder.display().to_string()) == folder.display().to_string())
+                .then_some(folder)
+        })
+        .collect()
 }
 
 pub(crate) fn safe_comment_text(text: &str) -> String {
@@ -292,33 +397,71 @@ mod tests {
     #[test]
     fn the_ignored_toml_is_explained_once_per_surface() {
         let (_dir, home) = home();
-        assert_eq!(legacy_notice(&home, Surface::Check, "client"), None);
+        let config = DeviceConfig::default();
+        assert_eq!(
+            legacy_notice(&home, Surface::Check, "client", &config),
+            None
+        );
         std::fs::write(
             home.file(LEGACY_FILE),
             "[schedule]\nenabled = true\nrun_as = 'user'\nmode = 'vpn'\nvpn_probe = '10.0.0.1:443'\n[managed_repos]\nfolders = ['/work']\n[report]\ncollector = 'https://collector.example.org'\n",
         )
         .unwrap();
-        let notice = legacy_notice(&home, Surface::Check, "client").unwrap();
+        let notice = legacy_notice(&home, Surface::Check, "client", &config).unwrap();
         for expected in [
             "open-pact.toml is ignored now",
-            "[schedule] enabled, run_as: `client schedule on`",
+            "[schedule] enabled, run_as: turn automatic sending on with `client schedule on`",
             "[schedule] mode, vpn_probe, vpn_probe_name: the company sets them",
             "[managed_repos] folders: run `client folders add <path>`",
             "[report]: removed",
         ] {
             assert!(notice.contains(expected), "{notice}");
         }
-        assert_eq!(legacy_notice(&home, Surface::Check, "client"), None);
-        assert!(legacy_notice(&home, Surface::Job, "client").is_some());
-        assert_eq!(legacy_notice(&home, Surface::Job, "client"), None);
+        assert!(
+            !notice.contains("asks for"),
+            "`schedule on` takes flags and asks nothing: {notice}"
+        );
+        assert_eq!(
+            legacy_notice(&home, Surface::Check, "client", &config),
+            None
+        );
+        assert!(legacy_notice(&home, Surface::Job, "client", &config).is_some());
+        assert_eq!(legacy_notice(&home, Surface::Job, "client", &config), None);
         assert!(home.file(LEGACY_FILE).exists(), "the owner's file stays");
+        assert!(
+            !home.file(FILE).exists(),
+            "the notice flags have their own file and never create device.json"
+        );
+        assert!(home.file(NOTICE_FILE).exists());
+    }
+
+    #[test]
+    fn the_notice_says_when_the_old_folders_were_imported() {
+        let (_dir, home) = home();
+        std::fs::write(
+            home.file(LEGACY_FILE),
+            "[managed_repos]\nfolders = ['/work']\n",
+        )
+        .unwrap();
+        let config = DeviceConfig {
+            folders: vec![PathBuf::from("/work")],
+            ..DeviceConfig::default()
+        };
+        let notice = legacy_notice(&home, Surface::Check, "client", &config).unwrap();
+        assert!(
+            notice.contains("imported into device.json")
+                && notice.contains("client folders remove <path>")
+                && !notice.contains("folders add"),
+            "{notice}"
+        );
     }
 
     #[test]
     fn an_unparseable_toml_is_still_ignored_with_a_notice() {
         let (_dir, home) = home();
         std::fs::write(home.file(LEGACY_FILE), "[managed_repos\n").unwrap();
-        let notice = legacy_notice(&home, Surface::Check, "client").unwrap();
+        let notice =
+            legacy_notice(&home, Surface::Check, "client", &DeviceConfig::default()).unwrap();
         assert!(notice.contains("ignored now") && !notice.contains("folders add"));
         assert!(legacy_folders(&home, None).is_empty());
     }
@@ -331,13 +474,133 @@ mod tests {
             "[managed_repos]\nfolders = ['~/work', '/srv/code']\n",
         )
         .unwrap();
+        let user_home = Path::new("/home/example");
         assert_eq!(
-            legacy_folders(&home, Some(Path::new("/home/example"))),
+            legacy_folders(&home, Some(user_home)),
             vec![
-                PathBuf::from("/home/example/work"),
-                PathBuf::from("/srv/code")
+                user_home.join("work"),
+                std::path::absolute("/srv/code").unwrap()
             ]
         );
+    }
+
+    #[test]
+    fn the_first_read_carries_the_old_folders_into_device_json() {
+        let (_dir, home) = home();
+        let user_home = Path::new("/home/example");
+        std::fs::write(
+            home.file(LEGACY_FILE),
+            "[managed_repos]\nfolders = ['~/work']\n",
+        )
+        .unwrap();
+        let preview = DeviceConfig::migrate(&home, Some(user_home), false, false).unwrap();
+        assert_eq!(preview.folders, vec![user_home.join("work")]);
+        assert!(!home.file(FILE).exists(), "a preview writes nothing");
+
+        let config = DeviceConfig::migrate(&home, Some(user_home), true, false).unwrap();
+        assert_eq!(config.folders, vec![user_home.join("work")]);
+        assert!(!config.auto_send && !config.setup_answered);
+        assert_eq!(DeviceConfig::load(&home).unwrap(), config);
+
+        let mut chosen = DeviceConfig::load(&home).unwrap();
+        chosen.folders.clear();
+        chosen.save(&home).unwrap();
+        let again = DeviceConfig::migrate(&home, Some(user_home), true, false).unwrap();
+        assert!(again.folders.is_empty(), "an existing device.json wins");
+    }
+
+    #[test]
+    fn a_home_with_nothing_to_carry_over_gets_no_device_json() {
+        let (_dir, home) = home();
+        assert_eq!(
+            DeviceConfig::migrate(&home, None, true, true).unwrap(),
+            DeviceConfig::default()
+        );
+        std::fs::write(home.file(LEGACY_FILE), "[schedule]\nenabled = true\n").unwrap();
+        DeviceConfig::migrate(&home, None, true, true).unwrap();
+        assert!(!home.file(FILE).exists());
+    }
+
+    #[test]
+    fn an_installed_system_job_keeps_run_as_system_on_windows() {
+        for (name, content) in [
+            (
+                crate::schedule::APPLIED,
+                "{\"run_as\":\"system\",\"executable\":\"C:/old/open-pact-client.exe\"}",
+            ),
+            (
+                LEGACY_FILE,
+                "[schedule]\nenabled = true\nrun_as = 'system'\n",
+            ),
+        ] {
+            let (_dir, home) = home();
+            std::fs::write(home.file(name), content).unwrap();
+            let config = DeviceConfig::migrate(&home, None, true, true).unwrap();
+            assert_eq!(config.run_as, RunAs::System, "{name}");
+            assert_eq!(DeviceConfig::load(&home).unwrap().run_as, RunAs::System);
+            let (_other_dir, other) = self::home();
+            std::fs::write(other.file(name), content).unwrap();
+            let elsewhere = DeviceConfig::migrate(&other, None, false, false).unwrap();
+            assert_eq!(
+                elsewhere.run_as,
+                RunAs::User,
+                "only Windows has SYSTEM jobs"
+            );
+        }
+        let (_dir, home) = home();
+        std::fs::write(home.file(crate::schedule::APPLIED), "{\"run_as\":\"user\"}").unwrap();
+        assert_eq!(
+            DeviceConfig::migrate(&home, None, true, true)
+                .unwrap()
+                .run_as,
+            RunAs::User
+        );
+    }
+
+    #[test]
+    fn the_notice_names_the_elevated_command_for_a_system_job() {
+        let (_dir, home) = home();
+        std::fs::write(
+            home.file(LEGACY_FILE),
+            "[schedule]\nenabled = true\nrun_as = 'system'\n",
+        )
+        .unwrap();
+        let config = DeviceConfig {
+            run_as: RunAs::System,
+            ..DeviceConfig::default()
+        };
+        let notice = legacy_notice(&home, Surface::Job, "client", &config).unwrap();
+        assert!(
+            notice.contains("elevated")
+                && notice.contains("schedule on --system")
+                && notice.contains(&home.0.to_string_lossy().into_owned()),
+            "{notice}"
+        );
+    }
+
+    #[test]
+    fn repository_paths_with_control_characters_are_escaped_and_never_suggested() {
+        let home = Path::new("/home/example");
+        let scan = crate::checks::repos::RepoScan {
+            scanned_at: chrono::Utc::now().timestamp(),
+            managed_repos_outside: 2,
+            managed_repos_total: 2,
+            outside_paths: Vec::new(),
+            managed_paths: Some(vec![
+                home.join("work\nunexpected = 1\n#/repo"),
+                home.join("plain/repo"),
+            ]),
+            partial: false,
+            access_denied: false,
+            causes: Vec::new(),
+        };
+        let overview = managed_repo_summary(&scan, home);
+        assert!(
+            overview.contains("    ~/work\\nunexpected = 1\\n# (1)\n"),
+            "{overview}"
+        );
+        assert_eq!(overview.lines().count(), 3, "no raw newline from a path");
+        assert_eq!(suggested_folders(&scan, home), vec![home.join("plain")]);
     }
 
     #[test]

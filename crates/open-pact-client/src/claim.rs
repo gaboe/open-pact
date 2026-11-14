@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use open_pact_core::{
-    Claim, ControlValue, CsrHash, DeviceStatus, LogCheckpoint, Manifest, ManifestHash, Os,
-    Pseudonym, Virtualized,
+    Checkpoint, Claim, ControlValue, CsrHash, DeviceStatus, LogCheckpoint, Manifest, ManifestHash,
+    Os, Pseudonym, Virtualized,
 };
 use rcgen::KeyPair;
 use serde_json::{Value, json};
@@ -15,8 +15,8 @@ use serde_json::{Value, json};
 use crate::checks::repos::RepoScan;
 use crate::device_config::{self, DeviceConfig};
 use crate::{
-    CheckpointVerifyError, ClaimResult, DeviceKey, Enrolment, Home, LogSync, Nonce, Pins, Response,
-    base,
+    CheckpointVerifyError, ClaimResult, DeviceKey, Enrolment, Home, LogSync, Nonce, OwnEntries,
+    Pins, Response, base,
 };
 
 const LOCK: &str = "claim.lock";
@@ -53,20 +53,31 @@ fn open(home: &Home) -> Result<Option<File>> {
     ))
 }
 
-/// Takes the lock for a command the owner started. Waits while another command holds it.
+/// Takes the lock for a command the owner started. Waits while another command holds it, and says
+/// so once: the holder is usually the scheduled job.
 pub(crate) async fn lock(home: &Home) -> Result<ClaimLock> {
-    lock_for(home, WAIT).await
+    lock_for(home, WAIT, || {
+        eprintln!(
+            "Waiting for the scheduled job, which holds {}. It releases the lock when its claim is done.",
+            home.file(LOCK).display()
+        );
+    })
+    .await
 }
 
-async fn lock_for(home: &Home, wait: Duration) -> Result<ClaimLock> {
+async fn lock_for(home: &Home, wait: Duration, on_wait: impl FnOnce()) -> Result<ClaimLock> {
     let Some(file) = open(home)? else {
         return Ok(ClaimLock(None));
     };
     let deadline = tokio::time::Instant::now() + wait;
+    let mut on_wait = Some(on_wait);
     loop {
         match file.try_lock() {
             Ok(()) => return Ok(ClaimLock(Some(file))),
             Err(std::fs::TryLockError::WouldBlock) => {
+                if let Some(announce) = on_wait.take() {
+                    announce();
+                }
                 if tokio::time::Instant::now() >= deadline {
                     bail!(
                         "another open-pact command has held {} for {} seconds; wait for it to finish and run this command again",
@@ -143,7 +154,8 @@ pub(crate) async fn prepare(
     insecure_dev: bool,
 ) -> Result<Prepared> {
     let mut can_scan_repositories = true;
-    let device_config = match DeviceConfig::load(home) {
+    let preview = matches!(policy, ScanPolicy::Preview);
+    let device_config = match DeviceConfig::load_or_migrate(home, user_home, !preview) {
         Ok(config) => Some(config),
         Err(error) => {
             can_scan_repositories = false;
@@ -249,6 +261,37 @@ pub(crate) async fn prepare(
     })
 }
 
+/// The daily repository scan, for the scheduled job. The job runs it before it takes the claim lock,
+/// so a long scan never makes `check` or `accept` wait. `prepare` then reads the stored result.
+/// A home that does not read cleanly is left to `prepare`, which says what is wrong.
+pub(crate) async fn scan_if_due(
+    home: &Home,
+    user_home: Option<&Path>,
+    age: Duration,
+) -> Result<()> {
+    let Ok(text) = std::fs::read(home.file("manifest.toml")) else {
+        return Ok(());
+    };
+    let Ok(manifest) = Manifest::parse(&text) else {
+        return Ok(());
+    };
+    let Ok(config) = DeviceConfig::load_or_migrate(home, user_home, false) else {
+        return Ok(());
+    };
+    if !crate::scans_repositories(&manifest) {
+        return Ok(());
+    }
+    let now = chrono::Utc::now().timestamp();
+    let age = i64::try_from(age.as_secs()).unwrap_or(i64::MAX);
+    let due = crate::checks::repos::load_attempt(&home.0)?
+        .is_none_or(|last| now.saturating_sub(last.scanned_at) >= age);
+    if due {
+        crate::checks::repos::lower_process_priority();
+        crate::scan_repositories_from(home, user_home, &manifest, Some(&config), true).await?;
+    }
+    Ok(())
+}
+
 /// How a claim went, after the pipeline printed what happened.
 pub(crate) enum Outcome {
     Accepted {
@@ -272,7 +315,30 @@ pub(crate) enum NotSent {
     OffVpn,
 }
 
+impl NotSent {
+    /// Why `check` sends nothing, for the end of a dry run.
+    fn reason(&self) -> &'static str {
+        match self {
+            NotSent::Pending => "this device waits for IT approval",
+            NotSent::Revoked => "IT revoked this device",
+            NotSent::AcceptPending(_) => {
+                "the gateway enforces a manifest this device has not signed yet"
+            }
+            NotSent::OffVpn => "the VPN probe failed",
+        }
+    }
+}
+
 impl Outcome {
+    /// One sentence on why `check` sends nothing. `None` when it sends.
+    pub(crate) fn why_nothing_is_sent(&self) -> Option<String> {
+        match self {
+            Outcome::NotSent(reason) => Some(reason.reason().to_owned()),
+            Outcome::Alarm(_) => Some("the transparency log did not verify".to_owned()),
+            Outcome::Accepted { .. } | Outcome::Denied { .. } => None,
+        }
+    }
+
     /// The gateway received the claim and answered, whatever its verdict.
     pub(crate) fn delivered(&self) -> bool {
         matches!(self, Outcome::Accepted { .. } | Outcome::Denied { .. })
@@ -292,8 +358,8 @@ pub(crate) enum Preview {
     /// The request `send` would post, with a placeholder for each field only the gateway or the
     /// clock can fill.
     Request(Value),
-    /// The gateway's keys or log did not verify, so `check` would send nothing.
-    Alarm(String),
+    /// `check` would send nothing. The pipeline already printed why.
+    NotSent(Outcome),
 }
 
 const NONCE_PLACEHOLDER: &str = "<nonce from POST /v1/nonce>";
@@ -366,31 +432,30 @@ impl Prepared {
         }
     }
 
-    /// Shows the request `send` would post. It reads the gateway (the enforced manifest and the
-    /// log checkpoint) but posts nothing, asks for no nonce and writes no file.
+    /// Shows the request `send` would post. It reads the gateway and asks it the same questions as
+    /// `send` (the enforced manifest, the log, this device's own entries and its status), so it
+    /// shows nothing when `check` would send nothing. It posts no claim and writes no file; the
+    /// gateway issues one nonce for the signed log request, which no claim uses.
     pub(crate) async fn dry_run(self, home: &Home) -> Result<Preview> {
         let http = crate::http_client()?;
-        let gateway = base(&self.enrolment.gateway).to_string();
-        let enforced = crate::enforced_manifest(&http, &gateway).await?;
-        let pins = Pins::load(home)?;
-        if let Some(changed) = pins.compare(&http, &gateway).await? {
-            return Ok(Preview::Alarm(changed));
-        }
-        let text = crate::get_text(&http, format!("{gateway}/v1/log/checkpoint")).await?;
-        let checkpoint = match crate::verify_checkpoint_unstored(
+        let mut enrolment = self.enrolment.clone();
+        let enforced = crate::enforced_manifest(&http, &enrolment.gateway).await?;
+        let changed = (enforced != enrolment.manifest).then(|| enforced.clone());
+        let verified = match admit(
             &http,
-            &gateway,
-            &pins.log,
-            self.manifest.body().log.as_ref(),
-            home.checkpoint()?.as_ref(),
-            &text,
+            home,
+            &self.manifest,
+            &enforced,
+            &mut enrolment,
+            changed.as_ref(),
+            false,
         )
         .await?
         {
-            Ok(checkpoint) => checkpoint,
-            Err(error) => return Ok(Preview::Alarm(error.alarm_text())),
+            Ok((verified, _)) => verified,
+            Err(outcome) => return Ok(Preview::NotSent(outcome)),
         };
-        let log_checkpoint = crate::disclosable_checkpoint(&self.manifest, Some(checkpoint));
+        let log_checkpoint = crate::disclosable_checkpoint(&self.manifest, Some(verified));
         let claim = self.claim(
             String::new(),
             chrono::DateTime::UNIX_EPOCH,
@@ -402,20 +467,20 @@ impl Prepared {
         shown["time"] = TIME_PLACEHOLDER.into();
         shown["csr_sha256"] = CSR_PLACEHOLDER.into();
         let mut request = json!({ "claim": shown, "csr_pem": CSR_PLACEHOLDER });
-        if enforced != self.enrolment.manifest {
+        if changed.is_some() {
             request["manifest_toml"] = self.manifest_toml.clone().into();
         }
         Ok(Preview::Request(request))
     }
 
     /// Verifies the log, signs the claim, posts it and installs the VPN pair the gateway answers
-    /// with. `before_post` runs once the claim is ready and before the first POST; when it returns
-    /// false, nothing is sent.
-    pub(crate) async fn send(
-        self,
-        home: &Home,
-        before_post: impl AsyncFnOnce() -> bool,
-    ) -> Result<Outcome> {
+    /// with. `probe` runs before the first gateway request and again once the claim is ready,
+    /// before the first POST; when it returns false, nothing more is sent.
+    pub(crate) async fn send(self, home: &Home, probe: impl AsyncFn() -> bool) -> Result<Outcome> {
+        if !probe().await {
+            println!("The VPN probe failed before the gateway was contacted. Nothing was sent.");
+            return Ok(Outcome::NotSent(NotSent::OffVpn));
+        }
         let mut enrolment = self.enrolment.clone();
         let manifest = &self.manifest;
         let os = self.os;
@@ -425,81 +490,23 @@ impl Prepared {
         let enforced = crate::enforced_manifest(&http, &enrolment.gateway).await?;
         let changed = (enforced != enrolment.manifest).then(|| enforced.clone());
         let notice = || crate::manifest_change_notice(&enforced, &command);
-        let sync = match crate::sync_log(&http, home, manifest, &enforced, &mut enrolment).await {
-            Err(error)
-                if error.downcast_ref::<reqwest::Error>().is_some_and(|error| {
-                    error.status() == Some(reqwest::StatusCode::FORBIDDEN)
-                        && error
-                            .url()
-                            .is_some_and(|url| url.path().ends_with("/v1/log/mine"))
-                }) =>
-            {
-                let state = match (
-                    crate::status_after_log_denial(&http, home, &enrolment).await,
-                    &changed,
-                ) {
-                    (Ok(state), _) => state,
-                    (Err(_), Some(_)) => {
-                        println!("{}", notice());
-                        crate::print_claim_log_status(home, None, Some("the manifest changed"));
-                        return Ok(Outcome::NotSent(NotSent::AcceptPending(enforced)));
-                    }
-                    (Err(error), None) => return Err(error),
-                };
-                return match state {
-                    DeviceStatus::Pending => {
-                        println!("This device waits for IT approval.");
-                        println!(
-                            "Wizard step [4/6] is unfinished. Continue with: {} join",
-                            crate::client_command(&home.0)
-                        );
-                        crate::print_claim_log_status(
-                            home,
-                            None,
-                            Some("the device is waiting for IT approval"),
-                        );
-                        if changed.is_some() {
-                            println!("\n{}", notice());
-                        }
-                        Ok(Outcome::NotSent(NotSent::Pending))
-                    }
-                    DeviceStatus::Revoked => {
-                        println!("IT revoked this device.");
-                        crate::print_claim_log_status(home, None, Some("IT revoked this device"));
-                        Ok(Outcome::NotSent(NotSent::Revoked))
-                    }
-                    DeviceStatus::Approved => {
-                        crate::print_claim_log_status(
-                            home,
-                            None,
-                            Some("the gateway denied log access after approval"),
-                        );
-                        Err(error)
-                    }
-                };
-            }
-            result => result?,
-        };
-        let (mut verified, own) = match sync {
-            LogSync::Verified(cp, own) => (cp, own),
-            LogSync::AcceptPending(pending) => {
-                crate::report_log(LogSync::AcceptPending(pending.clone()), home);
-                crate::print_claim_log_status(home, None, Some("the manifest changed"));
-                return Ok(Outcome::NotSent(NotSent::AcceptPending(pending)));
-            }
-            LogSync::Alarm(text) => {
-                crate::report_log(LogSync::Alarm(text.clone()), home);
-                crate::print_claim_log_status(
-                    home,
-                    None,
-                    Some("log verification did not complete"),
-                );
-                return Ok(Outcome::Alarm(text));
-            }
+        let (mut verified, own) = match admit(
+            &http,
+            home,
+            manifest,
+            &enforced,
+            &mut enrolment,
+            changed.as_ref(),
+            true,
+        )
+        .await?
+        {
+            Ok(admitted) => admitted,
+            Err(outcome) => return Ok(outcome),
         };
         let gateway = base(&enrolment.gateway);
         let log_checkpoint = crate::disclosable_checkpoint(manifest, home.checkpoint()?);
-        if !before_post().await {
+        if !probe().await {
             println!("The VPN probe failed before the claim was sent. Nothing was sent.");
             return Ok(Outcome::NotSent(NotSent::OffVpn));
         }
@@ -646,6 +653,92 @@ impl Prepared {
     }
 }
 
+/// Verifies the log and this device's own entries, then finds out whether the gateway lets the
+/// device send. `Err` is the outcome of a `check` that sends nothing; what happened is printed.
+/// With `store` false no file is written.
+async fn admit(
+    http: &reqwest::Client,
+    home: &Home,
+    manifest: &Manifest,
+    enforced: &ManifestHash,
+    enrolment: &mut Enrolment,
+    changed: Option<&ManifestHash>,
+    store: bool,
+) -> Result<std::result::Result<(Checkpoint, OwnEntries), Outcome>> {
+    let command = crate::client_command(&home.0);
+    let notice = || crate::manifest_change_notice(enforced, &command);
+    let sync = match crate::sync_log_with(http, home, manifest, enforced, enrolment, store).await {
+        Err(error)
+            if error.downcast_ref::<reqwest::Error>().is_some_and(|error| {
+                error.status() == Some(reqwest::StatusCode::FORBIDDEN)
+                    && error
+                        .url()
+                        .is_some_and(|url| url.path().ends_with("/v1/log/mine"))
+            }) =>
+        {
+            let state = match (
+                crate::status_after_log_denial(http, home, enrolment).await,
+                changed,
+            ) {
+                (Ok(state), _) => state,
+                (Err(_), Some(_)) => {
+                    println!("{}", notice());
+                    crate::print_claim_log_status(home, None, Some("the manifest changed"));
+                    return Ok(Err(Outcome::NotSent(NotSent::AcceptPending(
+                        enforced.clone(),
+                    ))));
+                }
+                (Err(error), None) => return Err(error),
+            };
+            return match state {
+                DeviceStatus::Pending => {
+                    println!("This device waits for IT approval.");
+                    println!(
+                        "Wizard step [4/6] is unfinished. Continue with: {} join",
+                        command
+                    );
+                    crate::print_claim_log_status(
+                        home,
+                        None,
+                        Some("the device is waiting for IT approval"),
+                    );
+                    if changed.is_some() {
+                        println!("\n{}", notice());
+                    }
+                    Ok(Err(Outcome::NotSent(NotSent::Pending)))
+                }
+                DeviceStatus::Revoked => {
+                    println!("IT revoked this device.");
+                    crate::print_claim_log_status(home, None, Some("IT revoked this device"));
+                    Ok(Err(Outcome::NotSent(NotSent::Revoked)))
+                }
+                DeviceStatus::Approved => {
+                    crate::print_claim_log_status(
+                        home,
+                        None,
+                        Some("the gateway denied log access after approval"),
+                    );
+                    Err(error)
+                }
+            };
+        }
+        result => result?,
+    };
+    Ok(match sync {
+        LogSync::Verified(cp, own) => Ok((cp, own)),
+        LogSync::AcceptPending(pending) => {
+            crate::report_log(LogSync::AcceptPending(pending.clone()), home);
+            crate::print_claim_log_status(home, None, Some("the manifest changed"));
+            Err(Outcome::NotSent(NotSent::AcceptPending(pending)))
+        }
+        LogSync::Alarm(text) => {
+            crate::report_log(LogSync::Alarm(text.clone()), home);
+            crate::print_claim_log_status(home, None, Some("log verification did not complete"));
+            Err(Outcome::Alarm(text))
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -665,12 +758,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let home = Home(dir.path().to_path_buf());
         let _held = try_lock(&home).unwrap().unwrap();
-        let error = lock_for(&home, Duration::from_millis(300))
+        let mut waits = 0;
+        let error = lock_for(&home, Duration::from_millis(300), || waits += 1)
             .await
             .err()
             .unwrap()
             .to_string();
         assert!(error.contains("claim.lock"), "{error}");
+        assert_eq!(waits, 1, "the wait is announced once, not on every poll");
+    }
+
+    #[tokio::test]
+    async fn a_free_lock_announces_no_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+        let mut waits = 0;
+        let _lock = lock_for(&home, Duration::from_millis(300), || waits += 1)
+            .await
+            .unwrap();
+        assert_eq!(waits, 0);
     }
 
     #[tokio::test]
