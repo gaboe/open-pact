@@ -476,7 +476,20 @@ On Windows, set `run_as = "system"` and run `apply` from an elevated PowerShell 
 
 `vpn_probe` must be a `host:port` that connects only on the company VPN. The job sends nothing while it does not connect, so an address that also answers off the VPN makes the job send off the VPN. A probe can succeed just before the VPN disconnects.
 
-Every five minutes, the job tries a TCP connection to `vpn_probe`, with a two-second timeout that includes name resolution. Use brackets around IPv6 addresses. A successful connection records connectivity for this check. The job sends on the first observed connection and then when at least 55 minutes have passed since the last claim that the gateway answered. The job checks the probe again after it prepares the claim and before it sends the first POST. It sends nothing if either probe fails. DNS runs in a child process that the parent kills at the two-second deadline. A disconnect and reconnect entirely between two probes is not observed. A failed send retries on a later run. If the clock moves behind the last answer time, the next connected run retries and resets that time.
+A private address such as `10.0.0.1:443` can also exist on other networks, such as hotel or home routers, so a TCP connection alone can match the wrong network. Set `vpn_probe_name` to prove the right host:
+
+```toml
+[schedule]
+enabled = true
+run_as = "user"
+mode = "vpn"
+vpn_probe = "10.0.0.1:443"
+vpn_probe_name = "vpn.example.org"
+```
+
+With the name set, the probe connects to `vpn_probe` without a DNS lookup of the name. It needs a TLS certificate that is valid for the name and chains to a root that the client trusts for its HTTPS requests. Any HTTP status counts as an answer. The probe has five seconds in total and does not use a proxy. An empty value or an IP address for `vpn_probe_name` is an error.
+
+Every five minutes, the job tries a TCP connection to `vpn_probe`, with a two-second timeout that includes name resolution. With `vpn_probe_name`, it tries the TLS probe instead. Use brackets around IPv6 addresses. A successful connection records connectivity for this check. The job sends on the first observed connection and then when at least 55 minutes have passed since the last claim that the gateway answered. The job checks the probe again after it prepares the claim and before it sends the first POST. It sends nothing if either probe fails. DNS runs in a child process that the parent kills at the deadline: two seconds for TCP, five seconds with `vpn_probe_name`. A disconnect and reconnect entirely between two probes is not observed. A failed send retries on a later run. If the clock moves behind the last answer time, the next connected run retries and resets that time.
 
 The job takes the same lock as `check` and `accept`. When one of them runs, the job skips that run. The job scans repositories at most once a day and uses the stored counts in `repo-scan.json` between scans. A claim that the gateway accepts or denies counts as sent, and a denied claim waits for the next trigger like an accepted one.
 

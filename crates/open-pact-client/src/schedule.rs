@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::claim::{self, NotSent, Outcome, ScanPolicy};
-use crate::device_config::{DeviceConfig, RunAs, SendPolicy};
+use crate::device_config::{DeviceConfig, ProbeName, RunAs, SendPolicy};
 use crate::{Home, checks};
 
 const STATE: &str = "report-state.json";
@@ -51,6 +51,9 @@ pub(crate) enum Command {
     Probe {
         #[arg(long)]
         address: String,
+        /// The DNS name that the probe's TLS certificate must carry
+        #[arg(long)]
+        name: Option<String>,
     },
 }
 
@@ -277,7 +280,34 @@ async fn probe_process(command: &mut tokio::process::Command, limit: Duration) -
     }
 }
 
-pub(crate) async fn vpn_up(probe: &str) -> bool {
+/// Whether the VPN answers at `probe`. With `name`, the answer must also be a TLS connection whose
+/// certificate is valid for `name`.
+pub(crate) async fn vpn_up(probe: &str, name: Option<&str>) -> bool {
+    let Some(name) = name else {
+        return tcp_up(probe).await;
+    };
+    if let Ok(address) = probe.parse::<std::net::SocketAddr>() {
+        return named_up(address, name, Vec::new()).await;
+    }
+    let Ok(executable) = std::env::current_exe() else {
+        return false;
+    };
+    // System DNS can block indefinitely. Only a separate process can be cancelled.
+    probe_process(
+        tokio::process::Command::new(executable).args([
+            "schedule",
+            "probe",
+            "--address",
+            probe,
+            "--name",
+            name,
+        ]),
+        NAMED_PROBE_LIMIT,
+    )
+    .await
+}
+
+async fn tcp_up(probe: &str) -> bool {
     if let Ok(address) = probe.parse::<std::net::SocketAddr>() {
         return matches!(
             tokio::time::timeout(
@@ -299,11 +329,55 @@ pub(crate) async fn vpn_up(probe: &str) -> bool {
     .await
 }
 
+/// The whole named probe, DNS included, must finish within this limit.
+const NAMED_PROBE_LIMIT: Duration = Duration::from_secs(5);
+
+/// A TLS connection to `address` that completes with a certificate valid for `name`. The name is
+/// never looked up in DNS. The connection goes to `address`, and `name` sets only the SNI and the
+/// certificate check. Any HTTP status counts, because the handshake is what proves the host.
+async fn named_up(
+    address: std::net::SocketAddr,
+    name: &str,
+    roots: Vec<reqwest::Certificate>,
+) -> bool {
+    let mut builder = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(NAMED_PROBE_LIMIT)
+        .resolve(name, address);
+    for root in roots {
+        builder = builder.add_root_certificate(root);
+    }
+    let Ok(client) = builder.build() else {
+        return false;
+    };
+    client
+        .get(format!("https://{name}:{}/", address.port()))
+        .send()
+        .await
+        .is_ok()
+}
+
 pub(crate) fn probe_blocking(address: &str) -> Result<()> {
     use std::net::{TcpStream, ToSocketAddrs};
     probe_address(address)?;
     for address in address.to_socket_addrs()? {
         if TcpStream::connect_timeout(&address, Duration::from_secs(2)).is_ok() {
+            return Ok(());
+        }
+    }
+    bail!("VPN probe failed")
+}
+
+/// The `schedule probe` command: exits with success only when the probe connects, and with `name`
+/// only when the TLS check passes too.
+pub(crate) async fn probe_command(address: &str, name: Option<&str>) -> Result<()> {
+    let Some(name) = name else {
+        return probe_blocking(address);
+    };
+    probe_address(address)?;
+    for address in tokio::net::lookup_host(address).await? {
+        if named_up(address, name, Vec::new()).await {
             return Ok(());
         }
     }
@@ -1133,9 +1207,10 @@ pub(crate) async fn tick(
     policy: &SendPolicy,
     read_events: impl FnOnce() -> checks::EventMarkerReads,
 ) -> Result<()> {
-    let SendPolicy::Vpn { probe } = policy;
+    let SendPolicy::Vpn { probe, name } = policy;
+    let name = name.as_ref().map(ProbeName::as_str);
     let mut state: State = state_home.read_json(STATE)?.unwrap_or_default();
-    state.observe(vpn_up(probe.as_str()).await);
+    state.observe(vpn_up(probe.as_str(), name).await);
     save(state_home, STATE, &state)?;
     let prepared = claim::prepare(
         home,
@@ -1152,7 +1227,7 @@ pub(crate) async fn tick(
     if let Some(trigger) = state.due(now) {
         save(state_home, STATE, &state)?;
         let outcome = prepared
-            .send(home, async || vpn_up(probe.as_str()).await)
+            .send(home, async || vpn_up(probe.as_str(), name).await)
             .await?;
         note_outcome(home, trigger, &outcome);
         state.sent(
@@ -1633,7 +1708,7 @@ pub(crate) async fn run(home: &Home, command: Command) -> Result<()> {
         Command::Run { system, user_home } => {
             operate(home, Operation::Run { system, user_home }, false).await
         }
-        Command::Probe { address } => probe_blocking(&address),
+        Command::Probe { address, name } => probe_command(&address, name.as_deref()).await,
     }
 }
 
@@ -1756,7 +1831,7 @@ async fn operate(home: &Home, command: Operation, home_locked: bool) -> Result<(
                 TaskRunAs::CurrentUser
             };
             register(&job, RegistrationAction::Install(run_as))?;
-            let SendPolicy::Vpn { probe } = &send;
+            let SendPolicy::Vpn { probe, .. } = &send;
             println!(
                 "Installed {}. The OS runs it every five minutes. It sends the same claim as `check`, only while {} connects. It writes what needs your attention to {}.",
                 job.id,
@@ -2113,6 +2188,7 @@ esac
     fn vpn(probe: &str) -> SendPolicy {
         SendPolicy::Vpn {
             probe: crate::device_config::ProbeAddress::parse(probe).unwrap(),
+            name: None,
         }
     }
 
@@ -3198,7 +3274,7 @@ Write-Output 'refused'
     async fn vpn_probe_connects_to_a_listening_port() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
-        assert!(vpn_up(&address.to_string()).await);
+        assert!(vpn_up(&address.to_string(), None).await);
         drop(listener);
 
         // A closed ephemeral port can be rebound by a parallel test; a bound socket that never
@@ -3206,7 +3282,105 @@ Write-Output 'refused'
         let reserved = tokio::net::TcpSocket::new_v4().unwrap();
         reserved.bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let refused = reserved.local_addr().unwrap();
-        assert!(!vpn_up(&refused.to_string()).await);
+        assert!(!vpn_up(&refused.to_string(), None).await);
+    }
+
+    /// A certificate for `name` issued by a fictional CA. Returns the CA as a root that only a test
+    /// may trust, and the server config that presents the certificate.
+    fn tls_identity(name: &str) -> (reqwest::Certificate, std::sync::Arc<rustls::ServerConfig>) {
+        let mut ca_params = rcgen::CertificateParams::new(vec![]).unwrap();
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "fictional VPN CA");
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Constrained(0));
+        ca_params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+        ];
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let root = reqwest::Certificate::from_der(ca.der()).unwrap();
+        let leaf_key = rcgen::KeyPair::generate().unwrap();
+        let leaf = rcgen::CertificateParams::new(vec![name.to_owned()])
+            .unwrap()
+            .signed_by(&leaf_key, &rcgen::Issuer::from_params(&ca_params, &ca_key))
+            .unwrap();
+        let config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![leaf.der().clone()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(leaf_key.serialize_der()).into(),
+        )
+        .unwrap();
+        (root, std::sync::Arc::new(config))
+    }
+
+    /// A TLS server that answers HTTP on every connection, with a certificate for `name`.
+    fn serve_tls(name: &str) -> (std::net::SocketAddr, reqwest::Certificate) {
+        use std::io::{Read, Write};
+        let (root, config) = tls_identity(name);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut tcp) = stream else { continue };
+                let _ = tcp.set_read_timeout(Some(Duration::from_secs(10)));
+                let Ok(mut conn) = rustls::ServerConnection::new(config.clone()) else {
+                    continue;
+                };
+                let mut tls = rustls::Stream::new(&mut conn, &mut tcp);
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0_u8];
+                    if tls.read(&mut byte).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    head.push(byte[0]);
+                }
+                if head.ends_with(b"\r\n\r\n") {
+                    let _ = tls.write_all(
+                        b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                    let _ = tls.flush();
+                }
+            }
+        });
+        (address, root)
+    }
+
+    #[tokio::test]
+    async fn named_probe_needs_a_certificate_for_its_name() {
+        let (address, root) = serve_tls("vpn.example.org");
+        assert!(named_up(address, "vpn.example.org", vec![root.clone()]).await);
+        assert!(!named_up(address, "other.example.org", vec![root]).await);
+        assert!(
+            !named_up(address, "vpn.example.org", Vec::new()).await,
+            "the fictional CA is trusted only through the test hook"
+        );
+        assert!(
+            !vpn_up(&address.to_string(), Some("vpn.example.org")).await,
+            "the production probe does not trust the fictional CA"
+        );
+    }
+
+    #[tokio::test]
+    async fn named_probe_fails_on_plain_tcp_without_tls() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for mut tcp in listener.incoming().flatten() {
+                let _ = tcp.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+        let (root, _) = tls_identity("vpn.example.org");
+        assert!(!named_up(address, "vpn.example.org", vec![root]).await);
     }
 
     #[tokio::test]
