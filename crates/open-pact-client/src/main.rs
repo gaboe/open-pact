@@ -76,7 +76,11 @@ enum Command {
         no_wait: bool,
     },
     /// Run the manifest's checks, send a signed claim and fetch a VPN certificate
-    Check,
+    Check {
+        /// Print the claim that would be sent. Send nothing and write no file
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Review a changed manifest from the gateway, sign it and move this device to it
     Accept {
         /// Sign without asking
@@ -3287,6 +3291,40 @@ async fn check(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
     check_impl(home, insecure_dev, true).await
 }
 
+/// Shows the request `check` would send now. It reads the gateway and changes nothing: no claim,
+/// no nonce, no file.
+async fn check_dry_run(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
+    let preview = match check_preview(home, insecure_dev).await {
+        Ok(preview) => preview,
+        Err(error) if error.is::<claim::LegacyLogHead>() => {
+            print_log_upgrade(home);
+            return Ok(ExitCode::FAILURE);
+        }
+        Err(error) => return Err(error),
+    };
+    match preview {
+        claim::Preview::Request(request) => {
+            eprintln!(
+                "Dry run: nothing was sent and no file was written. This is the claim that `check` \
+                 would send now. The nonce, the time and the VPN certificate request are filled in when it is sent."
+            );
+            println!("{}", serde_json::to_string_pretty(&request)?);
+            Ok(ExitCode::SUCCESS)
+        }
+        claim::Preview::Alarm(text) => {
+            report_log(alarm(text), home);
+            Ok(ExitCode::from(2))
+        }
+    }
+}
+
+async fn check_preview(home: &Home, insecure_dev: bool) -> Result<claim::Preview> {
+    claim::prepare(home, None, claim::ScanPolicy::Preview, insecure_dev)
+        .await?
+        .dry_run(home)
+        .await
+}
+
 async fn check_impl(home: &Home, insecure_dev: bool, show_resume_hint: bool) -> Result<ExitCode> {
     let _claim_lock = claim::lock(home).await?;
     let migrating = schedule::migration_example(home)?;
@@ -3959,7 +3997,8 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 .await
             }
         },
-        Command::Check => check(&home, cli.insecure_dev).await,
+        Command::Check { dry_run: false } => check(&home, cli.insecure_dev).await,
+        Command::Check { dry_run: true } => check_dry_run(&home, cli.insecure_dev).await,
         Command::Accept { yes } => accept(&home, yes, cli.insecure_dev).await,
         Command::Finish { yes } => finish(&home, cli.insecure_dev, yes, false).await,
         Command::Report { dry_run } => {
@@ -6468,6 +6507,27 @@ mod tests {
         VpnPair,
         String,
     ) {
+        let (code, before, after, pair, claim, _) =
+            check_under_previewed(false, enforced, response, pair, device_config).await;
+        (code, before, after, pair, claim)
+    }
+
+    /// `check_under`, which also runs `check --dry-run` first when `preview` is set. The dry run
+    /// must post nothing and leave the home as it was. Returns its request as the last value.
+    async fn check_under_previewed(
+        preview: bool,
+        enforced: impl FnOnce(&str) -> String,
+        response: impl FnOnce(&Company, &Witness, &[Entry], u64) -> Option<String>,
+        pair: impl FnOnce(&KeyPair) -> VpnPair,
+        device_config: Option<&str>,
+    ) -> (
+        Result<ExitCode>,
+        BTreeMap<String, Vec<u8>>,
+        BTreeMap<String, Vec<u8>>,
+        VpnPair,
+        String,
+        Option<Value>,
+    ) {
         let (company, witness) = (Company::new(), Witness::new());
         let toml = witnessed_manifest(&witness);
         let manifest = Manifest::parse(toml.as_bytes()).unwrap();
@@ -6548,6 +6608,18 @@ mod tests {
             home.write(crate::device_config::FILE, config.as_bytes())
                 .unwrap();
         }
+        let previewed = if preview {
+            let before_preview = snapshot(dir.path());
+            let claim::Preview::Request(request) = check_preview(&home, false).await.unwrap()
+            else {
+                panic!("the dry run found an alarm");
+            };
+            assert_eq!(gateway.posts(), Vec::<String>::new(), "no POST, no nonce");
+            assert_eq!(snapshot(dir.path()), before_preview, "no file written");
+            Some(request)
+        } else {
+            None
+        };
         let before = snapshot(dir.path());
 
         let code = check(&home, false).await;
@@ -6571,7 +6643,61 @@ mod tests {
             "the claim was sent"
         );
         let claim = gateway.bodies("POST /v1/claim").remove(0);
-        (code, before, snapshot(dir.path()), pair, claim)
+        (code, before, snapshot(dir.path()), pair, claim, previewed)
+    }
+
+    /// What the claim of `request`, the body `check` posted, says apart from the fields the
+    /// sender fills in at sending time.
+    fn sent_claim(request: &Value) -> Value {
+        let jws = verify_claim(request["jws"].as_str().unwrap()).unwrap();
+        let mut claim = serde_json::to_value(jws.claim()).unwrap();
+        for field in ["nonce", "time", "csr_sha256"] {
+            claim.as_object_mut().unwrap().remove(field);
+        }
+        claim
+    }
+
+    fn previewed_claim(preview: &Value) -> Value {
+        let mut claim = preview["claim"].clone();
+        for field in ["nonce", "time", "csr_sha256"] {
+            assert!(
+                claim[field]
+                    .as_str()
+                    .is_some_and(|text| text.starts_with('<')),
+                "{field} is a placeholder"
+            );
+            claim.as_object_mut().unwrap().remove(field);
+        }
+        claim
+    }
+
+    #[tokio::test]
+    async fn check_dry_run_shows_the_claim_check_sends_and_changes_nothing() {
+        for (manifest_changed, enforced) in [
+            (
+                false,
+                (|signed: &str| signed.to_string()) as fn(&str) -> String,
+            ),
+            (true, with_password_rule),
+        ] {
+            let (code, _, _, _, sent, preview) =
+                check_under_previewed(true, enforced, grown_checkpoint, valid_pair, None).await;
+            assert_eq!(code.unwrap(), ExitCode::SUCCESS);
+            let (sent, preview) = (
+                serde_json::from_str::<Value>(&sent).unwrap(),
+                preview.unwrap(),
+            );
+            let claim = sent_claim(&sent);
+            assert!(!claim["results"].as_object().unwrap().is_empty());
+            assert!(
+                claim["log_checkpoint"].is_object(),
+                "the comparison covers the log checkpoint"
+            );
+            assert_eq!(previewed_claim(&preview), claim);
+            assert_eq!(preview.get("manifest_toml"), sent.get("manifest_toml"));
+            assert_eq!(preview.get("manifest_toml").is_some(), manifest_changed);
+            assert!(preview.get("jws").is_none());
+        }
     }
 
     const PASSWORD_RULE: &str = r#"[[control]]
