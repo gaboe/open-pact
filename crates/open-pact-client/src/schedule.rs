@@ -5,11 +5,12 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::Subcommand;
+use open_pact_core::{ProbeName, SendPolicy};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::claim::{self, NotSent, Outcome, ScanPolicy};
-use crate::device_config::{DeviceConfig, ProbeName, RunAs, SendPolicy};
+use crate::device_config::{self, DeviceConfig, RunAs};
 use crate::{Home, checks};
 
 const STATE: &str = "report-state.json";
@@ -17,7 +18,7 @@ const STATE: &str = "report-state.json";
 /// sends the job's output here where it can.
 const JOB_LOG: &str = "schedule.log";
 const JOB_LOG_LIMIT: u64 = 256 * 1024;
-/// Files an earlier client left. `apply` removes them.
+/// Files an earlier client left. `schedule off` removes them.
 const HOME_LEFTOVER_FILES: &[&str] = &[
     "report-schedule.json",
     STATE,
@@ -39,6 +40,26 @@ const LOCK: &str = "report-schedule.lock";
 
 #[derive(Subcommand)]
 pub(crate) enum Command {
+    /// Install the job that sends claims by itself, as the signed manifest allows
+    On {
+        /// Windows only: run the job as SYSTEM. Needs an elevated PowerShell prompt
+        #[arg(long, hide = !cfg!(windows), conflicts_with = "user")]
+        system: bool,
+        /// Windows only: run the job as the current user
+        #[arg(long, hide = !cfg!(windows))]
+        user: bool,
+        /// Show what would change and change nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Remove the job
+    Off {
+        /// Show what would change and change nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Show whether the job is installed and what the signed manifest allows
+    Status,
     #[command(hide = true)]
     Run {
         #[arg(long)]
@@ -59,7 +80,6 @@ pub(crate) enum Command {
 
 enum Operation {
     Install {
-        send: SendPolicy,
         system: bool,
         user_home: Option<PathBuf>,
     },
@@ -122,12 +142,12 @@ impl State {
         self.vpn_up = vpn_up;
     }
 
-    fn should_send(&self, now: i64) -> bool {
+    fn should_send(&self, now: i64, interval: i64) -> bool {
         self.vpn_up
             && (self.reconnect_pending
                 || self
                     .last_success
-                    .is_none_or(|last| now < last || now.saturating_sub(last) >= 55 * 60))
+                    .is_none_or(|last| now < last || now.saturating_sub(last) >= interval))
     }
 
     fn new_events(&self, current: checks::EventMarkerReads) -> bool {
@@ -158,14 +178,14 @@ impl State {
         self.last_observed_compliance = Some(current.clone());
     }
 
-    fn due(&self, now: i64) -> Option<Trigger> {
+    fn due(&self, now: i64, interval: i64) -> Option<Trigger> {
         if !self.vpn_up {
             None
         } else if self.reconnect_pending {
             Some(Trigger::Connect)
         } else if self.event_pending {
             Some(Trigger::Event)
-        } else if self.should_send(now) {
+        } else if self.should_send(now, interval) {
             Some(Trigger::Periodic)
         } else {
             None
@@ -244,23 +264,6 @@ fn newer(current: checks::EventMarkerRead, initialized: bool, previous: Option<i
     initialized
         && matches!(current, checks::EventMarkerRead::Read(Some(current))
             if previous.is_none_or(|previous| current > previous))
-}
-
-pub(crate) fn probe_address(raw: &str) -> Result<()> {
-    let url =
-        reqwest::Url::parse(&format!("tcp://{raw}")).context("VPN probe must be host:port")?;
-    if url.host_str().is_none()
-        || url.port().is_none()
-        || !url.path().is_empty()
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-        || raw.chars().any(char::is_whitespace)
-    {
-        bail!("VPN probe must be host:port, with brackets around IPv6 addresses");
-    }
-    Ok(())
 }
 
 async fn probe_process(command: &mut tokio::process::Command, limit: Duration) -> bool {
@@ -358,9 +361,14 @@ async fn named_up(
         .is_ok()
 }
 
+fn check_probe(address: &str) -> Result<()> {
+    open_pact_core::ProbeAddress::try_from(address.to_owned()).map_err(anyhow::Error::msg)?;
+    Ok(())
+}
+
 pub(crate) fn probe_blocking(address: &str) -> Result<()> {
     use std::net::{TcpStream, ToSocketAddrs};
-    probe_address(address)?;
+    check_probe(address)?;
     for address in address.to_socket_addrs()? {
         if TcpStream::connect_timeout(&address, Duration::from_secs(2)).is_ok() {
             return Ok(());
@@ -375,7 +383,7 @@ pub(crate) async fn probe_command(address: &str, name: Option<&str>) -> Result<(
     let Some(name) = name else {
         return probe_blocking(address);
     };
-    probe_address(address)?;
+    check_probe(address)?;
     for address in tokio::net::lookup_host(address).await? {
         if named_up(address, name, Vec::new()).await {
             return Ok(());
@@ -1051,7 +1059,7 @@ fn windows_require_elevation_script() -> &'static str {
     r#"$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = New-Object Security.Principal.WindowsPrincipal($identity)
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    throw 'run `apply` from an elevated prompt'
+    throw 'run `schedule on` or `schedule off` from an elevated prompt'
 }"#
 }
 
@@ -1071,7 +1079,7 @@ fn windows_uninstall_script(job: &Job, system: bool) -> String {
     format!(
         r#"{query}
 if (-not {system} -and $null -ne $task -and (IsSystemTask $task)) {{
-    throw 'run `apply` from an elevated prompt'
+    throw 'run `schedule on` or `schedule off` from an elevated prompt'
 }}
 if ($null -ne $task) {{ $folder.DeleteTask({id},0) }}
 try {{
@@ -1092,7 +1100,7 @@ throw 'scheduled task remains: {name}'
 
 fn windows_uninstall(job: &Job, system: bool) -> Result<()> {
     windows_powershell(&windows_uninstall_script(job, system))
-        .context("run `apply` from an elevated prompt")?;
+        .context("run `schedule on` or `schedule off` from an elevated prompt")?;
     Ok(())
 }
 
@@ -1156,7 +1164,7 @@ try {{
 }} catch {{ $failure = $_.Exception.Message }}
 $leftovers = @(Get-ChildItem -LiteralPath $install -Filter 'open-pact-client.exe*' -File -Force -ErrorAction Stop)
 if ($leftovers.Count -gt 0) {{
-    throw "SYSTEM files remain: $($leftovers.FullName -join ', '). $failure Retry apply, or reboot for queued files."
+    throw "SYSTEM files remain: $($leftovers.FullName -join ', '). $failure Retry the schedule command, or reboot for queued files."
 }}
 if ($null -ne $failure) {{ throw $failure }}
 "#
@@ -1193,24 +1201,33 @@ fn windows_system_uninstall(job: &Job, home: &Home) -> Result<()> {
 
 fn validate_system_install(system: bool, os: open_pact_core::Os) -> Result<()> {
     if system && os != open_pact_core::Os::Windows {
-        bail!("[schedule].run_as = system is available only on Windows");
+        bail!("Running the job as SYSTEM is available only on Windows");
     }
     Ok(())
 }
 
-/// One scheduled run: note whether the VPN probe connects, collect the results, and send a claim
-/// when a trigger is due and the probe still connects.
+/// Whether the policy lets the job send now. A policy without a VPN needs no probe.
+async fn may_send(policy: &SendPolicy) -> bool {
+    match policy {
+        SendPolicy::Vpn { probe, name } => {
+            vpn_up(probe.as_str(), name.as_ref().map(ProbeName::as_str)).await
+        }
+        SendPolicy::Always => true,
+    }
+}
+
+/// One scheduled run: note whether the policy lets the job send, collect the results, and send a
+/// claim when a trigger is due and the policy still lets the job send.
 pub(crate) async fn tick(
     home: &Home,
     state_home: &Home,
     user_home: Option<&Path>,
-    policy: &SendPolicy,
+    schedule: &open_pact_core::Schedule,
     read_events: impl FnOnce() -> checks::EventMarkerReads,
 ) -> Result<()> {
-    let SendPolicy::Vpn { probe, name } = policy;
-    let name = name.as_ref().map(ProbeName::as_str);
+    let policy = &schedule.policy;
     let mut state: State = state_home.read_json(STATE)?.unwrap_or_default();
-    state.observe(vpn_up(probe.as_str(), name).await);
+    state.observe(may_send(policy).await);
     save(state_home, STATE, &state)?;
     let prepared = claim::prepare(
         home,
@@ -1224,11 +1241,9 @@ pub(crate) async fn tick(
     state.observe_compliance(&compliance);
     state.event_pending |= state.new_events(events);
     let now = chrono::Utc::now().timestamp();
-    if let Some(trigger) = state.due(now) {
+    if let Some(trigger) = state.due(now, schedule.interval.as_secs()) {
         save(state_home, STATE, &state)?;
-        let outcome = prepared
-            .send(home, async || vpn_up(probe.as_str(), name).await)
-            .await?;
+        let outcome = prepared.send(home, async || may_send(policy).await).await?;
         note_outcome(home, trigger, &outcome);
         state.sent(
             outcome.delivered(),
@@ -1326,7 +1341,6 @@ const APPLIED: &str = "schedule-applied.json";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct Applied {
-    send: SendPolicy,
     run_as: RunAs,
     executable: PathBuf,
     /// The profile a SYSTEM job reads. Only a SYSTEM job has one.
@@ -1335,7 +1349,7 @@ struct Applied {
 }
 
 /// What `schedule-applied.json` records. A file an earlier client wrote has another shape and
-/// reads as nothing, so `apply` replaces the job.
+/// reads as nothing, so `schedule on` replaces the job.
 fn read_applied(home: &Home) -> Result<Option<Applied>> {
     let path = home.file(APPLIED);
     let Some(text) = read_text_if_exists(&path)? else {
@@ -1558,11 +1572,12 @@ fn observe(home: &Home, desired: Option<&Applied>, inspect_protected: bool) -> R
     })
 }
 
-pub(crate) fn apply_command(home: &Path) -> String {
+/// The exact command that makes `change` (such as `schedule off`) from an elevated prompt.
+pub(crate) fn apply_command(home: &Path, change: &str) -> String {
     #[cfg(windows)]
     {
         format!(
-            "& {} --home {} apply",
+            "& {} --home {} {change}",
             powershell_literal(
                 &std::env::current_exe()
                     .unwrap_or_else(|_| PathBuf::from("open-pact-client.exe"))
@@ -1574,7 +1589,7 @@ pub(crate) fn apply_command(home: &Path) -> String {
     #[cfg(not(windows))]
     {
         format!(
-            "open-pact-client --home '{}' apply",
+            "open-pact-client --home '{}' {change}",
             home.to_string_lossy().replace('\'', "'\"'\"'")
         )
     }
@@ -1605,27 +1620,32 @@ if (Test-Path -LiteralPath $install) {{
     )
 }
 
-pub(crate) async fn apply(home: &Home, dry_run: bool) -> Result<()> {
+/// What the owner wants the job to be.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Wanted {
+    On(RunAs),
+    Off,
+}
+
+impl Wanted {
+    /// The command that repeats this change from an elevated prompt.
+    fn command(self) -> &'static str {
+        match self {
+            Wanted::On(RunAs::System) => "schedule on --system",
+            Wanted::On(RunAs::User) => "schedule on --user",
+            Wanted::Off => "schedule off",
+        }
+    }
+}
+
+/// Installs, updates or removes the OS job so it matches `wanted`.
+pub(crate) async fn change_job(home: &Home, wanted: Wanted, dry_run: bool) -> Result<()> {
     let home_exists = home.0.try_exists()?;
-    let config = match DeviceConfig::load(home)? {
-        Some(config) => config,
-        None if !home_exists => DeviceConfig::default(),
-        None => bail!(
-            "Create {}. Use `open-pact-client config example` for a template.",
-            home.file(crate::device_config::FILE).display()
-        ),
-    };
-    let requested_system = config
-        .schedule
-        .as_ref()
-        .is_some_and(|schedule| schedule.run_as == RunAs::System);
+    let requested_system = wanted == Wanted::On(RunAs::System);
+    let retry = wanted.command();
     let home = Home(schedule_home(&home.0, true)?);
-    let desired = match config.schedule {
-        Some(crate::device_config::Schedule {
-            run_as,
-            send: Some(send),
-        }) => Some(Applied {
-            send,
+    let desired = match wanted {
+        Wanted::On(run_as) => Some(Applied {
             run_as,
             executable: std::env::current_exe()?,
             user_home: (run_as == RunAs::System)
@@ -1636,23 +1656,23 @@ pub(crate) async fn apply(home: &Home, dry_run: bool) -> Result<()> {
                 })
                 .transpose()?,
         }),
-        _ => None,
+        Wanted::Off => None,
     };
     let elevated =
         crate::current_os()? == open_pact_core::Os::Windows && windows_require_elevation().is_ok();
     if requested_system && !elevated {
         bail!(
             "Run this exact command from an elevated PowerShell prompt:\n{}",
-            apply_command(&home.0)
+            apply_command(&home.0, retry)
         );
     }
     let observed = observe(&home, desired.as_ref(), elevated)
-        .with_context(|| format!("Cannot inspect the scheduled job. If access is denied, run this exact command from an elevated prompt:\n{}", apply_command(&home.0)))?;
+        .with_context(|| format!("Cannot inspect the scheduled job. If access is denied, run this exact command from an elevated prompt:\n{}", apply_command(&home.0, retry)))?;
     let system = needs_system_cleanup(requested_system, desired.is_none(), &observed);
     if system && !elevated {
         bail!(
             "Run this exact command from an elevated PowerShell prompt:\n{}",
-            apply_command(&home.0)
+            apply_command(&home.0, retry)
         );
     }
     let _lock = if dry_run || !home_exists {
@@ -1685,7 +1705,6 @@ pub(crate) async fn apply(home: &Home, dry_run: bool) -> Result<()> {
             operate(
                 &home,
                 Operation::Install {
-                    send: desired.send.clone(),
                     system: desired.run_as == RunAs::System,
                     user_home: desired.user_home.clone(),
                 },
@@ -1703,13 +1722,141 @@ pub(crate) async fn apply(home: &Home, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
+/// `schedule on`: needs a manifest that defines automatic sending.
+pub(crate) async fn turn_on(home: &Home, run_as: Option<RunAs>, dry_run: bool) -> Result<()> {
+    let manifest = home.signed_manifest()?;
+    let Some(schedule) = &manifest.body().schedule else {
+        bail!(
+            "The company did not define automatic sending in the manifest you signed, so the job cannot be turned on. Run `{} check` to send a claim by hand.",
+            crate::client_command(&home.0)
+        );
+    };
+    let mut config = DeviceConfig::load(home)?;
+    let run_as = run_as.unwrap_or(config.run_as);
+    validate_system_install(run_as == RunAs::System, crate::current_os()?)?;
+    println!("{schedule}");
+    change_job(home, Wanted::On(run_as), dry_run).await?;
+    if !dry_run {
+        let _claim_lock = claim::lock(home).await?;
+        config = DeviceConfig::load(home)?;
+        config.auto_send = true;
+        config.run_as = run_as;
+        config.save(home)?;
+    }
+    Ok(())
+}
+
+/// `schedule off`: removes the job and remembers the owner's no.
+pub(crate) async fn turn_off(home: &Home, dry_run: bool) -> Result<()> {
+    change_job(home, Wanted::Off, dry_run).await?;
+    if !dry_run && home.0.is_dir() {
+        let _claim_lock = claim::lock(home).await?;
+        let mut config = DeviceConfig::load(home)?;
+        if config.auto_send {
+            config.auto_send = false;
+            config.save(home)?;
+        }
+    }
+    Ok(())
+}
+
+/// `schedule status`: the owner's choice, the company's policy and the state of the job.
+async fn status(home: &Home) -> Result<()> {
+    let config = DeviceConfig::load(home)?;
+    match home.signed_manifest() {
+        Ok(manifest) => match &manifest.body().schedule {
+            Some(schedule) => println!("{schedule}"),
+            None => {
+                println!("The company did not define automatic sending in the manifest you signed.")
+            }
+        },
+        Err(error) => println!("Manifest: {error:#}"),
+    }
+    println!(
+        "Your choice: automatic sending is {}.",
+        if config.auto_send { "on" } else { "off" }
+    );
+    let desired = config.auto_send.then(|| Applied {
+        run_as: config.run_as,
+        executable: std::env::current_exe().unwrap_or_default(),
+        user_home: None,
+    });
+    if desired
+        .as_ref()
+        .is_some_and(|desired| desired.run_as == RunAs::System)
+    {
+        println!(
+            "The job runs as SYSTEM. Run `schedule on --system` from an elevated prompt to change it."
+        );
+        return Ok(());
+    }
+    let schedule_home = Home(schedule_home(&home.0, true)?);
+    let observed = observe(&schedule_home, desired.as_ref(), false)?;
+    let applied = read_applied(&schedule_home)?;
+    let command = crate::client_command(&home.0);
+    println!(
+        "{}",
+        match reconcile(desired.as_ref(), applied.as_ref(), &observed) {
+            Change::None if desired.is_some() => "The job is installed and current.".to_owned(),
+            Change::None => "The job is not installed.".to_owned(),
+            Change::Install => format!("The job is not installed. Run `{command} schedule on`."),
+            Change::Update => format!("The job is out of date. Run `{command} schedule on`."),
+            Change::Remove => format!(
+                "A job from an earlier setup remains. Run `{command} schedule off` to remove it."
+            ),
+        }
+    );
+    if let Some(state) = schedule_home.read_json::<State>(STATE)?
+        && let Some(last) = state.last_success
+        && let Some(time) = chrono::DateTime::from_timestamp(last, 0)
+    {
+        println!(
+            "Last claim the gateway answered: {}.",
+            time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        );
+    }
+    Ok(())
+}
+
 pub(crate) async fn run(home: &Home, command: Command) -> Result<()> {
     match command {
+        Command::On {
+            system,
+            user,
+            dry_run,
+        } => {
+            let run_as = if system {
+                Some(RunAs::System)
+            } else {
+                user.then_some(RunAs::User)
+            };
+            turn_on(home, run_as, dry_run).await
+        }
+        Command::Off { dry_run } => turn_off(home, dry_run).await,
+        Command::Status => status(home).await,
         Command::Run { system, user_home } => {
             operate(home, Operation::Run { system, user_home }, false).await
         }
         Command::Probe { address, name } => probe_command(&address, name.as_deref()).await,
     }
+}
+
+/// One run of the job. The policy comes from the manifest the owner signed, never from a manifest
+/// that waits for acceptance.
+async fn run_tick(home: &Home, state_home: &Home, user_home: Option<&Path>) -> Result<()> {
+    let command = crate::client_command(&home.0);
+    if let Some(notice) = device_config::legacy_notice(home, device_config::Surface::Job, &command)
+    {
+        job_log(home, &notice);
+    }
+    if !DeviceConfig::load(home)?.auto_send {
+        return Ok(());
+    }
+    let manifest = home.signed_manifest()?;
+    let Some(schedule) = &manifest.body().schedule else {
+        return Ok(());
+    };
+    tick(home, state_home, user_home, schedule, checks::event_markers).await
 }
 
 async fn operate(home: &Home, command: Operation, home_locked: bool) -> Result<()> {
@@ -1774,32 +1921,13 @@ async fn operate(home: &Home, command: Operation, home_locked: bool) -> Result<(
             let Some(_claim_lock) = claim::try_lock(&home)? else {
                 return Ok(());
             };
-            let result = async {
-                let device_config = DeviceConfig::load_for(&home, user_home.as_deref())?
-                    .context("open-pact.toml is missing; run `config example`")?;
-                let Some(policy) = device_config.schedule.and_then(|schedule| schedule.send) else {
-                    return Ok(());
-                };
-                tick(
-                    &home,
-                    &state_home,
-                    user_home.as_deref(),
-                    &policy,
-                    checks::event_markers,
-                )
-                .await
-            }
-            .await;
+            let result = run_tick(&home, &state_home, user_home.as_deref()).await;
             if let Err(error) = &result {
                 job_log(&home, &format!("error: {error:#}"));
             }
             result?;
         }
-        Operation::Install {
-            send,
-            system,
-            user_home,
-        } => {
+        Operation::Install { system, user_home } => {
             home.enrolment()?;
             crate::DeviceKey::load(&home.0)?;
             if os == open_pact_core::Os::Windows {
@@ -1831,12 +1959,9 @@ async fn operate(home: &Home, command: Operation, home_locked: bool) -> Result<(
                 TaskRunAs::CurrentUser
             };
             register(&job, RegistrationAction::Install(run_as))?;
-            let SendPolicy::Vpn { probe, .. } = &send;
             println!(
-                "Installed {}. The OS runs it every five minutes. It sends the same claim as `check`, only while {} connects. It writes what needs your attention to {}.",
-                job.id,
-                probe.as_str(),
-                job.log
+                "Installed {}. The OS runs it every five minutes. It sends the same claim as `check`, as the signed manifest allows. It writes what needs your attention to {}.",
+                job.id, job.log
             );
         }
         Operation::Uninstall { system } => {
@@ -1847,7 +1972,7 @@ async fn operate(home: &Home, command: Operation, home_locked: bool) -> Result<(
                 } else {
                     windows_uninstall(&job, false)?;
                     println!(
-                        "SYSTEM leftovers, if any, are removed with apply from an elevated prompt."
+                        "SYSTEM leftovers, if any, are removed with `schedule off` from an elevated prompt."
                     );
                 }
             } else {
@@ -1974,36 +2099,6 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     #[ignore = "requires a built OPEN_PACT_CLIENT_BIN; all scheduler commands use a fixture mock"]
-    fn config_example_prints_a_template_for_the_fictional_home() {
-        let binary = std::env::var_os("OPEN_PACT_CLIENT_BIN")
-            .expect("build the client and set OPEN_PACT_CLIENT_BIN");
-        let root = tempfile::Builder::new()
-            .prefix("open-pact-example-")
-            .tempdir()
-            .unwrap();
-        let user = root.path().join("home");
-        let path = user.join(".config/open-pact");
-        std::fs::create_dir_all(&path).unwrap();
-        let _home = enrolled_home(&path);
-        let output = std::process::Command::new(binary)
-            .args(["config", "example"])
-            .env("HOME", &user)
-            .output()
-            .unwrap();
-        let template = String::from_utf8(output.stdout).unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let config = DeviceConfig::parse(&template, Some(&user)).unwrap();
-        assert_eq!(config.schedule.unwrap().send, None);
-        println!("{template}");
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    #[ignore = "requires a built OPEN_PACT_CLIENT_BIN; all scheduler commands use a fixture mock"]
     fn declarative_cli_with_mock_scheduler() {
         use std::os::unix::fs::PermissionsExt;
         let binary = std::env::var_os("OPEN_PACT_CLIENT_BIN")
@@ -2066,30 +2161,16 @@ esac
             text
         };
         let before = std::fs::read_dir(&path).unwrap().count();
-        let example = run(&["config", "example"], true, "[managed_repos]");
-        let template = example
-            .lines()
-            .take_while(|line| !line.starts_with("Next:"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        DeviceConfig::parse(&template, Some(&user)).unwrap();
+        run(&["schedule", "status"], true, "The job is not installed.");
         assert_eq!(std::fs::read_dir(&path).unwrap().count(), before);
-        let write = |schedule: &str| {
-            std::fs::write(
-                home.file(crate::device_config::FILE),
-                format!("{schedule}\n[managed_repos]\nfolders = ['~/work']\n"),
-            )
-            .unwrap();
-        };
-        let enabled = |probe: &str| {
-            format!(
-                "[schedule]\nenabled = true\nrun_as = 'user'\nmode = 'vpn'\nvpn_probe = '{probe}'"
-            )
-        };
-        write(&enabled("10.20.0.1:443"));
-        run(&["apply", "--dry-run"], true, "schedule: install");
+        run(&["schedule", "on", "--dry-run"], true, "schedule: install");
         assert!(!root.path().join("changes").exists());
-        run(&["apply"], true, "schedule: install");
+        assert!(!home.file(crate::device_config::FILE).exists());
+        let on = run(&["schedule", "on"], true, "schedule: install");
+        assert!(
+            on.contains("Automatic claims: only while vpn.example.org answers at 10.0.0.1:443")
+        );
+        assert!(DeviceConfig::load(&home).unwrap().auto_send);
         let plist = std::fs::read_to_string(
             user.join("Library/LaunchAgents")
                 .read_dir()
@@ -2105,59 +2186,55 @@ esac
             std::fs::canonicalize(&path).unwrap().join(JOB_LOG).display()
         )));
         let changes = std::fs::read(root.path().join("changes")).unwrap();
-        run(&["apply"], true, "no changes");
+        run(&["schedule", "on"], true, "no changes");
         assert_eq!(std::fs::read(root.path().join("changes")).unwrap(), changes);
-        let configuration = std::fs::read(home.file(crate::device_config::FILE)).unwrap();
-        std::fs::remove_file(home.file(crate::device_config::FILE)).unwrap();
-        run(&["apply"], false, "Create ");
-        assert!(root.path().join("loaded").exists());
-        assert_eq!(std::fs::read(root.path().join("changes")).unwrap(), changes);
-        std::fs::write(home.file(crate::device_config::FILE), configuration).unwrap();
-        write(&enabled("10.20.0.2:443"));
-        run(&["apply"], true, "schedule: update");
-        run(&["apply"], true, "no changes");
+        run(
+            &["schedule", "status"],
+            true,
+            "The job is installed and current.",
+        );
         std::fs::remove_file(root.path().join("loaded")).unwrap();
-        run(&["apply"], true, "schedule: update");
-        write("[schedule]\nenabled = false\nrun_as = 'user'\nmode = 'vpn'");
-        run(&["apply"], true, "schedule: remove");
+        run(&["schedule", "on"], true, "schedule: update");
+        run(&["schedule", "off", "--dry-run"], true, "schedule: remove");
+        assert!(DeviceConfig::load(&home).unwrap().auto_send);
+        run(&["schedule", "off"], true, "schedule: remove");
         assert!(!home.file(STATE).exists());
         assert!(!home.file(APPLIED).exists());
-        run(&["apply"], true, "no changes");
-        write(&enabled("10.20.0.1:443"));
-        run(&["apply"], true, "schedule: install");
-        write("");
-        run(&["apply"], true, "schedule: remove");
-        write(&enabled("10.20.0.1:443"));
-        std::fs::write(
-            home.file(crate::device_config::FILE),
-            "[schedule]\nenabled = true\nrun_as = 'user'\nextra = 1",
-        )
-        .unwrap();
-        let changes = std::fs::read(root.path().join("changes")).unwrap();
-        run(&["apply"], false, "extra");
-        assert_eq!(std::fs::read(root.path().join("changes")).unwrap(), changes);
-        run(&["check"], false, "Other controls will still run");
-        std::fs::remove_file(home.file(crate::device_config::FILE)).unwrap();
-        let check = run(&["check"], false, "# Review this template");
-        assert!(check.contains("control | manifest requirement | device setting | result"));
-        assert!(check.contains("firewall |"));
-        std::fs::write(
-            home.file(crate::device_config::FILE),
-            "[report]\ncollector = 'https://collector.example.org/status'\nvpn_probe = '10.20.0.1:443'\n",
-        )
-        .unwrap();
-        run(
-            &["apply"],
-            false,
-            "Move `vpn_probe = \"10.20.0.1:443\"` into [schedule]",
+        assert!(!DeviceConfig::load(&home).unwrap().auto_send);
+        run(&["schedule", "off"], true, "no changes");
+        run(&["schedule", "on"], true, "schedule: install");
+        let work = user.join("work");
+        run(&["folders", "add", "~/work"], true, "Added");
+        run(&["folders", "add", "~/work"], true, "already listed");
+        assert_eq!(
+            DeviceConfig::load(&home).unwrap().folders,
+            std::slice::from_ref(&work)
         );
-        run(&["check"], false, "[report] was removed");
+        run(&["folders", "list"], true, &work.display().to_string());
+        run(&["folders", "remove", "~/work"], true, "Removed");
+        run(&["folders", "remove", "~/work"], false, "is not listed");
+        assert!(DeviceConfig::load(&home).unwrap().folders.is_empty());
+        std::fs::write(
+            home.file(crate::device_config::LEGACY_FILE),
+            "[schedule]\nenabled = true\nrun_as = 'user'\n[managed_repos]\nfolders = ['~/work']\n",
+        )
+        .unwrap();
+        let check = run(&["check"], false, "open-pact.toml is ignored now");
+        assert!(check.contains("[managed_repos] folders"), "{check}");
+        let second = run(&["check"], false, "control | manifest requirement");
+        assert!(!second.contains("is ignored now"), "{second}");
+        assert!(home.file(crate::device_config::LEGACY_FILE).exists());
+        let changes = std::fs::read(root.path().join("changes")).unwrap();
+        run(&["apply"], false, "unrecognized subcommand");
+        run(&["finish"], false, "unrecognized subcommand");
+        run(&["config", "example"], false, "unrecognized subcommand");
         assert_eq!(std::fs::read(root.path().join("changes")).unwrap(), changes);
-        write(&enabled("10.20.0.1:443"));
-        run(&["apply"], true, "schedule: install");
         std::fs::remove_dir_all(&path).unwrap();
-        run(&["apply"], true, "schedule: remove");
-        assert!(!path.exists(), "apply recreated the missing client home");
+        run(&["schedule", "off"], true, "schedule: remove");
+        assert!(
+            !path.exists(),
+            "schedule off recreated the missing client home"
+        );
         println!("{transcript}");
         if let Some(output) = std::env::var_os("OPEN_PACT_CLI_TRANSCRIPT") {
             std::fs::write(output, transcript).unwrap();
@@ -2179,23 +2256,46 @@ esac
             vec!["client", "report", "--collector", "https://example.org"],
             vec!["client", "report", "--dry-run"],
             vec!["client", "log", "reports"],
+            vec!["client", "apply"],
+            vec!["client", "finish"],
+            vec!["client", "config", "example"],
         ] {
             assert!(crate::Cli::try_parse_from(args).is_err());
         }
         assert!(crate::Cli::try_parse_from(["client", "check", "--dry-run"]).is_ok());
+        for args in [
+            vec!["client", "schedule", "on"],
+            vec!["client", "schedule", "on", "--dry-run"],
+            vec!["client", "schedule", "off"],
+            vec!["client", "schedule", "status"],
+            vec!["client", "folders", "list"],
+            vec!["client", "folders", "add", "~/work"],
+            vec!["client", "folders", "remove", "~/work"],
+        ] {
+            assert!(crate::Cli::try_parse_from(args).is_ok());
+        }
+        assert!(
+            crate::Cli::try_parse_from(["client", "schedule", "on", "--system", "--user"]).is_err()
+        );
     }
 
     fn vpn(probe: &str) -> SendPolicy {
         SendPolicy::Vpn {
-            probe: crate::device_config::ProbeAddress::parse(probe).unwrap(),
+            probe: open_pact_core::ProbeAddress::try_from(probe.to_owned()).unwrap(),
             name: None,
+        }
+    }
+
+    fn every_55_minutes(policy: SendPolicy) -> open_pact_core::Schedule {
+        open_pact_core::Schedule {
+            policy,
+            interval: open_pact_core::Interval::try_from("55m".to_owned()).unwrap(),
         }
     }
 
     #[test]
     fn schedule_reconcile_covers_install_update_remove_and_retry() {
         let settings = Applied {
-            send: vpn("10.20.0.1:443"),
             run_as: RunAs::User,
             executable: PathBuf::from("/opt/example/client"),
             user_home: None,
@@ -2230,7 +2330,7 @@ esac
         );
         for changed in [
             Applied {
-                send: vpn("10.20.0.2:443"),
+                executable: PathBuf::from("/opt/example/other-client"),
                 ..settings.clone()
             },
             Applied {
@@ -2259,7 +2359,6 @@ esac
     #[test]
     fn windows_reconcile_repairs_disabled_or_wrong_triggers() {
         let settings = Applied {
-            send: vpn("10.20.0.1:443"),
             run_as: RunAs::User,
             executable: PathBuf::from("C:\\Program Files\\open-pact\\open-pact-client.exe"),
             user_home: None,
@@ -2296,7 +2395,6 @@ esac
     #[test]
     fn windows_reconcile_repairs_missing_or_stale_system_binary() {
         let settings = Applied {
-            send: vpn("10.20.0.1:443"),
             run_as: RunAs::System,
             executable: PathBuf::from("C:\\example\\open-pact-client.exe"),
             user_home: Some(PathBuf::from("C:\\Users\\example")),
@@ -2467,7 +2565,7 @@ function New-Object {
         let checks = r#"$script:failure = 0
 $script:userId = 'SYSTEM'
 $caught = $false
-try { & $action | Out-Null } catch { $caught = $_.Exception.Message -like '*apply*' }
+try { & $action | Out-Null } catch { $caught = $_.Exception.Message -like '*schedule*' }
 if (-not $caught -or $script:deleted) { throw 'limited uninstall did not refuse SYSTEM task' }
 $script:userId = 'EXAMPLE\user'
 foreach ($code in @(5,2,0)) {
@@ -2633,9 +2731,19 @@ Write-Output 'refused'
     }
 
     fn enrolled_home(dir: &Path) -> Home {
+        enrolled_home_with_schedule(dir, None)
+    }
+
+    /// `schedule` replaces the demo manifest's `[schedule]` table; `Some("")` removes it.
+    fn enrolled_home_with_schedule(dir: &Path, schedule: Option<&str>) -> Home {
         let home = Home(dir.to_path_buf());
         let key = crate::DeviceKey::load_or_create(dir, true).unwrap();
-        let manifest = include_str!("../../../examples/manifest.toml")
+        let demo = include_str!("../../../examples/manifest.toml");
+        let demo = match schedule {
+            Some(table) => format!("{}\n{table}\n", &demo[..demo.find("\n[schedule]").unwrap()]),
+            None => demo.to_owned(),
+        };
+        let manifest = demo
             .lines()
             .map(|line| {
                 if line.starts_with("required =") {
@@ -2689,11 +2797,13 @@ Write-Output 'refused'
     fn apply_command_preserves_shell_metacharacters() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home with 'quotes' $cash `false` ; & end");
-        let command = apply_command(&home);
+        let command = apply_command(&home, "schedule off");
         let output = std::process::Command::new("sh")
             .args([
                 "-c",
-                &format!("set -- {command}; printf '%s\\n' \"$#\" \"$1\" \"$2\" \"$3\" \"$4\""),
+                &format!(
+                    "set -- {command}; printf '%s\\n' \"$#\" \"$1\" \"$2\" \"$3\" \"$4\" \"$5\""
+                ),
             ])
             .output()
             .unwrap();
@@ -2704,11 +2814,12 @@ Write-Output 'refused'
                 .lines()
                 .collect::<Vec<_>>(),
             [
-                "4",
+                "5",
                 "open-pact-client",
                 "--home",
                 home.to_str().unwrap(),
-                "apply"
+                "schedule",
+                "off"
             ]
         );
     }
@@ -2755,7 +2866,7 @@ Write-Output 'refused'
         let mut state = State::default();
         state.observe(true);
         state.acknowledged(100_000, checks::EventMarkerReads::default());
-        assert!(state.should_send(100_000 - 86_400 + 2 * 3600));
+        assert!(state.should_send(100_000 - 86_400 + 2 * 3600, 55 * 60));
     }
 
     #[cfg(unix)]
@@ -2860,24 +2971,27 @@ Write-Output 'refused'
                 event_baseline: None,
                 ..State::default()
             };
-            assert_eq!(state.should_send(now), expected);
+            assert_eq!(state.should_send(now, 55 * 60), expected);
         }
         let mut state = State::default();
-        assert!(!state.should_send(now));
+        assert!(!state.should_send(now, 55 * 60));
         state.observe(true);
-        assert!(state.should_send(now));
+        assert!(state.should_send(now, 55 * 60));
         state.acknowledged(now, checks::EventMarkerReads::default());
-        assert!(!state.should_send(now + 54 * 60));
-        assert!(state.should_send(now + 55 * 60));
+        assert!(!state.should_send(now + 54 * 60, 55 * 60));
+        assert!(state.should_send(now + 55 * 60, 55 * 60));
         state.observe(false);
         state.observe(true);
-        assert!(state.should_send(now + 60));
+        assert!(state.should_send(now + 60, 55 * 60));
         state.observe(true);
-        assert!(state.should_send(now + 120), "failed first send must retry");
-        state.acknowledged(now + 120, checks::EventMarkerReads::default());
-        assert!(!state.should_send(now + 121));
         assert!(
-            state.should_send(now - 1),
+            state.should_send(now + 120, 55 * 60),
+            "failed first send must retry"
+        );
+        state.acknowledged(now + 120, checks::EventMarkerReads::default());
+        assert!(!state.should_send(now + 121, 55 * 60));
+        assert!(
+            state.should_send(now - 1, 55 * 60),
             "clock rollback retries instead of suppressing reports"
         );
     }
@@ -2942,8 +3056,8 @@ Write-Output 'refused'
             ..state
         };
         assert!(offline.new_events(reads(Read(Some(101)), Read(Some(200)))));
-        assert_eq!(offline.due(600), None);
-        assert!(!offline.should_send(600));
+        assert_eq!(offline.due(600, 55 * 60), None);
+        assert!(!offline.should_send(600, 55 * 60));
     }
 
     #[test]
@@ -3000,7 +3114,7 @@ Write-Output 'refused'
                 last_success: last,
                 ..State::default()
             };
-            assert_eq!(state.due(3300), expected);
+            assert_eq!(state.due(3300, 55 * 60), expected);
         }
     }
 
@@ -3022,7 +3136,7 @@ Write-Output 'refused'
             };
             state.observe_compliance(&map(current));
             assert_eq!(state.event_pending, expected);
-            assert_eq!(state.due(101), expected.then_some(Trigger::Event));
+            assert_eq!(state.due(101, 55 * 60), expected.then_some(Trigger::Event));
             state.sent(
                 false,
                 101,
@@ -3049,15 +3163,15 @@ Write-Output 'refused'
         };
 
         state.observe_compliance(&map(false));
-        assert_eq!(state.due(101), Some(Trigger::Event));
+        assert_eq!(state.due(101, 55 * 60), Some(Trigger::Event));
         state.sent(true, 101, checks::EventMarkerReads::default(), map(false));
         assert!(!state.event_pending);
 
         state.observe_compliance(&map(true));
-        assert_eq!(state.due(102), None);
+        assert_eq!(state.due(102, 55 * 60), None);
         state = serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
         state.observe_compliance(&map(false));
-        assert_eq!(state.due(103), Some(Trigger::Event));
+        assert_eq!(state.due(103, 55 * 60), Some(Trigger::Event));
     }
 
     #[test]
@@ -3069,9 +3183,9 @@ Write-Output 'refused'
         let failing = BTreeMap::from([("required_control".into(), false)]);
 
         state.observe_compliance(&compliant);
-        assert_eq!(state.due(101), None);
+        assert_eq!(state.due(101, 55 * 60), None);
         state.observe_compliance(&failing);
-        assert_eq!(state.due(102), Some(Trigger::Event));
+        assert_eq!(state.due(102, 55 * 60), Some(Trigger::Event));
     }
 
     #[test]
@@ -3099,9 +3213,9 @@ Write-Output 'refused'
                 serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
             pending.event_pending |= pending.new_events(events);
             assert!(pending.event_pending);
-            assert_eq!(pending.due(101), None);
+            assert_eq!(pending.due(101, 55 * 60), None);
             pending.observe(true);
-            assert_eq!(pending.due(102), Some(Trigger::Connect));
+            assert_eq!(pending.due(102, 55 * 60), Some(Trigger::Connect));
             pending.sent(false, 102, events, BTreeMap::new());
             assert!(pending.event_pending);
             assert_eq!(pending.last_events, state.last_events);
@@ -3114,9 +3228,9 @@ Write-Output 'refused'
         assert!(state.event_pending);
         let mut restored: State =
             serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
-        assert_eq!(restored.due(101), None);
+        assert_eq!(restored.due(101, 55 * 60), None);
         restored.observe(true);
-        assert_eq!(restored.due(102), Some(Trigger::Connect));
+        assert_eq!(restored.due(102, 55 * 60), Some(Trigger::Connect));
     }
 
     #[test]
@@ -3253,23 +3367,6 @@ Write-Output 'refused'
         validate_system_install(true, open_pact_core::Os::Windows).unwrap();
     }
 
-    #[test]
-    fn probe_requires_host_and_port() {
-        for address in ["vpn.example.org:443", "127.0.0.1:1234", "[::1]:443"] {
-            assert!(probe_address(address).is_ok(), "{address}");
-        }
-        for address in [
-            "vpn.example.org",
-            "example.org:443/path",
-            "user@example.org:443",
-            "example.org:443?x",
-            "example.org:443#x",
-            "bad host:443",
-        ] {
-            assert!(probe_address(address).is_err(), "{address}");
-        }
-    }
-
     #[tokio::test]
     async fn vpn_probe_connects_to_a_listening_port() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3402,7 +3499,7 @@ Write-Output 'refused'
         enrolment.gateway = format!("http://{}", refused.local_addr().unwrap());
         home.write("enrolment.json", &serde_json::to_vec(&enrolment).unwrap())
             .unwrap();
-        let policy = vpn(&listener.local_addr().unwrap().to_string());
+        let policy = every_55_minutes(vpn(&listener.local_addr().unwrap().to_string()));
         save(
             &state_home,
             STATE,
@@ -3437,16 +3534,43 @@ Write-Output 'refused'
         assert!(home.read_json::<State>(STATE).unwrap().is_none());
     }
 
+    fn vpn_table(probe: &str) -> String {
+        format!("[schedule]\nmode = \"vpn\"\nvpn_probe = \"{probe}\"\ninterval = \"55m\"")
+    }
+
+    fn agree(home: &Home) {
+        let mut config = DeviceConfig::load(home).unwrap();
+        config.auto_send = true;
+        config.save(home).unwrap();
+    }
+
+    /// Points the enrolment at a port that refuses connections while the socket lives.
+    fn unreachable_gateway(home: &Home) -> tokio::net::TcpSocket {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let mut enrolment: crate::Enrolment = home.enrolment().unwrap();
+        enrolment.gateway = format!("http://{}", socket.local_addr().unwrap());
+        home.write("enrolment.json", &serde_json::to_vec(&enrolment).unwrap())
+            .unwrap();
+        socket
+    }
+
+    fn run_job() -> Command {
+        Command::Run {
+            system: false,
+            user_home: None,
+        }
+    }
+
     #[tokio::test]
     async fn scheduled_run_persists_connectivity_and_keeps_failed_reconnect_due() {
         let dir = tempfile::tempdir().unwrap();
         let home = Home(dir.path().to_path_buf());
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let probe = listener.local_addr().unwrap().to_string();
-        let write_config = |probe: &str| {
-            std::fs::write(home.file(crate::device_config::FILE), format!("[schedule]\nenabled = true\nrun_as = 'user'\nmode = 'vpn'\nvpn_probe = '{probe}'\n")).unwrap();
-        };
-        write_config(&probe);
+        enrolled_home_with_schedule(dir.path(), Some(&vpn_table(&probe)));
+        let _gateway = unreachable_gateway(&home);
+        agree(&home);
         save(
             &home,
             STATE,
@@ -3461,77 +3585,57 @@ Write-Output 'refused'
         )
         .unwrap();
         assert!(
-            run(
-                &home,
-                Command::Run {
-                    system: false,
-                    user_home: None,
-                },
-            )
-            .await
-            .is_err(),
-            "no enrolment"
+            run(&home, run_job()).await.is_err(),
+            "the gateway is unreachable"
         );
         let connected: State = home.read_json(STATE).unwrap().unwrap();
         assert!(connected.vpn_up);
         assert!(connected.reconnect_pending);
-        assert!(connected.should_send(chrono::Utc::now().timestamp()));
+        assert!(connected.should_send(chrono::Utc::now().timestamp(), 55 * 60));
         drop(listener);
         let reserved = tokio::net::TcpSocket::new_v4().unwrap();
         reserved.bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let refused = reserved.local_addr().unwrap().to_string();
-        write_config(&refused);
-        assert!(
-            run(
-                &home,
-                Command::Run {
-                    system: false,
-                    user_home: None,
-                },
-            )
-            .await
-            .is_err(),
-            "no enrolment for local evaluation"
-        );
+        enrolled_home_with_schedule(dir.path(), Some(&vpn_table(&refused)));
+        let _gateway = unreachable_gateway(&home);
+        run(&home, run_job()).await.unwrap();
         let disconnected: State = home.read_json(STATE).unwrap().unwrap();
         assert!(!disconnected.vpn_up);
         assert_eq!(disconnected.last_success, connected.last_success);
     }
 
     #[tokio::test]
-    async fn apply_and_run_require_a_probe_when_the_schedule_is_enabled() {
+    async fn schedule_on_is_refused_when_the_manifest_defines_no_schedule() {
         let dir = tempfile::tempdir().unwrap();
-        let home = Home(dir.path().to_path_buf());
-        std::fs::write(
-            home.file(crate::device_config::FILE),
-            "[schedule]\nenabled = false\nrun_as = 'user'\nmode = 'vpn'\n",
-        )
-        .unwrap();
-        DeviceConfig::load(&home).unwrap().unwrap();
+        let home = enrolled_home_with_schedule(dir.path(), Some(""));
+        assert!(home.signed_manifest().unwrap().body().schedule.is_none());
+        let error = turn_on(&home, None, false).await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("did not define automatic sending"),
+            "{error:#}"
+        );
+        assert!(!home.file(device_config::FILE).exists());
+        assert!(!home.file(APPLIED).exists());
+    }
 
-        std::fs::write(
-            home.file(crate::device_config::FILE),
-            "[schedule]\nenabled = true\nrun_as = 'user'\nmode = 'vpn'\n",
-        )
-        .unwrap();
-        let error = apply(&home, true).await.unwrap_err();
-        assert!(
-            format!("{error:#}").contains("[schedule].vpn_probe is required"),
-            "{error:#}"
-        );
-        let error = run(
-            &home,
-            Command::Run {
-                system: false,
-                user_home: None,
-            },
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            format!("{error:#}").contains("[schedule].vpn_probe is required"),
-            "{error:#}"
-        );
+    #[tokio::test]
+    async fn the_job_does_nothing_until_the_owner_agreed() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = enrolled_home(dir.path());
+        let _gateway = unreachable_gateway(&home);
+        run(&home, run_job()).await.unwrap();
+        assert!(!home.file(STATE).exists(), "no probe, no claim");
+        assert!(!home.file(JOB_LOG).exists());
+    }
+
+    #[tokio::test]
+    async fn the_job_does_nothing_when_the_signed_manifest_has_no_schedule() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = enrolled_home_with_schedule(dir.path(), Some(""));
+        let _gateway = unreachable_gateway(&home);
+        agree(&home);
+        run(&home, run_job()).await.unwrap();
+        assert!(!home.file(STATE).exists());
     }
 
     #[tokio::test]
@@ -3615,7 +3719,7 @@ Write-Output 'refused'
         ] {
             assert!(!script.contains(forbidden), "{forbidden}");
         }
-        assert!(script.contains("apply"));
+        assert!(script.contains("schedule"));
     }
 
     #[test]
@@ -3634,5 +3738,41 @@ Write-Output 'refused'
         assert!(!stored.reconnect_pending);
         drop(guard);
         assert!(lock(&home).is_ok());
+    }
+
+    #[tokio::test]
+    async fn an_old_open_pact_toml_starts_nothing_and_is_noted_once_in_the_job_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = enrolled_home(dir.path());
+        let _gateway = unreachable_gateway(&home);
+        std::fs::write(
+            home.file(device_config::LEGACY_FILE),
+            "[schedule]\nenabled = true\nrun_as = 'user'\nmode = 'vpn'\nvpn_probe = '127.0.0.1:1'\n",
+        )
+        .unwrap();
+        run(&home, run_job()).await.unwrap();
+        run(&home, run_job()).await.unwrap();
+        assert!(!home.file(STATE).exists(), "the old file starts no probe");
+        let log = std::fs::read_to_string(home.file(JOB_LOG)).unwrap();
+        assert_eq!(
+            log.matches("open-pact.toml is ignored now").count(),
+            1,
+            "{log}"
+        );
+        assert!(log.contains("schedule on"), "{log}");
+        assert!(home.file(device_config::LEGACY_FILE).exists());
+    }
+
+    #[test]
+    fn the_interval_of_the_manifest_sets_the_periodic_claim() {
+        let mut state = State::default();
+        state.observe(true);
+        state.acknowledged(1_000, checks::EventMarkerReads::default());
+        assert!(!state.should_send(1_000 + 4 * 60, 5 * 60));
+        assert!(state.should_send(1_000 + 5 * 60, 5 * 60));
+        assert!(!state.should_send(1_000 + 5 * 60, 55 * 60));
+        assert!(state.should_send(1_000 + 55 * 60, 55 * 60));
+        assert_eq!(state.due(1_000 + 5 * 60, 5 * 60), Some(Trigger::Periodic));
+        assert_eq!(state.due(1_000 + 5 * 60, 55 * 60), None);
     }
 }

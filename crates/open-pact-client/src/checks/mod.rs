@@ -117,6 +117,7 @@ pub fn check_supported(manifest: &Manifest) -> Result<(), String> {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn can_check(os: Os, id: &str) -> bool {
     let registry = registry(os);
     registry
@@ -138,6 +139,7 @@ type Registry = &'static [(&'static str, CheckFn)];
 
 struct OsRegistry {
     checks: Registry,
+    #[cfg(test)]
     not_applicable: &'static [&'static str],
 }
 
@@ -346,6 +348,7 @@ fn registry(os: Os) -> OsRegistry {
         #[cfg(any(target_os = "macos", test))]
         Os::Macos => OsRegistry {
             checks: MACOS,
+            #[cfg(test)]
             not_applicable: &[
                 "antimalware_active_threats",
                 "antimalware_full_scan_age_days",
@@ -358,6 +361,7 @@ fn registry(os: Os) -> OsRegistry {
         #[cfg(any(target_os = "linux", test))]
         Os::Linux => OsRegistry {
             checks: LINUX,
+            #[cfg(test)]
             not_applicable: &[
                 "process_audit",
                 "remote_wipe",
@@ -368,12 +372,14 @@ fn registry(os: Os) -> OsRegistry {
         #[cfg(any(target_os = "windows", test))]
         Os::Windows => OsRegistry {
             checks: WINDOWS,
+            #[cfg(test)]
             not_applicable: &["remote_wipe"],
         },
         // A release binary carries only its own OS checks; a foreign OS has none.
         #[cfg(not(test))]
         _ => OsRegistry {
             checks: &[],
+            #[cfg(test)]
             not_applicable: &[],
         },
     }
