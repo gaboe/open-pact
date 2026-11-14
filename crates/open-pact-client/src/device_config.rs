@@ -77,6 +77,11 @@ pub(crate) struct ManagedRepos {
 
 impl DeviceConfig {
     pub(crate) fn load(home: &Home) -> Result<Option<Self>> {
+        Self::load_for(home, None)
+    }
+
+    /// Reads the file and expands `~` to `user_home`, or to the profile of the current process.
+    pub(crate) fn load_for(home: &Home, user_home: Option<&Path>) -> Result<Option<Self>> {
         let path = home.file(FILE);
         let text = match crate::read_home_file(&path) {
             Ok(text) => text,
@@ -85,9 +90,16 @@ impl DeviceConfig {
         };
         let text =
             String::from_utf8(text).with_context(|| format!("{} must be UTF-8", path.display()))?;
-        let user_home =
-            std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from);
-        Self::parse(&text, user_home.as_deref())
+        let own_home;
+        let user_home = match user_home {
+            Some(user_home) => Some(user_home),
+            None => {
+                own_home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+                    .map(PathBuf::from);
+                own_home.as_deref()
+            }
+        };
+        Self::parse(&text, user_home)
             .with_context(|| format!("{}", path.display()))
             .map(Some)
     }

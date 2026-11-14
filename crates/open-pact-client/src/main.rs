@@ -24,21 +24,22 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use clap::{Parser, Subcommand};
 use device_key::DeviceKey;
-#[cfg(test)]
-use open_pact_core::PublicKey;
 use open_pact_core::{
     AcceptRequest, DeviceAuthPurpose, DeviceStatus, MyEntries, MyEntriesRequest,
     device_auth_statement,
 };
 use open_pact_core::{
-    Checkpoint, Claim, CsrHash, Endorsement, EnrolRequest, Entry, EntryKind, Invitation,
-    LogCheckpoint, LogHash, LogKey, LogPolicy, Manifest, ManifestHash, Metadata, Note, Os,
-    Pseudonym, SignedManifest, Virtualized, dev_key, verify_claim, verify_consistency,
-    verify_cosignatures, verify_inclusion,
+    Checkpoint, Endorsement, EnrolRequest, Entry, EntryKind, Invitation, LogCheckpoint, LogHash,
+    LogKey, LogPolicy, Manifest, ManifestHash, Metadata, Note, Os, Pseudonym, SignedManifest,
+    Virtualized, dev_key, verify_claim, verify_consistency, verify_cosignatures, verify_inclusion,
 };
+#[cfg(test)]
+use open_pact_core::{Claim, PublicKey};
 use rcgen::{CertificateParams, DistinguishedName, KeyPair};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
+#[cfg(test)]
+use serde_json::json;
 use sha2::{Digest, Sha256};
 
 #[derive(Parser)]
@@ -148,7 +149,7 @@ enum LogCommand {
     Reports,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Enrolment {
     gateway: String,
     manifest: ManifestHash,
@@ -919,11 +920,28 @@ async fn scan_repositories(
     manifest: &Manifest,
     config: Option<&device_config::DeviceConfig>,
 ) -> Result<Option<checks::repos::RepoScan>> {
+    scan_repositories_from(home, None, manifest, config, true).await
+}
+
+/// Scans below `root`, or below the current user's home when `root` is `None`. A scan that is
+/// not `store`d leaves the home untouched.
+async fn scan_repositories_from(
+    home: &Home,
+    root: Option<&Path>,
+    manifest: &Manifest,
+    config: Option<&device_config::DeviceConfig>,
+    store: bool,
+) -> Result<Option<checks::repos::RepoScan>> {
     if !scans_repositories(manifest) {
-        checks::repos::forget(&home.0)?;
+        if store {
+            checks::repos::forget(&home.0)?;
+        }
         return Ok(None);
     }
-    let root = repository_scan_root(home)?;
+    let root = match root {
+        Some(root) => root.to_path_buf(),
+        None => repository_scan_root(home)?,
+    };
     let folders = config
         .and_then(|config| config.managed_repos.as_ref())
         .map_or_else(Vec::new, |repos| repos.folders.clone());
@@ -939,7 +957,9 @@ async fn scan_repositories(
         tokio::task::spawn_blocking(move || checks::repos::scan(&scan_root, &folders, &patterns))
             .await
             .context("repository scan task stopped")??;
-    checks::repos::store(&state, &scan)?;
+    if store {
+        checks::repos::store(&state, &scan)?;
+    }
     Ok(Some(scan))
 }
 
@@ -1906,6 +1926,22 @@ async fn verify_checkpoint(
     prev: Option<&Checkpoint>,
     text: &str,
 ) -> Result<Result<Checkpoint, CheckpointVerifyError>> {
+    let checked = verify_checkpoint_unstored(http, gateway, key, policy, prev, text).await?;
+    if checked.is_ok() {
+        home.write(LOG_CHECKPOINT, text.as_bytes())?;
+    }
+    Ok(checked)
+}
+
+/// The checks of `verify_checkpoint` without storing the note.
+async fn verify_checkpoint_unstored(
+    http: &reqwest::Client,
+    gateway: &str,
+    key: &LogKey,
+    policy: Option<&LogPolicy>,
+    prev: Option<&Checkpoint>,
+    text: &str,
+) -> Result<Result<Checkpoint, CheckpointVerifyError>> {
     let now = u64::try_from(chrono::Utc::now().timestamp()).context("clock")?;
     let new = match Note::parse(text).and_then(|note| {
         let checkpoint = key.verify(&note)?;
@@ -1979,7 +2015,6 @@ async fn verify_checkpoint(
     if let Err(e) = checked {
         return Ok(Err(e));
     }
-    home.write(LOG_CHECKPOINT, text.as_bytes())?;
     Ok(Ok(new))
 }
 
@@ -3255,98 +3290,24 @@ async fn check(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
 async fn check_impl(home: &Home, insecure_dev: bool, show_resume_hint: bool) -> Result<ExitCode> {
     let _claim_lock = claim::lock(home).await?;
     let migrating = schedule::migration_example(home)?;
-    let mut can_scan_repositories = true;
-    let device_config = match device_config::DeviceConfig::load(home) {
-        Ok(Some(config)) => Some(config),
-        Ok(None) => None,
-        Err(error) => {
-            can_scan_repositories = false;
-            eprintln!(
-                "{error:#}\nCorrect this section and key in open-pact.toml. Other controls will still run."
-            );
-            None
+    let prepared = match claim::prepare(home, None, claim::ScanPolicy::Always, insecure_dev).await {
+        Ok(prepared) => prepared,
+        Err(error) if error.is::<claim::LegacyLogHead>() => {
+            print_log_upgrade(home);
+            return Ok(ExitCode::FAILURE);
         }
+        Err(error) => return Err(error),
     };
-    let mut enrolment = home.enrolment()?;
-    check_scheme(&enrolment.gateway, insecure_dev)?;
-    home.recover_vpn()?;
-    if home.has_legacy_log_head() {
-        print_log_upgrade(home);
-        return Ok(ExitCode::FAILURE);
-    }
-    let manifest_toml = String::from_utf8(std::fs::read(home.file("manifest.toml"))?)
-        .context("manifest.toml is not UTF-8")?;
-    let manifest = Manifest::parse(manifest_toml.as_bytes())?;
-    if manifest.hash() != &enrolment.manifest {
-        return Err(stored_manifest_mismatch(
-            home,
-            manifest.hash(),
-            &enrolment.manifest,
-        ));
-    }
-    checks::check_supported(&manifest)
-        .map_err(|e| anyhow::anyhow!("{e}; nothing was run or sent"))?;
-    let scan = if can_scan_repositories {
-        scan_repositories(home, &manifest, device_config.as_ref()).await?
-    } else {
-        None
-    };
-    let device = DeviceKey::load(&home.0)?;
-    let os = current_os()?;
-
-    if device_config.is_none() && !migrating {
+    if !migrating {
         let user_home =
             std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from);
-        print!(
-            "{}",
-            device_config::example(&manifest, os, scan.as_ref(), user_home.as_deref())
-        );
-    }
-    let check_manifest = manifest.clone();
-    let check_config = device_config.clone();
-    let check_scan = scan.clone();
-    let virtualization_manifest = manifest.clone();
-    let (results, virtualized) = tokio::task::spawn_blocking(move || {
-        let results = collect_results(
-            &check_manifest,
-            os,
-            check_config.as_ref(),
-            check_scan.as_ref(),
-        );
-        let virtualized = disclosable_virtualized(&virtualization_manifest, virtualized);
-        (results, virtualized)
-    })
-    .await
-    .context("control collection task stopped")?;
-    device_config::print_table(&manifest, os, device_config.as_ref(), &results);
-    if let Some(scan) = &scan {
-        if scan.partial {
-            println!("Repository scan is partial; repository counts are unknown.");
-            for cause in &scan.causes {
-                println!("  could not read {} ({})", cause.path.display(), cause.kind);
-            }
-            if scan.causes.is_empty() {
-                println!("  Fix access to unreadable folders or retry after they are available.");
-            } else {
-                println!("  Fix access to these locations, then run check again.");
-            }
-        }
-        if scan.partial && scan.access_denied {
-            let binary = std::env::current_exe().unwrap_or_default();
-            println!(
-                "Repository values are unknown because the client lacks access to some folders. On macOS, grant Full Disk Access to this client binary: {}",
-                binary.display()
-            );
-        }
-        for path in &scan.outside_paths {
-            println!(
-                "  outside repository: {}. Move it into a registered folder.",
-                path.display()
-            );
+        if let Some(template) = prepared.missing_config_template(user_home.as_deref()) {
+            print!("{template}");
         }
     }
-    let command = client_command(&home.0);
+    prepared.print_local_report();
     if show_resume_hint {
+        let command = client_command(&home.0);
         match wizard_resume(home)? {
             WizardResume::Finish => {
                 println!("Wizard step [5/6] is unfinished. Continue with: {command} join");
@@ -3357,234 +3318,8 @@ async fn check_impl(home: &Home, insecure_dev: bool, show_resume_hint: bool) -> 
             WizardResume::Complete => {}
         }
     }
-    let http = http_client()?;
-    let enforced = enforced_manifest(&http, &enrolment.gateway).await?;
-    let changed =
-        (enforced != enrolment.manifest).then(|| manifest_change_notice(&enforced, &command));
-    let sync = match sync_log(&http, home, &manifest, &enforced, &mut enrolment).await {
-        Err(error)
-            if error.downcast_ref::<reqwest::Error>().is_some_and(|error| {
-                error.status() == Some(reqwest::StatusCode::FORBIDDEN)
-                    && error
-                        .url()
-                        .is_some_and(|url| url.path().ends_with("/v1/log/mine"))
-            }) =>
-        {
-            let state = match (
-                status_after_log_denial(&http, home, &enrolment).await,
-                &changed,
-            ) {
-                (Ok(state), _) => state,
-                (Err(_), Some(notice)) => {
-                    println!("{notice}");
-                    print_claim_log_status(home, None, Some("the manifest changed"));
-                    return Ok(ExitCode::FAILURE);
-                }
-                (Err(error), None) => return Err(error),
-            };
-            match state {
-                DeviceStatus::Pending => {
-                    println!("This device waits for IT approval.");
-                    println!(
-                        "Wizard step [4/6] is unfinished. Continue with: {} join",
-                        client_command(&home.0)
-                    );
-                    print_claim_log_status(
-                        home,
-                        None,
-                        Some("the device is waiting for IT approval"),
-                    );
-                    if let Some(notice) = &changed {
-                        println!("\n{notice}");
-                    }
-                }
-                DeviceStatus::Revoked => {
-                    println!("IT revoked this device.");
-                    print_claim_log_status(home, None, Some("IT revoked this device"));
-                }
-                DeviceStatus::Approved => {
-                    print_claim_log_status(
-                        home,
-                        None,
-                        Some("the gateway denied log access after approval"),
-                    );
-                    return Err(error);
-                }
-            }
-            return Ok(ExitCode::FAILURE);
-        }
-        result => result?,
-    };
-    let (mut verified, own) = match sync {
-        LogSync::Verified(cp, own) => (cp, own),
-        pending @ LogSync::AcceptPending(_) => {
-            report_log(pending, home);
-            print_claim_log_status(home, None, Some("the manifest changed"));
-            return Ok(ExitCode::FAILURE);
-        }
-        alarm => {
-            report_log(alarm, home);
-            print_claim_log_status(home, None, Some("log verification did not complete"));
-            return Ok(ExitCode::from(2));
-        }
-    };
-    let gateway = base(&enrolment.gateway);
-    let log_checkpoint = disclosable_checkpoint(&manifest, home.checkpoint()?);
-    let nonce: Nonce = http
-        .post(format!("{gateway}/v1/nonce"))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    let device_key = device.public_key();
-    let (csr_pem, csr_der) = vpn_csr(home)?;
-    let claim = Claim {
-        manifest: manifest.hash().clone(),
-        device: Pseudonym::of(&device_key),
-        device_key,
-        nonce: nonce.nonce,
-        time: chrono::DateTime::from_timestamp(chrono::Utc::now().timestamp(), 0)
-            .context("clock")?,
-        client: concat!("open-pact-client ", env!("CARGO_PKG_VERSION")).into(),
-        os,
-        trust_level: device.trust_level(),
-        virtualized,
-        results,
-        csr_sha256: Some(CsrHash::of(&csr_der)),
-        log_checkpoint,
-    };
-    let mut request = json!({ "jws": device.sign_claim(&claim)?, "csr_pem": csr_pem });
-    if changed.is_some() {
-        request["manifest_toml"] = manifest_toml.into();
-    }
-    let sent = serde_json::to_vec(&request)?;
-    let resp = http
-        .post(format!("{gateway}/v1/claim"))
-        .header("content-type", "application/json")
-        .body(sent.clone())
-        .send()
-        .await?;
-    let status = resp.status();
-    let received = resp.bytes().await?;
-    locallog::append_with_status(
-        &home.file("claims.jsonl"),
-        &sent,
-        &received,
-        Some(status.as_u16()),
-    )?;
-
-    println!(
-        "Sent {} results for {}:",
-        claim.results.len(),
-        manifest.hash()
-    );
-    for (id, value) in &claim.results {
-        println!("  {id} = {value}");
-    }
-    let accepted = match serde_json::from_slice::<Response>(&received)
-        .with_context(|| String::from_utf8_lossy(&received).into_owned())?
-    {
-        Response::Accepted {
-            warnings,
-            certificate_pem,
-            ca_pem,
-            log_checkpoint,
-        } => {
-            if !status.is_success() {
-                bail!("claim request failed with HTTP {status}");
-            }
-            let checked = match log_checkpoint {
-                None => Ok(Err(CheckpointVerifyError::Alarm(
-                    "the accepted claim response has no log checkpoint".into(),
-                ))),
-                Some(text) => {
-                    let key = Pins::load(home)?.log;
-                    let policy = manifest.body().log.as_ref();
-                    verify_checkpoint(&http, home, gateway, &key, policy, Some(&verified), &text)
-                        .await
-                }
-            };
-            match checked? {
-                Ok(cp) => verified = cp,
-                Err(e) => {
-                    println!("ACCEPTED, but the response failed log verification");
-                    report_log(
-                        alarm(format!(
-                            "the checkpoint in the accepted claim response: {}; no certificate was installed",
-                            e.alarm_text()
-                        )),
-                        home,
-                    );
-                    print_claim_log_status(
-                        home,
-                        Some((
-                            claim
-                                .time
-                                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                            ClaimResult::ResponseUnverified,
-                            claim.results.len(),
-                        )),
-                        None,
-                    );
-                    return Ok(ExitCode::from(2));
-                }
-            }
-            println!("{}", ui::bold("ACCEPTED", ui::styled()));
-            for w in &warnings {
-                println!("  warning: {w}");
-            }
-            print_hints(&manifest, &claim.results, os);
-            let vpn_key = KeyPair::from_pem(&std::fs::read_to_string(home.file("vpn-key.pem"))?)?;
-            let certificate_pem = certificate_pem.context(
-                "the accepted response carries no VPN certificate for the request this check sent; the installed ones are kept",
-            )?;
-            let described = check_vpn_pair(&ca_pem, &certificate_pem, &vpn_key)
-                .context("the accepted response carries an unusable VPN certificate or CA; the installed ones are kept")?;
-            home.install_vpn_pair(ca_pem.as_bytes(), certificate_pem.as_bytes())?;
-            println!(
-                "VPN certificate {} ({described})",
-                home.file("vpn-cert.pem").display(),
-            );
-            println!("VPN CA          {}", home.file("ca.pem").display());
-            true
-        }
-        Response::Denied { reasons } => {
-            println!("{}", ui::bold("DENIED", ui::styled()));
-            for r in &reasons {
-                println!("  {r}");
-            }
-            print_hints(&manifest, &claim.results, os);
-            false
-        }
-    };
-    report_log(LogSync::Verified(verified, own), home);
-    print_claim_log_status(
-        home,
-        Some((
-            claim
-                .time
-                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            if accepted {
-                ClaimResult::Accepted
-            } else {
-                ClaimResult::Denied
-            },
-            claim.results.len(),
-        )),
-        None,
-    );
-    if let Some(notice) = &changed {
-        println!("\n{notice}");
-    }
-    if !accepted {
-        println!("\nNext: fix the items above, then run {command} check again.");
-    }
-    Ok(if accepted {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
-    })
+    let outcome = prepared.send(home, async || true).await?;
+    Ok(outcome.exit_code())
 }
 
 /// The hash of the manifest the gateway enforces now.
