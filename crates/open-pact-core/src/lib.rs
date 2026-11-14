@@ -30,9 +30,9 @@ pub use log::{
     verify_consistency, verify_inclusion,
 };
 pub use manifest::{
-    Accepted, AcceptedValues, Control, ControlValue, IntegerOutput, IntegerRange, LogPolicy,
-    Manifest, ManifestBody, Maximum, Metadata, Minimum, Os, Output, Source, Span, TimestampOutput,
-    TrustLevel, Witness,
+    Accepted, AcceptedValues, Control, ControlValue, IntegerOutput, IntegerRange, Interval,
+    LogPolicy, Manifest, ManifestBody, Maximum, Metadata, Minimum, Os, Output, ProbeAddress,
+    ProbeName, Schedule, SendPolicy, Source, Span, TimestampOutput, TrustLevel, Witness,
 };
 pub use narrowing::{Violation, is_narrowing};
 pub use note::{Checkpoint, LogKey, Note, NoteSignature, WitnessKey};

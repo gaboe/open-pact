@@ -38,6 +38,8 @@ pub enum Violation {
     TrustLevelHigher,
     #[error("the [log] witness policy changed")]
     WitnessPolicyChanged,
+    #[error("the [schedule] adds automatic claims or sends them more often or in more places")]
+    ScheduleWidened,
 }
 
 fn added<T: Ord + Clone>(old: &BTreeSet<T>, new: &BTreeSet<T>) -> Vec<T> {
@@ -129,6 +131,13 @@ pub fn is_narrowing(old: &Manifest, new: &Manifest) -> Result<(), Vec<Violation>
     if new.log != old.log {
         v.push(Violation::WitnessPolicyChanged);
     }
+    if let Some(now) = &new.schedule
+        && old.schedule.as_ref().is_none_or(|was| {
+            was.policy != now.policy || now.interval.as_secs() < was.interval.as_secs()
+        })
+    {
+        v.push(Violation::ScheduleWidened);
+    }
 
     if v.is_empty() { Ok(()) } else { Err(v) }
 }
@@ -175,6 +184,33 @@ mod tests {
             )],
             Violation::WitnessPolicyChanged,
         );
+    }
+
+    #[test]
+    fn a_wider_schedule_needs_the_owner_and_a_narrower_one_does_not() {
+        rejected(
+            &[(r#"interval = "55m""#, r#"interval = "30m""#)],
+            Violation::ScheduleWidened,
+        );
+        rejected(
+            &[(
+                r#"vpn_probe = "10.0.0.1:443""#,
+                r#"vpn_probe = "10.0.0.2:443""#,
+            )],
+            Violation::ScheduleWidened,
+        );
+        assert_eq!(
+            check(&[(r#"interval = "55m""#, r#"interval = "2h""#)]),
+            Ok(())
+        );
+        let without = DEMO.find("\n[schedule]").unwrap();
+        let old = Manifest::parse(DEMO[..without].as_bytes()).unwrap();
+        let new = Manifest::parse(DEMO.as_bytes()).unwrap();
+        assert_eq!(
+            is_narrowing(&old, &new),
+            Err(vec![Violation::ScheduleWidened])
+        );
+        assert_eq!(is_narrowing(&new, &old), Ok(()));
     }
 
     #[test]
