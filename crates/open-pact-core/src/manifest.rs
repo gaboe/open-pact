@@ -593,6 +593,272 @@ pub struct ManifestBody {
     /// Always present after `Manifest::parse`.
     #[serde(default)]
     pub log: Option<LogPolicy>,
+    /// When the client sends claims by itself. Without it the owner sends claims by hand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<Schedule>,
+}
+
+/// How often and where the scheduled job sends a claim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawSchedule", into = "RawSchedule")]
+pub struct Schedule {
+    pub policy: SendPolicy,
+    pub interval: Interval,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum RawMode {
+    Vpn,
+    Always,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSchedule {
+    mode: RawMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    vpn_probe: Option<ProbeAddress>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    vpn_probe_name: Option<ProbeName>,
+    interval: Interval,
+}
+
+/// When the scheduled job may send a claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SendPolicy {
+    /// Only while the probe connects. With `name`, the probe also needs a TLS certificate that is
+    /// valid for `name`.
+    Vpn {
+        probe: ProbeAddress,
+        name: Option<ProbeName>,
+    },
+    /// On any network.
+    Always,
+}
+
+impl TryFrom<RawSchedule> for Schedule {
+    type Error = String;
+
+    fn try_from(raw: RawSchedule) -> Result<Self, String> {
+        let policy = match (raw.mode, raw.vpn_probe, raw.vpn_probe_name) {
+            (RawMode::Vpn, Some(probe), name) => SendPolicy::Vpn { probe, name },
+            (RawMode::Vpn, None, _) => {
+                return Err(
+                    "schedule.vpn_probe is required with mode = \"vpn\": set it to a host:port that answers only on the company VPN"
+                        .into(),
+                );
+            }
+            (RawMode::Always, None, None) => SendPolicy::Always,
+            (RawMode::Always, _, _) => {
+                return Err(
+                    "schedule.mode = \"always\" sends on any network, so it takes no vpn_probe or vpn_probe_name"
+                        .into(),
+                );
+            }
+        };
+        Ok(Self {
+            policy,
+            interval: raw.interval,
+        })
+    }
+}
+
+impl From<Schedule> for RawSchedule {
+    fn from(schedule: Schedule) -> Self {
+        let (mode, vpn_probe, vpn_probe_name) = match schedule.policy {
+            SendPolicy::Vpn { probe, name } => (RawMode::Vpn, Some(probe), name),
+            SendPolicy::Always => (RawMode::Always, None, None),
+        };
+        Self {
+            mode,
+            vpn_probe,
+            vpn_probe_name,
+            interval: schedule.interval,
+        }
+    }
+}
+
+impl fmt::Display for Schedule {
+    /// The line the owner reads before agreeing to automatic claims.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.policy {
+            SendPolicy::Vpn {
+                probe,
+                name: Some(name),
+            } => write!(
+                f,
+                "Automatic claims: only while {name} answers at {probe}, at most every {}",
+                self.interval
+            ),
+            SendPolicy::Vpn { probe, name: None } => write!(
+                f,
+                "Automatic claims: only while {probe} answers, at most every {}",
+                self.interval
+            ),
+            SendPolicy::Always => {
+                write!(
+                    f,
+                    "Automatic claims: every {} on any network",
+                    self.interval
+                )
+            }
+        }
+    }
+}
+
+/// The time between periodic claims: whole minutes or hours, from 5 minutes to 24 hours.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct Interval {
+    minutes: u32,
+}
+
+impl Interval {
+    const MIN_MINUTES: u32 = 5;
+    const MAX_MINUTES: u32 = 24 * 60;
+
+    pub fn as_secs(&self) -> i64 {
+        i64::from(self.minutes) * 60
+    }
+}
+
+impl TryFrom<String> for Interval {
+    type Error = String;
+
+    fn try_from(text: String) -> Result<Self, String> {
+        let bad = || {
+            format!(
+                "schedule.interval {text:?} must be whole minutes or hours from 5m to 24h, such as \"55m\""
+            )
+        };
+        let (digits, unit) = text.split_at(text.len().saturating_sub(1));
+        let amount: u32 = digits.parse().map_err(|_| bad())?;
+        let minutes = match unit {
+            "m" => amount,
+            "h" => amount.checked_mul(60).ok_or_else(bad)?,
+            _ => return Err(bad()),
+        };
+        if !(Self::MIN_MINUTES..=Self::MAX_MINUTES).contains(&minutes) {
+            return Err(bad());
+        }
+        Ok(Self { minutes })
+    }
+}
+
+impl fmt::Display for Interval {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.minutes % 60 == 0 {
+            write!(f, "{}h", self.minutes / 60)
+        } else {
+            write!(f, "{}m", self.minutes)
+        }
+    }
+}
+
+impl From<Interval> for String {
+    fn from(interval: Interval) -> String {
+        interval.to_string()
+    }
+}
+
+fn dns_name_ok(raw: &str) -> bool {
+    let label_ok = |label: &str| {
+        (1..=63).contains(&label.len())
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+    };
+    let last = raw.rsplit('.').next().unwrap_or_default();
+    // An all-digit last label makes an IP address, which a DNS name cannot be here.
+    let numeric_last = !last.is_empty() && last.bytes().all(|byte| byte.is_ascii_digit());
+    raw.len() <= 253 && raw.split('.').all(label_ok) && !numeric_last
+}
+
+/// A `host:port`, checked once. The host is a DNS name, an IPv4 address or a bracketed IPv6
+/// address.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct ProbeAddress(String);
+
+impl ProbeAddress {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for ProbeAddress {
+    type Error = String;
+
+    fn try_from(raw: String) -> Result<Self, String> {
+        let bad = || {
+            format!(
+                "schedule.vpn_probe must be host:port, with brackets around IPv6 addresses: {raw:?}"
+            )
+        };
+        let (host, port) = raw.rsplit_once(':').ok_or_else(bad)?;
+        let port_ok = !port.is_empty()
+            && port.bytes().all(|byte| byte.is_ascii_digit())
+            && port.parse::<u16>().is_ok_and(|port| port != 0);
+        let host_ok = match host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+            Some(inner) => inner.parse::<std::net::Ipv6Addr>().is_ok(),
+            None => host.parse::<std::net::Ipv4Addr>().is_ok() || dns_name_ok(host),
+        };
+        if !port_ok || !host_ok {
+            return Err(bad());
+        }
+        Ok(Self(raw))
+    }
+}
+
+impl From<ProbeAddress> for String {
+    fn from(address: ProbeAddress) -> String {
+        address.0
+    }
+}
+
+impl fmt::Display for ProbeAddress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// The DNS name that the probe's TLS certificate must carry, checked once.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct ProbeName(String);
+
+impl ProbeName {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for ProbeName {
+    type Error = String;
+
+    fn try_from(raw: String) -> Result<Self, String> {
+        if !dns_name_ok(&raw) {
+            return Err(format!(
+                "schedule.vpn_probe_name must be a DNS name such as \"vpn.example.org\", not an IP address, a value with spaces, or a trailing dot: {raw:?}"
+            ));
+        }
+        Ok(Self(raw))
+    }
+}
+
+impl From<ProbeName> for String {
+    fn from(name: ProbeName) -> String {
+        name.0
+    }
+}
+
+impl fmt::Display for ProbeName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
 /// Which witnesses must cosign a log checkpoint before a client trusts it.
@@ -977,5 +1243,146 @@ mod tests {
             "2026-03-31T11:00:00+00:00"
         );
         assert_eq!(span("300000000mo").after(t), None);
+    }
+
+    fn with_schedule(table: &str) -> String {
+        let start = DEMO.find("\n[schedule]").unwrap();
+        format!("{}\n{table}\n", &DEMO[..start])
+    }
+
+    #[test]
+    fn schedule_parses_vpn_and_always() {
+        let vpn = Manifest::parse(DEMO.as_bytes()).unwrap();
+        let schedule = vpn.body().schedule.clone().unwrap();
+        assert_eq!(schedule.interval.as_secs(), 55 * 60);
+        assert!(matches!(
+            &schedule.policy,
+            SendPolicy::Vpn { probe, name: Some(name) }
+                if probe.as_str() == "10.0.0.1:443" && name.as_str() == "vpn.example.org"
+        ));
+        assert_eq!(
+            schedule.to_string(),
+            "Automatic claims: only while vpn.example.org answers at 10.0.0.1:443, at most every 55m"
+        );
+        let always = Manifest::parse(
+            with_schedule("[schedule]\nmode = \"always\"\ninterval = \"1h\"").as_bytes(),
+        )
+        .unwrap();
+        let schedule = always.body().schedule.clone().unwrap();
+        assert_eq!(schedule.policy, SendPolicy::Always);
+        assert_eq!(
+            schedule.to_string(),
+            "Automatic claims: every 1h on any network"
+        );
+        let unnamed = with_schedule(
+            "[schedule]\nmode = \"vpn\"\nvpn_probe = \"[::1]:443\"\ninterval = \"5m\"",
+        );
+        let manifest = Manifest::parse(unnamed.as_bytes()).unwrap();
+        assert_eq!(
+            manifest.body().schedule.as_ref().unwrap().to_string(),
+            "Automatic claims: only while [::1]:443 answers, at most every 5m"
+        );
+    }
+
+    #[test]
+    fn a_manifest_without_a_schedule_has_none() {
+        let start = DEMO.find("\n[schedule]").unwrap();
+        let manifest = Manifest::parse(DEMO[..start].as_bytes()).unwrap();
+        assert!(manifest.body().schedule.is_none());
+    }
+
+    #[test]
+    fn schedule_rejects_bad_tables() {
+        let cases = [
+            (
+                "mode = \"vpn\"\ninterval = \"55m\"",
+                "vpn_probe is required",
+            ),
+            (
+                "mode = \"always\"\nvpn_probe = \"10.0.0.1:443\"\ninterval = \"55m\"",
+                "takes no vpn_probe",
+            ),
+            (
+                "mode = \"always\"\nvpn_probe_name = \"vpn.example.org\"\ninterval = \"55m\"",
+                "takes no vpn_probe",
+            ),
+            (
+                "mode = \"sometimes\"\ninterval = \"55m\"",
+                "unknown variant `sometimes`",
+            ),
+            (
+                "mode = \"vpn\"\nvpn_probe = \"10.0.0.1:443\"",
+                "missing field `interval`",
+            ),
+            (
+                "mode = \"vpn\"\nvpn_probe = \"10.0.0.1:443\"\ninterval = \"4m\"",
+                "schedule.interval",
+            ),
+            (
+                "mode = \"vpn\"\nvpn_probe = \"10.0.0.1:443\"\ninterval = \"25h\"",
+                "schedule.interval",
+            ),
+            (
+                "mode = \"vpn\"\nvpn_probe = \"10.0.0.1:443\"\ninterval = \"55\"",
+                "schedule.interval",
+            ),
+            (
+                "mode = \"vpn\"\nvpn_probe = \"10.0.0.1\"\ninterval = \"55m\"",
+                "schedule.vpn_probe must be host:port",
+            ),
+            (
+                "mode = \"vpn\"\nvpn_probe = \"10.0.0.1:443\"\nvpn_probe_name = \"10.0.0.1\"\ninterval = \"55m\"",
+                "schedule.vpn_probe_name",
+            ),
+            (
+                "mode = \"vpn\"\nvpn_probe = \"10.0.0.1:443\"\nvpn_probe_name = \"vpn.example.org.\"\ninterval = \"55m\"",
+                "schedule.vpn_probe_name",
+            ),
+            (
+                "mode = \"vpn\"\nvpn_probe = \"10.0.0.1:443\"\nextra = 1\ninterval = \"55m\"",
+                "unknown field `extra`",
+            ),
+        ];
+        for (table, expected) in cases {
+            let text = with_schedule(&format!("[schedule]\n{table}"));
+            let error = Manifest::parse(text.as_bytes()).unwrap_err().to_string();
+            assert!(error.contains(expected), "{table}: {error}");
+        }
+    }
+
+    #[test]
+    fn probe_requires_host_and_port() {
+        for address in ["vpn.example.org:443", "127.0.0.1:1234", "[::1]:443"] {
+            assert!(
+                ProbeAddress::try_from(address.to_string()).is_ok(),
+                "{address}"
+            );
+        }
+        for address in [
+            "vpn.example.org",
+            "example.org:443/path",
+            "user@example.org:443",
+            "example.org:443?x",
+            "example.org:443#x",
+            "bad host:443",
+            "example.org:0",
+            "example.org:70000",
+            "::1:443",
+            "300.0.0.1:443",
+        ] {
+            assert!(
+                ProbeAddress::try_from(address.to_string()).is_err(),
+                "{address}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_schedule_is_part_of_the_manifest_hash() {
+        let changed = DEMO.replace("interval = \"55m\"", "interval = \"30m\"");
+        assert_ne!(
+            Manifest::parse(DEMO.as_bytes()).unwrap().hash(),
+            Manifest::parse(changed.as_bytes()).unwrap().hash()
+        );
     }
 }
