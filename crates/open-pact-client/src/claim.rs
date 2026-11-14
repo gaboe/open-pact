@@ -432,29 +432,58 @@ impl Prepared {
         }
     }
 
-    /// Shows the request `send` would post. It reads the gateway and asks it the same questions as
-    /// `send` (the enforced manifest, the log, this device's own entries and its status), so it
-    /// shows nothing when `check` would send nothing. It posts no claim and writes no file; the
-    /// gateway issues one nonce for the signed log request, which no claim uses.
+    /// Shows the request `send` would post, after GET checks and locally known admission state.
+    /// Own-entry admission needs a signed request, so the dry run reports that result as unknown.
     pub(crate) async fn dry_run(self, home: &Home) -> Result<Preview> {
         let http = crate::http_client()?;
-        let mut enrolment = self.enrolment.clone();
+        let enrolment = self.enrolment.clone();
         let enforced = crate::enforced_manifest(&http, &enrolment.gateway).await?;
         let changed = (enforced != enrolment.manifest).then(|| enforced.clone());
-        let verified = match admit(
+        let verified = match crate::sync_checkpoint_with(
             &http,
             home,
-            &self.manifest,
-            &enforced,
-            &mut enrolment,
-            changed.as_ref(),
+            &enrolment.gateway,
+            self.manifest.body().log.as_ref(),
             false,
         )
         .await?
         {
-            Ok((verified, _)) => verified,
-            Err(outcome) => return Ok(Preview::NotSent(outcome)),
+            Ok(checkpoint) => checkpoint,
+            Err(text) => {
+                crate::report_log(LogSync::Alarm(text.clone()), home);
+                return Ok(Preview::NotSent(Outcome::Alarm(text)));
+            }
         };
+        if let Some(changed) = changed {
+            let command = crate::client_command(&home.0);
+            println!("{}", crate::manifest_change_notice(&changed, &command));
+            crate::print_claim_log_status(home, None, Some("the manifest changed"));
+            return Ok(Preview::NotSent(Outcome::NotSent(NotSent::AcceptPending(
+                changed,
+            ))));
+        }
+        match enrolment.last_status {
+            Some(DeviceStatus::Pending) => {
+                let command = crate::client_command(&home.0);
+                println!("This device waits for IT approval.");
+                println!("Wizard step [4/6] is unfinished. Continue with: {command} join");
+                crate::print_claim_log_status(
+                    home,
+                    None,
+                    Some("the device is waiting for IT approval"),
+                );
+                return Ok(Preview::NotSent(Outcome::NotSent(NotSent::Pending)));
+            }
+            Some(DeviceStatus::Revoked) => {
+                println!("IT revoked this device.");
+                crate::print_claim_log_status(home, None, Some("IT revoked this device"));
+                return Ok(Preview::NotSent(Outcome::NotSent(NotSent::Revoked)));
+            }
+            Some(DeviceStatus::Approved) | None => {}
+        }
+        println!(
+            "check also asks the gateway whether this device may send; the dry run skips that signed request."
+        );
         let log_checkpoint = crate::disclosable_checkpoint(&self.manifest, Some(verified));
         let claim = self.claim(
             String::new(),
@@ -690,6 +719,10 @@ async fn admit(
                 }
                 (Err(error), None) => return Err(error),
             };
+            if store && enrolment.last_status != Some(state) {
+                enrolment.last_status = Some(state);
+                home.write("enrolment.json", &serde_json::to_vec_pretty(enrolment)?)?;
+            }
             return match state {
                 DeviceStatus::Pending => {
                     println!("This device waits for IT approval.");
@@ -724,6 +757,13 @@ async fn admit(
         }
         result => result?,
     };
+    if store
+        && matches!(&sync, LogSync::Verified(..))
+        && enrolment.last_status != Some(DeviceStatus::Approved)
+    {
+        enrolment.last_status = Some(DeviceStatus::Approved);
+        home.write("enrolment.json", &serde_json::to_vec_pretty(enrolment)?)?;
+    }
     Ok(match sync {
         LogSync::Verified(cp, own) => Ok((cp, own)),
         LogSync::AcceptPending(pending) => {
