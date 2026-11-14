@@ -7,7 +7,7 @@ The client reports the controls in this table only when the signed manifest list
 | `managed_repos_outside` | Integer count | Matching repositories outside every `[managed_repos].folders` entry | A repository must have a remote that matches a signed pattern. A copy without a remote is not counted. |
 | `managed_repos_total` | Integer count | All matching repositories | A repository must have a remote that matches a signed pattern. |
 | Either repository control when no scan exists or the scan is older than 48 hours | `unknown` | No current scan result | The scheduled scan runs at most once per 24 hours from the last scan attempt, including a partial scan. |
-| Either repository control when `repo-scan.json` is corrupt | `unknown` | No usable stored scan | The report continues and sends the other controls. |
+| Either repository control when `repo-scan.json` is corrupt | `unknown` | No usable stored scan | The claim continues and sends the other controls. |
 | Either repository control after a partial scan | `unknown` | The scan could not read one or more folders | The local scan file keeps the attempt time, partial flag, access status, and paths found. The report sends no partial counts because an unreadable folder could hide a matching repository. |
 | Either repository control after macOS denies folder access | `unknown` | Some folders could not be read | Grant Full Disk Access to the client binary. `check` prints the binary path and does not print denied folder paths. |
 
@@ -15,7 +15,7 @@ The client scans the user's home at `join`, `check`, and at most once per 24 hou
 
 The client reads remote URLs from each repository's local Git configuration. It does not run Git. It counts SSH, HTTPS, and scp-style URLs when their host and path match a pattern in the signed manifest. SSH aliases use the first `HostName` from matching `Host` blocks in file order, including wildcard and negated patterns.
 
-The device stores the scan time, counts, outside paths, and all matching repository paths in `repo-scan.json` in the client home. A report sends only the two integer counts. The `check` command prints outside paths. Setup proposals group all matching paths by their home folders.
+The device stores the scan time, counts, outside paths, and all matching repository paths in `repo-scan.json` in the client home. A claim sends only the two integer counts. The `check` command prints outside paths. Setup proposals group all matching paths by their home folders.
 
 This scan cannot find a copy without a matching remote. A `url.*.insteadOf` rewrite in `~/.gitconfig` can hide a matching remote. A repository deeper than eight levels can be missed. The scanner does not read SSH `Include` files. An unreadable folder makes both repository counts `unknown`; the scan continues and records its partial status locally.
 ## Control contracts by platform

@@ -1,6 +1,6 @@
 # Install and use the client
 
-The client sends results only for controls and outputs that the signed manifest permits. On Windows, a selected check can run a cached PowerShell batch that also reads other controls, browser profiles, and event sources. The client sends only permitted results in its claim or report. It sends a signed claim when you run `check`. It sends a separate status report when you run `report` or install a report schedule.
+The client sends results only for controls and outputs that the signed manifest permits. On Windows, a selected check can run a cached PowerShell batch that also reads other controls, browser profiles, and event sources. The client sends only permitted results in its claim. It sends a signed claim when you run `check` and, while the device is on the company VPN, from the scheduled job.
 
 ## Install with a package manager
 
@@ -100,7 +100,7 @@ open-pact-client join 'opi1:replace-with-your-invitation'
 
 The client checks the gateway keys and transparency checkpoint before it displays the manifest. Read the manifest before you approve the signature prompt. The owner key signs the manifest hash and the device enrolment statement. The gateway leaves the device pending until an operator approves its device code. After it prints the code, `join` checks for approval every 10 seconds. It reports approval only after it verifies the device's `device_approved` entry in the signed log. Press Ctrl+C to stop waiting. The enrolment stays on disk, so run `join` again or run `check` later. Pass `--no-wait` to print the code and exit without polling.
 
-After an interactive `join` verifies approval, the wizard writes or keeps `open-pact.toml` and asks you to review it before the first claim. Open the file in your editor and add the repository folders for managed repository checks. The wizard validates the saved file, then asks whether to send the first report. If you stop, run `join` again to resume.
+After an interactive `join` verifies approval, the wizard writes or keeps `open-pact.toml` and asks you to review it before the first claim. Open the file in your editor and add the repository folders for managed repository checks. The wizard validates the saved file, then asks whether to send the first claim. The scheduled job stays off until you enable `[schedule]` and run `apply`. If you stop, run `join` again to resume.
 
 On macOS, `join` reuses an existing device key. It creates a Secure Enclave key only when no key exists and creation succeeds. If creation fails, the client warns and uses a software key. Pass `--software-key` to select a software key for a new device. On Windows, an elevated administrator join tries a TPM key. A non-elevated join or an unavailable provider uses a software key. Marker write and key ACL failures stop join. Linux uses software keys. The owner key and the VPN certificate key are software keys on every platform.
 
@@ -120,7 +120,7 @@ The first sync verifies the gateway signature with the pinned log key and enforc
 
 If private log access is denied, `check` asks for this device's status. A pending device gets an IT approval message. A revoked device gets a revocation message. Both return exit code 1 without sending a claim.
 
-Run `open-pact-client log head` to show the last verified checkpoint. Run `open-pact-client log prove` to verify the inclusion proof for this device's enrolment. Run `open-pact-client log show` to print claims and gateway responses. Run `open-pact-client log reports` to print report requests and collector responses from the last 90 days. It combines home and SYSTEM history, sorts records by time, and labels each source. On Windows, an elevated prompt includes protected SYSTEM history. Without elevation, the command prints readable home history and says how to include SYSTEM history.
+Run `open-pact-client log head` to show the last verified checkpoint. Run `open-pact-client log prove` to verify the inclusion proof for this device's enrolment. Run `open-pact-client log show` to print claims and gateway responses.
 
 ### Accept a changed manifest
 
@@ -136,17 +136,17 @@ Run `open-pact-client manifest show` to review the signed manifest stored on thi
 
 ## Declare the device configuration
 
-After IT approves the device outside the interactive `join` wizard, run `open-pact-client finish`. With no `open-pact.toml`, it shows and writes the same template as `config example`. With an existing file, it reports no changes and keeps your text. It then runs `check`. Use `--yes` to skip the confirmation. Run `open-pact-client config example` to print a template without writing a file. When the company gives you a collector address, write it in `[report].collector` in `open-pact.toml`.
+After IT approves the device outside the interactive `join` wizard, run `open-pact-client finish`. With no `open-pact.toml`, it shows and writes the same template as `config example`. With an existing file, it reports no changes and keeps your text. It then runs `check`. Use `--yes` to skip the confirmation. Run `open-pact-client config example` to print a template without writing a file.
 
 ```toml
-[report]
-# Set collector to the address your company gives you before enabling the schedule.
-# collector = "https://collector.example.org/status"
-# vpn_probe = "vpn.example.org:443"
-
 [schedule]
+# The scheduled job sends the same claim as `open-pact-client check`, only while vpn_probe
+# connects. Set enabled to true, then run open-pact-client apply.
 enabled = false
 run_as = "user"
+mode = "vpn"
+# vpn_probe is a host:port that answers only on the company VPN.
+# vpn_probe = "10.20.0.1:443"
 
 [managed_repos]
 # Managed repositories found: 3
@@ -155,29 +155,37 @@ run_as = "user"
 # folders = ["~/projects", "~/source"]
 ```
 
-Every section is optional. Only `finish` writes this file, after your confirmation. Unknown sections or keys cause an error that names the file and key. Set `[report].collector` to the address your company gives you before sending a report or enabling the schedule. Enable the schedule after you set the collector and confirm VPN access. The client lists the folders it found in comments. To include suggested folders, remove only `# ` from the `folders` line. Edit the list if you want to include only some folders. Folder entries must be absolute after `~` expands to your user home. The loader does not inspect those paths. Folder paths stay on the device. These folders are reserved for managed repository checks.
+Every section is optional. Only `finish` writes this file, after your confirmation. Unknown sections or keys cause an error that names the file and key. Enable the schedule after you confirm VPN access and set `vpn_probe`. The client lists the folders it found in comments. To include suggested folders, remove only `# ` from the `folders` line. Edit the list if you want to include only some folders. Folder entries must be absolute after `~` expands to your user home. The loader does not inspect those paths. Folder paths stay on the device. These folders are reserved for managed repository checks.
 
 Run `check` to see one row per manifest control. Each row shows the requirement for your OS, the device setting that feeds it, and the result. A missing or invalid configuration prints what to add or fix. Other controls still run.
 
-The client scans for repositories that match the signed `remotes` patterns. It counts each matching repository inside the registered folders in `managed_repos_total`. It counts each matching repository outside those folders in both `managed_repos_total` and `managed_repos_outside`. The client stores paths locally and reports only counts. See [client controls](controls.md) for the scan rules and limits.
+The client scans for repositories that match the signed `remotes` patterns. It counts each matching repository inside the registered folders in `managed_repos_total`. It counts each matching repository outside those folders in both `managed_repos_total` and `managed_repos_outside`. The client stores paths locally and sends only counts. See [client controls](controls.md) for the scan rules and limits.
 
 On macOS, grant Full Disk Access to the client binary in System Settings before you use repository counts. Open Privacy & Security, select Full Disk Access, and add the client binary. If a scan still cannot read some folders, `check` reports `unknown` and prints the client binary path. It does not print denied folder paths.
 
-## Send a report
+## See what a claim sends
 
-Declare `[report].collector`, then inspect the signed payload:
+Inspect the claim that `check` would send now:
 
 ```sh
-open-pact-client report --dry-run
+open-pact-client check --dry-run
 ```
 
-The command prints the JSON report and its compact ES256 JWS. It sends nothing. Run `open-pact-client report` to send it. The HTTPS collector must verify the JWS with the enrolled device's public key and return HTTP 2xx to acknowledge it.
-
-A report includes `spec_version = "1.1"`, the enrolled device pseudonym in `device_id`, a random `report_id`, UTC time, client version, OS, key protection type, and manifest control results. `report_type` is `connect`, `event`, or `periodic`. Manual reports use `periodic`. Reports contain no public key or folder paths. The gateway does not receive this separate report.
+The command runs the same local checks as `check` and prints the claim as JSON. It adds `manifest_toml` when the gateway enforces another manifest than the one you signed. It sends only GET requests, for the enforced manifest, the log keys, the checkpoint, and its consistency proof. It sends no nonce request and no claim, and it writes no file, so it leaves `repo-scan.json`, the stored checkpoint, and `claims.jsonl` as they are. The nonce, the time of sending, and the VPN certificate request appear as placeholders, because the client creates them when it sends. The scheduled job sends this same claim.
 
 ## Apply the schedule
 
-Choose a collector that the device can reach only through the VPN. Set `[schedule].enabled = true`, then run:
+The scheduled job runs the claim pipeline of `check` and sends the claim only while the device is on the company VPN. It replaces the separate report to a collector: the gateway is the only server. Set `[schedule]` in `open-pact.toml`:
+
+```toml
+[schedule]
+enabled = true
+run_as = "user"
+mode = "vpn"
+vpn_probe = "10.20.0.1:443"
+```
+
+Choose a `vpn_probe` that connects only on the company VPN. An enabled schedule needs `mode = "vpn"` and `vpn_probe`. The mode `always` is not available. Then run:
 
 ```sh
 open-pact-client apply --dry-run
@@ -185,17 +193,19 @@ open-pact-client apply
 open-pact-client apply
 ```
 
-The first apply prints `schedule: install`. The second prints `no changes`. Dry run writes nothing. A collector or run-as edit produces `schedule: update`. Keep the client binary at its installed path. Use the same absolute `--home` for each apply.
+The first apply prints `schedule: install`. The second prints `no changes`. Dry run writes nothing. A probe or run-as edit produces `schedule: update`. Keep the client binary at its installed path. Use the same absolute `--home` for each apply.
 
-The scheduled run reads the file each time. It probes the collector host and port every five minutes. Set `[report].vpn_probe = "host:port"` to override the target. Use brackets around IPv6 addresses. Both the collector and probe must be unreachable outside the VPN. A public collector does not prevent off-VPN sends.
+The scheduled run reads the file each time. It tries a TCP connection to `vpn_probe` every five minutes, with a two-second timeout. Use brackets around IPv6 addresses. An address that also answers off the VPN makes the job send off the VPN.
 
-The job probes before report preparation and again before sending. It sends after a detected connection, then after at least 55 minutes since the last acknowledgment. A failed send retries later. A lost acknowledgment can cause a duplicate report. A required control that changes from compliant to non-compliant triggers an extra report. Missing results and `unknown` count as non-compliant without grace. Controls with no requirement do not trigger.
+The job probes before it prepares the claim and again before it sends the first POST. It sends after a detected connection, then after at least 55 minutes since the last claim that the gateway answered. An accepted claim and a denied claim both count as answered. A failed send retries later. The job takes the same lock as `check` and `accept`, and it skips a run while one of them holds it. It scans repositories at most once a day and uses the stored counts between scans. A required control that changes from compliant to non-compliant triggers an extra claim. Missing results and `unknown` count as non-compliant without grace. Controls with no requirement do not trigger.
 
-On Windows, a new Security event 1102 or Defender detection also triggers an event report. A limited task needs Event Log Readers access to read Security events. SYSTEM can read that log. The first successful read sets each event baseline. The job keeps pending events while offline. It sends at most one report per run. Only acknowledgment clears pending events.
+On Windows, a new Security event 1102 or Defender detection also triggers an extra claim. A limited task needs Event Log Readers access to read Security events. SYSTEM can read that log. The first successful read sets each event baseline. The job keeps pending events while offline. It sends at most one claim per run. Only an answer from the gateway clears pending events.
+
+The job cannot ask you anything. When only you can fix a problem, it writes a dated line to `schedule.log` in the client home: a changed manifest (run `accept`), a gateway denial and its reasons, a device that waits for approval or that IT revoked, a transparency log alarm, or an error. The log keeps two files of at most 256 KiB each. Run `check` to see the full result. `claims.jsonl` keeps every claim and response, as for `check`.
 
 macOS uses a launchd LaunchAgent. Linux uses a systemd user timer and needs a running user manager. Windows uses a limited Task Scheduler task when `run_as = "user"`.
 
-If an old job exists without `open-pact.toml`, `check` and `apply` print the content that reproduces it. Create that file before applying. Until then, apply changes nothing. Successful apply removes the old `report-schedule.json`. Setup uses only the configuration file and apply.
+A `[report]` table from an earlier client is an error. Move its `vpn_probe` into `[schedule]`, add `mode = "vpn"`, and delete `[report]`.
 
 ### Use Windows SYSTEM checks
 
@@ -205,11 +215,11 @@ Set `[schedule].run_as = "system"`. Run apply from an elevated PowerShell prompt
 open-pact-client --home 'C:\Example User\pact' apply
 ```
 
-Without elevation, apply prints the exact elevated command and changes nothing. Other operating systems reject `system`. The installer copies the client into `%ProgramFiles%\open-pact\open-pact-client.exe` and refuses a directory that non-administrators can write. SYSTEM reads the selected absolute client home and keeps report state under protected `%ProgramData%`. Choose a home path without `%`. The task reads Windows settings and does not change them. See [platform support](platform-support.md) for checks that need SYSTEM access.
+Without elevation, apply prints the exact elevated command and changes nothing. Other operating systems reject `system`. The installer copies the client into `%ProgramFiles%\open-pact\open-pact-client.exe` and refuses a directory that non-administrators can write. The SYSTEM job runs with `--system --user-home <profile>`. It reads the selected absolute client home, expands `~` in `open-pact.toml` against that profile, and keeps its state under protected `%ProgramData%`. Choose a home path without `%`. The task reads Windows settings and does not change them. See [platform support](platform-support.md) for checks that need SYSTEM access.
 
-### Stop reports and remove the client
+### Stop the scheduled claims and remove the client
 
-Set `[schedule].enabled = false` or remove the schedule section. Run `apply` with the same absolute `--home` before deleting the binary or client home. Apply removes the job, the applied-settings receipt, and report state. It keeps `open-pact.toml`. If the entire client home is already missing, apply removes the remaining job without recreating it. Run `stop` to print these instructions.
+Set `[schedule].enabled = false` or remove the schedule section. Run `apply` with the same absolute `--home` before deleting the binary or client home. Apply removes the job, the applied-settings receipt, and the job state. It keeps `open-pact.toml`. If the entire client home is already missing, apply removes the remaining job without recreating it. Run `stop` to print these instructions.
 
 Limited Windows operations leave orphaned protected state and the shared binary unchanged. To remove those leftovers, set `run_as = "system"` with `enabled = false` and run apply elevated. SYSTEM removal needs elevation and uses the existing protected state lock. A held lock stops task removal and asks you to retry. Removal cleans up the shared binary only when no SYSTEM task uses it. If cleanup fails, retry apply after the client stops or Windows restarts. Keep the configuration file until cleanup succeeds.
 
@@ -219,11 +229,7 @@ Limited Windows operations leave orphaned protected state and the shared binary 
 
 `accept` sends the new manifest hash, the owner public key, and signatures by the owner and device keys over both manifest hashes and a gateway nonce.
 
-`check` sends the signed claim fields that the manifest permits. When the gateway enforces another manifest, `check` also sends the manifest text that you signed, so the gateway can apply its terms. These include control results and permitted device metadata. The VPN certificate request travels beside the claim. Its private key stays on the device. The client stores claims and responses in `claims.jsonl`.
-
-`report` sends a signed payload to the HTTPS collector. It contains report metadata and control results. It contains no raw system logs, public key, or folder paths. The client stores each non-dry-run `report` command and scheduled report that receives an HTTP response in `reports.jsonl`.
-
-Each record keeps the exact signed request, response body, and HTTP status. If the client cannot read the full response body, `log reports` marks the record as incomplete. The client removes records older than 90 days on the next report. Limited jobs and manual `report` commands store this file beside `report-state.json` in the client home. Windows SYSTEM jobs store scheduled report history in the protected SYSTEM state directory. `log reports` combines both files and labels each record as `home` or `system`.
+`check` and the scheduled job send the signed claim fields that the manifest permits. When the gateway enforces another manifest, they also send the manifest text that you signed, so the gateway can apply its terms. These include control results and permitted device metadata. The VPN certificate request travels beside the claim. Its private key stays on the device. The client stores claims and responses in `claims.jsonl`. `check --dry-run` prints the claim and sends none of it.
 
 ## Troubleshoot common failures
 
@@ -234,9 +240,9 @@ Each record keeps the exact signed request, response body, and HTTP status. If t
 | `check` reports that the manifest changed | Run `open-pact-client accept`. Review the changes and sign the new manifest. You need no new invitation or approval. |
 | `check` says the device is pending | Give the device code to the gateway operator. Wait for approval. |
 | A check returns `unknown` on Windows | Run the task as an elevated administrator when the control needs machine-wide access. Set `run_as = "system"` in `open-pact.toml`, then run `apply` as an administrator. |
-| Windows event reports do not trigger | Check Event Log Readers access for the limited task user. Check that Defender history can be read. |
+| Windows event claims do not trigger | Check Event Log Readers access for the limited task user. Check that Defender history can be read. |
 | Linux apply cannot reach systemd | Start the user systemd manager. Run `apply` again. |
-| Schedule does not send | Check that the collector uses HTTPS, the VPN probe is reachable only through the VPN, and the binary remains at its installed path. |
+| Schedule does not send | Read `schedule.log` in the client home. Check that `vpn_probe` connects while the VPN is up, that `mode = "vpn"` is set, and that the binary remains at its installed path. |
 | `apply` cannot find the job | Use the same absolute `--home` path that you used for the earlier `apply` command. |
 | `apply` names an unknown key | Correct the section and key in `open-pact.toml`. Run `apply` again. |
 
@@ -250,7 +256,7 @@ On Windows, use the account that created the CNG key or SYSTEM. A different admi
 
 Run the client as the account that uses the device. `work_account` reports `admin` for membership in `sudo`, `wheel`, or `root`. The systemd user timer needs a running user manager. A container without that manager cannot install or exercise the user timer.
 
-To use the Linux ClamAV detection trigger, route `clamonacc` or `clamd` detection output to the system journal. Give the client account read access to that journal. The client reads trusted process names and `FOUND` records. The report timer checks every five minutes while the VPN is connected. File-only logs do not supply this trigger. A denied journal read preserves the saved detection baseline.
+To use the Linux ClamAV detection trigger, route `clamonacc` or `clamd` detection output to the system journal. Give the client account read access to that journal. The client reads trusted process names and `FOUND` records. The scheduled job checks every five minutes while the VPN is connected. File-only logs do not supply this trigger. A denied journal read preserves the saved detection baseline.
 
 The boot authentication check reads root and active swap mappings from `lsblk` and `/etc/crypttab`. An unspecified crypttab key reports `unknown` because automatic keys cannot be excluded. Explicit hardware PIN options report `user_secret`. A configured TPM2, FIDO2, or Clevis unlock reports `hardware_only`. A keyfile on a verified unencrypted filesystem reports `none`. Missing evidence reports `unknown`.
 

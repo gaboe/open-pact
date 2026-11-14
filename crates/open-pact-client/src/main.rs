@@ -115,7 +115,7 @@ enum Command {
         #[command(subcommand)]
         command: LogCommand,
     },
-    /// Show how to stop scheduled reports and remove the client
+    /// Show how to stop the scheduled claims and remove the client
     Stop,
     /// Destroy the device key before full uninstall or rotation
     DeleteDeviceKey,
@@ -1408,6 +1408,10 @@ fn review_config_with(
     reject_config_symlink(&path)?;
     writeln!(output, "Review {} before the first claim.", path.display())?;
     writeln!(output, "For example, add repository folders to `folders`.")?;
+    writeln!(
+        output,
+        "The scheduled job stays off until you enable [schedule] and run `apply`."
+    )?;
     if confirm_yes_by_default_from("Open open-pact.toml in your editor?", input, output)? {
         open_editor_for_review(&path, input, output, command, &mut open_editor)?;
     }
