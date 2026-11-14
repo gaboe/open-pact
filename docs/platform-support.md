@@ -30,7 +30,7 @@ This page lists the built-in controls in `crates/open-pact-client/src/checks/mod
 | `log_cleared` | `n/a` | RFC 3339 UTC time, JSON null, or `unknown` from Security and System logs | `n/a` | Windows needs administrator or SYSTEM access to read both logs. |
 | VPN certificate installation | Supported | Supported; `vpn\current` pointer, flat copies can lag while another program holds them open | Supported | Device user. |
 | Device key protection | `secure_enclave` or `os_permissions` | `tpm` or `os_permissions` | `os_permissions` | Joining user and SYSTEM on Windows. |
-| Report scheduler | launchd LaunchAgent, every five minutes | Task Scheduler, every five minutes; limited user or SYSTEM | systemd user timer, every five minutes | Windows SYSTEM install and uninstall need an elevated prompt. Linux needs a running user manager. |
+| Claim scheduler | launchd LaunchAgent, every five minutes | Task Scheduler, every five minutes; limited user or SYSTEM | systemd user timer, every five minutes | Windows SYSTEM install and uninstall need an elevated prompt. Linux needs a running user manager. |
 
 When a control returns `n/a`, the client sends `n/a` only if the manifest allows that value. Otherwise, it sends `unknown` when the manifest allows `unknown`. If neither value is allowed, the client omits the result. An omitted required result can cause the gateway to deny the claim.
 
@@ -38,7 +38,7 @@ When a control returns `n/a`, the client sends `n/a` only if the manifest allows
 
 Set `[schedule].run_as = "system"` in `open-pact.toml` and run `apply` from an elevated PowerShell prompt to read machine-wide Windows settings. The SYSTEM task can read `preboot_auth`, `os_patch_age_days`, `log_oldest_record_days`, `process_audit`, and `log_cleared`. It can also inspect browser settings in other user profiles. The task reads settings. It does not change them.
 
-The limited Windows task runs as the current user. It may report `unknown` when Windows denies access. To trigger an extra report after a Security log clear, add the task user to the built-in `Event Log Readers` group. SYSTEM can read the Security log without that group. Without either access, the Security log clear trigger is unavailable.
+The limited Windows task runs as the current user. It may report `unknown` when Windows denies access. To trigger an extra claim after a Security log clear, add the task user to the built-in `Event Log Readers` group. SYSTEM can read the Security log without that group. Without either access, the Security log clear trigger is unavailable.
 
 Defender controls require Microsoft Defender Antivirus in Normal mode with the service enabled. Other antivirus providers return `unknown` for Defender metrics. Active threat counts describe Defender threats that are still active.
 
@@ -70,7 +70,7 @@ unverified until `windows_tpm_roundtrip` runs on a TPM machine.
 
 ## Schedule support
 
-The SYSTEM task is available only on Windows. It reads the selected user's absolute `--home` path and stores its report state under `%ProgramData%`. It uses a shared client binary under `%ProgramFiles%`. The installer rejects a Windows home path that contains `%`.
+The SYSTEM task is available only on Windows. It reads the selected user's absolute `--home` path and stores its job state under `%ProgramData%`. The job runs with `--system --user-home <profile>`, so `~` in `open-pact.toml` expands against the selected user's profile. It uses a shared client binary under `%ProgramFiles%`. The installer rejects a Windows home path that contains `%`.
 
 ## Log-clearing output
 
@@ -94,7 +94,7 @@ Linux `web_protection` reads standard package locations for Chrome, Chromium, an
 
 `antimalware_active_threats` remains `unknown`. A ClamAV `FOUND` record does not say whether a later delete, move, or repair resolved the threat. `antimalware_full_scan_age_days` remains `unknown`. A completed `clamscan` log identifies the selected scan scope, which can be one file or a directory. It does not prove a complete device scan. `password_set` remains `unknown`. Standard users cannot read the shadow database, and a locked local password does not exclude other PAM authentication methods.
 
-The Linux detection marker reads the newest system-journal `FOUND` record from `clamonacc` or `clamd`. It uses the journal's trusted process name and microsecond timestamp. The scheduled five-minute poll can send an extra report when that marker advances. The scheduler retains a detection across failed sends and VPN disconnection. A journal permission warning returns an unknown read and preserves the previous baseline. File-only ClamAV logging has no supported event marker because a line without a trusted timestamp cannot supply a reliable event time. Operators must route ClamAV detections to the readable system journal for this trigger.
+The Linux detection marker reads the newest system-journal `FOUND` record from `clamonacc` or `clamd`. It uses the journal's trusted process name and microsecond timestamp. The scheduled five-minute poll can send an extra claim when that marker advances. The scheduler retains a detection across failed sends and VPN disconnection. A journal permission warning returns an unknown read and preserves the previous baseline. File-only ClamAV logging has no supported event marker because a line without a trusted timestamp cannot supply a reliable event time. Operators must route ClamAV detections to the readable system journal for this trigger.
 
 `log_cleared` stays `n/a` on Linux. Journal rotation and vacuuming remove old files without a retained, authoritative last-clear timestamp. An oldest visible entry cannot distinguish administrative clearing from retention or a new installation.
 

@@ -8,7 +8,7 @@ Rule for a change: a new direct dependency needs a line in this file. A security
 
 | Crate | Why |
 | --- | --- |
-| `serde`, `serde_json` | Manifest, claim and report data types. |
+| `serde`, `serde_json` | Manifest and claim data types. |
 | `serde_jcs` | RFC 8785 canonical JSON, the bytes that signatures cover. |
 | `toml` | Parses the signed manifest body. |
 | `p256` | ECDSA P-256 signatures on manifests and claims. |
@@ -23,14 +23,14 @@ Rule for a change: a new direct dependency needs a line in this file. A security
 | Crate | Why |
 | --- | --- |
 | `open-pact-core` | Manifest verification, evaluation and claim signing. |
-| `serde`, `serde_json`, `toml` | Local config, reports, local log and the example manifest. |
+| `serde`, `serde_json`, `toml` | Local config, local log and the example manifest. |
 | `tokio` | Runtime, `process` (run OS probes), `signal` (Ctrl-C), `time`, `net` (loopback probe), `sync` (oneshot). `sync` is now listed explicitly instead of coming in through `reqwest`. |
 | `reqwest` | HTTPS client for the gateway. `rustls-tls` only, no default features, redirects off. |
 | `clap` | Command line. Features: `derive` plus defaults; colour and "did you mean" suggestions stay on for owners. |
-| `chrono` | Timestamps in reports and local log. Features: `clock` only. |
+| `chrono` | Timestamps in claims and local log. Features: `clock` only. |
 | `anyhow` | Error context in the binary. |
-| `uuid` | Random report ids and temporary file names (`v4`). |
-| `base64`, `hex`, `sha2` | Encode and hash report payloads, log entries and Linux package index files. |
+| `uuid` | Random temporary file names (`v4`). |
+| `base64`, `hex`, `sha2` | Encode and hash claim payloads, log entries and Linux package index files. |
 | `rcgen` | Builds the device certificate signing request. Features: `crypto`, `ring`, `pem`. The unused `x509-parser` feature is off. |
 | `x509-parser` | Reads and verifies the certificate the gateway returns (`verify` feature). |
 | `libc` (unix) | `geteuid`, `setpriority`, `confstr` for the trusted `PATH`. |

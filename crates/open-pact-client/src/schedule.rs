@@ -361,10 +361,10 @@ fn lock_system_state(home: &Home) -> Result<ScheduleLock> {
                 .to_string()
                 .contains("another schedule command is running") =>
         {
-            Err(error).context("SYSTEM report state is in use; retry this command")
+            Err(error).context("SYSTEM job state is in use; retry this command")
         }
         Err(error) => Err(error).context(format!(
-            "cannot lock SYSTEM report state at {}; run from an elevated prompt",
+            "cannot lock SYSTEM job state at {}; run from an elevated prompt",
             home.0.display()
         )),
     }
@@ -1104,7 +1104,7 @@ fn windows_system_uninstall(job: &Job, home: &Home) -> Result<()> {
         && let Err(error) = remove_system_state_directory(&state)
     {
         failures.push(format!(
-            "SYSTEM report state remains at {}: {error}",
+            "SYSTEM job state remains at {}: {error}",
             state.display()
         ));
     }
