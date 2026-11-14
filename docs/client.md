@@ -197,6 +197,19 @@ The first apply prints `schedule: install`. The second prints `no changes`. Dry 
 
 The scheduled run reads the file each time. It tries a TCP connection to `vpn_probe` every five minutes, with a two-second timeout. Use brackets around IPv6 addresses. An address that also answers off the VPN makes the job send off the VPN.
 
+A private address such as `10.0.0.1:443` can also exist on other networks, such as hotel or home routers, so a TCP connection alone can match the wrong network. Set `vpn_probe_name` to prove the right host. The probe then connects to `vpn_probe` without a DNS lookup of the name, and it needs a TLS certificate that is valid for that name:
+
+```toml
+[schedule]
+enabled = true
+run_as = "user"
+mode = "vpn"
+vpn_probe = "10.0.0.1:443"
+vpn_probe_name = "vpn.example.org"
+```
+
+The certificate must chain to a root that the client trusts for its HTTPS requests. The probe has five seconds in total, and any HTTP status counts as an answer. The probe does not use a proxy. An empty value or an IP address for `vpn_probe_name` is an error.
+
 The job probes before it prepares the claim and again before it sends the first POST. It sends after a detected connection, then after at least 55 minutes since the last claim that the gateway answered. An accepted claim and a denied claim both count as answered. A failed send retries later. The job takes the same lock as `check` and `accept`, and it skips a run while one of them holds it. It scans repositories at most once a day and uses the stored counts between scans. A required control that changes from compliant to non-compliant triggers an extra claim. Missing results and `unknown` count as non-compliant without grace. Controls with no requirement do not trigger.
 
 On Windows, a new Security event 1102 or Defender detection also triggers an extra claim. A limited task needs Event Log Readers access to read Security events. SYSTEM can read that log. The first successful read sets each event baseline. The job keeps pending events while offline. It sends at most one claim per run. Only an answer from the gateway clears pending events.
@@ -242,7 +255,7 @@ Limited Windows operations leave orphaned protected state and the shared binary 
 | A check returns `unknown` on Windows | Run the task as an elevated administrator when the control needs machine-wide access. Set `run_as = "system"` in `open-pact.toml`, then run `apply` as an administrator. |
 | Windows event claims do not trigger | Check Event Log Readers access for the limited task user. Check that Defender history can be read. |
 | Linux apply cannot reach systemd | Start the user systemd manager. Run `apply` again. |
-| Schedule does not send | Read `schedule.log` in the client home. Check that `vpn_probe` connects while the VPN is up, that `mode = "vpn"` is set, and that the binary remains at its installed path. |
+| Schedule does not send | Read `schedule.log` in the client home. Check that `vpn_probe` connects while the VPN is up, that `mode = "vpn"` is set, and that the binary remains at its installed path. With `vpn_probe_name`, check that the probe presents a certificate for that name from a trusted root. |
 | `apply` cannot find the job | Use the same absolute `--home` path that you used for the earlier `apply` command. |
 | `apply` names an unknown key | Correct the section and key in `open-pact.toml`. Run `apply` again. |
 

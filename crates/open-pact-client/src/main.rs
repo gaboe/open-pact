@@ -3775,10 +3775,10 @@ fn log_show(path: &Path) -> Result<()> {
 
 async fn run(cli: Cli) -> Result<ExitCode> {
     if let Command::Schedule {
-        command: schedule::Command::Probe { address },
+        command: schedule::Command::Probe { address, name },
     } = &cli.command
     {
-        schedule::probe_blocking(address)?;
+        schedule::probe_command(address, name.as_deref()).await?;
         return Ok(ExitCode::SUCCESS);
     }
     let home = Home::new(cli.home)?;
@@ -6267,6 +6267,7 @@ mod tests {
     fn vpn_policy(probe: &str) -> device_config::SendPolicy {
         device_config::SendPolicy::Vpn {
             probe: device_config::ProbeAddress::parse(probe).unwrap(),
+            name: None,
         }
     }
 

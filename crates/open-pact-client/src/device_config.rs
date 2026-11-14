@@ -51,6 +51,7 @@ struct RawSchedule {
     run_as: RunAs,
     mode: Option<String>,
     vpn_probe: Option<String>,
+    vpn_probe_name: Option<String>,
 }
 
 /// The scheduled job: who runs it, and when and where it sends a claim.
@@ -64,8 +65,13 @@ pub(crate) struct Schedule {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "lowercase")]
 pub(crate) enum SendPolicy {
-    /// Send only while the probe connects.
-    Vpn { probe: ProbeAddress },
+    /// Send only while the probe connects. With `name`, the probe also needs a TLS certificate
+    /// that is valid for `name`.
+    Vpn {
+        probe: ProbeAddress,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<ProbeName>,
+    },
 }
 
 /// A `host:port`, checked once.
@@ -76,6 +82,42 @@ pub(crate) struct ProbeAddress(String);
 impl ProbeAddress {
     pub(crate) fn parse(raw: &str) -> Result<Self> {
         schedule::probe_address(raw)?;
+        Ok(Self(raw.to_owned()))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The DNS name that the probe's TLS certificate must carry, checked once.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub(crate) struct ProbeName(String);
+
+impl ProbeName {
+    pub(crate) fn parse(raw: &str) -> Result<Self> {
+        if raw.is_empty() {
+            bail!("must not be empty; set it to a DNS name such as \"vpn.example.org\"");
+        }
+        let labels: Vec<&str> = raw.split('.').collect();
+        let label_ok = |label: &&str| {
+            (1..=63).contains(&label.len())
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+        };
+        // An all-digit last label makes an IP address, which a certificate name cannot be here.
+        let numeric_last = labels
+            .last()
+            .is_some_and(|label| label.bytes().all(|byte| byte.is_ascii_digit()));
+        if raw.len() > 253 || !labels.iter().all(label_ok) || numeric_last {
+            bail!(
+                "must be a DNS name such as \"vpn.example.org\", not an IP address, a value with spaces, or a trailing dot: {raw:?}"
+            );
+        }
         Ok(Self(raw.to_owned()))
     }
 
@@ -95,6 +137,12 @@ impl RawSchedule {
             .map(ProbeAddress::parse)
             .transpose()
             .context("[schedule].vpn_probe")?;
+        let name = self
+            .vpn_probe_name
+            .as_deref()
+            .map(ProbeName::parse)
+            .transpose()
+            .context("[schedule].vpn_probe_name")?;
         match self.mode.as_deref() {
             None | Some("vpn") => {}
             Some("always") => bail!(
@@ -109,7 +157,7 @@ impl RawSchedule {
             let probe = probe.context(
                 "[schedule].vpn_probe is required when enabled = true: set it to a host:port that answers only on the company VPN",
             )?;
-            Some(SendPolicy::Vpn { probe })
+            Some(SendPolicy::Vpn { probe, name })
         } else {
             None
         };
@@ -933,7 +981,8 @@ folders = ['~/missing', '{}']
         assert_eq!(
             config.schedule.unwrap().send,
             Some(SendPolicy::Vpn {
-                probe: ProbeAddress::parse("10.20.0.1:443").unwrap()
+                probe: ProbeAddress::parse("10.20.0.1:443").unwrap(),
+                name: None,
             })
         );
         assert_eq!(
@@ -994,9 +1043,44 @@ folders = ['~/missing', '{}']
         assert_eq!(
             config.schedule.unwrap().send,
             Some(SendPolicy::Vpn {
-                probe: ProbeAddress::parse("[::1]:8443").unwrap()
+                probe: ProbeAddress::parse("[::1]:8443").unwrap(),
+                name: None,
             })
         );
+    }
+
+    #[test]
+    fn vpn_probe_name_is_parsed_and_checked() {
+        let text = "[schedule]\nenabled = true\nrun_as = 'user'\nmode = 'vpn'\nvpn_probe = '10.0.0.1:443'\nvpn_probe_name = 'vpn.example.org'";
+        assert_eq!(
+            DeviceConfig::parse(text, None)
+                .unwrap()
+                .schedule
+                .unwrap()
+                .send,
+            Some(SendPolicy::Vpn {
+                probe: ProbeAddress::parse("10.0.0.1:443").unwrap(),
+                name: Some(ProbeName::parse("vpn.example.org").unwrap()),
+            })
+        );
+        for bad in [
+            "",
+            "10.0.0.1",
+            "[::1]",
+            "vpn.example.org.",
+            "vpn example.org",
+            "-vpn.example.org",
+            "a..example.org",
+        ] {
+            let text = format!(
+                "[schedule]\nenabled = true\nrun_as = 'user'\nmode = 'vpn'\nvpn_probe = '10.0.0.1:443'\nvpn_probe_name = '{bad}'"
+            );
+            let error = format!("{:#}", DeviceConfig::parse(&text, None).unwrap_err());
+            assert!(
+                error.contains("[schedule].vpn_probe_name") && error.contains("DNS name"),
+                "{bad:?}: {error}"
+            );
+        }
     }
 
     #[test]
