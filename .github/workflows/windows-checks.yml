@@ -205,11 +205,11 @@ jobs:
           function Set-DeviceConfig($homePath, $enabled, $runAs) {
             $enabledToml = if ($enabled) { 'true' } else { 'false' }
             @(
-              '[report]',
-              'collector = "https://collector.example.org/status"',
               '[schedule]',
               "enabled = $enabledToml",
-              "run_as = `"$runAs`""
+              "run_as = `"$runAs`"",
+              'mode = "vpn"',
+              'vpn_probe = "127.0.0.1:9"'
             ) | Set-Content -Encoding UTF8 (Join-Path $homePath 'open-pact.toml')
           }
           function Install-System($homePath) {
@@ -255,7 +255,7 @@ jobs:
           try {
             $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
             if ((New-Object Security.Principal.WindowsPrincipal($identity)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'worker token is elevated' }
-            @('[report]', 'collector = "https://collector.example.org/status"', '[schedule]', 'enabled = true', 'run_as = "user"') | Set-Content -Encoding UTF8 "$homePath/open-pact.toml"
+            @('[schedule]', 'enabled = true', 'run_as = "user"', 'mode = "vpn"', 'vpn_probe = "127.0.0.1:9"') | Set-Content -Encoding UTF8 "$homePath/open-pact.toml"
             & $client --home $homePath apply
             if ($LASTEXITCODE -ne 0) { throw 'limited install failed' }
             if (-not (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue)) { throw 'limited task was not installed' }

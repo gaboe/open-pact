@@ -1,22 +1,21 @@
 use std::path::{Path, PathBuf};
 
-use crate::{Home, report, schedule};
+use crate::{Home, schedule};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 pub(crate) const FILE: &str = "open-pact.toml";
 
-const CONFIG_TEMPLATE: &str = r#"[report]
-# Set collector to the address your company gives you before enabling the schedule.
-# collector = "https://collector.example.org/status"
-# vpn_probe defaults to the collector host and port.
-# vpn_probe = "vpn.example.org:443"
-
-[schedule]
-# Set enabled to true, then run open-pact-client apply.
+const CONFIG_TEMPLATE: &str = r#"[schedule]
+# The scheduled job sends the same claim as `open-pact-client check`, only while vpn_probe
+# connects. Set enabled to true, then run open-pact-client apply.
 enabled = false
 # Use system only on Windows, from an elevated PowerShell prompt.
 run_as = "user"
+mode = "vpn"
+# vpn_probe is a host:port that answers only on the company VPN. The job sends nothing while
+# it does not connect, so never use an address that answers off the VPN.
+# vpn_probe = "10.20.0.1:443"
 
 [managed_repos]
 # Use absolute paths or ~/ paths. Paths stay on this device.
@@ -24,41 +23,101 @@ run_as = "user"
 folders = []
 "#;
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct DeviceConfig {
-    pub(crate) report: Option<Report>,
     pub(crate) schedule: Option<Schedule>,
     pub(crate) managed_repos: Option<ManagedRepos>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Report {
-    pub(crate) collector: Option<String>,
-    pub(crate) vpn_probe: Option<String>,
+struct RawConfig {
+    report: Option<RawReport>,
+    schedule: Option<RawSchedule>,
+    managed_repos: Option<ManagedRepos>,
 }
 
-impl Report {
-    pub(crate) fn probe(&self) -> Option<String> {
-        self.vpn_probe.clone().or_else(|| {
-            self.collector.as_deref().map(|collector| {
-                let url = report::collector_url(collector).expect("validated collector");
-                format!(
-                    "{}:{}",
-                    url.host().unwrap(),
-                    url.port_or_known_default().unwrap()
-                )
-            })
-        })
+/// The table that sent status reports to a collector. Only the old probe is read, to name it in
+/// the error.
+#[derive(Deserialize)]
+struct RawReport {
+    vpn_probe: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSchedule {
+    enabled: bool,
+    run_as: RunAs,
+    mode: Option<String>,
+    vpn_probe: Option<String>,
+}
+
+/// The scheduled job: who runs it, and when and where it sends a claim.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Schedule {
+    pub(crate) run_as: RunAs,
+    /// `None` when the schedule is off. `Some` always carries what the job needs to send.
+    pub(crate) send: Option<SendPolicy>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "lowercase")]
+pub(crate) enum SendPolicy {
+    /// Send only while the probe connects.
+    Vpn { probe: ProbeAddress },
+}
+
+/// A `host:port`, checked once.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub(crate) struct ProbeAddress(String);
+
+impl ProbeAddress {
+    pub(crate) fn parse(raw: &str) -> Result<Self> {
+        schedule::probe_address(raw)?;
+        Ok(Self(raw.to_owned()))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct Schedule {
-    pub(crate) enabled: bool,
-    pub(crate) run_as: RunAs,
+impl RawSchedule {
+    fn parse(self) -> Result<Schedule> {
+        if self.run_as == RunAs::System && !cfg!(windows) {
+            bail!("[schedule].run_as: system is available only on Windows");
+        }
+        let probe = self
+            .vpn_probe
+            .as_deref()
+            .map(ProbeAddress::parse)
+            .transpose()
+            .context("[schedule].vpn_probe")?;
+        match self.mode.as_deref() {
+            None | Some("vpn") => {}
+            Some("always") => bail!(
+                "[schedule].mode = \"always\" is not available: the scheduled job sends only while vpn_probe connects. Use mode = \"vpn\""
+            ),
+            Some(other) => bail!("[schedule].mode must be \"vpn\", not {other:?}"),
+        }
+        let send = if self.enabled {
+            if self.mode.is_none() {
+                bail!("[schedule].mode is required when enabled = true; set mode = \"vpn\"");
+            }
+            let probe = probe.context(
+                "[schedule].vpn_probe is required when enabled = true: set it to a host:port that answers only on the company VPN",
+            )?;
+            Some(SendPolicy::Vpn { probe })
+        } else {
+            None
+        };
+        Ok(Schedule {
+            run_as: self.run_as,
+            send,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -105,22 +164,19 @@ impl DeviceConfig {
     }
 
     pub(crate) fn parse(text: &str, user_home: Option<&Path>) -> Result<Self> {
-        let mut config: Self = toml::from_str(text).context("section/key")?;
-        if let Some(report) = &config.report {
-            if let Some(collector) = &report.collector {
-                report::collector_url(collector).context("[report].collector")?;
-            }
-            if let Some(probe) = report.probe() {
-                schedule::probe_address(&probe).context("[report].vpn_probe")?;
-            }
+        let raw: RawConfig = toml::from_str(text).context("section/key")?;
+        if let Some(report) = raw.report {
+            let probe = match report.vpn_probe {
+                Some(probe) => format!("`vpn_probe = {probe:?}`"),
+                None => "`vpn_probe` with an address that answers only on the company VPN".into(),
+            };
+            bail!(
+                "[report] was removed: the gateway now receives claims. Move {probe} into [schedule], add `mode = \"vpn\"`, and delete [report]"
+            );
         }
-        if let Some(schedule) = &config.schedule
-            && schedule.run_as == RunAs::System
-            && !cfg!(windows)
-        {
-            bail!("[schedule].run_as: system is available only on Windows");
-        }
-        if let Some(repos) = &mut config.managed_repos {
+        let schedule = raw.schedule.map(RawSchedule::parse).transpose()?;
+        let mut managed_repos = raw.managed_repos;
+        if let Some(repos) = &mut managed_repos {
             for folder in &mut repos.folders {
                 if folder == Path::new("~") || folder.starts_with("~/") {
                     let home = user_home
@@ -135,7 +191,10 @@ impl DeviceConfig {
                 }
             }
         }
-        Ok(config)
+        Ok(Self {
+            schedule,
+            managed_repos,
+        })
     }
 }
 
@@ -366,12 +425,12 @@ mod tests {
         assert!(DeviceConfig::load(&home).unwrap().is_none());
         std::fs::write(
             home.file(FILE),
-            "[report]\ncollector = 'http://example.org'",
+            "[schedule]\nenabled = true\nrun_as = 'user'\nmode = 'vpn'",
         )
         .unwrap();
         let error = format!("{:#}", DeviceConfig::load(&home).unwrap_err());
         assert!(
-            error.contains(FILE) && error.contains("[report].collector"),
+            error.contains(FILE) && error.contains("[schedule].vpn_probe"),
             "{error}"
         );
         std::fs::write(
@@ -379,7 +438,13 @@ mod tests {
             "[schedule]\nenabled = false\nrun_as = 'user'",
         )
         .unwrap();
-        assert!(DeviceConfig::load(&home).unwrap().unwrap().report.is_none());
+        assert_eq!(
+            DeviceConfig::load(&home).unwrap().unwrap().schedule,
+            Some(Schedule {
+                run_as: RunAs::User,
+                send: None
+            })
+        );
     }
 
     #[test]
@@ -389,11 +454,10 @@ mod tests {
                 .unwrap();
         let text = example(&manifest, open_pact_core::Os::Macos, None, None);
         let config = DeviceConfig::parse(&text, Some(Path::new("/home/example"))).unwrap();
-        assert!(!config.schedule.unwrap().enabled);
-        assert_eq!(config.report.unwrap().collector, None);
-        assert!(text.contains(
-            "# Set collector to the address your company gives you before enabling the schedule.\n# collector = \"https://collector.example.org/status\"\n"
-        ));
+        assert_eq!(config.schedule.unwrap().send, None);
+        assert!(text.contains("mode = \"vpn\"\n"));
+        assert!(text.contains("# vpn_probe = \"10.20.0.1:443\"\n"));
+        assert!(!text.contains("[report]") && !text.contains("collector"));
         assert!(text.contains("# Company requirements on macos:"));
         assert!(text.contains("# Reported only, no requirement:"));
         assert!(text.contains("# Not checked on macos:"));
@@ -855,11 +919,11 @@ grace = "0d"
         let absolute = user_home.join("work");
         let text = format!(
             r#"
-[report]
-collector = "https://collector.example.org/status"
 [schedule]
 enabled = true
 run_as = "user"
+mode = "vpn"
+vpn_probe = "10.20.0.1:443"
 [managed_repos]
 folders = ['~/missing', '{}']
 "#,
@@ -867,8 +931,10 @@ folders = ['~/missing', '{}']
         );
         let config = DeviceConfig::parse(&text, Some(user_home)).unwrap();
         assert_eq!(
-            config.report.unwrap().probe().as_deref(),
-            Some("collector.example.org:443")
+            config.schedule.unwrap().send,
+            Some(SendPolicy::Vpn {
+                probe: ProbeAddress::parse("10.20.0.1:443").unwrap()
+            })
         );
         assert_eq!(
             config.managed_repos.unwrap().folders,
@@ -884,14 +950,9 @@ folders = ['~/missing', '{}']
     fn device_config_rejects_unknown_keys_and_bad_values() {
         for (text, key) in [
             ("other = 1", "other"),
-            ("[report]\ncollector = 'http://example.org'", "collector"),
             (
-                "[report]\ncollector = 'https://example.org'\nvpn_probe = 'bad'",
+                "[schedule]\nenabled = true\nrun_as = 'user'\nmode = 'vpn'\nvpn_probe = 'bad'",
                 "vpn_probe",
-            ),
-            (
-                "[report]\ncollector = 'https://example.org'\nextra = 1",
-                "extra",
             ),
             ("[schedule]\nenabled = true\nrun_as = 'root'", "run_as"),
             (
@@ -907,27 +968,88 @@ folders = ['~/missing', '{}']
     }
 
     #[test]
-    fn device_config_probe_defaults_include_ipv6_and_explicit_port() {
-        for (collector, expected) in [
-            ("https://[::1]:8443/status", "[::1]:8443"),
-            ("https://example.org:8443/status", "example.org:8443"),
+    fn an_enabled_schedule_needs_a_vpn_mode_and_a_probe() {
+        for (text, key) in [
+            ("[schedule]\nenabled = true\nrun_as = 'user'", "mode"),
+            (
+                "[schedule]\nenabled = true\nrun_as = 'user'\nmode = 'vpn'",
+                "vpn_probe",
+            ),
+            (
+                "[schedule]\nenabled = true\nrun_as = 'user'\nvpn_probe = '10.20.0.1:443'",
+                "mode",
+            ),
         ] {
-            let config =
-                DeviceConfig::parse(&format!("[report]\ncollector = '{collector}'"), None).unwrap();
-            assert_eq!(config.report.unwrap().probe().as_deref(), Some(expected));
+            let error = format!("{:#}", DeviceConfig::parse(text, None).unwrap_err());
+            assert!(
+                error.contains(&format!("[schedule].{key} is required")),
+                "{error}"
+            );
+        }
+        let config = DeviceConfig::parse(
+            "[schedule]\nenabled = true\nrun_as = 'user'\nmode = 'vpn'\nvpn_probe = '[::1]:8443'",
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            config.schedule.unwrap().send,
+            Some(SendPolicy::Vpn {
+                probe: ProbeAddress::parse("[::1]:8443").unwrap()
+            })
+        );
+    }
+
+    #[test]
+    fn a_schedule_mode_other_than_vpn_is_rejected() {
+        for (mode, hint) in [
+            ("always", "\"always\" is not available"),
+            ("sometimes", "must be \"vpn\""),
+        ] {
+            for enabled in [false, true] {
+                let text = format!(
+                    "[schedule]\nenabled = {enabled}\nrun_as = 'user'\nmode = '{mode}'\nvpn_probe = '10.20.0.1:443'"
+                );
+                let error = format!("{:#}", DeviceConfig::parse(&text, None).unwrap_err());
+                assert!(
+                    error.contains("[schedule].mode") && error.contains(hint),
+                    "{error}"
+                );
+            }
         }
     }
 
     #[test]
-    fn report_without_collector_is_valid_until_a_report_is_required() {
-        let config = DeviceConfig::parse("[report]\n", None).unwrap();
-        assert_eq!(config.report.unwrap().collector, None);
+    fn a_schedule_off_needs_no_probe_and_keeps_the_keys_it_has() {
+        let config = DeviceConfig::parse(
+            "[schedule]\nenabled = false\nrun_as = 'user'\nmode = 'vpn'",
+            None,
+        )
+        .unwrap();
+        assert_eq!(config.schedule.unwrap().send, None);
+    }
 
-        let config =
-            DeviceConfig::parse("[report]\nvpn_probe = 'vpn.example.org:443'", None).unwrap();
+    #[test]
+    fn an_old_report_table_names_how_to_move_the_probe() {
+        let error = DeviceConfig::parse(
+            "[report]\ncollector = 'https://collector.example.org/status'\nvpn_probe = '10.20.0.1:443'\n[schedule]\nenabled = true\nrun_as = 'user'",
+            None,
+        )
+        .unwrap_err()
+        .to_string();
         assert_eq!(
-            config.report.unwrap().probe().as_deref(),
-            Some("vpn.example.org:443")
+            error,
+            "[report] was removed: the gateway now receives claims. Move `vpn_probe = \"10.20.0.1:443\"` into [schedule], add `mode = \"vpn\"`, and delete [report]"
+        );
+        let error = DeviceConfig::parse(
+            "[report]\ncollector = 'https://collector.example.org/status'",
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("[report] was removed")
+                && error.contains("answers only on the company VPN"),
+            "{error}"
         );
     }
 }
