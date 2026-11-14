@@ -1525,10 +1525,12 @@ fn setup_questions(
 async fn apply_setup(home: &Home, choices: SetupChoices) -> Result<()> {
     let was_on = {
         let _claim_lock = claim::lock(home).await?;
-        let mut config = device_config::DeviceConfig::load(home)?;
+        let mut config =
+            device_config::DeviceConfig::load_or_migrate(home, user_profile().as_deref(), true)?;
         let was_on = config.auto_send;
         config.folders = choices.folders;
         config.run_as = choices.run_as;
+        config.setup_answered = true;
         config.save(home)?;
         was_on
     };
@@ -1554,7 +1556,7 @@ async fn setup_device(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
     let scan = proposal_repo_scan(home)?;
     let context = SetupContext {
         os,
-        current: device_config::DeviceConfig::load(home)?,
+        current: device_config::DeviceConfig::load_or_migrate(home, user_home.as_deref(), true)?,
         overview: scan
             .as_ref()
             .zip(user_home.as_deref())
@@ -1563,21 +1565,9 @@ async fn setup_device(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
             }),
         suggested: scan
             .as_ref()
-            .and_then(|scan| scan.managed_paths.as_ref())
             .zip(user_home.as_deref())
-            .map_or_else(Vec::new, |(paths, user_home)| {
-                checks::repos::managed_repo_groups(paths, user_home)
-                    .into_iter()
-                    .filter_map(|(group, _)| {
-                        let folder = match group.strip_prefix("~/") {
-                            Some(rest) => user_home.join(rest),
-                            None => user_home.to_path_buf(),
-                        };
-                        (device_config::safe_comment_text(&folder.display().to_string())
-                            == folder.display().to_string())
-                        .then_some(folder)
-                    })
-                    .collect()
+            .map_or_else(Vec::new, |(scan, user_home)| {
+                device_config::suggested_folders(scan, user_home)
             }),
         legacy: device_config::legacy_folders(home, user_home.as_deref()),
         manifest,
@@ -1605,10 +1595,11 @@ async fn first_claim(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
     check_impl(home, insecure_dev, false).await
 }
 
-/// \`folders list|add|remove\`: the owner's repository folders.
+/// `folders list|add|remove`: the owner's repository folders.
 async fn folders(home: &Home, command: FoldersCommand) -> Result<ExitCode> {
     let user_home = user_profile();
-    let mut config = device_config::DeviceConfig::load(home)?;
+    let mut config =
+        device_config::DeviceConfig::load_or_migrate(home, user_home.as_deref(), false)?;
     if let FoldersCommand::List = command {
         if config.folders.is_empty() {
             println!(
@@ -1622,7 +1613,7 @@ async fn folders(home: &Home, command: FoldersCommand) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
     let _claim_lock = claim::lock(home).await?;
-    config = device_config::DeviceConfig::load(home)?;
+    config = device_config::DeviceConfig::load_or_migrate(home, user_home.as_deref(), true)?;
     match command {
         FoldersCommand::List => unreachable!("handled above"),
         FoldersCommand::Add { path } => {
@@ -1681,8 +1672,12 @@ enum WizardResume {
 }
 
 fn wizard_resume(home: &Home) -> Result<WizardResume> {
-    // Step 5 always saves the owner's choices, so the file marks it as done.
-    let configured = home.file(device_config::FILE).exists();
+    // Only step 5 sets `setup_answered`. An import or a command can create the file without it. A file
+    // that does not read counts as answered, because step 5 would only fail on it again.
+    let configured = match device_config::DeviceConfig::load(home) {
+        Ok(config) => config.setup_answered,
+        Err(_) => true,
+    };
     let (records, damaged) = match locallog::read_lenient(&home.file("claims.jsonl")) {
         Ok(history) => history,
         Err(error) => {
@@ -1792,15 +1787,29 @@ async fn sync_checkpoint(
     gateway: &str,
     policy: Option<&LogPolicy>,
 ) -> Result<Result<Checkpoint, String>> {
+    sync_checkpoint_with(http, home, gateway, policy, true).await
+}
+
+/// `sync_checkpoint`, which with `store` false verifies the checkpoint and keeps nothing.
+async fn sync_checkpoint_with(
+    http: &reqwest::Client,
+    home: &Home,
+    gateway: &str,
+    policy: Option<&LogPolicy>,
+    store: bool,
+) -> Result<Result<Checkpoint, String>> {
     let pins = Pins::load(home)?;
     if let Some(changed) = pins.compare(http, gateway).await? {
         return Ok(Err(changed));
     }
     let prev = home.checkpoint()?;
     let text = get_text(http, format!("{}/v1/log/checkpoint", base(gateway))).await?;
-    let new = match verify_checkpoint(http, home, gateway, &pins.log, policy, prev.as_ref(), &text)
-        .await?
-    {
+    let checked = if store {
+        verify_checkpoint(http, home, gateway, &pins.log, policy, prev.as_ref(), &text).await?
+    } else {
+        verify_checkpoint_unstored(http, gateway, &pins.log, policy, prev.as_ref(), &text).await?
+    };
+    let new = match checked {
         Ok(new) => new,
         Err(e) => return Ok(Err(e.alarm_text())),
     };
@@ -2134,6 +2143,7 @@ impl std::fmt::Display for OwnEntriesError {
 
 /// Verifies this device's entries against an authenticated checkpoint. `enforced` is the manifest
 /// the gateway enforces; it differs from the signed one while an owner has not accepted it yet.
+#[cfg(test)]
 async fn check_own_entries(
     http: &reqwest::Client,
     home: &Home,
@@ -2141,20 +2151,45 @@ async fn check_own_entries(
     enforced: &ManifestHash,
     cp: &mut Checkpoint,
 ) -> Result<Result<OwnEntries, OwnEntriesError>> {
+    check_own_entries_with(http, home, enrolment, enforced, cp, true).await
+}
+
+/// `check_own_entries`. With `store` false it writes no file: the checkpoint and the enrolment
+/// change only in memory.
+async fn check_own_entries_with(
+    http: &reqwest::Client,
+    home: &Home,
+    enrolment: &mut Enrolment,
+    enforced: &ManifestHash,
+    cp: &mut Checkpoint,
+    store: bool,
+) -> Result<Result<OwnEntries, OwnEntriesError>> {
     let response = fetch_my_entries(http, home, enrolment).await?;
     let pins = Pins::load(home)?;
     let manifest = Manifest::parse(&read_home_file(&home.file("manifest.toml"))?)?;
-    let next = match verify_checkpoint(
-        http,
-        home,
-        &enrolment.gateway,
-        &pins.log,
-        manifest.body().log.as_ref(),
-        Some(cp),
-        &response.checkpoint,
-    )
-    .await?
-    {
+    let checked = if store {
+        verify_checkpoint(
+            http,
+            home,
+            &enrolment.gateway,
+            &pins.log,
+            manifest.body().log.as_ref(),
+            Some(cp),
+            &response.checkpoint,
+        )
+        .await?
+    } else {
+        verify_checkpoint_unstored(
+            http,
+            &enrolment.gateway,
+            &pins.log,
+            manifest.body().log.as_ref(),
+            Some(cp),
+            &response.checkpoint,
+        )
+        .await?
+    };
+    let next = match checked {
         Ok(next) => next,
         Err(error) => return Ok(Err(OwnEntriesError::Alarm(error.alarm_text()))),
     };
@@ -2178,7 +2213,9 @@ async fn check_own_entries(
     }
     *cp = next;
     enrolment.log_entries = Some(own);
-    home.write("enrolment.json", &serde_json::to_vec_pretty(&enrolment)?)?;
+    if store {
+        home.write("enrolment.json", &serde_json::to_vec_pretty(&enrolment)?)?;
+    }
     Ok(Ok(own))
 }
 
@@ -2191,14 +2228,26 @@ async fn sync_log(
     enforced: &ManifestHash,
     enrolment: &mut Enrolment,
 ) -> Result<LogSync> {
+    sync_log_with(http, home, manifest, enforced, enrolment, true).await
+}
+
+/// `sync_log`. With `store` false the checkpoint and the enrolment stay as they are on disk.
+async fn sync_log_with(
+    http: &reqwest::Client,
+    home: &Home,
+    manifest: &Manifest,
+    enforced: &ManifestHash,
+    enrolment: &mut Enrolment,
+    store: bool,
+) -> Result<LogSync> {
     let gateway = enrolment.gateway.clone();
     let policy = manifest.body().log.as_ref();
-    let mut cp = match sync_checkpoint(http, home, &gateway, policy).await? {
+    let mut cp = match sync_checkpoint_with(http, home, &gateway, policy, store).await? {
         Ok(cp) => cp,
         Err(e) => return Ok(alarm(e)),
     };
     Ok(
-        match check_own_entries(http, home, enrolment, enforced, &mut cp).await? {
+        match check_own_entries_with(http, home, enrolment, enforced, &mut cp, store).await? {
             Ok(own) => LogSync::Verified(cp, own),
             Err(OwnEntriesError::Alarm(e)) => alarm(e),
             Err(OwnEntriesError::AcceptPending) => LogSync::AcceptPending(enforced.clone()),
@@ -2553,7 +2602,7 @@ async fn wait_after_join(
         if current_os()? == Os::Macos && scans_repositories(manifest) {
             println!("  If macOS asks for access to a folder, you can deny it.");
         }
-        let config = device_config::DeviceConfig::load(home)?;
+        let config = device_config::DeviceConfig::load_or_migrate(home, None, false)?;
         if let Some(scan) = scan_repositories(home, manifest, Some(&config)).await? {
             print!(
                 "{}",
@@ -2577,7 +2626,7 @@ async fn wait_after_join(
             "Wait for IT approval"
         },
     );
-    let config = match device_config::DeviceConfig::load(home) {
+    let config = match device_config::DeviceConfig::load_or_migrate(home, None, false) {
         Ok(config) => Some(config),
         Err(_) if resumed && wizard => None,
         Err(error) => return Err(error),
@@ -3038,6 +3087,22 @@ fn device_code(device: &Pseudonym) -> String {
     device.as_str().trim_start_matches("pseudonym:")[..12].to_string()
 }
 
+/// How to stop the scheduled claims. On Windows the command carries the full path of this
+/// program, because the elevated prompt a SYSTEM job needs may not find it by name.
+fn stop_instructions(home: &Path, windows: bool) -> String {
+    if windows {
+        format!(
+            "Run this from PowerShell to stop the scheduled claims:\n  {}\nA job that runs as SYSTEM needs an elevated PowerShell prompt.",
+            schedule::apply_command(home, "schedule off")
+        )
+    } else {
+        format!(
+            "Run `{} schedule off` to stop the scheduled claims.",
+            client_command(home)
+        )
+    }
+}
+
 /// The command prefix the owner types next: with `--home` only when join used another home.
 fn client_command(home: &Path) -> String {
     match Home::new(None) {
@@ -3212,9 +3277,14 @@ async fn check_dry_run(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
             println!("{}", serde_json::to_string_pretty(&request)?);
             Ok(ExitCode::SUCCESS)
         }
-        claim::Preview::Alarm(text) => {
-            report_log(alarm(text), home);
-            Ok(ExitCode::from(2))
+        claim::Preview::NotSent(outcome) => {
+            let why = outcome
+                .why_nothing_is_sent()
+                .unwrap_or_else(|| "the gateway turned the claim away".to_owned());
+            eprintln!(
+                "Dry run: `check` would send nothing now, because {why}. It shows no request."
+            );
+            Ok(outcome.exit_code())
         }
     }
 }
@@ -3240,6 +3310,7 @@ async fn check_impl(home: &Home, insecure_dev: bool, show_resume_hint: bool) -> 
         home,
         device_config::Surface::Check,
         &client_command(&home.0),
+        &device_config::DeviceConfig::load(home).unwrap_or_default(),
     ) {
         println!("{notice}\n");
     }
@@ -3791,10 +3862,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Stop => {
-            println!(
-                "Run `{} schedule off` to stop the scheduled claims.",
-                client_command(&home.0)
-            );
+            println!("{}", stop_instructions(&home.0, cfg!(windows)));
             println!(
                 "Before deleting the home or binary, run `open-pact-client delete-device-key` with the same --home."
             );
@@ -3995,6 +4063,16 @@ mod tests {
         let home = Home(dir.path().to_path_buf());
         assert_eq!(wizard_resume(&home).unwrap(), WizardResume::Setup);
         fs::write(home.file(device_config::FILE), "{}").unwrap();
+        assert_eq!(
+            wizard_resume(&home).unwrap(),
+            WizardResume::Setup,
+            "a device.json that step 5 never answered does not skip step 5"
+        );
+        fs::write(
+            home.file(device_config::FILE),
+            r#"{"setup_answered": true}"#,
+        )
+        .unwrap();
         assert_eq!(wizard_resume(&home).unwrap(), WizardResume::FirstCheck);
         locallog::append(&home.file("claims.jsonl"), b"sent", b"upstream unavailable").unwrap();
         assert_eq!(wizard_resume(&home).unwrap(), WizardResume::FirstCheck);
@@ -4421,7 +4499,7 @@ mod tests {
                 .display()
         )));
         assert!(output.contains(
-            "Automatic claims: only while vpn.example.org answers at 10.0.0.1:443, at most every 55m"
+            "Automatic claims: only while vpn.example.org answers at 10.0.0.1:443, every 55 minutes, and at once when a check result changes"
         ));
         assert!(output.contains("Transparency log entry  #12"));
         assert_eq!(home_files(&home), before);
@@ -5192,7 +5270,8 @@ mod tests {
         })
         .await;
         put_gateway_in_enrolment(&home, &mut enrolment, &gateway.url);
-        home.write(device_config::FILE, b"{}").unwrap();
+        home.write(device_config::FILE, br#"{"setup_answered": true}"#)
+            .unwrap();
         let accepted_claim = serde_json::to_vec(&json!({
             "status": "accepted",
             "warnings": [],
@@ -5727,7 +5806,7 @@ mod tests {
     }
 
     /// `check_under`, which also runs `check --dry-run` first when `preview` is set. The dry run
-    /// must post nothing and leave the home as it was. Returns its request as the last value.
+    /// posts no claim and leaves the home as it was. Returns its request as the last value.
     async fn check_under_previewed(
         preview: bool,
         enforced: impl FnOnce(&str) -> String,
@@ -5748,13 +5827,19 @@ mod tests {
             gateway,
             pair,
         } = claim_fixture_replying(None, enforced, response, pair, device_config, None).await;
+        let mut expected_posts: Vec<&str> = Vec::new();
         let previewed = if preview {
             let before_preview = snapshot(dir.path());
             let claim::Preview::Request(request) = check_preview(&home, false).await.unwrap()
             else {
-                panic!("the dry run found an alarm");
+                panic!("the dry run stopped where check would send");
             };
-            assert_eq!(gateway.posts(), Vec::<String>::new(), "no POST, no nonce");
+            expected_posts = vec!["POST /v1/nonce", "POST /v1/log/mine"];
+            assert_eq!(
+                gateway.posts(),
+                expected_posts,
+                "the signed log question, and no claim"
+            );
             assert_eq!(snapshot(dir.path()), before_preview, "no file written");
             Some(request)
         } else {
@@ -5772,16 +5857,13 @@ mod tests {
         }
 
         let posts = gateway.posts();
-        assert_eq!(
-            posts,
-            [
-                "POST /v1/nonce",
-                "POST /v1/log/mine",
-                "POST /v1/nonce",
-                "POST /v1/claim"
-            ],
-            "the claim was sent"
-        );
+        expected_posts.extend([
+            "POST /v1/nonce",
+            "POST /v1/log/mine",
+            "POST /v1/nonce",
+            "POST /v1/claim",
+        ]);
+        assert_eq!(posts, expected_posts, "the claim was sent");
         let claim = gateway.bodies("POST /v1/claim").remove(0);
         (code, before, snapshot(dir.path()), pair, claim, previewed)
     }
@@ -5969,24 +6051,119 @@ mod tests {
         assert!(schedule_state(&fixture)["last_success"].is_null());
     }
 
-    #[tokio::test]
-    async fn a_scheduled_tick_sends_nothing_when_the_vpn_drops_before_the_post() {
-        let fixture = scheduled_fixture(None, unchanged, grown_checkpoint).await;
+    /// A probe address that accepts `answers` connections and then refuses.
+    fn probe_answering(answers: usize) -> (std::thread::JoinHandle<()>, String) {
         let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = probe.local_addr().unwrap().to_string();
-        let close = std::thread::spawn(move || {
-            let (stream, _) = probe.accept().unwrap();
-            drop(stream);
+        let closed = std::thread::spawn(move || {
+            for _ in 0..answers {
+                drop(probe.accept().unwrap().0);
+            }
             drop(probe);
         });
+        (closed, address)
+    }
+
+    #[tokio::test]
+    async fn a_scheduled_tick_whose_probe_fails_at_send_start_contacts_no_gateway() {
+        let fixture = scheduled_fixture(None, unchanged, grown_checkpoint).await;
+        let (closed, address) = probe_answering(1);
         tick_once(&fixture, &address).await.unwrap();
-        close.join().unwrap();
-        assert_eq!(claim_posts(&fixture), 0);
+        closed.join().unwrap();
+        assert_eq!(
+            fixture.gateway.requests(),
+            Vec::<String>::new(),
+            "no manifest, checkpoint, nonce or log request leaves the device off the VPN"
+        );
         assert!(!fixture.home.file("claims.jsonl").exists());
         assert_eq!(earlier_pair(&fixture), EARLIER_PAIR);
         let state = schedule_state(&fixture);
         assert_eq!(state["vpn_up"], false);
         assert_eq!(state["reconnect_pending"], true, "the reconnect stays due");
+    }
+
+    #[tokio::test]
+    async fn a_scheduled_tick_sends_no_claim_when_the_vpn_drops_before_the_post() {
+        let fixture = scheduled_fixture(None, unchanged, grown_checkpoint).await;
+        let (closed, address) = probe_answering(2);
+        tick_once(&fixture, &address).await.unwrap();
+        closed.join().unwrap();
+        assert_eq!(claim_posts(&fixture), 0);
+        assert_eq!(
+            fixture.gateway.posts(),
+            ["POST /v1/nonce", "POST /v1/log/mine"],
+            "only the log question went out before the last probe"
+        );
+        assert!(!fixture.home.file("claims.jsonl").exists());
+        assert_eq!(earlier_pair(&fixture), EARLIER_PAIR);
+        let state = schedule_state(&fixture);
+        assert_eq!(state["vpn_up"], false);
+        assert_eq!(state["reconnect_pending"], true, "the reconnect stays due");
+    }
+
+    #[tokio::test]
+    async fn a_reconnect_inside_the_interval_sends_no_second_claim() {
+        let fixture = scheduled_fixture(None, unchanged, grown_checkpoint).await;
+        let (_open, open) = open_probe();
+        let (_socket, refused) = refused_probe();
+        tick_once(&fixture, &open).await.unwrap();
+        assert_eq!(claim_posts(&fixture), 1);
+        for _ in 0..3 {
+            tick_once(&fixture, &refused).await.unwrap();
+            tick_once(&fixture, &open).await.unwrap();
+        }
+        assert_eq!(
+            claim_posts(&fixture),
+            1,
+            "the probe came back three times and no claim went out"
+        );
+        assert_eq!(schedule_state(&fixture)["reconnect_pending"], true);
+    }
+
+    #[tokio::test]
+    async fn a_waiting_device_is_not_asked_again_before_the_interval() {
+        let company = Company::new();
+        let witness = Witness::new();
+        let toml = witnessed_manifest(&witness);
+        let published = Company::published(&toml, &company.key);
+        let log = company.log.vkey();
+        let checkpoint = cosigned_empty_checkpoint(&company, &witness);
+        let gateway = FakeGateway::start(move |line, _| match line {
+            "GET /v1/manifest" => (200, published.clone()),
+            "GET /v1/log/key" => (200, log.clone()),
+            "GET /v1/log/checkpoint" => (200, checkpoint.clone()),
+            "POST /v1/nonce" => (200, json!({"nonce":"n"}).to_string()),
+            "POST /v1/log/mine" => (403, json!({"status":"denied"}).to_string()),
+            "POST /v1/device/status" => (200, json!({"state":"revoked"}).to_string()),
+            _ => not_found(),
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let home = enrolled_home_with(dir.path(), &gateway.url, &company, &toml);
+        let (_open, address) = open_probe();
+        let schedule = vpn_schedule(&address);
+        let tick = || {
+            schedule::tick(
+                &home,
+                &home,
+                None,
+                &schedule,
+                checks::EventMarkerReads::default,
+            )
+        };
+        tick().await.unwrap();
+        let first = gateway.requests().len();
+        assert!(first > 0);
+        for _ in 0..3 {
+            tick().await.unwrap();
+        }
+        assert_eq!(
+            gateway.requests().len(),
+            first,
+            "no second attempt inside the interval"
+        );
+        let log = std::fs::read_to_string(home.file("schedule.log")).unwrap();
+        assert_eq!(log.matches("IT revoked this device").count(), 1, "{log}");
     }
 
     #[tokio::test]
@@ -6056,9 +6233,20 @@ mod tests {
         assert_eq!(earlier_pair(&fixture), EARLIER_PAIR);
         let state = schedule_state(&fixture);
         assert!(state["last_success"].is_null());
-        assert_eq!(state["reconnect_pending"], true, "the claim is retried");
+        assert!(
+            state["last_attempt"].is_number(),
+            "the gateway answered, so the next attempt waits for the interval"
+        );
+        assert_eq!(state["reconnect_pending"], false);
         let log = job_log_text(&fixture);
         assert!(log.contains("TRANSPARENCY LOG ALARM"), "{log}");
+        tick_once(&fixture, &address).await.unwrap();
+        assert_eq!(
+            job_log_text(&fixture)
+                .matches("TRANSPARENCY LOG ALARM")
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -7464,7 +7652,7 @@ grace = "1d"
             }
         );
         assert!(output.contains(
-            "Automatic claims: only while vpn.example.org answers at 10.0.0.1:443, at most every 55m"
+            "Automatic claims: only while vpn.example.org answers at 10.0.0.1:443, every 55 minutes, and at once when a check result changes"
         ));
         assert!(output.contains("Send claims automatically while on the company VPN? [Y/n] "));
         assert!(output.contains("No managed repositories found."));
@@ -7478,7 +7666,7 @@ grace = "1d"
         let (choices, output) = answer(&context, "n\n\n");
         assert!(!choices.auto_send);
         let policy = output
-            .find("Automatic claims: every 1h on any network")
+            .find("Automatic claims: every 1 hour on any network, and at once when a check result changes")
             .unwrap();
         let question = output
             .find("Send claims automatically as the manifest says? [Y/n] ")
@@ -7641,20 +7829,20 @@ grace = "1d"
         assert_eq!(
             manifest_changes(&old, &faster),
             [
-                "automatic claims: only while vpn.example.org answers at 10.0.0.1:443, at most every 30m (was only while vpn.example.org answers at 10.0.0.1:443, at most every 55m)"
+                "automatic claims: only while vpn.example.org answers at 10.0.0.1:443, every 30 minutes, and at once when a check result changes (was only while vpn.example.org answers at 10.0.0.1:443, every 55 minutes, and at once when a check result changes)"
             ]
         );
         let none = Manifest::parse(without_schedule().as_bytes()).unwrap();
         assert_eq!(
             manifest_changes(&none, &old),
             [
-                "automatic claims: only while vpn.example.org answers at 10.0.0.1:443, at most every 55m (was none)"
+                "automatic claims: only while vpn.example.org answers at 10.0.0.1:443, every 55 minutes, and at once when a check result changes (was none)"
             ]
         );
         assert_eq!(
             manifest_changes(&old, &none),
             [
-                "automatic claims: none (was only while vpn.example.org answers at 10.0.0.1:443, at most every 55m)"
+                "automatic claims: none (was only while vpn.example.org answers at 10.0.0.1:443, every 55 minutes, and at once when a check result changes)"
             ]
         );
         assert!(manifest_changes(&old, &old).is_empty());
@@ -7669,10 +7857,10 @@ grace = "1d"
             String::from_utf8(output).unwrap()
         };
         assert!(summary(&demo_manifest()).contains(
-            "  Automatic claims: only while vpn.example.org answers at 10.0.0.1:443, at most every 55m\n"
+            "  Automatic claims: only while vpn.example.org answers at 10.0.0.1:443, every 55 minutes, and at once when a check result changes\n"
         ));
         assert!(
-            summary(&always_schedule()).contains("  Automatic claims: every 1h on any network\n")
+            summary(&always_schedule()).contains("  Automatic claims: every 1 hour on any network, and at once when a check result changes\n")
         );
         assert!(
             summary(&without_schedule())
@@ -7777,5 +7965,166 @@ grace = "1d"
         .await
         .unwrap();
         assert_eq!(claim_posts(&fixture), 1);
+    }
+
+    #[tokio::test]
+    async fn check_dry_run_stops_where_check_stops() {
+        for (state, enforce_changed, why) in [
+            (Some("pending"), false, "this device waits for IT approval"),
+            (Some("revoked"), false, "IT revoked this device"),
+            (
+                None,
+                true,
+                "the gateway enforces a manifest this device has not signed yet",
+            ),
+        ] {
+            let company = Company::new();
+            let witness = Witness::new();
+            let toml = witnessed_manifest(&witness);
+            let enforced = if enforce_changed {
+                with_password_rule(&toml)
+            } else {
+                toml.clone()
+            };
+            let published = Company::published(&enforced, &company.key);
+            let log = company.log.vkey();
+            let checkpoint = cosigned_empty_checkpoint(&company, &witness);
+            let gateway = FakeGateway::start(move |line, _| match line {
+                "GET /v1/manifest" => (200, published.clone()),
+                "GET /v1/log/key" => (200, log.clone()),
+                "GET /v1/log/checkpoint" => (200, checkpoint.clone()),
+                "POST /v1/nonce" => (200, json!({"nonce":"n"}).to_string()),
+                "POST /v1/log/mine" => (403, json!({"status":"denied"}).to_string()),
+                "POST /v1/device/status" => match state {
+                    Some(state) => (200, json!({ "state": state }).to_string()),
+                    None => (403, json!({"status":"denied"}).to_string()),
+                },
+                _ => not_found(),
+            })
+            .await;
+            let dir = tempfile::tempdir().unwrap();
+            let home = enrolled_home_with(dir.path(), &gateway.url, &company, &toml);
+            let before = snapshot(dir.path());
+
+            let claim::Preview::NotSent(outcome) = check_preview(&home, true).await.unwrap() else {
+                panic!("{why}: the dry run printed a request check would not send");
+            };
+            assert_eq!(outcome.why_nothing_is_sent().as_deref(), Some(why));
+            assert_eq!(
+                gateway.posts(),
+                [
+                    "POST /v1/nonce",
+                    "POST /v1/log/mine",
+                    "POST /v1/nonce",
+                    "POST /v1/device/status"
+                ],
+                "{why}: the same questions as check"
+            );
+            assert_eq!(snapshot(dir.path()), before, "{why}: no file written");
+            assert_eq!(
+                check_dry_run(&home, true).await.unwrap(),
+                ExitCode::FAILURE,
+                "{why}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn check_dry_run_reports_a_log_alarm_like_check() {
+        let company = Company::new();
+        let attacker = dev_key::generate();
+        let log = company.log.vkey();
+        let gateway = FakeGateway::start(move |line, _| match line {
+            "GET /v1/manifest" => (200, Company::published(DEMO_MANIFEST, &attacker)),
+            "GET /v1/log/key" => (200, format!("{log}\n")),
+            _ => not_found(),
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let home = enrolled_home(dir.path(), &gateway.url, &company);
+        let before = snapshot(dir.path());
+        let preview = check_preview(&home, false).await.unwrap();
+        let claim::Preview::NotSent(claim::Outcome::Alarm(_)) = preview else {
+            panic!("a changed company key must stop the dry run");
+        };
+        assert_eq!(gateway.posts(), Vec::<String>::new());
+        let mut after = snapshot(dir.path());
+        after.remove("repo-scan.json");
+        assert_eq!(after, before);
+        assert_eq!(
+            check_dry_run(&home, false).await.unwrap(),
+            ExitCode::from(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_upgraded_home_keeps_the_old_folders_through_the_job_and_check() {
+        for job_first in [true, false] {
+            let fixture = scheduled_fixture(None, unchanged, grown_checkpoint).await;
+            let home = &fixture.home;
+            home.write(
+                device_config::LEGACY_FILE,
+                b"[managed_repos]\nfolders = ['/srv/code']\n",
+            )
+            .unwrap();
+            let expected = vec![std::path::absolute("/srv/code").unwrap()];
+            let job = || {
+                schedule::run(
+                    home,
+                    schedule::Command::Run {
+                        system: false,
+                        user_home: None,
+                    },
+                )
+            };
+            if job_first {
+                job().await.unwrap();
+            }
+            assert_eq!(check(home, false).await.unwrap(), ExitCode::SUCCESS);
+            if !job_first {
+                job().await.unwrap();
+            }
+            let config = device_config::DeviceConfig::load(home).unwrap();
+            assert_eq!(config.folders, expected, "job first: {job_first}");
+            assert!(!config.setup_answered, "step 5 is still open");
+            assert_eq!(
+                wizard_resume(home).unwrap(),
+                WizardResume::Setup,
+                "join still asks step 5"
+            );
+            assert!(home.file(device_config::LEGACY_FILE).exists());
+            assert!(
+                !fs::read_to_string(home.file(device_config::FILE))
+                    .unwrap()
+                    .contains("legacy"),
+                "the notice flags are not in device.json"
+            );
+        }
+    }
+
+    #[test]
+    fn stop_names_the_elevated_prompt_on_windows_and_a_plain_command_elsewhere() {
+        let home = Path::new("/home/example/pact");
+        let windows = stop_instructions(home, true);
+        assert!(
+            windows.contains("schedule off") && windows.contains("elevated PowerShell prompt"),
+            "{windows}"
+        );
+        #[cfg(windows)]
+        assert!(
+            windows.contains(
+                &std::env::current_exe()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            ),
+            "the full path of this program: {windows}"
+        );
+        let elsewhere = stop_instructions(home, false);
+        assert!(
+            elsewhere.contains("open-pact-client") && elsewhere.contains("schedule off"),
+            "{elsewhere}"
+        );
+        assert!(!elsewhere.contains("elevated"));
     }
 }
