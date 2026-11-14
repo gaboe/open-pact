@@ -688,18 +688,18 @@ impl fmt::Display for Schedule {
                 name: Some(name),
             } => write!(
                 f,
-                "Automatic claims: only while {name} answers at {probe}, at most every {}",
+                "Automatic claims: only while {name} answers at {probe}, every {}, and at once when a check result changes",
                 self.interval
             ),
             SendPolicy::Vpn { probe, name: None } => write!(
                 f,
-                "Automatic claims: only while {probe} answers, at most every {}",
+                "Automatic claims: only while {probe} answers, every {}, and at once when a check result changes",
                 self.interval
             ),
             SendPolicy::Always => {
                 write!(
                     f,
-                    "Automatic claims: every {} on any network",
+                    "Automatic claims: every {} on any network, and at once when a check result changes",
                     self.interval
                 )
             }
@@ -732,12 +732,22 @@ impl TryFrom<String> for Interval {
                 "schedule.interval {text:?} must be whole minutes or hours from 5m to 24h, such as \"55m\""
             )
         };
-        let (digits, unit) = text.split_at(text.len().saturating_sub(1));
-        let amount: u32 = digits.parse().map_err(|_| bad())?;
-        let minutes = match unit {
-            "m" => amount,
-            "h" => amount.checked_mul(60).ok_or_else(bad)?,
+        let (digits, hours) = match (text.strip_suffix('m'), text.strip_suffix('h')) {
+            (Some(digits), _) => (digits, false),
+            (_, Some(digits)) => (digits, true),
             _ => return Err(bad()),
+        };
+        if digits.is_empty()
+            || digits.starts_with('0')
+            || !digits.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return Err(bad());
+        }
+        let amount: u32 = digits.parse().map_err(|_| bad())?;
+        let minutes = if hours {
+            amount.checked_mul(60).ok_or_else(bad)?
+        } else {
+            amount
         };
         if !(Self::MIN_MINUTES..=Self::MAX_MINUTES).contains(&minutes) {
             return Err(bad());
@@ -747,18 +757,25 @@ impl TryFrom<String> for Interval {
 }
 
 impl fmt::Display for Interval {
+    /// Plain words for the owner: "55 minutes", "1 hour", "90 minutes".
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.minutes.is_multiple_of(60) {
-            write!(f, "{}h", self.minutes / 60)
+            let hours = self.minutes / 60;
+            write!(f, "{hours} hour{}", if hours == 1 { "" } else { "s" })
         } else {
-            write!(f, "{}m", self.minutes)
+            write!(f, "{} minutes", self.minutes)
         }
     }
 }
 
 impl From<Interval> for String {
+    /// The manifest spelling, such as `55m` or `2h`.
     fn from(interval: Interval) -> String {
-        interval.to_string()
+        if interval.minutes.is_multiple_of(60) {
+            format!("{}h", interval.minutes / 60)
+        } else {
+            format!("{}m", interval.minutes)
+        }
     }
 }
 
@@ -1262,7 +1279,7 @@ mod tests {
         ));
         assert_eq!(
             schedule.to_string(),
-            "Automatic claims: only while vpn.example.org answers at 10.0.0.1:443, at most every 55m"
+            "Automatic claims: only while vpn.example.org answers at 10.0.0.1:443, every 55 minutes, and at once when a check result changes"
         );
         let always = Manifest::parse(
             with_schedule("[schedule]\nmode = \"always\"\ninterval = \"1h\"").as_bytes(),
@@ -1272,7 +1289,7 @@ mod tests {
         assert_eq!(schedule.policy, SendPolicy::Always);
         assert_eq!(
             schedule.to_string(),
-            "Automatic claims: every 1h on any network"
+            "Automatic claims: every 1 hour on any network, and at once when a check result changes"
         );
         let unnamed = with_schedule(
             "[schedule]\nmode = \"vpn\"\nvpn_probe = \"[::1]:443\"\ninterval = \"5m\"",
@@ -1280,7 +1297,7 @@ mod tests {
         let manifest = Manifest::parse(unnamed.as_bytes()).unwrap();
         assert_eq!(
             manifest.body().schedule.as_ref().unwrap().to_string(),
-            "Automatic claims: only while [::1]:443 answers, at most every 5m"
+            "Automatic claims: only while [::1]:443 answers, every 5 minutes, and at once when a check result changes"
         );
     }
 
@@ -1327,6 +1344,26 @@ mod tests {
                 "schedule.interval",
             ),
             (
+                "mode = \"vpn\"\nvpn_probe = \"10.0.0.1:443\"\ninterval = \"5é\"",
+                "schedule.interval",
+            ),
+            (
+                "mode = \"vpn\"\nvpn_probe = \"10.0.0.1:443\"\ninterval = \"+55m\"",
+                "schedule.interval",
+            ),
+            (
+                "mode = \"vpn\"\nvpn_probe = \"10.0.0.1:443\"\ninterval = \"055m\"",
+                "schedule.interval",
+            ),
+            (
+                "mode = \"vpn\"\nvpn_probe = \"10.0.0.1:443\"\ninterval = \"m\"",
+                "schedule.interval",
+            ),
+            (
+                "mode = \"vpn\"\nvpn_probe = \"10.0.0.1:443\"\ninterval = \"\"",
+                "schedule.interval",
+            ),
+            (
                 "mode = \"vpn\"\nvpn_probe = \"10.0.0.1\"\ninterval = \"55m\"",
                 "schedule.vpn_probe must be host:port",
             ),
@@ -1348,6 +1385,32 @@ mod tests {
             let error = Manifest::parse(text.as_bytes()).unwrap_err().to_string();
             assert!(error.contains(expected), "{table}: {error}");
         }
+    }
+
+    #[test]
+    fn intervals_print_in_plain_words_and_keep_the_manifest_spelling() {
+        for (text, printed) in [
+            ("5m", "5 minutes"),
+            ("55m", "55 minutes"),
+            ("60m", "1 hour"),
+            ("90m", "90 minutes"),
+            ("1h", "1 hour"),
+            ("2h", "2 hours"),
+            ("24h", "24 hours"),
+        ] {
+            let interval = Interval::try_from(text.to_string()).unwrap();
+            assert_eq!(interval.to_string(), printed, "{text}");
+            let written = String::from(interval);
+            assert_eq!(Interval::try_from(written).unwrap(), interval, "{text}");
+        }
+        assert_eq!(
+            String::from(Interval::try_from("2h".to_string()).unwrap()),
+            "2h"
+        );
+        assert_eq!(
+            String::from(Interval::try_from("90m".to_string()).unwrap()),
+            "90m"
+        );
     }
 
     #[test]
