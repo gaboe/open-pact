@@ -3294,12 +3294,20 @@ async fn check_dry_run(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
         Err(error) => return Err(error),
     };
     match preview {
-        claim::Preview::Request(request) => {
+        claim::Preview::Request {
+            request,
+            last_status,
+        } => {
             eprintln!(
                 "Dry run: GET requests only. No signed request was sent and no file was written. This is the claim that `check` \
                  would send now. The nonce, the time and the VPN certificate request are filled in when it is sent."
             );
             println!("{}", serde_json::to_string_pretty(&request)?);
+            if let Some(status) = last_status {
+                println!(
+                    "Last known status: {status}. check asks the gateway again; if the status still holds, check sends nothing."
+                );
+            }
             Ok(ExitCode::SUCCESS)
         }
         claim::Preview::NotSent(outcome) => {
@@ -5856,7 +5864,8 @@ mod tests {
         let mut expected_posts: Vec<&str> = Vec::new();
         let previewed = if preview {
             let before_preview = snapshot(dir.path());
-            let claim::Preview::Request(request) = check_preview(&home, false).await.unwrap()
+            let claim::Preview::Request { request, .. } =
+                check_preview(&home, false).await.unwrap()
             else {
                 panic!("the dry run stopped where check would send");
             };
@@ -5928,28 +5937,31 @@ mod tests {
 
     #[tokio::test]
     async fn check_dry_run_shows_the_claim_check_sends_and_changes_nothing() {
-        let (code, _, _, _, sent, preview) = check_under_previewed(
-            true,
-            |signed| signed.to_string(),
-            grown_checkpoint,
-            valid_pair,
-            None,
-        )
-        .await;
-        assert_eq!(code.unwrap(), ExitCode::SUCCESS);
-        let (sent, preview) = (
-            serde_json::from_str::<Value>(&sent).unwrap(),
-            preview.unwrap(),
-        );
-        let claim = sent_claim(&sent);
-        assert!(!claim["results"].as_object().unwrap().is_empty());
-        assert!(
-            claim["log_checkpoint"].is_object(),
-            "the comparison covers the log checkpoint"
-        );
-        assert_eq!(previewed_claim(&preview), claim);
-        assert_eq!(preview.get("manifest_toml"), sent.get("manifest_toml"));
-        assert!(preview.get("jws").is_none());
+        for (manifest_changed, enforced) in [
+            (
+                false,
+                (|signed: &str| signed.to_string()) as fn(&str) -> String,
+            ),
+            (true, with_password_rule),
+        ] {
+            let (code, _, _, _, sent, preview) =
+                check_under_previewed(true, enforced, grown_checkpoint, valid_pair, None).await;
+            assert_eq!(code.unwrap(), ExitCode::SUCCESS);
+            let (sent, preview) = (
+                serde_json::from_str::<Value>(&sent).unwrap(),
+                preview.unwrap(),
+            );
+            let claim = sent_claim(&sent);
+            assert!(!claim["results"].as_object().unwrap().is_empty());
+            assert!(
+                claim["log_checkpoint"].is_object(),
+                "the comparison covers the log checkpoint"
+            );
+            assert_eq!(previewed_claim(&preview), claim);
+            assert_eq!(preview.get("manifest_toml"), sent.get("manifest_toml"));
+            assert_eq!(preview.get("manifest_toml").is_some(), manifest_changed);
+            assert!(preview.get("jws").is_none());
+        }
     }
 
     const EARLIER_PAIR: [&[u8]; 2] = [b"earlier CA", b"earlier certificate"];
@@ -8065,77 +8077,65 @@ grace = "1d"
         assert_eq!(claim_posts(&fixture), 1);
     }
 
+    /// A saved pending or revoked status does not hide the claim. `check` asks the gateway again,
+    /// and the dry run cannot, so it prints the claim and the saved status.
     #[tokio::test]
-    async fn check_dry_run_stops_where_check_stops() {
-        for (state, enforce_changed, why) in [
-            (Some("pending"), false, "this device waits for IT approval"),
-            (Some("revoked"), false, "IT revoked this device"),
-            (
-                None,
-                true,
-                "the gateway enforces a manifest this device has not signed yet",
-            ),
+    async fn check_dry_run_prints_the_claim_when_the_saved_status_is_pending_or_revoked() {
+        for (state, status) in [
+            (DeviceStatus::Pending, "pending"),
+            (DeviceStatus::Revoked, "revoked"),
         ] {
             let company = Company::new();
             let witness = Witness::new();
             let toml = witnessed_manifest(&witness);
-            let enforced = if enforce_changed {
-                with_password_rule(&toml)
-            } else {
-                toml.clone()
-            };
-            let published = Company::published(&enforced, &company.key);
+            let published = Company::published(&toml, &company.key);
             let log = company.log.vkey();
             let checkpoint = cosigned_empty_checkpoint(&company, &witness);
             let gateway = FakeGateway::start(move |line, _| match line {
                 "GET /v1/manifest" => (200, published.clone()),
                 "GET /v1/log/key" => (200, log.clone()),
                 "GET /v1/log/checkpoint" => (200, checkpoint.clone()),
-                "POST /v1/nonce" => (200, json!({"nonce":"n"}).to_string()),
-                "POST /v1/log/mine" => (403, json!({"status":"denied"}).to_string()),
-                "POST /v1/device/status" => match state {
-                    Some(state) => (200, json!({ "state": state }).to_string()),
-                    None => (403, json!({"status":"denied"}).to_string()),
-                },
                 _ => not_found(),
             })
             .await;
             let dir = tempfile::tempdir().unwrap();
             let home = enrolled_home_with(dir.path(), &gateway.url, &company, &toml);
-            if let Some(state) = state {
-                let mut enrolment = home.enrolment().unwrap();
-                enrolment.last_status = Some(match state {
-                    "pending" => DeviceStatus::Pending,
-                    "revoked" => DeviceStatus::Revoked,
-                    _ => unreachable!(),
-                });
-                home.write("enrolment.json", &serde_json::to_vec(&enrolment).unwrap())
-                    .unwrap();
-            }
+            let mut enrolment = home.enrolment().unwrap();
+            enrolment.last_status = Some(state);
+            home.write("enrolment.json", &serde_json::to_vec(&enrolment).unwrap())
+                .unwrap();
             let before = snapshot(dir.path());
 
-            let claim::Preview::NotSent(outcome) = check_preview(&home, true).await.unwrap() else {
-                panic!("{why}: the dry run printed a request check would not send");
+            let claim::Preview::Request {
+                request,
+                last_status,
+            } = check_preview(&home, true).await.unwrap()
+            else {
+                panic!("{status}: the dry run printed no claim");
             };
-            assert_eq!(outcome.why_nothing_is_sent().as_deref(), Some(why));
+            assert_eq!(last_status, Some(status));
+            assert!(
+                request["claim"].is_object(),
+                "{status}: the claim is printed"
+            );
             assert_eq!(
                 gateway.posts(),
                 Vec::<String>::new(),
-                "{why}: no signed request"
+                "{status}: no signed request"
             );
             assert!(
                 gateway
                     .requests()
                     .iter()
                     .all(|request| request.starts_with("GET ")),
-                "{why}: only GET requests: {:?}",
+                "{status}: only GET requests: {:?}",
                 gateway.requests()
             );
-            assert_eq!(snapshot(dir.path()), before, "{why}: no file written");
+            assert_eq!(snapshot(dir.path()), before, "{status}: no file written");
             assert_eq!(
                 check_dry_run(&home, true).await.unwrap(),
-                ExitCode::FAILURE,
-                "{why}"
+                ExitCode::SUCCESS,
+                "{status}"
             );
         }
     }

@@ -356,8 +356,11 @@ impl Outcome {
 /// What `check --dry-run` found.
 pub(crate) enum Preview {
     /// The request `send` would post, with a placeholder for each field only the gateway or the
-    /// clock can fill.
-    Request(Value),
+    /// clock can fill. `last_status` is the saved device status when it is pending or revoked.
+    Request {
+        request: Value,
+        last_status: Option<&'static str>,
+    },
     /// `check` would send nothing. The pipeline already printed why.
     NotSent(Outcome),
 }
@@ -432,8 +435,9 @@ impl Prepared {
         }
     }
 
-    /// Shows the request `send` would post, after GET checks and locally known admission state.
-    /// Own-entry admission needs a signed request, so the dry run reports that result as unknown.
+    /// Shows the request `send` would post, after GET checks. A saved pending or revoked status is
+    /// returned with the request, never used to hide it. Own-entry admission needs a signed
+    /// request, so the dry run reports that result as unknown.
     pub(crate) async fn dry_run(self, home: &Home) -> Result<Preview> {
         let http = crate::http_client()?;
         let enrolment = self.enrolment.clone();
@@ -454,33 +458,15 @@ impl Prepared {
                 return Ok(Preview::NotSent(Outcome::Alarm(text)));
             }
         };
-        if let Some(changed) = changed {
+        if let Some(changed) = &changed {
             let command = crate::client_command(&home.0);
-            println!("{}", crate::manifest_change_notice(&changed, &command));
-            crate::print_claim_log_status(home, None, Some("the manifest changed"));
-            return Ok(Preview::NotSent(Outcome::NotSent(NotSent::AcceptPending(
-                changed,
-            ))));
+            println!("{}", crate::manifest_change_notice(changed, &command));
         }
-        match enrolment.last_status {
-            Some(DeviceStatus::Pending) => {
-                let command = crate::client_command(&home.0);
-                println!("This device waits for IT approval.");
-                println!("Wizard step [4/6] is unfinished. Continue with: {command} join");
-                crate::print_claim_log_status(
-                    home,
-                    None,
-                    Some("the device is waiting for IT approval"),
-                );
-                return Ok(Preview::NotSent(Outcome::NotSent(NotSent::Pending)));
-            }
-            Some(DeviceStatus::Revoked) => {
-                println!("IT revoked this device.");
-                crate::print_claim_log_status(home, None, Some("IT revoked this device"));
-                return Ok(Preview::NotSent(Outcome::NotSent(NotSent::Revoked)));
-            }
-            Some(DeviceStatus::Approved) | None => {}
-        }
+        let last_status = match enrolment.last_status {
+            Some(DeviceStatus::Pending) => Some("pending"),
+            Some(DeviceStatus::Revoked) => Some("revoked"),
+            Some(DeviceStatus::Approved) | None => None,
+        };
         println!(
             "check also asks the gateway whether this device may send; the dry run skips that signed request."
         );
@@ -499,7 +485,10 @@ impl Prepared {
         if changed.is_some() {
             request["manifest_toml"] = self.manifest_toml.clone().into();
         }
-        Ok(Preview::Request(request))
+        Ok(Preview::Request {
+            request,
+            last_status,
+        })
     }
 
     /// Verifies the log, signs the claim, posts it and installs the VPN pair the gateway answers
