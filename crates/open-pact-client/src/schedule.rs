@@ -1,11 +1,12 @@
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
+use std::future::Future;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::Subcommand;
-use open_pact_core::{ProbeName, SendPolicy};
+use open_pact_core::{ManifestHash, ProbeName, SendPolicy};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -1269,18 +1270,54 @@ pub(crate) async fn tick(
     home: &Home,
     state_home: &Home,
     user_home: Option<&Path>,
-    schedule: &open_pact_core::Schedule,
+    authorization: &ScheduleAuthorization,
     read_events: impl FnOnce() -> checks::EventMarkerReads,
 ) -> Result<()> {
-    let policy = &schedule.policy;
+    tick_with_scan(
+        home,
+        state_home,
+        user_home,
+        authorization,
+        read_events,
+        claim::scan_if_due(home, user_home, REPO_SCAN_INTERVAL),
+    )
+    .await
+}
+
+/// The schedule and the owner's agreement to use the signed manifest's schedule.
+#[derive(Clone)]
+pub(crate) struct ScheduleAuthorization {
+    pub(crate) manifest_hash: ManifestHash,
+    pub(crate) schedule: open_pact_core::Schedule,
+    pub(crate) owner_consented: bool,
+}
+
+pub(crate) async fn tick_with_scan(
+    home: &Home,
+    state_home: &Home,
+    user_home: Option<&Path>,
+    authorization: &ScheduleAuthorization,
+    read_events: impl FnOnce() -> checks::EventMarkerReads,
+    scan: impl Future<Output = Result<()>>,
+) -> Result<()> {
+    let policy = &authorization.schedule.policy;
     let mut state: State = state_home.read_json(STATE)?.unwrap_or_default();
     state.observe(may_send(policy).await);
     save(state_home, STATE, &state)?;
     // The scan can take long. It runs before the claim lock, which `check` and `accept` wait for.
-    claim::scan_if_due(home, user_home, REPO_SCAN_INTERVAL).await?;
+    scan.await?;
     let Some(_claim_lock) = claim::try_lock(home)? else {
         return Ok(());
     };
+    let config = DeviceConfig::load_or_migrate(home, user_home, false)?;
+    let manifest = home.signed_manifest()?;
+    // `accept` can replace the signed policy during the unlocked scan.
+    if !authorization.owner_consented
+        || authorization.owner_consented != config.auto_send
+        || &authorization.manifest_hash != manifest.hash()
+    {
+        return Ok(());
+    }
     let prepared = claim::prepare(
         home,
         user_home,
@@ -1293,7 +1330,7 @@ pub(crate) async fn tick(
     state.observe_compliance(&compliance);
     state.event_pending |= state.new_events(events);
     let now = chrono::Utc::now().timestamp();
-    if let Some(trigger) = state.due(now, schedule.interval.as_secs()) {
+    if let Some(trigger) = state.due(now, authorization.schedule.interval.as_secs()) {
         save(state_home, STATE, &state)?;
         let outcome = prepared.send(home, async || may_send(policy).await).await?;
         note_outcome(home, &mut state, trigger, &outcome);
@@ -1909,7 +1946,7 @@ pub(crate) async fn run(home: &Home, command: Command) -> Result<()> {
 /// One run of the job. The policy comes from the manifest the owner signed, never from a manifest
 /// that waits for acceptance.
 async fn run_tick(home: &Home, state_home: &Home, user_home: Option<&Path>) -> Result<()> {
-    let schedule = {
+    let authorization = {
         let Some(_claim_lock) = claim::try_lock(home)? else {
             return Ok(());
         };
@@ -1927,13 +1964,17 @@ async fn run_tick(home: &Home, state_home: &Home, user_home: Option<&Path>) -> R
         let Some(schedule) = manifest.body().schedule.clone() else {
             return Ok(());
         };
-        schedule
+        ScheduleAuthorization {
+            manifest_hash: manifest.hash().clone(),
+            schedule,
+            owner_consented: config.auto_send,
+        }
     };
     tick(
         home,
         state_home,
         user_home,
-        &schedule,
+        &authorization,
         checks::event_markers,
     )
     .await
@@ -2852,6 +2893,7 @@ Write-Output 'refused'
                 device: open_pact_core::Pseudonym::of(&key.public_key()),
                 salt: "fictional-review-fixture".into(),
                 log_entries: None,
+                last_status: None,
             })
             .unwrap(),
         )
@@ -3593,6 +3635,7 @@ Write-Output 'refused'
         );
         std::fs::create_dir_all(&home.0).unwrap();
         std::fs::create_dir_all(&state_home.0).unwrap();
+        agree(&home);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let refused = tokio::net::TcpSocket::new_v4().unwrap();
         refused.bind("127.0.0.1:0".parse().unwrap()).unwrap();
@@ -3615,7 +3658,12 @@ Write-Output 'refused'
             security_log_cleared: checks::EventMarkerRead::Read(Some(timestamp)),
             antimalware_detection: checks::EventMarkerRead::Unknown,
         };
-        tick(&home, &state_home, None, &policy, || events(100))
+        let authorization = ScheduleAuthorization {
+            manifest_hash: home.enrolment().unwrap().manifest,
+            schedule: policy.clone(),
+            owner_consented: true,
+        };
+        tick(&home, &state_home, None, &authorization, || events(100))
             .await
             .unwrap();
         let baseline: State = state_home.read_json(STATE).unwrap().unwrap();
@@ -3623,7 +3671,7 @@ Write-Output 'refused'
             baseline.last_events.unwrap().security_log_cleared,
             Some(100)
         );
-        let error = tick(&home, &state_home, None, &policy, || events(101))
+        let error = tick(&home, &state_home, None, &authorization, || events(101))
             .await
             .unwrap_err();
         assert!(format!("{error:#}").contains("/v1/manifest"), "{error:#}");
@@ -4067,6 +4115,7 @@ Write-Output 'refused'
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let probe = listener.local_addr().unwrap().to_string();
         let home = enrolled_home_with_schedule(dir.path(), Some(&vpn_table(&probe)));
+        agree(&home);
         let _gateway = unreachable_gateway(&home);
         let repo = dir.path().join("work/app");
         std::fs::create_dir_all(repo.join(".git")).unwrap();
@@ -4082,13 +4131,18 @@ Write-Output 'refused'
             .schedule
             .clone()
             .unwrap();
+        let authorization = ScheduleAuthorization {
+            manifest_hash: home.enrolment().unwrap().manifest,
+            schedule,
+            owner_consented: true,
+        };
 
         let held = claim::try_lock(&home).unwrap().unwrap();
         tick(
             &home,
             &home,
             None,
-            &schedule,
+            &authorization,
             checks::EventMarkerReads::default,
         )
         .await
@@ -4108,7 +4162,7 @@ Write-Output 'refused'
             &home,
             &home,
             None,
-            &schedule,
+            &authorization,
             checks::EventMarkerReads::default,
         )
         .await

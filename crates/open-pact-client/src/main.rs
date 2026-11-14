@@ -74,7 +74,7 @@ enum Command {
     },
     /// Run the manifest's checks, send a signed claim and fetch a VPN certificate
     Check {
-        /// Print the claim that would be sent. Send nothing and write no file
+        /// Print the claim that would be sent. Make GET requests only and write no file
         #[arg(long)]
         dry_run: bool,
     },
@@ -145,6 +145,9 @@ struct Enrolment {
     /// Where the log holds this enrolment's entries. A hint only: every check verifies them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     log_entries: Option<OwnEntries>,
+    /// The last device status this client learned from a signed gateway request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_status: Option<DeviceStatus>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -2351,6 +2354,16 @@ async fn fetch_device_status(
     Ok(response.state)
 }
 
+fn remember_device_status(home: &Home, status: DeviceStatus) -> Result<()> {
+    let mut enrolment = home.enrolment()?;
+    if enrolment.last_status == Some(status) {
+        return Ok(());
+    }
+    enrolment.last_status = Some(status);
+    home.write("enrolment.json", &serde_json::to_vec_pretty(&enrolment)?)?;
+    Ok(())
+}
+
 /// Verifies the gateway checkpoint and every private entry before trusting an approval entry.
 async fn verify_approval_entry(
     http: &reqwest::Client,
@@ -2398,7 +2411,14 @@ async fn poll_approval(
     enrolment: &Enrolment,
     manifest: &Manifest,
 ) -> std::result::Result<ApprovalProgress, WaitError> {
-    match fetch_device_status(http, home, enrolment).await? {
+    let status = fetch_device_status(http, home, enrolment).await?;
+    let stored = match status {
+        Approval::Pending => DeviceStatus::Pending,
+        Approval::Approved => DeviceStatus::Approved,
+        Approval::Revoked => DeviceStatus::Revoked,
+    };
+    remember_device_status(home, stored).map_err(WaitError::Fatal)?;
+    match status {
         Approval::Pending => Ok(ApprovalProgress::Pending),
         Approval::Revoked => Ok(ApprovalProgress::Revoked),
         Approval::Approved => match verify_approval_entry(http, home, enrolment, manifest).await {
@@ -3041,6 +3061,12 @@ async fn join(
         device: Pseudonym::of(&device.public_key()),
         salt: body["salt"].as_str().context("salt")?.to_string(),
         log_entries,
+        last_status: match body["state"].as_str() {
+            Some("pending") => Some(DeviceStatus::Pending),
+            Some("approved") => Some(DeviceStatus::Approved),
+            Some("revoked") => Some(DeviceStatus::Revoked),
+            _ => None,
+        },
     };
     home.write("enrolment.json", &serde_json::to_vec_pretty(&enrolment)?)?;
     let client_home = std::path::absolute(&home.0).unwrap_or_else(|_| home.0.clone());
@@ -3257,8 +3283,7 @@ async fn check(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
     check_impl(home, insecure_dev, true).await
 }
 
-/// Shows the request `check` would send now. It reads the gateway and changes nothing: no claim,
-/// no nonce, no file.
+/// Shows the request `check` would send now. It makes GET requests only and writes no file.
 async fn check_dry_run(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
     let preview = match check_preview(home, insecure_dev).await {
         Ok(preview) => preview,
@@ -3271,7 +3296,7 @@ async fn check_dry_run(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
     match preview {
         claim::Preview::Request(request) => {
             eprintln!(
-                "Dry run: nothing was sent and no file was written. This is the claim that `check` \
+                "Dry run: GET requests only. No signed request was sent and no file was written. This is the claim that `check` \
                  would send now. The nonce, the time and the VPN certificate request are filled in when it is sent."
             );
             println!("{}", serde_json::to_string_pretty(&request)?);
@@ -3281,9 +3306,7 @@ async fn check_dry_run(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
             let why = outcome
                 .why_nothing_is_sent()
                 .unwrap_or_else(|| "the gateway turned the claim away".to_owned());
-            eprintln!(
-                "Dry run: `check` would send nothing now, because {why}. It shows no request."
-            );
+            eprintln!("Dry run: `check` would send no claim now, because {why}.");
             Ok(outcome.exit_code())
         }
     }
@@ -3890,6 +3913,7 @@ async fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::device_config::DeviceConfig;
 
     #[test]
     fn confirmation_reprompts_until_it_gets_a_valid_yes_or_no() {
@@ -4580,6 +4604,7 @@ mod tests {
             device: Pseudonym::of(&device.public_key()),
             salt: "00".repeat(32),
             log_entries: None,
+            last_status: None,
         };
         home.write("enrolment.json", &serde_json::to_vec(&enrolment).unwrap())
             .unwrap();
@@ -5725,6 +5750,7 @@ mod tests {
             device: Pseudonym::of(&device.public_key()),
             salt: "00".repeat(32),
             log_entries: None,
+            last_status: None,
         })
         .unwrap();
         let entries = vec![
@@ -5806,7 +5832,7 @@ mod tests {
     }
 
     /// `check_under`, which also runs `check --dry-run` first when `preview` is set. The dry run
-    /// posts no claim and leaves the home as it was. Returns its request as the last value.
+    /// sends GET requests only and leaves the home as it was. Returns its request as the last value.
     async fn check_under_previewed(
         preview: bool,
         enforced: impl FnOnce(&str) -> String,
@@ -5834,11 +5860,18 @@ mod tests {
             else {
                 panic!("the dry run stopped where check would send");
             };
-            expected_posts = vec!["POST /v1/nonce", "POST /v1/log/mine"];
             assert_eq!(
                 gateway.posts(),
                 expected_posts,
-                "the signed log question, and no claim"
+                "the dry run sends no signed request"
+            );
+            assert!(
+                gateway
+                    .requests()
+                    .iter()
+                    .all(|request| request.starts_with("GET ")),
+                "the dry run sends GET requests only: {:?}",
+                gateway.requests()
             );
             assert_eq!(snapshot(dir.path()), before_preview, "no file written");
             Some(request)
@@ -5895,31 +5928,28 @@ mod tests {
 
     #[tokio::test]
     async fn check_dry_run_shows_the_claim_check_sends_and_changes_nothing() {
-        for (manifest_changed, enforced) in [
-            (
-                false,
-                (|signed: &str| signed.to_string()) as fn(&str) -> String,
-            ),
-            (true, with_password_rule),
-        ] {
-            let (code, _, _, _, sent, preview) =
-                check_under_previewed(true, enforced, grown_checkpoint, valid_pair, None).await;
-            assert_eq!(code.unwrap(), ExitCode::SUCCESS);
-            let (sent, preview) = (
-                serde_json::from_str::<Value>(&sent).unwrap(),
-                preview.unwrap(),
-            );
-            let claim = sent_claim(&sent);
-            assert!(!claim["results"].as_object().unwrap().is_empty());
-            assert!(
-                claim["log_checkpoint"].is_object(),
-                "the comparison covers the log checkpoint"
-            );
-            assert_eq!(previewed_claim(&preview), claim);
-            assert_eq!(preview.get("manifest_toml"), sent.get("manifest_toml"));
-            assert_eq!(preview.get("manifest_toml").is_some(), manifest_changed);
-            assert!(preview.get("jws").is_none());
-        }
+        let (code, _, _, _, sent, preview) = check_under_previewed(
+            true,
+            |signed| signed.to_string(),
+            grown_checkpoint,
+            valid_pair,
+            None,
+        )
+        .await;
+        assert_eq!(code.unwrap(), ExitCode::SUCCESS);
+        let (sent, preview) = (
+            serde_json::from_str::<Value>(&sent).unwrap(),
+            preview.unwrap(),
+        );
+        let claim = sent_claim(&sent);
+        assert!(!claim["results"].as_object().unwrap().is_empty());
+        assert!(
+            claim["log_checkpoint"].is_object(),
+            "the comparison covers the log checkpoint"
+        );
+        assert_eq!(previewed_claim(&preview), claim);
+        assert_eq!(preview.get("manifest_toml"), sent.get("manifest_toml"));
+        assert!(preview.get("jws").is_none());
     }
 
     const EARLIER_PAIR: [&[u8]; 2] = [b"earlier CA", b"earlier certificate"];
@@ -5974,11 +6004,19 @@ mod tests {
     }
 
     async fn tick_under(fixture: &ClaimFixture, schedule: &open_pact_core::Schedule) -> Result<()> {
+        let mut config = DeviceConfig::load(&fixture.home)?;
+        config.auto_send = true;
+        config.save(&fixture.home)?;
+        let authorization = schedule::ScheduleAuthorization {
+            manifest_hash: fixture.home.enrolment()?.manifest,
+            schedule: schedule.clone(),
+            owner_consented: config.auto_send,
+        };
         schedule::tick(
             &fixture.home,
             &Home(fixture.dir.path().to_path_buf()),
             None,
-            schedule,
+            &authorization,
             checks::EventMarkerReads::default,
         )
         .await
@@ -6039,6 +6077,60 @@ mod tests {
 
         tick_once(&fixture, &address).await.unwrap();
         assert_eq!(claim_posts(&fixture), 1, "no trigger is due again so soon");
+    }
+
+    #[tokio::test]
+    async fn a_scheduled_tick_discards_scan_results_after_the_signed_policy_changes() {
+        let always = "[schedule]\nmode = \"always\"\ninterval = \"55m\"";
+        for (change, replacement) in [
+            ("VPN policy", Some(vpn_table("127.0.0.1:9"))),
+            ("no schedule", None),
+        ] {
+            let fixture = claim_fixture_replying(
+                None,
+                unchanged,
+                grown_checkpoint,
+                valid_pair,
+                Some(AGREED),
+                Some(always),
+            )
+            .await;
+            let before = fixture.home.signed_manifest().unwrap();
+            let authorization = schedule::ScheduleAuthorization {
+                manifest_hash: before.hash().clone(),
+                schedule: before.body().schedule.clone().unwrap(),
+                owner_consented: true,
+            };
+            let original = std::fs::read_to_string(fixture.home.file("manifest.toml")).unwrap();
+            let text = if let Some(replacement) = replacement {
+                with_schedule(&original, &replacement)
+            } else {
+                original.split("\n[schedule]").next().unwrap().to_owned()
+            };
+            let mut enrolment = fixture.home.enrolment().unwrap();
+            let accepted = Manifest::parse(text.as_bytes()).unwrap();
+            enrolment.manifest = accepted.hash().clone();
+            let home = &fixture.home;
+            schedule::tick_with_scan(
+                home,
+                home,
+                None,
+                &authorization,
+                checks::EventMarkerReads::default,
+                async move {
+                    home.write("manifest.toml", text.as_bytes())?;
+                    home.write("enrolment.json", &serde_json::to_vec(&enrolment)?)?;
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                fixture.gateway.requests(),
+                Vec::<String>::new(),
+                "{change}: the stale tick sends no gateway requests"
+            );
+        }
     }
 
     #[tokio::test]
@@ -6140,14 +6232,20 @@ mod tests {
         .await;
         let dir = tempfile::tempdir().unwrap();
         let home = enrolled_home_with(dir.path(), &gateway.url, &company, &toml);
+        home.write(device_config::FILE, AGREED.as_bytes()).unwrap();
         let (_open, address) = open_probe();
         let schedule = vpn_schedule(&address);
+        let authorization = schedule::ScheduleAuthorization {
+            manifest_hash: home.enrolment().unwrap().manifest,
+            schedule,
+            owner_consented: true,
+        };
         let tick = || {
             schedule::tick(
                 &home,
                 &home,
                 None,
-                &schedule,
+                &authorization,
                 checks::EventMarkerReads::default,
             )
         };
@@ -8004,6 +8102,16 @@ grace = "1d"
             .await;
             let dir = tempfile::tempdir().unwrap();
             let home = enrolled_home_with(dir.path(), &gateway.url, &company, &toml);
+            if let Some(state) = state {
+                let mut enrolment = home.enrolment().unwrap();
+                enrolment.last_status = Some(match state {
+                    "pending" => DeviceStatus::Pending,
+                    "revoked" => DeviceStatus::Revoked,
+                    _ => unreachable!(),
+                });
+                home.write("enrolment.json", &serde_json::to_vec(&enrolment).unwrap())
+                    .unwrap();
+            }
             let before = snapshot(dir.path());
 
             let claim::Preview::NotSent(outcome) = check_preview(&home, true).await.unwrap() else {
@@ -8012,13 +8120,16 @@ grace = "1d"
             assert_eq!(outcome.why_nothing_is_sent().as_deref(), Some(why));
             assert_eq!(
                 gateway.posts(),
-                [
-                    "POST /v1/nonce",
-                    "POST /v1/log/mine",
-                    "POST /v1/nonce",
-                    "POST /v1/device/status"
-                ],
-                "{why}: the same questions as check"
+                Vec::<String>::new(),
+                "{why}: no signed request"
+            );
+            assert!(
+                gateway
+                    .requests()
+                    .iter()
+                    .all(|request| request.starts_with("GET ")),
+                "{why}: only GET requests: {:?}",
+                gateway.requests()
             );
             assert_eq!(snapshot(dir.path()), before, "{why}: no file written");
             assert_eq!(
