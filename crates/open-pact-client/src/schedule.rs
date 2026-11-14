@@ -2732,7 +2732,8 @@ Write-Output 'refused'
 
     /// A probe that never answers, so native job runs in CI never send.
     #[cfg(any(target_os = "linux", windows))]
-    const LOOPBACK_SCHEDULE: &str = "[schedule]\nmode = \"vpn\"\nvpn_probe = \"127.0.0.1:9\"\ninterval = \"55m\"";
+    const LOOPBACK_SCHEDULE: &str =
+        "[schedule]\nmode = \"vpn\"\nvpn_probe = \"127.0.0.1:9\"\ninterval = \"55m\"";
 
     fn enrolled_home(dir: &Path) -> Home {
         enrolled_home_with_schedule(dir, None)
