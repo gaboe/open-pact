@@ -1,4 +1,5 @@
 mod checks;
+mod claim;
 mod device_config;
 mod device_key;
 #[cfg(test)]
@@ -1029,10 +1030,20 @@ fn check_scheme(gateway: &str, insecure_dev: bool) -> Result<()> {
     }
 }
 
-/// The API never redirects, so a redirect cannot move the client from https to http.
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The API never redirects, so a redirect cannot move the client from https to http. A stalled
+/// gateway ends the request, so a scheduled run cannot hang for ever.
 fn http_client() -> Result<reqwest::Client> {
+    http_client_with(HTTP_CONNECT_TIMEOUT, HTTP_REQUEST_TIMEOUT)
+}
+
+fn http_client_with(connect: Duration, request: Duration) -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(connect)
+        .timeout(request)
         .build()?)
 }
 
@@ -3242,6 +3253,7 @@ async fn check(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
 }
 
 async fn check_impl(home: &Home, insecure_dev: bool, show_resume_hint: bool) -> Result<ExitCode> {
+    let _claim_lock = claim::lock(home).await?;
     let migrating = schedule::migration_example(home)?;
     let mut can_scan_repositories = true;
     let device_config = match device_config::DeviceConfig::load(home) {
@@ -3749,6 +3761,7 @@ fn manifest_changes(old: &Manifest, new: &Manifest) -> Vec<String> {
 /// Shows the manifest the gateway enforces and what it changes, asks the owner, and sends the
 /// owner's and the device's signatures. The device keeps its approval; no invitation is needed.
 async fn accept(home: &Home, yes: bool, insecure_dev: bool) -> Result<ExitCode> {
+    let _claim_lock = claim::lock(home).await?;
     let mut enrolment = home.enrolment()?;
     check_scheme(&enrolment.gateway, insecure_dev)?;
     let gateway = base(&enrolment.gateway).to_string();
@@ -6608,6 +6621,23 @@ mod tests {
             "The gateway does not support this client version. Ask IT to update the gateway to 0.4.0 or later."
         );
         assert_eq!(gateway.requests(), ["POST /v1/nonce", "POST /v1/log/mine"]);
+    }
+
+    #[tokio::test]
+    async fn http_client_gives_up_on_a_gateway_that_never_answers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1/manifest", listener.local_addr().unwrap());
+        let _silent = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        let http = http_client_with(Duration::from_secs(5), Duration::from_millis(300)).unwrap();
+        let started = std::time::Instant::now();
+        let error = http.get(&url).send().await.unwrap_err();
+        assert!(error.is_timeout(), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[tokio::test]

@@ -1628,6 +1628,9 @@ async fn operate(home: &Home, command: Operation, home_locked: bool) -> Result<(
     };
     match command {
         Operation::Run { .. } => {
+            let Some(_claim_lock) = crate::claim::try_lock(&home)? else {
+                return Ok(());
+            };
             let device_config = DeviceConfig::load(&home)?
                 .context("open-pact.toml is missing; run `config example`")?;
             if !device_config

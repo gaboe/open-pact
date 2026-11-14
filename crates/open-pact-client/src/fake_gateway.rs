@@ -176,12 +176,13 @@ pub fn not_found() -> (u16, String) {
     (404, "{}".into())
 }
 
-/// Every file directly in `dir`, read through links, with its contents.
+/// Every file directly in `dir`, read through links, with its contents. The claim lock holds no
+/// data and is left out.
 pub fn snapshot(dir: &std::path::Path) -> BTreeMap<String, Vec<u8>> {
     std::fs::read_dir(dir)
         .unwrap()
         .map(|e| e.unwrap())
-        .filter(|e| !e.path().is_dir())
+        .filter(|e| !e.path().is_dir() && e.file_name() != "claim.lock")
         .map(|e| {
             (
                 e.file_name().to_string_lossy().into_owned(),
