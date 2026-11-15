@@ -1,13 +1,7 @@
 [advisories]
 unmaintained = "workspace"
 yanked = "deny"
-ignore = [
-    { id = "RUSTSEC-2026-0346", reason = "No custom rustls ClientSessionStore is used; rustls documents the built-in session cache Debug output as redacted." },
-    { id = "RUSTSEC-2026-0347", reason = "The workspace does not enable rustls ECH or call EchMode::Enable." },
-    { id = "RUSTSEC-2026-0348", reason = "The workspace does not enable rustls Brotli certificate decompression." },
-    { id = "RUSTSEC-2026-0349", reason = "The workspace does not enable rustls prefer-post-quantum, so the affected hybrid key-share prediction is inactive." },
-    { id = "RUSTSEC-2026-0009", reason = "Workspace code uses time for current time and durations; it does not parse untrusted RFC 2822 input. x509-parser only formats RFC 2822 dates." },
-]
+ignore = []
 
 [bans]
 multiple-versions = "warn"
