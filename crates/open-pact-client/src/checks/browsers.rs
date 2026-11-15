@@ -1574,10 +1574,14 @@ mod missed_mutant_tests {
             let link = root.path().join(name);
             std::os::unix::fs::symlink("Storage/inner", &link).unwrap();
 
-            assert_eq!(
-                profiles(root.path(), firefox),
-                Ok(if expected { vec![link] } else { vec![] })
-            );
+            let mut actual = profiles(root.path(), firefox).unwrap();
+            let mut expected_paths = if expected { vec![link] } else { vec![] };
+            if firefox {
+                expected_paths.push(root.path().join("Storage"));
+            }
+            actual.sort();
+            expected_paths.sort();
+            assert_eq!(actual, expected_paths);
         }
     }
 
@@ -1706,7 +1710,7 @@ mod missed_mutant_tests {
 
     #[test]
     fn each_sandbox_package_keeps_linux_result_unknown() {
-        for marker in ["home/.var/app", "snap/firefox", "snap/chromium"] {
+        for marker in ["home/fictional/.var/app", "snap/firefox", "snap/chromium"] {
             let root = tempfile::tempdir().unwrap();
             let home = root.path().join("home/fictional");
             let config = home.join(".config");
