@@ -2662,11 +2662,13 @@ async fn wait_after_join(
         result = async {
             let mut completed_scan = None;
             let initial = if resumed {
+                let poll = poll_approval(http, home, enrolment, manifest);
+                tokio::pin!(poll);
                 Some(tokio::select! {
-                    result = poll_approval(http, home, enrolment, manifest) => result,
+                    result = &mut poll => result,
                     result = &mut scan => {
                         completed_scan = Some(result?);
-                        poll_approval(http, home, enrolment, manifest).await
+                        poll.await
                     }
                 })
             } else {
@@ -5254,7 +5256,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn approved_resume_checks_status_when_wizard_is_disabled() {
         const CHILD: &str = "OPEN_PACT_APPROVED_RESUME_TEST_CHILD";
 
@@ -5269,23 +5271,31 @@ mod tests {
                 .output()
                 .unwrap();
             let stdout = String::from_utf8_lossy(&output.stdout);
-            assert!(output.status.success(), "{stdout}");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{stdout}\n{stderr}");
             assert!(
                 stdout.contains("This device is already approved."),
-                "{stdout}"
+                "{stdout}\n{stderr}"
             );
-            assert!(!stdout.contains("Read this code to IT"), "{stdout}");
+            assert!(
+                !stdout.contains("Read this code to IT"),
+                "{stdout}\n{stderr}"
+            );
             assert!(
                 stdout.contains("Next: open-pact-client --home "),
-                "{stdout}"
+                "{stdout}\n{stderr}"
             );
-            assert!(stdout.contains("Local claim log:"), "{stdout}");
+            assert!(stdout.contains("Local claim log:"), "{stdout}\n{stderr}");
             return;
         }
 
         let company = Company::new();
         let witness = Witness::new();
-        let toml = witnessed_manifest(&witness);
+        let toml = witnessed_manifest(&witness).replacen(
+            "[log]",
+            "[[control]]\nid = \"managed_repos_total\"\nsource = \"company_policy\"\ncheck = \"builtin:managed_repos_total@1\"\nremotes = [\"github.com/example-org/\"]\noutput = { integer = { min = 0, max = 2147483647 } }\nrequired = {}\ngrace = \"1d\"\n\n[log]",
+            1,
+        );
         let dir = tempfile::tempdir().unwrap();
         let home = enrolled_home_with(dir.path(), "", &company, &toml);
         let (manifest, mut enrolment, entries, _, approved_checkpoint) =
