@@ -5256,7 +5256,20 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    fn with_repository_control(toml: &str) -> String {
+        let controlled = toml.replacen(
+            "[log]",
+            "[[control]]\nid = \"managed_repos_total\"\nsource = \"company_policy\"\ncheck = \"builtin:managed_repos_total@1\"\nremotes = [\"github.com/example-org/\"]\noutput = { integer = { min = 0, max = 2147483647 } }\nrequired = {}\ngrace = \"1d\"\n\n[log]",
+            1,
+        );
+        assert_ne!(
+            controlled, toml,
+            "the [log] anchor moved, so no repository control was added"
+        );
+        controlled
+    }
+
+    #[tokio::test]
     async fn approved_resume_checks_status_when_wizard_is_disabled() {
         const CHILD: &str = "OPEN_PACT_APPROVED_RESUME_TEST_CHILD";
 
@@ -5291,11 +5304,7 @@ mod tests {
 
         let company = Company::new();
         let witness = Witness::new();
-        let toml = witnessed_manifest(&witness).replacen(
-            "[log]",
-            "[[control]]\nid = \"managed_repos_total\"\nsource = \"company_policy\"\ncheck = \"builtin:managed_repos_total@1\"\nremotes = [\"github.com/example-org/\"]\noutput = { integer = { min = 0, max = 2147483647 } }\nrequired = {}\ngrace = \"1d\"\n\n[log]",
-            1,
-        );
+        let toml = witnessed_manifest(&witness);
         let dir = tempfile::tempdir().unwrap();
         let home = enrolled_home_with(dir.path(), "", &company, &toml);
         let (manifest, mut enrolment, entries, _, approved_checkpoint) =
@@ -5377,11 +5386,7 @@ mod tests {
 
         let company = Company::new();
         let witness = Witness::new();
-        let toml = witnessed_manifest(&witness).replacen(
-            "[log]",
-            "[[control]]\nid = \"managed_repos_total\"\nsource = \"company_policy\"\ncheck = \"builtin:managed_repos_total@1\"\nremotes = [\"github.com/example-org/\"]\noutput = { integer = { min = 0, max = 2147483647 } }\nrequired = {}\ngrace = \"1d\"\n\n[log]",
-            1,
-        );
+        let toml = with_repository_control(&witnessed_manifest(&witness));
         let dir = tempfile::tempdir().unwrap();
         let home = enrolled_home_with(dir.path(), "", &company, &toml);
         let (manifest, mut enrolment, entries, _, approved_checkpoint) =
@@ -5454,6 +5459,99 @@ mod tests {
                 .filter(|request| request.as_str() == "POST /v1/device/status")
                 .count(),
             2
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resumed_join_keeps_its_status_request_when_the_scan_finishes_first() {
+        let company = Company::new();
+        let witness = Witness::new();
+        let toml = with_repository_control(&witnessed_manifest(&witness));
+        let dir = tempfile::tempdir().unwrap();
+        let home = enrolled_home_with(dir.path(), "", &company, &toml);
+        let (manifest, mut enrolment, entries, _, approved_checkpoint) =
+            approval_fixture(&home, &company, &witness);
+        let response = my_entries_response(&approved_checkpoint, &entries, 3);
+        let entries_for_log = entries.clone();
+        let log_key = company.log.vkey();
+        // A scan of this tree outlasts the nonce and the first status request, so the scan
+        // finishes while that request is still open.
+        let tree = home.file("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        for i in 0..4000 {
+            std::fs::create_dir(tree.join(format!("{i:04}"))).unwrap();
+        }
+        let scan_file = home.file("repo-scan.json");
+        let gateway = FakeGateway::start(move |line, nth| match line {
+            "GET /v1/log/key" => (200, format!("{log_key}\n")),
+            "GET /v1/log/checkpoint" => (200, approved_checkpoint.clone()),
+            "POST /v1/nonce" => (200, json!({"nonce":"resume"}).to_string()),
+            "POST /v1/device/status" if nth == 0 => {
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                while !scan_file.is_file() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                (200, json!({"state":"approved"}).to_string())
+            }
+            "POST /v1/device/status" => (200, json!({"state":"approved"}).to_string()),
+            "POST /v1/log/mine" => (200, response.clone()),
+            _ => serve_log(&entries_for_log, line).unwrap_or_else(not_found),
+        })
+        .await;
+        put_gateway_in_enrolment(&home, &mut enrolment, &gateway.url);
+        home.write(device_config::FILE, br#"{"setup_answered": true}"#)
+            .unwrap();
+        let accepted_claim = serde_json::to_vec(&json!({
+            "status": "accepted",
+            "warnings": [],
+            "certificate_pem": "earlier certificate",
+            "ca_pem": "earlier CA",
+            "log_checkpoint": "fictional verified checkpoint"
+        }))
+        .unwrap();
+        locallog::append_with_status(
+            &home.file("claims.jsonl"),
+            b"completed setup",
+            &accepted_claim,
+            Some(200),
+        )
+        .unwrap();
+        assert_eq!(wizard_resume(&home).unwrap(), WizardResume::Complete);
+
+        let code = wait_after_join(
+            &http_client().unwrap(),
+            &home,
+            &enrolment,
+            &manifest,
+            JoinOptions {
+                insecure_dev: true,
+                no_wait: false,
+                poll_interval: APPROVAL_POLL_INTERVAL,
+            },
+            false,
+            JoinOrigin::Resumed,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(home.file("repo-scan.json").is_file(), "the scan ran");
+        let requests = gateway.requests();
+        let status = requests
+            .iter()
+            .position(|request| request == "POST /v1/device/status")
+            .unwrap();
+        let proof = requests
+            .iter()
+            .position(|request| request == "POST /v1/log/mine")
+            .unwrap();
+        assert!(status < proof, "status is checked before its signed proof");
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.as_str() == "POST /v1/device/status")
+                .count(),
+            1
         );
     }
 
