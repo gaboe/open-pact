@@ -118,6 +118,13 @@ pub(crate) struct Report {
     limitations: Vec<String>,
 }
 
+impl Options {
+    /// The command prints JSON, so its failure is JSON too.
+    pub(crate) fn json(&self) -> bool {
+        self.json
+    }
+}
+
 pub(crate) async fn run(home: &Home, options: Options, insecure_dev: bool) -> Result<ExitCode> {
     let report = collect(home, options.online, insecure_dev).await?;
     let text = if options.json {
