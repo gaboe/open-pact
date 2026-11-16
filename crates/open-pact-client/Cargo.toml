@@ -9,6 +9,7 @@ license.workspace = true
 open-pact-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+semver = "1"
 tokio = { workspace = true, features = ["process", "sync"] }
 clap = { version = "4", features = ["derive"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

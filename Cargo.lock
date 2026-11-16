@@ -1558,6 +1558,7 @@ dependencies = [
  "rustls",
  "security-framework",
  "security-framework-sys",
+ "semver",
  "serde",
  "serde_json",
  "sha2 0.11.1",
