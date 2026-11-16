@@ -342,6 +342,8 @@ The exit code tells a script what to do:
 
 `--json` prints the same evidence, items, and exit code as one JSON document. `schedule status` stays the detailed view of the schedule and the job.
 
+`status --online` also asks GitHub for the latest release of the client. The request is one GET to `api.github.com` with the User-Agent `open-pact-client/<version>`, with a 3 second limit. When a newer release exists, the report ends with a line that names it, and it gives the update command for a Homebrew or Scoop install. Set `OPEN_PACT_NO_UPDATE_CHECK=1` to send no request. A failed check adds nothing to the report and does not change the exit code.
+
 ## Understand what leaves the device
 
 `join` sends the invitation, signed manifest, owner and device public keys, and signatures that bind the owner, device, invitation, and manifest. It sends no private keys.

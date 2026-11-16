@@ -56,6 +56,7 @@ mod schedule;
 mod secure_enclave;
 mod status;
 mod ui;
+mod update;
 
 use std::cell::Cell;
 use std::collections::BTreeMap;

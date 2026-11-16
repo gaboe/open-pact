@@ -116,6 +116,7 @@ pub(crate) struct Report {
     log: String,
     issues: Vec<Issue>,
     limitations: Vec<String>,
+    update: Option<crate::update::Notice>,
 }
 
 impl Options {
@@ -126,7 +127,10 @@ impl Options {
 }
 
 pub(crate) async fn run(home: &Home, options: Options, insecure_dev: bool) -> Result<ExitCode> {
-    let report = collect(home, options.online, insecure_dev).await?;
+    let mut report = collect(home, options.online, insecure_dev).await?;
+    if options.online {
+        report.update = crate::update::latest_notice().await;
+    }
     let text = if options.json {
         serde_json::to_string_pretty(&report)? + "\n"
     } else {
@@ -207,6 +211,7 @@ async fn collect_with(
             "An accepted saved response does not prove a verified certificate install.".into(),
             "Exact grace deadlines are unavailable; the gateway returns text, not first-failure times.".into(),
         ],
+        update: None,
     };
     let command = crate::client_command(&home.0);
     for (file, error) in damaged {
@@ -1061,6 +1066,9 @@ impl Report {
             let _ = writeln!(text, "Note: {limitation}");
         }
         let _ = writeln!(text, "Exit: {}", self.exit_code);
+        if let Some(update) = &self.update {
+            let _ = writeln!(text, "{}", update.line());
+        }
         text
     }
 

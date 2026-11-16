@@ -976,3 +976,24 @@ async fn a_changed_company_key_stops_before_device_authentication() {
     assert_eq!(report.exit_code, 2);
     assert_eq!(gateway.requests(), ["GET /v1/manifest"]);
 }
+
+#[tokio::test]
+async fn an_update_notice_is_the_last_text_line_and_a_json_field() {
+    let fixture = Fixture::new("approved_ok").await;
+    let mut report = fixture.report(true).await;
+    assert!(serde_json::to_value(&report).unwrap()["update"].is_null());
+    assert!(!report.render().contains("is available"));
+    report.update = Some(crate::update::Notice {
+        current: "0.6.0".into(),
+        latest: "0.6.1".into(),
+        command: Some("brew upgrade open-pact"),
+    });
+    assert!(report.render().ends_with(&format!(
+        "Exit: {}\nopen-pact-client 0.6.1 is available. Update: brew upgrade open-pact\n",
+        report.exit_code
+    )));
+    let json = serde_json::to_value(&report).unwrap();
+    assert_eq!(json["update"]["current"], "0.6.0");
+    assert_eq!(json["update"]["latest"], "0.6.1");
+    assert_eq!(json["update"]["command"], "brew upgrade open-pact");
+}
