@@ -81,8 +81,8 @@ async fn change(
             .fetch_optional(&mut *tx)
             .await?;
     let previous = match previous {
-        Some(hash) => hash,
-        None => read_manifest()?.2.hash().to_string(),
+        Some(hash) => Some(hash),
+        None => startup_manifest_hash()?,
     };
     let (toml, note) = match text {
         Some((toml, note)) => (toml.to_owned(), note.to_owned()),
