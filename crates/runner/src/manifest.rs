@@ -1327,6 +1327,15 @@ impl Pending {
         ))
     }
 
+    /// Why the view may not change: one of the inputs holds text that is not a value yet.
+    pub fn unread_blocks(&self, form: &Form) -> Option<String> {
+        let field = self.0.keys().next()?;
+        Some(format!(
+            "{} holds text that is not a value yet. Fix it before you switch views.",
+            field.label(form)
+        ))
+    }
+
     /// The panel's inputs are gone, and so is the text they held.
     pub fn drop_panel(&mut self) {
         self.0.retain(|field, _| !field.in_panel());

@@ -890,6 +890,25 @@ impl AppView {
         }
     }
 
+    /// Moves between the Form and TOML views. Leaving the Form waits while an input holds text
+    /// that is not a value yet, so that text is never dropped.
+    fn switch_view(&mut self, to_form: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let unread = self.unread_note();
+        match view_switch(self.form, to_form, unread.is_some()) {
+            ViewSwitch::Stay => {}
+            ViewSwitch::Refuse => self.error = unread,
+            ViewSwitch::Switch if to_form => {
+                self.form = true;
+                self.build_form(window, cx);
+            }
+            ViewSwitch::Switch => {
+                self.form = false;
+                self.fv.pending.clear();
+            }
+        }
+        cx.notify();
+    }
+
     pub fn select_check(
         &mut self,
         id: Option<String>,
@@ -1225,6 +1244,11 @@ impl AppView {
         self.fv.pending.panel_blocks(&form)
     }
 
+    fn unread_note(&self) -> Option<String> {
+        let form = Form::parse(&self.draft).ok()?;
+        self.fv.pending.unread_blocks(&form)
+    }
+
     fn panel_blocked(&mut self) -> bool {
         let Some(note) = self.panel_note() else {
             return false;
@@ -1297,20 +1321,15 @@ impl AppView {
                 seg_item("form", "Form", self.form)
                     .when(form_blocked, |item| item.opacity(0.45))
                     .on_click(cx.listener(|this, _, window, cx| {
-                        if this.busy {
-                            return;
+                        if !this.busy {
+                            this.switch_view(true, window, cx);
                         }
-                        this.form = true;
-                        this.build_form(window, cx);
-                        cx.notify();
                     })),
                 seg_item("toml", "TOML", !self.form)
                     .when(self.busy, |item| item.opacity(0.45))
-                    .on_click(cx.listener(|this, _, _, cx| {
+                    .on_click(cx.listener(|this, _, window, cx| {
                         if !this.busy {
-                            this.form = false;
-                            this.fv.pending.clear();
-                            cx.notify();
+                            this.switch_view(false, window, cx);
                         }
                     })),
             ]))
@@ -2521,6 +2540,27 @@ enum PanelSwitch {
     Replace,
 }
 
+/// What a click on a view tab does.
+#[derive(Debug, PartialEq, Eq)]
+enum ViewSwitch {
+    /// The view that is already open. Nothing changes.
+    Stay,
+    /// Leaving the Form while an input holds text that is not a value yet.
+    Refuse,
+    /// Another view, with no unread input to lose.
+    Switch,
+}
+
+fn view_switch(form_now: bool, to_form: bool, unread: bool) -> ViewSwitch {
+    if form_now == to_form {
+        ViewSwitch::Stay
+    } else if form_now && unread {
+        ViewSwitch::Refuse
+    } else {
+        ViewSwitch::Switch
+    }
+}
+
 fn panel_switch(selected: Option<&str>, requested: Option<&str>, blocked: bool) -> PanelSwitch {
     if requested == selected {
         PanelSwitch::Keep
@@ -2533,7 +2573,7 @@ fn panel_switch(selected: Option<&str>, requested: Option<&str>, blocked: bool) 
 
 #[cfg(test)]
 mod tests {
-    use super::{PanelSwitch, PopoverPlace, panel_switch, popover_place};
+    use super::{PanelSwitch, PopoverPlace, ViewSwitch, panel_switch, popover_place, view_switch};
 
     fn place(above: bool, height: f32) -> PopoverPlace {
         PopoverPlace { above, height }
@@ -2561,6 +2601,20 @@ mod tests {
     fn clicking_the_open_check_keeps_its_panel_even_with_unread_input() {
         assert_eq!(panel_switch(Some("a"), Some("a"), true), PanelSwitch::Keep);
         assert_eq!(panel_switch(Some("a"), Some("a"), false), PanelSwitch::Keep);
+    }
+
+    #[test]
+    fn clicking_the_active_view_changes_nothing() {
+        assert_eq!(view_switch(true, true, false), ViewSwitch::Stay);
+        assert_eq!(view_switch(true, true, true), ViewSwitch::Stay);
+        assert_eq!(view_switch(false, false, false), ViewSwitch::Stay);
+    }
+
+    #[test]
+    fn leaving_the_form_waits_while_an_input_holds_unread_text() {
+        assert_eq!(view_switch(true, false, true), ViewSwitch::Refuse);
+        assert_eq!(view_switch(true, false, false), ViewSwitch::Switch);
+        assert_eq!(view_switch(false, true, false), ViewSwitch::Switch);
     }
 
     #[test]
