@@ -1,5 +1,6 @@
 use anyhow::{Context, bail};
 use open_pact_core::{EntryKind, Pseudonym};
+use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{PgConnection, PgPool};
@@ -231,7 +232,47 @@ pub fn full_pseudonym(text: &str) -> anyhow::Result<String> {
     Ok(full)
 }
 
-pub async fn list(db: &PgPool) -> anyhow::Result<String> {
+/// One enrolment as `devices list --json` prints it. The database keeps no claim facts next to
+/// a device: a claim holds its device pseudonym only inside its sealed body, and no refusal reason
+/// is stored at all. So the row has no `last_claim_at`, `last_result` or `last_reasons`.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct DeviceRow {
+    pub pseudonym: String,
+    /// The first 12 hex digits of the pseudonym: what the owner reads out to IT.
+    pub code: String,
+    pub state: String,
+    /// The note of the invitation the device enrolled with; empty when it has none.
+    pub note: String,
+    pub enrolled_at: String,
+    pub manifest_hash: String,
+}
+
+impl DeviceRow {
+    fn new(
+        state: String,
+        pseudonym: String,
+        manifest_hash: String,
+        enrolled_at: String,
+        note: Option<String>,
+    ) -> Self {
+        DeviceRow {
+            code: pseudonym
+                .strip_prefix("pseudonym:")
+                .unwrap_or(&pseudonym)
+                .chars()
+                .take(12)
+                .collect(),
+            pseudonym,
+            state,
+            note: note.unwrap_or_default(),
+            enrolled_at,
+            manifest_hash,
+        }
+    }
+}
+
+/// Every enrolment, oldest first.
+pub async fn rows(db: &PgPool) -> anyhow::Result<Vec<DeviceRow>> {
     let rows: Vec<(String, String, String, String, Option<String>)> = sqlx::query_as(
         "SELECT d.state, d.pseudonym, d.manifest_hash, \
                 to_char(d.enrolled_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), i.note \
@@ -240,20 +281,105 @@ pub async fn list(db: &PgPool) -> anyhow::Result<String> {
     )
     .fetch_all(db)
     .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(state, pseudonym, manifest, enrolled, note)| {
+            DeviceRow::new(state, pseudonym, manifest, enrolled, note)
+        })
+        .collect())
+}
+
+/// The lines of `devices list`.
+pub fn render(rows: &[DeviceRow]) -> String {
     let mut out = String::new();
-    for (state, pseudonym, manifest, enrolled, note) in rows {
-        let manifest = manifest.get(..19).unwrap_or(&manifest);
+    for row in rows {
+        let manifest = row.manifest_hash.get(..19).unwrap_or(&row.manifest_hash);
         out.push_str(&format!(
-            "{state:<9} {pseudonym}  {manifest}  {enrolled}  {}\n",
-            note.unwrap_or_default()
+            "{:<9} {}  {manifest}  {}  {}\n",
+            row.state, row.pseudonym, row.enrolled_at, row.note
         ));
     }
-    Ok(out)
+    out
+}
+
+pub async fn list(db: &PgPool) -> anyhow::Result<String> {
+    Ok(render(&rows(db).await?))
+}
+
+/// `devices list --json`: an array with one object per enrolment.
+pub async fn list_json(db: &PgPool) -> anyhow::Result<String> {
+    Ok(serde_json::to_string_pretty(&rows(db).await?)? + "\n")
+}
+
+/// How many devices are in each state. A device with several enrolments counts once per state.
+#[derive(Debug, Default, PartialEq, Eq, Serialize)]
+pub struct StateCounts {
+    pub pending: u64,
+    pub approved: u64,
+    pub revoked: u64,
+}
+
+pub async fn counts(db: &PgPool) -> anyhow::Result<StateCounts> {
+    let rows: Vec<(String, i64)> =
+        sqlx::query_as("SELECT state, count(DISTINCT pseudonym) FROM devices GROUP BY state")
+            .fetch_all(db)
+            .await?;
+    let mut counts = StateCounts::default();
+    for (state, number) in rows {
+        let number = u64::try_from(number)?;
+        match State::parse(&state)? {
+            State::Pending => counts.pending = number,
+            State::Approved => counts.approved = number,
+            State::Revoked => counts.revoked = number,
+        }
+    }
+    Ok(counts)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_row_carries_the_code_the_owner_reads_out() {
+        let hex = "0123456789abcdef".repeat(4);
+        let row = DeviceRow::new(
+            "pending".into(),
+            format!("pseudonym:{hex}"),
+            format!("sha256:{}", "ab".repeat(32)),
+            "2026-11-02T10:00:00Z".into(),
+            None,
+        );
+        assert_eq!(row.code, "0123456789ab");
+        assert_eq!(row.note, "");
+        let json = serde_json::to_value(&row).unwrap();
+        assert_eq!(
+            json,
+            json!({
+                "pseudonym": format!("pseudonym:{hex}"),
+                "code": "0123456789ab",
+                "state": "pending",
+                "note": "",
+                "enrolled_at": "2026-11-02T10:00:00Z",
+                "manifest_hash": format!("sha256:{}", "ab".repeat(32)),
+            })
+        );
+    }
+
+    #[test]
+    fn the_text_list_keeps_its_columns() {
+        let row = DeviceRow::new(
+            "approved".into(),
+            "pseudonym:aa".into(),
+            format!("sha256:{}", "cd".repeat(32)),
+            "2026-11-02T10:00:00Z".into(),
+            Some("MacBook of K. Example".into()),
+        );
+        assert_eq!(
+            render(&[row]),
+            "approved  pseudonym:aa  sha256:cdcdcdcdcdcd  2026-11-02T10:00:00Z  MacBook of K. Example\n"
+        );
+    }
 
     #[test]
     fn approval_moves_only_pending_devices() {
@@ -293,5 +419,45 @@ mod tests {
         let hex = "ab".repeat(32);
         assert_eq!(full_pseudonym(&hex).unwrap(), format!("pseudonym:{hex}"));
         assert!(full_pseudonym("abcd1234").is_err());
+    }
+
+    /// Run with TEST_DATABASE_URL set, as the other database tests.
+    #[tokio::test]
+    #[ignore = "needs TEST_DATABASE_URL"]
+    async fn the_json_list_and_the_counts_follow_the_database() {
+        let db = crate::testdb::fresh().await;
+        let manifest = format!("sha256:{}", "ab".repeat(32));
+        for (n, state) in [
+            (1u8, "pending"),
+            (2, "approved"),
+            (3, "approved"),
+            (4, "revoked"),
+        ] {
+            let pseudonym = format!("pseudonym:{}", hex::encode([n; 32]));
+            crate::testdb::enrolled_device(&db, &pseudonym, &manifest).await;
+            sqlx::query("UPDATE devices SET state = $1 WHERE pseudonym = $2")
+                .bind(state)
+                .bind(&pseudonym)
+                .execute(&db)
+                .await
+                .unwrap();
+        }
+        let listed: Value = serde_json::from_str(&list_json(&db).await.unwrap()).unwrap();
+        let listed = listed.as_array().unwrap();
+        assert_eq!(listed.len(), 4);
+        assert_eq!(listed[0]["code"], "010101010101");
+        assert_eq!(listed[0]["state"], "pending");
+        assert_eq!(listed[0]["manifest_hash"], manifest);
+        assert!(listed[0]["enrolled_at"].as_str().unwrap().ends_with('Z'));
+        assert_eq!(listed[0]["note"], "");
+        assert_eq!(list(&db).await.unwrap().lines().count(), 4);
+        assert_eq!(
+            counts(&db).await.unwrap(),
+            StateCounts {
+                pending: 1,
+                approved: 2,
+                revoked: 1
+            }
+        );
     }
 }

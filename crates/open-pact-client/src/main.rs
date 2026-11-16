@@ -1,9 +1,51 @@
+/// Under `--json` a command prints JSON and nothing else. These stand in for the standard macros:
+/// text goes to a note buffer while JSON output is on. Textual scope covers every module below.
+macro_rules! println {
+    () => {
+        if $crate::json_out::active() {
+            $crate::json_out::note_line(String::new());
+        } else {
+            ::std::println!();
+        }
+    };
+    ($($arg:tt)*) => {
+        if $crate::json_out::active() {
+            $crate::json_out::note_line(format!($($arg)*));
+        } else {
+            ::std::println!($($arg)*);
+        }
+    };
+}
+
+macro_rules! eprintln {
+    () => {
+        ::std::eprintln!();
+    };
+    ($($arg:tt)*) => {{
+        if $crate::json_out::active() {
+            $crate::json_out::note_line(format!($($arg)*));
+        }
+        ::std::eprintln!($($arg)*)
+    }};
+}
+
+macro_rules! print {
+    ($($arg:tt)*) => {
+        if $crate::json_out::active() {
+            $crate::json_out::note_partial(format!($($arg)*));
+        } else {
+            ::std::print!($($arg)*);
+        }
+    };
+}
+
 mod checks;
 mod claim;
 mod device_config;
 mod device_key;
 #[cfg(test)]
 mod fake_gateway;
+mod json_out;
 mod locallog;
 mod schedule;
 #[cfg(target_os = "macos")]
@@ -58,6 +100,19 @@ struct Cli {
     command: Command,
 }
 
+impl Cli {
+    /// The command prints JSON, so a failure before it starts is JSON too.
+    fn prints_json(&self) -> bool {
+        matches!(
+            self.command,
+            Command::Join { preview: true, .. }
+                | Command::Join { json: true, .. }
+                | Command::Check { json: true, .. }
+                | Command::Accept { preview: true, .. }
+        )
+    }
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Show the device status without running checks or sending a claim
@@ -75,18 +130,40 @@ enum Command {
         /// Print the device code and exit without waiting for IT
         #[arg(long)]
         no_wait: bool,
+        /// Show what joining would sign, as JSON, and stop. Signs nothing, writes no file, sends no POST
+        #[arg(
+            long,
+            requires = "invitation",
+            conflicts_with_all = ["yes", "software_key", "no_wait", "json"]
+        )]
+        preview: bool,
+        /// Print one JSON line per wizard step event. Needs --yes; nothing is asked
+        #[arg(long, requires = "yes")]
+        json: bool,
+        /// With --json: a folder that holds your repositories, for the manifest's repository checks. Repeatable
+        #[arg(long = "folder", requires = "json")]
+        folders: Vec<PathBuf>,
+        /// With --json: send claims automatically (on) or not (off) [default: off]
+        #[arg(long, requires = "json", value_enum)]
+        auto_send: Option<Toggle>,
     },
     /// Run the manifest's checks, send a signed claim and fetch a VPN certificate
     Check {
         /// Print the claim that would be sent. Make GET requests only and write no file
         #[arg(long)]
         dry_run: bool,
+        /// After sending, print the result as JSON
+        #[arg(long, conflicts_with = "dry_run")]
+        json: bool,
     },
     /// Review a changed manifest from the gateway, sign it and move this device to it
     Accept {
         /// Sign without asking
         #[arg(long)]
         yes: bool,
+        /// Print what accepting would change, as JSON, and stop. Signs nothing, writes no file
+        #[arg(long, conflicts_with = "yes")]
+        preview: bool,
     },
     /// Choose the folders that hold your repositories, for the manifest's repository checks
     Folders {
@@ -112,6 +189,12 @@ enum Command {
     Stop,
     /// Destroy the device key before full uninstall or rotation
     DeleteDeviceKey,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum Toggle {
+    On,
+    Off,
 }
 
 #[derive(Subcommand)]
@@ -334,7 +417,11 @@ tokio::task_local! {
 
 fn wizard_step(step: u8, title: &str) {
     let _ = WIZARD_STEP.try_with(|current| current.set(step));
-    ui::step(step, 6, title);
+    if json_out::active() {
+        json_out::step_started(step, title);
+    } else {
+        ui::step(step, 6, title);
+    }
 }
 
 fn set_wizard_step(step: u8) {
@@ -365,13 +452,18 @@ where
                 signal = tokio::signal::ctrl_c(), if !WIZARD_APPROVAL_WAIT.try_with(Cell::get).unwrap_or(false) => match signal {
                     Ok(()) => {
                         print_stopped(home, invitation);
+                        if json_out::active() {
+                            json_out::exit_interrupted();
+                        }
                         let _ = std::io::stdout().flush();
                         std::process::exit(130);
                     }
                     Err(error) => Err(error.into()),
                 },
                 result = operation => {
-                    if !matches!(&result, Ok(code) if *code == ExitCode::SUCCESS) {
+                    if !json_out::active()
+                        && !matches!(&result, Ok(code) if *code == ExitCode::SUCCESS)
+                    {
                         print_stopped(home, invitation);
                     }
                     result
@@ -1528,6 +1620,25 @@ fn setup_questions(
     })
 }
 
+/// The choices `join --json` was given. Like the questions, it takes folders only when the manifest
+/// counts repositories, and automatic sending only when the manifest defines it.
+fn setup_answers(context: &SetupContext, answers: &json_out::Answers) -> SetupChoices {
+    let auto_send = context.manifest.body().schedule.is_some() && answers.auto_send;
+    let mut folders = context.current.folders.clone();
+    if scans_repositories(&context.manifest) {
+        for folder in &answers.folders {
+            if !folders.contains(folder) {
+                folders.push(folder.clone());
+            }
+        }
+    }
+    SetupChoices {
+        auto_send,
+        run_as: context.current.run_as,
+        folders,
+    }
+}
+
 /// Saves the choices and installs or removes the job to match.
 async fn apply_setup(home: &Home, choices: SetupChoices) -> Result<()> {
     let was_on = {
@@ -1580,20 +1691,36 @@ async fn setup_device(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
         manifest,
         user_home,
     };
-    let (send, receive) = tokio::sync::oneshot::channel();
-    std::thread::spawn(move || {
-        let input = std::io::stdin();
-        let mut output = std::io::stdout();
-        let _ = send.send(setup_questions(&context, &mut input.lock(), &mut output));
-    });
-    let choices = receive.await.context("setup questions stopped")??;
+    let choices = if let Some(answers) = json_out::answers() {
+        setup_answers(&context, &answers)
+    } else {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let input = std::io::stdin();
+            let mut output = std::io::stdout();
+            let _ = send.send(setup_questions(&context, &mut input.lock(), &mut output));
+        });
+        receive.await.context("setup questions stopped")??
+    };
+    let detail = serde_json::json!({ "auto_send": choices.auto_send, "folders": choices.folders });
     apply_setup(home, choices).await?;
+    json_out::step_done(5, Some(detail));
     first_claim(home, insecure_dev).await
 }
 
 /// Wizard step 6: ask once more, then run the first check.
 async fn first_claim(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
     set_wizard_step(6);
+    if json_out::active() {
+        wizard_step(6, "First check and claim");
+        let outcome = check_run(home, insecure_dev, false).await?;
+        let detail = match json_out::claim() {
+            Some(report) => serde_json::to_value(report)?,
+            None => json_out::not_sent_detail(&outcome.failure_text()),
+        };
+        json_out::step_done(6, Some(detail));
+        return Ok(outcome.exit_code());
+    }
     if !confirm_yes_by_default("Send the first claim now?").await? {
         print_stopped_at(home, None, 6);
         return Ok(ExitCode::SUCCESS);
@@ -1664,9 +1791,10 @@ async fn after_approval(home: &Home, insecure_dev: bool, wizard: bool) -> Result
         WizardResume::Setup => return setup_device(home, insecure_dev).await,
         WizardResume::Complete => {
             println!("This device setup is complete.");
+            json_out::steps_skipped(&[5, 6]);
             return Ok(ExitCode::SUCCESS);
         }
-        WizardResume::FirstCheck => {}
+        WizardResume::FirstCheck => json_out::steps_skipped(&[5]),
     }
     first_claim(home, insecure_dev).await
 }
@@ -2434,6 +2562,9 @@ async fn poll_approval(
 }
 
 fn print_waiting_line(message: &str) {
+    if json_out::active() {
+        return;
+    }
     let mut stdout = std::io::stdout().lock();
     if stdout.is_terminal() {
         let _ = write!(stdout, "\r\x1b[2K  {message}");
@@ -2618,6 +2749,9 @@ async fn wait_after_join(
     let wizard = wizard && !options.no_wait;
     if options.no_wait {
         wizard_step(4, "Wait for IT approval");
+        json_out::step_waiting(
+            serde_json::json!({ "device_code": device_code(&enrolment.device) }),
+        );
         let code = ui::device_code_line(&device_code(&enrolment.device), ui::styled());
         print!(
             "{}",
@@ -2660,6 +2794,9 @@ async fn wait_after_join(
     let result = tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             println!("\n{}", stopped_message(4, &format!("{command} join")));
+            if json_out::active() {
+                json_out::exit_interrupted();
+            }
             let _ = std::io::stdout().flush();
             std::process::exit(130);
         }
@@ -2688,6 +2825,9 @@ async fn wait_after_join(
             ) {
                 ""
             } else {
+                json_out::step_waiting(
+                    serde_json::json!({ "device_code": device_code(&enrolment.device) }),
+                );
                 &code
             };
             print!(
@@ -2763,6 +2903,7 @@ async fn wait_after_join(
     match approval {
         Ok(ApprovalWait::Approved) if wizard => {
             println!("\n  {}", ui::bold(approval_confirmation(), ui::styled()));
+            json_out::step_done(4, Some(serde_json::json!({ "state": "approved" })));
             after_approval(home, options.insecure_dev, true).await
         }
         Ok(wait) => {
@@ -2793,7 +2934,9 @@ async fn wait_after_join(
 }
 
 fn wizard_enabled(no_wait: bool) -> bool {
-    !no_wait && std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+    !no_wait
+        && (json_out::active()
+            || (std::io::stdin().is_terminal() && std::io::stdout().is_terminal()))
 }
 
 async fn continue_saved_join(
@@ -2853,6 +2996,7 @@ async fn resume_join(
         print_claim_log_status(home, None, Some("the log checkpoint did not verify"));
         return Ok(ExitCode::from(2));
     }
+    json_out::steps_skipped(&[1, 2, 3]);
     continue_saved_join(
         &http,
         home,
@@ -2948,6 +3092,13 @@ async fn join(
         wizard_step(1, "Check the invitation");
     }
     wanted.save(home)?;
+    json_out::step_done(
+        1,
+        Some(serde_json::json!({
+            "gateway": gateway,
+            "company_key_fingerprint": published.company.key.fingerprint(),
+        })),
+    );
     if !saved_enrolment_matches {
         println!("  The gateway keys match your invitation.");
         for line in invitation.describe().lines() {
@@ -2973,6 +3124,7 @@ async fn join(
     {
         match DeviceKey::load(&home.0) {
             Ok(device) if Pseudonym::of(&device.public_key()) == existing.device => {
+                json_out::steps_skipped(&[1, 2, 3]);
                 return continue_saved_join(
                     &http,
                     home,
@@ -3020,6 +3172,10 @@ async fn join(
         return Ok(ExitCode::FAILURE);
     }
     drop(reading);
+    json_out::step_done(
+        2,
+        Some(serde_json::json!({ "manifest_hash": manifest.hash() })),
+    );
     wizard_step(3, "Enrol this device");
     let owner = dev_key::load_or_create(&home.file("owner-dev.pem"))?;
     let device = DeviceKey::load_or_create(&home.0, software_key)?;
@@ -3078,6 +3234,10 @@ async fn join(
     let client_home = std::path::absolute(&home.0).unwrap_or_else(|_| home.0.clone());
     println!("  Signed       {}  (the manifest above)", manifest.hash());
     println!("  Enrolled as  {}", enrolment.device);
+    json_out::step_done(
+        3,
+        Some(serde_json::json!({ "device": enrolment.device, "state": body["state"] })),
+    );
     println!(
         "  Device key   {}, trust level {:?} (asserted by this client; without attestation the gateway counts it as L0)",
         device.describe(),
@@ -3334,15 +3494,44 @@ async fn check_preview(home: &Home, insecure_dev: bool) -> Result<claim::Preview
 }
 
 async fn check_impl(home: &Home, insecure_dev: bool, show_resume_hint: bool) -> Result<ExitCode> {
-    let _claim_lock = claim::lock(home).await?;
-    let prepared = match claim::prepare(home, None, claim::ScanPolicy::Always, insecure_dev).await {
-        Ok(prepared) => prepared,
+    match check_run(home, insecure_dev, show_resume_hint).await {
+        Ok(outcome) => Ok(outcome.exit_code()),
         Err(error) if error.is::<claim::LegacyLogHead>() => {
             print_log_upgrade(home);
-            return Ok(ExitCode::FAILURE);
+            Ok(ExitCode::FAILURE)
         }
-        Err(error) => return Err(error),
-    };
+        Err(error) => Err(error),
+    }
+}
+
+/// `check --json`: sends the claim like `check` and prints what happened as one JSON document.
+async fn check_json(
+    home: &Home,
+    insecure_dev: bool,
+    json: std::sync::Arc<json_out::Json>,
+) -> ExitCode {
+    json_out::scope(json, async {
+        match check_run(home, insecure_dev, false).await {
+            Ok(outcome) => {
+                match json_out::claim() {
+                    Some(report) => json_out::document(&report),
+                    None => json_out::error(&outcome.failure_text()),
+                }
+                outcome.exit_code()
+            }
+            Err(error) => json_out::failed(&format!("{error:#}")),
+        }
+    })
+    .await
+}
+
+async fn check_run(
+    home: &Home,
+    insecure_dev: bool,
+    show_resume_hint: bool,
+) -> Result<claim::Outcome> {
+    let _claim_lock = claim::lock(home).await?;
+    let prepared = claim::prepare(home, None, claim::ScanPolicy::Always, insecure_dev).await?;
     if let Some(notice) = device_config::legacy_notice(
         home,
         device_config::Surface::Check,
@@ -3364,8 +3553,7 @@ async fn check_impl(home: &Home, insecure_dev: bool, show_resume_hint: bool) -> 
             WizardResume::Complete => {}
         }
     }
-    let outcome = prepared.send(home, async || true).await?;
-    Ok(outcome.exit_code())
+    prepared.send(home, async || true).await
 }
 
 /// The hash of the manifest the gateway enforces now.
@@ -3419,13 +3607,41 @@ fn control_rule(c: &open_pact_core::Control) -> String {
     format!("{clauses} (grace {}, reports {})", c.grace, c.output)
 }
 
+/// One difference between the manifest a device signed and the one the gateway enforces now.
+/// `before` or `after` is null for a control that was added or removed.
+#[derive(Debug, PartialEq, Serialize)]
+struct ManifestChange {
+    id: String,
+    before: Option<String>,
+    after: Option<String>,
+    #[serde(skip)]
+    line: String,
+}
+
+/// A control as the owner reads it in a change: its rule and its check.
+fn control_state(c: &open_pact_core::Control) -> String {
+    format!("{}; check {}", control_rule(c), c.check)
+}
+
 /// What `new` changes against `old`, the manifest this device signed, one line per change.
 fn manifest_changes(old: &Manifest, new: &Manifest) -> Vec<String> {
+    manifest_change_list(old, new)
+        .into_iter()
+        .map(|change| change.line)
+        .collect()
+}
+
+fn manifest_change_list(old: &Manifest, new: &Manifest) -> Vec<ManifestChange> {
     let (was, now) = (old.body(), new.body());
     let mut changes = Vec::new();
     for c in &now.controls {
         match was.control(&c.id) {
-            None => changes.push(format!("added control {}: {}", c.id, control_rule(c))),
+            None => changes.push(ManifestChange {
+                id: c.id.clone(),
+                before: None,
+                after: Some(control_state(c)),
+                line: format!("added control {}: {}", c.id, control_rule(c)),
+            }),
             Some(before) if control_rule(before) != control_rule(c) || before.check != c.check => {
                 let mut line = format!("changed control {}:", c.id);
                 if control_rule(before) != control_rule(c) {
@@ -3434,23 +3650,39 @@ fn manifest_changes(old: &Manifest, new: &Manifest) -> Vec<String> {
                 if before.check != c.check {
                     line += &format!(" check {} (was {})", c.check, before.check);
                 }
-                changes.push(line);
+                changes.push(ManifestChange {
+                    id: c.id.clone(),
+                    before: Some(control_state(before)),
+                    after: Some(control_state(c)),
+                    line,
+                });
             }
             Some(_) => {}
         }
     }
     for c in &was.controls {
         if now.control(&c.id).is_none() {
-            changes.push(format!("removed control {}", c.id));
+            changes.push(ManifestChange {
+                id: c.id.clone(),
+                before: Some(control_state(c)),
+                after: None,
+                line: format!("removed control {}", c.id),
+            });
         }
     }
     let list = |items: Vec<String>| items.join(", ");
-    let mut term = |name: &str, before: String, after: String| {
+    let mut term = |id: &str, name: &str, before: String, after: String| {
         if before != after {
-            changes.push(format!("{name}: {after} (was {before})"));
+            changes.push(ManifestChange {
+                id: id.to_owned(),
+                line: format!("{name}: {after} (was {before})"),
+                before: Some(before),
+                after: Some(after),
+            });
         }
     };
     term(
+        "disclosed_metadata",
         "disclosed metadata",
         list(
             was.disclosed_metadata
@@ -3466,37 +3698,44 @@ fn manifest_changes(old: &Manifest, new: &Manifest) -> Vec<String> {
         ),
     );
     term(
+        "claim_retention",
         "claim retention",
         was.claim_retention.to_string(),
         now.claim_retention.to_string(),
     );
     term(
+        "claim_recipients",
         "claim recipients",
         list(was.claim_recipients.iter().cloned().collect()),
         list(now.claim_recipients.iter().cloned().collect()),
     );
     term(
+        "data_controller",
         "data controller",
         was.data_controller.clone(),
         now.data_controller.clone(),
     );
-    term("issuer", was.issuer.clone(), now.issuer.clone());
+    term("issuer", "issuer", was.issuer.clone(), now.issuer.clone());
     term(
+        "valid_from",
         "valid from",
         was.valid_from.to_string(),
         now.valid_from.to_string(),
     );
     term(
+        "claim_max_age",
         "claims valid for",
         was.claim_max_age.to_string(),
         now.claim_max_age.to_string(),
     );
     term(
+        "unknown_grace",
         "unknown results tolerated for",
         was.unknown_grace.to_string(),
         now.unknown_grace.to_string(),
     );
     term(
+        "min_trust_level",
         "minimum trust level",
         format!("{:?}", was.min_trust_level),
         format!("{:?}", now.min_trust_level),
@@ -3512,7 +3751,12 @@ fn manifest_changes(old: &Manifest, new: &Manifest) -> Vec<String> {
             },
         )
     };
-    term("automatic claims", schedule_words(was), schedule_words(now));
+    term(
+        "schedule",
+        "automatic claims",
+        schedule_words(was),
+        schedule_words(now),
+    );
     // A parsed manifest always has its log policy.
     let (was_log, now_log) = (
         was.log
@@ -3529,21 +3773,25 @@ fn manifest_changes(old: &Manifest, new: &Manifest) -> Vec<String> {
             .collect::<Vec<_>>()
     };
     term(
+        "log_witnesses",
         "log witnesses",
         list(witnesses(was_log)),
         list(witnesses(now_log)),
     );
     term(
+        "log_witness_quorum",
         "log witness quorum",
         was_log.witness_quorum.to_string(),
         now_log.witness_quorum.to_string(),
     );
     term(
+        "log_allows_split_views",
         "log allows split views",
         was_log.allow_split_views.to_string(),
         now_log.allow_split_views.to_string(),
     );
     term(
+        "log_checkpoint_max_age",
         "log checkpoint max age",
         was_log.checkpoint_max_age.to_string(),
         now_log.checkpoint_max_age.to_string(),
@@ -3694,6 +3942,303 @@ async fn accept(home: &Home, yes: bool, insecure_dev: bool) -> Result<ExitCode> 
     }
     println!("Next: run {command} check to send a claim under the new manifest.");
     Ok(ExitCode::SUCCESS)
+}
+
+/// What `accept --preview` prints.
+#[derive(Debug, Serialize)]
+struct AcceptPreview {
+    signed_hash: ManifestHash,
+    published_hash: ManifestHash,
+    changes: Vec<ManifestChange>,
+    schedule_widened: bool,
+}
+
+/// `accept --preview`: the changes of the manifest the gateway enforces against the one this
+/// device signed. It makes GET requests only, signs nothing and writes no file.
+async fn accept_preview(home: &Home, insecure_dev: bool) -> Result<AcceptPreview> {
+    let enrolment = home.enrolment()?;
+    check_scheme(&enrolment.gateway, insecure_dev)?;
+    let gateway = base(&enrolment.gateway).to_string();
+    let http = http_client()?;
+    let published: PublishedManifest = get_json(&http, format!("{gateway}/v1/manifest")).await?;
+    let new = Manifest::parse(published.toml.as_bytes())?;
+    if !published.company.verify(new.hash()) {
+        bail!("the company signature does not match this manifest; refusing to show it");
+    }
+    let log = get_text(&http, format!("{gateway}/v1/log/key")).await?;
+    if let Some(changed) = Pins::load(home)?.differs(&published.company.key.fingerprint(), &log) {
+        bail!("{changed}");
+    }
+    let unchanged = |changes| AcceptPreview {
+        signed_hash: enrolment.manifest.clone(),
+        published_hash: new.hash().clone(),
+        changes,
+        schedule_widened: false,
+    };
+    if new.hash() == &enrolment.manifest {
+        return Ok(unchanged(Vec::new()));
+    }
+    let old = Manifest::parse(&read_home_file(&home.file("manifest.toml"))?)?;
+    if old.hash() == new.hash() {
+        // An earlier accept stopped after the gateway confirmed it. Nothing is left to compare.
+        return Ok(unchanged(Vec::new()));
+    }
+    if old.hash() != &enrolment.manifest {
+        bail!("manifest.toml no longer matches the hash you signed");
+    }
+    checks::check_supported(&new).map_err(|e| {
+        anyhow::anyhow!("{e}; refusing to show or sign this manifest. Nothing was sent")
+    })?;
+    if let Err(error) = sync_checkpoint_with(
+        &http,
+        home,
+        &enrolment.gateway,
+        new.body().log.as_ref(),
+        false,
+    )
+    .await?
+    {
+        bail!("{error}");
+    }
+    Ok(AcceptPreview {
+        signed_hash: enrolment.manifest.clone(),
+        published_hash: new.hash().clone(),
+        changes: manifest_change_list(&old, &new),
+        schedule_widened: schedule_widened(
+            old.body().schedule.as_ref(),
+            new.body().schedule.as_ref(),
+        ),
+    })
+}
+
+/// Runs `accept --preview` and prints its document, or its error.
+async fn accept_preview_json(
+    home: &Home,
+    insecure_dev: bool,
+    json: std::sync::Arc<json_out::Json>,
+) -> ExitCode {
+    json_out::scope(json, async {
+        match accept_preview(home, insecure_dev).await {
+            Ok(preview) => {
+                json_out::document(&preview);
+                ExitCode::SUCCESS
+            }
+            Err(error) => json_out::failed(&format!("{error:#}")),
+        }
+    })
+    .await
+}
+
+#[derive(Debug, Serialize)]
+struct PreviewCompany {
+    name: String,
+    key_fingerprint: String,
+    matches_invitation: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct PreviewControl {
+    id: String,
+    title: String,
+    requirement: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rationale: Option<String>,
+}
+
+/// What `join --preview` prints: the manifest as the owner would sign it.
+#[derive(Debug, Serialize)]
+struct JoinPreview {
+    company: PreviewCompany,
+    gateway: String,
+    manifest_hash: ManifestHash,
+    controls: Vec<PreviewControl>,
+    disclosed_metadata: Vec<String>,
+    schedule: Option<open_pact_core::Schedule>,
+    folders: Vec<PathBuf>,
+}
+
+/// The id of a control in words: `password_min_length` is "Password min length".
+fn control_title(id: &str) -> String {
+    let mut words = id.replace('_', " ");
+    if let Some(first) = words.get_mut(..1) {
+        first.make_ascii_uppercase();
+    }
+    words
+}
+
+/// What a control asks of this system: its rule, `n/a`, or `report only`.
+fn requirement_text(control: &open_pact_core::Control, os: Os) -> String {
+    control
+        .required
+        .get(&os)
+        .map_or_else(|| "report only".into(), ToString::to_string)
+}
+
+/// `join --preview`: everything join does up to showing the manifest, and then nothing. It makes
+/// GET requests only, signs nothing and writes no file. A gateway that does not match the
+/// invitation is reported in `matches_invitation`, and the exit code is 1.
+async fn join_preview(
+    home: &Home,
+    invitation: &str,
+    insecure_dev: bool,
+) -> Result<(JoinPreview, bool)> {
+    let invitation = Invitation::decode(invitation)?;
+    let gateway = invitation.gateway.as_str();
+    check_scheme(gateway, insecure_dev)?;
+    let wanted = Pins {
+        company: invitation.company.clone(),
+        log: invitation.log_key(),
+    };
+    if let Ok(pinned) = Pins::load(home)
+        && let Some(changed) = pinned.differs(&wanted.company, &wanted.log.vkey())
+    {
+        bail!("{changed} (the new invitation). Use a separate --home for another company");
+    }
+    let http = http_client()?;
+    let published: PublishedManifest =
+        get_json(&http, format!("{}/v1/manifest", base(gateway))).await?;
+    let manifest = Manifest::parse(published.toml.as_bytes())?;
+    if !published.company.verify(manifest.hash()) {
+        bail!("the company signature does not match this manifest; refusing to show it");
+    }
+    let log = get_text(&http, format!("{}/v1/log/key", base(gateway))).await?;
+    let fingerprint = published.company.key.fingerprint();
+    let matches = wanted.differs(&fingerprint, &log).is_none();
+    checks::check_supported(&manifest).map_err(|e| {
+        anyhow::anyhow!("{e}; refusing to show or sign this manifest. Nothing was sent")
+    })?;
+    let os = current_os()?;
+    let body = manifest.body();
+    let user_home = user_profile();
+    let mut folders =
+        device_config::DeviceConfig::load_or_migrate(home, user_home.as_deref(), false)
+            .unwrap_or_default()
+            .folders;
+    if let Some(scan) = scan_repositories_from(home, None, &manifest, None, false).await?
+        && let Some(user_home) = user_home.as_deref()
+    {
+        for folder in device_config::suggested_folders(&scan, user_home) {
+            if !folders.contains(&folder) {
+                folders.push(folder);
+            }
+        }
+    }
+    let preview = JoinPreview {
+        company: PreviewCompany {
+            name: body.issuer.clone(),
+            key_fingerprint: fingerprint,
+            matches_invitation: matches,
+        },
+        gateway: invitation.gateway.clone(),
+        manifest_hash: manifest.hash().clone(),
+        controls: body
+            .controls
+            .iter()
+            .map(|control| PreviewControl {
+                id: control.id.clone(),
+                title: control_title(&control.id),
+                requirement: requirement_text(control, os),
+                rationale: control.rationale.clone(),
+            })
+            .collect(),
+        disclosed_metadata: body
+            .disclosed_metadata
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        schedule: body.schedule.clone(),
+        folders,
+    };
+    Ok((preview, matches))
+}
+
+async fn join_preview_json(
+    home: &Home,
+    invitation: &str,
+    insecure_dev: bool,
+    json: std::sync::Arc<json_out::Json>,
+) -> ExitCode {
+    json_out::scope(json, async {
+        match join_preview(home, invitation, insecure_dev).await {
+            Ok((preview, matches)) => {
+                json_out::document(&preview);
+                if matches {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::FAILURE
+                }
+            }
+            Err(error) => json_out::failed(&format!("{error:#}")),
+        }
+    })
+    .await
+}
+
+/// What a finished `join --json` reached: `done` when the device is approved and its first claim
+/// was accepted, `approved` when IT approved it, `enrolled` before that.
+fn join_result(home: &Home, enrolment: &Enrolment) -> &'static str {
+    if enrolment.last_status != Some(DeviceStatus::Approved) {
+        "enrolled"
+    } else if matches!(wizard_resume(home), Ok(WizardResume::Complete)) {
+        "done"
+    } else {
+        "approved"
+    }
+}
+
+/// `join --json`: the wizard with its questions answered by flags, one JSON line per step event
+/// and a last line that says how far it got. A failure ends with `{"error": ...}`.
+async fn join_json(
+    home: &Home,
+    invitation: Option<&str>,
+    software_key: bool,
+    no_wait: bool,
+    insecure_dev: bool,
+    poll_interval: Duration,
+    json: std::sync::Arc<json_out::Json>,
+) -> ExitCode {
+    json_out::scope(json, async {
+        let operation = async {
+            match invitation {
+                Some(invitation) => {
+                    join(
+                        home,
+                        invitation,
+                        true,
+                        software_key,
+                        insecure_dev,
+                        no_wait,
+                        poll_interval,
+                    )
+                    .await
+                }
+                None => resume_join(home, insecure_dev, no_wait, poll_interval).await,
+            }
+        };
+        let code = match run_wizard(home, invitation, no_wait, operation).await {
+            Ok(code) => code,
+            Err(error) => return json_out::failed(&format!("{error:#}")),
+        };
+        let enrolment = home.read_json::<Enrolment>("enrolment.json").ok().flatten();
+        let denied_claim = json_out::claim().is_some_and(|report| !report.accepted);
+        match enrolment {
+            Some(enrolment) if code == ExitCode::SUCCESS || denied_claim => {
+                json_out::finish(
+                    join_result(home, &enrolment),
+                    &enrolment.device,
+                    &enrolment.manifest,
+                );
+                code
+            }
+            _ => {
+                json_out::error(
+                    &json_out::last_note().unwrap_or_else(|| "join did not finish".to_owned()),
+                );
+                code
+            }
+        }
+    })
+    .await
 }
 
 fn print_claim_log_status(
@@ -3878,9 +4423,50 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Command::Status(options) => status::run(&home, options, cli.insecure_dev).await,
         Command::Join {
             invitation,
+            preview: true,
+            ..
+        } => Ok(join_preview_json(
+            &home,
+            invitation.as_deref().expect("clap requires the invitation"),
+            cli.insecure_dev,
+            json_out::Json::new(std::io::stdout(), json_out::Answers::default()),
+        )
+        .await),
+        Command::Join {
+            invitation,
+            software_key,
+            no_wait,
+            json: true,
+            folders,
+            auto_send,
+            ..
+        } => Ok(join_json(
+            &home,
+            invitation.as_deref(),
+            software_key,
+            no_wait,
+            cli.insecure_dev,
+            APPROVAL_POLL_INTERVAL,
+            json_out::Json::new(
+                std::io::stdout(),
+                json_out::Answers {
+                    auto_send: auto_send == Some(Toggle::On),
+                    folders: folders
+                        .iter()
+                        .map(|folder| {
+                            device_config::absolute_folder(folder, user_profile().as_deref())
+                        })
+                        .collect::<Result<_>>()?,
+                },
+            ),
+        )
+        .await),
+        Command::Join {
+            invitation,
             yes,
             software_key,
             no_wait,
+            ..
         } => match invitation {
             Some(invitation) => {
                 run_wizard(
@@ -3909,9 +4495,21 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 .await
             }
         },
-        Command::Check { dry_run: false } => check(&home, cli.insecure_dev).await,
-        Command::Check { dry_run: true } => check_dry_run(&home, cli.insecure_dev).await,
-        Command::Accept { yes } => accept(&home, yes, cli.insecure_dev).await,
+        Command::Check { json: true, .. } => Ok(check_json(
+            &home,
+            cli.insecure_dev,
+            json_out::Json::new(std::io::stdout(), json_out::Answers::default()),
+        )
+        .await),
+        Command::Check { dry_run: false, .. } => check(&home, cli.insecure_dev).await,
+        Command::Check { dry_run: true, .. } => check_dry_run(&home, cli.insecure_dev).await,
+        Command::Accept { preview: true, .. } => Ok(accept_preview_json(
+            &home,
+            cli.insecure_dev,
+            json_out::Json::new(std::io::stdout(), json_out::Answers::default()),
+        )
+        .await),
+        Command::Accept { yes, .. } => accept(&home, yes, cli.insecure_dev).await,
         Command::Folders { command } => folders(&home, command).await,
         Command::Manifest {
             command: ManifestCommand::Show,
@@ -3954,8 +4552,14 @@ async fn main() -> ExitCode {
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
-    match run(Cli::parse()).await {
+    let cli = Cli::parse();
+    let json = cli.prints_json();
+    match run(cli).await {
         Ok(code) => code,
+        Err(e) if json => {
+            println!("{}", serde_json::json!({ "error": format!("{e:#}") }));
+            ExitCode::FAILURE
+        }
         Err(e) => {
             eprintln!("error: {e:#}");
             ExitCode::FAILURE
@@ -8478,5 +9082,622 @@ grace = "1d"
             "{elsewhere}"
         );
         assert!(!elsewhere.contains("elevated"));
+    }
+
+    // ----- JSON output for the desktop apps -----
+
+    fn json_capture() -> (json_out::testing::Capture, std::sync::Arc<json_out::Json>) {
+        let capture = json_out::testing::Capture::default();
+        let json = json_out::Json::new(capture.clone(), json_out::Answers::default());
+        (capture, json)
+    }
+
+    #[test]
+    fn json_flags_need_the_flags_they_depend_on() {
+        let parse = |args: &[&str]| {
+            let mut all = vec!["open-pact-client"];
+            all.extend_from_slice(args);
+            Cli::try_parse_from(all).map(|_| ())
+        };
+        assert!(parse(&["join", "--preview", "opi1:x"]).is_ok());
+        assert!(
+            parse(&["join", "--preview"]).is_err(),
+            "preview needs the invitation"
+        );
+        assert!(parse(&["join", "--preview", "--yes", "opi1:x"]).is_err());
+        assert!(
+            parse(&[
+                "join",
+                "--json",
+                "--yes",
+                "--folder",
+                "/a",
+                "--auto-send",
+                "on"
+            ])
+            .is_ok()
+        );
+        assert!(
+            parse(&["join", "--json"]).is_err(),
+            "--json asks nothing, so it needs --yes"
+        );
+        assert!(parse(&["join", "--yes", "--folder", "/a"]).is_err());
+        assert!(parse(&["join", "--yes", "--auto-send", "on"]).is_err());
+        assert!(parse(&["join", "--json", "--yes", "--auto-send", "maybe"]).is_err());
+        assert!(parse(&["check", "--json"]).is_ok());
+        assert!(parse(&["check", "--json", "--dry-run"]).is_err());
+        assert!(parse(&["accept", "--preview"]).is_ok());
+        assert!(parse(&["accept", "--preview", "--yes"]).is_err());
+    }
+
+    #[tokio::test]
+    async fn text_output_goes_to_the_notes_while_json_is_on() {
+        let (capture, json) = json_capture();
+        json_out::scope(json, async {
+            println!("first");
+            print!("par");
+            println!("tial");
+            assert_eq!(json_out::last_note().as_deref(), Some("partial"));
+        })
+        .await;
+        assert_eq!(
+            capture.text(),
+            "",
+            "text output never reaches the JSON stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_json_prints_the_accepted_claim() {
+        let fixture = claim_fixture_replying(
+            None,
+            |signed| signed.to_string(),
+            grown_checkpoint,
+            valid_pair,
+            None,
+            None,
+        )
+        .await;
+        let (capture, json) = json_capture();
+
+        let code = check_json(&fixture.home, false, json).await;
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        let report: Value = serde_json::from_str(&capture.text()).expect("one JSON document");
+        assert_eq!(report["accepted"], true);
+        assert!(report["sent_at"].as_str().unwrap().ends_with('Z'));
+        assert_eq!(report["warnings"], json!([]));
+        assert_eq!(report["reasons"], json!([]));
+        let controls = report["controls"].as_array().unwrap();
+        assert_eq!(controls.len(), 1);
+        assert_eq!(controls[0]["id"], "os_supported");
+        assert!(controls[0]["ok"].is_boolean());
+        assert!(controls[0].get("value").is_some());
+        assert!(
+            fixture
+                .gateway
+                .posts()
+                .contains(&"POST /v1/claim".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn check_json_prints_the_reasons_of_a_denied_claim() {
+        let denied = json!({"status":"denied","reasons":["password too short"]}).to_string();
+        let fixture = claim_fixture_replying(
+            Some(&denied),
+            |signed| signed.to_string(),
+            grown_checkpoint,
+            valid_pair,
+            None,
+            None,
+        )
+        .await;
+        let (capture, json) = json_capture();
+
+        let code = check_json(&fixture.home, false, json).await;
+
+        assert_eq!(code, ExitCode::FAILURE);
+        let report: Value = serde_json::from_str(&capture.text()).unwrap();
+        assert_eq!(report["accepted"], false);
+        assert_eq!(report["reasons"], json!(["password too short"]));
+        assert_eq!(report["warnings"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn check_json_reports_a_failure_as_an_error_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let (capture, json) = json_capture();
+
+        let code = check_json(&Home(dir.path().to_path_buf()), false, json).await;
+
+        assert_eq!(code, ExitCode::FAILURE);
+        let report: Value = serde_json::from_str(&capture.text()).unwrap();
+        assert!(
+            report["error"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty()),
+            "{report}"
+        );
+        assert_eq!(report.as_object().unwrap().len(), 1);
+    }
+
+    /// A gateway that serves the demo manifest signed by `company`, and an invitation to it.
+    async fn preview_gateway(company: &Company, toml: &str) -> (FakeGateway, Invitation) {
+        let published = Company::published(toml, &company.key);
+        let log = company.log.vkey();
+        let gateway = FakeGateway::start(move |line, _| match line {
+            "GET /v1/manifest" => (200, published.clone()),
+            "GET /v1/log/key" => (200, format!("{log}\n")),
+            _ => not_found(),
+        })
+        .await;
+        let invitation = Invitation::new(
+            &gateway.url,
+            &PublicKey::from(&company.key),
+            &company.log,
+            open_pact_core::InvitationCode::from_bytes([7; 32]),
+        );
+        (gateway, invitation)
+    }
+
+    #[tokio::test]
+    async fn join_preview_describes_the_manifest_and_writes_and_sends_nothing() {
+        let company = Company::new();
+        let toml = DEMO_MANIFEST.to_string();
+        let manifest = Manifest::parse(toml.as_bytes()).unwrap();
+        let (gateway, invitation) = preview_gateway(&company, &toml).await;
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+        let before = snapshot(dir.path());
+        let (capture, json) = json_capture();
+
+        let code = join_preview_json(&home, &invitation.encode(), false, json).await;
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(snapshot(dir.path()), before, "no file written");
+        assert!(gateway.posts().is_empty(), "{:?}", gateway.posts());
+        let preview: Value = serde_json::from_str(&capture.text()).expect("one JSON document");
+        assert_eq!(preview["company"]["name"], manifest.body().issuer.as_str());
+        assert_eq!(preview["company"]["key_fingerprint"], company.fingerprint());
+        assert_eq!(preview["company"]["matches_invitation"], true);
+        assert_eq!(preview["gateway"], gateway.url);
+        assert_eq!(preview["manifest_hash"], manifest.hash().as_str());
+        let controls = preview["controls"].as_array().unwrap();
+        assert_eq!(controls.len(), manifest.body().controls.len());
+        let total = controls
+            .iter()
+            .find(|control| control["id"] == "managed_repos_total")
+            .unwrap();
+        assert_eq!(total["title"], "Managed repos total");
+        assert!(
+            controls
+                .iter()
+                .all(|control| control["requirement"].is_string())
+        );
+        assert_eq!(
+            preview["disclosed_metadata"].as_array().unwrap().len(),
+            manifest.body().disclosed_metadata.len()
+        );
+        assert_eq!(
+            preview["schedule"],
+            serde_json::to_value(&manifest.body().schedule).unwrap()
+        );
+        assert_eq!(preview["schedule"]["mode"], "vpn");
+        assert_eq!(preview["folders"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn join_preview_names_a_gateway_that_is_not_the_one_in_the_invitation() {
+        let company = Company::new();
+        let (gateway, invitation) = preview_gateway(&company, DEMO_MANIFEST).await;
+        let other = Company::new();
+        let wrong = Invitation::new(
+            &gateway.url,
+            &PublicKey::from(&other.key),
+            &company.log,
+            open_pact_core::InvitationCode::from_bytes([7; 32]),
+        );
+        assert_ne!(wrong.company, invitation.company);
+        let dir = tempfile::tempdir().unwrap();
+        let (capture, json) = json_capture();
+
+        let code = join_preview_json(
+            &Home(dir.path().to_path_buf()),
+            &wrong.encode(),
+            false,
+            json,
+        )
+        .await;
+
+        assert_eq!(code, ExitCode::FAILURE);
+        let preview: Value = serde_json::from_str(&capture.text()).unwrap();
+        assert_eq!(preview["company"]["matches_invitation"], false);
+        assert!(gateway.posts().is_empty());
+        assert!(snapshot(dir.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn join_preview_reports_a_bad_invitation_as_an_error_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let (capture, json) = json_capture();
+
+        let code = join_preview_json(
+            &Home(dir.path().to_path_buf()),
+            "not an invitation",
+            false,
+            json,
+        )
+        .await;
+
+        assert_eq!(code, ExitCode::FAILURE);
+        let report: Value = serde_json::from_str(&capture.text()).unwrap();
+        assert!(
+            report["error"].as_str().unwrap().contains("opi1:"),
+            "{report}"
+        );
+    }
+
+    #[tokio::test]
+    async fn join_preview_lists_the_configured_folders() {
+        let company = Company::new();
+        let toml = DEMO_MANIFEST.to_string();
+        let (_gateway, invitation) = preview_gateway(&company, &toml).await;
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+        let config = DeviceConfig {
+            folders: vec![PathBuf::from("/example/work")],
+            ..DeviceConfig::default()
+        };
+        config.save(&home).unwrap();
+        let before = snapshot(dir.path());
+        let (capture, json) = json_capture();
+
+        let code = join_preview_json(&home, &invitation.encode(), false, json).await;
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        let preview: Value = serde_json::from_str(&capture.text()).unwrap();
+        assert_eq!(preview["folders"], json!(["/example/work"]));
+        assert_eq!(snapshot(dir.path()), before);
+    }
+
+    #[tokio::test]
+    async fn join_json_prints_the_wizard_events_until_it_waits_for_it() {
+        let witness = Witness::new();
+        let toml = witnessed_manifest(&witness);
+        let company = Company::new();
+        let published = Company::published(&toml, &company.key);
+        let log = company.log.vkey();
+        let mut checkpoint = company.sign(&Checkpoint {
+            origin: company.log.origin().into(),
+            size: 1,
+            root: LogHash([3; 32]),
+        });
+        witness.cosign(
+            &mut checkpoint,
+            u64::try_from(chrono::Utc::now().timestamp()).unwrap(),
+        );
+        let checkpoint = checkpoint.to_string();
+        let gateway = FakeGateway::start(move |line, _| match line {
+            "GET /v1/manifest" => (200, published.clone()),
+            "GET /v1/log/key" => (200, format!("{log}\n")),
+            "GET /v1/log/checkpoint" => (200, checkpoint.clone()),
+            "POST /v1/enroll" => (
+                200,
+                json!({"salt":"11".repeat(32),"state":"pending"}).to_string(),
+            ),
+            _ => not_found(),
+        })
+        .await;
+        let invitation = Invitation::new(
+            &gateway.url,
+            &PublicKey::from(&company.key),
+            &company.log,
+            open_pact_core::InvitationCode::from_bytes([7; 32]),
+        )
+        .encode();
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+        let (capture, json) = json_capture();
+
+        let code = join_json(
+            &home,
+            Some(&invitation),
+            true,
+            true,
+            false,
+            Duration::from_millis(1),
+            json,
+        )
+        .await;
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(gateway.posts(), vec!["POST /v1/enroll"]);
+        let lines = capture.lines();
+        let steps: Vec<(u64, &str)> = lines
+            .iter()
+            .filter_map(|line| Some((line["step"].as_u64()?, line["state"].as_str()?)))
+            .collect();
+        assert_eq!(
+            steps,
+            [
+                (1, "started"),
+                (1, "done"),
+                (2, "started"),
+                (2, "done"),
+                (3, "started"),
+                (3, "done"),
+                (4, "started"),
+                (4, "waiting"),
+            ],
+            "{lines:?}"
+        );
+        assert_eq!(lines[0]["title"], "Check the invitation");
+        assert_eq!(lines[1]["detail"]["gateway"], gateway.url);
+        let waiting = &lines[lines.len() - 2];
+        let code = waiting["detail"]["device_code"].as_str().unwrap();
+        assert_eq!(code.len(), 12);
+        assert!(code.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        let enrolment = home.enrolment().unwrap();
+        assert_eq!(code, device_code(&enrolment.device));
+        let last = lines.last().unwrap();
+        assert_eq!(last["result"], "enrolled");
+        assert_eq!(last["device"], enrolment.device.as_str());
+        assert_eq!(last["manifest_hash"], enrolment.manifest.as_str());
+    }
+
+    #[tokio::test]
+    async fn join_json_reports_a_refused_enrolment_as_an_error_line() {
+        let witness = Witness::new();
+        let toml = witnessed_manifest(&witness);
+        let company = Company::new();
+        let published = Company::published(&toml, &company.key);
+        let log = company.log.vkey();
+        let mut checkpoint = company.sign(&Checkpoint {
+            origin: company.log.origin().into(),
+            size: 1,
+            root: LogHash([3; 32]),
+        });
+        witness.cosign(
+            &mut checkpoint,
+            u64::try_from(chrono::Utc::now().timestamp()).unwrap(),
+        );
+        let checkpoint = checkpoint.to_string();
+        let gateway = FakeGateway::start(move |line, _| match line {
+            "GET /v1/manifest" => (200, published.clone()),
+            "GET /v1/log/key" => (200, format!("{log}\n")),
+            "GET /v1/log/checkpoint" => (200, checkpoint.clone()),
+            "POST /v1/enroll" => (403, json!({"status":"denied"}).to_string()),
+            _ => not_found(),
+        })
+        .await;
+        let invitation = Invitation::new(
+            &gateway.url,
+            &PublicKey::from(&company.key),
+            &company.log,
+            open_pact_core::InvitationCode::from_bytes([7; 32]),
+        )
+        .encode();
+        let dir = tempfile::tempdir().unwrap();
+        let (capture, json) = json_capture();
+
+        let code = join_json(
+            &Home(dir.path().to_path_buf()),
+            Some(&invitation),
+            true,
+            false,
+            false,
+            Duration::from_millis(1),
+            json,
+        )
+        .await;
+
+        assert_eq!(code, ExitCode::FAILURE);
+        let lines = capture.lines();
+        let last = lines.last().unwrap();
+        assert!(
+            last["error"]
+                .as_str()
+                .unwrap()
+                .contains("Enrolment refused"),
+            "{lines:?}"
+        );
+        assert!(lines.iter().all(|line| line.get("result").is_none()));
+    }
+
+    #[tokio::test]
+    async fn join_json_runs_setup_and_the_first_claim_from_its_flags() {
+        let fixture = claim_fixture_replying(
+            None,
+            |signed| signed.to_string(),
+            grown_checkpoint,
+            valid_pair,
+            None,
+            None,
+        )
+        .await;
+        let capture = json_out::testing::Capture::default();
+        let json = json_out::Json::new(
+            capture.clone(),
+            json_out::Answers {
+                auto_send: false,
+                folders: vec![PathBuf::from("/example/work")],
+            },
+        );
+
+        let code = json_out::scope(json, async {
+            after_approval(&fixture.home, false, true).await.unwrap()
+        })
+        .await;
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        let lines = capture.lines();
+        let steps: Vec<(u64, &str)> = lines
+            .iter()
+            .filter_map(|line| Some((line["step"].as_u64()?, line["state"].as_str()?)))
+            .collect();
+        assert_eq!(
+            steps,
+            [(5, "started"), (5, "done"), (6, "started"), (6, "done")]
+        );
+        assert_eq!(lines[1]["detail"]["auto_send"], false);
+        assert_eq!(
+            lines[1]["detail"]["folders"],
+            json!([]),
+            "the manifest has no repository control, so the folder answer is not used"
+        );
+        assert_eq!(lines[3]["detail"]["accepted"], true);
+        assert_eq!(lines[3]["detail"]["controls"][0]["id"], "os_supported");
+        assert!(DeviceConfig::load(&fixture.home).unwrap().setup_answered);
+        assert!(
+            fixture
+                .gateway
+                .posts()
+                .contains(&"POST /v1/claim".to_string())
+        );
+    }
+
+    #[test]
+    fn setup_answers_follow_the_manifest_like_the_questions() {
+        let context = |toml: &str| SetupContext {
+            manifest: Manifest::parse(toml.as_bytes()).unwrap(),
+            os: Os::Linux,
+            current: DeviceConfig {
+                folders: vec![PathBuf::from("/example/kept")],
+                ..DeviceConfig::default()
+            },
+            overview: String::new(),
+            suggested: Vec::new(),
+            legacy: Vec::new(),
+            user_home: None,
+        };
+        let answers = json_out::Answers {
+            auto_send: true,
+            folders: vec![
+                PathBuf::from("/example/new"),
+                PathBuf::from("/example/kept"),
+            ],
+        };
+
+        let plain = setup_answers(&context(&witnessed_manifest(&Witness::new())), &answers);
+        assert!(
+            plain.auto_send,
+            "the demo manifest defines automatic sending"
+        );
+        assert_eq!(plain.folders, [PathBuf::from("/example/kept")]);
+
+        let repositories = setup_answers(&context(DEMO_MANIFEST), &answers);
+        assert_eq!(
+            repositories.folders,
+            [
+                PathBuf::from("/example/kept"),
+                PathBuf::from("/example/new")
+            ]
+        );
+
+        let off = setup_answers(&context(DEMO_MANIFEST), &json_out::Answers::default());
+        assert!(
+            !off.auto_send,
+            "automatic sending is off unless the flag says on"
+        );
+    }
+
+    #[tokio::test]
+    async fn accept_preview_lists_the_changes_and_writes_and_sends_nothing() {
+        let company = Company::new();
+        let witness = Witness::new();
+        let old = witnessed_manifest(&witness);
+        let new_toml =
+            with_password_rule(&old).replacen("interval = \"55m\"", "interval = \"30m\"", 1);
+        let published = Company::published(&new_toml, &company.key);
+        let new = Manifest::parse(new_toml.as_bytes()).unwrap();
+        let log = company.log.vkey();
+        let checkpoint = cosigned_empty_checkpoint(&company, &witness);
+        let gateway = FakeGateway::start(move |line, _| match line {
+            "GET /v1/manifest" => (200, published.clone()),
+            "GET /v1/log/key" => (200, format!("{log}\n")),
+            "GET /v1/log/checkpoint" => (200, checkpoint.clone()),
+            _ => not_found(),
+        })
+        .await;
+        let (dir, _) = accept_home(&gateway.url, &company, &old);
+        let home = Home(dir.path().to_path_buf());
+        let before = snapshot(dir.path());
+        let (capture, json) = json_capture();
+
+        let code = accept_preview_json(&home, false, json).await;
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(snapshot(dir.path()), before, "no file written");
+        assert!(gateway.posts().is_empty(), "{:?}", gateway.posts());
+        let preview: Value = serde_json::from_str(&capture.text()).expect("one JSON document");
+        assert_eq!(
+            preview["signed_hash"],
+            ManifestHash::of(old.as_bytes()).as_str()
+        );
+        assert_eq!(preview["published_hash"], new.hash().as_str());
+        let changes = preview["changes"].as_array().unwrap();
+        let password = changes
+            .iter()
+            .find(|change| change["id"] == "password_min_length")
+            .expect("the added control");
+        assert!(password["before"].is_null());
+        assert!(password["after"].as_str().unwrap().contains("must be"));
+        let schedule = changes
+            .iter()
+            .find(|change| change["id"] == "schedule")
+            .unwrap();
+        assert!(schedule["before"].as_str().unwrap().contains("55 minutes"));
+        assert!(schedule["after"].as_str().unwrap().contains("30 minutes"));
+        assert!(changes.iter().all(|change| change.get("line").is_none()));
+        assert_eq!(preview["schedule_widened"], true);
+    }
+
+    #[tokio::test]
+    async fn accept_preview_of_an_unchanged_manifest_has_no_changes() {
+        let company = Company::new();
+        let witness = Witness::new();
+        let toml = witnessed_manifest(&witness);
+        let published = Company::published(&toml, &company.key);
+        let log = company.log.vkey();
+        let gateway = FakeGateway::start(move |line, _| match line {
+            "GET /v1/manifest" => (200, published.clone()),
+            "GET /v1/log/key" => (200, format!("{log}\n")),
+            _ => not_found(),
+        })
+        .await;
+        let (dir, _) = accept_home(&gateway.url, &company, &toml);
+        let (capture, json) = json_capture();
+
+        let code = accept_preview_json(&Home(dir.path().to_path_buf()), false, json).await;
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        let preview: Value = serde_json::from_str(&capture.text()).unwrap();
+        assert_eq!(preview["signed_hash"], preview["published_hash"]);
+        assert_eq!(preview["changes"], json!([]));
+        assert_eq!(preview["schedule_widened"], false);
+    }
+
+    #[test]
+    fn manifest_changes_keep_their_lines_and_get_ids() {
+        let plain = witnessed_manifest(&Witness::new());
+        let old = Manifest::parse(plain.as_bytes()).unwrap();
+        let new = Manifest::parse(with_password_rule(&plain).as_bytes()).unwrap();
+        let list = manifest_change_list(&old, &new);
+        assert_eq!(
+            manifest_changes(&old, &new),
+            list.iter()
+                .map(|change| change.line.clone())
+                .collect::<Vec<_>>()
+        );
+        let added = list
+            .iter()
+            .find(|change| change.id == "password_min_length");
+        assert!(added.is_some_and(|change| change.before.is_none() && change.after.is_some()));
+        let removed = manifest_change_list(&new, &old);
+        let gone = removed
+            .iter()
+            .find(|change| change.id == "password_min_length");
+        assert!(gone.is_some_and(|change| change.before.is_some() && change.after.is_none()));
     }
 }

@@ -82,6 +82,36 @@ kubectl exec deploy/pact-gateway -- open-pact-gateway devices approve 0123456789
 
 Use `kubectl exec deploy/pact-gateway -- open-pact-gateway devices revoke 'pseudonym:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'` to revoke an enrolled device. `AUTO_APPROVE=true` approves each new device without IT review. Keep it false unless that behavior is intended.
 
+### Read the gateway as JSON
+
+An app can run these commands through `kubectl exec`. Each prints one JSON document on stdout. On a database or other error it prints `{"error": "<text>"}` and exits non-zero.
+
+```sh
+kubectl exec deploy/pact-gateway -- open-pact-gateway devices list --json
+kubectl exec deploy/pact-gateway -- open-pact-gateway invite --url https://pact.example.com --ttl 72h --note "Example laptop" --json
+kubectl exec deploy/pact-gateway -- open-pact-gateway status --json
+```
+
+`devices list --json` prints an array with one object per enrolment, oldest first:
+
+```json
+[{"pseudonym": "pseudonym:0123…", "code": "0123456789ab", "state": "pending", "note": "Example laptop",
+  "enrolled_at": "2026-11-02T10:00:00Z", "manifest_hash": "sha256:…"}]
+```
+
+`code` is the first 12 hex digits of the pseudonym, which `devices approve` takes. `note` is the invitation note, empty when there is none. The object has no `last_claim_at`, `last_result` or `last_reasons`: the database stores each claim's device pseudonym only inside its sealed body, and it stores no refusal reasons.
+
+`invite --json` prints `{"invitation": "opi1:…", "expires_at": "2026-11-05T10:00:00Z", "company_key_fingerprint": "sha256:…", "note": "Example laptop"}` and nothing on stderr.
+
+`status --json` reads the manifest the same way `serve` does (`MANIFEST_PATH`, or the example manifest) and `AUTO_APPROVE`:
+
+```json
+{"version": "0.6.0", "manifest_hash": "sha256:…", "auto_approve": false,
+ "devices": {"pending": 1, "approved": 12, "revoked": 0}, "company_key_fingerprint": "sha256:…"}
+```
+
+`devices` counts distinct pseudonyms per state. Without `--json`, `status` prints the same facts as text.
+
 ## Run a witness
 
 A witness keeps its own Ed25519 key and latest checkpoint. Run it under a different operator and in a separate environment from the gateway. A witness run by the gateway operator cannot show that operator a conflicting log history.
