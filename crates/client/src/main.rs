@@ -17,7 +17,7 @@ use std::{
 
 enum Operation {
     Open,
-    Install,
+    Install(bool),
     Preview(String),
     Join(String, Vec<String>, bool),
     Status,
@@ -42,6 +42,7 @@ struct AppView {
     invitation: Entity<InputState>,
     folders: Vec<Entity<InputState>>,
     automatic: bool,
+    also_terminal: bool,
     busy: bool,
     error: Option<String>,
     terminal: bool,
@@ -64,6 +65,7 @@ impl AppView {
             invitation: cx.new(|cx| InputState::new(window, cx).placeholder("opi1:…")),
             folders: Vec::new(),
             automatic: false,
+            also_terminal: true,
             busy: false,
             error: None,
             terminal: false,
@@ -120,9 +122,12 @@ impl AppView {
                                 Ok(Outcome::Open(None, None))
                             }
                         }
-                        Operation::Install => {
+                        Operation::Install(also_terminal) => {
                             let path = client::installed_path()?;
                             client::install(&client.runner, &bundled, &path)?;
+                            if also_terminal {
+                                client::enable_terminal(&path)?;
+                            }
                             client.executable = path.clone();
                             Ok(Outcome::Open(Some(path), Some(client.status()?)))
                         }
@@ -160,7 +165,14 @@ impl AppView {
                         if let Some(path) = path {
                             this.client.executable = path;
                         }
+                        let resume = status
+                            .as_ref()
+                            .filter(|status| status.approval.state.as_deref() == Some("pending"))
+                            .map(|status| status.schedule["owner_consented"] == true);
                         this.screen = status.map(Self::status_screen).unwrap_or(Screen::Install);
+                        if let Some(automatic) = resume {
+                            this.run(Operation::Join(String::new(), Vec::new(), automatic), cx);
+                        }
                     }
                     Ok(Outcome::Preview(preview)) => {
                         this.automatic = false;
@@ -199,6 +211,7 @@ impl AppView {
     ) -> Button {
         Button::new(id)
             .label(label)
+            .self_end()
             .primary()
             .disabled(self.busy)
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -212,10 +225,11 @@ impl AppView {
             Screen::Install => column()
                 .child(title("Set up open-pact on this computer"))
                 .child("open-pact does its work with a small command line tool that comes with this app. It goes to a fixed place so the scheduled check keeps working when you move or update the app.")
-                .child(row("Command line tool", client::installed_path().map(|p| p.display().to_string()).unwrap_or_default()))
-                .child(row("Version", "Bundled command line tool"))
-                .child(note("The installed tool can also be used in Terminal. Add its folder to your PATH if you want to use it there."))
-                .child(self.action("install", "Install and continue", |_, _| Operation::Install, cx))
+                .child(row("Command line tool", if cfg!(windows) { "%LOCALAPPDATA%\\open-pact\\open-pact-client.exe" } else { "~/.local/bin/open-pact-client" }))
+                .child(row("Version", self.client.runner.logs().into_iter().find(|entry| entry.args == ["--version"]).map(|entry| entry.stdout.trim().to_owned()).unwrap_or_else(|| "Bundled command line tool".into())))
+                .child(Button::new("also-terminal").label(if self.also_terminal { "Also use it in Terminal · on" } else { "Also use it in Terminal · off" }).disabled(self.busy).on_click(cx.listener(|this, _, _, cx| { this.also_terminal = !this.also_terminal; cx.notify(); })))
+                .child(note("Adds the folder to your PATH. You can skip this. Open a new Terminal after installation."))
+                .child(self.action("install", "Install and continue", |this, _| Operation::Install(this.also_terminal), cx))
                 .child(note("copies the bundled tool, then runs open-pact-client --version")),
             Screen::Invitation => column()
                 .child(title("Join your company"))
@@ -229,7 +243,7 @@ impl AppView {
                     self.folders = preview.folders.iter().map(|folder| cx.new(|cx| InputState::new(window, cx).default_value(folder.clone()))).collect();
                 }
                 let mut view = column().child(title(format!("{} asks to check this device", preview.company.name)))
-                    .child(banner(format!("Company key {} {}", preview.company.key_fingerprint, if preview.company.matches_invitation { "matches your invitation" } else { "does not match your invitation" }), if preview.company.matches_invitation { 0x2e7d4f } else { 0xb3261e }, if preview.company.matches_invitation { 0xe5f2ea } else { 0xfbe6e4 }));
+                    .child(note(format!("Company key {} {}", preview.company.key_fingerprint, if preview.company.matches_invitation { "matches your invitation" } else { "does not match your invitation" })).text_color(rgb(if preview.company.matches_invitation { 0x2e7d4f } else { 0xb3261e })));
                 for control in preview.controls.iter().take(if self.all_controls { usize::MAX } else { 5 }) {
                     view = view.child(row(control.title.clone(), display(&control.requirement)));
                 }
@@ -241,7 +255,7 @@ impl AppView {
                 view = view.child(Button::new("automatic").label(if self.automatic { "☑ Send results automatically" } else { "☐ Send results automatically" })
                     .disabled(preview.schedule.is_none() || self.busy)
                     .on_click(cx.listener(|this, _, _, cx| { this.automatic = !this.automatic; cx.notify(); })))
-                    .child(note(preview.schedule.as_ref().map(display).unwrap_or_else(|| "No automatic sending schedule.".into())))
+                    .child(note(preview.schedule.as_ref().map(schedule_text).unwrap_or_else(|| "No automatic sending schedule.".into())))
                     .child(Button::new("cancel").label("Cancel").disabled(self.busy).on_click(cx.listener(|this, _, _, cx| { this.screen = Screen::Invitation; cx.notify(); })))
                     .child(self.action("join", "Sign and join", |this, cx| Operation::Join(this.invitation.read(cx).value().to_string(), this.folders.iter().map(|p| p.read(cx).value().to_string()).collect(), this.automatic), cx).disabled(self.busy || !preview.company.matches_invitation))
                     .child(note("runs open-pact-client join --yes --json --auto-send on|off 'opi1:…'"));
@@ -263,7 +277,7 @@ impl AppView {
                     view = view.child(column().gap_1().child(issue.message.clone()).child(note(issue.fix.clone().unwrap_or_default())).child(note(issue.deadline.clone())));
                 }
                 view = view.child(note(status.current_compliance.clone()))
-                    .child(row("Approval", format!("{} · {}", status.approval.state.as_deref().unwrap_or("unknown"), status.approval.source)))
+                    .child(note(format!("Approval {} · {}", status.approval.state.as_deref().unwrap_or("unknown"), status.approval.source)))
                     .child(row("Last result", status.last_claim.as_ref().map(|v| format!("{} · {}", display(&v["response_at"]), display(&v["response"]))).unwrap_or_else(|| "No saved result".into())))
                     .child(row("Send results automatically", display(&status.schedule["policy"])))
                     .child(row("Scheduled job", display(&status.schedule["job"])))
@@ -272,10 +286,12 @@ impl AppView {
                         let enabled = matches!(&this.screen, Screen::Status(s) if s.schedule["owner_consented"] == true);
                         Operation::Schedule(!enabled)
                     }, cx))
-                    .child(self.action("check", "Check now", |_, _| Operation::Check, cx))
-                    .child(self.action("refresh", "Refresh status", |_, _| Operation::Status, cx))
-                    .child(self.action("changes", "Review changes", |_, _| Operation::Changes, cx))
-                    .child(Button::new("checks").label("Show every check").on_click(cx.listener(|this, _, _, cx| { this.all_controls = !this.all_controls; cx.notify(); })));
+                    .child(div().flex().justify_end().gap_2()
+                        .child(Button::new("checks").label("Show every check").on_click(cx.listener(|this, _, _, cx| { this.all_controls = !this.all_controls; cx.notify(); })))
+                        .child(self.action("check", "Check now", |_, _| Operation::Check, cx)))
+                    .child(div().flex().justify_end().gap_2()
+                        .child(self.action("refresh", "Refresh status", |_, _| Operation::Status, cx))
+                        .child(self.action("changes", "Review changes", |_, _| Operation::Changes, cx)));
                 if self.all_controls {
                     if let Some(check) = &self.last_check {
                         for control in &check.controls { view = view.child(note(display(control))); }
@@ -302,6 +318,19 @@ fn display(value: &serde_json::Value) -> String {
         .as_str()
         .map(str::to_owned)
         .unwrap_or_else(|| value.to_string())
+}
+
+fn schedule_text(value: &serde_json::Value) -> String {
+    let interval = value
+        .get("interval")
+        .or_else(|| value.get("every"))
+        .map(display)
+        .unwrap_or_else(|| "the signed interval".into());
+    if value["mode"] == "vpn" || value["policy"] == "vpn" {
+        format!("Every {interval} while on the company VPN. You can turn it off later.")
+    } else {
+        format!("Every {interval}. You can turn it off later.")
+    }
 }
 
 impl Render for AppView {

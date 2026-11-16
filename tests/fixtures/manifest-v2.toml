@@ -1,0 +1,14 @@
+# Example manifest. Fictional.
+manifest_version = 1
+[company]
+name = "Example Company"
+[schedule]
+mode = "vpn"
+probe = "10.0.0.1:443"
+interval = "55m"
+[[controls]]
+id = "password_min_length"
+enabled = true
+require = { min = 12 }
+grace = "24h"
+folders = ["~/Documents"]

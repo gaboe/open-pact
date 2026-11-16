@@ -2,7 +2,7 @@
 
 Optional desktop apps for [open-pact](https://github.com/gaboe/open-pact). `open-pact` joins a company, reviews manifests, and sends device checks. `open-pact-admin` edits deployment manifests and manages devices.
 
-The apps only run `open-pact-client`, `kubectl`, and `git`. They never call the gateway or Kubernetes APIs directly. The collapsed Terminal panel shows each command, its output, and its exit code.
+The apps only run `open-pact-client` and `kubectl`. They never call the gateway or Kubernetes APIs directly. The collapsed Terminal panel shows each command, its input, output, and exit code.
 
 ## Build the apps
 
@@ -26,11 +26,13 @@ The bundles appear in `dist`. The client bundle contains the CLI in `Contents/He
 
 ## Set up the admin app
 
-Install `git` and `kubectl`. Enter the deployment repository, a relative manifest file path, a kube context, and a namespace. Leave the file empty to find the single YAML file with open-pact Helm values and a literal `manifest` block. The app saves settings in the OS config directory under `open-pact-admin/settings.json`.
+Install `kubectl`. Enter the cluster, namespace, and local backup folder. The default backup folder is `open-pact-admin/backups` in the OS app data directory. The app saves settings in the OS config directory under `open-pact-admin/settings.json`.
 
-Form and TOML edit one text. Review shows the diff and commands before applying. The deployment repository must have no local changes. Apply pulls with `--ff-only`, writes the manifest block, commits, pushes, and waits for a deployment restart and the expected manifest hash.
+Form and TOML edit one text. Review shows the diff and commands before applying. Apply saves the active TOML locally, pipes the new TOML to `manifest set --note <note> --json` through `kubectl exec -i`, and polls gateway status for up to 60 seconds. The gateway picks up the change without a restart.
 
-A failed push can leave the outcome unknown. Inspect the repository and refresh gateway status before retrying. Gateway JSON commands require the open-pact `cli-json` changes.
+History sync runs on app open and with **Sync now**. It downloads every missing server version and checks its hash. Each server version and local backup has a **Restore** action. Restore shows a diff against the active manifest and asks once. Server versions use `manifest activate`; a local file absent from server history uses `manifest set`. Every write backs up the active manifest first.
+
+A lost write response leaves the outcome unknown. Refresh gateway status before retrying. The app needs the gateway manifest version commands and the client JSON commands.
 
 ## Verify changes
 

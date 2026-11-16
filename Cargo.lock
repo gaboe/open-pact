@@ -5428,6 +5428,7 @@ dependencies = [
 name = "runner"
 version = "0.6.0"
 dependencies = [
+ "chrono",
  "dirs 6.0.0",
  "gpui-component",
  "gpui-kit-assets",
@@ -5437,8 +5438,10 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "similar",
  "tempfile",
  "toml_edit 0.23.10+spec-1.0.0",
+ "winreg",
 ]
 
 [[package]]

@@ -5,7 +5,7 @@ pub mod desktop;
 pub mod manifest;
 
 use serde::de::DeserializeOwned;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -17,6 +17,7 @@ pub struct CommandLog {
     pub stdout: String,
     pub stderr: String,
     pub exit: Option<i32>,
+    pub stdin: Option<String>,
 }
 
 impl CommandLog {
@@ -35,6 +36,38 @@ pub struct Runner {
 }
 
 impl Runner {
+    pub fn raw(&self, program: &Path, args: &[String]) -> Result<CommandLog, String> {
+        let mut entry = CommandLog {
+            program: program.display().to_string(),
+            args: args.to_vec(),
+            ..Default::default()
+        };
+        let result = match Command::new(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+        {
+            Ok(output) => {
+                entry.stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+                entry.stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+                entry.exit = output.status.code();
+                if output.status.success() {
+                    Ok(())
+                } else {
+                    Err(command_error(&entry))
+                }
+            }
+            Err(error) => {
+                entry.stderr = error.to_string();
+                Err(entry.stderr.clone())
+            }
+        };
+        self.log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(entry.clone());
+        result.map(|()| entry)
+    }
     pub fn logs(&self) -> Vec<CommandLog> {
         self.log.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
@@ -47,11 +80,31 @@ impl Runner {
         &self,
         program: &Path,
         args: &[String],
+        line: impl FnMut(&str),
+    ) -> Result<CommandLog, String> {
+        self.execute(program, args, None, line)
+    }
+
+    pub fn input(
+        &self,
+        program: &Path,
+        args: &[String],
+        input: &str,
+    ) -> Result<CommandLog, String> {
+        self.execute(program, args, Some(input.to_owned()), |_| {})
+    }
+
+    fn execute(
+        &self,
+        program: &Path,
+        args: &[String],
+        input: Option<String>,
         mut line: impl FnMut(&str),
     ) -> Result<CommandLog, String> {
         let mut entry = CommandLog {
             program: program.display().to_string(),
             args: args.to_vec(),
+            stdin: input.clone(),
             ..Default::default()
         };
         let index = {
@@ -63,7 +116,11 @@ impl Runner {
         let result = (|| {
             let mut child = Command::new(program)
                 .args(args)
-                .stdin(Stdio::null())
+                .stdin(if input.is_some() {
+                    Stdio::piped()
+                } else {
+                    Stdio::null()
+                })
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
@@ -71,6 +128,14 @@ impl Runner {
                     format!("{}: {e}. Install the command and retry.", program.display())
                 })?;
             let mut stderr = child.stderr.take().ok_or("Missing command stderr")?;
+            let writer = input.map(|input| {
+                let stdin = child.stdin.take();
+                std::thread::spawn(move || {
+                    stdin
+                        .ok_or_else(|| std::io::Error::other("Missing command stdin"))?
+                        .write_all(input.as_bytes())
+                })
+            });
             let reader = std::thread::spawn(move || {
                 let mut text = String::new();
                 stderr.read_to_string(&mut text).map(|_| text)
@@ -95,8 +160,17 @@ impl Runner {
                 .join()
                 .map_err(|_| "stderr reader stopped")?
                 .map_err(|e| e.to_string())?;
+            let write_result = writer
+                .map(|writer| {
+                    writer
+                        .join()
+                        .map_err(|_| "stdin writer stopped".to_owned())
+                        .and_then(|result| result.map_err(|e| e.to_string()))
+                })
+                .transpose();
             read_result?;
             if status.success() {
+                write_result?;
                 Ok(())
             } else {
                 Err(command_error(&entry))

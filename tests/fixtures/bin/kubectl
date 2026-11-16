@@ -1,9 +1,20 @@
 #!/bin/sh
 set -eu
 fixtures=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+state="$fixtures/state.toml"
+if ! test -f "$state"; then state="$fixtures/manifest.toml"; fi
+hash() { shasum -a 256 "$1" | cut -d ' ' -f 1; }
+applied() { printf '{"version":3,"manifest_hash":"sha256:%s","previous_hash":null}\n' "$(hash "$fixtures/state.toml")"; }
 case "$*" in
+  *'manifest history --json') cat "$fixtures/history.json" ;;
+  *'manifest get --version 1') cat "$fixtures/manifest.toml" ;;
+  *'manifest get --version 2') cat "$fixtures/manifest-v2.toml" ;;
+  *'manifest get') cat "$state" ;;
+  *'manifest set --note '*) cat > "$fixtures/state.toml"; applied ;;
+  *'manifest activate 1 --json') cp "$fixtures/manifest.toml" "$fixtures/state.toml"; applied ;;
+  *'manifest activate 2 --json') cp "$fixtures/manifest-v2.toml" "$fixtures/state.toml"; applied ;;
   *'devices list --json') cat "$fixtures/devices.json" ;;
-  *'status --json') cat "$fixtures/gateway.json" ;;
+  *'status --json') printf '{"version":"0.6.0","manifest_hash":"sha256:%s","auto_approve":false,"devices":{},"company_key_fingerprint":"fictional","manifest_source":"database","manifest_version":1}\n' "$(hash "$state")" ;;
   *'invite --ttl '*) cat "$fixtures/invitation.json" ;;
   *'devices approve '*|*'devices revoke '*) printf '%s\n' '{}' ;;
   *'get deploy/open-pact-gateway -o json') printf '%s\n' '{"metadata":{"generation":1},"status":{"availableReplicas":1,"conditions":[{"type":"Available","status":"True"}]}}' ;;

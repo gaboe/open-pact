@@ -1,143 +1,4 @@
-use std::path::{Path, PathBuf};
 use toml_edit::{DocumentMut, Item, Value};
-
-#[derive(Clone, Debug)]
-pub struct Block {
-    source: String,
-    start: usize,
-    end: usize,
-    indent: String,
-    newline: &'static str,
-    pub text: String,
-}
-
-impl Block {
-    pub fn parse(source: String) -> Result<Self, String> {
-        let newline = if source.contains("\r\n") {
-            "\r\n"
-        } else {
-            "\n"
-        };
-        let lines: Vec<&str> = source.split_inclusive('\n').collect();
-        let mut offset = 0;
-        let mut found = None;
-        for (index, line) in lines.iter().enumerate() {
-            let trimmed = line.trim();
-            if matches!(trimmed, "manifest: |" | "manifest: |-" | "manifest: |+") {
-                if found.is_some() {
-                    return Err(
-                        "More than one manifest block. Choose a file with one block.".into(),
-                    );
-                }
-                let key_indent = line.len() - line.trim_start().len();
-                let start = offset + line.len();
-                let mut end = start;
-                let mut indentation = None;
-                for body in &lines[index + 1..] {
-                    if !body.trim().is_empty() {
-                        let spaces = body.len() - body.trim_start_matches(' ').len();
-                        if spaces <= key_indent {
-                            break;
-                        }
-                        indentation.get_or_insert(spaces);
-                        if spaces < indentation.unwrap_or(0) {
-                            return Err("Inconsistent manifest indentation".into());
-                        }
-                    }
-                    end += body.len();
-                }
-                found = Some((
-                    start,
-                    end,
-                    " ".repeat(indentation.ok_or("Empty manifest block")?),
-                ));
-            }
-            offset += line.len();
-        }
-        let (start, end, indent) = found.ok_or("No manifest: | block found")?;
-        let mut text = String::new();
-        for line in source[start..end].split_inclusive('\n') {
-            text.push_str(
-                line.trim_end_matches(['\r', '\n'])
-                    .strip_prefix(&indent)
-                    .unwrap_or(""),
-            );
-            text.push('\n');
-        }
-        Ok(Self {
-            source,
-            start,
-            end,
-            indent,
-            newline,
-            text,
-        })
-    }
-
-    pub fn replace(&self, text: &str) -> Result<String, String> {
-        text.parse::<DocumentMut>().map_err(|e| e.to_string())?;
-        let mut output = self.source[..self.start].to_owned();
-        for line in text.lines() {
-            output.push_str(&self.indent);
-            output.push_str(line);
-            output.push_str(self.newline);
-        }
-        output.push_str(&self.source[self.end..]);
-        Ok(output)
-    }
-
-    pub fn unchanged(&self, path: &Path) -> Result<(), String> {
-        let current = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-        if current == self.source {
-            Ok(())
-        } else {
-            Err("The deployment file changed. Reload it before applying.".into())
-        }
-    }
-}
-
-pub fn discover(repo: &Path) -> Result<PathBuf, String> {
-    fn scan(dir: &Path, matches: &mut Vec<PathBuf>) -> Result<(), String> {
-        for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
-            let entry = entry.map_err(|e| e.to_string())?;
-            let kind = entry.file_type().map_err(|e| e.to_string())?;
-            if kind.is_symlink() {
-                continue;
-            }
-            let path = entry.path();
-            if kind.is_dir() {
-                if !matches!(
-                    entry.file_name().to_str(),
-                    Some(".git" | "target" | "node_modules")
-                ) {
-                    scan(&path, matches)?;
-                }
-            } else if matches!(
-                path.extension().and_then(|s| s.to_str()),
-                Some("yaml" | "yml")
-            ) {
-                let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-                if text.contains("open-pact")
-                    && text.contains("helm:")
-                    && Block::parse(text).is_ok()
-                {
-                    matches.push(path);
-                }
-            }
-        }
-        Ok(())
-    }
-    let mut matches = Vec::new();
-    scan(repo, &mut matches)?;
-    if matches.len() == 1 {
-        Ok(matches.remove(0))
-    } else {
-        Err(format!(
-            "Found {} deployment files. Enter the manifest file path.",
-            matches.len()
-        ))
-    }
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Part {
@@ -292,9 +153,59 @@ pub fn diff(before: &str, after: &str) -> String {
     if before == after {
         return "No changes".into();
     }
-    before
-        .lines()
-        .map(|s| format!("- {s}\n"))
-        .chain(after.lines().map(|s| format!("+ {s}\n")))
-        .collect()
+    similar::TextDiff::from_lines(before, after)
+        .unified_diff()
+        .context_radius(2)
+        .header("Active manifest", "Proposed manifest")
+        .to_string()
+}
+
+pub enum ListEdit<'a> {
+    Set(usize, &'a str),
+    Add,
+    Remove(usize),
+}
+
+pub fn edit_list(text: &str, field: &Field, edit: ListEdit<'_>) -> Result<String, String> {
+    let current = fields(text)?
+        .into_iter()
+        .find(|current| current.path == field.path)
+        .ok_or("List no longer exists")?;
+    let mut value = current.value.parse::<Value>().map_err(|e| e.to_string())?;
+    let array = value.as_array_mut().ok_or("Field is not a list")?;
+    match edit {
+        ListEdit::Add => {
+            array.push("");
+        }
+        ListEdit::Remove(index) => {
+            if index >= array.len() {
+                return Err("List item no longer exists".into());
+            }
+            array.remove(index);
+        }
+        ListEdit::Set(index, input) => {
+            let original = array.get(index).ok_or("List item no longer exists")?;
+            let replacement = if original.is_str() {
+                Value::from(input)
+            } else {
+                input.parse::<Value>().map_err(|e| e.to_string())?
+            };
+            array.replace(index, replacement);
+        }
+    }
+    set_field(text, field, &value.to_string())
+}
+
+pub fn list_items(field: &Field) -> Result<Vec<String>, String> {
+    let value = field.value.parse::<Value>().map_err(|e| e.to_string())?;
+    Ok(value
+        .as_array()
+        .ok_or("Field is not a list")?
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| item.to_string())
+        })
+        .collect())
 }

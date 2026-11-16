@@ -8,7 +8,7 @@ pub const RULE: u32 = 0xe2ddd2;
 pub const BLUE: u32 = 0x2f64c8;
 
 pub fn column() -> Div {
-    div().flex().flex_col().gap_4()
+    div().flex().flex_col().gap_3()
 }
 
 pub fn title(text: impl Into<SharedString>) -> Div {
@@ -30,7 +30,7 @@ pub fn row(key: impl Into<SharedString>, value: impl Into<SharedString>) -> Div 
         .flex()
         .justify_between()
         .gap_4()
-        .py_2()
+        .py_1()
         .border_b_1()
         .border_color(rgb(RULE))
         .child(key.into())
@@ -59,6 +59,9 @@ pub fn terminal(runner: &crate::Runner) -> Div {
         panel = panel.child("No commands yet.");
     }
     for log in logs {
+        if let Some(input) = &log.stdin {
+            panel = panel.child(note(format!("stdin\n{input}")));
+        }
         panel = panel
             .child(div().text_color(rgb(0x8fb4f0)).child(log.display()))
             .child(log.stdout)
@@ -71,6 +74,15 @@ pub fn terminal(runner: &crate::Runner) -> Div {
 pub fn init(cx: &mut App) {
     gpui_component::init(cx);
     Theme::change(ThemeMode::Light, None, cx);
+    Theme::update(cx, |theme| {
+        theme.font_size = px(15.);
+        theme.primary = rgb(BLUE).into();
+        theme.primary_hover = rgb(0x1f4fa8).into();
+        theme.primary_active = rgb(0x1f4fa8).into();
+        theme.button_primary = rgb(BLUE).into();
+        theme.primary_foreground = rgb(0xffffff).into();
+        theme.radius = px(8.);
+    });
 }
 
 pub fn launch<V: Render + 'static>(

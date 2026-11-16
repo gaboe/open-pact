@@ -1,1 +1,1 @@
-{"version":"0.6.0","manifest_hash":"sha256:97e1594a","auto_approve":false,"devices":{"pending":1,"approved":2,"revoked":0},"company_key_fingerprint":"7f3a 91c2 04e8"}
+{"version":"0.6.0","manifest_hash":"sha256:0020826210b6c486015e84ef35adc9cb09d3b957b0d69b7b8367c97dd16e2c5d","auto_approve":false,"devices":{"pending":1,"approved":2,"revoked":0},"company_key_fingerprint":"7f3a 91c2 04e8","manifest_source":"database","manifest_version":1}

@@ -1,16 +1,28 @@
-use crate::{Runner, args, manifest::Block};
+use crate::{Runner, args};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Settings {
-    pub repo: PathBuf,
-    pub manifest: PathBuf,
     pub context: String,
     pub namespace: String,
+    pub backup_dir: PathBuf,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            context: String::new(),
+            namespace: "open-pact".into(),
+            backup_dir: dirs::data_local_dir()
+                .unwrap_or_default()
+                .join("open-pact-admin/backups"),
+        }
+    }
 }
 
 impl Settings {
@@ -23,10 +35,7 @@ impl Settings {
     pub fn load() -> Result<Self, String> {
         let path = Self::path()?;
         if !path.exists() {
-            return Ok(Self {
-                namespace: "open-pact".into(),
-                ..Self::default()
-            });
+            return Ok(Self::default());
         }
         serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())
@@ -46,26 +55,6 @@ impl Settings {
             std::fs::remove_file(&path).map_err(|e| e.to_string())?;
         }
         std::fs::rename(temporary, path).map_err(|e| e.to_string())
-    }
-
-    pub fn manifest_path(&self) -> Result<PathBuf, String> {
-        if self.manifest.is_absolute()
-            || self
-                .manifest
-                .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir))
-        {
-            return Err("Manifest path must be inside the deployment repository".into());
-        }
-        let repo = self.repo.canonicalize().map_err(|e| e.to_string())?;
-        let path = repo
-            .join(&self.manifest)
-            .canonicalize()
-            .map_err(|e| e.to_string())?;
-        if !path.starts_with(&repo) {
-            return Err("Manifest resolves outside the deployment repository".into());
-        }
-        Ok(path)
     }
 }
 
@@ -89,6 +78,10 @@ pub struct Gateway {
     pub auto_approve: bool,
     pub devices: Value,
     pub company_key_fingerprint: String,
+    #[serde(default)]
+    pub manifest_source: Option<String>,
+    #[serde(default)]
+    pub manifest_version: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -99,12 +92,93 @@ pub struct Invitation {
     pub note: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Version {
+    pub version: u64,
+    pub manifest_hash: String,
+    pub created_at: String,
+    pub note: String,
+    pub active: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Applied {
+    pub version: u64,
+    pub manifest_hash: String,
+    pub previous_hash: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Backup {
+    pub path: PathBuf,
+    pub manifest_hash: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct History {
+    pub versions: Vec<Version>,
+    pub backups: Vec<Backup>,
+    pub synced_at: String,
+}
+
+#[derive(Clone, Debug)]
+pub enum Restore {
+    Server(Version),
+    Local(Backup),
+}
+
 #[derive(Clone)]
 pub struct Admin {
     pub runner: Runner,
     pub settings: Settings,
     pub kubectl: PathBuf,
-    pub git: PathBuf,
+}
+
+pub fn hash(text: &str) -> String {
+    format!("sha256:{:x}", Sha256::digest(text.as_bytes()))
+}
+
+fn hash12(hash: &str) -> Result<&str, String> {
+    let bytes = hash
+        .strip_prefix("sha256:")
+        .ok_or("Invalid manifest hash")?;
+    if bytes.len() != 64 || !bytes.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("Invalid manifest hash".into());
+    }
+    Ok(&bytes[..12])
+}
+
+fn save_backup(directory: &Path, filename: &str, text: &str) -> Result<PathBuf, String> {
+    use std::io::Write;
+    std::fs::create_dir_all(directory).map_err(|e| e.to_string())?;
+    let path = directory.join(filename);
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            file.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
+            file.sync_all().map_err(|e| e.to_string())?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if std::fs::symlink_metadata(&path)
+                .map_err(|e| e.to_string())?
+                .file_type()
+                .is_symlink()
+            {
+                return Err("Backup path is a symbolic link".into());
+            }
+            if std::fs::read_to_string(&path).map_err(|e| e.to_string())? != text {
+                return Err(format!(
+                    "Backup {} differs from the server. Choose a new backup folder.",
+                    path.display()
+                ));
+            }
+        }
+        Err(error) => return Err(error.to_string()),
+    }
+    Ok(path)
 }
 
 impl Admin {
@@ -113,7 +187,6 @@ impl Admin {
             runner,
             settings,
             kubectl: "kubectl".into(),
-            git: "git".into(),
         }
     }
 
@@ -177,82 +250,238 @@ impl Admin {
             .map(|_| ())
     }
 
-    fn git(&self, words: &[&str]) -> Result<crate::CommandLog, String> {
-        let mut command = args(&["-C", &self.settings.repo.to_string_lossy()]);
-        command.extend(args(words));
-        self.runner.run(&self.git, &command)
+    pub fn manifest(&self, version: Option<u64>) -> Result<String, String> {
+        let mut words = self.gateway_args(&["manifest", "get"]);
+        if let Some(version) = version {
+            words.extend(args(&["--version", &version.to_string()]));
+        }
+        Ok(self.runner.raw(&self.kubectl, &words)?.stdout)
     }
 
-    pub fn validate(&self) -> Result<(), String> {
-        self.settings.manifest_path()?;
-        self.git(&["status", "--porcelain"])?;
-        self.deployment()?;
+    pub fn history(&self) -> Result<Vec<Version>, String> {
+        self.runner.json(
+            &self.kubectl,
+            &self.gateway_args(&["manifest", "history", "--json"]),
+        )
+    }
+
+    pub fn backups(&self) -> Result<Vec<Backup>, String> {
+        if !self.settings.backup_dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut backups = Vec::new();
+        for entry in std::fs::read_dir(&self.settings.backup_dir).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            if entry.file_type().map_err(|e| e.to_string())?.is_file()
+                && entry.path().extension().is_some_and(|ext| ext == "toml")
+            {
+                let text = std::fs::read_to_string(entry.path()).map_err(|e| e.to_string())?;
+                backups.push(Backup {
+                    path: entry.path(),
+                    manifest_hash: hash(&text),
+                });
+            }
+        }
+        backups.sort_by(|left, right| right.path.cmp(&left.path));
+        Ok(backups)
+    }
+
+    pub fn sync(&self) -> Result<History, String> {
+        let versions = self.history()?;
+        for version in &versions {
+            let time = DateTime::parse_from_rfc3339(&version.created_at)
+                .map_err(|e| format!("Invalid server version time: {e}"))?
+                .with_timezone(&Utc)
+                .format("%Y%m%dT%H%M%S%.3fZ")
+                .to_string();
+            let filename = format!(
+                "{time}-v{}-{}.toml",
+                version.version,
+                hash12(&version.manifest_hash)?
+            );
+            let path = self.settings.backup_dir.join(&filename);
+            if path.exists() {
+                if std::fs::symlink_metadata(&path)
+                    .map_err(|e| e.to_string())?
+                    .file_type()
+                    .is_symlink()
+                    || hash(&std::fs::read_to_string(path).map_err(|e| e.to_string())?)
+                        != version.manifest_hash
+                {
+                    return Err(format!(
+                        "Local backup for version {} does not match the server.",
+                        version.version
+                    ));
+                }
+                continue;
+            }
+            let text = self.manifest(Some(version.version))?;
+            if hash(&text) != version.manifest_hash {
+                return Err(format!(
+                    "Downloaded version {} has the wrong hash",
+                    version.version
+                ));
+            }
+            save_backup(&self.settings.backup_dir, &filename, &text)?;
+        }
+        Ok(History {
+            versions,
+            backups: self.backups()?,
+            synced_at: Utc::now().to_rfc3339(),
+        })
+    }
+
+    pub fn restore_text(&self, restore: &Restore) -> Result<String, String> {
+        let (text, expected) = match restore {
+            Restore::Server(version) => (
+                self.manifest(Some(version.version))?,
+                &version.manifest_hash,
+            ),
+            Restore::Local(backup) => {
+                let path = backup.path.canonicalize().map_err(|e| e.to_string())?;
+                let directory = self
+                    .settings
+                    .backup_dir
+                    .canonicalize()
+                    .map_err(|e| e.to_string())?;
+                if path.parent() != Some(directory.as_path()) {
+                    return Err("Backup is outside the configured folder".into());
+                }
+                (
+                    std::fs::read_to_string(path).map_err(|e| e.to_string())?,
+                    &backup.manifest_hash,
+                )
+            }
+        };
+        if hash(&text) != *expected {
+            return Err("The selected manifest changed. Sync and review it again.".into());
+        }
+        text.parse::<toml_edit::DocumentMut>()
+            .map_err(|e| e.to_string())?;
+        Ok(text)
+    }
+
+    fn backup_active(&self, reviewed_hash: &str) -> Result<(), String> {
+        let current = self.manifest(None)?;
+        let current_hash = hash(&current);
+        if current_hash != reviewed_hash {
+            return Err("The active manifest changed. Reload it and review the diff again.".into());
+        }
+        let filename = format!(
+            "{}-{}.toml",
+            Utc::now().format("%Y%m%dT%H%M%S%.3fZ"),
+            hash12(&current_hash)?
+        );
+        save_backup(&self.settings.backup_dir, &filename, &current)?;
         Ok(())
+    }
+
+    fn set(&self, text: &str, note: &str) -> Result<Applied, String> {
+        let words = self.kube_args(&[
+            "exec",
+            "-i",
+            "deploy/open-pact-gateway",
+            "--",
+            "open-pact-gateway",
+            "manifest",
+            "set",
+            "--note",
+            note,
+            "--json",
+        ]);
+        let output = self.runner.input(&self.kubectl, &words, text)?;
+        serde_json::from_str(&output.stdout).map_err(|e| {
+            format!("Manifest write response is unknown: {e}. Refresh status before retrying.")
+        })
     }
 
     pub fn apply(
         &self,
-        block: &Block,
         text: &str,
-        message: &str,
+        note: &str,
+        reviewed_hash: &str,
         timeout: Duration,
-        mut progress: impl FnMut(&str),
     ) -> Result<String, String> {
-        if message.trim().is_empty() {
-            return Err("Enter a commit message".into());
+        text.parse::<toml_edit::DocumentMut>()
+            .map_err(|e| e.to_string())?;
+        if note.trim().is_empty() {
+            return Err("Enter a change note".into());
         }
-        let path = self.settings.manifest_path()?;
-        block.unchanged(&path)?;
-        let replacement = block.replace(text)?;
-        if !self
-            .git(&["status", "--porcelain"])?
-            .stdout
-            .trim()
-            .is_empty()
-        {
+        self.backup_active(reviewed_hash)?;
+        let result = self.set(text, note)?;
+        let expected = hash(text);
+        if result.manifest_hash != expected {
             return Err(
-                "The deployment repository has local changes. Commit or remove them first.".into(),
+                "The gateway write returned an unexpected hash. Refresh status before retrying."
+                    .into(),
             );
         }
-        let previous = self.deployment()?;
-        let previous_generation = previous.pointer("/metadata/generation").cloned();
-        progress("Pulling the deployment repository");
-        self.git(&["pull", "--ff-only"])?;
-        block.unchanged(&path)?;
-        progress("Writing and committing the manifest");
-        std::fs::write(&path, replacement).map_err(|e| e.to_string())?;
-        self.git(&["commit", "-am", message])?;
-        progress("Pushing the commit");
-        self.git(&["push"])?;
-        let committed = Block::parse(std::fs::read_to_string(path).map_err(|e| e.to_string())?)?;
-        let expected = format!("sha256:{:x}", Sha256::digest(committed.text.as_bytes()));
-        let deadline = Instant::now() + timeout;
-        progress("Waiting for the gateway to restart and enforce the new manifest");
-        while Instant::now() < deadline {
-            let deployment = self.deployment()?;
-            let restarted =
-                deployment.pointer("/metadata/generation") != previous_generation.as_ref();
-            let available = deployment
-                .pointer("/status/availableReplicas")
-                .and_then(Value::as_u64)
-                .unwrap_or(0)
-                > 0;
-            if restarted && available {
-                let status = self.gateway()?;
-                if status.manifest_hash == expected {
-                    return Ok(status.manifest_hash);
-                }
+        self.wait_for(&expected, timeout)
+    }
+
+    pub fn restore(
+        &self,
+        restore: &Restore,
+        reviewed_hash: &str,
+        timeout: Duration,
+    ) -> Result<String, String> {
+        let text = self.restore_text(restore)?;
+        self.backup_active(reviewed_hash)?;
+        let versions = self.history()?;
+        let expected = hash(&text);
+        let server = versions.iter().find(|version| match restore {
+            Restore::Server(selected) => {
+                version.version == selected.version && version.manifest_hash == expected
             }
-            std::thread::sleep(Duration::from_secs(2));
+            Restore::Local(_) => version.manifest_hash == expected,
+        });
+        let result: Applied = if let Some(version) = server {
+            self.runner.json(
+                &self.kubectl,
+                &self.gateway_args(&[
+                    "manifest",
+                    "activate",
+                    &version.version.to_string(),
+                    "--json",
+                ]),
+            )?
+        } else {
+            let name = match restore {
+                Restore::Local(backup) => backup
+                    .path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+                Restore::Server(version) => format!("version {}", version.version),
+            };
+            self.set(&text, &format!("restore {name}"))?
+        };
+        if result.manifest_hash != expected {
+            return Err(
+                "The restore returned an unexpected hash. Refresh status before retrying.".into(),
+            );
+        }
+        self.wait_for(&expected, timeout)
+    }
+
+    pub fn wait_for(&self, expected: &str, timeout: Duration) -> Result<String, String> {
+        let deadline = Instant::now() + timeout;
+        let mut last_error = String::new();
+        while Instant::now() < deadline {
+            match self.gateway() {
+                Ok(status) if status.manifest_hash == expected => return Ok(expected.into()),
+                Ok(status) => last_error = format!("Gateway reports {}", status.manifest_hash),
+                Err(error) => last_error = error,
+            }
+            std::thread::sleep(
+                Duration::from_secs(1).min(deadline.saturating_duration_since(Instant::now())),
+            );
         }
         Err(format!(
-            "Rollout timed out. Expected {expected}. Reload gateway status before retrying. The commit was pushed."
+            "Manifest update timed out. Expected {expected}. {last_error}. The write outcome is unconfirmed. Refresh status before retrying."
         ))
     }
-}
-
-pub fn load_block(settings: &Settings) -> Result<Block, String> {
-    Block::parse(std::fs::read_to_string(settings.manifest_path()?).map_err(|e| e.to_string())?)
 }
 
 pub fn ready(deployment: &Value) -> bool {
@@ -262,12 +491,6 @@ pub fn ready(deployment: &Value) -> bool {
         .is_some_and(|conditions| {
             conditions
                 .iter()
-                .any(|v| v["type"] == "Available" && v["status"] == "True")
+                .any(|value| value["type"] == "Available" && value["status"] == "True")
         })
-}
-
-pub fn relative(repo: &Path, file: &Path) -> Result<PathBuf, String> {
-    file.strip_prefix(repo)
-        .map(Path::to_path_buf)
-        .map_err(|e| e.to_string())
 }

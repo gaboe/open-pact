@@ -153,7 +153,9 @@ impl Client {
         for folder in folders {
             words.extend(args(&["--folder", folder]));
         }
-        words.push(invitation.into());
+        if !invitation.is_empty() {
+            words.push(invitation.into());
+        }
         let mut parse_error = None;
         let mut completed = false;
         self.runner.stream(
@@ -273,4 +275,76 @@ pub fn install(runner: &Runner, bundled: &Path, destination: &Path) -> Result<()
         std::fs::remove_file(destination).map_err(|e| e.to_string())?;
     }
     std::fs::rename(temporary, destination).map_err(|e| e.to_string())
+}
+
+#[cfg(unix)]
+pub fn terminal_path(profile: &Path, directory: &Path) -> Result<(), String> {
+    use std::io::Write;
+    let existing = match std::fs::read_to_string(profile) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error.to_string()),
+    };
+    let quoted = directory.to_string_lossy().replace('\'', "'\\''");
+    let line = format!("export PATH='{quoted}':\"$PATH\"");
+    if existing.lines().any(|row| row == line) {
+        return Ok(());
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(profile)
+        .map_err(|e| e.to_string())?;
+    if !existing.is_empty() && !existing.ends_with('\n') {
+        writeln!(file).map_err(|e| e.to_string())?;
+    }
+    writeln!(file, "{line}").map_err(|e| e.to_string())
+}
+
+pub fn enable_terminal(destination: &Path) -> Result<(), String> {
+    let directory = destination.parent().ok_or("Invalid CLI location")?;
+    #[cfg(unix)]
+    {
+        let home = dirs::home_dir().ok_or("Cannot locate the home directory")?;
+        let shell = std::env::var("SHELL").unwrap_or_default();
+        let profile = if shell.ends_with("zsh") {
+            ".zprofile"
+        } else {
+            ".profile"
+        };
+        terminal_path(&home.join(profile), directory)
+    }
+    #[cfg(windows)]
+    {
+        use winreg::{HKCU, RegValue, enums::REG_EXPAND_SZ, types::ToRegValue};
+        let (environment, _) = HKCU
+            .create_subkey("Environment")
+            .map_err(|e| e.to_string())?;
+        let original: String = match environment.get_value("Path") {
+            Ok(path) => path,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(error.to_string()),
+        };
+        let directory = directory.to_string_lossy();
+        if original
+            .split(';')
+            .any(|part| part.eq_ignore_ascii_case(&directory))
+        {
+            return Ok(());
+        }
+        let kind = environment
+            .get_raw_value("Path")
+            .map(|value| value.vtype)
+            .unwrap_or(REG_EXPAND_SZ);
+        let value = format!("{directory};{original}").to_reg_value();
+        environment
+            .set_raw_value(
+                "Path",
+                &RegValue {
+                    bytes: value.bytes,
+                    vtype: kind,
+                },
+            )
+            .map_err(|e| e.to_string())
+    }
 }
