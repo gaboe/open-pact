@@ -114,6 +114,46 @@ kubectl exec deploy/pact-gateway -- open-pact-gateway status --json
 
 `manifest_source` is `database`, `file` for `MANIFEST_PATH`, or `builtin` for the image's example manifest. `manifest_version` is the active database version, or `null` for either file source. `devices` counts distinct pseudonyms per state. Without `--json`, `status` prints the same facts as text.
 
+## Read results
+
+IT can read what devices reported without a database client. Both commands only read. They open the stored claims with the KEK, so they need `GATEWAY_KEK` in the gateway container, and they add no HTTP route. With `--json` each prints one JSON document. On an error it prints `{"error": "<text>"}` and exits 1.
+
+```sh
+kubectl exec deploy/pact-gateway -- open-pact-gateway claims list --json --device 0123456789ab --result warnings --limit 20
+kubectl exec deploy/pact-gateway -- open-pact-gateway claims show 4812 --json
+```
+
+`claims list` prints the newest claims first. Every filter is optional and the filters combine:
+
+- `--device` takes at least 8 hex digits of a device pseudonym, as `devices approve` does.
+- `--result` is `accepted`, `warnings` or `denied`.
+- `--since` is an RFC 3339 time. A claim received at that time is included.
+- `--limit` is the number of claims to print: 100 by default, 1000 at most. The command stops reading after that many matches.
+
+```json
+{"claims": [{"id": 4812, "received_at": "2026-11-03T08:15:00Z", "device": "pseudonym:0123…",
+             "device_note": "Example laptop", "manifest_hash": "sha256:…", "result": "warnings",
+             "failed_controls": ["os_patch_age_days"]}],
+ "unreadable": 0}
+```
+
+`device_note` is the invitation note of the device, empty when it has none. `failed_controls` lists the required controls that do not pass, inside their grace or not. `unreadable` counts the claims the command met that it cannot open, because retention deleted the key of their month. No filter applies to them.
+
+`claims show <id>` prints one claim with every control of the manifest it was made under:
+
+```json
+{"id": 4812, "received_at": "2026-11-03T08:15:00Z", "device": "pseudonym:0123…", "device_note": "Example laptop",
+ "manifest_hash": "sha256:…", "os": "linux", "client_version": "0.6.0", "trust_level": "L0", "result": "warnings",
+ "controls": [{"id": "os_patch_age_days", "value": 40, "required": "<= 30", "status": "fail", "grace": "1d",
+               "first_failed_at": "2026-11-02T08:15:00Z", "deadline": "2026-11-03T08:15:00Z"}]}
+```
+
+`status` is `pass`, `fail`, `unknown` (the device reported `unknown`) or `not_required` (the manifest requires nothing for this OS). `grace` is the grace of a control that fails: its own, or `unknown_grace` for an `unknown` value. `first_failed_at` is the start the gateway holds now for that control, and `deadline` is that start plus `grace`. Both are `null` when the control passes or the gateway holds no start. `value` is `null` when the claim has no value for the control.
+
+The command finds the manifest by its hash in the stored versions, or in the manifest the process started with. When it finds neither, it cannot evaluate: `result` comes from the stored decision, every control has `"required": null` and `"status": "unknown"`, and `failed_controls` of `claims list` is empty. `result` is `null` for a claim that an early version stored with no decision. The result is derived from the stored decision and the claim's own manifest, so a claim that was accepted only because of a manifest the device had not accepted yet can show `accepted`. A claim shown for an id that does not exist, or whose month key retention deleted, prints an error and exits 1.
+
+Without `--json`, both commands print a short table.
+
 ## Run a witness
 
 A witness keeps its own Ed25519 key and latest checkpoint. Run it under a different operator and in a separate environment from the gateway. A witness run by the gateway operator cannot show that operator a conflicting log history.

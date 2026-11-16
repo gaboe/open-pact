@@ -5,6 +5,8 @@
 //! before a key was deleted still holds it, so the claims stay readable from that backup with the
 //! KEK until the backup expires (R2-M2).
 
+use std::collections::HashMap;
+
 use anyhow::Context;
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use open_pact_core::{EntryKind, ManifestHash, Pseudonym, Span};
@@ -193,6 +195,99 @@ pub async fn set_missing_deadlines(
     .execute(db)
     .await?
     .rows_affected())
+}
+
+/// A claim as the gateway stored it, opened: the device and the claim JSON as `stored_claim` wrote
+/// them. The JWS stays sealed; reading results never needs it.
+pub struct Stored {
+    pub id: i64,
+    pub received_at: DateTime<Utc>,
+    pub allowed: Option<bool>,
+    pub device: String,
+    pub claim: Value,
+}
+
+/// The columns `SELECT_STORED` returns.
+pub type StoredRow = (
+    i64,
+    DateTime<Utc>,
+    Option<bool>,
+    Option<NaiveDate>,
+    Option<String>,
+    Option<String>,
+    Option<Value>,
+);
+
+pub const SELECT_STORED: &str =
+    "SELECT id, received_at, allowed, period, sealed, device, claim FROM claims";
+
+/// Opens stored claims for reading. It reads each month key once. A month whose key retention
+/// deleted has no key, and its claims stay sealed for good.
+pub struct Opener<'a> {
+    db: &'a PgPool,
+    kek: &'a SealingKey,
+    keys: HashMap<NaiveDate, Option<SealingKey>>,
+}
+
+impl<'a> Opener<'a> {
+    pub fn new(db: &'a PgPool, kek: &'a SealingKey) -> Self {
+        Opener {
+            db,
+            kek,
+            keys: HashMap::new(),
+        }
+    }
+
+    /// `None` when the claim's month key is gone. A claim not sealed yet (an earlier version
+    /// stored it, and `serve` has not run since) is read from its plain columns.
+    pub async fn open(&mut self, row: StoredRow) -> anyhow::Result<Option<Stored>> {
+        let (id, received_at, allowed, period, sealed, device, claim) = row;
+        let (device, claim) = match (period, sealed) {
+            (Some(period), Some(sealed)) => {
+                if !self.keys.contains_key(&period) {
+                    let wrapped: Option<String> =
+                        sqlx::query_scalar("SELECT wrapped_key FROM claim_keys WHERE period = $1")
+                            .bind(period)
+                            .fetch_optional(self.db)
+                            .await?;
+                    let key = match wrapped {
+                        Some(wrapped) => {
+                            let name = key_name(period);
+                            let bytes: [u8; 32] = self
+                                .kek
+                                .open(&name, &wrapped)?
+                                .try_into()
+                                .map_err(|_| anyhow::anyhow!("{name} is not 32 bytes"))?;
+                            Some(SealingKey::new(&bytes))
+                        }
+                        None => None,
+                    };
+                    self.keys.insert(period, key);
+                }
+                let Some(key) = &self.keys[&period] else {
+                    return Ok(None);
+                };
+                let mut body: Value =
+                    serde_json::from_slice(&key.open(&row_name(period), &sealed)?)?;
+                let device = match body["device"].take() {
+                    Value::String(device) => device,
+                    _ => anyhow::bail!("claim {id} has no device"),
+                };
+                (device, body["claim"].take())
+            }
+            _ => match (device, claim) {
+                (Some(device), Some(claim)) => (device, claim),
+                _ => anyhow::bail!("claim {id} is neither sealed nor stored in plain columns"),
+            },
+        };
+        Ok(Some(Stored {
+            id,
+            received_at,
+            allowed,
+            device,
+            claim,
+        }))
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
