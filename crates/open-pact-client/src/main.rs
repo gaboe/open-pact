@@ -3615,7 +3615,7 @@ async fn accept(home: &Home, yes: bool, insecure_dev: bool) -> Result<ExitCode> 
         );
         if turn_off_auto_send {
             println!(
-                "Signing turns automatic sending off until you run `{command} schedule on` again, because the new manifest adds automatic sending or sends more often or in more places."
+                "Signing turns automatic sending off until you run `{command} schedule on` again, because the new manifest adds automatic sending, sends more often, or changes where it sends."
             );
         }
         _reading = reading;
@@ -3623,11 +3623,6 @@ async fn accept(home: &Home, yes: bool, insecure_dev: bool) -> Result<ExitCode> 
             println!("Not signed. Nothing was sent. Run {command} accept when you are ready.");
             return Ok(ExitCode::FAILURE);
         }
-    }
-    if turn_off_auto_send {
-        let mut config = device_config::DeviceConfig::load(home)?;
-        config.auto_send = false;
-        config.save(home)?;
     }
     let owner = dev_key::load(&home.file("owner-dev.pem"))?;
     let device = DeviceKey::load(&home.0)?;
@@ -3654,14 +3649,18 @@ async fn accept(home: &Home, yes: bool, insecure_dev: bool) -> Result<ExitCode> 
     let status = response.status();
     let body: Value = response.json().await.unwrap_or(Value::Null);
     if !status.is_success() {
-        if turn_off_auto_send {
-            let mut config = device_config::DeviceConfig::load(home)?;
-            config.auto_send = true;
-            config.save(home)?;
-        }
         println!("Acceptance refused ({status}): {body}");
         return Ok(ExitCode::FAILURE);
     }
+    // The job reads this switch and manifest.toml under the claim lock, so the switch goes off just before manifest.toml changes.
+    let turned_off = if turn_off_auto_send {
+        let mut config = device_config::DeviceConfig::load(home)?;
+        config.auto_send = false;
+        config.save(home)?;
+        Some(config.run_as)
+    } else {
+        None
+    };
     home.write("manifest.toml", published.toml.as_bytes())?;
     enrolment.manifest = new.hash().clone();
     enrolment.log_entries = None;
@@ -3670,13 +3669,18 @@ async fn accept(home: &Home, yes: bool, insecure_dev: bool) -> Result<ExitCode> 
     if let Some(state) = body["state"].as_str() {
         println!("  Device       {state}");
     }
-    if turn_off_auto_send {
+    if let Some(run_as) = turned_off {
         if let Some(schedule) = &new.body().schedule {
             println!("{schedule}");
         }
-        println!(
-            "Automatic sending is off. Run `{command} schedule on` to agree to this schedule."
-        );
+        match run_as {
+            device_config::RunAs::System => println!(
+                "Automatic sending is off. Run `{command} schedule on --system` from an elevated prompt to agree to this schedule."
+            ),
+            device_config::RunAs::User => println!(
+                "Automatic sending is off. Run `{command} schedule on` to agree to this schedule."
+            ),
+        }
     }
     println!("Next: run {command} check to send a claim under the new manifest.");
     Ok(ExitCode::SUCCESS)
@@ -6657,7 +6661,7 @@ grace = "1d"
         auto_send: bool,
         interval: &str,
         status: u16,
-    ) -> tempfile::TempDir {
+    ) -> (tempfile::TempDir, Result<ExitCode>) {
         let company = Company::new();
         let witness = Witness::new();
         let old = witnessed_manifest(&witness);
@@ -6666,6 +6670,7 @@ grace = "1d"
             &format!("interval = \"{interval}\""),
             1,
         );
+        assert_ne!(old, new_toml);
         let published = Company::published(&new_toml, &company.key);
         let new = Manifest::parse(new_toml.as_bytes()).unwrap();
         let log = company.log.vkey();
@@ -6687,41 +6692,59 @@ grace = "1d"
         config.auto_send = auto_send;
         config.save(&home).unwrap();
 
-        let expected = if (200..300).contains(&status) {
-            ExitCode::SUCCESS
-        } else {
-            ExitCode::FAILURE
-        };
-        assert_eq!(accept(&home, true, false).await.unwrap(), expected);
-        dir
+        let result = accept(&home, true, false).await;
+        (dir, result)
     }
 
     #[tokio::test]
     async fn accept_turns_automatic_sending_off_when_the_schedule_shortens() {
-        let dir = accept_schedule_change(true, "30m", 200).await;
+        let (dir, result) = accept_schedule_change(true, "30m", 200).await;
+        assert_eq!(result.unwrap(), ExitCode::SUCCESS);
         let home = Home(dir.path().to_path_buf());
         assert!(!device_config::DeviceConfig::load(&home).unwrap().auto_send);
     }
 
     #[tokio::test]
     async fn accept_keeps_automatic_sending_on_when_the_schedule_lengthens() {
-        let dir = accept_schedule_change(true, "2h", 200).await;
+        let (dir, result) = accept_schedule_change(true, "2h", 200).await;
+        assert_eq!(result.unwrap(), ExitCode::SUCCESS);
         let home = Home(dir.path().to_path_buf());
         assert!(device_config::DeviceConfig::load(&home).unwrap().auto_send);
     }
 
     #[tokio::test]
-    async fn accept_restores_automatic_sending_when_the_gateway_refuses() {
-        let dir = accept_schedule_change(true, "30m", 409).await;
+    async fn accept_keeps_automatic_sending_on_when_the_gateway_refuses() {
+        let (dir, result) = accept_schedule_change(true, "30m", 409).await;
+        assert_eq!(result.unwrap(), ExitCode::FAILURE);
         let home = Home(dir.path().to_path_buf());
         assert!(device_config::DeviceConfig::load(&home).unwrap().auto_send);
+    }
+
+    #[tokio::test]
+    async fn accept_keeps_automatic_sending_off_when_the_gateway_refuses() {
+        let (dir, result) = accept_schedule_change(false, "30m", 409).await;
+        assert_eq!(result.unwrap(), ExitCode::FAILURE);
+        let home = Home(dir.path().to_path_buf());
+        assert!(!device_config::DeviceConfig::load(&home).unwrap().auto_send);
     }
 
     #[tokio::test]
     async fn accept_keeps_automatic_sending_off_when_it_was_already_off() {
-        let dir = accept_schedule_change(false, "30m", 200).await;
+        let (dir, result) = accept_schedule_change(false, "30m", 200).await;
+        assert_eq!(result.unwrap(), ExitCode::SUCCESS);
         let home = Home(dir.path().to_path_buf());
         assert!(!device_config::DeviceConfig::load(&home).unwrap().auto_send);
+    }
+
+    #[tokio::test]
+    async fn a_dropped_accept_connection_keeps_automatic_sending_on() {
+        let (dir, result) = accept_schedule_change(true, "30m", 0).await;
+        assert!(result.is_err());
+        let home = Home(dir.path().to_path_buf());
+        assert!(device_config::DeviceConfig::load(&home).unwrap().auto_send);
+        let stored = std::fs::read_to_string(home.file("manifest.toml")).unwrap();
+        assert!(stored.contains("interval = \"55m\""));
+        assert!(!stored.contains("interval = \"30m\""));
     }
 
     /// A checkpoint of the empty log that `witness` has cosigned, as the gateway serves it.

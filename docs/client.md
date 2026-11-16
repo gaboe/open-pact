@@ -132,7 +132,7 @@ open-pact-client accept
 
 The client fetches the new manifest and checks its company signature, the pinned keys and the log checkpoint under the new manifest's log policy. It shows the manifest and what changed against the one you signed: added, removed, and changed controls, `disclosed_metadata`, `claim_retention`, `claim_recipients`, `data_controller`, the minimum trust level, `unknown_grace`, `claim_max_age`, the issuer, the validity date and the log policy. A changed control shows its requirement for each operating system that differs. If you confirm, the owner key and the device key sign the new hash. The gateway moves the device to the new manifest without a new invitation or approval. The client then stores the new manifest, and the next `check` runs its checks. Pass `--yes` to sign without the prompt.
 
-When a new manifest adds automatic sending, changes its mode or probe, or shortens its interval, `accept` turns automatic sending off. Run `open-pact-client schedule on` to agree to the new schedule.
+When a new manifest adds automatic sending, changes its mode or probe, or shortens its interval, `accept` turns automatic sending off after the gateway confirms the new manifest. Run `open-pact-client schedule on` to agree to the new schedule.
 
 Before you sign, `accept` prints the absolute path of a copy of the whole new manifest, so you can read all of it. The copy is removed when the command ends. A change to `[schedule]` appears in the list of changes in plain words, such as `Automatic claims: only while vpn.example.org answers at 10.0.0.1:443, every 55 minutes, and at once when a check result changes`. Until you accept, the job keeps the policy of the manifest you signed.
 
@@ -196,7 +196,7 @@ open-pact-client schedule status
 open-pact-client schedule off
 ```
 
-`schedule on` prints the policy line, then `schedule: install`. A second run prints `no changes`, and a changed executable path prints `schedule: update`. Dry run prints the planned change and writes nothing. `schedule status` shows the company's policy, your choice, and the state of the job. Keep the client binary at its installed path. Use the same absolute `--home` for each command. If the entire client home is already missing, `schedule off` removes the remaining job without recreating that home. The job reads the policy from the manifest you signed. A manifest change needs no new `schedule on`.
+`schedule on` prints the policy line, then `schedule: install`, then `Your choice: automatic sending is on.` A second run prints `no changes` and the same choice line, and a changed executable path prints `schedule: update`. Dry run prints the planned change and writes nothing. `schedule status` shows the company's policy, your choice, and the state of the job. Keep the client binary at its installed path. Use the same absolute `--home` for each command. If the entire client home is already missing, `schedule off` removes the remaining job without recreating that home. The job reads the policy from the manifest you signed. A manifest change that keeps or narrows the schedule needs no new `schedule on`. After `accept` signs a manifest that widens it, run `schedule on` again.
 
 Choose a `vpn_probe` that connects only on the company VPN. With `mode = "vpn"`, the job tries a TCP connection to it every five minutes, with a two-second timeout. Use brackets around IPv6 addresses. An address that also answers off the VPN makes the job send off the VPN.
 

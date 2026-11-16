@@ -1844,6 +1844,7 @@ pub(crate) async fn turn_on(home: &Home, run_as: Option<RunAs>, dry_run: bool) -
         config.auto_send = true;
         config.run_as = run_as;
         config.save(home)?;
+        println!("Your choice: automatic sending is on.");
     }
     Ok(())
 }
@@ -1865,7 +1866,11 @@ pub(crate) async fn turn_off(home: &Home, dry_run: bool) -> Result<()> {
 /// `schedule status`: the owner's choice, the company's policy and the state of the job.
 async fn status(home: &Home) -> Result<()> {
     let config = DeviceConfig::load_or_migrate(home, crate::user_profile().as_deref(), false)?;
-    match home.signed_manifest() {
+    let signed = home.signed_manifest();
+    let signed_schedule = signed
+        .as_ref()
+        .is_ok_and(|manifest| manifest.body().schedule.is_some());
+    match signed {
         Ok(manifest) => match &manifest.body().schedule {
             Some(schedule) => println!("{schedule}"),
             None => {
@@ -1903,8 +1908,11 @@ async fn status(home: &Home) -> Result<()> {
             Change::None => "The job is not installed.".to_owned(),
             Change::Install => format!("The job is not installed. Run `{command} schedule on`."),
             Change::Update => format!("The job is out of date. Run `{command} schedule on`."),
-            Change::Remove => format!(
+            Change::Remove if observed.exists && signed_schedule => format!(
                 "The job is installed, but it sends nothing while automatic sending is off. Run `{command} schedule on` to agree to the signed schedule, or `{command} schedule off` to remove the job."
+            ),
+            Change::Remove => format!(
+                "A job from an earlier setup remains. Run `{command} schedule off` to remove it."
             ),
         }
     );
