@@ -287,6 +287,7 @@ impl Admin {
     }
 
     pub fn sync(&self) -> Result<History, String> {
+        std::fs::create_dir_all(&self.settings.backup_dir).map_err(|e| e.to_string())?;
         let versions = self.history()?;
         for version in &versions {
             let time = DateTime::parse_from_rfc3339(&version.created_at)

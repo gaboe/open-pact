@@ -336,7 +336,8 @@ pub fn enable_terminal(destination: &Path) -> Result<(), String> {
             .get_raw_value("Path")
             .map(|value| value.vtype)
             .unwrap_or(REG_EXPAND_SZ);
-        let value = format!("{directory};{original}").to_reg_value();
+        let path_value = format!("{directory};{original}");
+        let value = path_value.to_reg_value();
         environment
             .set_raw_value(
                 "Path",
