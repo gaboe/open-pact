@@ -34,10 +34,11 @@ gateway:
     capabilities:
       drop: [ALL]
 
-# The signed manifest as TOML text. Empty: the gateway enforces the example manifest built into the
-# image. Set it to run your own: the chart mounts it at /etc/open-pact/custom/manifest.toml, sets
-# MANIFEST_PATH, and restarts the pod when the text changes. Keep the manifest in your deployment
-# config, for example `--set-file manifest=company-manifest.toml`; no image rebuild is needed.
+# The startup manifest as TOML text. An active database version always takes precedence.
+# Without one, an empty value uses the image's example manifest. A supplied value is mounted at
+# /etc/open-pact/custom/manifest.toml and sets MANIFEST_PATH. A text change restarts the pod.
+# Keep this fallback in your deployment config, for example `--set-file manifest=company-manifest.toml`.
+# Use `open-pact-gateway manifest set` to change the active database version without a restart.
 manifest: ""
 
 ingress:

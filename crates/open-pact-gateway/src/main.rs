@@ -1009,7 +1009,8 @@ fn consented_manifest(
     let toml = toml.ok_or_else(|| {
         format!("{run_accept}; update open-pact-client if it does not send its signed manifest")
     })?;
-    let manifest = Manifest::parse(toml.as_bytes()).map_err(|e| format!("manifest_toml: {e}"))?;
+    let manifest = Manifest::parse(toml.as_bytes())
+        .map_err(|_| "manifest_toml is not a valid manifest".to_string())?;
     if manifest.hash() != signed {
         return Err(format!(
             "manifest_toml is {}, not the manifest this device signed; {run_accept}",
@@ -1133,7 +1134,13 @@ async fn refresh_cosignatures(mut app: App) {
     let mut last = Instant::now();
     let mut version = app.version;
     loop {
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        let delay = witness_refresh(&app.manifest, &app.log.witnesses)
+            .ok()
+            .flatten()
+            .map(|every| every.saturating_sub(last.elapsed()))
+            .unwrap_or(Duration::from_secs(10))
+            .min(Duration::from_secs(10));
+        tokio::time::sleep(delay).await;
         app.enforced = app.current.read().expect("manifest snapshot").clone();
         let Ok(Some(every)) = witness_refresh(&app.manifest, &app.log.witnesses) else {
             continue;
@@ -1371,7 +1378,7 @@ async fn reload_manifest(app: &App) -> anyhow::Result<()> {
         return Ok(());
     }
     let mut enforced = manifests::enforced(&row.toml, &app.keys, Some(row.version))?;
-    enforced.siem = siem::from_env(&enforced.manifest);
+    enforced.siem = current.siem.clone();
     publish_manifest(&app.db, &enforced.manifest).await?;
     eprintln!(
         "enforcing database manifest version {} {}",
@@ -1644,6 +1651,153 @@ mod tests {
 
     const DEMO: &str = include_str!("../../../examples/manifest.toml");
     const TEST_KEK: [u8; 32] = [5; 32];
+
+    async fn manifest_app(toml: &str) -> App {
+        let db = testdb::fresh().await;
+        let kek = SealingKey::new(&TEST_KEK);
+        let keys = Keys::load_or_create(&db, &kek).await.unwrap();
+        let enforced = Arc::new(manifests::enforced(toml, &keys, None).unwrap());
+        App {
+            db,
+            enforced: enforced.clone(),
+            current: Arc::new(RwLock::new(enforced)),
+            keys: Arc::new(keys),
+            auto_approve: false,
+            limiter: Arc::new(Limiter::new(100, Duration::from_secs(60), 100)),
+            nonce_limiter: Arc::new(Limiter::new(100, Duration::from_secs(60), 100)),
+            max_nonces: 10000,
+            kek: Arc::new(kek),
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "needs TEST_DATABASE_URL and LOG_ORIGIN"]
+    async fn manifest_reloads_keep_one_siem_sink() {
+        let mut app = manifest_app(DEMO).await;
+        let path =
+            std::env::temp_dir().join(format!("open-pact-siem-{}.ndjson", std::process::id()));
+        let sink = siem::Exporter::file_for_test(path);
+        let mut enforced = manifests::enforced(DEMO, &app.keys, None).unwrap();
+        enforced.siem = Some(sink.clone());
+        app.enforced = Arc::new(enforced);
+        *app.current.write().unwrap() = app.enforced.clone();
+        let mut sinks = std::collections::HashSet::from([sink.sink_id()]);
+        for toml in [DEMO.to_owned(), manifest_a(), DEMO.to_owned()] {
+            manifests::set_for_test(&app.db, &app.keys, &toml).await;
+            reload_manifest(&app).await.unwrap();
+            let current = app.current.read().unwrap();
+            let sink = current
+                .siem
+                .as_ref()
+                .expect("reload keeps the configured sink");
+            sinks.insert(sink.sink_id());
+        }
+        assert_eq!(sinks.len(), 1, "reload must not create another SIEM sink");
+    }
+
+    #[test]
+    fn invalid_supplied_manifest_has_a_fixed_reason() {
+        let enforced = Manifest::parse(DEMO.as_bytes()).unwrap();
+        let signed = Manifest::parse(manifest_a().as_bytes()).unwrap();
+        let reason = consented_manifest(
+            &enforced,
+            signed.hash(),
+            Some("fictional_private_marker = \"fictional-private-value\"\n"),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(reason, "manifest_toml is not a valid manifest");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs TEST_DATABASE_URL"]
+    async fn invalid_supplied_manifest_does_not_store_parser_text() {
+        let (app, db) = test_app_with(DEMO, 10, 100).await;
+        let a = manifest_a();
+        let owned = device_on(&db, &a).await;
+        let claim = claim_under(&app, &owned.device, &a).await;
+        let (status, _) = send_claim(
+            &app,
+            &owned.device,
+            &claim,
+            Some("fictional_private_marker = \"fictional-private-value\"\n"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let reasons: Vec<String> =
+            sqlx::query_scalar("SELECT last_reasons FROM devices WHERE pseudonym = $1")
+                .bind(owned.pseudonym.as_str())
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(reasons, ["manifest_toml is not a valid manifest"]);
+        let listed = devices::list_json(&db).await.unwrap();
+        assert!(!listed.contains("fictional_private_marker"), "{listed}");
+        assert!(!listed.contains("fictional-private-value"), "{listed}");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs TEST_DATABASE_URL and LOG_ORIGIN"]
+    async fn witness_refresh_keeps_a_one_second_interval() {
+        const CHILD: &str = "OPEN_PACT_TEST_WITNESS_REFRESH_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "tests::witness_refresh_keeps_a_one_second_interval",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("WITNESS_REFRESH_SECS", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let pushes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = pushes.clone();
+        let witness = Router::new().route(
+            "/add-checkpoint",
+            post(move || {
+                let seen = seen.clone();
+                async move {
+                    seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, witness).await.unwrap() });
+        let mut app = manifest_app(DEMO).await;
+        let mut enforced = manifests::enforced(DEMO, &app.keys, None).unwrap();
+        Arc::get_mut(&mut enforced.log).unwrap().witnesses =
+            Witnesses::new(vec![url], enforced.manifest.body().log.as_ref()).unwrap();
+        app.enforced = Arc::new(enforced);
+        *app.current.write().unwrap() = app.enforced.clone();
+        let refresh = tokio::spawn(refresh_cosignatures(app));
+        let result = tokio::time::timeout(Duration::from_secs(4), async {
+            while pushes.load(std::sync::atomic::Ordering::Relaxed) < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        refresh.abort();
+        server.abort();
+        let _ = refresh.await;
+        let _ = server.await;
+        assert!(
+            result.is_ok(),
+            "expected two witness pushes within four seconds, saw {}",
+            pushes.load(std::sync::atomic::Ordering::Relaxed)
+        );
+    }
 
     /// R4-L2: `invite --ttl` is checked where the command line is read, before any database or
     /// key is touched, and bad input is an error message, never a panic.

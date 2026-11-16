@@ -246,6 +246,20 @@ struct Shared {
 pub struct Exporter(Arc<Shared>);
 
 impl Exporter {
+    #[cfg(test)]
+    pub fn file_for_test(path: std::path::PathBuf) -> Self {
+        Self::start(Sink::File {
+            path,
+            mode: FileMode::OwnerOnly,
+        })
+        .unwrap()
+    }
+
+    #[cfg(test)]
+    pub fn sink_id(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
+    }
+
     fn start(sink: Sink) -> anyhow::Result<Self> {
         Self::start_with_report_interval(sink, Duration::from_secs(60))
     }

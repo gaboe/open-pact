@@ -4607,13 +4607,24 @@ async fn catch_panic(future: impl Future<Output = Result<ExitCode>>) -> Result<E
     .await
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
-    // Rust ignores SIGPIPE, so `open-pact-client log show | head` would panic on a closed pipe.
-    #[cfg(unix)]
-    unsafe {
-        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-    }
+fn main() -> ExitCode {
+    // Windows gives the main thread 1 MiB, which the debug CLI future can exceed.
+    std::thread::Builder::new()
+        .name("open-pact-client".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("build the CLI runtime")
+                .block_on(cli_main())
+        })
+        .expect("start the CLI thread")
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
+async fn cli_main() -> ExitCode {
     let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
     let cli = match Cli::try_parse_from(&args) {
         Ok(cli) => cli,
@@ -4626,6 +4637,14 @@ async fn main() -> ExitCode {
         },
     };
     let json = cli.prints_json();
+    // Keep Rust's ignored SIGPIPE for JSON: a closed stderr must not kill usable stdout.
+    // Text commands still exit quietly when their stdout pipe closes, such as `log show | head`.
+    #[cfg(unix)]
+    if !json {
+        unsafe {
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        }
+    }
     let result = if json {
         catch_panic(run(cli)).await
     } else {
