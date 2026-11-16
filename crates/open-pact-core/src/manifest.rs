@@ -1012,6 +1012,46 @@ impl ManifestBody {
     }
 }
 
+/// The manifest key a validation message opens with. Every message names its key first: a top-level
+/// field, a `log.` or `schedule.` path, or `<control id>: <reason>` for a control.
+pub(crate) fn key_named_by(message: &str) -> Option<String> {
+    let key_char = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_';
+    let word_end = message
+        .find(|c: char| !key_char(c) && c != '.')
+        .unwrap_or(message.len());
+    let word = message[..word_end].trim_end_matches('.');
+    let rest = &message[word_end..];
+    if matches!(word, "disclosed_metadata" | "unknown_grace")
+        || (word.starts_with("log.") || word.starts_with("schedule."))
+            && word.split('.').all(|part| !part.is_empty())
+    {
+        return Some(word.to_string());
+    }
+    let reason = rest.strip_prefix(": ")?;
+    if word.is_empty() || word.contains('.') {
+        return None;
+    }
+    let field = ["check", "remotes", "output"]
+        .into_iter()
+        .find(|field| reason.starts_with(&format!("{field} ")));
+    let field = match (field, reason.strip_prefix("required.")) {
+        (Some(field), _) => format!(".{field}"),
+        (None, Some(after)) => {
+            let os = after
+                .split(|c: char| !key_char(c))
+                .next()
+                .unwrap_or_default();
+            if os.is_empty() {
+                String::new()
+            } else {
+                format!(".required.{os}")
+            }
+        }
+        (None, None) => String::new(),
+    };
+    Some(format!("controls.{word}{field}"))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Manifest {
     hash: ManifestHash,
@@ -1101,6 +1141,36 @@ mod tests {
         assert!(DEMO.contains(from), "fixture lacks {from}");
         let toml = DEMO.replacen(from, to, 1);
         assert!(Manifest::parse(toml.as_bytes()).is_err(), "accepted {to}");
+    }
+
+    #[test]
+    fn a_manifest_error_names_its_key() {
+        let key = |from: &str, to: &str| {
+            let toml = DEMO.replacen(from, to, 1);
+            assert_ne!(toml, DEMO, "fixture lacks {from}");
+            Manifest::parse(toml.as_bytes()).unwrap_err().manifest_key()
+        };
+        assert_eq!(
+            key("witness_quorum = 1", "witness_quorum = 2").as_deref(),
+            Some("log.witness_quorum")
+        );
+        assert_eq!(
+            key(
+                r#"check = "builtin:firewall@1""#,
+                r#"check = "shell:ufw status""#
+            )
+            .as_deref(),
+            Some("controls.firewall.check")
+        );
+        assert_eq!(key(r#"id = "firewall""#, r#"id = "disk_encryption""#), None);
+        assert_eq!(
+            key(r#"unknown_grace = "7d""#, r#"unknown_grace = "0d""#).as_deref(),
+            Some("unknown_grace")
+        );
+        assert_eq!(
+            key("manifest_version = 1", "manifest_version = 1\nextra = true"),
+            None
+        );
     }
 
     #[test]
