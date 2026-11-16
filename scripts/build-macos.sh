@@ -24,7 +24,7 @@ for binary in open-pact open-pact-admin; do
 </dict></plist>
 EOF
   if [ "$binary" = open-pact ]; then
-    cp "$cli" "$bundle/Contents/Helpers/open-pact-client"
+    cp -f "$cli" "$bundle/Contents/Helpers/open-pact-client"
     codesign --force --sign - "$bundle/Contents/Helpers/open-pact-client"
   fi
   codesign --force --sign - "$bundle"
