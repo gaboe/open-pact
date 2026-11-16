@@ -54,6 +54,8 @@ struct AppView {
     terminal: bool,
     all_controls: bool,
     last_check: Option<Check>,
+    /// Fixtures set this RFC 3339 time. The app uses the real clock.
+    clock: Option<String>,
 }
 
 impl AppView {
@@ -77,6 +79,7 @@ impl AppView {
             terminal: false,
             all_controls: false,
             last_check: None,
+            clock: None,
         }
     }
 
@@ -178,10 +181,7 @@ impl AppView {
                         if let Some(path) = path {
                             this.client.executable = path;
                         }
-                        let resume = status
-                            .as_ref()
-                            .filter(|status| status.approval.state.as_deref() == Some("pending"))
-                            .map(|status| status.schedule["owner_consented"] == true);
+                        let resume = status.as_ref().and_then(client::resume_join);
                         this.screen = status.map(Self::status_screen).unwrap_or(Screen::Install);
                         if let Some(automatic) = resume {
                             this.run(Operation::Join(String::new(), Vec::new(), automatic), cx);
@@ -330,13 +330,30 @@ impl AppView {
                     return column().child(verdict(Tone::Bad, "IT removed this device", "Ask IT if this is a mistake."));
                 }
                 let head = headline(&status);
+                let installable = job_needs_install(&plain_value(&status.schedule["job"]))
+                    || status.issues.iter().any(|issue| issue_action(issue) == Some(IssueAction::InstallJob));
                 let mut view = column().child(verdict(head.tone, head.heading, head.detail));
                 if !status.issues.is_empty() {
-                    view = view.child(div().flex().flex_col().children(status.issues.iter().map(|issue| {
-                        div().flex().flex_col().gap_0p5().py(px(10.)).border_b_1().border_color(rgb(RULE_2))
-                            .child(div().font_weight(FontWeight::SEMIBOLD).child(issue.message.clone()))
-                            .when_some(issue.fix.clone(), |item, fix| item.child(div().text_size(px(14.)).text_color(rgb(INK_2)).child(fix)))
-                            .when_some(deadline_text(issue), |item, deadline| item.child(note(deadline)))
+                    view = view.child(div().flex().flex_col().children(status.issues.iter().enumerate().map(|(i, issue)| {
+                        let shown = issue_view_local(issue, self.clock.as_deref());
+                        let button = shown.action.map(|action| {
+                            Button::new(("issue-action", i)).label(action.label()).small().disabled(self.busy)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let operation = match action {
+                                        IssueAction::InstallJob => Operation::Schedule(true),
+                                        IssueAction::TurnOffJob => Operation::Schedule(false),
+                                        IssueAction::Retry => Operation::Status,
+                                        IssueAction::Review => Operation::Changes,
+                                    };
+                                    this.run(operation, cx);
+                                }))
+                        });
+                        div().flex().items_start().gap_4().py(px(10.)).border_b_1().border_color(rgb(RULE_2))
+                            .child(div().flex().flex_col().flex_1().min_w_0().gap_0p5()
+                                .child(div().font_weight(FontWeight::SEMIBOLD).child(shown.title))
+                                .when_some(shown.fix, |item, fix| item.child(div().text_size(px(14.)).text_color(rgb(INK_2)).child(fix)))
+                                .when_some(shown.note, |item, text| item.child(note(text))))
+                            .when_some(button, |row, button| row.child(div().flex_none().child(button)))
                     })));
                 }
                 let consented = status.schedule["owner_consented"] == true;
@@ -358,13 +375,20 @@ impl AppView {
                     .child(actions().child(Button::new("checks").label(if self.all_controls { "Hide every check" } else { "Show every check" }).on_click(cx.listener(|this, _, _, cx| { this.all_controls = !this.all_controls; cx.notify(); })))
                         .child(self.action("check", "Check now", |_, _| Operation::Check, cx)))
                     .child(table()
-                        .child(row("Send results automatically", div().flex().items_center().gap_3()
-                            .child(plain_value(&status.schedule["policy"]))
-                            .child(Switch::new("schedule").checked(consented).disabled(self.busy).on_click(cx.listener(|this, checked: &bool, _, cx| this.run(Operation::Schedule(*checked), cx))))))
+                        .child(div().flex().items_center().justify_between().gap_4().py(px(9.)).border_b_1().border_color(rgb(RULE_2))
+                            .child(div().flex_none().child("Send results automatically"))
+                            .child(div().flex().items_center().justify_end().gap_3().min_w_0()
+                                .child(div().min_w_0().text_right().text_color(rgb(INK_2)).child(plain_value(&status.schedule["policy"])))
+                                .child(div().flex_none().child(Switch::new("schedule").checked(consented).disabled(self.busy).on_click(cx.listener(|this, checked: &bool, _, cx| this.run(Operation::Schedule(*checked), cx)))))))
                         .child(row("Last result", last_result.clone()))
                         .when_some(scheduled.filter(|text| !text.is_empty() && *text != last_result), |view, text| view.child(row("Last scheduled result", text)))
                         .child(row("Approval", approval_text(status.approval.state.as_deref(), status.approval.live)))
-                        .child(row("Scheduled job", job_text(&plain_value(&status.schedule["job"]))))
+                        .child(row("Scheduled job", {
+                            let raw = plain_value(&status.schedule["job"]);
+                            div().flex().items_center().gap_3().child(job_text(&raw))
+                                .when(job_needs_install(&raw), |value| value.child(Button::new("install-job").label("Install job").small().disabled(self.busy)
+                                    .on_click(cx.listener(|this, _, _, cx| this.run(Operation::Schedule(true), cx)))))
+                        }))
                         .child(row("What is checked", div().flex().flex_col().items_end().gap_1()
                             .child(div().flex().items_center().gap_2().child("Signed by you").when_some(signed, |line, hash| line.child(hash_chip(&hash))))
                             .when_some(agreement, |col, text| col.child(note(text))))));
@@ -385,7 +409,9 @@ impl AppView {
                 view.child(div().flex().gap_1()
                         .child(self.button("refresh", "Refresh status", |_, _| Operation::Status, false, cx).ghost().small())
                         .child(self.button("changes", "Review changes", |_, _| Operation::Changes, false, cx).ghost().small()))
-                    .child(column().gap_1().child(runs("opening runs", "open-pact-client status --online --json")).child(runs("Check now runs", "open-pact-client check --json")))
+                    .child(column().gap_1().child(runs("opening runs", "open-pact-client status --online --json")).child(runs("Check now runs", "open-pact-client check --json"))
+                        .when(installable, |view| view.child(runs("Install job runs", "open-pact-client schedule on"))))
+                    .max_w(px(860.))
             }
             Screen::Changed(changes) => {
                 let mut list = table();
@@ -543,6 +569,12 @@ fn snapshots(output: PathBuf) {
     let denied: Check =
         serde_json::from_str(include_str!("../../../tests/fixtures/check-denied.json")).unwrap();
     let denied_status = status.clone();
+    let needs: Status = serde_json::from_str(include_str!(
+        "../../../tests/fixtures/status-needs-action.json"
+    ))
+    .unwrap();
+    let vpn_only: Status =
+        serde_json::from_str(include_str!("../../../tests/fixtures/status-vpn-only.json")).unwrap();
     let mut revoked = status.clone();
     revoked.approval.state = Some("revoked".into());
     for (name, screen) in [
@@ -577,25 +609,39 @@ fn snapshots(output: PathBuf) {
         ("client-6-changed", Screen::Changed(changes)),
         ("client-7-revoked", Screen::Status(Box::new(revoked))),
         ("client-8-denied", Screen::Status(Box::new(denied_status))),
+        ("client-9-actions", Screen::Status(Box::new(needs))),
+        ("client-a-vpn-only", Screen::Status(Box::new(vpn_only))),
     ] {
-        snapshot(&output, name, 520., 740., |window, cx| {
-            cx.new(|cx| {
-                let mut app = AppView::new(
-                    screen,
-                    Client {
-                        runner: Runner::default(),
-                        executable: "open-pact-client".into(),
-                    },
-                    "open-pact-client".into(),
-                    window,
-                    cx,
-                );
-                if name == "client-8-denied" {
-                    app.last_check = Some(denied.clone());
-                    app.all_controls = true;
-                }
-                app
-            })
-        });
+        let width = if matches!(name, "client-9-actions" | "client-a-vpn-only") {
+            1100.
+        } else {
+            520.
+        };
+        snapshot(
+            &output,
+            name,
+            width,
+            if width > 600. { 980. } else { 740. },
+            |window, cx| {
+                cx.new(|cx| {
+                    let mut app = AppView::new(
+                        screen,
+                        Client {
+                            runner: Runner::default(),
+                            executable: "open-pact-client".into(),
+                        },
+                        "open-pact-client".into(),
+                        window,
+                        cx,
+                    );
+                    app.clock = Some("2026-11-16T15:00:00Z".into());
+                    if name == "client-8-denied" {
+                        app.last_check = Some(denied.clone());
+                        app.all_controls = true;
+                    }
+                    app
+                })
+            },
+        );
     }
 }

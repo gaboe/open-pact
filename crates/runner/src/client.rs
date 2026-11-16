@@ -208,6 +208,18 @@ impl Client {
     }
 }
 
+/// The join resumes when IT approves a device while the app is closed. A saved "pending" or a
+/// live "approved" with no claim yet means the wizard steps for the first claim are still open.
+/// Returns the automatic-sending choice to resume with.
+pub fn resume_join(status: &Status) -> Option<bool> {
+    let open = match status.approval.state.as_deref() {
+        Some("pending") => true,
+        Some("approved") => status.last_claim.is_none(),
+        _ => false,
+    };
+    open.then(|| status.schedule["owner_consented"] == true)
+}
+
 pub fn cli_name() -> &'static str {
     if cfg!(windows) {
         "open-pact-client.exe"

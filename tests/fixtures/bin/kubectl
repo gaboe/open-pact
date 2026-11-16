@@ -6,6 +6,12 @@ if ! test -f "$state"; then state="$fixtures/manifest.toml"; fi
 hash() { shasum -a 256 "$1" | cut -d ' ' -f 1; }
 applied() { printf '{"version":3,"manifest_hash":"sha256:%s","previous_hash":"sha256:%s"}\n' "$(hash "$fixtures/state.toml")" "$1"; }
 case "$*" in
+  'config get-contexts -o name') printf '%s\n' test-cluster staging-cluster locked-cluster ;;
+  'config current-context') printf '%s\n' staging-cluster ;;
+  'get namespaces -o name --context test-cluster') printf '%s\n' namespace/default namespace/kube-system namespace/open-pact ;;
+  'get namespaces -o name --context staging-cluster') printf '%s\n' namespace/default namespace/team-a ;;
+  'get namespaces -o name --context empty-cluster') ;;
+  'get namespaces -o name --context locked-cluster') printf '%s\n' 'Error from server (Forbidden): namespaces is forbidden: User "fictional-user" cannot list resource "namespaces" in API group "" at the cluster scope' >&2; exit 1 ;;
   *'manifest history --json') cat "$fixtures/history.json" ;;
   *'manifest get --version 1') cat "$fixtures/manifest.toml" ;;
   *'manifest get --version 2') cat "$fixtures/manifest-v2.toml" ;;

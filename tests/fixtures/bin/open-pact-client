@@ -3,7 +3,7 @@ set -eu
 fixtures=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 case "$*" in
   --version) printf '%s\n' 'open-pact-client 0.6.0' ;;
-  'status --online --json') cat "$fixtures/status.json"; exit 2 ;;
+  'status --online --json') if test -f "$fixtures/approved-no-claim"; then cat "$fixtures/status-approved-no-claim.json"; exit 1; fi; cat "$fixtures/status.json"; exit 2 ;;
   'join --preview -- opi1:expired') printf '%s\n' '{"error":"This invitation expired on 14 Nov. Ask IT for a new one."}'; exit 1 ;;
   'join --preview -- opi1:mismatch') cat "$fixtures/preview-mismatch.json"; exit 1 ;;
   'join --preview -- '*) cat "$fixtures/preview.json" ;;

@@ -227,14 +227,13 @@ fn failed_commands_keep_errors_and_never_interpret_shell_input() {
 #[test]
 fn local_backups_keep_the_exact_toml_bytes() {
     let temp = tempfile::tempdir().unwrap();
-    let settings = Settings {
-        backup_dir: temp.path().into(),
-        ..Settings::default()
-    };
-    let admin = runner::admin::Admin::new(runner::Runner::default(), settings);
+    let mut admin = runner::admin::Admin::new(runner::Runner::default(), Settings::default());
+    admin.backup_root = temp.path().into();
+    let folder = admin.backup_dir();
+    std::fs::create_dir_all(&folder).unwrap();
     let text = "name = \"Fictional\"";
-    std::fs::write(temp.path().join("example.toml"), text).unwrap();
-    std::fs::write(temp.path().join("ignore.txt"), "ignored").unwrap();
+    std::fs::write(folder.join("example.toml"), text).unwrap();
+    std::fs::write(folder.join("ignore.txt"), "ignored").unwrap();
     let backups = admin.backups().unwrap();
     assert_eq!(backups.len(), 1);
     assert_eq!(backups[0].manifest_hash, runner::admin::hash(text));
@@ -269,10 +268,10 @@ fn isolated_admin() -> (tempfile::TempDir, Admin) {
         Settings {
             context: "test-cluster".into(),
             namespace: "open-pact".into(),
-            backup_dir: temp.path().join("backups"),
             ..Settings::default()
         },
     );
+    admin.backup_root = temp.path().join("backups");
     admin.kubectl = fixtures.join("bin/kubectl");
     (temp, admin)
 }
@@ -352,7 +351,7 @@ fn apply_and_both_restore_paths_backup_before_writing_and_confirm_the_hash() {
         hash(&active)
     );
     let local = active.replace("min = 10", "min = 14");
-    let path = admin.settings.backup_dir.join("older-local.toml");
+    let path = admin.backup_dir().join("older-local.toml");
     std::fs::write(&path, &local).unwrap();
     let backup = runner::admin::Backup {
         path,
@@ -557,11 +556,19 @@ fn login_shell_path_is_read_once_with_a_time_limit() {
         None
     );
     let joined = compose_path(Some("/a:/b".into()), Some("/b:/c".into()));
-    assert_eq!(joined, OsString::from("/a:/b:/c"));
+    assert_eq!(
+        joined,
+        OsString::from("/a:/b:/c:/opt/homebrew/bin:/usr/local/bin")
+    );
     let fallback = compose_path(None, Some("/usr/bin".into()));
     assert_eq!(
         fallback,
         OsString::from("/usr/bin:/opt/homebrew/bin:/usr/local/bin")
+    );
+    // The Homebrew directories are added to a login PATH that lacks them, and never twice.
+    assert_eq!(
+        compose_path(Some("/usr/local/bin:/a".into()), None),
+        OsString::from("/usr/local/bin:/a:/opt/homebrew/bin")
     );
 }
 
@@ -605,11 +612,20 @@ fn default_backup_folder_has_one_folder_per_cluster_and_namespace() {
     let two = settings("other", "open-pact").backup_folder();
     assert_ne!(one, two);
     assert!(one.ends_with("open-pact-admin/backups/arn_aws_eks_eu_prod/open-pact"));
-    let chosen = Settings {
-        backup_dir: "/fictional/chosen".into(),
-        ..settings("x", "y")
-    };
-    assert_eq!(chosen.backup_folder(), PathBuf::from("/fictional/chosen"));
+    assert_eq!(
+        one,
+        Settings::backup_root().join("arn_aws_eks_eu_prod/open-pact")
+    );
+    assert_eq!(
+        settings("x", "y").backup_folder_in(&PathBuf::from("/fictional/root")),
+        PathBuf::from("/fictional/root/x/y")
+    );
+    // A settings file from an older version may still name a folder. It is ignored.
+    let old: Settings = serde_json::from_str(
+        r#"{"context":"x","namespace":"y","backup_dir":"/fictional/chosen","kubectl":""}"#,
+    )
+    .unwrap();
+    assert_eq!(old.backup_folder(), settings("x", "y").backup_folder());
     assert_eq!(
         settings("x", "y").kubectl_program(),
         PathBuf::from("kubectl")
@@ -763,4 +779,172 @@ fn backups_are_written_through_a_temporary_file() {
         .filter(|entry| entry.file_name().to_string_lossy().ends_with(".part"))
         .count();
     assert_eq!(partial, 1);
+}
+
+#[test]
+#[cfg(unix)]
+fn the_cluster_dropdown_lists_kubectl_contexts_and_preselects_saved_then_current() {
+    use runner::admin::{current_context, list_contexts, pick_context};
+    let runner = Runner::default();
+    let kubectl = fixture("bin/kubectl");
+    let contexts = list_contexts(&runner, &kubectl).unwrap();
+    assert_eq!(
+        contexts,
+        ["test-cluster", "staging-cluster", "locked-cluster"]
+    );
+    let current = current_context(&runner, &kubectl);
+    assert_eq!(current.as_deref(), Some("staging-cluster"));
+    assert_eq!(
+        pick_context("test-cluster", &contexts, current.as_deref()).as_deref(),
+        Some("test-cluster")
+    );
+    assert_eq!(
+        pick_context("", &contexts, current.as_deref()).as_deref(),
+        Some("staging-cluster")
+    );
+    assert_eq!(
+        pick_context("gone-cluster", &contexts, current.as_deref()).as_deref(),
+        Some("staging-cluster")
+    );
+    assert_eq!(pick_context("", &contexts, Some("not-listed")), None);
+    let logs = runner.logs();
+    assert_eq!(logs[0].args, ["config", "get-contexts", "-o", "name"]);
+    assert_eq!(logs[1].args, ["config", "current-context"]);
+}
+
+#[test]
+fn the_namespace_dropdown_prefers_saved_then_open_pact_then_the_first() {
+    use runner::admin::pick_namespace;
+    let list = |names: &[&str]| {
+        names
+            .iter()
+            .map(|name| name.to_string())
+            .collect::<Vec<_>>()
+    };
+    let with = list(&["default", "open-pact", "team-a"]);
+    assert_eq!(pick_namespace("team-a", &with).as_deref(), Some("team-a"));
+    assert_eq!(pick_namespace("", &with).as_deref(), Some("open-pact"));
+    assert_eq!(pick_namespace("gone", &with).as_deref(), Some("open-pact"));
+    let without = list(&["default", "team-a"]);
+    assert_eq!(pick_namespace("", &without).as_deref(), Some("default"));
+    assert_eq!(pick_namespace("", &[]), None);
+}
+
+#[test]
+#[cfg(unix)]
+fn changing_the_cluster_lists_the_namespaces_of_that_cluster() {
+    use runner::admin::list_namespaces;
+    let runner = Runner::default();
+    let kubectl = fixture("bin/kubectl");
+    assert_eq!(
+        list_namespaces(&runner, &kubectl, "test-cluster").unwrap(),
+        ["default", "kube-system", "open-pact"]
+    );
+    assert_eq!(
+        list_namespaces(&runner, &kubectl, "staging-cluster").unwrap(),
+        ["default", "team-a"]
+    );
+    let logs = runner.logs();
+    assert_eq!(
+        logs[0].args,
+        [
+            "get",
+            "namespaces",
+            "-o",
+            "name",
+            "--context",
+            "test-cluster"
+        ]
+    );
+    assert_eq!(
+        logs[1].args,
+        [
+            "get",
+            "namespaces",
+            "-o",
+            "name",
+            "--context",
+            "staging-cluster"
+        ]
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn a_namespace_list_that_fails_gives_one_short_kubectl_line() {
+    use runner::admin::{list_namespaces, short_error};
+    let runner = Runner::default();
+    let kubectl = fixture("bin/kubectl");
+    let error = list_namespaces(&runner, &kubectl, "locked-cluster").unwrap_err();
+    assert!(error.contains("Forbidden"));
+    let line = short_error(&error);
+    assert!(!line.contains('\n'));
+    assert!(line.starts_with("Error from server (Forbidden)"));
+    assert!(line.chars().count() <= 140);
+    let empty = list_namespaces(&runner, &kubectl, "empty-cluster").unwrap_err();
+    assert_eq!(empty, "kubectl returned no namespaces.");
+    assert_eq!(
+        short_error("error: You must be logged in\nmore"),
+        "You must be logged in"
+    );
+    assert_eq!(short_error(&"x".repeat(300)).chars().count(), 140);
+}
+
+#[test]
+#[cfg(unix)]
+fn an_approval_that_came_while_the_app_was_closed_resumes_the_join() {
+    use runner::client::resume_join;
+    let (_temp, fixtures, client) = isolated_client();
+    // The saved state is approved and a claim exists: nothing to resume.
+    assert_eq!(resume_join(&client.status().unwrap()), None);
+    // IT approved while the app was closed: the live state is approved and there is no claim yet.
+    std::fs::write(fixtures.join("approved-no-claim"), "").unwrap();
+    let status = client.status().unwrap();
+    assert_eq!(status.approval.state.as_deref(), Some("approved"));
+    assert!(status.approval.live && status.last_claim.is_none());
+    assert_eq!(resume_join(&status), Some(true));
+    let mut pending = status.clone();
+    pending.approval.state = Some("pending".into());
+    pending.last_claim = Some(serde_json::json!({}));
+    assert_eq!(resume_join(&pending), Some(true));
+    let mut revoked = status;
+    revoked.approval.state = Some("revoked".into());
+    assert_eq!(resume_join(&revoked), None);
+    // The resumed join has no invitation.
+    client.join("", &[], true, |_| {}).unwrap();
+    assert_eq!(
+        client.runner.logs().last().unwrap().args,
+        ["join", "--yes", "--json", "--auto-send", "on"]
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn a_write_timeout_still_names_the_manifest_that_was_replaced() {
+    use runner::admin::hash;
+    let (temp, admin) = isolated_admin();
+    let active = admin.manifest(None).unwrap();
+    let other = active.replace("min = 10", "min = 99");
+    std::fs::write(temp.path().join("fixtures/race.toml"), &other).unwrap();
+    let error = admin
+        .apply(
+            &active.replace("min = 10", "min = 12"),
+            "Fictional change",
+            &hash(&active),
+            std::time::Duration::ZERO,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("unconfirmed"));
+    assert!(error.contains(&hash(&other)));
+    let after =
+        runner::admin::WriteError::AfterWrite("The manifest was saved, then replaced.".into());
+    assert!(!after.to_string().contains("unconfirmed"));
+}
+
+#[test]
+#[cfg(feature = "desktop")]
+fn closing_the_last_window_quits_both_apps() {
+    use gpui::QuitMode;
+    assert_eq!(runner::desktop::QUIT_MODE, QuitMode::LastWindowClosed);
 }

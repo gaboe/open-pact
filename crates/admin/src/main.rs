@@ -6,6 +6,7 @@ use gpui_component::{
     button::{Button, ButtonVariants},
     checkbox::Checkbox,
     input::{Input, InputEvent, InputState, Textarea, TextareaState},
+    select::{Select, SelectEvent, SelectState},
 };
 use runner::{
     Runner,
@@ -66,11 +67,42 @@ enum Outcome {
     Invitation(Invitation),
 }
 
+/// What kubectl answered for a list on the setup screen.
+#[derive(Clone)]
+enum Listing {
+    Loading,
+    /// Nothing to ask yet, for example no cluster is chosen.
+    Idle,
+    Listed(Vec<String>),
+    Failed(String),
+}
+
+impl Listing {
+    fn items(&self) -> Option<&Vec<String>> {
+        match self {
+            Self::Listed(list) if !list.is_empty() => Some(list),
+            _ => None,
+        }
+    }
+}
+
+type Choice = Entity<SelectState<Vec<SharedString>>>;
+
 struct AppView {
     admin: Admin,
     screen: Screen,
     dialog: Option<Dialog>,
-    setup: Vec<Entity<InputState>>,
+    cluster: Choice,
+    cluster_text: Entity<InputState>,
+    namespace: Choice,
+    namespace_text: Entity<InputState>,
+    kubectl_input: Entity<InputState>,
+    contexts: Listing,
+    namespaces: Listing,
+    /// Counts kubectl list requests, so a late answer for an old cluster is dropped.
+    generation: u64,
+    kubectl_loaded: String,
+    setup_subscriptions: Vec<Subscription>,
     draft: String,
     editor: Entity<TextareaState>,
     fields: Vec<(Field, Entity<InputState>)>,
@@ -94,24 +126,49 @@ struct AppView {
 
 impl AppView {
     fn new(settings: Settings, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let setup = [
-            (settings.context.clone(), ""),
-            (settings.namespace.clone(), ""),
-            (
-                settings.backup_dir.display().to_string(),
-                "Empty uses a folder for this cluster and namespace",
-            ),
-            (settings.kubectl.clone(), "Empty searches PATH"),
-        ]
-        .into_iter()
-        .map(|(value, hint)| {
-            cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder(hint)
-                    .default_value(value)
+        let cluster = cx.new(|cx| SelectState::new(Vec::<SharedString>::new(), None, window, cx));
+        let namespace = cx.new(|cx| SelectState::new(Vec::<SharedString>::new(), None, window, cx));
+        let cluster_text = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Cluster name")
+                .default_value(settings.context.clone())
+        });
+        let namespace_text = cx.new(|cx| {
+            InputState::new(window, cx).default_value(if settings.namespace.trim().is_empty() {
+                "open-pact".to_owned()
+            } else {
+                settings.namespace.clone()
             })
-        })
-        .collect();
+        });
+        let kubectl_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Empty searches PATH")
+                .default_value(settings.kubectl.clone())
+        });
+        let setup_subscriptions = vec![
+            cx.subscribe_in(
+                &cluster,
+                window,
+                |this, _, event: &SelectEvent<Vec<SharedString>>, window, cx| {
+                    let SelectEvent::Confirm(Some(context)) = event else {
+                        return;
+                    };
+                    this.load_namespaces(context.to_string(), window, cx);
+                },
+            ),
+            cx.subscribe_in(
+                &kubectl_input,
+                window,
+                |this, input, event: &InputEvent, window, cx| {
+                    if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. })
+                        && input.read(cx).value().as_ref() != this.kubectl_loaded
+                    {
+                        this.load_contexts(window, cx);
+                    }
+                },
+            ),
+        ];
+        let kubectl_loaded = settings.kubectl.clone();
         let editor = cx.new(|cx| TextareaState::new(window, cx).rows(18));
         let editor_subscription = cx.subscribe(&editor, |this, state, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
@@ -123,7 +180,16 @@ impl AppView {
             admin: Admin::new(Runner::default(), settings),
             screen: Screen::Setup,
             dialog: None,
-            setup,
+            cluster,
+            cluster_text,
+            namespace,
+            namespace_text,
+            kubectl_input,
+            contexts: Listing::Idle,
+            namespaces: Listing::Idle,
+            generation: 0,
+            kubectl_loaded,
+            setup_subscriptions,
             draft: String::new(),
             editor,
             fields: Vec::new(),
@@ -144,6 +210,150 @@ impl AppView {
                 .new(|cx| InputState::new(window, cx).default_value("Update open-pact manifest")),
             invitation_note: cx.new(|cx| InputState::new(window, cx).placeholder("Note for you")),
             ttl: "72h".into(),
+        }
+    }
+
+    /// The kubectl program from the field, as saved settings would use it.
+    fn kubectl_program(&self, cx: &App) -> std::path::PathBuf {
+        Settings {
+            kubectl: self.kubectl_input.read(cx).value().to_string(),
+            ..Settings::default()
+        }
+        .kubectl_program()
+    }
+
+    /// Asks kubectl for the clusters, then for the namespaces of the one that is selected.
+    fn load_contexts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.generation += 1;
+        let generation = self.generation;
+        self.contexts = Listing::Loading;
+        self.namespaces = Listing::Idle;
+        self.kubectl_loaded = self.kubectl_input.read(cx).value().to_string();
+        let runner = self.admin.runner.clone();
+        let kubectl = self.kubectl_program(cx);
+        let saved = self.admin.settings.context.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let contexts = admin::list_contexts(&runner, &kubectl)?;
+                    let current = if contexts.is_empty() {
+                        None
+                    } else {
+                        admin::current_context(&runner, &kubectl)
+                    };
+                    Ok::<_, String>((contexts, current))
+                })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                if this.generation != generation {
+                    return;
+                }
+                match result {
+                    Ok((contexts, current)) if !contexts.is_empty() => {
+                        let picked = admin::pick_context(&saved, &contexts, current.as_deref());
+                        this.show_contexts(contexts, picked.clone(), window, cx);
+                        if let Some(context) = picked {
+                            this.load_namespaces(context, window, cx);
+                        }
+                    }
+                    Ok(_) => this.contexts = Listing::Listed(Vec::new()),
+                    Err(error) => this.contexts = Listing::Failed(error),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Asks kubectl for the namespaces of one cluster. The text field stays when kubectl cannot list.
+    fn load_namespaces(&mut self, context: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.generation += 1;
+        let generation = self.generation;
+        self.namespaces = Listing::Loading;
+        let runner = self.admin.runner.clone();
+        let kubectl = self.kubectl_program(cx);
+        let saved = self.admin.settings.namespace.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { admin::list_namespaces(&runner, &kubectl, &context) })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                if this.generation != generation {
+                    return;
+                }
+                match result {
+                    Ok(list) => this.show_namespaces(list, &saved, window, cx),
+                    Err(error) => this.namespaces = Listing::Failed(error),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn show_contexts(
+        &mut self,
+        contexts: Vec<String>,
+        picked: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let items: Vec<SharedString> = contexts.iter().cloned().map(Into::into).collect();
+        self.cluster.update(cx, |state, cx| {
+            state.set_items(items, window, cx);
+            match picked {
+                Some(name) => state.set_selected_value(&SharedString::from(name), window, cx),
+                None => state.set_selected_index(None, window, cx),
+            }
+        });
+        self.contexts = Listing::Listed(contexts);
+    }
+
+    fn show_namespaces(
+        &mut self,
+        namespaces: Vec<String>,
+        saved: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let picked = admin::pick_namespace(saved, &namespaces);
+        let items: Vec<SharedString> = namespaces.iter().cloned().map(Into::into).collect();
+        self.namespace.update(cx, |state, cx| {
+            state.set_items(items, window, cx);
+            match picked {
+                Some(name) => state.set_selected_value(&SharedString::from(name), window, cx),
+                None => state.set_selected_index(None, window, cx),
+            }
+        });
+        self.namespaces = Listing::Listed(namespaces);
+    }
+
+    /// The settings the user chose: the dropdown values, or the text fields when kubectl gave no list.
+    fn chosen(&self, cx: &App) -> Settings {
+        let text = |input: &Entity<InputState>| input.read(cx).value().trim().to_owned();
+        let selected = |choice: &Choice| {
+            choice
+                .read(cx)
+                .selected_value()
+                .map(ToString::to_string)
+                .unwrap_or_default()
+        };
+        Settings {
+            context: if self.contexts.items().is_some() {
+                selected(&self.cluster)
+            } else {
+                text(&self.cluster_text)
+            },
+            namespace: if self.namespaces.items().is_some() {
+                selected(&self.namespace)
+            } else {
+                text(&self.namespace_text)
+            },
+            kubectl: text(&self.kubectl_input),
         }
     }
 
@@ -229,8 +439,9 @@ impl AppView {
                     Ok(Overview { gateway: admin.gateway()?, devices: admin.devices()?, deployment: admin.deployment()? })
                 }
                 fn applied(admin: &Admin, written: Written) -> Result<Outcome, WriteError> {
-                    let active = admin.manifest(None).map_err(WriteError::Unknown)?;
-                    if admin::hash(&active) != written.hash { return Err(WriteError::Unknown("Another manifest became active after the write. Reload and review the current manifest.".into())); }
+                    // The gateway confirmed this write, so a failure from here on is not an unconfirmed write.
+                    let active = admin.manifest(None).map_err(|error| WriteError::AfterWrite(format!("The manifest was saved, but reloading it failed ({error}). Refresh before you continue.")))?;
+                    if admin::hash(&active) != written.hash { return Err(WriteError::AfterWrite("The manifest was saved, then another manifest became active. Reload and review the current manifest.".into())); }
                     // The write is confirmed. A failed history sync must not turn it into an unconfirmed write.
                     let (history, sync_problem) = match admin.sync() {
                         Ok(history) => (Some(history), None),
@@ -250,8 +461,8 @@ impl AppView {
                 }
                 match operation {
                     Operation::Setup(settings) => {
-                        if settings.context.trim().is_empty() || settings.namespace.trim().is_empty() || !settings.backup_folder().is_absolute() {
-                            return Err("Enter a kube context, namespace, and an absolute backup folder path (or leave it empty).".into());
+                        if settings.context.trim().is_empty() || settings.namespace.trim().is_empty() {
+                            return Err("Choose a cluster and a namespace.".into());
                         }
                         admin.use_settings(settings.clone());
                         let active = admin.manifest(None)?;
@@ -376,15 +587,95 @@ impl AppView {
     }
 
     fn setup_screen(&self, cx: &Context<Self>) -> Div {
-        column().max_w(px(640.)).gap(px(14.)).child(title("Where is your gateway?"))
+        let muted = |text: String| note(text).text_size(px(12.));
+        let cluster = match &self.contexts {
+            Listing::Listed(list) if !list.is_empty() => Select::new(&self.cluster)
+                .placeholder("Choose a cluster")
+                .into_any_element(),
+            Listing::Loading => muted("Reading kubectl contexts...".into()).into_any_element(),
+            _ => Input::new(&self.cluster_text).into_any_element(),
+        };
+        let cluster_line = match &self.contexts {
+            Listing::Listed(list) if list.is_empty() => {
+                Some("No kubectl contexts found. Log in to your cluster first.".to_owned())
+            }
+            Listing::Failed(error) => Some(admin::short_error(error)),
+            _ => None,
+        };
+        let namespace = match &self.namespaces {
+            Listing::Listed(list) if !list.is_empty() => Select::new(&self.namespace)
+                .placeholder("Choose a namespace")
+                .into_any_element(),
+            Listing::Loading => muted("Reading namespaces...".into()).into_any_element(),
+            _ => Input::new(&self.namespace_text).into_any_element(),
+        };
+        let namespace_line = match &self.namespaces {
+            Listing::Failed(error) => Some(admin::short_error(error)),
+            _ => None,
+        };
+        let open_label = if cfg!(target_os = "macos") {
+            "Open in Finder"
+        } else if cfg!(windows) {
+            "Open in Explorer"
+        } else {
+            "Open folder"
+        };
+        let mut view = column().max_w(px(640.)).gap(px(14.)).child(title("Where is your gateway?"))
             .child(div().text_color(rgb(INK_2)).child("The admin app uses your kubectl access. It saves a local backup before each manifest change and syncs the server history."))
-            .children(["Cluster", "Namespace", "Local backup folder", "kubectl path (optional)"].into_iter().enumerate().map(|(i, name)| column().gap_1p5().child(label(name)).child(Input::new(&self.setup[i]))))
-            .child(actions().child(Button::new("save").label("Save and open").primary().disabled(self.busy).on_click(cx.listener(|this, _, window, cx| {
-                let values: Vec<_> = this.setup.iter().map(|state| state.read(cx).value().to_string()).collect();
-                this.run(Operation::Setup(Settings { context: values[0].clone(), namespace: values[1].clone(), backup_dir: values[2].trim().into(), kubectl: values[3].trim().into() }), window, cx);
-            }))))
-            .child(runs("runs", "kubectl exec deploy/open-pact-gateway -- open-pact-gateway status --json"))
-            .child(runs("and", "kubectl exec deploy/open-pact-gateway -- open-pact-gateway manifest history --json"))
+            .child(column().gap_1p5().child(label("Cluster")).child(cluster).when_some(cluster_line, |field, line| field.child(muted(line))))
+            .child(column().gap_1p5().child(label("Namespace")).child(namespace).when_some(namespace_line, |field, line| field.child(muted(line))))
+            .child(column().gap_1p5().child(label("kubectl path (optional)")).child(Input::new(&self.kubectl_input)));
+        if self.overview.is_some() {
+            let folder = self.admin.backup_dir();
+            view = view.child(
+                column()
+                    .gap_1p5()
+                    .child(label("Local backup folder"))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .font_family(mono())
+                                    .text_size(px(12.))
+                                    .text_color(rgb(INK_2))
+                                    .child(folder.display().to_string()),
+                            )
+                            .child(
+                                Button::new("open-backup-folder")
+                                    .label(open_label)
+                                    .small()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if let Err(error) =
+                                            runner::open_folder(&this.admin.backup_dir())
+                                        {
+                                            this.error = Some(error);
+                                        }
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    .child(muted(
+                        "The app keeps backups here, one folder for each cluster and namespace."
+                            .into(),
+                    )),
+            );
+        }
+        view.child(actions()
+                .child(Button::new("reload-kube").label("Reload from kubectl").ghost().small().disabled(self.busy).on_click(cx.listener(|this, _, window, cx| this.load_contexts(window, cx))))
+                .child(Button::new("save").label("Save and open").primary().disabled(self.busy).on_click(cx.listener(|this, _, window, cx| {
+                    let settings = this.chosen(cx);
+                    this.run(Operation::Setup(settings), window, cx);
+                }))))
+            .child(column().gap_1()
+                .child(runs("lists clusters with", "kubectl config get-contexts -o name"))
+                .child(runs("and namespaces with", "kubectl get namespaces -o name --context <cluster>"))
+                .child(runs("saving runs", "kubectl exec deploy/open-pact-gateway -- open-pact-gateway status --json"))
+                .child(runs("and", "kubectl exec deploy/open-pact-gateway -- open-pact-gateway manifest history --json")))
     }
 
     fn overview_screen(&self, cx: &Context<Self>) -> Div {
@@ -1238,7 +1529,7 @@ fn tone_text(tone: Tone) -> u32 {
 
 impl Render for AppView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let _ = &self.editor_subscription;
+        let _ = (&self.editor_subscription, &self.setup_subscriptions);
         let content = match self.screen {
             Screen::Setup => self.setup_screen(cx),
             Screen::Overview => self.overview_screen(cx),
@@ -1372,6 +1663,7 @@ fn main() {
     launch("open-pact admin", 1040., 760., move |window, cx| {
         cx.new(|cx| {
             let mut app = AppView::new(settings.clone().unwrap_or_default(), window, cx);
+            app.load_contexts(window, cx);
             match settings {
                 Ok(settings) if !settings.context.is_empty() => {
                     app.run(Operation::Setup(settings), window, cx)
@@ -1388,6 +1680,9 @@ fn main() {
 fn snapshots(output: PathBuf) {
     for (name, screen, form, dialog) in [
         ("admin-setup", Screen::Setup, true, None),
+        ("admin-h-settings", Screen::Setup, true, None),
+        ("admin-i-setup-fallback", Screen::Setup, true, None),
+        ("admin-j-setup-no-contexts", Screen::Setup, true, None),
         ("admin-a-overview", Screen::Overview, true, None),
         ("admin-b-form", Screen::Manifest, true, None),
         ("admin-c-toml", Screen::Manifest, false, None),
@@ -1420,7 +1715,8 @@ fn snapshots(output: PathBuf) {
     ] {
         snapshot(&output, name, 1040., 800., |window, cx| {
             cx.new(|cx| {
-            let mut app = AppView::new(Settings { backup_dir: "/fictional/backups".into(), context: "test-cluster".into(), namespace: "open-pact".into(), ..Settings::default() }, window, cx);
+            let mut app = AppView::new(Settings { context: "test-cluster".into(), namespace: "open-pact".into(), ..Settings::default() }, window, cx);
+            app.admin.backup_root = "/fictional/backups".into();
             app.screen = screen; app.form = form; app.dialog = dialog;
             app.show_history = name == "admin-f-history";
                 app.active = include_str!("../../../tests/fixtures/manifest.toml").into();
@@ -1435,6 +1731,25 @@ fn snapshots(output: PathBuf) {
                 deployment: serde_json::json!({"status":{"conditions":[{"type":"Available","status":"True"}]}}),
             });
             app.history = Some(History { versions: serde_json::from_str(include_str!("../../../tests/fixtures/history.json")).unwrap(), backups: vec![admin::Backup { path: "/fictional/backups/20261116T100000Z-v1-example.toml".into(), manifest_hash: admin::hash(&app.active) }], synced_at: "2026-11-16T12:30:00Z".into(), warnings: if name == "admin-f-history" { vec!["Skipped backup 20261116T101500.000Z-0123456789ab.toml: its content does not match the hash in its name. Move it out of the folder and sync again.".into()] } else { Vec::new() } });
+            if matches!(name, "admin-setup" | "admin-h-settings" | "admin-i-setup-fallback" | "admin-j-setup-no-contexts") {
+                let clusters: Vec<String> = ["test-cluster", "staging-cluster", "prod-cluster"].map(String::from).into();
+                match name {
+                    "admin-j-setup-no-contexts" => app.contexts = Listing::Listed(Vec::new()),
+                    _ => {
+                        let picked = admin::pick_context(if name == "admin-setup" { "" } else { "test-cluster" }, &clusters, Some("staging-cluster"));
+                        app.show_contexts(clusters, picked, window, cx);
+                        if name == "admin-i-setup-fallback" {
+                            app.namespaces = Listing::Failed("Error from server (Forbidden): namespaces is forbidden: User \"fictional-user\" cannot list resource \"namespaces\" in API group \"\" at the cluster scope".into());
+                        } else {
+                            let namespaces: Vec<String> = ["default", "kube-system", "open-pact", "open-pact-staging"].map(String::from).into();
+                            app.show_namespaces(namespaces, "open-pact", window, cx);
+                        }
+                    }
+                }
+                if name == "admin-setup" || name == "admin-i-setup-fallback" || name == "admin-j-setup-no-contexts" {
+                    app.overview = None;
+                }
+            }
             app
         })
         });

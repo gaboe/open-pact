@@ -369,6 +369,11 @@ pub fn init(cx: &mut App) {
     });
 }
 
+/// Both apps hold no background work (the scheduled job is a separate OS task), so closing the
+/// last window ends the app. On macOS GPUI would otherwise keep it running with no window, and
+/// the Dock icon would not bring one back.
+pub const QUIT_MODE: QuitMode = QuitMode::LastWindowClosed;
+
 pub fn launch<V: Render + 'static>(
     name: &'static str,
     width: f32,
@@ -377,6 +382,7 @@ pub fn launch<V: Render + 'static>(
 ) {
     gpui_platform::application()
         .with_assets(gpui_kit_assets::Assets)
+        .with_quit_mode(QUIT_MODE)
         .run(move |cx| {
             init(cx);
             cx.open_window(

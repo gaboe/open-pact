@@ -2,7 +2,7 @@
 
 Optional desktop apps for [open-pact](https://github.com/gaboe/open-pact). `open-pact` joins a company, reviews manifests, and sends device checks. `open-pact-admin` edits deployment manifests and manages devices.
 
-The apps only run `open-pact-client` and `kubectl`. They never call the gateway or Kubernetes APIs directly. The Terminal strip at the bottom of each window opens to show each command, its input, output, and exit code.
+The apps only run `open-pact-client`, `kubectl`, and the OS folder opener (`open` or `explorer`, for the admin backup folder). They never call the gateway or Kubernetes APIs directly. The Terminal strip at the bottom of each window opens to show each command, its input, output, and exit code.
 
 ## Build the apps
 
@@ -14,7 +14,7 @@ cargo run -p open-pact-app
 cargo run -p open-pact-admin
 ```
 
-For an unbundled client build, put `open-pact-client` next to the app executable. At start, each app reads the login shell PATH once (`$SHELL -lc`, 5 second limit; Homebrew and `/usr/local/bin` are added when that fails), because an app started from Finder has only the short system PATH. Every child process gets that PATH. The client then compares CLI versions. A CLI on that PATH, or in the install folder, that is as new as the bundled one skips installation. With none, or only an older one, the app installs the bundled CLI to `~/.local/bin` on macOS or `%LOCALAPPDATA%\open-pact` on Windows.
+For an unbundled client build, put `open-pact-client` next to the app executable. At start, each app reads the login shell PATH once (`$SHELL -lc`, 5 second limit; `/opt/homebrew/bin` and `/usr/local/bin` are always added after it when missing), because an app started from Finder has only the short system PATH. Every child process gets that PATH. The client then compares CLI versions. A CLI on that PATH, or in the install folder, that is as new as the bundled one skips installation. With none, or only an older one, the app installs the bundled CLI to `~/.local/bin` on macOS or `%LOCALAPPDATA%\open-pact` on Windows.
 
 On macOS, make ad hoc signed bundles with the installed CLI.
 
@@ -26,7 +26,9 @@ The bundles appear in `dist`. The client bundle contains the CLI in `Contents/He
 
 ## Set up the admin app
 
-Install `kubectl`. Enter the cluster and namespace. Leave the kubectl path empty to search PATH, or enter the full path. Leave the local backup folder empty to use `open-pact-admin/backups/<cluster>/<namespace>` in the OS app data directory, or enter an absolute path. The app saves settings in the OS config directory under `open-pact-admin/settings.json`.
+Install `kubectl` and log in to your cluster. Pick the cluster from the dropdown that the app fills with `kubectl config get-contexts -o name`; it preselects the saved cluster, else `kubectl config current-context`. Pick the namespace from the dropdown that the app fills with `kubectl get namespaces -o name --context <cluster>` and reloads when the cluster changes; it preselects the saved namespace, else `open-pact`, else the first one. When kubectl cannot list namespaces (no right to, cluster unreachable, login needed), the app keeps a text field with `open-pact` and shows the kubectl error. With no contexts, both fields are text fields. Leave the kubectl path empty to search PATH, or enter the full path. These commands use the same PATH, timeout, and Terminal log as every other command.
+
+The app chooses the local backup folder: `open-pact-admin/backups/<cluster>/<namespace>` in the OS app data directory. Settings shows it read-only with an **Open in Finder** button (`open <folder>` on macOS, `explorer <folder>` on Windows). An old `backup_dir` entry in `settings.json` is ignored. The app saves settings in the OS config directory under `open-pact-admin/settings.json`.
 
 Form and TOML edit one text. Review shows the diff and commands before applying. Apply saves the active TOML locally, pipes the new TOML to `manifest set --note=<note> --json` through `kubectl exec -i`, and polls gateway status for up to 60 seconds. The gateway loads the stored manifest within 10 seconds, without a restart. Every kubectl call stops after 60 seconds. If another admin made a different manifest active after your review, the app says so and names its hash. That manifest stays in the server history.
 

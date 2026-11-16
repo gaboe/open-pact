@@ -75,17 +75,15 @@ pub fn login_path(shell: &Path, timeout: Duration) -> Option<OsString> {
     Some(line.into())
 }
 
-/// Login shell directories first, then the app's own PATH. Without a login PATH, the two usual
-/// Homebrew and Docker Desktop directories are added.
+/// Login shell directories first, then the app's own PATH, then the two usual Homebrew and
+/// Docker Desktop directories when they are missing. A login shell that skips `.zshrc` does not
+/// see tools that a user added there.
 pub fn compose_path(login: Option<OsString>, current: Option<OsString>) -> OsString {
     let mut directories: Vec<PathBuf> = Vec::new();
-    let fallback = login.is_none();
     for source in [login, current].into_iter().flatten() {
         directories.extend(std::env::split_paths(&source));
     }
-    if fallback {
-        directories.extend(["/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from));
-    }
+    directories.extend(["/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from));
     let mut unique: Vec<PathBuf> = Vec::new();
     for directory in directories {
         if !directory.as_os_str().is_empty() && !unique.contains(&directory) {
@@ -122,6 +120,31 @@ pub fn command(program: &Path) -> Command {
         command.creation_flags(0x0800_0000);
     }
     command
+}
+
+/// Opens a folder in the file manager (`open`, `explorer` or `xdg-open`) and does not wait for
+/// it. The folder is created first, because the file manager cannot open a missing one.
+pub fn open_folder(folder: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(folder).map_err(|e| e.to_string())?;
+    let program = if cfg!(windows) {
+        "explorer"
+    } else if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let mut child = command(Path::new(program))
+        .arg(folder)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("{program}: {e}"))?;
+    // Reap the child; explorer exits with code 1 even when it opened the folder.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
 }
 
 /// Quotes one word for a POSIX shell, so a shown command can be pasted back safely.

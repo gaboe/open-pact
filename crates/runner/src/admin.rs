@@ -11,8 +11,6 @@ use std::time::{Duration, Instant};
 pub struct Settings {
     pub context: String,
     pub namespace: String,
-    /// Empty means the default folder for this context and namespace.
-    pub backup_dir: PathBuf,
     /// Empty means search PATH for kubectl.
     #[serde(default)]
     pub kubectl: String,
@@ -23,7 +21,6 @@ impl Default for Settings {
         Self {
             context: String::new(),
             namespace: "open-pact".into(),
-            backup_dir: PathBuf::new(),
             kubectl: String::new(),
         }
     }
@@ -49,17 +46,22 @@ fn folder_name(text: &str) -> String {
 }
 
 impl Settings {
-    /// The chosen backup folder, or one folder per context and namespace so that backups of
-    /// another cluster are never offered for restore.
-    pub fn backup_folder(&self) -> PathBuf {
-        if !self.backup_dir.as_os_str().is_empty() {
-            return self.backup_dir.clone();
-        }
+    /// The folder that holds the backups of every cluster. The user never chooses it.
+    pub fn backup_root() -> PathBuf {
         dirs::data_local_dir()
             .unwrap_or_default()
             .join("open-pact-admin/backups")
-            .join(folder_name(&self.context))
+    }
+
+    /// One folder per context and namespace under `root`, so that backups of another cluster
+    /// are never offered for restore.
+    pub fn backup_folder_in(&self, root: &Path) -> PathBuf {
+        root.join(folder_name(&self.context))
             .join(folder_name(&self.namespace))
+    }
+
+    pub fn backup_folder(&self) -> PathBuf {
+        self.backup_folder_in(&Self::backup_root())
     }
 
     pub fn kubectl_program(&self) -> PathBuf {
@@ -183,6 +185,8 @@ pub enum WriteError {
     Refused(String),
     /// The gateway may or may not have stored the manifest.
     Unknown(String),
+    /// The gateway confirmed the write. A later step failed or found another manifest.
+    AfterWrite(String),
 }
 
 fn sentence(text: &str) -> String {
@@ -198,6 +202,7 @@ impl fmt::Display for WriteError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Refused(message) => write!(f, "{} Nothing was written.", sentence(message)),
+            Self::AfterWrite(message) => f.write_str(message),
             Self::Unknown(message) if message.contains("unconfirmed") => f.write_str(message),
             Self::Unknown(message) => {
                 write!(f, "{} The write outcome is unconfirmed.", sentence(message))
@@ -219,6 +224,90 @@ pub struct Admin {
     pub runner: Runner,
     pub settings: Settings,
     pub kubectl: PathBuf,
+    /// Tests point this at a temporary folder. The app always uses `Settings::backup_root()`.
+    pub backup_root: PathBuf,
+}
+
+/// Cluster names from `kubectl config get-contexts -o name`.
+pub fn list_contexts(runner: &Runner, kubectl: &Path) -> Result<Vec<String>, String> {
+    let output = runner.run(kubectl, &args(&["config", "get-contexts", "-o", "name"]))?;
+    Ok(output
+        .stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
+/// The context kubectl uses now, or `None` when none is set.
+pub fn current_context(runner: &Runner, kubectl: &Path) -> Option<String> {
+    let output = runner
+        .run(kubectl, &args(&["config", "current-context"]))
+        .ok()?;
+    let name = output.stdout.trim();
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
+/// Namespace names from `kubectl get namespaces -o name --context <context>`. A user without the
+/// right to list namespaces, or a cluster that does not answer, gets the kubectl error.
+pub fn list_namespaces(
+    runner: &Runner,
+    kubectl: &Path,
+    context: &str,
+) -> Result<Vec<String>, String> {
+    let output = runner.run(
+        kubectl,
+        &args(&["get", "namespaces", "-o", "name", "--context", context]),
+    )?;
+    let names: Vec<String> = output
+        .stdout
+        .lines()
+        .map(str::trim)
+        .map(|line| line.strip_prefix("namespace/").unwrap_or(line))
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if names.is_empty() {
+        Err("kubectl returned no namespaces.".into())
+    } else {
+        Ok(names)
+    }
+}
+
+/// The saved cluster when kubectl still has it, else the current context when it is listed.
+pub fn pick_context(saved: &str, contexts: &[String], current: Option<&str>) -> Option<String> {
+    let listed = |name: &str| contexts.iter().any(|context| context == name);
+    if listed(saved) {
+        return Some(saved.into());
+    }
+    current.filter(|name| listed(name)).map(str::to_owned)
+}
+
+/// The saved namespace, else "open-pact", else the first one.
+pub fn pick_namespace(saved: &str, namespaces: &[String]) -> Option<String> {
+    let listed = |name: &str| namespaces.iter().any(|namespace| namespace == name);
+    [saved, "open-pact"]
+        .into_iter()
+        .find(|name| listed(name))
+        .map(str::to_owned)
+        .or_else(|| namespaces.first().cloned())
+}
+
+/// The first line of a kubectl error, short enough for one muted line.
+pub fn short_error(error: &str) -> String {
+    let line = error
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("kubectl failed.");
+    let line = line.strip_prefix("error: ").unwrap_or(line);
+    if line.chars().count() > 140 {
+        let cut: String = line.chars().take(137).collect();
+        format!("{cut}...")
+    } else {
+        line.into()
+    }
 }
 
 pub fn hash(text: &str) -> String {
@@ -264,7 +353,7 @@ fn save_backup(directory: &Path, filename: &str, text: &str) -> Result<PathBuf, 
             }
             if std::fs::read_to_string(&path).map_err(|e| e.to_string())? != text {
                 return Err(format!(
-                    "Backup {} differs from the server. Choose a new backup folder.",
+                    "Backup {} differs from the server. Move it out of the folder and sync again.",
                     path.display()
                 ));
             }
@@ -305,6 +394,7 @@ impl Admin {
             runner: runner.with_timeout(Duration::from_secs(60)),
             kubectl: settings.kubectl_program(),
             settings,
+            backup_root: Settings::backup_root(),
         }
     }
 
@@ -314,7 +404,7 @@ impl Admin {
     }
 
     pub fn backup_dir(&self) -> PathBuf {
-        self.settings.backup_folder()
+        self.settings.backup_folder_in(&self.backup_root)
     }
 
     pub fn kube_args(&self, words: &[&str]) -> Vec<String> {
@@ -555,8 +645,18 @@ impl Admin {
             .previous_hash
             .filter(|previous| previous != reviewed_hash);
         self.wait_for(expected, timeout)
-            .map(|hash| Written { hash, overwritten })
-            .map_err(WriteError::Unknown)
+            .map(|hash| Written {
+                hash,
+                overwritten: overwritten.clone(),
+            })
+            .map_err(|error| {
+                WriteError::Unknown(match overwritten {
+                    Some(previous) => format!(
+                        "{error} Another admin's manifest {previous} was active before this write and may be replaced. It stays in the server history."
+                    ),
+                    None => error,
+                })
+            })
     }
 
     pub fn apply(
