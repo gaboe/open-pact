@@ -18,19 +18,71 @@ pub enum Fetch<T> {
     Failed(String),
 }
 
-pub struct ResultsView {
+/// What the Results screen holds for one gateway. It has no window or entity, so a test can drive it.
+pub struct ResultsState {
     pub filters: Filters,
     pub list: Fetch<ClaimList>,
     /// The command the list ran, shown quietly under the table.
     pub command: String,
     pub selected: Option<u64>,
     pub detail: Fetch<ClaimDetail>,
+    list_generation: u64,
+    detail_generation: u64,
+}
+
+impl Default for ResultsState {
+    fn default() -> Self {
+        Self {
+            filters: Filters::default(),
+            list: Fetch::Idle,
+            command: String::new(),
+            selected: None,
+            detail: Fetch::Idle,
+            list_generation: 0,
+            detail_generation: 0,
+        }
+    }
+}
+
+impl ResultsState {
+    /// Starts a list read. Only the reply of the newest read is kept.
+    fn next_list_generation(&mut self) -> u64 {
+        self.list_generation += 1;
+        self.list_generation
+    }
+
+    fn next_detail_generation(&mut self) -> u64 {
+        self.detail_generation += 1;
+        self.detail_generation
+    }
+
+    fn list_is_current(&self, generation: u64) -> bool {
+        self.list_generation == generation
+    }
+
+    fn detail_is_current(&self, generation: u64) -> bool {
+        self.detail_generation == generation
+    }
+
+    /// Drops everything that belongs to the gateway the screen read. Its replies still on the way are ignored.
+    /// The result and period filters stay.
+    pub fn forget_gateway(&mut self) {
+        self.filters.device = None;
+        self.list = Fetch::Idle;
+        self.command.clear();
+        self.selected = None;
+        self.detail = Fetch::Idle;
+        self.next_list_generation();
+        self.next_detail_generation();
+    }
+}
+
+pub struct ResultsView {
+    pub state: ResultsState,
     pub device: Choice,
     pub period: Choice,
     /// The device menu: each label and the device code it stands for. The first is "All devices".
     pub devices: Vec<(SharedString, Option<String>)>,
-    list_generation: u64,
-    detail_generation: u64,
     pub subscriptions: Vec<Subscription>,
 }
 
@@ -57,7 +109,7 @@ impl ResultsView {
                     else {
                         return;
                     };
-                    let mut filters = this.results.filters.clone();
+                    let mut filters = this.results.state.filters.clone();
                     filters.device = code.clone();
                     this.apply_filters(filters, window, cx);
                 },
@@ -75,23 +127,17 @@ impl ResultsView {
                     else {
                         return;
                     };
-                    let mut filters = this.results.filters.clone();
+                    let mut filters = this.results.state.filters.clone();
                     filters.period = period;
                     this.apply_filters(filters, window, cx);
                 },
             ),
         ];
         Self {
-            filters: Filters::default(),
-            list: Fetch::Idle,
-            command: String::new(),
-            selected: None,
-            detail: Fetch::Idle,
+            state: ResultsState::default(),
             device,
             period,
             devices: vec![(ALL_DEVICES.into(), None)],
-            list_generation: 0,
-            detail_generation: 0,
             subscriptions,
         }
     }
@@ -119,7 +165,7 @@ impl AppView {
                 devices.push((device_label(device).into(), Some(device.code.clone())));
             }
         }
-        if let Some(code) = &self.results.filters.device
+        if let Some(code) = &self.results.state.filters.device
             && !devices
                 .iter()
                 .any(|(_, known)| known.as_ref() == Some(code))
@@ -140,13 +186,13 @@ impl AppView {
             .results
             .devices
             .iter()
-            .find(|(_, code)| *code == self.results.filters.device)
+            .find(|(_, code)| *code == self.results.state.filters.device)
             .map(|(label, _)| label.clone());
         self.results.device.update(cx, |state, cx| match device {
             Some(label) => state.set_selected_value(&label, window, cx),
             None => state.set_selected_index(None, window, cx),
         });
-        let period: SharedString = self.results.filters.period.label().into();
+        let period: SharedString = self.results.state.filters.period.label().into();
         self.results.period.update(cx, |state, cx| {
             state.set_selected_value(&period, window, cx)
         });
@@ -166,32 +212,31 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.results.filters = Filters {
+        self.results.state.filters = Filters {
             device: Some(code),
             ..Filters::default()
         };
-        self.results.selected = None;
-        self.results.detail = Fetch::Idle;
+        self.results.state.selected = None;
+        self.results.state.detail = Fetch::Idle;
         self.open_results(window, cx);
     }
 
     /// Changes the filters and reads the list again. The same filters read nothing.
     pub fn apply_filters(&mut self, filters: Filters, window: &mut Window, cx: &mut Context<Self>) {
-        if filters == self.results.filters {
+        if filters == self.results.state.filters {
             return;
         }
-        self.results.filters = filters;
+        self.results.state.filters = filters;
         self.show_filter_choices(window, cx);
         self.reload_results(window, cx);
     }
 
     pub fn reload_results(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.results.list_generation += 1;
-        let generation = self.results.list_generation;
-        self.results.list = Fetch::Loading;
+        let generation = self.results.state.next_list_generation();
+        self.results.state.list = Fetch::Loading;
         let now = results::now();
-        let filters = self.results.filters.clone();
-        self.results.command = Admin::claims_command(&filters, now);
+        let filters = self.results.state.filters.clone();
+        self.results.state.command = Admin::claims_command(&filters, now);
         let admin = self.admin.clone();
         cx.spawn_in(window, async move |this, cx| {
             let result = cx
@@ -199,10 +244,10 @@ impl AppView {
                 .spawn(async move { admin.claims(&filters, now) })
                 .await;
             let _ = this.update_in(cx, |this, _, cx| {
-                if this.results.list_generation != generation {
+                if !this.results.state.list_is_current(generation) {
                     return;
                 }
-                this.results.list = match result {
+                this.results.state.list = match result {
                     Ok(list) => Fetch::Ready(list),
                     Err(error) => Fetch::Failed(error),
                 };
@@ -214,10 +259,9 @@ impl AppView {
     }
 
     pub fn open_claim(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
-        self.results.detail_generation += 1;
-        let generation = self.results.detail_generation;
-        self.results.selected = Some(id);
-        self.results.detail = Fetch::Loading;
+        let generation = self.results.state.next_detail_generation();
+        self.results.state.selected = Some(id);
+        self.results.state.detail = Fetch::Loading;
         let admin = self.admin.clone();
         cx.spawn_in(window, async move |this, cx| {
             let result = cx
@@ -225,10 +269,10 @@ impl AppView {
                 .spawn(async move { admin.claim(id) })
                 .await;
             let _ = this.update_in(cx, |this, _, cx| {
-                if this.results.detail_generation != generation {
+                if !this.results.state.detail_is_current(generation) {
                     return;
                 }
-                this.results.detail = match result {
+                this.results.state.detail = match result {
                     Ok(detail) => Fetch::Ready(detail),
                     Err(error) => Fetch::Failed(error),
                 };
@@ -240,10 +284,16 @@ impl AppView {
     }
 
     fn close_claim(&mut self, cx: &mut Context<Self>) {
-        self.results.detail_generation += 1;
-        self.results.selected = None;
-        self.results.detail = Fetch::Idle;
+        self.results.state.next_detail_generation();
+        self.results.state.selected = None;
+        self.results.state.detail = Fetch::Idle;
         cx.notify();
+    }
+
+    /// Clears the Results screen when a new connection is saved, so no panel shows another gateway's data.
+    pub fn forget_results_gateway(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.results.state.forget_gateway();
+        self.sync_result_devices(window, cx);
     }
 
     pub fn results_screen(&self, cx: &Context<Self>) -> Div {
@@ -253,13 +303,13 @@ impl AppView {
             .h_full()
             .min_w_0()
             .child(self.results_main(cx))
-            .when_some(self.results.selected, |screen, _| {
+            .when_some(self.results.state.selected, |screen, _| {
                 screen.child(self.result_panel(cx))
             })
     }
 
     fn results_main(&self, cx: &Context<Self>) -> Stateful<Div> {
-        let state = &self.results;
+        let state = &self.results.state;
         let loading = matches!(state.list, Fetch::Loading);
         let field = |name: &'static str, body: AnyElement| {
             column().gap_1p5().child(label(name)).child(body)
@@ -273,7 +323,7 @@ impl AppView {
                 "Device",
                 div()
                     .w(px(280.))
-                    .child(Select::new(&state.device).placeholder(ALL_DEVICES))
+                    .child(Select::new(&self.results.device).placeholder(ALL_DEVICES))
                     .into_any_element(),
             ))
             .child(field(
@@ -289,7 +339,7 @@ impl AppView {
                         )
                         .on_click(cx.listener(
                             move |this, _, window, cx| {
-                                let mut filters = this.results.filters.clone();
+                                let mut filters = this.results.state.filters.clone();
                                 filters.result = result;
                                 this.apply_filters(filters, window, cx);
                             },
@@ -302,7 +352,7 @@ impl AppView {
                 "Period",
                 div()
                     .w(px(150.))
-                    .child(Select::new(&state.period))
+                    .child(Select::new(&self.results.period))
                     .into_any_element(),
             ))
             .child(
@@ -347,7 +397,7 @@ impl AppView {
     }
 
     fn no_results(&self, cx: &Context<Self>) -> Div {
-        if self.results.filters.is_default() {
+        if self.results.state.filters.is_default() {
             return column().child(note("No results yet."));
         }
         column()
@@ -389,7 +439,7 @@ impl AppView {
     }
 
     fn result_row(&self, index: usize, claim: &Claim, cx: &Context<Self>) -> Stateful<Div> {
-        let selected = self.results.selected == Some(claim.id);
+        let selected = self.results.state.selected == Some(claim.id);
         let id = claim.id;
         let (words, tone) = results::result_tag(claim.result.as_deref());
         let note_text = claim
@@ -481,7 +531,7 @@ impl AppView {
                     .on_click(cx.listener(|this, _, _, cx| this.close_claim(cx))),
             );
         let shell = shell.child(header);
-        match &self.results.detail {
+        match &self.results.state.detail {
             Fetch::Idle => shell,
             Fetch::Loading => shell.child(note("Loading result...")),
             Fetch::Failed(error) => shell.child(error_block(error.clone())),
@@ -589,4 +639,48 @@ fn control_block(control: &ClaimControl) -> Div {
         )
         .child(note(facts))
         .children(when.map(note))
+}
+
+#[cfg(test)]
+mod tests {
+    // A glob import would bring gpui's `test` attribute into scope and shadow `#[test]`.
+    use super::{Fetch, Filters, Period, ResultFilter, ResultsState};
+
+    #[test]
+    fn forgetting_a_gateway_drops_its_panel_and_late_replies() {
+        let mut state = ResultsState {
+            filters: Filters {
+                device: Some("7c09e1f4a2b8".to_owned()),
+                result: ResultFilter::Denied,
+                period: Period::Month,
+            },
+            list: Fetch::Loading,
+            selected: Some(4814),
+            detail: Fetch::Loading,
+            ..ResultsState::default()
+        };
+        let list = state.next_list_generation();
+        let detail = state.next_detail_generation();
+
+        state.forget_gateway();
+
+        assert_eq!(
+            state.filters,
+            Filters {
+                device: None,
+                result: ResultFilter::Denied,
+                period: Period::Month,
+            }
+        );
+        assert!(matches!(state.list, Fetch::Idle));
+        assert_eq!(state.selected, None);
+        assert!(matches!(state.detail, Fetch::Idle));
+        assert!(!state.list_is_current(list));
+        assert!(!state.detail_is_current(detail));
+
+        let fresh_list = state.next_list_generation();
+        let fresh_detail = state.next_detail_generation();
+        assert!(state.list_is_current(fresh_list));
+        assert!(state.detail_is_current(fresh_detail));
+    }
 }

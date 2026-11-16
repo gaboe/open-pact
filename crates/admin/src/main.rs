@@ -474,6 +474,7 @@ impl AppView {
                     Ok(Outcome::Setup(settings, active, overview, history)) => {
                         this.admin.use_settings(settings); this.active = active.clone(); this.draft = active;
                         this.overview = Some(overview);
+                        this.forget_results_gateway(window, cx);
                         let skipped = history.warnings.len();
                         this.history = Some(history);
                         this.show_draft(window, cx);
@@ -1576,13 +1577,13 @@ fn snapshots(output: PathBuf) {
                     "admin-v-results-empty" => { list.claims.clear(); list.unreadable = 0; }
                     _ => (),
                 }
-                app.results.command = Admin::claims_command(&filters, now);
-                app.results.filters = filters;
-                app.results.list = results::Fetch::Ready(list);
+                app.results.state.command = Admin::claims_command(&filters, now);
+                app.results.state.filters = filters;
+                app.results.state.list = results::Fetch::Ready(list);
                 if name == "admin-u-result-detail" {
-                    app.results.selected = Some(4814);
+                    app.results.state.selected = Some(4814);
                     let detail: ClaimDetail = serde_json::from_str(include_str!("../../../tests/fixtures/claim.json")).unwrap();
-                    app.results.detail = results::Fetch::Ready(detail);
+                    app.results.state.detail = results::Fetch::Ready(detail);
                 }
                 app.sync_result_devices(window, cx);
             }
