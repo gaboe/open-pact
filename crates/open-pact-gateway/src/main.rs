@@ -2814,16 +2814,15 @@ grace = "1d"
             !timed_out && status.success(),
             "fixture child: {status}, timed out: {timed_out}\nstdout:\n{stdout}\nstderr:\n{stderr}"
         );
-        assert!(stdout.lines().any(|line| line == "running 1 test"), "{stdout}");
-        let passed = format!("test {exact_name} ... ok");
         assert!(
-            stdout.lines().any(|line| line == passed),
+            stdout.lines().any(|line| line == "running 1 test"),
             "{stdout}"
         );
+        let passed = format!("test {exact_name} ... ok");
+        assert!(stdout.lines().any(|line| line == passed), "{stdout}");
         assert!(
-            stdout.lines().any(|line| line.starts_with(
-                "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; "
-            )),
+            stdout.lines().any(|line| line
+                .starts_with("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; ")),
             "{stdout}"
         );
         true
@@ -2859,7 +2858,8 @@ grace = "1d"
 
     #[tokio::test]
     async fn gateway_main_semantics_log_entries_rejects_range_overflow() {
-        if gateway_main_in_owned_child("gateway_main_semantics_log_entries_rejects_range_overflow") {
+        if gateway_main_in_owned_child("gateway_main_semantics_log_entries_rejects_range_overflow")
+        {
             return;
         }
         let db = PgPoolOptions::new()
@@ -2873,7 +2873,10 @@ grace = "1d"
             .err()
             .expect("an overflowing log range must be rejected");
 
-        assert_eq!(error.to_string(), "from + limit exceeds the log index range");
+        assert_eq!(
+            error.to_string(),
+            "from + limit exceeds the log index range"
+        );
         assert_eq!(output, [b'X']);
     }
 }

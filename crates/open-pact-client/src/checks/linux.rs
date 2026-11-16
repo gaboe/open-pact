@@ -2587,9 +2587,7 @@ vda2         part  0 0 ext4 /boot
     }
 
     struct FiniteReader {
-        outcomes: std::collections::VecDeque<
-            Result<&'static [u8], std::io::ErrorKind>,
-        >,
+        outcomes: std::collections::VecDeque<Result<&'static [u8], std::io::ErrorKind>>,
     }
 
     impl std::io::Read for FiniteReader {
@@ -2610,11 +2608,7 @@ vda2         part  0 0 ext4 /boot
     #[test]
     fn hash_retries_interrupted_reads_and_stops_on_other_errors() {
         let interrupted = FiniteReader {
-            outcomes: [
-                Err(std::io::ErrorKind::Interrupted),
-                Ok(&b"abc"[..]),
-            ]
-            .into(),
+            outcomes: [Err(std::io::ErrorKind::Interrupted), Ok(&b"abc"[..])].into(),
         };
         let digest = hash_with::<sha2::Sha256>(interrupted).unwrap();
         assert_eq!(digest.size, 3);
@@ -2765,9 +2759,7 @@ vda2         part  0 0 ext4 /boot
 
     #[test]
     fn autologin_accepts_only_enabled_values() {
-        assert!(!parse_autologin(
-            "[daemon]\nAutomaticLoginEnable=false\n"
-        ));
+        assert!(!parse_autologin("[daemon]\nAutomaticLoginEnable=false\n"));
         assert!(!parse_autologin("[daemon]\nAutomaticLoginEnable=0\n"));
         assert!(parse_autologin("[daemon]\nAutomaticLoginEnable=TRUE\n"));
         assert!(parse_autologin("[daemon]\nAutomaticLoginEnable=1\n"));

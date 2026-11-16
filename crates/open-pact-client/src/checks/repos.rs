@@ -1608,9 +1608,9 @@ mod tests {
     #[test]
     fn cleanup_keeps_temporary_files_younger_than_ten_minutes() {
         let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join(
-            ".repo-scan.json.11111111-1111-4111-8111-111111111111.tmp",
-        );
+        let path = temp
+            .path()
+            .join(".repo-scan.json.11111111-1111-4111-8111-111111111111.tmp");
         fs::write(&path, b"keep").unwrap();
         fs::File::open(&path)
             .unwrap()

@@ -1522,10 +1522,7 @@ mod missed_mutant_tests {
     fn missing_linux_policy_is_empty() {
         let root = tempfile::tempdir().unwrap();
 
-        assert_eq!(
-            linux_policy(&root.path().join("missing")),
-            Ok(json!({}))
-        );
+        assert_eq!(linux_policy(&root.path().join("missing")), Ok(json!({})));
     }
 
     #[test]
@@ -1631,10 +1628,7 @@ mod missed_mutant_tests {
             &root.path().join("policy/managed/a.json"),
             r#"{"SafeBrowsingEnabled":true}"#,
         );
-        write(
-            &root.path().join("policy/recommended/a.json"),
-            "{broken",
-        );
+        write(&root.path().join("policy/recommended/a.json"), "{broken");
 
         assert_eq!(
             linux_chromium(&root.path().join("data"), &root.path().join("policy")),
