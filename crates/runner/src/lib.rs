@@ -3,6 +3,7 @@ pub mod client;
 #[cfg(feature = "desktop")]
 pub mod desktop;
 pub mod manifest;
+pub mod results;
 pub mod text;
 pub mod update;
 

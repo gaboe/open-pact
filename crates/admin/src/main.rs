@@ -1,6 +1,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod form;
+mod results;
 
 use form::FormState;
 use gpui::{prelude::*, *};
@@ -10,6 +11,7 @@ use gpui_component::{
     input::{EditorState, Input, InputEvent, InputState},
     select::{Select, SelectEvent, SelectState},
 };
+use results::ResultsView;
 use runner::{
     Runner,
     admin::{
@@ -30,6 +32,7 @@ enum Screen {
     Overview,
     Manifest,
     Devices,
+    Results,
 }
 
 #[derive(Clone)]
@@ -155,6 +158,7 @@ struct AppView {
     invitation_note: Entity<InputState>,
     ttl: String,
     update: UpdateState,
+    results: ResultsView,
 }
 
 impl AppView {
@@ -218,6 +222,7 @@ impl AppView {
             },
         );
         let fv = FormState::new(window, cx);
+        let results = ResultsView::new(window, cx);
         Self {
             admin: Admin::new(Runner::default(), settings),
             screen: Screen::Setup,
@@ -251,6 +256,7 @@ impl AppView {
             invitation_note: cx.new(|cx| InputState::new(window, cx).placeholder("Note for you")),
             ttl: "72h".into(),
             update: UpdateState::None,
+            results,
         }
     }
 
@@ -714,23 +720,35 @@ impl AppView {
             )
             .child(label("Latest results"));
         let mut results = table().child(result_header());
-        for device in admin::latest_results(&overview.devices) {
+        for (index, device) in admin::latest_results(&overview.devices)
+            .into_iter()
+            .enumerate()
+        {
             let result = result_text(device.last_result.as_ref());
             let reasons = reasons_text(device.last_reasons.as_ref());
-            results = results.child(result_row(
-                device
-                    .last_claim_at
-                    .as_deref()
-                    .map(readable_local)
-                    .unwrap_or_else(|| "–".into()),
-                div().child(device.note.clone()),
-                &result,
-                if reasons.is_empty() {
-                    "–".into()
-                } else {
-                    reasons
-                },
-            ));
+            let code = device.code.clone();
+            results = results.child(
+                result_row(
+                    device
+                        .last_claim_at
+                        .as_deref()
+                        .map(readable_local)
+                        .unwrap_or_else(|| "–".into()),
+                    div().child(device.note.clone()),
+                    &result,
+                    if reasons.is_empty() {
+                        "–".into()
+                    } else {
+                        reasons
+                    },
+                )
+                .id(("latest-result", index))
+                .cursor_pointer()
+                .hover(|row| row.bg(rgb(0xfaf8f4)))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.show_device_results(code.clone(), window, cx);
+                })),
+            );
         }
         view.child(results)
             .child(column().gap_1().child(runs("runs", "kubectl get deploy/open-pact-gateway -o json")).child(runs("and", "kubectl exec deploy/open-pact-gateway -- open-pact-gateway devices list --json")))
@@ -1253,15 +1271,21 @@ fn tone_text(tone: Tone) -> u32 {
 
 impl Render for AppView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let _ = (&self.editor_subscription, &self.setup_subscriptions);
+        let _ = (
+            &self.editor_subscription,
+            &self.setup_subscriptions,
+            &self.results.subscriptions,
+        );
         let content = match self.screen {
             Screen::Setup => self.setup_screen(cx),
             Screen::Overview => self.overview_screen(cx),
             Screen::Manifest if self.show_history => self.manifest_history(cx),
             Screen::Manifest => self.manifest_editor(cx),
             Screen::Devices => self.devices_screen(cx),
+            Screen::Results => self.results_screen(cx),
         };
-        let wide = self.screen == Screen::Manifest && !self.show_history;
+        let wide = self.screen == Screen::Results
+            || (self.screen == Screen::Manifest && !self.show_history);
         let sidebar = div()
             .flex()
             .flex_col()
@@ -1279,14 +1303,19 @@ impl Render for AppView {
                     (Screen::Overview, "Overview"),
                     (Screen::Manifest, "Manifest"),
                     (Screen::Devices, "Devices"),
+                    (Screen::Results, "Results"),
                     (Screen::Setup, "Settings"),
                 ]
                 .into_iter()
                 .enumerate()
                 .map(|(i, (screen, name))| {
                     nav_item(("nav", i), name, self.screen == screen).on_click(cx.listener(
-                        move |this, _, _, cx| {
+                        move |this, _, window, cx| {
                             if this.busy || (screen != Screen::Setup && this.overview.is_none()) {
+                                return;
+                            }
+                            if screen == Screen::Results {
+                                this.open_results(window, cx);
                                 return;
                             }
                             this.screen = screen;
@@ -1432,6 +1461,9 @@ fn snapshots(output: PathBuf) {
         ("admin-j-setup-no-contexts", Screen::Setup, true, None),
         ("admin-k-update", Screen::Overview, true, None),
         ("admin-l-devices", Screen::Devices, true, None),
+        ("admin-t-results", Screen::Results, true, None),
+        ("admin-u-result-detail", Screen::Results, true, None),
+        ("admin-v-results-empty", Screen::Results, true, None),
         ("admin-a-overview", Screen::Overview, true, None),
         ("admin-b-form", Screen::Manifest, true, None),
         ("admin-c-toml", Screen::Manifest, false, None),
@@ -1469,27 +1501,28 @@ fn snapshots(output: PathBuf) {
             )),
         ),
     ] {
-        let (width, height) =
-            if matches!(name, "admin-p-add-check-all" | "admin-q-add-check-scrolled") {
-                (1360., 860.)
-            } else if screen == Screen::Manifest {
-                (
-                    1440.,
-                    if matches!(
-                        name,
-                        "admin-b-form"
-                            | "admin-m-number-check"
-                            | "admin-n-add-check"
-                            | "admin-o-field-errors"
-                    ) {
-                        1700.
-                    } else {
-                        880.
-                    },
-                )
-            } else {
-                (1040., 800.)
-            };
+        let (width, height) = if screen == Screen::Results {
+            (1440., 880.)
+        } else if matches!(name, "admin-p-add-check-all" | "admin-q-add-check-scrolled") {
+            (1360., 860.)
+        } else if screen == Screen::Manifest {
+            (
+                1440.,
+                if matches!(
+                    name,
+                    "admin-b-form"
+                        | "admin-m-number-check"
+                        | "admin-n-add-check"
+                        | "admin-o-field-errors"
+                ) {
+                    1700.
+                } else {
+                    880.
+                },
+            )
+        } else {
+            (1040., 800.)
+        };
         snapshot(&output, name, width, height, |window, cx| {
             cx.new(|cx| {
             let mut app = AppView::new(Settings { context: "test-cluster".into(), namespace: "open-pact".into(), ..Settings::default() }, window, cx);
@@ -1528,6 +1561,31 @@ fn snapshots(output: PathBuf) {
                 deployment: serde_json::json!({"status":{"conditions":[{"type":"Available","status":"True"}]}}),
             });
             app.history = Some(History { versions: serde_json::from_str(include_str!("../../../tests/fixtures/history.json")).unwrap(), backups: vec![admin::Backup { path: "/fictional/backups/20261116T100000Z-v1-example.toml".into(), manifest_hash: admin::hash(&app.active) }], synced_at: "2026-11-16T12:30:00Z".into(), warnings: if name == "admin-f-history" { vec!["Skipped backup 20261116T101500.000Z-0123456789ab.toml: its content does not match the hash in its name. Move it out of the folder and sync again.".into()] } else { Vec::new() } });
+            if screen == Screen::Results {
+                use runner::results::{ClaimDetail, ClaimList, Filters, Period, ResultFilter};
+                let now = "2026-11-16T12:00:00Z".parse().unwrap();
+                let mut list: ClaimList = serde_json::from_str(include_str!("../../../tests/fixtures/claims.json")).unwrap();
+                let test_a = Some("7c09e1f4a2b8".to_owned());
+                let filters = match name {
+                    "admin-t-results" => Filters { period: Period::Month, ..Filters::default() },
+                    "admin-u-result-detail" => Filters { device: test_a.clone(), ..Filters::default() },
+                    _ => Filters { device: test_a.clone(), result: ResultFilter::Denied, period: Period::Day },
+                };
+                match name {
+                    "admin-u-result-detail" => list.claims.retain(|claim| Some(claim.code()) == test_a),
+                    "admin-v-results-empty" => { list.claims.clear(); list.unreadable = 0; }
+                    _ => (),
+                }
+                app.results.command = Admin::claims_command(&filters, now);
+                app.results.filters = filters;
+                app.results.list = results::Fetch::Ready(list);
+                if name == "admin-u-result-detail" {
+                    app.results.selected = Some(4814);
+                    let detail: ClaimDetail = serde_json::from_str(include_str!("../../../tests/fixtures/claim.json")).unwrap();
+                    app.results.detail = results::Fetch::Ready(detail);
+                }
+                app.sync_result_devices(window, cx);
+            }
             if matches!(name, "admin-setup" | "admin-h-settings" | "admin-i-setup-fallback" | "admin-j-setup-no-contexts") {
                 let clusters: Vec<String> = ["test-cluster", "staging-cluster", "prod-cluster"].map(String::from).into();
                 match name {

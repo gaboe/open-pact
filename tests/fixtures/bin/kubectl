@@ -25,6 +25,10 @@ case "$*" in
     previous=$(hash "$state"); cat > "$fixtures/state.toml"; applied "$previous" ;;
   *'manifest activate 1 --json') previous=$(hash "$state"); cp "$fixtures/manifest.toml" "$fixtures/state.toml"; applied "$previous" ;;
   *'manifest activate 2 --json') previous=$(hash "$state"); cp "$fixtures/manifest-v2.toml" "$fixtures/state.toml"; applied "$previous" ;;
+  *'--context old-gateway-cluster'*'claims '*) printf '%s\n' '{"error":"error: unrecognized subcommand '"'"'claims'"'"'"}'; exit 2 ;;
+  *'claims list --json'*) cat "$fixtures/claims.json" ;;
+  *'claims show 4814 --json') cat "$fixtures/claim.json" ;;
+  *'claims show '*' --json') printf '%s\n' '{"error":"no claim with id 5"}'; exit 1 ;;
   *'devices list --json') cat "$fixtures/devices.json" ;;
   *'status --json') printf '{"version":"0.6.0","manifest_hash":"sha256:%s","auto_approve":false,"devices":{},"company_key_fingerprint":"fictional","manifest_source":"database","manifest_version":1}\n' "$(hash "$state")" ;;
   *'invite --ttl '*) cat "$fixtures/invitation.json" ;;

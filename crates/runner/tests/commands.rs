@@ -1280,3 +1280,312 @@ fn status_reports_a_newer_command_line_tool_only_when_the_field_has_its_shape() 
         .is_none()
     );
 }
+
+mod results {
+    use chrono::{TimeZone, Utc};
+    use runner::results::{
+        ClaimDetail, ClaimList, ControlStatus, Filters, OLD_GATEWAY, Period, ResultFilter,
+        check_name, explain_error, failed_checks_text, result_tag, unreadable_text,
+    };
+    use runner::text::Tone;
+
+    const LIST: &str = include_str!("../../../tests/fixtures/claims.json");
+    const SHOW: &str = include_str!("../../../tests/fixtures/claim.json");
+
+    fn now() -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 11, 16, 12, 0, 0).unwrap()
+    }
+
+    fn words(filters: &Filters) -> Vec<String> {
+        filters.list_words(now())
+    }
+
+    #[test]
+    fn the_list_json_is_read_with_its_unreadable_count() {
+        let list: ClaimList = serde_json::from_str(LIST).unwrap();
+        assert_eq!(list.claims.len(), 6);
+        assert_eq!(list.unreadable, 2);
+        let first = &list.claims[0];
+        assert_eq!(first.id, 4815);
+        assert_eq!(first.code(), "0a1b2c3d4e5f");
+        assert_eq!(
+            first.device_note.as_deref(),
+            Some("MacBook, Example Person")
+        );
+        assert_eq!(first.result.as_deref(), Some("accepted"));
+        let last = &list.claims[5];
+        assert_eq!(
+            (last.result.as_deref(), last.device_note.as_deref()),
+            (None, None)
+        );
+        let empty: ClaimList = serde_json::from_str(r#"{"claims":[],"unreadable":0}"#).unwrap();
+        assert!(empty.claims.is_empty());
+    }
+
+    #[test]
+    fn the_show_json_is_read_control_by_control() {
+        let detail: ClaimDetail = serde_json::from_str(SHOW).unwrap();
+        assert_eq!(detail.id, 4814);
+        assert_eq!(detail.hash_text(), "97e1594a0000");
+        assert_eq!(detail.os.as_deref(), Some("macos"));
+        assert_eq!(detail.controls.len(), 7);
+        let by_id = |id: &str| detail.controls.iter().find(|c| c.id == id).unwrap();
+        let age = by_id("os_patch_age_days");
+        assert_eq!(age.status, ControlStatus::Fail);
+        assert_eq!(age.name(), "OS updates");
+        assert_eq!(age.value_text(), "40");
+        assert_eq!(age.required_text(), "≤ 30");
+        assert_eq!(age.grace_text(), "1 d");
+        assert_ne!(age.first_failed_text(), "–");
+        assert_ne!(age.deadline_text(), "–");
+        let lock = by_id("screen_lock");
+        assert_eq!(lock.value_text(), "≤ 5 min");
+        assert_eq!(lock.required_text(), "≤ 5 min");
+        assert_eq!(lock.first_failed_text(), "–");
+        assert_eq!(by_id("password_min_length").required_text(), "≥ 10");
+        assert_eq!(by_id("antimalware_realtime").status, ControlStatus::Unknown);
+        let skipped = by_id("secure_boot");
+        assert_eq!(skipped.status, ControlStatus::NotRequired);
+        assert_eq!(
+            (
+                skipped.value_text(),
+                skipped.required_text(),
+                skipped.grace_text()
+            ),
+            ("–".to_owned(), "–".to_owned(), "–".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_status_the_app_does_not_know_reads_as_unknown() {
+        let control: runner::results::ClaimControl =
+            serde_json::from_str(r#"{"id":"firewall","value":"on","status":"something_new"}"#)
+                .unwrap();
+        assert_eq!(control.status, ControlStatus::Unknown);
+    }
+
+    #[test]
+    fn failing_controls_come_first_and_each_group_keeps_its_order() {
+        let detail: ClaimDetail = serde_json::from_str(SHOW).unwrap();
+        let order: Vec<_> = detail.ordered().iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(
+            order,
+            [
+                "password_min_length",
+                "os_patch_age_days",
+                "antimalware_realtime",
+                "disk_encryption",
+                "firewall",
+                "screen_lock",
+                "secure_boot",
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_checks_show_plain_names_three_at_most() {
+        let ids = |list: &[&str]| list.iter().map(|id| (*id).to_owned()).collect::<Vec<_>>();
+        assert_eq!(failed_checks_text(&[]), "–");
+        assert_eq!(failed_checks_text(&ids(&["firewall"])), "Firewall");
+        assert_eq!(
+            failed_checks_text(&ids(&["firewall", "screen_lock", "disk_encryption"])),
+            "Firewall, Screen lock, Disk encryption"
+        );
+        let list: ClaimList = serde_json::from_str(LIST).unwrap();
+        assert_eq!(
+            list.claims[2].failed_text(),
+            "Disk encryption, Firewall, Screen lock +2"
+        );
+        assert_eq!(check_name("custom_vault_check"), "custom_vault_check");
+    }
+
+    #[test]
+    fn unreadable_results_are_a_quiet_note() {
+        assert_eq!(unreadable_text(0), None);
+        assert_eq!(
+            unreadable_text(1).as_deref(),
+            Some("1 older result can no longer be read.")
+        );
+        assert_eq!(
+            unreadable_text(2).as_deref(),
+            Some("2 older results can no longer be read.")
+        );
+    }
+
+    #[test]
+    fn results_have_a_word_and_a_colour() {
+        assert_eq!(
+            result_tag(Some("accepted")),
+            ("Accepted".to_owned(), Tone::Good)
+        );
+        assert_eq!(
+            result_tag(Some("warnings")),
+            ("Warnings".to_owned(), Tone::Warn)
+        );
+        assert_eq!(result_tag(Some("denied")), ("Denied".to_owned(), Tone::Bad));
+        assert_eq!(result_tag(None), ("Unknown".to_owned(), Tone::Idle));
+    }
+
+    #[test]
+    fn filters_become_gateway_flags() {
+        let all = Filters::default();
+        assert!(all.is_default());
+        assert_eq!(words(&all), ["claims", "list", "--json", "--limit", "200"]);
+        let device = Filters {
+            device: Some("7c09e1f4a2b8".into()),
+            ..Filters::default()
+        };
+        assert!(!device.is_default());
+        assert_eq!(
+            words(&device),
+            [
+                "claims",
+                "list",
+                "--json",
+                "--device",
+                "7c09e1f4a2b8",
+                "--limit",
+                "200"
+            ]
+        );
+        let every_flag = Filters {
+            device: Some("0a1b2c3d4e5f".into()),
+            result: ResultFilter::Denied,
+            period: Period::Day,
+        };
+        assert_eq!(
+            words(&every_flag),
+            [
+                "claims",
+                "list",
+                "--json",
+                "--device",
+                "0a1b2c3d4e5f",
+                "--result",
+                "denied",
+                "--since",
+                "2026-11-15T12:00:00Z",
+                "--limit",
+                "200",
+            ]
+        );
+        for (result, flag) in [
+            (ResultFilter::Accepted, "accepted"),
+            (ResultFilter::Warnings, "warnings"),
+        ] {
+            let filters = Filters {
+                result,
+                ..Filters::default()
+            };
+            assert_eq!(words(&filters)[3..5], ["--result", flag]);
+        }
+        for (period, since) in [
+            (Period::Week, "2026-11-09T12:00:00Z"),
+            (Period::Month, "2026-10-17T12:00:00Z"),
+        ] {
+            let filters = Filters {
+                period,
+                ..Filters::default()
+            };
+            assert_eq!(words(&filters)[3..5], ["--since", since]);
+        }
+    }
+
+    #[test]
+    fn the_gateway_error_for_an_unknown_subcommand_says_the_gateway_is_old() {
+        assert_eq!(
+            explain_error("error: unrecognized subcommand 'claims'"),
+            OLD_GATEWAY
+        );
+        assert_eq!(explain_error("no claim with id 5"), "no claim with id 5");
+        assert_eq!(
+            OLD_GATEWAY,
+            "The gateway is older than 0.7; results need gateway 0.7 or later."
+        );
+    }
+
+    #[cfg(unix)]
+    mod gateway {
+        use super::*;
+        use runner::{
+            Runner,
+            admin::{Admin, Settings},
+        };
+
+        fn admin(context: &str) -> Admin {
+            let mut admin = Admin::new(
+                Runner::default(),
+                Settings {
+                    context: context.into(),
+                    namespace: "open-pact".into(),
+                    ..Settings::default()
+                },
+            );
+            admin.kubectl = super::super::fixture("bin/kubectl");
+            admin
+        }
+
+        #[test]
+        fn the_admin_lists_and_shows_results_through_kubectl_exec() {
+            let admin = admin("fictional-cluster");
+            let filters = Filters {
+                device: Some("7c09e1f4a2b8".into()),
+                result: ResultFilter::Warnings,
+                period: Period::Week,
+            };
+            let list = admin.claims(&filters, now()).unwrap();
+            assert_eq!(list.claims.len(), 6);
+            let detail = admin.claim(4814).unwrap();
+            assert_eq!(detail.controls.len(), 7);
+            let logs = admin.runner.logs();
+            assert_eq!(logs.len(), 2);
+            assert_eq!(
+                logs[0].args,
+                [
+                    "--context",
+                    "fictional-cluster",
+                    "-n",
+                    "open-pact",
+                    "exec",
+                    "deploy/open-pact-gateway",
+                    "--",
+                    "open-pact-gateway",
+                    "claims",
+                    "list",
+                    "--json",
+                    "--device",
+                    "7c09e1f4a2b8",
+                    "--result",
+                    "warnings",
+                    "--since",
+                    "2026-11-09T12:00:00Z",
+                    "--limit",
+                    "200",
+                ]
+            );
+            assert_eq!(logs[1].args[8..], ["claims", "show", "4814", "--json"]);
+            assert_eq!(
+                Admin::claims_command(&filters, now()),
+                "kubectl exec deploy/open-pact-gateway -- open-pact-gateway claims list --json --device 7c09e1f4a2b8 --result warnings --since 2026-11-09T12:00:00Z --limit 200"
+            );
+        }
+
+        #[test]
+        fn an_unknown_result_shows_the_gateway_error() {
+            assert_eq!(
+                admin("fictional-cluster").claim(5).unwrap_err(),
+                "no claim with id 5"
+            );
+        }
+
+        #[test]
+        fn an_older_gateway_gets_the_version_hint_for_list_and_show() {
+            let admin = admin("old-gateway-cluster");
+            assert_eq!(
+                admin.claims(&Filters::default(), now()).unwrap_err(),
+                OLD_GATEWAY
+            );
+            assert_eq!(admin.claim(4814).unwrap_err(), OLD_GATEWAY);
+        }
+    }
+}
