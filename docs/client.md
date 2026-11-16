@@ -232,7 +232,7 @@ Limited Windows operations leave orphaned protected state and the shared binary 
 
 ## Read the output as JSON
 
-A desktop app can drive the client through these flags. Each prints JSON on stdout and nothing else; warnings stay on stderr. A failure prints `{"error": "<text>"}` on stdout and exits non-zero. Without the flag the output is the text you read in the other sections.
+A desktop app can drive the client through these flags. Each prints JSON on stdout and nothing else; warnings stay on stderr. A failure prints `{"error": "<text>"}` on stdout and exits non-zero. This includes a command line that does not parse, which exits 2, and a panic. A command that cannot write its JSON, because stdout is closed or full, exits non-zero instead of reporting success. `status --json` follows the same rule. Without the flag the output is the text you read in the other sections.
 
 | Command | Prints |
 | --- | --- |

@@ -84,7 +84,7 @@ Use `kubectl exec deploy/pact-gateway -- open-pact-gateway devices revoke 'pseud
 
 ### Read the gateway as JSON
 
-An app can run these commands through `kubectl exec`. Each prints one JSON document on stdout. On a database or other error it prints `{"error": "<text>"}` and exits non-zero.
+An app can run these commands through `kubectl exec`. Each prints one JSON document on stdout. On a database or other error it prints `{"error": "<text>"}` and exits non-zero. A command line that does not parse, such as `--ttl invalid`, prints the same error document and exits 2.
 
 ```sh
 kubectl exec deploy/pact-gateway -- open-pact-gateway devices list --json
@@ -95,11 +95,13 @@ kubectl exec deploy/pact-gateway -- open-pact-gateway status --json
 `devices list --json` prints an array with one object per enrolment, oldest first:
 
 ```json
-[{"pseudonym": "pseudonym:0123…", "code": "0123456789ab", "state": "pending", "note": "Example laptop",
-  "enrolled_at": "2026-11-02T10:00:00Z", "manifest_hash": "sha256:…"}]
+[{"pseudonym": "pseudonym:0123…", "code": "0123456789ab", "state": "approved", "note": "Example laptop",
+  "enrolled_at": "2026-11-02T10:00:00Z", "manifest_hash": "sha256:…",
+  "last_claim_at": "2026-11-03T08:15:00Z", "last_result": "accepted_with_warnings",
+  "last_reasons": ["os_patch_age_days = 40, <= 30 required, access ends in 24h"]}]
 ```
 
-`code` is the first 12 hex digits of the pseudonym, which `devices approve` takes. `note` is the invitation note, empty when there is none. The object has no `last_claim_at`, `last_result` or `last_reasons`: the database stores each claim's device pseudonym only inside its sealed body, and it stores no refusal reasons.
+`code` is the first 12 hex digits of the pseudonym, which `devices approve` takes. `note` is the invitation note, empty when there is none. `last_claim_at`, `last_result` and `last_reasons` are the gateway's decision on the last claim of this enrolment. `last_result` is `accepted`, `accepted_with_warnings` or `denied`. `last_reasons` holds the warnings of an accepted claim or the reasons of a denied one, and is empty for a clean accepted claim. A device that never sent a claim has `null` in `last_claim_at` and `last_result` and `[]` in `last_reasons`. The gateway writes them in the transaction that decides the claim, as plain columns of the `devices` table. A claim that carries data the manifest does not allow is not stored, and its reasons can quote that data, so its `last_reasons` is the one line "the claim disclosed more than the manifest allows".
 
 `invite --json` prints `{"invitation": "opi1:…", "expires_at": "2026-11-05T10:00:00Z", "company_key_fingerprint": "sha256:…", "note": "Example laptop"}` and nothing on stderr.
 

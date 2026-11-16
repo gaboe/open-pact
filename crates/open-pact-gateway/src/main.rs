@@ -832,6 +832,17 @@ async fn claim(
             Ok(manifest) => Arc::new(manifest),
             Err(reason) => {
                 reasons.push(reason);
+                devices::record_claim(
+                    &mut tx,
+                    &claim.device,
+                    manifest_hash,
+                    chrono::Utc::now(),
+                    devices::ClaimResult::Denied,
+                    &reasons,
+                )
+                .await
+                .map_err(internal)?;
+                tx.commit().await.map_err(internal)?;
                 return Err(denied(reasons));
             }
         }
@@ -900,6 +911,10 @@ async fn claim(
 
     if enrolled {
         grace::save(&mut tx, &claim.device, manifest_hash, &first_failures)
+            .await
+            .map_err(internal)?;
+        let (result, listed) = devices::claim_outcome(&warnings, &reasons, oversharing);
+        devices::record_claim(&mut tx, &claim.device, manifest_hash, now, result, &listed)
             .await
             .map_err(internal)?;
     }
@@ -1366,15 +1381,48 @@ async fn log_entries(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    use std::io::Write;
+
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let cli = match Cli::try_parse_from(&args) {
+        Ok(cli) => cli,
+        Err(error) => match usage_error_line(&args, &error) {
+            Some(line) => {
+                let _ = writeln!(std::io::stdout(), "{line}");
+                std::process::exit(2)
+            }
+            None => error.exit(),
+        },
+    };
     let json = cli.prints_json();
     match run(cli).await {
         Err(error) if json => {
-            println!("{}", json!({ "error": format!("{error:#}") }));
+            let _ = writeln!(
+                std::io::stdout(),
+                "{}",
+                json!({ "error": format!("{error:#}") })
+            );
             std::process::exit(1)
         }
         result => result,
     }
+}
+
+/// The error line for a command line that does not parse, when it asked for JSON. Help and version
+/// output, and the errors of a command line that did not ask for JSON, stay as clap prints them.
+fn usage_error_line(args: &[std::ffi::OsString], error: &clap::Error) -> Option<String> {
+    let asked = args
+        .iter()
+        .skip(1)
+        .take_while(|arg| *arg != "--")
+        .any(|arg| arg == "--json");
+    if !error.use_stderr() || !asked {
+        return None;
+    }
+    let text = error.to_string();
+    let first = text.split("\n\n").next().unwrap_or_default().trim();
+    let first = first.strip_prefix("error: ").unwrap_or(first);
+    Some(json!({ "error": first }).to_string())
 }
 
 async fn run(cli: Cli) -> anyhow::Result<()> {
@@ -2519,7 +2567,8 @@ grace = "1d"
             );
         }
         let texts = texts.join("\n");
-        assert!(!texts.contains("csr_pem") && !texts.contains("CERTIFICATE REQUEST"));
+        // The key of a stored request body. A refusal reason in `devices.last_reasons` names the field in words.
+        assert!(!texts.contains("\"csr_pem\"") && !texts.contains("CERTIFICATE REQUEST"));
         for pem in pems {
             let body: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
             let der = base64::engine::general_purpose::STANDARD
@@ -3019,6 +3068,37 @@ grace = "1d"
     }
 
     #[test]
+    fn a_command_line_that_does_not_parse_gets_a_json_error_when_it_asked_for_json() {
+        let line = |args: &[&str]| {
+            let mut all = vec!["open-pact-gateway"];
+            all.extend_from_slice(args);
+            let all: Vec<std::ffi::OsString> = all.into_iter().map(Into::into).collect();
+            let error = Cli::try_parse_from(&all).map(|_| ()).unwrap_err();
+            usage_error_line(&all, &error)
+        };
+        for args in [
+            &[
+                "invite",
+                "--json",
+                "--ttl",
+                "invalid",
+                "--url",
+                "https://pact.example.com",
+            ][..],
+            &["status", "--json", "--bogus"],
+            &["devices", "list", "--json", "--bogus"],
+        ] {
+            let text = line(args).unwrap_or_else(|| panic!("{args:?} has no JSON error"));
+            let document: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(document.as_object().unwrap().len(), 1, "{text}");
+            assert!(!document["error"].as_str().unwrap().is_empty(), "{text}");
+            assert!(!text.contains('\n'), "{text}");
+        }
+        assert_eq!(line(&["status", "--bogus"]), None);
+        assert_eq!(line(&["invite", "--ttl", "invalid"]), None);
+    }
+
+    #[test]
     fn the_json_flags_parse_and_make_failures_json() {
         let parse = |args: &[&str]| {
             let mut all = vec!["open-pact-gateway"];
@@ -3130,5 +3210,76 @@ grace = "1d"
         let printed = json!({ "error": format!("{error:#}") });
         assert!(!printed["error"].as_str().unwrap().is_empty());
         assert_eq!(printed.as_object().unwrap().len(), 1);
+    }
+    /// `devices list --json` shows how the gateway decided the last claim of each enrolment.
+    #[tokio::test]
+    #[ignore = "needs TEST_DATABASE_URL"]
+    async fn devices_list_shows_the_last_claim_decision_of_each_device() {
+        let (app, db) = test_app_with(DEMO, 10, 100).await;
+        let manifest = Manifest::parse(DEMO.as_bytes()).unwrap();
+        let (key, first) = enrolled_claim(&app, &db, DEMO).await;
+        let (idle, _) = enrolled_claim(&app, &db, DEMO).await;
+        let last = |rows: Vec<Value>, key: &SigningKey| {
+            let pseudonym = Pseudonym::of(&PublicKey::from(key));
+            rows.into_iter()
+                .find(|row| row["pseudonym"] == pseudonym.as_str())
+                .unwrap()
+        };
+        let listed = || async {
+            let text = devices::list_json(&db).await.unwrap();
+            serde_json::from_str::<Vec<Value>>(&text).unwrap()
+        };
+
+        let row = last(listed().await, &key);
+        assert_eq!(row["last_claim_at"], Value::Null);
+        assert_eq!(row["last_result"], Value::Null);
+        assert_eq!(row["last_reasons"], json!([]));
+
+        let mut stale = first.clone();
+        stale.results.insert("os_patch_age_days".into(), 40.into());
+        let (status, body) = send_claim(&app, &key, &stale, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let row = last(listed().await, &key);
+        assert_eq!(row["last_result"], "accepted_with_warnings");
+        assert_eq!(row["last_reasons"], body["warnings"]);
+        assert!(!row["last_reasons"].as_array().unwrap().is_empty());
+        let at = row["last_claim_at"].as_str().unwrap().to_owned();
+        assert!(at.ends_with('Z') && at.len() == 20, "{at}");
+
+        let clean = fresh_claim(&app, &key, &manifest).await;
+        let (status, body) = send_claim(&app, &key, &clean, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let row = last(listed().await, &key);
+        assert_eq!(row["last_result"], "accepted");
+        assert_eq!(row["last_reasons"], json!([]));
+
+        let mut leaking = fresh_claim(&app, &key, &manifest).await;
+        leaking
+            .results
+            .insert("firewall".into(), "fictional-secret-value".into());
+        let (status, body) = send_claim(&app, &key, &leaking, None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        let row = last(listed().await, &key);
+        assert_eq!(row["last_result"], "denied");
+        assert!(!row.to_string().contains("fictional-secret-value"), "{row}");
+
+        sqlx::query("UPDATE devices SET state = 'revoked' WHERE pseudonym = $1")
+            .bind(Pseudonym::of(&PublicKey::from(&key)).as_str())
+            .execute(&db)
+            .await
+            .unwrap();
+        let revoked = fresh_claim(&app, &key, &manifest).await;
+        let (status, _) = send_claim(&app, &key, &revoked, None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let row = last(listed().await, &key);
+        assert_eq!(row["last_result"], "denied");
+        assert_eq!(row["last_reasons"], json!(["device revoked"]));
+
+        let row = last(listed().await, &idle);
+        assert_eq!(
+            row["last_result"],
+            Value::Null,
+            "another device is untouched"
+        );
     }
 }

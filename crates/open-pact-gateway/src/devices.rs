@@ -1,4 +1,5 @@
 use anyhow::{Context, bail};
+use chrono::{DateTime, Utc};
 use open_pact_core::{EntryKind, Pseudonym};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -232,9 +233,72 @@ pub fn full_pseudonym(text: &str) -> anyhow::Result<String> {
     Ok(full)
 }
 
-/// One enrolment as `devices list --json` prints it. The database keeps no claim facts next to
-/// a device: a claim holds its device pseudonym only inside its sealed body, and no refusal reason
-/// is stored at all. So the row has no `last_claim_at`, `last_result` or `last_reasons`.
+/// How the gateway decided the last claim of an enrolment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimResult {
+    Accepted,
+    AcceptedWithWarnings,
+    Denied,
+}
+
+impl ClaimResult {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ClaimResult::Accepted => "accepted",
+            ClaimResult::AcceptedWithWarnings => "accepted_with_warnings",
+            ClaimResult::Denied => "denied",
+        }
+    }
+}
+
+/// What a claim decision leaves on the device row: the result, and the warnings or reasons that
+/// went with it. A claim that carried data the manifest does not allow is not stored, and its
+/// reasons can quote that data, so they are not stored here either: one fixed line takes their place.
+pub fn claim_outcome(
+    warnings: &[String],
+    reasons: &[String],
+    oversharing: bool,
+) -> (ClaimResult, Vec<String>) {
+    if oversharing {
+        (
+            ClaimResult::Denied,
+            vec!["the claim disclosed more than the manifest allows".to_owned()],
+        )
+    } else if !reasons.is_empty() {
+        (ClaimResult::Denied, reasons.to_vec())
+    } else if !warnings.is_empty() {
+        (ClaimResult::AcceptedWithWarnings, warnings.to_vec())
+    } else {
+        (ClaimResult::Accepted, vec![])
+    }
+}
+
+/// Records the last claim decision of the enrolment `device` holds under `manifest`, in the
+/// transaction that decides the claim.
+pub async fn record_claim(
+    conn: &mut PgConnection,
+    device: &Pseudonym,
+    manifest: &str,
+    at: DateTime<Utc>,
+    result: ClaimResult,
+    reasons: &[String],
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "UPDATE devices SET last_claim_at = $3, last_result = $4, last_reasons = $5 \
+         WHERE pseudonym = $1 AND manifest_hash = $2",
+    )
+    .bind(device.as_str())
+    .bind(manifest)
+    .bind(at)
+    .bind(result.as_str())
+    .bind(reasons)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// One enrolment as `devices list --json` prints it. The last three fields are the gateway's last
+/// claim decision for this enrolment: null and empty until the device sends a claim.
 #[derive(Debug, PartialEq, Eq, Serialize)]
 pub struct DeviceRow {
     pub pseudonym: String,
@@ -245,7 +309,25 @@ pub struct DeviceRow {
     pub note: String,
     pub enrolled_at: String,
     pub manifest_hash: String,
+    /// When the gateway decided the last claim of this enrolment, as `enrolled_at` is written.
+    pub last_claim_at: Option<String>,
+    /// `accepted`, `accepted_with_warnings` or `denied`.
+    pub last_result: Option<String>,
+    /// The warnings of an accepted claim, or the reasons of a denied one.
+    pub last_reasons: Vec<String>,
 }
+
+/// The columns of an enrolment as `rows` selects them.
+type RawRow = (
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<Vec<String>>,
+);
 
 impl DeviceRow {
     fn new(
@@ -267,15 +349,32 @@ impl DeviceRow {
             note: note.unwrap_or_default(),
             enrolled_at,
             manifest_hash,
+            last_claim_at: None,
+            last_result: None,
+            last_reasons: vec![],
         }
+    }
+
+    fn with_last_claim(
+        mut self,
+        at: Option<String>,
+        result: Option<String>,
+        reasons: Option<Vec<String>>,
+    ) -> Self {
+        self.last_claim_at = at;
+        self.last_result = result;
+        self.last_reasons = reasons.unwrap_or_default();
+        self
     }
 }
 
 /// Every enrolment, oldest first.
 pub async fn rows(db: &PgPool) -> anyhow::Result<Vec<DeviceRow>> {
-    let rows: Vec<(String, String, String, String, Option<String>)> = sqlx::query_as(
+    let rows: Vec<RawRow> = sqlx::query_as(
         "SELECT d.state, d.pseudonym, d.manifest_hash, \
-                to_char(d.enrolled_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), i.note \
+                to_char(d.enrolled_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), i.note, \
+                to_char(d.last_claim_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), \
+                d.last_result, d.last_reasons \
          FROM devices d LEFT JOIN invitations i ON i.hash = d.invitation \
          ORDER BY d.enrolled_at",
     )
@@ -283,9 +382,15 @@ pub async fn rows(db: &PgPool) -> anyhow::Result<Vec<DeviceRow>> {
     .await?;
     Ok(rows
         .into_iter()
-        .map(|(state, pseudonym, manifest, enrolled, note)| {
-            DeviceRow::new(state, pseudonym, manifest, enrolled, note)
-        })
+        .map(
+            |(state, pseudonym, manifest, enrolled, note, last_at, last_result, last_reasons)| {
+                DeviceRow::new(state, pseudonym, manifest, enrolled, note).with_last_claim(
+                    last_at,
+                    last_result,
+                    last_reasons,
+                )
+            },
+        )
         .collect())
 }
 
@@ -362,8 +467,36 @@ mod tests {
                 "note": "",
                 "enrolled_at": "2026-11-02T10:00:00Z",
                 "manifest_hash": format!("sha256:{}", "ab".repeat(32)),
+                "last_claim_at": null,
+                "last_result": null,
+                "last_reasons": [],
             })
         );
+    }
+
+    #[test]
+    fn a_decision_becomes_a_result_with_its_warnings_or_reasons() {
+        let words = |text: &[&str]| text.iter().map(|t| t.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            claim_outcome(&[], &[], false),
+            (ClaimResult::Accepted, vec![])
+        );
+        let warnings = words(&["firewall = unknown, access ends in 23h"]);
+        assert_eq!(
+            claim_outcome(&warnings, &[], false),
+            (ClaimResult::AcceptedWithWarnings, warnings.clone())
+        );
+        let reasons = words(&["device revoked"]);
+        assert_eq!(
+            claim_outcome(&[], &reasons, false),
+            (ClaimResult::Denied, reasons.clone())
+        );
+        let leaking =
+            words(&["fictional_control = secret value is not an output the manifest allows"]);
+        let (result, stored) = claim_outcome(&[], &leaking, true);
+        assert_eq!(result, ClaimResult::Denied);
+        assert_eq!(stored.len(), 1);
+        assert!(!stored[0].contains("secret"), "{stored:?}");
     }
 
     #[test]

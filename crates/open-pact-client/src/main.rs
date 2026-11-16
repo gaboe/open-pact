@@ -17,15 +17,19 @@ macro_rules! println {
     };
 }
 
+/// A warning that cannot be written must not stop the command, so this one ignores a stderr that is
+/// closed or full. `std::eprintln!` panics there.
 macro_rules! eprintln {
-    () => {
-        ::std::eprintln!();
-    };
+    () => {{
+        use ::std::io::Write as _;
+        let _ = ::std::writeln!(::std::io::stderr());
+    }};
     ($($arg:tt)*) => {{
+        use ::std::io::Write as _;
         if $crate::json_out::active() {
             $crate::json_out::note_line(format!($($arg)*));
         }
-        ::std::eprintln!($($arg)*)
+        let _ = ::std::writeln!(::std::io::stderr(), $($arg)*);
     }};
 }
 
@@ -103,13 +107,16 @@ struct Cli {
 impl Cli {
     /// The command prints JSON, so a failure before it starts is JSON too.
     fn prints_json(&self) -> bool {
-        matches!(
-            self.command,
-            Command::Join { preview: true, .. }
-                | Command::Join { json: true, .. }
-                | Command::Check { json: true, .. }
-                | Command::Accept { preview: true, .. }
-        )
+        match &self.command {
+            Command::Status(options) => options.json(),
+            command => matches!(
+                command,
+                Command::Join { preview: true, .. }
+                    | Command::Join { json: true, .. }
+                    | Command::Check { json: true, .. }
+                    | Command::Accept { preview: true, .. }
+            ),
+        }
     }
 }
 
@@ -1323,6 +1330,15 @@ fn write_summary(
         )?;
     }
     writeln!(output)?;
+    Ok(())
+}
+
+/// Prints the manifest summary. Under `--json` it goes to the note buffer like any other text, so
+/// stdout keeps only JSON.
+fn print_summary(manifest: &Manifest, company_fingerprint: &str, os: Os) -> Result<()> {
+    let mut text = Vec::new();
+    write_summary(&mut text, manifest, company_fingerprint, os)?;
+    print!("{}", String::from_utf8(text)?);
     Ok(())
 }
 
@@ -3155,12 +3171,7 @@ async fn join(
     let os = current_os()?;
     wizard_step(2, "Review and sign the manifest");
     let reading = ReadingCopy::write(home, &published.toml)?;
-    write_summary(
-        &mut std::io::stdout().lock(),
-        &manifest,
-        &published.company.key.fingerprint(),
-        os,
-    )?;
+    print_summary(&manifest, &published.company.key.fingerprint(), os)?;
     println!(
         "  Read the whole manifest before you sign: {}\n",
         reading.0.display()
@@ -3517,9 +3528,9 @@ async fn check_json(
                     Some(report) => json_out::document(&report),
                     None => json_out::error(&outcome.failure_text()),
                 }
-                outcome.exit_code()
+                json_out::settle(outcome.exit_code())
             }
-            Err(error) => json_out::failed(&format!("{error:#}")),
+            Err(error) => json_out::settle(json_out::failed(&format!("{error:#}"))),
         }
     })
     .await
@@ -3856,7 +3867,7 @@ async fn accept(home: &Home, yes: bool, insecure_dev: bool) -> Result<ExitCode> 
         let os = current_os()?;
         let reading = ReadingCopy::write(home, &published.toml)?;
         println!("The gateway now enforces a new manifest:\n");
-        write_summary(&mut std::io::stdout().lock(), &new, &company, os)?;
+        print_summary(&new, &company, os)?;
         println!("Changes against the manifest you signed ({}):", old.hash());
         let changes = manifest_changes(&old, &new);
         if changes.is_empty() {
@@ -4021,9 +4032,9 @@ async fn accept_preview_json(
         match accept_preview(home, insecure_dev).await {
             Ok(preview) => {
                 json_out::document(&preview);
-                ExitCode::SUCCESS
+                json_out::settle(ExitCode::SUCCESS)
             }
-            Err(error) => json_out::failed(&format!("{error:#}")),
+            Err(error) => json_out::settle(json_out::failed(&format!("{error:#}"))),
         }
     })
     .await
@@ -4162,13 +4173,13 @@ async fn join_preview_json(
         match join_preview(home, invitation, insecure_dev).await {
             Ok((preview, matches)) => {
                 json_out::document(&preview);
-                if matches {
+                json_out::settle(if matches {
                     ExitCode::SUCCESS
                 } else {
                     ExitCode::FAILURE
-                }
+                })
             }
-            Err(error) => json_out::failed(&format!("{error:#}")),
+            Err(error) => json_out::settle(json_out::failed(&format!("{error:#}"))),
         }
     })
     .await
@@ -4217,11 +4228,11 @@ async fn join_json(
         };
         let code = match run_wizard(home, invitation, no_wait, operation).await {
             Ok(code) => code,
-            Err(error) => return json_out::failed(&format!("{error:#}")),
+            Err(error) => return json_out::settle(json_out::failed(&format!("{error:#}"))),
         };
         let enrolment = home.read_json::<Enrolment>("enrolment.json").ok().flatten();
         let denied_claim = json_out::claim().is_some_and(|report| !report.accepted);
-        match enrolment {
+        let code = match enrolment {
             Some(enrolment) if code == ExitCode::SUCCESS || denied_claim => {
                 json_out::finish(
                     join_result(home, &enrolment),
@@ -4236,7 +4247,8 @@ async fn join_json(
                 );
                 code
             }
-        }
+        };
+        json_out::settle(code)
     })
     .await
 }
@@ -4402,13 +4414,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
     }
     let home = Home::new(cli.home)?;
     #[cfg(windows)]
-    if !matches!(
-        &cli.command,
-        Command::Status(_)
-            | Command::Manifest {
-                command: ManifestCommand::Show
-            }
-    ) {
+    if recovers_vpn_first(&cli.command) {
         match home.recover_vpn_at_startup() {
             Ok(true) => {}
             Ok(false) => {
@@ -4545,6 +4551,62 @@ async fn run(cli: Cli) -> Result<ExitCode> {
     }
 }
 
+/// Whether the command repairs an interrupted VPN installation before it runs. A command that only
+/// reads, or that promises to write no file, does not.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn recovers_vpn_first(command: &Command) -> bool {
+    !matches!(
+        command,
+        Command::Status(_)
+            | Command::Manifest {
+                command: ManifestCommand::Show
+            }
+            | Command::Join { preview: true, .. }
+            | Command::Accept { preview: true, .. }
+    )
+}
+
+/// Whether the command line asked for JSON output, so a failure to parse it is JSON too.
+fn args_ask_for_json(args: &[std::ffi::OsString]) -> bool {
+    args.iter()
+        .skip(1)
+        .take_while(|arg| *arg != "--")
+        .any(|arg| arg == "--json" || arg == "--preview")
+}
+
+/// The error line for a command line that does not parse, when it asked for JSON. Help and version
+/// output, and the errors of a command line that did not ask for JSON, stay as clap prints them.
+fn usage_error_line(args: &[std::ffi::OsString], error: &clap::Error) -> Option<String> {
+    if !error.use_stderr() || !args_ask_for_json(args) {
+        return None;
+    }
+    let text = error.to_string();
+    let first = text.split("\n\n").next().unwrap_or_default().trim();
+    let first = first.strip_prefix("error: ").unwrap_or(first);
+    Some(serde_json::json!({ "error": first }).to_string())
+}
+
+/// Polls `future` so that a panic in it comes back as an error.
+async fn catch_panic(future: impl Future<Output = Result<ExitCode>>) -> Result<ExitCode> {
+    let mut future = std::pin::pin!(future);
+    std::future::poll_fn(|cx| {
+        let polled =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| future.as_mut().poll(cx)));
+        match polled {
+            Ok(poll) => poll,
+            Err(payload) => {
+                let text = payload
+                    .downcast_ref::<&str>()
+                    .map(|text| (*text).to_owned())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown cause".to_owned());
+                std::task::Poll::Ready(Err(anyhow::anyhow!("internal error: {text}")))
+            }
+        }
+    })
+    .await
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     // Rust ignores SIGPIPE, so `open-pact-client log show | head` would panic on a closed pipe.
@@ -4552,12 +4614,28 @@ async fn main() -> ExitCode {
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
-    let cli = Cli::parse();
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let cli = match Cli::try_parse_from(&args) {
+        Ok(cli) => cli,
+        Err(error) => match usage_error_line(&args, &error) {
+            Some(line) => {
+                let _ = writeln!(std::io::stdout(), "{line}");
+                return ExitCode::from(2);
+            }
+            None => error.exit(),
+        },
+    };
     let json = cli.prints_json();
-    match run(cli).await {
+    let result = if json {
+        catch_panic(run(cli)).await
+    } else {
+        run(cli).await
+    };
+    match result {
         Ok(code) => code,
         Err(e) if json => {
-            println!("{}", serde_json::json!({ "error": format!("{e:#}") }));
+            let line = serde_json::json!({ "error": format!("{e:#}") });
+            let _ = writeln!(std::io::stdout(), "{line}");
             ExitCode::FAILURE
         }
         Err(e) => {
@@ -9361,8 +9439,8 @@ grace = "1d"
         assert_eq!(snapshot(dir.path()), before);
     }
 
-    #[tokio::test]
-    async fn join_json_prints_the_wizard_events_until_it_waits_for_it() {
+    /// A gateway that serves a witnessed manifest and enrols a device as pending, and an invitation to it.
+    async fn witnessed_join_fixture() -> (FakeGateway, String) {
         let witness = Witness::new();
         let toml = witnessed_manifest(&witness);
         let company = Company::new();
@@ -9396,6 +9474,12 @@ grace = "1d"
             open_pact_core::InvitationCode::from_bytes([7; 32]),
         )
         .encode();
+        (gateway, invitation)
+    }
+
+    #[tokio::test]
+    async fn join_json_prints_the_wizard_events_until_it_waits_for_it() {
+        let (gateway, invitation) = witnessed_join_fixture().await;
         let dir = tempfile::tempdir().unwrap();
         let home = Home(dir.path().to_path_buf());
         let (capture, json) = json_capture();
@@ -9699,5 +9783,213 @@ grace = "1d"
             .iter()
             .find(|change| change.id == "password_min_length");
         assert!(gone.is_some_and(|change| change.before.is_some() && change.after.is_none()));
+    }
+    // ----- JSON output stays clean on the real stdout and stderr -----
+
+    const CHILD: &str = "OPEN_PACT_JSON_TEST_CHILD";
+    const BEGIN: &str = "BEGIN-JSON-OUTPUT";
+    const END: &str = "END-JSON-OUTPUT";
+
+    /// True in the child process that `run_child` starts for the test `name`.
+    fn in_child(name: &str) -> bool {
+        std::env::var(CHILD).as_deref() == Ok(name)
+    }
+
+    /// Runs the test `name` again in a child of this test binary, so the test sees the real stdout
+    /// and stderr of a process. The parent test judges the child's output.
+    fn run_child(name: &str, stderr: std::process::Stdio) -> std::process::Output {
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &format!("tests::{name}"), "--nocapture"])
+            .args(["--test-threads=1"])
+            .env(CHILD, name)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(stderr)
+            .output()
+            .unwrap()
+    }
+
+    /// The lines the child wrote to its stdout between its markers.
+    fn marked_lines(stdout: &str) -> Vec<&str> {
+        stdout
+            .lines()
+            .skip_while(|line| *line != BEGIN)
+            .skip(1)
+            .take_while(|line| *line != END)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn child_join_json_on_the_real_stdout() {
+        if !in_child("child_join_json_on_the_real_stdout") {
+            return;
+        }
+        let (_gateway, invitation) = witnessed_join_fixture().await;
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+        println!("\n{BEGIN}");
+        let code = join_json(
+            &home,
+            Some(&invitation),
+            true,
+            true,
+            false,
+            Duration::from_millis(1),
+            json_out::Json::new(std::io::stdout(), json_out::Answers::default()),
+        )
+        .await;
+        println!("{END}");
+        assert_eq!(code, ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn a_new_join_with_json_writes_only_json_to_the_real_stdout() {
+        let output = run_child(
+            "child_join_json_on_the_real_stdout",
+            std::process::Stdio::null(),
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{stdout}");
+        let lines = marked_lines(&stdout);
+        assert!(lines.len() > 8, "{stdout}");
+        for line in &lines {
+            let value: Value = serde_json::from_str(line)
+                .unwrap_or_else(|error| panic!("stdout holds {line:?}: {error}"));
+            assert!(value.is_object(), "{line}");
+        }
+        assert!(
+            lines.last().unwrap().contains("\"result\":\"enrolled\""),
+            "{lines:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn child_warning_on_a_broken_stderr() {
+        if !in_child("child_warning_on_a_broken_stderr") {
+            return;
+        }
+        let (capture, json) = json_capture();
+        let code = json_out::scope(json, async {
+            eprintln!("warning: fictional split view");
+            json_out::failed("fictional failure")
+        })
+        .await;
+        println!("\n{BEGIN}\nSURVIVED\n{END}");
+        assert_eq!(code, ExitCode::FAILURE);
+        assert_eq!(capture.lines(), [json!({"error": "fictional failure"})]);
+    }
+
+    #[test]
+    fn a_warning_on_a_broken_stderr_does_not_panic() {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        let output = run_child(
+            "child_warning_on_a_broken_stderr",
+            std::process::Stdio::from(writer),
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{stdout}");
+        assert_eq!(marked_lines(&stdout), ["SURVIVED"]);
+    }
+
+    #[tokio::test]
+    async fn a_panic_in_a_command_comes_back_as_an_error() {
+        let result = catch_panic(async { panic!("fictional panic") }).await;
+        let text = format!("{:#}", result.expect_err("a panic is an error"));
+        assert!(text.contains("fictional panic"), "{text}");
+        let result = catch_panic(async { Ok(ExitCode::SUCCESS) }).await;
+        assert!(matches!(result, Ok(code) if code == ExitCode::SUCCESS));
+    }
+
+    struct Broken;
+
+    impl Write for Broken {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("fictional full disk"))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_document_that_cannot_be_written_fails_the_command() {
+        let company = Company::new();
+        let toml = DEMO_MANIFEST.to_string();
+        let (_gateway, invitation) = preview_gateway(&company, &toml).await;
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+        let json = json_out::Json::new(Broken, json_out::Answers::default());
+
+        let code = join_preview_json(&home, &invitation.encode(), false, json).await;
+
+        assert_eq!(code, ExitCode::FAILURE);
+    }
+
+    #[tokio::test]
+    async fn a_failed_write_is_remembered_until_the_command_ends() {
+        let json = json_out::Json::new(Broken, json_out::Answers::default());
+        let (before, after) = json_out::scope(json, async {
+            let before = json_out::write_failure();
+            json_out::document(&json!({"fictional": true}));
+            (before, json_out::write_failure())
+        })
+        .await;
+        assert_eq!(before, None);
+        assert!(after.is_some_and(|error| error.contains("fictional full disk")));
+    }
+
+    #[test]
+    fn startup_vpn_recovery_skips_the_commands_that_write_no_file() {
+        let parse = |args: &[&str]| {
+            let mut all = vec!["open-pact-client"];
+            all.extend_from_slice(args);
+            Cli::try_parse_from(all).unwrap()
+        };
+        for skipped in [
+            &["status"][..],
+            &["manifest", "show"],
+            &["join", "--preview", "opi1:fictional"],
+            &["accept", "--preview"],
+        ] {
+            assert!(!recovers_vpn_first(&parse(skipped).command), "{skipped:?}");
+        }
+        for recovering in [
+            &["check"][..],
+            &["check", "--json"],
+            &["join", "opi1:fictional"],
+            &["accept"],
+        ] {
+            assert!(
+                recovers_vpn_first(&parse(recovering).command),
+                "{recovering:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_command_line_that_does_not_parse_gets_a_json_error_when_it_asked_for_json() {
+        let line = |args: &[&str]| {
+            let mut all = vec!["open-pact-client"];
+            all.extend_from_slice(args);
+            let all: Vec<std::ffi::OsString> = all.into_iter().map(Into::into).collect();
+            let error = Cli::try_parse_from(&all).map(|_| ()).unwrap_err();
+            usage_error_line(&all, &error)
+        };
+        for args in [
+            &["join", "--json", "--yes", "--auto-send", "maybe"][..],
+            &["join", "--preview"],
+            &["check", "--json", "--bogus"],
+            &["status", "--json", "--bogus"],
+        ] {
+            let text = line(args).unwrap_or_else(|| panic!("{args:?} has no JSON error"));
+            let document: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(document.as_object().unwrap().len(), 1, "{text}");
+            assert!(!document["error"].as_str().unwrap().is_empty(), "{text}");
+            assert!(!text.contains('\n'), "{text}");
+        }
+        assert_eq!(line(&["join", "--bogus"]), None);
+        assert_eq!(line(&["check", "--bogus"]), None);
     }
 }

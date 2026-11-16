@@ -113,6 +113,8 @@ struct State {
     claim: Option<ClaimReport>,
     notes: Vec<String>,
     partial: String,
+    /// The first line that could not be written. The command fails when its output was lost.
+    write_error: Option<String>,
 }
 
 pub(crate) struct Json {
@@ -137,15 +139,22 @@ impl Json {
     }
 
     fn line(&self, value: &impl Serialize, pretty: bool) {
+        if let Err(error) = self.write_line(value, pretty) {
+            self.state.lock().unwrap().write_error.get_or_insert(error);
+        }
+    }
+
+    fn write_line(&self, value: &impl Serialize, pretty: bool) -> Result<(), String> {
         let text = if pretty {
             serde_json::to_string_pretty(value)
         } else {
             serde_json::to_string(value)
-        };
-        let Ok(text) = text else { return };
+        }
+        .map_err(|error| format!("could not serialize the output: {error}"))?;
         let mut out = self.out.lock().unwrap();
-        let _ = writeln!(out, "{text}");
-        let _ = out.flush();
+        writeln!(out, "{text}")
+            .and_then(|()| out.flush())
+            .map_err(|error| format!("could not write the output: {error}"))
     }
 
     fn step_event(&self, step: u8, title: &str, state: StepState, detail: Option<Value>) {
@@ -222,6 +231,23 @@ pub(crate) fn last_note() -> Option<String> {
             .map(str::to_owned)
     })
     .flatten()
+}
+
+/// Why a line of output was lost, if one was. A command that lost its output did not deliver its
+/// result, so it must not exit with success.
+pub(crate) fn write_failure() -> Option<String> {
+    with(|json| json.state.lock().unwrap().write_error.clone()).flatten()
+}
+
+/// The exit code of a command that ran under [`scope`]: failure when its output was lost.
+pub(crate) fn settle(code: ExitCode) -> ExitCode {
+    match write_failure() {
+        Some(error) => {
+            let _ = writeln!(std::io::stderr(), "error: {error}");
+            ExitCode::FAILURE
+        }
+        None => code,
+    }
 }
 
 /// Prints one JSON document.
