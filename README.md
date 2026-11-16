@@ -2,7 +2,7 @@
 
 Optional desktop apps for [open-pact](https://github.com/gaboe/open-pact). `open-pact` joins a company, reviews manifests, and sends device checks. `open-pact-admin` edits deployment manifests and manages devices.
 
-The apps only run `open-pact-client` and `kubectl`. They never call the gateway or Kubernetes APIs directly. The collapsed Terminal panel shows each command, its input, output, and exit code.
+The apps only run `open-pact-client` and `kubectl`. They never call the gateway or Kubernetes APIs directly. The Terminal strip at the bottom of each window opens to show each command, its input, output, and exit code.
 
 ## Build the apps
 

@@ -1,3 +1,4 @@
+use crate::text::humanize;
 use toml_edit::{DocumentMut, Item, Value};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -17,9 +18,35 @@ pub enum Kind {
 #[derive(Clone, Debug)]
 pub struct Field {
     pub path: Vec<Part>,
+    pub section: String,
     pub label: String,
     pub kind: Kind,
     pub value: String,
+}
+
+fn field_names(path: &[Part]) -> (String, String) {
+    let Some(Part::Key(first)) = path.first() else {
+        return ("Manifest".into(), String::new());
+    };
+    if path.len() == 1 {
+        return ("Manifest".into(), humanize(first));
+    }
+    let section = match first.as_str() {
+        "company" => "Company".into(),
+        "schedule" => "Automatic sending".into(),
+        "controls" => "Checks".into(),
+        other => humanize(other),
+    };
+    let noun = if first == "controls" { "Check" } else { "Item" };
+    let label = path[1..]
+        .iter()
+        .map(|part| match part {
+            Part::Key(key) => humanize(key),
+            Part::Index(index) => format!("{noun} {}", index + 1),
+        })
+        .collect::<Vec<_>>()
+        .join(" · ");
+    (section, label)
 }
 
 pub fn fields(text: &str) -> Result<Vec<Field>, String> {
@@ -59,20 +86,14 @@ pub fn fields(text: &str) -> Result<Vec<Field>, String> {
             Value::Array(_) => Kind::List,
             _ => Kind::Text,
         };
-        let label = path
-            .iter()
-            .map(|p| match p {
-                Part::Key(k) => k.clone(),
-                Part::Index(i) => format!("[{}]", i + 1),
-            })
-            .collect::<Vec<_>>()
-            .join(" / ");
+        let (section, label) = field_names(&path);
         let value = value
             .as_str()
             .map(str::to_owned)
             .unwrap_or_else(|| value.to_string().trim().into());
         output.push(Field {
             path,
+            section,
             label,
             kind,
             value,

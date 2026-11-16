@@ -124,6 +124,26 @@ fn every_toml_value_has_an_editable_control() {
 }
 
 #[test]
+fn form_labels_use_readable_names() {
+    let text = "manifest_version = 1\n[schedule]\ninterval = \"55m\"\n[[controls]]\nid = \"disk\"\nrequire = { min = 10 }\n";
+    let labels: Vec<_> = manifest::fields(text)
+        .unwrap()
+        .into_iter()
+        .map(|field| (field.section, field.label))
+        .collect();
+    assert_eq!(
+        labels,
+        [
+            ("Manifest", "Manifest version"),
+            ("Automatic sending", "Interval"),
+            ("Checks", "Check 1 · ID"),
+            ("Checks", "Check 1 · Require · Min"),
+        ]
+        .map(|(section, label)| (section.to_owned(), label.to_owned()))
+    );
+}
+
+#[test]
 fn list_editor_adds_edits_and_removes_items() {
     use manifest::ListEdit;
     let text = "folders = [\"one\", \"two\"]\n";

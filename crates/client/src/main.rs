@@ -1,13 +1,16 @@
 use gpui::{prelude::*, *};
 use gpui_component::{
-    Disableable,
+    Disableable, Sizable,
     button::{Button, ButtonVariants},
+    checkbox::Checkbox,
     input::{Input, InputState},
+    switch::Switch,
 };
 use runner::{
     Runner,
     client::{self, Changes, Check, Client, JoinEvent, Preview, Screen, Status},
     desktop::*,
+    text::*,
 };
 use std::{
     path::PathBuf,
@@ -202,129 +205,229 @@ impl AppView {
         }
     }
 
-    fn action(
+    fn button(
         &self,
         id: &'static str,
-        label: &'static str,
+        text: &'static str,
         operation: impl Fn(&Self, &App) -> Operation + 'static,
+        primary: bool,
         cx: &Context<Self>,
     ) -> Button {
-        Button::new(id)
-            .label(label)
-            .self_end()
-            .primary()
+        let button = Button::new(id)
+            .label(text)
             .disabled(self.busy)
             .on_click(cx.listener(move |this, _, _, cx| {
                 let operation = operation(this, cx);
                 this.run(operation, cx);
-            }))
+            }));
+        if primary { button.primary() } else { button }
+    }
+
+    fn action(
+        &self,
+        id: &'static str,
+        text: &'static str,
+        operation: impl Fn(&Self, &App) -> Operation + 'static,
+        cx: &Context<Self>,
+    ) -> Button {
+        self.button(id, text, operation, true, cx)
     }
 
     fn content(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         match self.screen.clone() {
-            Screen::Install => column()
-                .child(title("Set up open-pact on this computer"))
-                .child("open-pact does its work with a small command line tool that comes with this app. It goes to a fixed place so the scheduled check keeps working when you move or update the app.")
-                .child(row("Command line tool", if cfg!(windows) { "%LOCALAPPDATA%\\open-pact\\open-pact-client.exe" } else { "~/.local/bin/open-pact-client" }))
-                .child(row("Version", self.client.runner.logs().into_iter().find(|entry| entry.args == ["--version"]).map(|entry| entry.stdout.trim().to_owned()).unwrap_or_else(|| "Bundled command line tool".into())))
-                .child(Button::new("also-terminal").label(if self.also_terminal { "Also use it in Terminal · on" } else { "Also use it in Terminal · off" }).disabled(self.busy).on_click(cx.listener(|this, _, _, cx| { this.also_terminal = !this.also_terminal; cx.notify(); })))
-                .child(note("Adds the folder to your PATH. You can skip this. Open a new Terminal after installation."))
-                .child(self.action("install", "Install and continue", |this, _| Operation::Install(this.also_terminal), cx))
-                .child(note("copies the bundled tool, then runs open-pact-client --version")),
+            Screen::Install => {
+                let version = self
+                    .client
+                    .runner
+                    .logs()
+                    .into_iter()
+                    .find(|entry| entry.args == ["--version"])
+                    .map(|entry| entry.stdout.trim().to_owned())
+                    .unwrap_or_else(|| "Bundled command line tool".into());
+                let location = if cfg!(windows) {
+                    "%LOCALAPPDATA%\\open-pact\\open-pact-client.exe"
+                } else {
+                    "~/.local/bin/open-pact-client"
+                };
+                column()
+                    .child(title("Set up open-pact on this computer"))
+                    .child(div().text_color(rgb(INK_2)).child("open-pact does its work with a small command line tool that comes with this app. It goes to a fixed place so the scheduled check keeps working when you move or update the app."))
+                    .child(table()
+                        .child(row("Command line tool", div().font_family(mono()).text_size(px(13.)).child(location)))
+                        .child(row("Version", version)))
+                    .child(column().gap_1()
+                        .child(Checkbox::new("also-terminal").label("Also use it in Terminal").checked(self.also_terminal).disabled(self.busy)
+                            .on_click(cx.listener(|this, checked: &bool, _, cx| { this.also_terminal = *checked; cx.notify(); })))
+                        .child(note("Adds the folder to your PATH. You can skip this. Open a new Terminal after installation.").pl(px(26.))))
+                    .child(actions().child(self.action("install", "Install and continue", |this, _| Operation::Install(this.also_terminal), cx)))
+                    .child(runs("copies the bundled tool, then runs", "open-pact-client --version"))
+            }
             Screen::Invitation => column()
                 .child(title("Join your company"))
-                .child("Paste the invitation line that IT sent you. It starts with opi1: and works once, for 72 hours.")
-                .child("Invitation")
-                .child(Input::new(&self.invitation))
-                .child(self.action("continue", "Continue", |this, cx| Operation::Preview(this.invitation.read(cx).value().to_string()), cx))
-                .child(note("runs open-pact-client join --preview 'opi1:…'")),
+                .child(div().text_color(rgb(INK_2)).child("Paste the invitation line that IT sent you. It starts with opi1: and works once, for 72 hours."))
+                .child(column().gap_1p5().child(label("Invitation")).child(Input::new(&self.invitation)))
+                .child(actions().child(self.action("continue", "Continue", |this, cx| Operation::Preview(this.invitation.read(cx).value().to_string()), cx)))
+                .child(runs("runs", "open-pact-client join --preview 'opi1:…'")),
             Screen::Review(preview) => {
                 if self.folders.is_empty() {
                     self.folders = preview.folders.iter().map(|folder| cx.new(|cx| InputState::new(window, cx).default_value(folder.clone()))).collect();
                 }
-                let mut view = column().child(title(format!("{} asks to check this device", preview.company.name)))
-                    .child(note(format!("Company key {} {}", preview.company.key_fingerprint, if preview.company.matches_invitation { "matches your invitation" } else { "does not match your invitation" })).text_color(rgb(if preview.company.matches_invitation { 0x2e7d4f } else { 0xb3261e })));
-                for control in preview.controls.iter().take(if self.all_controls { usize::MAX } else { 5 }) {
-                    view = view.child(row(control.title.clone(), display(&control.requirement)));
+                let matches = preview.company.matches_invitation;
+                let key_color = rgb(if matches { 0x2e7d4f } else { BAD });
+                let shown = if self.all_controls { usize::MAX } else { 5 };
+                let mut checks = table();
+                for control in preview.controls.iter().take(shown) {
+                    checks = checks.child(row(control.title.clone(), plain_value(&control.requirement)));
                 }
-                if preview.controls.len() > 5 {
-                    view = view.child(Button::new("show-all").label("Show all").on_click(cx.listener(|this, _, _, cx| { this.all_controls = true; cx.notify(); })));
+                if preview.controls.len() > 5 && !self.all_controls {
+                    checks = checks.child(row(note(format!("and {} more", preview.controls.len() - 5)), ghost("show-all", "Show all").on_click(cx.listener(|this, _, _, cx| { this.all_controls = true; cx.notify(); }))));
                 }
-                view = view.child(note(format!("Sent to the company: {}", preview.disclosed_metadata.iter().map(display).collect::<Vec<_>>().join(", "))));
-                for folder in &self.folders { view = view.child(Input::new(folder)); }
-                view = view.child(Button::new("automatic").label(if self.automatic { "☑ Send results automatically" } else { "☐ Send results automatically" })
-                    .disabled(preview.schedule.is_none() || self.busy)
-                    .on_click(cx.listener(|this, _, _, cx| { this.automatic = !this.automatic; cx.notify(); })))
-                    .child(note(preview.schedule.as_ref().map(schedule_text).unwrap_or_else(|| "No automatic sending schedule.".into())))
-                    .child(Button::new("cancel").label("Cancel").disabled(self.busy).on_click(cx.listener(|this, _, _, cx| { this.screen = Screen::Invitation; cx.notify(); })))
-                    .child(self.action("join", "Sign and join", |this, cx| Operation::Join(this.invitation.read(cx).value().to_string(), this.folders.iter().map(|p| p.read(cx).value().to_string()).collect(), this.automatic), cx).disabled(self.busy || !preview.company.matches_invitation))
-                    .child(note("runs open-pact-client join --yes --json --auto-send on|off 'opi1:…'"));
-                view
+                let mut view = column().gap(px(14.)).child(title(format!("{} asks to check this device", preview.company.name)))
+                    .child(div().flex().flex_wrap().items_center().gap_2().text_size(px(13.)).text_color(key_color)
+                        .child(div().font_weight(FontWeight::BOLD).child(if matches { "✓" } else { "!" }))
+                        .child("Company key")
+                        .child(div().px(px(7.)).py(px(2.)).rounded(px(5.)).bg(rgb(if matches { 0xe5f2ea } else { BAD_WASH })).font_family(mono()).text_size(px(12.)).child(preview.company.key_fingerprint.clone()))
+                        .child(if matches { "matches your invitation" } else { "does not match your invitation" }))
+                    .child(checks)
+                    .child(note(format!("Sent to the company: {}.", preview.disclosed_metadata.iter().map(plain_value).collect::<Vec<_>>().join(", "))));
+                if !self.folders.is_empty() {
+                    view = view.child(column().gap_1p5().child(label("Folders to scan")).children(self.folders.iter().map(Input::new)));
+                }
+                view.child(column().gap_1()
+                        .child(Checkbox::new("automatic").label("Send results automatically").checked(self.automatic).disabled(preview.schedule.is_none() || self.busy)
+                            .on_click(cx.listener(|this, checked: &bool, _, cx| { this.automatic = *checked; cx.notify(); })))
+                        .child(note(preview.schedule.as_ref().map(schedule_text).unwrap_or_else(|| "No automatic sending schedule.".into())).pl(px(26.))))
+                    .child(actions()
+                        .child(Button::new("cancel").label("Cancel").disabled(self.busy).on_click(cx.listener(|this, _, _, cx| { this.screen = Screen::Invitation; cx.notify(); })))
+                        .child(self.action("join", "Sign and join", |this, cx| Operation::Join(this.invitation.read(cx).value().to_string(), this.folders.iter().map(|p| p.read(cx).value().to_string()).collect(), this.automatic), cx).disabled(self.busy || !matches)))
+                    .child(runs("runs", "open-pact-client join --yes --json --auto-send on|off 'opi1:…'"))
             }
-            Screen::Joining(events) => column().child(title("Joining your company"))
-                .children(events.iter().map(|event| match event {
-                    JoinEvent::Step { step, title, state, detail } => column().gap_1().child(format!("{step}. {title} · {state}")).child(note(detail.as_ref().map(display).unwrap_or_default())),
-                    JoinEvent::Result { result, device, .. } => column().child(format!("{result} · {device}")),
-                }))
+            Screen::Joining(events) => column().gap(px(14.)).child(title("Joining your company"))
+                .child(column().gap_4().children(events.iter().map(step_view)))
                 .child(note("Closing the window is safe. Reopen it to check saved status."))
-                .child(self.action("reload", "Refresh status", |_, _| Operation::Status, cx)),
+                .child(actions().child(self.action("reload", "Refresh status", |_, _| Operation::Status, cx))),
             Screen::Status(status) => {
-                let revoked = status.approval.state.as_deref() == Some("revoked");
-                if revoked { return column().child(banner("IT removed this device. Ask IT if this is a mistake.", 0xb3261e, 0xfbe6e4)); }
-                let heading = match status.verdict.as_str() { "no_known_problem" => "All good", "action_needed" => "Action needed", "alarm" => "Keep the last checkpoint and tell IT.", _ => "Current status is unknown" };
-                let mut view = column().child(banner(heading, if status.verdict == "no_known_problem" { 0x2e7d4f } else { 0x9a5b0c }, if status.verdict == "no_known_problem" { 0xe5f2ea } else { 0xfbeedc }));
-                for issue in &status.issues {
-                    view = view.child(column().gap_1().child(issue.message.clone()).child(note(issue.fix.clone().unwrap_or_default())).child(note(issue.deadline.clone())));
+                if status.approval.state.as_deref() == Some("revoked") {
+                    return column().child(verdict(Tone::Bad, "IT removed this device", "Ask IT if this is a mistake."));
                 }
-                view = view.child(note(status.current_compliance.clone()))
-                    .child(note(format!("Approval {} · {}", status.approval.state.as_deref().unwrap_or("unknown"), status.approval.source)))
-                    .child(row("Last result", status.last_claim.as_ref().map(|v| format!("{} · {}", display(&v["response_at"]), display(&v["response"]))).unwrap_or_else(|| "No saved result".into())))
-                    .child(row("Send results automatically", display(&status.schedule["policy"])))
-                    .child(row("Scheduled job", display(&status.schedule["job"])))
-                    .child(row("What is checked", status.manifest.as_ref().map(|v| display(&v["signed"])).unwrap_or_else(|| "Unknown".into())))
-                    .child(self.action("schedule", if status.schedule["owner_consented"] == true { "Turn automatic sending off" } else { "Turn automatic sending on" }, |this, _| {
-                        let enabled = matches!(&this.screen, Screen::Status(s) if s.schedule["owner_consented"] == true);
-                        Operation::Schedule(!enabled)
-                    }, cx))
-                    .child(div().flex().justify_end().gap_2()
-                        .child(Button::new("checks").label("Show every check").on_click(cx.listener(|this, _, _, cx| { this.all_controls = !this.all_controls; cx.notify(); })))
+                let head = headline(&status);
+                let mut view = column().child(verdict(head.tone, head.heading, head.detail));
+                if !status.issues.is_empty() {
+                    view = view.child(div().flex().flex_col().children(status.issues.iter().map(|issue| {
+                        div().flex().flex_col().gap_0p5().py(px(10.)).border_b_1().border_color(rgb(RULE_2))
+                            .child(div().font_weight(FontWeight::SEMIBOLD).child(issue.message.clone()))
+                            .when_some(issue.fix.clone(), |item, fix| item.child(div().text_size(px(14.)).text_color(rgb(INK_2)).child(fix)))
+                            .when_some(deadline_text(issue), |item, deadline| item.child(note(deadline)))
+                    })));
+                }
+                let consented = status.schedule["owner_consented"] == true;
+                let last_result = status.last_claim.as_ref().map(|claim| format!("{} · {}", readable_local(&plain_value(&claim["response_at"])), plain_value(&claim["response"]))).unwrap_or_else(|| "None saved yet".into());
+                let scheduled = status.schedule["last_scheduled_claim"].as_object().map(|claim| {
+                    [claim.get("answered_at").map(|v| readable_local(&plain_value(v))), claim.get("response").map(plain_value)].into_iter().flatten().filter(|part| !part.is_empty()).collect::<Vec<_>>().join(" · ")
+                });
+                let signed = status.manifest.as_ref().map(|m| plain_value(&m["signed"]));
+                let agreement = status.manifest.as_ref().and_then(|m| agreement_text(&plain_value(&m["agreement"])));
+                view = view
+                    .child(actions().child(Button::new("checks").label(if self.all_controls { "Hide every check" } else { "Show every check" }).on_click(cx.listener(|this, _, _, cx| { this.all_controls = !this.all_controls; cx.notify(); })))
                         .child(self.action("check", "Check now", |_, _| Operation::Check, cx)))
-                    .child(div().flex().justify_end().gap_2()
-                        .child(self.action("refresh", "Refresh status", |_, _| Operation::Status, cx))
-                        .child(self.action("changes", "Review changes", |_, _| Operation::Changes, cx)));
+                    .child(table()
+                        .child(row("Send results automatically", div().flex().items_center().gap_3()
+                            .child(plain_value(&status.schedule["policy"]))
+                            .child(Switch::new("schedule").checked(consented).disabled(self.busy).on_click(cx.listener(|this, checked: &bool, _, cx| this.run(Operation::Schedule(*checked), cx))))))
+                        .child(row("Last result", last_result.clone()))
+                        .when_some(scheduled.filter(|text| !text.is_empty() && *text != last_result), |view, text| view.child(row("Last scheduled result", text)))
+                        .child(row("Approval", approval_text(status.approval.state.as_deref(), status.approval.live)))
+                        .child(row("Scheduled job", job_text(&plain_value(&status.schedule["job"]))))
+                        .child(row("What is checked", div().flex().flex_col().items_end().gap_1()
+                            .child(div().flex().items_center().gap_2().child("Signed by you").when_some(signed, |line, hash| line.child(hash_chip(&hash))))
+                            .when_some(agreement, |col, text| col.child(note(text))))));
                 if self.all_controls {
+                    view = view.child(label("Every check"));
+                    let mut every = table();
                     if let Some(check) = &self.last_check {
-                        for control in &check.controls { view = view.child(note(display(control))); }
-                    } else if let Some(claim) = &status.last_claim { view = view.child(note(display(&claim["results"]))); }
+                        for control in &check.controls {
+                            let (name, value, ok) = result_control(control);
+                            every = every.child(row(name, div().text_color(rgb(if ok { 0x2e7d4f } else { BAD })).child(value)));
+                        }
+                    } else if let Some(results) = status.last_claim.as_ref().and_then(|claim| claim["results"].as_object()) {
+                        for (id, value) in results { every = every.child(row(humanize(id), plain_value(value))); }
+                    }
+                    view = view.child(every);
                     for limitation in &status.limitations { view = view.child(note(limitation.clone())); }
                 }
-                view.child(note("opening runs open-pact-client status --json; Check now runs open-pact-client check --json"))
+                view.child(div().flex().gap_1()
+                        .child(self.button("refresh", "Refresh status", |_, _| Operation::Status, false, cx).ghost().small())
+                        .child(self.button("changes", "Review changes", |_, _| Operation::Changes, false, cx).ghost().small()))
+                    .child(column().gap_1().child(runs("opening runs", "open-pact-client status --json")).child(runs("Check now runs", "open-pact-client check --json")))
             }
             Screen::Changed(changes) => {
-                let mut view = column().child(banner("Your company changed what is checked", BLUE, 0xe9eef8))
-                    .child("Review and sign the new list to keep sending results.");
-                for change in &changes.changes { view = view.child(row(display(&change["id"]), format!("{} → {}", display(&change["before"]), display(&change["after"])))); }
-                if changes.schedule_widened { view = view.child(note("Signing turns automatic sending off until you turn it on again, because the schedule widened.")); }
-                view.child(self.action("later", "Later", |_, _| Operation::Status, cx))
-                    .child(self.action("accept", "Review and sign", |_, _| Operation::Accept, cx))
-                    .child(note("runs open-pact-client accept --yes"))
+                let mut list = table();
+                for change in &changes.changes {
+                    let before = plain_value(&change["before"]);
+                    list = list.child(row(plain_value(&change["id"]), div().flex().gap_2()
+                        .child(duration_text(&plain_value(&change["after"])))
+                        .child(div().text_color(rgb(MUTED)).child(if before.is_empty() { "new".to_owned() } else { format!("was {}", duration_text(&before)) }))));
+                }
+                column().child(verdict(Tone::Info, "Your company changed what is checked", "Review and sign the new list to keep sending results."))
+                    .child(list)
+                    .when(changes.schedule_widened, |view| view.child(note("Signing turns automatic sending off until you turn it on again, because the schedule widened.")))
+                    .child(actions().child(self.button("later", "Later", |_, _| Operation::Status, false, cx)).child(self.action("accept", "Review and sign", |_, _| Operation::Accept, cx)))
+                    .child(runs("runs", "open-pact-client accept --yes"))
             }
         }
     }
 }
 
-fn display(value: &serde_json::Value) -> String {
-    value
-        .as_str()
-        .map(str::to_owned)
-        .unwrap_or_else(|| value.to_string())
+fn step_view(event: &JoinEvent) -> Div {
+    let (done, text, detail) = match event {
+        JoinEvent::Step {
+            title,
+            state,
+            detail,
+            ..
+        } => (state == "done", title.clone(), step_detail(detail.as_ref())),
+        JoinEvent::Result { result, .. } => (
+            true,
+            format!("Result sent: {}", plain_value(result)),
+            String::new(),
+        ),
+    };
+    let icon = if done {
+        div()
+            .size(px(18.))
+            .flex_none()
+            .mt(px(2.))
+            .rounded_full()
+            .bg(rgb(0x2e7d4f))
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_color(rgb(0xffffff))
+            .text_size(px(11.))
+            .font_weight(FontWeight::BOLD)
+            .child("✓")
+    } else {
+        div()
+            .size(px(18.))
+            .flex_none()
+            .mt(px(2.))
+            .rounded_full()
+            .border_2()
+            .border_color(rgb(BLUE))
+    };
+    div().flex().gap_3().items_start().child(icon).child(
+        column()
+            .gap_0p5()
+            .child(div().font_weight(FontWeight::SEMIBOLD).child(text))
+            .when(!detail.is_empty(), |view| view.child(note(detail))),
+    )
 }
 
 fn schedule_text(value: &serde_json::Value) -> String {
     let interval = value
         .get("interval")
         .or_else(|| value.get("every"))
-        .map(display)
+        .map(|interval| duration_text(&plain_value(interval)))
         .unwrap_or_else(|| "the signed interval".into());
     if value["mode"] == "vpn" || value["policy"] == "vpn" {
         format!("Every {interval} while on the company VPN. You can turn it off later.")
@@ -336,37 +439,36 @@ fn schedule_text(value: &serde_json::Value) -> String {
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let content = self.content(window, cx);
-        let mut view = column()
+        let mut page = column()
             .id("client")
-            .size_full()
+            .flex_1()
+            .min_h_0()
             .overflow_y_scroll()
-            .bg(rgb(0xffffff))
-            .text_color(rgb(INK))
-            .text_size(px(15.))
+            .gap_4()
             .p_7()
             .child(content);
         if self.busy {
-            view = view.child(note("Working…"));
+            page = page.child(note("Working…"));
         }
         if let Some(error) = &self.error {
-            view = view.child(banner(error.clone(), 0xb3261e, 0xfbe6e4));
+            page = page.child(banner(error.clone(), BAD, BAD_WASH));
         }
-        view = view.child(
-            Button::new("terminal")
-                .label(if self.terminal {
-                    "Terminal · hide"
-                } else {
-                    "Terminal · show"
-                })
-                .on_click(cx.listener(|this, _, _, cx| {
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(rgb(0xffffff))
+            .text_color(rgb(INK))
+            .text_size(px(15.))
+            .child(page)
+            .child(terminal_drawer(
+                self.terminal,
+                &self.client.runner,
+                cx.listener(|this, _, _, cx| {
                     this.terminal = !this.terminal;
                     cx.notify();
-                })),
-        );
-        if self.terminal {
-            view = view.child(terminal(&self.client.runner));
-        }
-        view
+                }),
+            ))
     }
 }
 

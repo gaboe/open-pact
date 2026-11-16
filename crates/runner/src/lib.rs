@@ -3,6 +3,7 @@ pub mod client;
 #[cfg(feature = "desktop")]
 pub mod desktop;
 pub mod manifest;
+pub mod text;
 
 use serde::de::DeserializeOwned;
 use std::io::{BufRead, BufReader, Read, Write};
