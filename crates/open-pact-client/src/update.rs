@@ -1,6 +1,7 @@
 //! The newer-release notice that `status --online` prints. It asks GitHub for the latest release
 //! and reports nothing when the check fails, so a slow or offline network never changes the status.
 
+use std::future::Future;
 use std::path::Path;
 use std::time::Duration;
 
@@ -34,17 +35,43 @@ impl Notice {
     }
 }
 
-pub(crate) async fn latest_notice() -> Option<Notice> {
+pub(crate) fn latest_notice() -> Option<Notice> {
     let switch = std::env::var(OPT_OUT).ok();
     let exe = std::env::current_exe().ok();
-    check(
-        switch.as_deref(),
-        LATEST_RELEASE,
-        CHECK_LIMIT,
-        env!("CARGO_PKG_VERSION"),
-        exe.as_deref(),
-    )
-    .await
+    bounded(CHECK_LIMIT, move || async move {
+        check(
+            switch.as_deref(),
+            LATEST_RELEASE,
+            CHECK_LIMIT,
+            env!("CARGO_PKG_VERSION"),
+            exe.as_deref(),
+        )
+        .await
+    })
+}
+
+/// Runs `work` on its own thread and waits at most `limit` for its answer. The thread is never
+/// joined: a DNS lookup that it started cannot be cancelled, and the CLI runtime must not wait for it.
+fn bounded<T, F, Fut>(limit: Duration, work: F) -> Option<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = Option<T>>,
+{
+    let (send, receive) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .spawn(move || {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            let answer = runtime.block_on(work());
+            let _ = send.send(answer);
+        })
+        .ok()?;
+    receive.recv_timeout(limit).ok().flatten()
 }
 
 async fn check(
@@ -58,13 +85,17 @@ async fn check(
         return None;
     }
     let tag = fetch_tag(url, limit, current).await?;
-    let latest = tag.strip_prefix('v')?;
-    if parse_semver(latest)? <= parse_semver(current)? {
+    let text = tag.strip_prefix('v')?;
+    let latest = semver::Version::parse(text).ok()?;
+    if !latest.pre.is_empty() {
+        return None;
+    }
+    if latest <= semver::Version::parse(current).ok()? {
         return None;
     }
     Some(Notice {
         current: current.into(),
-        latest: latest.into(),
+        latest: text.into(),
         command: exe.and_then(|path| install_command(&path.to_string_lossy())),
     })
 }
@@ -86,19 +117,6 @@ async fn fetch_tag(url: &str, limit: Duration, current: &str) -> Option<String> 
         .await
         .ok()?;
     Some(release.tag_name)
-}
-
-fn parse_semver(text: &str) -> Option<[u64; 3]> {
-    let mut parts = text.split('.');
-    let mut version = [0; 3];
-    for slot in &mut version {
-        let part = parts.next()?;
-        if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) {
-            return None;
-        }
-        *slot = part.parse().ok()?;
-    }
-    parts.next().is_none().then_some(version)
 }
 
 /// Homebrew and Scoop own their copies, so only they get a command. The desktop app updates its own copy.
@@ -203,6 +221,27 @@ mod tests {
     async fn the_same_or_an_older_release_gives_no_notice() {
         assert!(notice(r#"{"tag_name":"v0.6.0"}"#, "0.6.0").await.is_none());
         assert!(notice(r#"{"tag_name":"v0.5.9"}"#, "0.6.0").await.is_none());
+        assert!(
+            notice(r#"{"tag_name":"v0.6.0"}"#, "0.6.0+build.1")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stable_release_is_newer_than_the_release_candidate_before_it() {
+        let found = notice(r#"{"tag_name":"v0.6.0"}"#, "0.6.0-rc.1")
+            .await
+            .unwrap();
+        assert_eq!(found.latest, "0.6.0");
+    }
+
+    #[tokio::test]
+    async fn build_metadata_on_the_running_version_does_not_hide_a_newer_release() {
+        let found = notice(r#"{"tag_name":"v0.6.1"}"#, "0.6.0+build.1")
+            .await
+            .unwrap();
+        assert_eq!(found.latest, "0.6.1");
     }
 
     #[tokio::test]
@@ -219,6 +258,26 @@ mod tests {
             let found = check(None, &mock.url, Duration::from_secs(3), "0.6.0", None).await;
             assert!(found.is_none(), "{status} {reply}");
         }
+    }
+
+    #[test]
+    fn an_answer_inside_the_limit_comes_back() {
+        assert_eq!(bounded(CHECK_LIMIT, || async { Some(7) }), Some(7));
+    }
+
+    #[test]
+    fn a_check_that_blocks_past_the_limit_gives_no_answer() {
+        let start = std::time::Instant::now();
+        let found: Option<u8> = bounded(CHECK_LIMIT, || async {
+            std::thread::sleep(Duration::from_secs(10));
+            Some(1)
+        });
+        assert!(found.is_none());
+        assert!(
+            start.elapsed() < CHECK_LIMIT + Duration::from_secs(1),
+            "{:?}",
+            start.elapsed()
+        );
     }
 
     #[tokio::test]
@@ -285,13 +344,5 @@ mod tests {
             command: None,
         };
         assert_eq!(found.line(), "open-pact-client 0.6.1 is available.");
-    }
-
-    #[test]
-    fn semver_reads_three_numbers_only() {
-        assert_eq!(parse_semver("0.6.1"), Some([0, 6, 1]));
-        for text in ["0.6", "0.6.1.2", "0.6.x", "0.6.+1", "", "0..1"] {
-            assert_eq!(parse_semver(text), None, "{text}");
-        }
     }
 }

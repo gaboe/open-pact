@@ -128,8 +128,8 @@ impl Options {
 
 pub(crate) async fn run(home: &Home, options: Options, insecure_dev: bool) -> Result<ExitCode> {
     let mut report = collect(home, options.online, insecure_dev).await?;
-    if options.online {
-        report.update = crate::update::latest_notice().await;
+    if options.online && home.file("enrolment.json").exists() {
+        report.update = crate::update::latest_notice();
     }
     let text = if options.json {
         serde_json::to_string_pretty(&report)? + "\n"
