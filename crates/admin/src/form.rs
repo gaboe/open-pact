@@ -6,10 +6,13 @@ use gpui_component::{
     input::{Editor, Position, Textarea, TextareaState},
 };
 use runner::manifest::{
-    self, Control, Field, FieldError, Filter, Form, Os, Output, Pending, Requirement, SOURCES,
-    Span, TRUST_LEVELS, Unit,
+    self, Control, Field, FieldError, Filter, Form, ManifestCheck, Os, Output, Pending, Problems,
+    Requirement, SOURCES, Span, TRUST_LEVELS, Unit,
 };
-use std::{cell::Cell, rc::Rc};
+use std::{cell::Cell, rc::Rc, time::Duration};
+
+/// How long the draft stays unchanged before the CLI is asked about it.
+const CHECK_AFTER: Duration = Duration::from_millis(300);
 
 type Units = Entity<SelectState<Vec<SharedString>>>;
 /// Turns the app state and a new value into the new draft.
@@ -122,6 +125,10 @@ pub struct FormState {
     pub add_open: bool,
     /// Input the form could not read yet, one message per field.
     pub pending: Pending,
+    /// What the open-pact CLI said about the draft.
+    pub check: ManifestCheck,
+    /// Tests and snapshots set the answer themselves, so no CLI runs.
+    pub manual_check: bool,
     /// Where the Add check button was in the last paint: its top and the window height.
     add_anchor: Rc<Cell<(f32, f32)>>,
     pub adding_recipient: bool,
@@ -138,6 +145,17 @@ pub struct FormState {
 }
 
 impl FormState {
+    /// Sets the answer of the CLI for `draft`, as a snapshot scene needs it.
+    #[cfg(all(feature = "snapshot", target_os = "macos"))]
+    pub fn set_check(
+        &mut self,
+        draft: &str,
+        outcome: Result<Vec<runner::admin::CheckError>, String>,
+    ) {
+        let generation = self.check.begin();
+        self.check.finish(generation, draft, outcome);
+    }
+
     pub fn new(window: &mut Window, cx: &mut Context<AppView>) -> Self {
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Find a check"));
         let add_search = cx.new(|cx| InputState::new(window, cx).placeholder("Find a check"));
@@ -184,6 +202,8 @@ impl FormState {
             filter: Filter::All,
             add_open: false,
             pending: Pending::default(),
+            check: ManifestCheck::default(),
+            manual_check: false,
             add_anchor: Rc::new(Cell::new((0., 0.))),
             adding_recipient: false,
             jump: 0,
@@ -421,27 +441,50 @@ impl AppView {
         }
     }
 
-    /// Puts the draft into the TOML editor and marks the line of a parse error in it.
+    /// Puts the draft into the TOML editor, marks the lines the parser and the CLI refuse in it,
+    /// and asks the CLI about the draft.
     pub fn show_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let draft = self.draft.clone();
-        let error = draft.parse::<toml_edit::DocumentMut>().err();
         self.editor.update(cx, |state, cx| {
             if state.value().as_ref() != draft {
-                state.set_value(draft.clone(), window, cx);
+                state.set_value(draft, window, cx);
             }
+        });
+        self.mark_lines(cx);
+        self.check_draft(window, cx);
+    }
+
+    /// Marks the line of a parse error and the line of each CLI error that has one.
+    pub fn mark_lines(&mut self, cx: &mut Context<Self>) {
+        let draft = self.draft.clone();
+        let mut marks: Vec<(usize, String)> = Vec::new();
+        match draft.parse::<toml_edit::DocumentMut>() {
+            Err(error) => marks.push((
+                manifest::error_line(&draft, &error),
+                error.message().to_owned(),
+            )),
+            Ok(_) => marks.extend(
+                self.fv
+                    .check
+                    .result(&draft)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|error| Some((error.line?, error.message))),
+            ),
+        }
+        self.editor.update(cx, |state, cx| {
             let text = state.text().clone();
-            if let Some(marks) = state.diagnostics_mut() {
-                marks.reset(&text);
-                if let Some(error) = &error {
-                    let line = manifest::error_line(&draft, error).saturating_sub(1) as u32;
-                    let width = draft
-                        .lines()
-                        .nth(line as usize)
-                        .map_or(1, |l| l.chars().count()) as u32;
-                    marks.push(
+            if let Some(diagnostics) = state.diagnostics_mut() {
+                diagnostics.reset(&text);
+                let last = draft.lines().count().saturating_sub(1);
+                for (line, message) in marks {
+                    let line = line.saturating_sub(1).min(last);
+                    let width = draft.lines().nth(line).map_or(1, |l| l.chars().count()) as u32;
+                    let line = line as u32;
+                    diagnostics.push(
                         Diagnostic::new(
                             Position::new(line, 0)..Position::new(line, width.max(1)),
-                            error.message().to_owned(),
+                            message,
                         )
                         .with_severity(DiagnosticSeverity::Error),
                     );
@@ -449,6 +492,49 @@ impl AppView {
             }
             cx.notify();
         });
+    }
+
+    /// Asks the CLI about the draft once it has stayed the same for a moment. An answer that
+    /// arrives after the draft changed again is dropped.
+    fn check_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.fv.manual_check {
+            return;
+        }
+        let generation = self.fv.check.begin();
+        let draft = self.draft.clone();
+        if draft.parse::<toml_edit::DocumentMut>().is_err() {
+            return;
+        }
+        let admin = self.admin.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(CHECK_AFTER).await;
+            let current = this
+                .update(cx, |this, _| this.fv.check.is_current(generation))
+                .unwrap_or(false);
+            if !current {
+                return;
+            }
+            let asked = draft.clone();
+            let outcome = cx
+                .background_executor()
+                .spawn(async move { admin.check_manifest(&asked) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.fv.check.finish(generation, &draft, outcome) {
+                    this.mark_lines(cx);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Everything that stops a review of this draft.
+    fn problems(&self) -> Problems {
+        manifest::problems(
+            &self.fv.pending,
+            &self.fv.check.result(&self.draft).unwrap_or_default(),
+        )
     }
 
     fn bind_text(
@@ -810,6 +896,10 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if id != self.fv.selected && self.panel_blocked() {
+            cx.notify();
+            return;
+        }
         self.fv.selected = id;
         self.fv.add_open = false;
         self.build_panel(window, cx);
@@ -1125,7 +1215,25 @@ impl AppView {
         manifest::changes_between(&self.active, &self.draft)
     }
 
+    /// Why the check panel may not be replaced now. Its inputs hold text that is not a value yet,
+    /// and a new panel would drop it without a word.
+    fn panel_blocked(&mut self) -> bool {
+        let Ok(form) = Form::parse(&self.draft) else {
+            return false;
+        };
+        let Some(note) = self.fv.pending.panel_blocks(&form) else {
+            return false;
+        };
+        self.fv.add_open = false;
+        self.error = Some(note);
+        true
+    }
+
     fn add_check(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.panel_blocked() {
+            cx.notify();
+            return;
+        }
         match manifest::add_control(&self.draft, id) {
             Ok((text, _)) => {
                 self.fv.add_open = false;
@@ -1218,7 +1326,35 @@ impl AppView {
             .child(top)
             .child(notices)
             .child(body)
+            .children(self.error_list())
             .child(self.apply_bar(cx))
+    }
+
+    /// The errors that have no field to sit under, above the bottom bar. The TOML view has no
+    /// fields, so it lists every error.
+    fn error_list(&self) -> Option<Div> {
+        let form = Form::parse(&self.draft).ok()?;
+        let problems = self.problems();
+        let mut lines: Vec<String> = Vec::new();
+        if !self.form {
+            lines.extend(
+                problems
+                    .fields
+                    .iter()
+                    .map(|issue| format!("{}: {}", issue.field.label(&form), issue.message)),
+            );
+        }
+        lines.extend(problems.listed.iter().map(runner::admin::CheckError::text));
+        (!lines.is_empty()).then(|| {
+            div()
+                .flex_none()
+                .px(px(28.))
+                .pb(px(12.))
+                .child(error_block(format!(
+                    "The gateway or a client would refuse this manifest.\n{}",
+                    lines.join("\n")
+                )))
+        })
     }
 
     fn toml_body(&self, parse_error: Option<&toml_edit::TomlError>) -> Div {
@@ -1243,18 +1379,6 @@ impl AppView {
                 "Line {line}: {}. Fix it to switch back to Form or apply.",
                 error.message()
             )));
-        } else if let Ok(form) = Form::parse(&self.draft) {
-            let issues = manifest::problems(&form, &self.fv.pending);
-            if !issues.is_empty() {
-                let lines: Vec<String> = issues
-                    .iter()
-                    .map(|issue| format!("{}: {}", issue.field.label(&form), issue.message))
-                    .collect();
-                body = body.child(error_block(format!(
-                    "The gateway or a client would refuse this manifest.\n{}",
-                    lines.join("\n")
-                )));
-            }
         }
         body
     }
@@ -1278,7 +1402,7 @@ impl AppView {
             return fix("Fix the TOML first.".into());
         };
         let before = Form::parse(&self.active).ok();
-        let issues = manifest::problems(&form, &self.fv.pending);
+        let issues = self.problems().fields;
         let disabled = self.busy;
         let jumps = [
             "Agreement".to_owned(),
@@ -1405,11 +1529,12 @@ impl AppView {
             "Agreement",
             "Who asks for the checks and who answers for the data.",
             rows(vec![
-                kv_row(
+                kv_row_error(
                     "Issuer",
                     div()
                         .w(px(440.))
                         .child(Input::new(&inputs.issuer).disabled(disabled)),
+                    error_of(issues, &Field::Issuer),
                 ),
                 kv_row_error(
                     "Valid from",
@@ -1418,11 +1543,12 @@ impl AppView {
                         .child(Input::new(&inputs.valid_from).disabled(disabled)),
                     error_of(issues, &Field::ValidFrom),
                 ),
-                kv_row(
+                kv_row_error(
                     "Data controller",
                     div()
                         .w(px(440.))
                         .child(Input::new(&inputs.controller).disabled(disabled)),
+                    error_of(issues, &Field::Controller),
                 ),
                 kv_row("Results go to", chips),
             ]),
@@ -1488,7 +1614,11 @@ impl AppView {
                     self.duration(&inputs.unknown_grace, Some("then it counts as failed")),
                     error_of(issues, &Field::UnknownGrace),
                 ),
-                kv_row("Device key at least", trust),
+                kv_row_error(
+                    "Device key at least",
+                    trust,
+                    error_of(issues, &Field::Trust),
+                ),
             ]),
         )
     }
@@ -2016,15 +2146,14 @@ impl AppView {
                         .child(value)
                 }));
         let heading = match (&control.output, manifest::builtin(control.builtin_id())) {
-            (Output::Integer { .. }, Some(known)) if !known.noun.is_empty() => format!(
-                "Required: {} {}",
-                known.noun,
-                if control.limit_is_max() {
-                    "at most"
-                } else {
-                    "at least"
-                }
-            ),
+            (Output::Integer { .. }, Some(known)) if !known.noun.is_empty() => {
+                let direction = match (control.mixed_limits(), control.limit_is_max()) {
+                    (true, _) => "",
+                    (false, true) => " at most",
+                    (false, false) => " at least",
+                };
+                format!("Required: {}{direction}", known.noun)
+            }
             _ => "Required".to_owned(),
         };
         let mut requirements = div().grid().grid_cols(1).gap(px(8.));
@@ -2045,6 +2174,14 @@ impl AppView {
                             .flex()
                             .items_center()
                             .gap(px(6.))
+                            .child(
+                                div()
+                                    .w(px(14.))
+                                    .flex_none()
+                                    .text_size(px(14.))
+                                    .text_color(rgb(INK_2))
+                                    .child(control.limit_symbol(os)),
+                            )
                             .child(
                                 div()
                                     .w(px(72.))
@@ -2268,27 +2405,23 @@ impl AppView {
         let list = self.change_list();
         let changes = list.len();
         let form = Form::parse(&self.draft).ok();
-        let issues = form
-            .as_ref()
-            .map(|form| manifest::problems(form, &self.fv.pending))
-            .unwrap_or_default();
-        let can_review = !(self.busy || changes == 0 || form.is_none() || !issues.is_empty());
+        let problems = self.problems();
+        let checking = self.fv.check.result(&self.draft).is_none();
+        let can_review =
+            !(self.busy || changes == 0 || form.is_none() || checking || !problems.is_empty());
         let shown = list.iter().take(2).cloned().collect::<Vec<_>>().join(" · ");
         let summary = if changes > 2 {
             format!("{shown} · and {} more", changes - 2)
         } else {
             shown
         };
-        let blocked = form.as_ref().zip(issues.first()).map(|(form, first)| {
-            let more = match issues.len() {
+        let blocked = form.as_ref().and_then(|form| {
+            let first = problems.first(form)?;
+            let more = match problems.len() {
                 1 => String::new(),
                 rest => format!(" · and {} more", rest - 1),
             };
-            format!(
-                "Fix first. {}: {}{more}",
-                first.field.label(form),
-                first.message
-            )
+            Some(format!("Fix first. {first}{more}"))
         });
         div()
             .flex()
@@ -2321,6 +2454,7 @@ impl AppView {
                     .child(match blocked {
                         Some(blocked) => blocked,
                         None if changes == 0 => "Form and TOML edit the same text.".to_owned(),
+                        None if checking => "Checking the manifest...".to_owned(),
                         None => summary,
                     }),
             )

@@ -267,6 +267,16 @@ impl Runner {
         strict(self.execute(program, args, Some(input.to_owned()), |_| {})?)
     }
 
+    /// Like `input`, but a command that ran and exited with a nonzero code is not an error.
+    pub fn input_any(
+        &self,
+        program: &Path,
+        args: &[String],
+        input: &str,
+    ) -> Result<CommandLog, String> {
+        self.execute(program, args, Some(input.to_owned()), |_| {})
+    }
+
     fn execute(
         &self,
         program: &Path,

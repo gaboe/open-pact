@@ -1,5 +1,6 @@
 //! The manifest as the Form view reads and edits it. Every edit parses the text with toml_edit,
 //! changes one value and prints the document again, so comments and order stay as written.
+use crate::admin::CheckError;
 use crate::text::humanize;
 use chrono::{Datelike, NaiveDate};
 use std::collections::{BTreeMap, BTreeSet};
@@ -310,6 +311,22 @@ impl Control {
             }
         }
         builtin(self.builtin_id()).is_none_or(|known| known.max)
+    }
+
+    /// "≤" or "≥" for the number of one OS. An OS without a bound gets the control's default.
+    pub fn limit_symbol(&self, os: Os) -> &'static str {
+        let max = match self.requirement(os) {
+            Requirement::Max(_) => true,
+            Requirement::Min(_) => false,
+            _ => self.limit_is_max(),
+        };
+        if max { "≤" } else { "≥" }
+    }
+
+    /// Whether some OS has a maximum and another a minimum, so no one direction fits them all.
+    pub fn mixed_limits(&self) -> bool {
+        let has = |wanted: fn(&Requirement) -> bool| self.required.iter().any(wanted);
+        has(|r| matches!(r, Requirement::Max(_))) && has(|r| matches!(r, Requirement::Min(_)))
     }
 
     pub fn grace_text(&self) -> String {
@@ -1128,16 +1145,55 @@ pub fn changes_between(before: &str, after: &str) -> Vec<String> {
     if !other.is_empty() {
         list.push(format!("Other edits in TOML: {}", other.join(", ")));
     }
-    if list.is_empty() && before != after {
-        list.push("Other edits in TOML: comments or layout".into());
+    if comments(before) != comments(after) {
+        list.push("Comments changed in TOML".into());
+    } else if list.is_empty() && before != after {
+        list.push("Layout changed in TOML".into());
     }
     list
+}
+
+/// Every comment of a TOML text, in order. A `#` inside a string is no comment.
+fn comments(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut found = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'#' => {
+                let end = text[at..].find('\n').map_or(bytes.len(), |n| at + n);
+                found.push(text[at..end].trim_end().to_owned());
+                at = end;
+            }
+            quote @ (b'"' | b'\'') => {
+                let basic = quote == b'"';
+                if bytes[at..].starts_with(&[quote; 3]) {
+                    at += 3;
+                    while at < bytes.len() && !bytes[at..].starts_with(&[quote; 3]) {
+                        at += if basic && bytes[at] == b'\\' { 2 } else { 1 };
+                    }
+                    at += 3;
+                } else {
+                    at += 1;
+                    while at < bytes.len() && bytes[at] != b'\n' && bytes[at] != quote {
+                        at += if basic && bytes[at] == b'\\' { 2 } else { 1 };
+                    }
+                    at += 1;
+                }
+            }
+            _ => at += 1,
+        }
+    }
+    found
 }
 
 /// Where a problem sits in the form.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Field {
+    Issuer,
     ValidFrom,
+    Controller,
+    Trust,
     MaxAge,
     Retention,
     UnknownGrace,
@@ -1172,7 +1228,10 @@ impl Field {
                 .map_or_else(|| id.to_owned(), Control::name)
         };
         match self {
+            Self::Issuer => "Issuer".into(),
             Self::ValidFrom => "Valid from".into(),
+            Self::Controller => "Data controller".into(),
+            Self::Trust => "Device key at least".into(),
             Self::MaxAge => "A result is valid for".into(),
             Self::Retention => "Results are kept for".into(),
             Self::UnknownGrace => "Unknown is allowed for".into(),
@@ -1255,223 +1314,167 @@ impl Pending {
         }
     }
 
+    /// Why the panel may not be replaced: one of its inputs holds text that is not a value yet.
+    pub fn panel_blocks(&self, form: &Form) -> Option<String> {
+        let field = self.0.keys().find(|field| field.in_panel())?;
+        Some(format!(
+            "{} holds text that is not a value yet. Fix it before you switch checks.",
+            field.label(form)
+        ))
+    }
+
     /// The panel's inputs are gone, and so is the text they held.
     pub fn drop_panel(&mut self) {
         self.0.retain(|field, _| !field.in_panel());
     }
 }
 
-/// Everything that stops a review: unparsed input first, then what the gateway or a client
-/// would refuse.
-pub fn problems(form: &Form, pending: &Pending) -> Vec<FieldError> {
-    let mut all = pending.errors();
-    all.extend(validate(form));
+/// Everything that stops a review. Unparsed input is the form's own business. Every rule of the
+/// manifest comes from the open-pact CLI, which runs the same code as a client and the gateway.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Problems {
+    /// Shown under their field: unparsed input first, then the CLI errors whose key names one.
+    pub fields: Vec<FieldError>,
+    /// The CLI errors that name no field of the form.
+    pub listed: Vec<CheckError>,
+}
+
+impl Problems {
+    pub fn is_empty(&self) -> bool {
+        self.fields.is_empty() && self.listed.is_empty()
+    }
+
+    /// The first problem as one line, with its field name when it has one.
+    pub fn first(&self, form: &Form) -> Option<String> {
+        self.fields
+            .first()
+            .map(|first| format!("{}: {}", first.field.label(form), first.message))
+            .or_else(|| self.listed.first().map(CheckError::text))
+    }
+
+    pub fn len(&self) -> usize {
+        self.fields.len() + self.listed.len()
+    }
+}
+
+impl CheckError {
+    /// "Line 3: message" for an error with a line, else the message.
+    pub fn text(&self) -> String {
+        match self.line {
+            Some(line) => format!("Line {line}: {}", self.message),
+            None => self.message.clone(),
+        }
+    }
+}
+
+/// The form field that a CLI error key names, or `None` when the key names none. A key is a
+/// top-level name (`issuer`), `schedule.interval`, or `controls.<id>[.check|.required.<os>]`.
+pub fn field_of(key: &str) -> Option<Field> {
+    let key = key.trim();
+    if let Some(rest) = key
+        .strip_prefix("controls.")
+        .or_else(|| key.strip_prefix("control."))
+    {
+        let mut parts = rest.split('.');
+        let id = parts.next().filter(|id| !id.is_empty())?.to_owned();
+        return match (parts.next(), parts.next(), parts.next()) {
+            (Some("check"), None, _) => Some(Field::Id(id)),
+            (Some("grace"), None, _) => Some(Field::Grace(id)),
+            (Some("required"), Some(os), None) => Os::ALL
+                .into_iter()
+                .find(|known| known.key() == os)
+                .map(|os| Field::Requirement(id, os)),
+            _ => None,
+        };
+    }
+    let name = key.strip_prefix("schedule.").unwrap_or(key);
+    match name {
+        "issuer" => Some(Field::Issuer),
+        "valid_from" => Some(Field::ValidFrom),
+        "data_controller" => Some(Field::Controller),
+        "min_trust_level" | "trust" => Some(Field::Trust),
+        "claim_max_age" => Some(Field::MaxAge),
+        "claim_retention" => Some(Field::Retention),
+        "unknown_grace" => Some(Field::UnknownGrace),
+        "interval" => Some(Field::Interval),
+        "vpn_probe" => Some(Field::VpnProbe),
+        "vpn_probe_name" => Some(Field::VpnProbeName),
+        "mode" => Some(Field::Send),
+        _ => None,
+    }
+}
+
+/// Unparsed input first, then what the CLI refused, each error under its field when its key
+/// names one.
+pub fn problems(pending: &Pending, refused: &[CheckError]) -> Problems {
+    let mut all = Problems {
+        fields: pending.errors(),
+        listed: Vec::new(),
+    };
+    for error in refused {
+        match error.key.as_deref().and_then(field_of) {
+            Some(field) => all.fields.push(FieldError {
+                field,
+                message: error.message.clone(),
+            }),
+            None => all.listed.push(error.clone()),
+        }
+    }
     all
 }
 
-const SPAN_LIMIT: u64 = u64::MAX / (31 * 24 * 3600);
-
-/// A duration as the core reads it: whole hours, days, weeks or months.
-fn span_error(raw: &str) -> Option<String> {
-    let split = raw.find(|c: char| !c.is_ascii_digit()).unwrap_or(raw.len());
-    let (digits, suffix) = raw.split_at(split);
-    if !matches!(suffix, "h" | "d" | "w" | "mo") {
-        return Some("Use hours, days, weeks or months.".into());
-    }
-    match digits.parse::<u64>() {
-        Err(_) => Some("Type a whole number.".into()),
-        Ok(amount) if amount > SPAN_LIMIT => Some("This is too long.".into()),
-        Ok(_) => None,
-    }
+/// The answer of the CLI for one draft. A draft edited after the question was sent has no
+/// answer yet, and a reply to an older question is dropped.
+#[derive(Clone, Debug, Default)]
+pub struct ManifestCheck {
+    generation: u64,
+    checked: String,
+    outcome: Option<Result<Vec<CheckError>, String>>,
 }
 
-fn span_is_zero(raw: &str) -> bool {
-    Span::parse(raw).is_some_and(|span| span.amount == 0)
-}
-
-/// The sending interval as the core reads it: whole minutes or hours, 5 minutes to 24 hours.
-fn interval_error(raw: &str) -> Option<String> {
-    let bad = || Some("Use whole minutes or hours, from 5 minutes to 24 hours.".to_owned());
-    let (digits, hours) = match (raw.strip_suffix('m'), raw.strip_suffix('h')) {
-        (Some(digits), _) => (digits, false),
-        (_, Some(digits)) => (digits, true),
-        _ => return bad(),
-    };
-    if digits.is_empty()
-        || digits.starts_with('0')
-        || !digits.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return bad();
+impl ManifestCheck {
+    /// Starts a new question. Every earlier one is stale from now on.
+    pub fn begin(&mut self) -> u64 {
+        self.generation += 1;
+        self.generation
     }
-    let Ok(amount) = digits.parse::<u32>() else {
-        return bad();
-    };
-    let Some(minutes) = (if hours {
-        amount.checked_mul(60)
-    } else {
-        Some(amount)
-    }) else {
-        return bad();
-    };
-    if (5..=24 * 60).contains(&minutes) {
-        None
-    } else {
-        bad()
+
+    pub fn is_current(&self, generation: u64) -> bool {
+        self.generation == generation
     }
-}
 
-fn dns_name_ok(raw: &str) -> bool {
-    let label_ok = |label: &str| {
-        (1..=63).contains(&label.len())
-            && label
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-            && !label.starts_with('-')
-            && !label.ends_with('-')
-    };
-    let last = raw.rsplit('.').next().unwrap_or_default();
-    let numeric_last = !last.is_empty() && last.bytes().all(|byte| byte.is_ascii_digit());
-    raw.len() <= 253 && raw.split('.').all(label_ok) && !numeric_last
-}
-
-/// A `host:port` as the core reads it.
-fn probe_error(raw: &str) -> Option<String> {
-    if raw.is_empty() {
-        return Some("Type the address that answers only on the company VPN, as host:port.".into());
+    /// Keeps the reply to the question `generation` about `draft`. A stale reply is dropped and
+    /// the result is `false`.
+    pub fn finish(
+        &mut self,
+        generation: u64,
+        draft: &str,
+        outcome: Result<Vec<CheckError>, String>,
+    ) -> bool {
+        if !self.is_current(generation) {
+            return false;
+        }
+        self.checked = draft.to_owned();
+        self.outcome = Some(outcome);
+        true
     }
-    let ok = raw.rsplit_once(':').is_some_and(|(host, port)| {
-        let port_ok = !port.is_empty()
-            && port.bytes().all(|byte| byte.is_ascii_digit())
-            && port.parse::<u16>().is_ok_and(|port| port != 0);
-        let host_ok = match host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
-            Some(inner) => inner.parse::<std::net::Ipv6Addr>().is_ok(),
-            None => host.parse::<std::net::Ipv4Addr>().is_ok() || dns_name_ok(host),
-        };
-        port_ok && host_ok
-    });
-    (!ok).then(|| {
-        "Type host:port, such as 10.0.0.1:443. Put brackets around an IPv6 address.".into()
-    })
-}
 
-fn utc_timestamp(text: &str) -> bool {
-    text.ends_with('Z') && chrono::DateTime::parse_from_rfc3339(text).is_ok()
-}
-
-/// Why the core or a client would refuse this requirement for this output, if it would.
-fn requirement_error(control: &Control, requirement: &Requirement) -> Option<String> {
-    match requirement {
-        Requirement::Reported => None,
-        Requirement::Values(values) if values.is_empty() => {
-            Some("Choose a result, or Not required.".into())
+    /// The errors of the CLI for exactly this draft. `None` while the answer is not here. A CLI
+    /// that did not answer is one error, so it stops a review like any other.
+    pub fn result(&self, draft: &str) -> Option<Vec<CheckError>> {
+        if self.checked != draft {
+            return None;
         }
-        Requirement::Values(values) => {
-            let allowed = |value: &String| match &control.output {
-                Output::Choices(outputs) => outputs.contains(value),
-                Output::Timestamp { nullable, values } => {
-                    values.contains(value) || utc_timestamp(value) || (value == "null" && *nullable)
-                }
-                Output::Integer { values, .. } => values.contains(value),
-                Output::Unreadable => true,
-            };
-            values.iter().find(|value| !allowed(value)).map(|value| {
-                format!(
-                    "{} cannot be required for this check.",
-                    value_label(control.builtin_id(), value, true)
-                )
-            })
-        }
-        Requirement::Max(number) | Requirement::Min(number) => {
-            match control.output.number_range() {
-                None => Some("This check reports no number.".into()),
-                Some((min, max)) if !(min..=max).contains(number) => {
-                    Some(format!("Type a whole number from {min} to {max}."))
-                }
-                Some(_) => None,
-            }
-        }
+        Some(match self.outcome.as_ref()? {
+            Ok(errors) => errors.clone(),
+            Err(message) => vec![CheckError {
+                message: format!("The manifest could not be checked. {message}"),
+                line: None,
+                key: None,
+            }],
+        })
     }
 }
-
-/// What the gateway and the clients would refuse in a manifest, for the parts the form edits.
-/// The limits come from the core's manifest checks and from the client's list of built-in checks.
-pub fn validate(form: &Form) -> Vec<FieldError> {
-    let mut errors = Vec::new();
-    let mut add = |field: Field, message: String| errors.push(FieldError { field, message });
-    for (field, raw) in [
-        (Field::MaxAge, &form.max_age),
-        (Field::Retention, &form.retention),
-        (Field::UnknownGrace, &form.unknown_grace),
-    ] {
-        if let Some(message) = span_error(raw) {
-            add(field, message);
-        }
-    }
-    if span_error(&form.unknown_grace).is_none() && span_is_zero(&form.unknown_grace) {
-        add(Field::UnknownGrace, "Type more than zero.".into());
-    }
-    if let Some(schedule) = &form.schedule {
-        if let Some(message) = interval_error(&schedule.interval) {
-            add(Field::Interval, message);
-        }
-        match schedule.mode.as_str() {
-            "vpn" => {
-                if let Some(message) = probe_error(&schedule.probe) {
-                    add(Field::VpnProbe, message);
-                }
-                if !schedule.name.is_empty() && !dns_name_ok(&schedule.name) {
-                    add(
-                        Field::VpnProbeName,
-                        "Type a DNS name such as vpn.example.org, not an IP address.".into(),
-                    );
-                }
-            }
-            "always" => {
-                if !schedule.probe.is_empty() || !schedule.name.is_empty() {
-                    add(
-                        Field::Send,
-                        "Always sends on any network, so it takes no VPN address.".into(),
-                    );
-                }
-            }
-            _ => add(
-                Field::Send,
-                "Choose Always or Only on the company VPN.".into(),
-            ),
-        }
-    }
-    let mut seen = BTreeSet::new();
-    for control in &form.controls {
-        let id = || Field::Id(control.id.clone());
-        if control.id.is_empty() || !seen.insert(control.id.as_str()) {
-            add(id(), "Every check needs its own ID.".into());
-        }
-        if !control.id_locked() {
-            add(id(), "The check must be builtin:<name>@<version>.".into());
-        } else if builtin(&control.id).is_none()
-            || control.check != format!("builtin:{}@1", control.id)
-        {
-            let message = match builtin(control.builtin_id()) {
-                Some(known) if known.id != control.id => format!(
-                    "A built-in check keeps its ID. Clients run {} only as {}.",
-                    control.check, known.id
-                ),
-                _ => format!("No client runs {}.", control.check),
-            };
-            add(id(), message);
-        }
-        if let Some(message) = span_error(&control.grace) {
-            add(Field::Grace(control.id.clone()), message);
-        }
-        for os in Os::ALL {
-            if let Some(message) = requirement_error(control, control.requirement(os)) {
-                add(Field::Requirement(control.id.clone(), os), message);
-            }
-        }
-    }
-    errors
-}
-
 fn document(text: &str) -> Result<DocumentMut, String> {
     text.parse::<DocumentMut>().map_err(|e| e.to_string())
 }

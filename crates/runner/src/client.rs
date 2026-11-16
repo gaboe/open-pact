@@ -259,6 +259,23 @@ pub fn installed_path() -> Result<PathBuf, String> {
         .join(cli_name()))
 }
 
+/// The CLIs a desktop app may run, best first: the one on PATH, the one the client app installs,
+/// and the one next to this app. Only files that exist.
+pub fn cli_candidates(app: Option<&Path>) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = Vec::new();
+    let listed = [
+        find_on_path(cli_name()),
+        installed_path().ok(),
+        app.and_then(|app| bundled_path(app).ok()),
+    ];
+    for path in listed.into_iter().flatten() {
+        if path.is_file() && !found.contains(&path) {
+            found.push(path);
+        }
+    }
+    found
+}
+
 pub fn bundled_path(app: &Path) -> Result<PathBuf, String> {
     let parent = app.parent().ok_or("Cannot find the app folder")?;
     let adjacent = parent.join(cli_name());

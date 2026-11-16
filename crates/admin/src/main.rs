@@ -1406,6 +1406,8 @@ fn snapshots(output: PathBuf) {
         ("admin-o-field-errors", Screen::Manifest, true, None),
         ("admin-p-add-check-all", Screen::Manifest, true, None),
         ("admin-q-add-check-scrolled", Screen::Manifest, true, None),
+        ("admin-r-old-cli", Screen::Manifest, true, None),
+        ("admin-s-check-line", Screen::Manifest, false, None),
         ("admin-d-apply", Screen::Manifest, true, Some(Dialog::Apply)),
         (
             "admin-e-invitation",
@@ -1463,13 +1465,10 @@ fn snapshots(output: PathBuf) {
             if name == "admin-k-update" { app.update = UpdateState::Available("0.1.1".into()); }
                 app.active = include_str!("../../../tests/fixtures/manifest.toml").into();
                 app.draft = app.active.clone();
-            if matches!(name, "admin-d-apply" | "admin-b-form" | "admin-m-number-check" | "admin-n-add-check" | "admin-o-field-errors" | "admin-p-add-check-all" | "admin-q-add-check-scrolled") { app.draft = include_str!("../../../tests/fixtures/manifest-v2.toml").into(); }
+            if matches!(name, "admin-d-apply" | "admin-b-form" | "admin-m-number-check" | "admin-n-add-check" | "admin-o-field-errors" | "admin-p-add-check-all" | "admin-q-add-check-scrolled" | "admin-r-old-cli" | "admin-s-check-line") { app.draft = include_str!("../../../tests/fixtures/manifest-v2.toml").into(); }
             if name == "admin-o-field-errors" {
                 app.draft = app.draft
-                    .replace("interval = \"55m\"", "interval = \"4m\"")
-                    .replace("unknown_grace = \"7d\"", "unknown_grace = \"0d\"")
-                    .replace("windows = { max = 30 }, linux = { max = 30 } }\ngrace = \"1d\"\n\n[[control]]\nid = \"os_supported\"", "windows = { max = 3651 }, linux = { max = 30 } }\ngrace = \"1d\"\n\n[[control]]\nid = \"os_supported\"")
-                    .replace("required = { windows = \"null\", macos = \"n/a\"", "required = { windows = \"time\", macos = \"n/a\"");
+                    .replace("windows = { max = 30 }, linux = { max = 30 } }\ngrace = \"1d\"\n\n[[control]]\nid = \"os_supported\"", "windows = { max = 3651 }, linux = { max = 30 } }\ngrace = \"1d\"\n\n[[control]]\nid = \"os_supported\"");
             }
             if matches!(name, "admin-p-add-check-all" | "admin-q-add-check-scrolled") {
                 let text = &app.draft;
@@ -1478,11 +1477,14 @@ fn snapshots(output: PathBuf) {
                     app.draft = format!("{}{}", &text[..head], &text[tail..]);
                 }
             }
-            if !form { app.draft = include_str!("../../../tests/fixtures/manifest-v2.toml").replace("issuer = \"Example Company, IT security\"", "issuer = \"Example Company, IT security"); }
+            if !form && name != "admin-s-check-line" { app.draft = include_str!("../../../tests/fixtures/manifest-v2.toml").replace("issuer = \"Example Company, IT security\"", "issuer = \"Example Company, IT security"); }
             app.fv.selected = match name { "admin-m-number-check" | "admin-o-field-errors" => Some("os_patch_age_days".to_owned()), "admin-b-form" | "admin-n-add-check" => Some("screen_lock".to_owned()), _ => None };
             app.fv.add_open = matches!(name, "admin-n-add-check" | "admin-p-add-check-all" | "admin-q-add-check-scrolled");
+            app.fv.manual_check = true;
             app.show_draft(window, cx);
             app.build_form(window, cx);
+            app.fv.set_check(&app.draft, snapshot_check(name, &app.draft));
+            app.mark_lines(cx);
             if name == "admin-o-field-errors" { app.type_valid_from("garbage", window, cx); }
             if matches!(name, "admin-p-add-check-all" | "admin-q-add-check-scrolled") { app.fv.scroll.set_offset(point(px(0.), px(-1000.))); }
             if name == "admin-q-add-check-scrolled" { app.fv.add_scroll.set_offset(point(px(0.), px(-5000.))); }
@@ -1515,6 +1517,35 @@ fn snapshots(output: PathBuf) {
         })
         });
     }
+}
+
+/// What the open-pact CLI would say about the draft of a snapshot scene.
+#[cfg(all(feature = "snapshot", target_os = "macos"))]
+fn snapshot_check(name: &str, draft: &str) -> Result<Vec<runner::admin::CheckError>, String> {
+    use runner::admin::{CLI_TOO_OLD, CheckError};
+    Ok(match name {
+        "admin-o-field-errors" => vec![CheckError {
+            message:
+                "os_patch_age_days: required.windows 3651 is above the output range 0 to 3650."
+                    .into(),
+            line: None,
+            key: Some("controls.os_patch_age_days.required.windows".into()),
+        }],
+        "admin-r-old-cli" => vec![CheckError {
+            message: CLI_TOO_OLD.into(),
+            line: None,
+            key: None,
+        }],
+        "admin-s-check-line" => vec![CheckError {
+            message: "invalid date, expected YYYY-MM-DD".into(),
+            line: draft
+                .lines()
+                .position(|line| line.starts_with("valid_from"))
+                .map(|index| index + 1),
+            key: None,
+        }],
+        _ => Vec::new(),
+    })
 }
 
 #[cfg(test)]
