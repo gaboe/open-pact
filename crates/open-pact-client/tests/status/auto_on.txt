@@ -9,6 +9,7 @@ Signed schedule: every 55 minutes on any network, and at once when a check resul
 VPN: not required by the signed schedule.
 Last claim sent: 2026-11-16T09:50:00Z.
 Last claim response: 2026-11-16T09:50:00Z, accepted.
+Last answered scheduled claim: 2026-11-16T09:50:00Z.
 Manifest agreement: yes; gateway checked now.
 Signed: sha256:<signed>
 Enforced: sha256:<signed>
