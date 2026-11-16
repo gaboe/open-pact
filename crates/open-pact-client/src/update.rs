@@ -90,7 +90,10 @@ async fn check(
     if !latest.pre.is_empty() {
         return None;
     }
-    if latest <= semver::Version::parse(current).ok()? {
+    if !latest
+        .cmp_precedence(&semver::Version::parse(current).ok()?)
+        .is_gt()
+    {
         return None;
     }
     Some(Notice {
@@ -242,6 +245,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(found.latest, "0.6.1");
+    }
+
+    #[tokio::test]
+    async fn build_metadata_on_the_latest_release_does_not_make_it_newer() {
+        assert!(
+            notice(r#"{"tag_name":"v0.6.0+build.2"}"#, "0.6.0+build.1")
+                .await
+                .is_none()
+        );
+        assert!(
+            notice(r#"{"tag_name":"v0.6.0+build.1"}"#, "0.6.0")
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
