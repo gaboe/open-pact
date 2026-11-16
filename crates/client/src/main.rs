@@ -13,6 +13,7 @@ use runner::{
     client::{self, Changes, Check, Client, JoinEvent, Preview, Screen, Status},
     desktop::*,
     text::*,
+    update::{self, Platform, UpdateState},
 };
 use std::{
     path::PathBuf,
@@ -30,6 +31,7 @@ enum Operation {
     Changes,
     Accept,
     Schedule(bool),
+    UpdateCli(String),
 }
 
 enum Outcome {
@@ -56,6 +58,7 @@ struct AppView {
     last_check: Option<Check>,
     /// Fixtures set this RFC 3339 time. The app uses the real clock.
     clock: Option<String>,
+    update: UpdateState,
 }
 
 impl AppView {
@@ -80,6 +83,7 @@ impl AppView {
             all_controls: false,
             last_check: None,
             clock: None,
+            update: UpdateState::None,
         }
     }
 
@@ -169,6 +173,11 @@ impl AppView {
                         }
                         Operation::Schedule(enabled) => {
                             client.schedule(enabled)?;
+                            client.status().map(Outcome::Status)
+                        }
+                        Operation::UpdateCli(line) => {
+                            let call = update::shell_invocation(Platform::current(), &line);
+                            update::run(&client.runner, &call)?;
                             client.status().map(Outcome::Status)
                         }
                     }
@@ -333,6 +342,17 @@ impl AppView {
                 let installable = job_needs_install(&plain_value(&status.schedule["job"]))
                     || status.issues.iter().any(|issue| issue_action(issue) == Some(IssueAction::InstallJob));
                 let mut view = column().child(verdict(head.tone, head.heading, head.detail));
+                if let Some(cli) = &status.update {
+                    let (text, command) = update::cli_notice(cli);
+                    let command = command.map(str::to_owned);
+                    view = view.child(div().flex().items_start().gap_4().py(px(10.)).border_b_1().border_color(rgb(RULE_2))
+                        .child(div().flex().flex_col().flex_1().min_w_0().gap_1()
+                            .child(div().font_weight(FontWeight::SEMIBOLD).child(text))
+                            .when_some(command.clone(), |item, command| item.child(runs("runs", command))))
+                        .when_some(command, |row, command| row.child(div().flex_none().child(
+                            Button::new("cli-update").label("Update").small().disabled(self.busy)
+                                .on_click(cx.listener(move |this, _, _, cx| this.run(Operation::UpdateCli(command.clone()), cx)))))));
+                }
                 if !status.issues.is_empty() {
                     view = view.child(div().flex().flex_col().children(status.issues.iter().enumerate().map(|(i, issue)| {
                         let shown = issue_view_local(issue, self.clock.as_deref());
@@ -506,6 +526,13 @@ impl Render for AppView {
         if let Some(error) = &self.error {
             page = page.child(banner(error.clone(), BAD, BAD_WASH));
         }
+        let banner = update_banner(
+            &self.update,
+            cx.listener(|this, _, _, cx| {
+                let runner = this.client.runner.clone();
+                start_update(&mut this.update, cx, runner, |view| &mut view.update);
+            }),
+        );
         div()
             .size_full()
             .flex()
@@ -513,6 +540,7 @@ impl Render for AppView {
             .bg(rgb(0xffffff))
             .text_color(rgb(INK))
             .text_size(px(15.))
+            .children(banner)
             .child(page)
             .child(terminal_drawer(
                 self.terminal,
@@ -550,6 +578,8 @@ fn main() {
                 cx,
             );
             app.run(Operation::Open, cx);
+            let runner = app.client.runner.clone();
+            watch_updates(cx, runner, |view: &mut AppView| &mut view.update);
             app
         })
     });
@@ -575,6 +605,14 @@ fn snapshots(output: PathBuf) {
     .unwrap();
     let vpn_only: Status =
         serde_json::from_str(include_str!("../../../tests/fixtures/status-vpn-only.json")).unwrap();
+    let cli_update: Status = serde_json::from_str(include_str!(
+        "../../../tests/fixtures/status-cli-update.json"
+    ))
+    .unwrap();
+    let cli_bundled: Status = serde_json::from_str(include_str!(
+        "../../../tests/fixtures/status-cli-update-bundled.json"
+    ))
+    .unwrap();
     let mut revoked = status.clone();
     revoked.approval.state = Some("revoked".into());
     for (name, screen) in [
@@ -611,6 +649,11 @@ fn snapshots(output: PathBuf) {
         ("client-8-denied", Screen::Status(Box::new(denied_status))),
         ("client-9-actions", Screen::Status(Box::new(needs))),
         ("client-a-vpn-only", Screen::Status(Box::new(vpn_only))),
+        ("client-b-update", Screen::Status(Box::new(cli_update))),
+        (
+            "client-c-update-bundled",
+            Screen::Status(Box::new(cli_bundled)),
+        ),
     ] {
         let width = if matches!(name, "client-9-actions" | "client-a-vpn-only") {
             1100.
@@ -635,6 +678,9 @@ fn snapshots(output: PathBuf) {
                         cx,
                     );
                     app.clock = Some("2026-11-16T15:00:00Z".into());
+                    if name.starts_with("client-b") || name.starts_with("client-c") {
+                        app.update = UpdateState::Available("0.1.1".into());
+                    }
                     if name == "client-8-denied" {
                         app.last_check = Some(denied.clone());
                         app.all_controls = true;

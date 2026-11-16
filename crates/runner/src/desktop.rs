@@ -1,9 +1,11 @@
 use crate::text::{Tone, short_hash};
+use crate::update::{self, Platform, UpdateState};
 use gpui::{prelude::*, *};
 use gpui_component::{
-    Root, Sizable, Theme, ThemeMode,
+    Disableable, Root, Sizable, Theme, ThemeMode,
     button::{Button, ButtonVariants},
 };
+use std::time::Duration;
 
 pub const PAPER: u32 = 0xf5f3ee;
 pub const INK: u32 = 0x16202b;
@@ -168,6 +170,112 @@ pub fn banner(text: impl Into<SharedString>, color: u32, wash: u32) -> Div {
         .text_lg()
         .font_weight(FontWeight::SEMIBOLD)
         .child(text.into())
+}
+
+/// A slim strip at the top of the window while an update is on offer, running, or failed.
+pub fn update_banner(
+    state: &UpdateState,
+    update: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Option<Div> {
+    let text = state.text()?;
+    let (ink, _, wash) = tone_colors(if matches!(state, UpdateState::Failed(..)) {
+        Tone::Bad
+    } else {
+        Tone::Info
+    });
+    Some(
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_between()
+            .gap_3()
+            .px_4()
+            .py(px(6.))
+            .bg(rgb(wash))
+            .text_color(rgb(ink))
+            .text_size(px(13.))
+            .font_weight(FontWeight::SEMIBOLD)
+            .child(div().flex_1().min_w_0().child(text))
+            .when_some(state.button(), |strip, label| {
+                strip.child(
+                    Button::new("update")
+                        .label(label)
+                        .small()
+                        .primary()
+                        .disabled(state.running())
+                        .on_click(update),
+                )
+            }),
+    )
+}
+
+/// Checks for a newer release once now and then every 24 hours, unless
+/// `OPEN_PACT_NO_UPDATE_CHECK` turns it off. A failed check stays quiet; the Terminal strip shows it.
+pub fn watch_updates<V: 'static>(
+    cx: &mut Context<V>,
+    runner: crate::Runner,
+    state: fn(&mut V) -> &mut UpdateState,
+) {
+    let disabled = std::env::var("OPEN_PACT_NO_UPDATE_CHECK").ok();
+    if !update::checks_enabled(disabled.as_deref()) || Platform::current() == Platform::Other {
+        return;
+    }
+    cx.spawn(async move |this, cx| {
+        loop {
+            let runner = runner.with_timeout(Duration::from_secs(10));
+            let found = cx
+                .background_executor()
+                .spawn(async move { update::check(&runner).ok().flatten() })
+                .await;
+            let alive = this.update(cx, |view, cx| {
+                let slot = state(view);
+                *slot = std::mem::take(slot).after_check(found);
+                cx.notify();
+            });
+            if alive.is_err() {
+                break;
+            }
+            cx.background_executor().timer(update::CHECK_EVERY).await;
+        }
+    })
+    .detach();
+}
+
+/// Starts the update command when the banner offers one, and shows its progress in the banner.
+/// `current` is the view's own state and `state` reaches it again when the command ends. The
+/// command is in the Terminal log.
+pub fn start_update<V: 'static>(
+    current: &mut UpdateState,
+    cx: &mut Context<V>,
+    runner: crate::Runner,
+    state: fn(&mut V) -> &mut UpdateState,
+) {
+    let Some(version) = current.startable().map(str::to_owned) else {
+        return;
+    };
+    let exe = std::env::current_exe()
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
+    let Some(call) = update::update_invocation(Platform::current(), &exe) else {
+        return;
+    };
+    *current = UpdateState::Running(version.clone());
+    cx.notify();
+    cx.spawn(async move |this, cx| {
+        let result = cx
+            .background_executor()
+            .spawn(async move { update::run(&runner, &call) })
+            .await;
+        let _ = this.update(cx, |view, cx| {
+            *state(view) = match result {
+                Ok(()) => UpdateState::Done(version),
+                Err(error) => UpdateState::Failed(version, error),
+            };
+            cx.notify();
+        });
+    })
+    .detach();
 }
 
 /// A parse or validation problem shown as plain red text, not as a heading.

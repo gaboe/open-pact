@@ -1,0 +1,116 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+jobs:
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - id: meta
+        name: Check that the tag names the workspace version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "The tag $GITHUB_REF_NAME does not match the workspace version $version." >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: sigstore/cosign-installer@v3
+      - name: Build both apps for both Mac architectures
+        run: |
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo build --release --locked --workspace --target "$target"
+          done
+          mkdir universal
+          for binary in open-pact open-pact-admin; do
+            lipo -create -output "universal/$binary" \
+              "target/aarch64-apple-darwin/release/$binary" \
+              "target/x86_64-apple-darwin/release/$binary"
+          done
+      - name: Fetch and verify the command line tool
+        run: |
+          sh scripts/fetch-cli.sh cli open-pact-client-aarch64-apple-darwin open-pact-client-x86_64-apple-darwin
+          lipo -create -output cli/open-pact-client cli/open-pact-client-aarch64-apple-darwin cli/open-pact-client-x86_64-apple-darwin
+          chmod +x cli/open-pact-client
+      - name: Bundle, sign ad hoc, and zip
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          OPEN_PACT_APP_DIR: universal
+        run: |
+          sh scripts/build-macos.sh "$PWD/cli/open-pact-client"
+          name="open-pact-desktop-$VERSION-macos.zip"
+          mkdir -p out
+          ditto -c -k --norsrc dist "out/$name"
+          (cd out && shasum -a 256 "$name" > "$name.sha256")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: out/*
+          if-no-files-found: error
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - id: meta
+        name: Check that the tag names the workspace version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "The tag $GITHUB_REF_NAME does not match the workspace version $version." >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: '20.1'
+      - uses: sigstore/cosign-installer@v3
+      - name: Build both apps
+        run: cargo build --release --locked --workspace
+      - name: Fetch and verify the command line tool
+        run: sh scripts/fetch-cli.sh cli open-pact-client-x86_64-pc-windows-msvc.exe
+      - name: Zip and write the scoop manifest
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          mkdir stage out
+          cp target/release/open-pact.exe target/release/open-pact-admin.exe stage/
+          cp cli/open-pact-client-x86_64-pc-windows-msvc.exe stage/open-pact-client.exe
+          name="open-pact-desktop-$VERSION-windows-x64.zip"
+          powershell -NoProfile -Command "Compress-Archive -Path stage/* -DestinationPath out/$name"
+          hash=$(sha256sum "out/$name" | cut -d ' ' -f 1)
+          echo "$hash  $name" > "out/$name.sha256"
+          sh scripts/scoop-manifest.sh "$VERSION" "$hash" > out/open-pact-desktop.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: out/*
+          if-no-files-found: error
+  release:
+    needs: [macos, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+      - name: Attach every file to the release
+        run: |
+          flag=
+          case "$GITHUB_REF_NAME" in *-*) flag=--prerelease ;; esac
+          ls -l assets
+          gh release create "$GITHUB_REF_NAME" assets/* --verify-tag --title "$GITHUB_REF_NAME" --generate-notes $flag

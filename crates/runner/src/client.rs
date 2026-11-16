@@ -44,6 +44,24 @@ pub struct Approval {
     pub source: String,
 }
 
+/// A newer command line tool, as `status --online --json` reports it. `command` is null when the
+/// tool comes with the app update.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct CliUpdate {
+    pub current: String,
+    pub latest: String,
+    pub command: Option<String>,
+}
+
+/// An older command line tool has no `update` field, and a shape this app does not know is no
+/// update. Neither may break the status screen.
+fn lenient_update<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<CliUpdate>, D::Error> {
+    let value = Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).ok())
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Status {
     pub schema_version: u8,
@@ -56,6 +74,8 @@ pub struct Status {
     pub limitations: Vec<String>,
     pub current_compliance: String,
     pub log: String,
+    #[serde(default, deserialize_with = "lenient_update")]
+    pub update: Option<CliUpdate>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -261,7 +281,7 @@ pub fn version(runner: &Runner, path: &Path) -> Result<String, String> {
 }
 
 /// Orders `open-pact-client 0.6.0` style version lines. A prerelease sorts before its release.
-fn version_key(text: &str) -> Option<(Vec<u64>, bool)> {
+pub(crate) fn version_key(text: &str) -> Option<(Vec<u64>, bool)> {
     let token = text.split_whitespace().last()?;
     let token = token.strip_prefix('v').unwrap_or(token);
     let token = token.split('+').next()?;

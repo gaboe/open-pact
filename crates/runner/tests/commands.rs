@@ -948,3 +948,40 @@ fn closing_the_last_window_quits_both_apps() {
     use gpui::QuitMode;
     assert_eq!(runner::desktop::QUIT_MODE, QuitMode::LastWindowClosed);
 }
+
+#[test]
+fn status_reports_a_newer_command_line_tool_only_when_the_field_has_its_shape() {
+    use runner::client::Status;
+    let parse = |text: &str| serde_json::from_str::<Status>(text).unwrap();
+    assert!(
+        parse(include_str!("../../../tests/fixtures/status.json"))
+            .update
+            .is_none()
+    );
+    let with = parse(include_str!(
+        "../../../tests/fixtures/status-cli-update.json"
+    ))
+    .update
+    .unwrap();
+    assert_eq!(
+        (with.current.as_str(), with.latest.as_str()),
+        ("0.6.0", "0.6.1")
+    );
+    assert_eq!(
+        with.command.as_deref(),
+        Some("brew upgrade open-pact-client")
+    );
+    let bundled = parse(include_str!(
+        "../../../tests/fixtures/status-cli-update-bundled.json"
+    ))
+    .update
+    .unwrap();
+    assert_eq!(bundled.command, None);
+    assert!(
+        parse(include_str!(
+            "../../../tests/fixtures/status-cli-update-unknown.json"
+        ))
+        .update
+        .is_none()
+    );
+}

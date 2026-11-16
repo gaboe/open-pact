@@ -4,6 +4,7 @@ pub mod client;
 pub mod desktop;
 pub mod manifest;
 pub mod text;
+pub mod update;
 
 use serde::de::DeserializeOwned;
 use std::ffi::{OsStr, OsString};

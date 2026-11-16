@@ -9,6 +9,9 @@ publish = false
 [features]
 snapshot = ["runner/snapshot", "gpui/test-support", "gpui-platform/test-support"]
 
+[build-dependencies]
+winresource = "0.1"
+
 [dependencies]
 runner = { workspace = true, features = ["desktop"] }
 serde_json.workspace = true

@@ -17,6 +17,7 @@ use runner::{
     manifest::{self, Field, Kind},
     shell_line, shell_quote,
     text::*,
+    update::UpdateState,
 };
 #[cfg(all(feature = "snapshot", target_os = "macos"))]
 use std::path::PathBuf;
@@ -86,9 +87,10 @@ impl Listing {
     }
 }
 
-/// Save may run only when the namespace on screen is final. While kubectl lists, the hidden text field would be saved.
-fn can_save(namespaces: &Listing, busy: bool) -> bool {
-    !busy && !matches!(namespaces, Listing::Loading)
+/// Save may run only when the cluster and the namespace on screen are final. While kubectl lists,
+/// the hidden text field would be saved.
+fn can_save(contexts: &Listing, namespaces: &Listing, busy: bool) -> bool {
+    !busy && !matches!(contexts, Listing::Loading) && !matches!(namespaces, Listing::Loading)
 }
 
 type Choice = Entity<SelectState<Vec<SharedString>>>;
@@ -127,6 +129,7 @@ struct AppView {
     change_note: Entity<InputState>,
     invitation_note: Entity<InputState>,
     ttl: String,
+    update: UpdateState,
 }
 
 impl AppView {
@@ -215,6 +218,7 @@ impl AppView {
                 .new(|cx| InputState::new(window, cx).default_value("Update open-pact manifest")),
             invitation_note: cx.new(|cx| InputState::new(window, cx).placeholder("Note for you")),
             ttl: "72h".into(),
+            update: UpdateState::None,
         }
     }
 
@@ -672,7 +676,7 @@ impl AppView {
         }
         view.child(actions()
                 .child(Button::new("reload-kube").label("Reload from kubectl").ghost().small().disabled(self.busy).on_click(cx.listener(|this, _, window, cx| this.load_contexts(window, cx))))
-                .child(Button::new("save").label("Save and open").primary().disabled(!can_save(&self.namespaces, self.busy)).on_click(cx.listener(|this, _, window, cx| {
+                .child(Button::new("save").label("Save and open").primary().disabled(!can_save(&self.contexts, &self.namespaces, self.busy)).on_click(cx.listener(|this, _, window, cx| {
                     let settings = this.chosen(cx);
                     this.run(Operation::Setup(settings), window, cx);
                 }))))
@@ -1227,7 +1231,9 @@ impl AppView {
                         .border_color(rgb(RULE_2))
                         .child(
                             div()
-                                .w(px(100.))
+                                .w(px(140.))
+                                .flex_none()
+                                .whitespace_nowrap()
                                 .font_family(mono())
                                 .child(device.code.clone()),
                         )
@@ -1482,7 +1488,7 @@ fn device_header() -> Div {
         .text_size(px(12.))
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(rgb(MUTED))
-        .child(div().w(px(100.)).child("Device code"))
+        .child(div().w(px(140.)).flex_none().child("Device code"))
         .child(div().flex_1().child("Note"))
         .child(div().w(px(160.)).child("Last result"))
         .child(div().w(px(120.)).child("Result"))
@@ -1631,6 +1637,13 @@ impl Render for AppView {
             .bg(rgb(0xffffff))
             .text_color(rgb(INK))
             .text_size(px(15.))
+            .children(update_banner(
+                &self.update,
+                cx.listener(|this, _, _, cx| {
+                    let runner = this.admin.runner.clone();
+                    start_update(&mut this.update, cx, runner, |view| &mut view.update);
+                }),
+            ))
             .child(div().flex().flex_1().min_h_0().child(sidebar).child(main))
             .child(terminal_drawer(
                 self.terminal,
@@ -1669,6 +1682,8 @@ fn main() {
         cx.new(|cx| {
             let mut app = AppView::new(settings.clone().unwrap_or_default(), window, cx);
             app.load_contexts(window, cx);
+            let runner = app.admin.runner.clone();
+            watch_updates(cx, runner, |view: &mut AppView| &mut view.update);
             match settings {
                 Ok(settings) if !settings.context.is_empty() => {
                     app.run(Operation::Setup(settings), window, cx)
@@ -1688,6 +1703,8 @@ fn snapshots(output: PathBuf) {
         ("admin-h-settings", Screen::Setup, true, None),
         ("admin-i-setup-fallback", Screen::Setup, true, None),
         ("admin-j-setup-no-contexts", Screen::Setup, true, None),
+        ("admin-k-update", Screen::Overview, true, None),
+        ("admin-l-devices", Screen::Devices, true, None),
         ("admin-a-overview", Screen::Overview, true, None),
         ("admin-b-form", Screen::Manifest, true, None),
         ("admin-c-toml", Screen::Manifest, false, None),
@@ -1724,6 +1741,7 @@ fn snapshots(output: PathBuf) {
             app.admin.backup_root = "/fictional/backups".into();
             app.screen = screen; app.form = form; app.dialog = dialog;
             app.show_history = name == "admin-f-history";
+            if name == "admin-k-update" { app.update = UpdateState::Available("0.1.1".into()); }
                 app.active = include_str!("../../../tests/fixtures/manifest.toml").into();
                 app.draft = app.active.clone();
             if name == "admin-d-apply" || name == "admin-b-form" { app.draft = include_str!("../../../tests/fixtures/manifest-v2.toml").into(); }
@@ -1768,10 +1786,31 @@ mod tests {
     #[test]
     fn save_waits_while_kubectl_lists_namespaces() {
         let listed = Listing::Listed(vec!["open-pact".to_owned()]);
-        assert!(!can_save(&Listing::Loading, false));
-        assert!(!can_save(&listed, true));
-        assert!(can_save(&listed, false));
-        assert!(can_save(&Listing::Failed("forbidden".to_owned()), false));
-        assert!(can_save(&Listing::Idle, false));
+        assert!(!can_save(&listed, &Listing::Loading, false));
+        assert!(!can_save(&listed, &listed, true));
+        assert!(can_save(&listed, &listed, false));
+        assert!(can_save(
+            &listed,
+            &Listing::Failed("forbidden".to_owned()),
+            false
+        ));
+        assert!(can_save(&Listing::Idle, &Listing::Idle, false));
+    }
+
+    #[test]
+    fn save_waits_while_kubectl_lists_clusters() {
+        let listed = Listing::Listed(vec!["open-pact".to_owned()]);
+        assert!(!can_save(&Listing::Loading, &Listing::Idle, false));
+        assert!(!can_save(&Listing::Loading, &listed, false));
+        assert!(can_save(
+            &Listing::Failed("no kubectl".to_owned()),
+            &Listing::Idle,
+            false
+        ));
+        assert!(can_save(
+            &Listing::Listed(Vec::new()),
+            &Listing::Idle,
+            false
+        ));
     }
 }
