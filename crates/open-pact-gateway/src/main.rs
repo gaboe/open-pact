@@ -60,6 +60,10 @@ enum Command {
     Serve,
     /// Create a one-time invitation; prints the opi1: string on stdout, a readable form on stderr
     Invite {
+        /// Print one JSON document on stdout instead: the invitation, its expiry, the company key
+        /// fingerprint and the note. Nothing goes to stderr
+        #[arg(long)]
+        json: bool,
         /// How long the invitation stays valid: 30m, 72h, 7d (at most 30d)
         #[arg(long, default_value = "72h", value_parser = invitations::parse_ttl)]
         ttl: chrono::Duration,
@@ -80,6 +84,28 @@ enum Command {
         #[command(subcommand)]
         command: DevicesCommand,
     },
+    /// Show the gateway version, the manifest it enforces and how many devices are in each state
+    Status {
+        /// Print one JSON document. On a database error it prints {"error": ...} and exits non-zero
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+impl Cli {
+    /// The command prints JSON, so its failure is JSON too.
+    fn prints_json(&self) -> bool {
+        matches!(
+            self.command,
+            Some(
+                Command::Invite { json: true, .. }
+                    | Command::Status { json: true }
+                    | Command::Devices {
+                        command: DevicesCommand::List { json: true }
+                    }
+            )
+        )
+    }
 }
 
 #[derive(Subcommand)]
@@ -96,7 +122,11 @@ enum LogCommand {
 #[derive(Subcommand)]
 enum DevicesCommand {
     /// Every enrolment with its state and invitation note
-    List,
+    List {
+        /// Print a JSON array instead: pseudonym, code, state, note, enrolled_at, manifest_hash
+        #[arg(long)]
+        json: bool,
+    },
     /// Approve the pending device whose pseudonym starts with these hex digits (at least 8)
     Approve { prefix: String },
     /// Revoke a device by its full pseudonym. Final: the device cannot be approved again
@@ -1075,22 +1105,45 @@ fn log_key(keys: &Keys) -> anyhow::Result<LogKey> {
     Ok(LogKey::new(&log_origin()?, &PublicKey::from(&keys.log)))
 }
 
-async fn invite(db: &PgPool, url: &str, ttl: chrono::Duration, note: &str) -> anyhow::Result<()> {
+/// What `invite --json` prints.
+#[derive(serde::Serialize)]
+struct InviteDocument {
+    invitation: String,
+    expires_at: String,
+    company_key_fingerprint: String,
+    note: String,
+}
+
+async fn invite(
+    db: &PgPool,
+    kek: &SealingKey,
+    url: &str,
+    ttl: chrono::Duration,
+    note: &str,
+    json: bool,
+    out: &mut impl std::io::Write,
+) -> anyhow::Result<()> {
     let parsed = url.parse::<axum::http::Uri>()?;
     if !matches!(parsed.scheme_str(), Some("https" | "http")) || parsed.host().is_none() {
         anyhow::bail!("--url must be an http(s) URL, got {url:?}");
     }
-    let keys = Keys::load_or_create(db, &SealingKey::kek_from_env()?).await?;
+    let keys = Keys::load_or_create(db, kek).await?;
     let (code, expires) = invitations::create(db, ttl, note).await?;
-    let invitation = Invitation::new(
-        url,
-        &PublicKey::from(&keys.manifest),
-        &log_key(&keys)?,
-        code,
-    );
+    let company = PublicKey::from(&keys.manifest);
+    let invitation = Invitation::new(url, &company, &log_key(&keys)?, code);
+    let expires_at = expires.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    if json {
+        let document = InviteDocument {
+            invitation: invitation.encode(),
+            expires_at,
+            company_key_fingerprint: company.fingerprint(),
+            note: note.to_owned(),
+        };
+        writeln!(out, "{}", serde_json::to_string_pretty(&document)?)?;
+        return Ok(());
+    }
     eprint!(
-        "One-time invitation, valid until {}{}\n{}",
-        expires.format("%Y-%m-%dT%H:%M:%SZ"),
+        "One-time invitation, valid until {expires_at}{}\n{}",
         if note.is_empty() {
             String::new()
         } else {
@@ -1102,14 +1155,52 @@ async fn invite(db: &PgPool, url: &str, ttl: chrono::Duration, note: &str) -> an
         "Send the opi1: line to the owner. Confirm the company key fingerprint over a second channel.\n\
          Approve the device with: open-pact-gateway devices approve <first 8+ hex digits of its pseudonym>"
     );
-    println!("{}", invitation.encode());
+    writeln!(out, "{}", invitation.encode())?;
     Ok(())
+}
+
+/// What `status --json` prints.
+#[derive(serde::Serialize)]
+struct StatusDocument {
+    version: &'static str,
+    manifest_hash: String,
+    auto_approve: bool,
+    devices: devices::StateCounts,
+    company_key_fingerprint: String,
+}
+
+async fn status(
+    db: &PgPool,
+    kek: &SealingKey,
+    manifest: &Manifest,
+    auto_approve: bool,
+) -> anyhow::Result<StatusDocument> {
+    let keys = Keys::load_or_create(db, kek).await?;
+    Ok(StatusDocument {
+        version: env!("CARGO_PKG_VERSION"),
+        manifest_hash: manifest.hash().to_string(),
+        auto_approve,
+        devices: devices::counts(db).await?,
+        company_key_fingerprint: PublicKey::from(&keys.manifest).fingerprint(),
+    })
+}
+
+/// The manifest this process enforces: the file at `MANIFEST_PATH`, or the example manifest.
+fn read_manifest() -> anyhow::Result<(String, String, Manifest)> {
+    let path = std::env::var("MANIFEST_PATH").unwrap_or_else(|_| "examples/manifest.toml".into());
+    let toml = std::fs::read_to_string(&path)?;
+    let manifest = Manifest::parse(toml.as_bytes())?;
+    Ok((path, toml, manifest))
 }
 
 async fn admin_devices(db: &PgPool, command: DevicesCommand) -> anyhow::Result<()> {
     let (device, action) = match command {
-        DevicesCommand::List => {
+        DevicesCommand::List { json: false } => {
             print!("{}", devices::list(db).await?);
+            return Ok(());
+        }
+        DevicesCommand::List { json: true } => {
+            print!("{}", devices::list_json(db).await?);
             return Ok(());
         }
         DevicesCommand::Approve { prefix } => (
@@ -1146,10 +1237,7 @@ fn router(app: App) -> Router {
 
 async fn serve(db: PgPool) -> anyhow::Result<()> {
     let addr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
-    let manifest_path =
-        std::env::var("MANIFEST_PATH").unwrap_or_else(|_| "examples/manifest.toml".into());
-    let toml = std::fs::read_to_string(&manifest_path)?;
-    let manifest = Manifest::parse(toml.as_bytes())?;
+    let (manifest_path, toml, manifest) = read_manifest()?;
     eprintln!("enforcing {manifest_path} {}", manifest.hash());
     if manifest.body().min_trust_level > open_pact_core::TrustLevel::L0 {
         eprintln!(
@@ -1279,12 +1367,64 @@ async fn log_entries(
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    let json = cli.prints_json();
+    match run(cli).await {
+        Err(error) if json => {
+            println!("{}", json!({ "error": format!("{error:#}") }));
+            std::process::exit(1)
+        }
+        result => result,
+    }
+}
+
+async fn run(cli: Cli) -> anyhow::Result<()> {
     let db = connect(&std::env::var("DATABASE_URL")?).await?;
     sqlx::migrate!("./migrations").run(&db).await?;
     match cli.command.unwrap_or(Command::Serve) {
         Command::Serve => serve(db).await,
-        Command::Invite { ttl, note, url } => invite(&db, &url, ttl, note.trim()).await,
+        Command::Invite {
+            json,
+            ttl,
+            note,
+            url,
+        } => {
+            invite(
+                &db,
+                &SealingKey::kek_from_env()?,
+                &url,
+                ttl,
+                note.trim(),
+                json,
+                &mut std::io::stdout(),
+            )
+            .await
+        }
         Command::Devices { command } => admin_devices(&db, command).await,
+        Command::Status { json } => {
+            let (_, _, manifest) = read_manifest()?;
+            let document = status(
+                &db,
+                &SealingKey::kek_from_env()?,
+                &manifest,
+                env_flag("AUTO_APPROVE")?,
+            )
+            .await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&document)?);
+            } else {
+                println!(
+                    "version {}\nmanifest {}\ncompany key {}\nauto approve {}\ndevices: {} pending, {} approved, {} revoked",
+                    document.version,
+                    document.manifest_hash,
+                    document.company_key_fingerprint,
+                    document.auto_approve,
+                    document.devices.pending,
+                    document.devices.approved,
+                    document.devices.revoked
+                );
+            }
+            Ok(())
+        }
         Command::Log {
             command: LogCommand::Entries { from, limit },
         } => log_entries(&db, from, limit, &mut std::io::stdout()).await,
@@ -2839,9 +2979,12 @@ grace = "1d"
 
         let error = invite(
             &db,
+            &SealingKey::new(&TEST_KEK),
             "ftp://fictional.example/path",
             chrono::Duration::hours(1),
             "FICTIONAL",
+            false,
+            &mut Vec::new(),
         )
         .await
         .expect_err("a disallowed URL scheme must be rejected");
@@ -2873,5 +3016,119 @@ grace = "1d"
             "from + limit exceeds the log index range"
         );
         assert_eq!(output, [b'X']);
+    }
+
+    #[test]
+    fn the_json_flags_parse_and_make_failures_json() {
+        let parse = |args: &[&str]| {
+            let mut all = vec!["open-pact-gateway"];
+            all.extend_from_slice(args);
+            Cli::try_parse_from(all).unwrap()
+        };
+        assert!(parse(&["status", "--json"]).prints_json());
+        assert!(parse(&["devices", "list", "--json"]).prints_json());
+        assert!(parse(&["invite", "--json", "--url=https://pact.example.com"]).prints_json());
+        assert!(!parse(&["status"]).prints_json());
+        assert!(!parse(&["devices", "list"]).prints_json());
+        assert!(!parse(&["invite", "--url=https://pact.example.com"]).prints_json());
+        assert!(!parse(&[]).prints_json());
+    }
+
+    #[tokio::test]
+    #[ignore = "needs TEST_DATABASE_URL and LOG_ORIGIN"]
+    async fn invite_json_prints_one_document_and_nothing_else() {
+        let db = testdb::fresh().await;
+        let kek = SealingKey::new(&TEST_KEK);
+        let mut out = Vec::new();
+
+        invite(
+            &db,
+            &kek,
+            "https://pact.example.com",
+            chrono::Duration::hours(72),
+            "MacBook, K. Example",
+            true,
+            &mut out,
+        )
+        .await
+        .unwrap();
+
+        let document: Value = serde_json::from_slice(&out).expect("one JSON document");
+        let invitation = Invitation::decode(document["invitation"].as_str().unwrap()).unwrap();
+        assert_eq!(invitation.gateway, "https://pact.example.com");
+        assert_eq!(document["note"], "MacBook, K. Example");
+        assert_eq!(document["company_key_fingerprint"], invitation.company);
+        let expires = document["expires_at"].as_str().unwrap();
+        let expires: chrono::DateTime<chrono::Utc> = expires.parse().unwrap();
+        let hours = (expires - chrono::Utc::now()).num_hours();
+        assert!((70..=72).contains(&hours), "{hours}");
+
+        let mut plain = Vec::new();
+        invite(
+            &db,
+            &kek,
+            "https://pact.example.com",
+            chrono::Duration::hours(1),
+            "",
+            false,
+            &mut plain,
+        )
+        .await
+        .unwrap();
+        let plain = String::from_utf8(plain).unwrap();
+        assert!(
+            plain.starts_with("opi1:") && plain.lines().count() == 1,
+            "{plain}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "needs TEST_DATABASE_URL"]
+    async fn status_reports_version_manifest_and_device_counts() {
+        let db = testdb::fresh().await;
+        let kek = SealingKey::new(&TEST_KEK);
+        let manifest = Manifest::parse(DEMO.as_bytes()).unwrap();
+        for (n, state) in [(1u8, "pending"), (2, "approved"), (3, "approved")] {
+            let pseudonym = format!("pseudonym:{}", hex::encode([n; 32]));
+            testdb::enrolled_device(&db, &pseudonym, manifest.hash().as_str()).await;
+            sqlx::query("UPDATE devices SET state = $1 WHERE pseudonym = $2")
+                .bind(state)
+                .bind(&pseudonym)
+                .execute(&db)
+                .await
+                .unwrap();
+        }
+
+        let document = status(&db, &kek, &manifest, true).await.unwrap();
+
+        let keys = Keys::load_or_create(&db, &kek).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(&document).unwrap(),
+            json!({
+                "version": env!("CARGO_PKG_VERSION"),
+                "manifest_hash": manifest.hash().as_str(),
+                "auto_approve": true,
+                "devices": {"pending": 1, "approved": 2, "revoked": 0},
+                "company_key_fingerprint": PublicKey::from(&keys.manifest).fingerprint(),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn status_reports_a_database_error() {
+        let db = PgPoolOptions::new()
+            .connect_lazy("postgres://fictional:fictional@127.0.0.1:1/fictional")
+            .unwrap();
+        db.close().await;
+        let manifest = Manifest::parse(DEMO.as_bytes()).unwrap();
+
+        let error = status(&db, &SealingKey::new(&TEST_KEK), &manifest, false)
+            .await
+            .err()
+            .expect("a closed pool is an error");
+
+        let printed = json!({ "error": format!("{error:#}") });
+        assert!(!printed["error"].as_str().unwrap().is_empty());
+        assert_eq!(printed.as_object().unwrap().len(), 1);
     }
 }

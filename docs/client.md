@@ -230,6 +230,82 @@ Run `open-pact-client schedule off` with the same absolute `--home` before delet
 
 Limited Windows operations leave orphaned protected state and the shared binary unchanged. To remove those leftovers, run `schedule off` from an elevated PowerShell prompt. SYSTEM removal needs elevation and uses the existing protected state lock. A held lock stops task removal and asks you to retry. Removal cleans up the shared binary only when no SYSTEM task uses it. If cleanup fails, retry `schedule off` after the client stops or Windows restarts.
 
+## Read the output as JSON
+
+A desktop app can drive the client through these flags. Each prints JSON on stdout and nothing else; warnings stay on stderr. A failure prints `{"error": "<text>"}` on stdout and exits non-zero. Without the flag the output is the text you read in the other sections.
+
+| Command | Prints |
+| --- | --- |
+| `join --preview 'opi1:…'` | One document, then exit 0. It does what `join` does up to the manifest: it checks the invitation, the gateway, the company key against the invitation, and the manifest and its signature. It signs nothing, writes no file and sends no POST. |
+| `join --yes --json ['opi1:…']` | One line per wizard step event, then a last line. Nothing is asked. |
+| `check --json` | One document after the claim was sent. |
+| `accept --preview` | One document. It signs nothing, writes no file and sends only GET requests. |
+
+### `join --preview`
+
+```json
+{
+  "company": {"name": "company.example", "key_fingerprint": "sha256:…", "matches_invitation": true},
+  "gateway": "https://pact.example.com",
+  "manifest_hash": "sha256:…",
+  "controls": [
+    {"id": "password_min_length", "title": "Password min length", "requirement": ">= 10", "rationale": "…"}
+  ],
+  "disclosed_metadata": ["os", "client_version"],
+  "schedule": {"mode": "vpn", "vpn_probe": "10.0.0.1:443", "interval": "55m"},
+  "folders": ["/home/example/work"]
+}
+```
+
+- `company.name` is the manifest issuer. `matches_invitation` is false when the gateway's company key or log key differs from the invitation. The command still prints the document, then exits 1. Do not sign.
+- `title` is the control id in words. `requirement` is the rule for this operating system, `n/a`, or `report only`. `rationale` appears only when the manifest has one.
+- `schedule` is the manifest's `[schedule]` table, or null when the manifest defines no automatic sending.
+- `folders` lists the folders the repository checks would use: the folders already chosen on this device plus the folders that hold the managed repositories a read-only scan finds. It is empty when the manifest has no repository control. The scan stores nothing.
+
+### `join --json`
+
+`--json` needs `--yes`. Give the answers that step 5 asks for as flags:
+
+- `--folder <path>`, repeatable: a folder that holds your repositories. The client uses it only when the manifest counts repositories.
+- `--auto-send on|off`: send claims automatically. The default is `off`. The client turns it on only when the manifest defines automatic sending.
+
+Every step prints `{"step": 1-6, "title": "...", "state": "started"|"done"|"waiting"|"skipped", "detail": {...}}`. `detail` is optional. Step 4 prints `waiting` with `{"device_code": "..."}` while it waits for IT; give the code to IT. Steps that do not run, for example because the device is enrolled already, print `skipped`. The last line is `{"result": "enrolled"|"approved"|"done", "device": "pseudonym:…", "manifest_hash": "sha256:…"}`:
+
+- `enrolled`: the device is enrolled and waits for approval. `--no-wait` stops here.
+- `approved`: IT approved the device, but setup did not finish or the first claim was denied. A denied first claim exits 1; its reasons are in the `detail` of step 6.
+- `done`: setup is complete and the first claim was accepted.
+
+On a failure the last line is `{"error": "..."}`. When the command has no error of its own, the text is the last message it would have printed. Ctrl+C prints `{"error": "interrupted"}` and exits 130. Run `join --json` without the invitation to resume an enrolled device.
+
+### `check --json`
+
+```json
+{
+  "sent_at": "2026-11-02T10:00:00Z",
+  "accepted": true,
+  "warnings": [],
+  "reasons": [],
+  "controls": [{"id": "os_supported", "value": "yes", "ok": true}]
+}
+```
+
+`accepted` is false when the gateway denied the claim; `reasons` then says why and the exit code is 1. `warnings` appear on an accepted claim. `value` is what the device reported. `ok` tells whether the manifest requires the control on this system and accepts the value; it is null for a control the manifest does not require. A claim that was not sent, such as for a pending device or after a log alarm, prints `{"error": "..."}` instead (exit code 1, or 2 for a log alarm).
+
+### `accept --preview`
+
+```json
+{
+  "signed_hash": "sha256:…",
+  "published_hash": "sha256:…",
+  "changes": [
+    {"id": "password_min_length", "before": null, "after": ">= 10 on linux …; check builtin:password_min_length@1"}
+  ],
+  "schedule_widened": false
+}
+```
+
+`changes` has one entry per change that the text list of `accept` shows. `id` is the control id, or one of `disclosed_metadata`, `claim_retention`, `claim_recipients`, `data_controller`, `issuer`, `valid_from`, `claim_max_age`, `unknown_grace`, `min_trust_level`, `schedule`, `log_witnesses`, `log_witness_quorum`, `log_allows_split_views`, `log_checkpoint_max_age`. `before` is null for an added control and `after` is null for a removed one. `schedule_widened` is true when the new schedule adds automatic sending, changes its mode or probe, or shortens its interval; `accept` then turns automatic sending off. When the device signed the manifest the gateway enforces, `changes` is empty.
+
 ## Show the device status
 
 Run `status` to see where the device stands. It reads the client home and prints a summary. It never runs the checks, never sends a claim, never accepts a manifest, and writes no file.

@@ -339,6 +339,19 @@ impl Outcome {
         }
     }
 
+    /// What went wrong, for a claim that was not delivered. An alarm names its own text.
+    pub(crate) fn failure_text(&self) -> String {
+        match self {
+            Outcome::Alarm(text) => text.clone(),
+            Outcome::NotSent(NotSent::AcceptPending(hash)) => format!(
+                "the gateway enforces manifest {hash}, which this device has not signed; run `accept`"
+            ),
+            Outcome::NotSent(reason) => reason.reason().to_owned(),
+            Outcome::Denied { reasons, .. } => reasons.join("; "),
+            Outcome::Accepted { .. } => "the claim was accepted".to_owned(),
+        }
+    }
+
     /// The gateway received the claim and answered, whatever its verdict.
     pub(crate) fn delivered(&self) -> bool {
         matches!(self, Outcome::Accepted { .. } | Outcome::Denied { .. })
@@ -573,7 +586,7 @@ impl Prepared {
         let sent_at = claim
             .time
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let (result, reasons) = match serde_json::from_slice::<Response>(&received)
+        let (result, reasons, warnings) = match serde_json::from_slice::<Response>(&received)
             .with_context(|| String::from_utf8_lossy(&received).into_owned())?
         {
             Response::Accepted {
@@ -643,7 +656,7 @@ impl Prepared {
                     home.file("vpn-cert.pem").display(),
                 );
                 println!("VPN CA          {}", home.file("ca.pem").display());
-                (ClaimResult::Accepted, Vec::new())
+                (ClaimResult::Accepted, Vec::new(), warnings)
             }
             Response::Denied { reasons } => {
                 println!("{}", crate::ui::bold("DENIED", crate::ui::styled()));
@@ -651,11 +664,21 @@ impl Prepared {
                     println!("  {r}");
                 }
                 crate::print_hints(manifest, &claim.results, os);
-                (ClaimResult::Denied, reasons)
+                (ClaimResult::Denied, reasons, Vec::new())
             }
         };
         crate::report_log(LogSync::Verified(verified, own), home);
         let accepted = matches!(result, ClaimResult::Accepted);
+        if crate::json_out::active() {
+            crate::json_out::set_claim(crate::json_out::ClaimReport::new(
+                sent_at.clone(),
+                accepted,
+                warnings,
+                reasons.clone(),
+                &claim.results,
+                &self.compliance,
+            ));
+        }
         crate::print_claim_log_status(home, Some((sent_at, result, claim.results.len())), None);
         if changed.is_some() {
             println!("\n{}", notice());
