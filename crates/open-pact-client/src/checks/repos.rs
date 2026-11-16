@@ -1612,7 +1612,9 @@ mod tests {
             .path()
             .join(".repo-scan.json.11111111-1111-4111-8111-111111111111.tmp");
         fs::write(&path, b"keep").unwrap();
-        fs::File::open(&path)
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
             .unwrap()
             .set_times(
                 fs::FileTimes::new()
