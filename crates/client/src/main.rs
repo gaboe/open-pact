@@ -270,8 +270,8 @@ impl AppView {
                 .child(self.action("reload", "Refresh status", |_, _| Operation::Status, cx)),
             Screen::Status(status) => {
                 let revoked = status.approval.state.as_deref() == Some("revoked");
-                let heading = if revoked { "IT removed this device. Ask IT if this is a mistake." }
-                    else { match status.verdict.as_str() { "no_known_problem" => "All good", "action_needed" => "Action needed", "alarm" => "Keep the last checkpoint and tell IT.", _ => "Current status is unknown" } };
+                if revoked { return column().child(banner("IT removed this device. Ask IT if this is a mistake.", 0xb3261e, 0xfbe6e4)); }
+                let heading = match status.verdict.as_str() { "no_known_problem" => "All good", "action_needed" => "Action needed", "alarm" => "Keep the last checkpoint and tell IT.", _ => "Current status is unknown" };
                 let mut view = column().child(banner(heading, if status.verdict == "no_known_problem" { 0x2e7d4f } else { 0x9a5b0c }, if status.verdict == "no_known_problem" { 0xe5f2ea } else { 0xfbeedc }));
                 for issue in &status.issues {
                     view = view.child(column().gap_1().child(issue.message.clone()).child(note(issue.fix.clone().unwrap_or_default())).child(note(issue.deadline.clone())));
@@ -410,6 +410,8 @@ fn snapshots(output: PathBuf) {
     let mut good = status.clone();
     good.verdict = "no_known_problem".into();
     good.issues.clear();
+    let mut revoked = status.clone();
+    revoked.approval.state = Some("revoked".into());
     for (name, screen) in [
         ("client-0-install", Screen::Install),
         ("client-1-invitation", Screen::Invitation),
@@ -440,6 +442,7 @@ fn snapshots(output: PathBuf) {
         ("client-4-action", Screen::Status(Box::new(status))),
         ("client-5-good", Screen::Status(Box::new(good))),
         ("client-6-changed", Screen::Changed(changes)),
+        ("client-7-revoked", Screen::Status(Box::new(revoked))),
     ] {
         snapshot(&output, name, 520., 740., |window, cx| {
             cx.new(|cx| {
