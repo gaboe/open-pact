@@ -1,0 +1,23 @@
+Action needed. See the items below.
+Observed: 2026-11-16T10:00:00Z (online).
+
+1. The last claim response is unconfirmed.
+   Fix: Refresh with a new check. Keep the log if the failure repeats.
+   Run: open-pact-client --home '/home/example/pact' check
+   Deadline: Unknown; a lost response does not prove rejection.
+
+Device: approved (gateway refreshed now).
+Automatic sending: on. Job: installed and current; OS checked now.
+Signed schedule: every 55 minutes on any network, and at once when a check result changes.
+VPN: not required by the signed schedule.
+Last claim sent: 2026-11-16T09:50:00Z.
+Last claim response: 2026-11-16T09:50:00Z, unknown; response incomplete or unusable.
+Manifest agreement: yes; gateway checked now.
+Signed: sha256:<signed>
+Enforced: sha256:<signed>
+
+Log: checkpoint verified now; own-entry proofs not requested.
+Current checks: unknown; status does not run checks or send a claim.
+Note: An accepted saved response does not prove a verified certificate install.
+Note: Exact grace deadlines are unavailable; the gateway returns text, not first-failure times.
+Exit: 1

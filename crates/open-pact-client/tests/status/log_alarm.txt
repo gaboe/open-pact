@@ -1,0 +1,29 @@
+LOG ALARM. Keep the checkpoint and tell IT.
+Observed: 2026-11-16T10:00:00Z (online).
+
+1. Saved scheduled log alarm: the saved checkpoint did not verify
+   Fix: Keep the last checkpoint and tell IT.
+   Run: open-pact-client --home '/home/example/pact' log head
+   Deadline: Review now.
+
+2. transparency log: signed note has no blank line before its signatures
+   Fix: Keep the last checkpoint and tell IT.
+   Run: open-pact-client --home '/home/example/pact' log head
+   Deadline: Review now.
+
+Device: approved (saved on this device; not refreshed).
+Automatic sending: on. Job: installed and current; OS checked now.
+Signed schedule: every 55 minutes on any network, and at once when a check result changes.
+VPN: not required by the signed schedule.
+Last claim sent: 2026-11-16T09:50:00Z.
+Last claim response: 2026-11-16T09:50:00Z, accepted.
+Last job log line (saved): 2026-11-16T09:50:00Z TRANSPARENCY LOG ALARM: the saved checkpoint did not verify
+Manifest agreement: unknown; gateway not checked.
+Signed: sha256:<signed>
+Enforced: unknown; gateway not checked
+
+Log: ALARM; live checkpoint or pinned keys did not verify.
+Current checks: unknown; status does not run checks or send a claim.
+Note: An accepted saved response does not prove a verified certificate install.
+Note: Exact grace deadlines are unavailable; the gateway returns text, not first-failure times.
+Exit: 2

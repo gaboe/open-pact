@@ -1,0 +1,22 @@
+Some status is unknown. See the evidence below.
+Observed: 2026-11-16T10:00:00Z (local).
+Run `open-pact-client --home '/home/example/pact' status --online` for current approval and manifest.
+
+No recorded item needs a fix. Current checks have not run.
+
+Device: approved (saved on this device; not refreshed).
+Automatic sending: on. Job: installation recorded; OS job not checked.
+Signed schedule: every 55 minutes on any network, and at once when a check result changes.
+VPN: not required by the signed schedule.
+Last claim sent: 2026-11-16T09:50:00Z.
+Last claim response: 2026-11-16T09:50:00Z, accepted.
+Manifest agreement: unknown; gateway not checked.
+Signed: sha256:<signed>
+Enforced: unknown; gateway not checked
+
+Log: not verified by status; manual alarms are not saved.
+Current checks: unknown; status does not run checks or send a claim.
+Note: An accepted saved response does not prove a verified certificate install.
+Note: Exact grace deadlines are unavailable; the gateway returns text, not first-failure times.
+Note: Local mode makes no network or OS job queries. Approval, manifest agreement, and live VPN state can have changed.
+Exit: 3

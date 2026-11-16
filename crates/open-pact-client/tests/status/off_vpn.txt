@@ -1,0 +1,23 @@
+Action needed. See the items below.
+Observed: 2026-11-16T10:00:00Z (online).
+
+1. The signed VPN probe failed.
+   Fix: Connect the company VPN, then retry.
+   Run: open-pact-client --home '/home/example/pact' check
+   Deadline: No grace deadline follows from the VPN probe.
+
+Device: approved (gateway refreshed now).
+Automatic sending: on. Job: installed and current; OS checked now.
+Signed schedule: only while 127.0.0.1:7443 answers, every 55 minutes, and at once when a check result changes.
+VPN: probe failed now; automatic sending pauses.
+Last claim sent: 2026-11-16T09:50:00Z.
+Last claim response: 2026-11-16T09:50:00Z, accepted.
+Manifest agreement: yes; gateway checked now.
+Signed: sha256:<signed>
+Enforced: sha256:<signed>
+
+Log: checkpoint verified now; own-entry proofs not requested.
+Current checks: unknown; status does not run checks or send a claim.
+Note: An accepted saved response does not prove a verified certificate install.
+Note: Exact grace deadlines are unavailable; the gateway returns text, not first-failure times.
+Exit: 1

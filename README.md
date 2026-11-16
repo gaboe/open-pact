@@ -7,7 +7,7 @@ Status: proof of concept, not for production. On macOS, `join` tries a Secure En
 ## Layout
 
 - `crates/open-pact-core` manifest, signatures, narrowing, claims (RFC 8785 + JWS), evaluation, the Merkle transparency log and signed checkpoints
-- `crates/open-pact-client` CLI: `join <invitation>`, `check`, `accept`, `manifest show`, `schedule on|off|status`, `folders list|add|remove`, `log head`, `log prove`, `log show`, `stop`
+- `crates/open-pact-client` CLI: `join <invitation>`, `check`, `status [--online] [--json]`, `accept`, `manifest show`, `schedule on|off|status`, `folders list|add|remove`, `log head`, `log prove`, `log show`, `stop`
 - `crates/open-pact-gateway` HTTP gateway, small CA and transparency log, backed by PostgreSQL; admin commands `invite` and `devices`
 - `deploy/helm/open-pact` Helm chart (values use placeholders)
 
