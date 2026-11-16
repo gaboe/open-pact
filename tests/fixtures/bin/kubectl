@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+fixtures=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+case "$*" in
+  *'devices list --json') cat "$fixtures/devices.json" ;;
+  *'status --json') cat "$fixtures/gateway.json" ;;
+  *'invite --ttl '*) cat "$fixtures/invitation.json" ;;
+  *'devices approve '*|*'devices revoke '*) printf '%s\n' '{}' ;;
+  *'get deploy/open-pact-gateway -o json') printf '%s\n' '{"metadata":{"generation":1},"status":{"availableReplicas":1,"conditions":[{"type":"Available","status":"True"}]}}' ;;
+  *) printf '%s\n' '{"error":"Unexpected fixture command"}'; exit 1 ;;
+esac
