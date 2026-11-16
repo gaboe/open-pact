@@ -555,17 +555,17 @@ fn read_generation(mut read: impl FnMut(&str) -> Result<Option<Vec<u8>>>) -> Res
             return Ok(Generation::NotEnrolled);
         };
         let enrolment: Enrolment = serde_json::from_slice(&bytes)?;
+        // Retry only when enrolment.json changed. A stable enrolment with another manifest is reported, not retried.
         let manifest = manifest.and_then(|bytes| {
-            Ok(Manifest::parse(
-                &bytes.context("manifest.toml is missing")?,
-            )?)
+            let manifest = Manifest::parse(&bytes.context("manifest.toml is missing")?)?;
+            if manifest.hash() != &enrolment.manifest {
+                bail!(
+                    "manifest.toml is not the enrolled manifest {}",
+                    enrolment.manifest.as_str()
+                );
+            }
+            Ok(manifest)
         });
-        if manifest
-            .as_ref()
-            .is_ok_and(|manifest| manifest.hash() != &enrolment.manifest)
-        {
-            continue;
-        }
         return Ok(Generation::Enrolled(Box::new(EnrolledGeneration {
             enrolment,
             manifest,
@@ -733,8 +733,15 @@ impl Report {
 
     fn finish_unknown(&mut self) {
         self.issues.sort_by_key(|issue| issue.urgency);
-        self.verdict = Verdict::Unknown;
-        self.exit_code = 3;
+        (self.verdict, self.exit_code) = if self
+            .issues
+            .iter()
+            .any(|issue| issue.urgency == Urgency::Alarm)
+        {
+            (Verdict::Alarm, 2)
+        } else {
+            (Verdict::Unknown, 3)
+        };
     }
 
     fn issue(

@@ -85,6 +85,13 @@ impl Fixture {
         let signed = manifest.hash().clone();
         let enforced = ManifestHash::of(enforced_toml.as_bytes());
         let published = Company::published(&enforced_toml, &company.key);
+        let published = if state == "bad_company_signature" {
+            let mut body: serde_json::Value = serde_json::from_str(&published).unwrap();
+            body["toml"] = json!(enforced_toml.replace("company.example", "other.example"));
+            body.to_string()
+        } else {
+            published
+        };
         let entry = open_pact_core::Entry {
             index: 0,
             kind: open_pact_core::EntryKind::ManifestPublished,
@@ -618,7 +625,7 @@ async fn damaged_enrolment_still_renders_an_unknown_report() {
 }
 
 #[tokio::test]
-async fn mismatched_generations_report_busy_instead_of_mixing_facts() {
+async fn lasting_manifest_mismatch_shows_the_accept_fix() {
     let fixture = Fixture::new("approved_ok").await;
     let text = fixture
         .home
@@ -631,17 +638,15 @@ async fn mismatched_generations_report_busy_instead_of_mixing_facts() {
         .write("manifest.toml", text.as_bytes())
         .unwrap();
     let report = fixture.report(false).await;
-    assert_eq!(report.exit_code, 3);
-    assert!(
-        report
-            .render()
-            .contains("busy: another command changed this device during status")
-    );
-    assert!(report.manifest.is_none());
+    let rendered = report.render();
+    assert_eq!(report.exit_code, 1);
+    assert!(rendered.contains("The signed local manifest is unavailable"));
+    assert!(rendered.contains("accept"));
+    assert!(!rendered.contains("busy:"));
 }
 
 #[tokio::test]
-async fn generation_reads_retry_both_enrolment_changes_and_manifest_write_windows() {
+async fn generation_reads_retry_only_when_enrolment_changes() {
     let fixture = Fixture::new("approved_ok").await;
     let before = std::fs::read(fixture.home.file("enrolment.json")).unwrap();
     let manifest = fixture
@@ -654,28 +659,47 @@ async fn generation_reads_retry_both_enrolment_changes_and_manifest_write_window
     let mut enrolled = fixture.home.enrolment().unwrap();
     enrolled.manifest = ManifestHash::of(&manifest);
     let after = serde_json::to_vec(&enrolled).unwrap();
-    for first_after in [&before, &after] {
-        let mut reads = std::collections::VecDeque::from([
-            ("enrolment.json", before.clone()),
-            ("manifest.toml", manifest.clone()),
-            ("enrolment.json", first_after.clone()),
-            ("enrolment.json", after.clone()),
-            ("manifest.toml", manifest.clone()),
-            ("enrolment.json", after.clone()),
-        ]);
-        let result = read_generation(|file| {
-            let (expected, bytes) = reads.pop_front().expect("too many reads");
-            assert_eq!(file, expected);
-            Ok(Some(bytes))
-        })
-        .unwrap();
-        let Generation::Enrolled(generation) = result else {
-            panic!("expected the stable second generation")
-        };
-        assert_eq!(generation.enrolment.manifest, enrolled.manifest);
-        assert_eq!(generation.manifest.unwrap().hash(), &enrolled.manifest);
-        assert!(reads.is_empty());
-    }
+    let mut reads = std::collections::VecDeque::from([
+        ("enrolment.json", before.clone()),
+        ("manifest.toml", manifest.clone()),
+        ("enrolment.json", after.clone()),
+        ("enrolment.json", after.clone()),
+        ("manifest.toml", manifest.clone()),
+        ("enrolment.json", after.clone()),
+    ]);
+    let result = read_generation(|file| {
+        let (expected, bytes) = reads.pop_front().expect("too many reads");
+        assert_eq!(file, expected);
+        Ok(Some(bytes))
+    })
+    .unwrap();
+    let Generation::Enrolled(generation) = result else {
+        panic!("expected the stable second generation")
+    };
+    assert_eq!(generation.enrolment.manifest, enrolled.manifest);
+    assert_eq!(generation.manifest.unwrap().hash(), &enrolled.manifest);
+    assert!(reads.is_empty());
+
+    let mut reads = std::collections::VecDeque::from([
+        ("enrolment.json", before.clone()),
+        ("manifest.toml", manifest.clone()),
+        ("enrolment.json", before.clone()),
+    ]);
+    let result = read_generation(|file| {
+        let (expected, bytes) = reads.pop_front().expect("too many reads");
+        assert_eq!(file, expected);
+        Ok(Some(bytes))
+    })
+    .unwrap();
+    let Generation::Enrolled(generation) = result else {
+        panic!("expected the stable enrolment")
+    };
+    assert_eq!(
+        generation.enrolment.manifest,
+        fixture.home.enrolment().unwrap().manifest
+    );
+    assert!(generation.manifest.is_err());
+    assert!(reads.is_empty());
 }
 
 #[tokio::test]
@@ -791,6 +815,7 @@ async fn accept_restores_missing_or_damaged_signed_manifest() {
                     .unwrap();
             }
         }
+        let enrolment = std::fs::read(fixture.home.file("enrolment.json")).unwrap();
         assert_eq!(
             crate::accept(&fixture.home, true, false).await.unwrap(),
             ExitCode::SUCCESS
@@ -798,6 +823,10 @@ async fn accept_restores_missing_or_damaged_signed_manifest() {
         assert_eq!(
             fixture.home.read_text("manifest.toml").unwrap().unwrap(),
             original
+        );
+        assert_eq!(
+            std::fs::read(fixture.home.file("enrolment.json")).unwrap(),
+            enrolment
         );
         assert!(
             !fixture
@@ -808,6 +837,47 @@ async fn accept_restores_missing_or_damaged_signed_manifest() {
         );
         assert_eq!(fixture.report(true).await.exit_code, 0);
     }
+}
+
+#[tokio::test]
+async fn accept_refuses_a_manifest_the_company_did_not_sign() {
+    let fixture = Fixture::new("bad_company_signature").await;
+    std::fs::remove_file(fixture.home.file("manifest.toml")).unwrap();
+    let enrolment = std::fs::read(fixture.home.file("enrolment.json")).unwrap();
+    assert!(crate::accept(&fixture.home, true, false).await.is_err());
+    assert!(!fixture.home.file("manifest.toml").exists());
+    assert_eq!(
+        std::fs::read(fixture.home.file("enrolment.json")).unwrap(),
+        enrolment
+    );
+    assert!(
+        !fixture
+            .gateway
+            .requests()
+            .iter()
+            .any(|line| line.starts_with("POST "))
+    );
+}
+
+#[tokio::test]
+async fn saved_alarm_keeps_exit_2_when_enrolment_is_damaged() {
+    let fixture = Fixture::new("approved_ok").await;
+    fixture
+        .home
+        .write(
+            "report-state.json",
+            &serde_json::to_vec(&json!({"vpn_up":true,"last_note":"alarm checkpoint kept"}))
+                .unwrap(),
+        )
+        .unwrap();
+    fixture.home.write("enrolment.json", b"{").unwrap();
+    let report = fixture.report(false).await;
+    assert_eq!(report.exit_code, 2);
+    assert!(
+        report
+            .render()
+            .contains("Saved scheduled log alarm: checkpoint kept")
+    );
 }
 
 #[tokio::test]
