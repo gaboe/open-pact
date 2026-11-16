@@ -1327,9 +1327,14 @@ impl Pending {
         ))
     }
 
+    /// The first input that holds text the form could not read.
+    pub fn first_unread(&self) -> Option<&Field> {
+        self.0.keys().next()
+    }
+
     /// Why the view may not change: one of the inputs holds text that is not a value yet.
     pub fn unread_blocks(&self, form: &Form) -> Option<String> {
-        let field = self.0.keys().next()?;
+        let field = self.first_unread()?;
         Some(format!(
             "{} holds text that is not a value yet. Fix it before you switch views.",
             field.label(form)

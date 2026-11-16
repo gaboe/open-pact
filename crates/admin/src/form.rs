@@ -1249,6 +1249,12 @@ impl AppView {
         self.fv.pending.unread_blocks(&form)
     }
 
+    /// The label of the input that holds text the form could not read, if the form can be read.
+    pub fn unread_field(&self) -> Option<String> {
+        let form = Form::parse(&self.draft).ok()?;
+        Some(self.fv.pending.first_unread()?.label(&form))
+    }
+
     fn panel_blocked(&mut self) -> bool {
         let Some(note) = self.panel_note() else {
             return false;

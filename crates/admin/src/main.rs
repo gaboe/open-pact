@@ -52,6 +52,32 @@ enum Operation {
     Invite(String, String),
 }
 
+/// What a refresh does with the draft and the inputs of the form.
+#[derive(Debug, PartialEq, Eq)]
+enum RefreshStep {
+    /// Take the refreshed manifest as the draft and make the inputs again.
+    Rebuild,
+    /// Keep the draft and the inputs.
+    Keep,
+    /// Keep the draft and the inputs, and say that the gateway changed. The field holds unread text.
+    Warn(String),
+}
+
+/// Unread input is never rebuilt away. The draft follows the gateway only when it is the active
+/// manifest and no input holds unread text.
+fn refresh_step(
+    unread: Option<String>,
+    draft_is_active: bool,
+    active_changed: bool,
+) -> RefreshStep {
+    match unread {
+        Some(field) if active_changed => RefreshStep::Warn(field),
+        Some(_) => RefreshStep::Keep,
+        None if draft_is_active => RefreshStep::Rebuild,
+        None => RefreshStep::Keep,
+    }
+}
+
 struct Overview {
     gateway: Gateway,
     devices: Vec<Device>,
@@ -449,10 +475,16 @@ impl AppView {
                         this.status = (skipped > 0).then(|| format!("Skipped {skipped} backup file(s). See Manifest, then History."));
                     }
                     Ok(Outcome::Refresh(overview, active)) => {
-                        if this.draft == this.active {
-                            this.draft = active.clone();
-                            this.show_draft(window, cx);
-                            this.build_form(window, cx);
+                        match refresh_step(this.unread_field(), this.draft == this.active, this.active != active) {
+                            RefreshStep::Rebuild => {
+                                this.draft = active.clone();
+                                this.show_draft(window, cx);
+                                this.build_form(window, cx);
+                            }
+                            RefreshStep::Keep => {}
+                            RefreshStep::Warn(field) => {
+                                this.error = Some(format!("The manifest on the gateway changed. Fix {field} or discard your edits, then refresh again."));
+                            }
                         }
                         this.active = active; this.overview = Some(overview); this.status = Some("Gateway and active manifest refreshed.".into());
                     }
@@ -1552,7 +1584,29 @@ fn snapshot_check(name: &str, draft: &str) -> Result<Vec<runner::admin::CheckErr
 
 #[cfg(test)]
 mod tests {
-    use super::{Listing, can_save};
+    use super::{Listing, RefreshStep, can_save, refresh_step};
+
+    #[test]
+    fn a_refresh_keeps_unread_input_and_says_when_the_gateway_changed() {
+        let field = Some("Valid from".to_owned());
+        assert_eq!(refresh_step(field.clone(), true, false), RefreshStep::Keep);
+        assert_eq!(refresh_step(field.clone(), false, false), RefreshStep::Keep);
+        assert_eq!(
+            refresh_step(field.clone(), true, true),
+            RefreshStep::Warn("Valid from".to_owned())
+        );
+        assert_eq!(
+            refresh_step(field, false, true),
+            RefreshStep::Warn("Valid from".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_refresh_without_unread_input_takes_the_gateway_only_into_an_active_draft() {
+        assert_eq!(refresh_step(None, true, true), RefreshStep::Rebuild);
+        assert_eq!(refresh_step(None, true, false), RefreshStep::Rebuild);
+        assert_eq!(refresh_step(None, false, true), RefreshStep::Keep);
+    }
 
     #[test]
     fn save_waits_while_kubectl_lists_namespaces() {
