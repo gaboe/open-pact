@@ -9,6 +9,7 @@ mod keys;
 mod manifests;
 mod nonces;
 mod ratelimit;
+mod results;
 mod seal;
 mod siem;
 #[cfg(test)]
@@ -90,6 +91,11 @@ enum Command {
         #[command(subcommand)]
         command: manifests::Command,
     },
+    /// Read stored check results: list claims, show one with every check
+    Claims {
+        #[command(subcommand)]
+        command: results::Command,
+    },
     /// Show the gateway version, the manifest it enforces and how many devices are in each state
     Status {
         /// Print one JSON document. On a database error it prints {"error": ...} and exits non-zero
@@ -115,7 +121,7 @@ impl Cli {
                         command: DevicesCommand::List { json: true }
                     }
             )
-        )
+        ) || matches!(&self.command, Some(Command::Claims { command }) if command.prints_json())
     }
 }
 
@@ -1598,6 +1604,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Manifest { command } => manifests::run(&db, command).await,
         Command::Devices { command } => admin_devices(&db, command).await,
+        Command::Claims { command } => {
+            let startup = read_manifest().ok().map(|(_, _, manifest)| manifest);
+            results::run(&db, &SealingKey::kek_from_env()?, startup.as_ref(), command).await
+        }
         Command::Status { json } => {
             let manifest = match manifests::active(&db).await? {
                 Some(row) => Manifest::parse(row.toml.as_bytes())?,
@@ -3460,6 +3470,10 @@ grace = "1d"
         };
         assert!(parse(&["status", "--json"]).prints_json());
         assert!(parse(&["devices", "list", "--json"]).prints_json());
+        assert!(parse(&["claims", "list", "--json"]).prints_json());
+        assert!(parse(&["claims", "show", "7", "--json"]).prints_json());
+        assert!(!parse(&["claims", "list"]).prints_json());
+        assert!(!parse(&["claims", "show", "7"]).prints_json());
         assert!(parse(&["invite", "--json", "--url=https://pact.example.com"]).prints_json());
         assert!(!parse(&["status"]).prints_json());
         assert!(!parse(&["devices", "list"]).prints_json());

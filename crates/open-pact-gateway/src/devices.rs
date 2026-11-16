@@ -199,24 +199,31 @@ pub async fn apply(
     Ok(result)
 }
 
-/// The one pending pseudonym that starts with `prefix`. The owner reads the prefix out to IT.
-pub async fn pending_by_prefix(db: &PgPool, prefix: &str) -> anyhow::Result<String> {
+/// The start of a pseudonym the owner or IT reads out: at least 8 lowercase hex digits, with or
+/// without `pseudonym:`. Returns it with the prefix.
+pub fn pseudonym_prefix(prefix: &str) -> anyhow::Result<String> {
     const MIN: usize = 8;
     let hex = prefix.strip_prefix("pseudonym:").unwrap_or(prefix);
     if hex.len() < MIN || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
         bail!("give at least {MIN} lowercase hex digits of the pseudonym, got {prefix:?}");
     }
+    Ok(format!("pseudonym:{hex}"))
+}
+
+/// The one pending pseudonym that starts with `prefix`. The owner reads the prefix out to IT.
+pub async fn pending_by_prefix(db: &PgPool, prefix: &str) -> anyhow::Result<String> {
+    let prefix = pseudonym_prefix(prefix)?;
     let found: Vec<String> = sqlx::query_scalar(
         "SELECT DISTINCT pseudonym FROM devices WHERE state = 'pending' AND starts_with(pseudonym, $1) ORDER BY pseudonym",
     )
-    .bind(format!("pseudonym:{hex}"))
+    .bind(&prefix)
     .fetch_all(db)
     .await?;
     match found.as_slice() {
         [one] => Ok(one.clone()),
-        [] => bail!("no pending device starts with pseudonym:{hex}"),
+        [] => bail!("no pending device starts with {prefix}"),
         many => bail!(
-            "{} pending devices start with pseudonym:{hex}; give more digits:\n{}",
+            "{} pending devices start with {prefix}; give more digits:\n{}",
             many.len(),
             many.join("\n")
         ),
