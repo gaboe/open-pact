@@ -1288,12 +1288,26 @@ async fn status(
     })
 }
 
+fn manifest_path() -> String {
+    std::env::var("MANIFEST_PATH").unwrap_or_else(|_| "examples/manifest.toml".into())
+}
+
 /// The manifest this process enforces: the file at `MANIFEST_PATH`, or the example manifest.
 fn read_manifest() -> anyhow::Result<(String, String, Manifest)> {
-    let path = std::env::var("MANIFEST_PATH").unwrap_or_else(|_| "examples/manifest.toml".into());
+    let path = manifest_path();
     let toml = std::fs::read_to_string(&path)?;
     let manifest = Manifest::parse(toml.as_bytes())?;
     Ok((path, toml, manifest))
+}
+
+/// The hash of the startup file, or None when that file does not exist. Only a missing file is
+/// tolerated: `manifest set` reports this hash and must not fail for want of it.
+fn startup_manifest_hash() -> anyhow::Result<Option<String>> {
+    match std::fs::read_to_string(manifest_path()) {
+        Ok(toml) => Ok(Some(Manifest::parse(toml.as_bytes())?.hash().to_string())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }
 
 async fn admin_devices(db: &PgPool, command: DevicesCommand) -> anyhow::Result<()> {
