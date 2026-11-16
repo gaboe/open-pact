@@ -959,6 +959,27 @@ fn refused_and_unconfirmed_writes_say_which_they_are() {
 
 #[test]
 #[cfg(unix)]
+fn a_gateway_refusal_reaches_the_apply_view_in_its_own_words() {
+    use runner::admin::hash;
+    let (temp, admin) = isolated_admin();
+    let reason = "schedule.interval 4m must be whole minutes or hours from 5m to 24h";
+    std::fs::write(temp.path().join("fixtures/refuse.txt"), reason).unwrap();
+    let active = admin.manifest(None).unwrap();
+    let next = active.replace("interval = \"55m\"", "interval = \"4m\"");
+    let error = admin
+        .apply(
+            &next,
+            "Too short",
+            &hash(&active),
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains(reason), "{error}");
+    assert_eq!(admin.manifest(None).unwrap(), active);
+}
+
+#[test]
+#[cfg(unix)]
 fn notes_that_start_with_a_dash_stay_values() {
     let (_temp, admin) = isolated_admin();
     admin.invite("72h", "-Bob; $(x)").unwrap();

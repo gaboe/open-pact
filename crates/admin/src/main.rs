@@ -1403,6 +1403,9 @@ fn snapshots(output: PathBuf) {
         ("admin-c-toml", Screen::Manifest, false, None),
         ("admin-m-number-check", Screen::Manifest, true, None),
         ("admin-n-add-check", Screen::Manifest, true, None),
+        ("admin-o-field-errors", Screen::Manifest, true, None),
+        ("admin-p-add-check-all", Screen::Manifest, true, None),
+        ("admin-q-add-check-scrolled", Screen::Manifest, true, None),
         ("admin-d-apply", Screen::Manifest, true, Some(Dialog::Apply)),
         (
             "admin-e-invitation",
@@ -1430,21 +1433,27 @@ fn snapshots(output: PathBuf) {
             )),
         ),
     ] {
-        let (width, height) = if screen == Screen::Manifest {
-            (
-                1440.,
-                if matches!(
-                    name,
-                    "admin-b-form" | "admin-m-number-check" | "admin-n-add-check"
-                ) {
-                    1700.
-                } else {
-                    880.
-                },
-            )
-        } else {
-            (1040., 800.)
-        };
+        let (width, height) =
+            if matches!(name, "admin-p-add-check-all" | "admin-q-add-check-scrolled") {
+                (1360., 860.)
+            } else if screen == Screen::Manifest {
+                (
+                    1440.,
+                    if matches!(
+                        name,
+                        "admin-b-form"
+                            | "admin-m-number-check"
+                            | "admin-n-add-check"
+                            | "admin-o-field-errors"
+                    ) {
+                        1700.
+                    } else {
+                        880.
+                    },
+                )
+            } else {
+                (1040., 800.)
+            };
         snapshot(&output, name, width, height, |window, cx| {
             cx.new(|cx| {
             let mut app = AppView::new(Settings { context: "test-cluster".into(), namespace: "open-pact".into(), ..Settings::default() }, window, cx);
@@ -1454,12 +1463,29 @@ fn snapshots(output: PathBuf) {
             if name == "admin-k-update" { app.update = UpdateState::Available("0.1.1".into()); }
                 app.active = include_str!("../../../tests/fixtures/manifest.toml").into();
                 app.draft = app.active.clone();
-            if matches!(name, "admin-d-apply" | "admin-b-form" | "admin-m-number-check" | "admin-n-add-check") { app.draft = include_str!("../../../tests/fixtures/manifest-v2.toml").into(); }
+            if matches!(name, "admin-d-apply" | "admin-b-form" | "admin-m-number-check" | "admin-n-add-check" | "admin-o-field-errors" | "admin-p-add-check-all" | "admin-q-add-check-scrolled") { app.draft = include_str!("../../../tests/fixtures/manifest-v2.toml").into(); }
+            if name == "admin-o-field-errors" {
+                app.draft = app.draft
+                    .replace("interval = \"55m\"", "interval = \"4m\"")
+                    .replace("unknown_grace = \"7d\"", "unknown_grace = \"0d\"")
+                    .replace("windows = { max = 30 }, linux = { max = 30 } }\ngrace = \"1d\"\n\n[[control]]\nid = \"os_supported\"", "windows = { max = 3651 }, linux = { max = 30 } }\ngrace = \"1d\"\n\n[[control]]\nid = \"os_supported\"")
+                    .replace("required = { windows = \"null\", macos = \"n/a\"", "required = { windows = \"time\", macos = \"n/a\"");
+            }
+            if matches!(name, "admin-p-add-check-all" | "admin-q-add-check-scrolled") {
+                let text = &app.draft;
+                let (head, tail) = (text.find("[[control]]"), text.find("[log]"));
+                if let (Some(head), Some(tail)) = (head, tail) {
+                    app.draft = format!("{}{}", &text[..head], &text[tail..]);
+                }
+            }
             if !form { app.draft = include_str!("../../../tests/fixtures/manifest-v2.toml").replace("issuer = \"Example Company, IT security\"", "issuer = \"Example Company, IT security"); }
-            app.fv.selected = match name { "admin-m-number-check" => Some("os_patch_age_days".to_owned()), "admin-b-form" | "admin-n-add-check" => Some("screen_lock".to_owned()), _ => None };
-            app.fv.add_open = name == "admin-n-add-check";
+            app.fv.selected = match name { "admin-m-number-check" | "admin-o-field-errors" => Some("os_patch_age_days".to_owned()), "admin-b-form" | "admin-n-add-check" => Some("screen_lock".to_owned()), _ => None };
+            app.fv.add_open = matches!(name, "admin-n-add-check" | "admin-p-add-check-all" | "admin-q-add-check-scrolled");
             app.show_draft(window, cx);
             app.build_form(window, cx);
+            if name == "admin-o-field-errors" { app.type_valid_from("garbage", window, cx); }
+            if matches!(name, "admin-p-add-check-all" | "admin-q-add-check-scrolled") { app.fv.scroll.set_offset(point(px(0.), px(-1000.))); }
+            if name == "admin-q-add-check-scrolled" { app.fv.add_scroll.set_offset(point(px(0.), px(-5000.))); }
             app.overview = Some(Overview {
                 gateway: serde_json::from_str(include_str!("../../../tests/fixtures/gateway.json")).unwrap(),
                 devices: serde_json::from_str(include_str!("../../../tests/fixtures/devices.json")).unwrap(),

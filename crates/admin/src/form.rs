@@ -6,9 +6,10 @@ use gpui_component::{
     input::{Editor, Position, Textarea, TextareaState},
 };
 use runner::manifest::{
-    self, Control, Filter, Form, Os, Output, Requirement, SOURCES, Span, TRUST_LEVELS, Unit,
+    self, Control, Field, FieldError, Filter, Form, Os, Output, Pending, Requirement, SOURCES,
+    Span, TRUST_LEVELS, Unit,
 };
-use std::rc::Rc;
+use std::{cell::Cell, rc::Rc};
 
 type Units = Entity<SelectState<Vec<SharedString>>>;
 /// Turns the app state and a new value into the new draft.
@@ -16,13 +17,65 @@ type Apply = Rc<dyn Fn(&AppView, &str) -> Result<String, String>>;
 
 const SPANS: &[Unit] = &Unit::SPANS;
 const INTERVALS: &[Unit] = &Unit::INTERVALS;
+/// How far from the Add check button its options open, the gap kept to the window edge, and the
+/// least height the options get.
+const POPOVER_TOP: f32 = 40.;
+const POPOVER_MARGIN: f32 = 12.;
+const POPOVER_MIN: f32 = 200.;
+
+/// Where the Add check options open and how tall they may be.
+#[derive(Debug, PartialEq)]
+struct PopoverPlace {
+    above: bool,
+    height: f32,
+}
+
+/// The options open below the button with the window height minus their top, never under 200 px.
+/// When that leaves less than 200 px and the room above the button is larger, they open above.
+fn popover_place(window_height: f32, button_top: f32) -> PopoverPlace {
+    let below = window_height - (button_top + POPOVER_TOP) - POPOVER_MARGIN;
+    let above = button_top - (POPOVER_TOP - 32.) - POPOVER_MARGIN;
+    if below >= POPOVER_MIN || below >= above {
+        PopoverPlace {
+            above: false,
+            height: below.max(POPOVER_MIN),
+        }
+    } else {
+        PopoverPlace {
+            above: true,
+            height: above.max(POPOVER_MIN),
+        }
+    }
+}
 const CHIP: u32 = 0xefebe3;
 const ROW_HOVER: u32 = 0xfaf8f4;
 const PANEL_BG: u32 = 0xfbfaf7;
 
+/// Which inputs an edit makes again from the new text.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Rebuild {
+    No,
+    /// The inputs of the form, not the panel of the selected check.
+    Inputs,
+    All,
+}
+
+/// The field a duration input edits. A check's panel looks it up when the input changes, because
+/// the check may have a new ID by then.
+type FieldOf = Rc<dyn Fn(&AppView) -> Option<Field>>;
+
 pub struct DurationField {
     amount: Entity<InputState>,
     unit: Units,
+}
+
+struct DurationSpec {
+    raw: String,
+    units: &'static [Unit],
+    panel: bool,
+    field: FieldOf,
+    /// An input that holds text the form could not read yet. It stays.
+    reuse: Option<DurationField>,
 }
 
 pub struct FormInputs {
@@ -49,13 +102,14 @@ enum OsInput {
 }
 
 pub struct Panel {
-    id: Entity<InputState>,
+    /// None for a built-in check: its ID is fixed.
+    id: Option<Entity<InputState>>,
     source: Units,
-    source_ref: Entity<InputState>,
+    source_ref: Entity<TextareaState>,
     rationale: Entity<TextareaState>,
     os: [OsInput; 3],
     /// A number field is open for this OS before any number is typed.
-    pending: [bool; 3],
+    opened: [bool; 3],
     grace: DurationField,
 }
 
@@ -66,9 +120,15 @@ pub struct FormState {
     pub selected: Option<String>,
     pub filter: Filter,
     pub add_open: bool,
+    /// Input the form could not read yet, one message per field.
+    pub pending: Pending,
+    /// Where the Add check button was in the last paint: its top and the window height.
+    add_anchor: Rc<Cell<(f32, f32)>>,
     pub adding_recipient: bool,
     pub jump: usize,
     pub scroll: ScrollHandle,
+    /// The scroll position of the Add check options.
+    pub add_scroll: ScrollHandle,
     search: Entity<InputState>,
     add_search: Entity<InputState>,
     chip: Entity<InputState>,
@@ -110,7 +170,7 @@ impl FormState {
                             }
                             let result =
                                 manifest::set_top_list(&this.draft, "claim_recipients", &items);
-                            this.edit_form(result, true, window, cx);
+                            this.edit_form(result, Rebuild::No, window, cx);
                         }
                         cx.notify();
                     }
@@ -123,9 +183,12 @@ impl FormState {
             selected: None,
             filter: Filter::All,
             add_open: false,
+            pending: Pending::default(),
+            add_anchor: Rc::new(Cell::new((0., 0.))),
             adding_recipient: false,
             jump: 0,
             scroll: ScrollHandle::new(),
+            add_scroll: ScrollHandle::new(),
             search,
             add_search,
             chip,
@@ -177,19 +240,49 @@ fn section(title: &'static str, why: &'static str, body: impl IntoElement) -> Di
 }
 
 fn kv_row(key: &'static str, control: impl IntoElement) -> Div {
+    kv_row_error(key, control, None)
+}
+
+/// A line under a field that says why the form refuses its value.
+fn error_line(message: impl Into<SharedString>) -> Div {
+    div()
+        .text_size(px(12.5))
+        .text_color(rgb(BAD))
+        .child(message.into())
+}
+
+/// The first message for a field. Unparsed input comes before what the manifest check finds.
+fn error_of(issues: &[FieldError], field: &Field) -> Option<String> {
+    issues
+        .iter()
+        .find(|issue| issue.field == *field)
+        .map(|issue| issue.message.clone())
+}
+
+fn kv_row_error(key: &'static str, control: impl IntoElement, error: Option<String>) -> Div {
+    let failed = error.is_some();
     div()
         .flex()
         .items_center()
         .gap(px(16.))
+        .when(failed, |row| row.items_start())
         .child(
             div()
                 .w(px(150.))
                 .flex_none()
                 .text_size(px(13.))
                 .text_color(rgb(INK_2))
+                .when(failed, |name| name.pt(px(7.)))
                 .child(key),
         )
-        .child(control)
+        .child(match error {
+            Some(error) => column()
+                .gap(px(4.))
+                .child(control)
+                .child(error_line(error))
+                .into_any_element(),
+            None => control.into_any_element(),
+        })
 }
 
 fn rows(items: Vec<Div>) -> Div {
@@ -281,12 +374,12 @@ fn plural(count: usize, one: &str, many: &str) -> String {
 }
 
 impl AppView {
-    /// Applies an edit of the form to the draft. `rebuild` makes new inputs from the new text,
-    /// for edits that change which inputs exist.
+    /// Applies an edit of the form to the draft. `rebuild` says which inputs the new text makes
+    /// again, for edits that change which inputs exist.
     pub fn edit_form(
         &mut self,
         result: Result<String, String>,
-        rebuild: bool,
+        rebuild: Rebuild,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -295,13 +388,37 @@ impl AppView {
                 self.error = None;
                 self.draft = text;
                 self.show_draft(window, cx);
-                if rebuild {
-                    self.build_form(window, cx);
+                match rebuild {
+                    Rebuild::No => (),
+                    Rebuild::Inputs => self.make_inputs(window, cx),
+                    Rebuild::All => self.refresh_form(window, cx),
                 }
             }
             Err(error) => self.error = Some(error),
         }
         cx.notify();
+    }
+
+    /// An edit of one input. A good value clears the error of that field only. A bad one leaves
+    /// the draft as it is and marks the field until its input is fixed.
+    fn edit_field(
+        &mut self,
+        field: Field,
+        result: Result<String, String>,
+        rebuild: Rebuild,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match result {
+            Ok(text) => {
+                self.fv.pending.record(field, Ok(()));
+                self.edit_form(Ok(text), rebuild, window, cx);
+            }
+            Err(message) => {
+                self.fv.pending.record(field, Err(message));
+                cx.notify();
+            }
+        }
     }
 
     /// Puts the draft into the TOML editor and marks the line of a parse error in it.
@@ -337,6 +454,7 @@ impl AppView {
     fn bind_text(
         &mut self,
         input: &Entity<InputState>,
+        field: Option<Field>,
         apply: Apply,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -348,7 +466,12 @@ impl AppView {
                 if matches!(event, InputEvent::Change) {
                     let value = input.read(cx).value().to_string();
                     let result = apply(this, &value);
-                    this.edit_form(result, false, window, cx);
+                    match &field {
+                        Some(field) => {
+                            this.edit_field(field.clone(), result, Rebuild::No, window, cx)
+                        }
+                        None => this.edit_form(result, Rebuild::No, window, cx),
+                    }
                 }
             },
         );
@@ -358,52 +481,72 @@ impl AppView {
     fn text_input(
         &mut self,
         value: &str,
+        field: Option<Field>,
         apply: Apply,
+        reuse: Option<Entity<InputState>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<InputState> {
-        let input = cx.new(|cx| InputState::new(window, cx).default_value(value.to_owned()));
-        self.bind_text(&input, apply, window, cx);
+        let input = reuse.unwrap_or_else(|| {
+            cx.new(|cx| InputState::new(window, cx).default_value(value.to_owned()))
+        });
+        self.bind_text(&input, field, apply, window, cx);
         input
     }
 
     fn duration_field(
         &mut self,
-        raw: &str,
-        units: &'static [Unit],
-        panel: bool,
+        spec: DurationSpec,
         apply: Apply,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> DurationField {
-        let span = Span::parse(raw).filter(|span| units.contains(&span.unit));
-        let amount = cx.new(|cx| {
-            InputState::new(window, cx)
-                .default_value(span.map(|span| span.amount.to_string()).unwrap_or_default())
-        });
-        let unit = cx.new(|cx| {
-            SelectState::new(
-                unit_labels(units, span.map_or(0, |s| s.amount)),
-                None,
-                window,
-                cx,
-            )
-        });
-        if let Some(span) = span {
-            unit.update(cx, |state, cx| {
-                state.set_selected_value(
-                    &SharedString::from(span.unit.name(span.amount)),
-                    window,
-                    cx,
-                )
-            });
-        }
+        let DurationSpec {
+            raw,
+            units,
+            panel,
+            field,
+            reuse,
+        } = spec;
+        let (amount, unit) = match reuse {
+            Some(held) => (held.amount, held.unit),
+            None => {
+                let span = Span::parse(&raw).filter(|span| units.contains(&span.unit));
+                let amount = cx.new(|cx| {
+                    InputState::new(window, cx)
+                        .default_value(span.map(|span| span.amount.to_string()).unwrap_or_default())
+                });
+                let unit = cx.new(|cx| {
+                    SelectState::new(
+                        unit_labels(units, span.map_or(0, |s| s.amount)),
+                        None,
+                        window,
+                        cx,
+                    )
+                });
+                if let Some(span) = span {
+                    unit.update(cx, |state, cx| {
+                        state.set_selected_value(
+                            &SharedString::from(span.unit.name(span.amount)),
+                            window,
+                            cx,
+                        )
+                    });
+                }
+                (amount, unit)
+            }
+        };
         let changed = {
             let (amount, unit) = (amount.clone(), unit.clone());
             move |this: &mut AppView, window: &mut Window, cx: &mut Context<AppView>| {
+                let Some(field) = field(this) else {
+                    return;
+                };
                 let typed = amount.read(cx).value().trim().to_owned();
                 let Ok(count) = typed.parse::<u64>() else {
-                    this.error = Some("Type a whole number.".into());
+                    this.fv
+                        .pending
+                        .record(field, Err("Type a whole number.".into()));
                     cx.notify();
                     return;
                 };
@@ -418,7 +561,7 @@ impl AppView {
                 }
                 .print();
                 let result = apply(this, &text);
-                this.edit_form(result, false, window, cx);
+                this.edit_field(field, result, Rebuild::No, window, cx);
                 unit.update(cx, |state, cx| {
                     state.set_items(unit_labels(units, count), window, cx);
                     state.set_selected_value(&SharedString::from(chosen.name(count)), window, cx);
@@ -459,33 +602,95 @@ impl AppView {
         &mut self,
         raw: &str,
         key: &'static str,
+        field: Field,
+        reuse: Option<DurationField>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> DurationField {
+        let spec = DurationSpec {
+            raw: raw.to_owned(),
+            units: SPANS,
+            panel: false,
+            field: Rc::new(move |_| Some(field.clone())),
+            reuse,
+        };
         self.duration_field(
-            raw,
-            SPANS,
-            false,
+            spec,
             Rc::new(move |this, value| manifest::set_top_text(&this.draft, key, value)),
             window,
             cx,
         )
     }
 
-    /// Makes the inputs of the form and of the selected check from the draft.
+    /// Makes every input again from the draft and forgets the text no input could read.
     pub fn build_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.fv.subs.clear();
+        self.fv.pending.clear();
         self.fv.inputs = None;
+        self.refresh_form(window, cx);
+    }
+
+    /// Makes the inputs of the form and the panel again, and keeps the inputs that hold text the
+    /// form could not read, so an edit elsewhere never drops it.
+    fn refresh_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.make_inputs(window, cx);
+        self.build_panel(window, cx);
+    }
+
+    fn make_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.fv.subs.clear();
+        let kept = self.fv.inputs.take();
         let Ok(form) = Form::parse(&self.draft) else {
+            self.fv.pending.clear();
             self.fv.panel = None;
             self.fv.panel_subs.clear();
             return;
         };
+        let held = self.fv.pending.clone();
+        let reuse_input = |field: Field, pick: fn(&FormInputs) -> &Entity<InputState>| {
+            kept.as_ref()
+                .filter(|_| held.get(&field).is_some())
+                .map(|inputs| pick(inputs).clone())
+        };
+        let reuse_duration = |field: Field, pick: fn(&FormInputs) -> &DurationField| {
+            kept.as_ref()
+                .filter(|_| held.get(&field).is_some())
+                .map(|inputs| {
+                    let duration = pick(inputs);
+                    DurationField {
+                        amount: duration.amount.clone(),
+                        unit: duration.unit.clone(),
+                    }
+                })
+        };
+        let kept_valid_from = reuse_input(Field::ValidFrom, |inputs| &inputs.valid_from);
+        let kept_max_age = reuse_duration(Field::MaxAge, |inputs| &inputs.max_age);
+        let kept_retention = reuse_duration(Field::Retention, |inputs| &inputs.retention);
+        let kept_unknown_grace =
+            reuse_duration(Field::UnknownGrace, |inputs| &inputs.unknown_grace);
+        let kept_interval = reuse_duration(Field::Interval, |inputs| &inputs.interval);
+        for (field, stays) in [
+            (Field::ValidFrom, kept_valid_from.is_some()),
+            (Field::MaxAge, kept_max_age.is_some()),
+            (Field::Retention, kept_retention.is_some()),
+            (Field::UnknownGrace, kept_unknown_grace.is_some()),
+            (Field::Interval, kept_interval.is_some()),
+        ] {
+            if !stays {
+                self.fv.pending.record(field, Ok(()));
+            }
+        }
         let top = |key: &'static str| -> Apply {
             Rc::new(move |this, value| manifest::set_top_text(&this.draft, key, value))
         };
-        let issuer = self.text_input(&form.issuer, top("issuer"), window, cx);
-        let controller = self.text_input(&form.data_controller, top("data_controller"), window, cx);
+        let issuer = self.text_input(&form.issuer, None, top("issuer"), None, window, cx);
+        let controller = self.text_input(
+            &form.data_controller,
+            None,
+            top("data_controller"),
+            None,
+            window,
+            cx,
+        );
         let date: Apply = Rc::new(|this, value| match manifest::parse_date(value) {
             Some(date) => manifest::set_top_text(
                 &this.draft,
@@ -494,10 +699,38 @@ impl AppView {
             ),
             None => Err("Type the date as 1 Oct 2026 or 2026-10-01.".into()),
         });
-        let valid_from = self.text_input(&manifest::date_text(&form.valid_from), date, window, cx);
-        let max_age = self.top_span(&form.max_age, "claim_max_age", window, cx);
-        let retention = self.top_span(&form.retention, "claim_retention", window, cx);
-        let unknown_grace = self.top_span(&form.unknown_grace, "unknown_grace", window, cx);
+        let valid_from = self.text_input(
+            &manifest::date_text(&form.valid_from),
+            Some(Field::ValidFrom),
+            date,
+            kept_valid_from,
+            window,
+            cx,
+        );
+        let max_age = self.top_span(
+            &form.max_age,
+            "claim_max_age",
+            Field::MaxAge,
+            kept_max_age,
+            window,
+            cx,
+        );
+        let retention = self.top_span(
+            &form.retention,
+            "claim_retention",
+            Field::Retention,
+            kept_retention,
+            window,
+            cx,
+        );
+        let unknown_grace = self.top_span(
+            &form.unknown_grace,
+            "unknown_grace",
+            Field::UnknownGrace,
+            kept_unknown_grace,
+            window,
+            cx,
+        );
         let schedule = form.schedule.clone().unwrap_or(manifest::Schedule {
             mode: String::new(),
             probe: String::new(),
@@ -507,13 +740,30 @@ impl AppView {
         let schedule_key = |key: &'static str| -> Apply {
             Rc::new(move |this, value| manifest::set_schedule(&this.draft, key, value))
         };
-        let probe = self.text_input(&schedule.probe, schedule_key("vpn_probe"), window, cx);
-        let probe_name =
-            self.text_input(&schedule.name, schedule_key("vpn_probe_name"), window, cx);
+        let probe = self.text_input(
+            &schedule.probe,
+            None,
+            schedule_key("vpn_probe"),
+            None,
+            window,
+            cx,
+        );
+        let probe_name = self.text_input(
+            &schedule.name,
+            None,
+            schedule_key("vpn_probe_name"),
+            None,
+            window,
+            cx,
+        );
         let interval = self.duration_field(
-            &schedule.interval,
-            INTERVALS,
-            false,
+            DurationSpec {
+                raw: schedule.interval.clone(),
+                units: INTERVALS,
+                panel: false,
+                field: Rc::new(|_| Some(Field::Interval)),
+                reuse: kept_interval,
+            },
             schedule_key("interval"),
             window,
             cx,
@@ -537,7 +787,21 @@ impl AppView {
         {
             self.fv.selected = None;
         }
-        self.build_panel(window, cx);
+    }
+
+    /// Puts text the form cannot read into the Valid from input and marks the field, as typing
+    /// it does. The snapshot of a refused date uses it.
+    #[cfg(all(feature = "snapshot", target_os = "macos"))]
+    pub fn type_valid_from(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(inputs) = &self.fv.inputs {
+            inputs
+                .valid_from
+                .update(cx, |state, cx| state.set_value(text.to_owned(), window, cx));
+            self.fv.pending.record(
+                Field::ValidFrom,
+                Err("Type the date as 1 Oct 2026 or 2026-10-01.".into()),
+            );
+        }
     }
 
     pub fn select_check(
@@ -564,6 +828,7 @@ impl AppView {
     fn build_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.fv.panel_subs.clear();
         self.fv.panel = None;
+        self.fv.pending.drop_panel();
         let Ok(form) = Form::parse(&self.draft) else {
             return;
         };
@@ -576,25 +841,36 @@ impl AppView {
         else {
             return;
         };
-        let id = cx.new(|cx| InputState::new(window, cx).default_value(control.id.clone()));
-        let renamed = cx.subscribe_in(
-            &id,
-            window,
-            |this, input, event: &InputEvent, window, cx| {
-                if matches!(event, InputEvent::Change) {
+        let id = (!control.id_locked()).then(|| {
+            let id = cx.new(|cx| InputState::new(window, cx).default_value(control.id.clone()));
+            let renamed = cx.subscribe_in(
+                &id,
+                window,
+                |this, input, event: &InputEvent, window, cx| {
+                    if !matches!(event, InputEvent::Change) {
+                        return;
+                    }
                     let value = input.read(cx).value().trim().to_owned();
-                    let Some(index) = this.selected_index() else {
+                    let (Some(index), Some(old)) =
+                        (this.selected_index(), this.fv.selected.clone())
+                    else {
                         return;
                     };
-                    let result = manifest::set_control_text(&this.draft, index, "id", &value);
-                    if result.is_ok() {
-                        this.fv.selected = Some(value);
+                    match manifest::set_control_text(&this.draft, index, "id", &value) {
+                        Ok(text) => {
+                            this.fv.pending.rename_control(&old, &value);
+                            this.fv.selected = Some(value.clone());
+                            this.edit_field(Field::Id(value), Ok(text), Rebuild::No, window, cx);
+                        }
+                        Err(message) => {
+                            this.edit_field(Field::Id(old), Err(message), Rebuild::No, window, cx)
+                        }
                     }
-                    this.edit_form(result, false, window, cx);
-                }
-            },
-        );
-        self.fv.panel_subs.push(renamed);
+                },
+            );
+            self.fv.panel_subs.push(renamed);
+            id
+        });
         let mut keys: Vec<String> = SOURCES
             .iter()
             .map(|(key, _, _)| (*key).to_owned())
@@ -631,12 +907,13 @@ impl AppView {
                     return;
                 };
                 let result = manifest::set_control_text(&this.draft, index, "source", key);
-                this.edit_form(result, false, window, cx);
+                this.edit_form(result, Rebuild::No, window, cx);
             },
         );
         self.fv.panel_subs.push(source_subscription);
         let source_ref = cx.new(|cx| {
-            InputState::new(window, cx)
+            TextareaState::new(window, cx)
+                .auto_grow(1, 6)
                 .placeholder("Reference")
                 .default_value(control.source_ref.clone())
         });
@@ -648,7 +925,7 @@ impl AppView {
         let reference = cx.subscribe_in(
             &source_ref,
             window,
-            |this, input, event: &InputEvent, window, cx| {
+            |this, state, event: &InputEvent, window, cx| {
                 if matches!(event, InputEvent::Change) {
                     let Some(index) = this.selected_index() else {
                         return;
@@ -657,9 +934,9 @@ impl AppView {
                         &this.draft,
                         index,
                         "source_ref",
-                        input.read(cx).value().trim(),
+                        state.read(cx).value().trim(),
                     );
-                    this.edit_form(result, false, window, cx);
+                    this.edit_form(result, Rebuild::No, window, cx);
                 }
             },
         );
@@ -678,15 +955,19 @@ impl AppView {
                         "rationale",
                         state.read(cx).value().trim(),
                     );
-                    this.edit_form(result, false, window, cx);
+                    this.edit_form(result, Rebuild::No, window, cx);
                 }
             },
         );
         self.fv.panel_subs.push(reason);
         let grace = self.duration_field(
-            &control.grace,
-            SPANS,
-            true,
+            DurationSpec {
+                raw: control.grace.clone(),
+                units: SPANS,
+                panel: true,
+                field: Rc::new(|this| this.fv.selected.clone().map(Field::Grace)),
+                reuse: None,
+            },
             Rc::new(|this, value| {
                 let index = this
                     .selected_index()
@@ -703,7 +984,7 @@ impl AppView {
             source_ref,
             rationale,
             os,
-            pending: [false; 3],
+            opened: [false; 3],
             grace,
         });
     }
@@ -726,32 +1007,41 @@ impl AppView {
                         .placeholder("Number")
                         .default_value(number)
                 });
-                let max = control.limit_is_max();
                 let subscription = cx.subscribe_in(
                     &input,
                     window,
                     move |this, input, event: &InputEvent, window, cx| {
-                        if matches!(event, InputEvent::Change) {
-                            let Some(index) = this.selected_index() else {
-                                return;
-                            };
-                            let typed = input.read(cx).value().trim().to_owned();
-                            let Ok(number) = typed.parse::<i64>() else {
-                                if !typed.is_empty() {
-                                    this.error = Some("Type a whole number.".into());
-                                    cx.notify();
-                                }
-                                return;
-                            };
-                            let requirement = if max {
-                                Requirement::Max(number)
-                            } else {
-                                Requirement::Min(number)
-                            };
-                            let result =
-                                manifest::set_requirement(&this.draft, index, os, &requirement);
-                            this.edit_form(result, false, window, cx);
+                        if !matches!(event, InputEvent::Change) {
+                            return;
                         }
+                        let (Some(index), Some(id)) =
+                            (this.selected_index(), this.fv.selected.clone())
+                        else {
+                            return;
+                        };
+                        let field = Field::Requirement(id, os);
+                        let typed = input.read(cx).value().trim().to_owned();
+                        let Ok(number) = typed.parse::<i64>() else {
+                            this.fv.pending.record(
+                                field,
+                                Err("Type a whole number, or choose Not required.".into()),
+                            );
+                            cx.notify();
+                            return;
+                        };
+                        let Some(control) = Form::parse(&this.draft)
+                            .ok()
+                            .and_then(|form| form.controls.into_iter().nth(index))
+                        else {
+                            return;
+                        };
+                        let result = manifest::set_requirement(
+                            &this.draft,
+                            index,
+                            os,
+                            &control.limit(os, number),
+                        );
+                        this.edit_field(field, result, Rebuild::No, window, cx);
                     },
                 );
                 self.fv.panel_subs.push(subscription);
@@ -760,7 +1050,7 @@ impl AppView {
             _ => {
                 let mut picks: Vec<(SharedString, Pick)> = control
                     .output
-                    .values()
+                    .choices()
                     .into_iter()
                     .map(|value| {
                         (
@@ -820,7 +1110,7 @@ impl AppView {
                         };
                         let result =
                             manifest::set_requirement(&this.draft, index, os, &requirement);
-                        this.edit_form(result, false, window, cx);
+                        this.edit_form(result, Rebuild::No, window, cx);
                     },
                 );
                 self.fv.panel_subs.push(subscription);
@@ -832,17 +1122,7 @@ impl AppView {
 
 impl AppView {
     pub fn change_list(&self) -> Vec<String> {
-        match (Form::parse(&self.active), Form::parse(&self.draft)) {
-            (Ok(before), Ok(after)) => {
-                let mut list = manifest::changes(&before, &after);
-                if list.is_empty() && self.active != self.draft {
-                    list.push("Other edits in the TOML".into());
-                }
-                list
-            }
-            _ if self.active != self.draft => vec!["The TOML text changed".into()],
-            _ => Vec::new(),
-        }
+        manifest::changes_between(&self.active, &self.draft)
     }
 
     fn add_check(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -851,7 +1131,7 @@ impl AppView {
                 self.fv.add_open = false;
                 self.fv.filter = Filter::All;
                 self.fv.selected = Some(id.to_owned());
-                self.edit_form(Ok(text), true, window, cx);
+                self.edit_form(Ok(text), Rebuild::All, window, cx);
                 let rows = Form::parse(&self.draft).map_or(0, |form| form.controls.len());
                 self.fv.scroll.scroll_to_item(5.min(rows));
             }
@@ -866,7 +1146,7 @@ impl AppView {
         };
         self.fv.selected = None;
         let result = manifest::remove_control(&self.draft, index);
-        self.edit_form(result, true, window, cx);
+        self.edit_form(result, Rebuild::All, window, cx);
     }
 
     pub fn manifest_editor(&self, cx: &Context<Self>) -> Div {
@@ -906,6 +1186,7 @@ impl AppView {
                     .on_click(cx.listener(|this, _, _, cx| {
                         if !this.busy {
                             this.form = false;
+                            this.fv.pending.clear();
                             cx.notify();
                         }
                     })),
@@ -962,6 +1243,18 @@ impl AppView {
                 "Line {line}: {}. Fix it to switch back to Form or apply.",
                 error.message()
             )));
+        } else if let Ok(form) = Form::parse(&self.draft) {
+            let issues = manifest::problems(&form, &self.fv.pending);
+            if !issues.is_empty() {
+                let lines: Vec<String> = issues
+                    .iter()
+                    .map(|issue| format!("{}: {}", issue.field.label(&form), issue.message))
+                    .collect();
+                body = body.child(error_block(format!(
+                    "The gateway or a client would refuse this manifest.\n{}",
+                    lines.join("\n")
+                )));
+            }
         }
         body
     }
@@ -985,6 +1278,7 @@ impl AppView {
             return fix("Fix the TOML first.".into());
         };
         let before = Form::parse(&self.active).ok();
+        let issues = manifest::problems(&form, &self.fv.pending);
         let disabled = self.busy;
         let jumps = [
             "Agreement".to_owned(),
@@ -1023,17 +1317,17 @@ impl AppView {
             .px(px(28.))
             .pt(px(22.))
             .child(jump)
-            .child(self.agreement(&form, inputs, disabled, cx))
-            .child(self.results(&form, inputs, cx))
+            .child(self.agreement(&form, inputs, disabled, &issues, cx))
+            .child(self.results(&form, inputs, &issues, cx))
             .child(self.sent(&form, cx))
-            .child(self.sending(&form, inputs, cx))
-            .child(self.checks(&form, before.as_ref(), cx));
+            .child(self.sending(&form, inputs, &issues, cx))
+            .child(self.checks(&form, before.as_ref(), &issues, cx));
         div()
             .flex()
             .flex_1()
             .min_h_0()
             .child(scroll)
-            .child(self.panel(&form, before.as_ref(), cx))
+            .child(self.panel(&form, before.as_ref(), &issues, cx))
     }
 
     fn agreement(
@@ -1041,6 +1335,7 @@ impl AppView {
         form: &Form,
         inputs: &FormInputs,
         disabled: bool,
+        issues: &[FieldError],
         cx: &Context<Self>,
     ) -> Div {
         let mut chips = div().flex().flex_wrap().items_center().gap(px(6.));
@@ -1078,7 +1373,7 @@ impl AppView {
                                 }
                                 let result =
                                     manifest::set_top_list(&this.draft, "claim_recipients", &items);
-                                this.edit_form(result, true, window, cx);
+                                this.edit_form(result, Rebuild::No, window, cx);
                             })),
                     ),
             );
@@ -1116,11 +1411,12 @@ impl AppView {
                         .w(px(440.))
                         .child(Input::new(&inputs.issuer).disabled(disabled)),
                 ),
-                kv_row(
+                kv_row_error(
                     "Valid from",
                     div()
                         .w(px(150.))
                         .child(Input::new(&inputs.valid_from).disabled(disabled)),
+                    error_of(issues, &Field::ValidFrom),
                 ),
                 kv_row(
                     "Data controller",
@@ -1151,7 +1447,13 @@ impl AppView {
             .when_some(after, |row, text| row.child(small(text)))
     }
 
-    fn results(&self, form: &Form, inputs: &FormInputs, cx: &Context<Self>) -> Div {
+    fn results(
+        &self,
+        form: &Form,
+        inputs: &FormInputs,
+        issues: &[FieldError],
+        cx: &Context<Self>,
+    ) -> Div {
         let trust = seg2(
             TRUST_LEVELS
                 .iter()
@@ -1161,7 +1463,7 @@ impl AppView {
                         move |this, _, window, cx| {
                             let result =
                                 manifest::set_top_text(&this.draft, "min_trust_level", key);
-                            this.edit_form(result, false, window, cx);
+                            this.edit_form(result, Rebuild::No, window, cx);
                         },
                     ))
                 })
@@ -1171,17 +1473,20 @@ impl AppView {
             "Results",
             "How old a result may be, and how long the gateway keeps it.",
             rows(vec![
-                kv_row(
+                kv_row_error(
                     "A result is valid for",
                     self.duration(&inputs.max_age, None),
+                    error_of(issues, &Field::MaxAge),
                 ),
-                kv_row(
+                kv_row_error(
                     "Results are kept for",
                     self.duration(&inputs.retention, None),
+                    error_of(issues, &Field::Retention),
                 ),
-                kv_row(
+                kv_row_error(
                     "Unknown is allowed for",
                     self.duration(&inputs.unknown_grace, Some("then it counts as failed")),
+                    error_of(issues, &Field::UnknownGrace),
                 ),
                 kv_row("Device key at least", trust),
             ]),
@@ -1224,7 +1529,7 @@ impl AppView {
                             }
                             let result =
                                 manifest::set_top_list(&this.draft, "disclosed_metadata", &items);
-                            this.edit_form(result, false, window, cx);
+                            this.edit_form(result, Rebuild::No, window, cx);
                         },
                     )))
                     .child(
@@ -1252,7 +1557,13 @@ impl AppView {
         )
     }
 
-    fn sending(&self, form: &Form, inputs: &FormInputs, cx: &Context<Self>) -> Div {
+    fn sending(
+        &self,
+        form: &Form,
+        inputs: &FormInputs,
+        issues: &[FieldError],
+        cx: &Context<Self>,
+    ) -> Div {
         let mode = form
             .schedule
             .as_ref()
@@ -1266,20 +1577,20 @@ impl AppView {
                     seg2_item(("send", i), name, mode == key).on_click(cx.listener(
                         move |this, _, window, cx| {
                             let result = manifest::set_send_mode(&this.draft, key);
-                            this.edit_form(result, true, window, cx);
+                            this.edit_form(result, Rebuild::Inputs, window, cx);
                         },
                     ))
                 })
                 .collect(),
         );
-        let mut list = vec![kv_row("Send", send)];
+        let mut list = vec![kv_row_error("Send", send, error_of(issues, &Field::Send))];
         if form.schedule.is_none() {
             list.push(div().child(small(
                 "Devices send nothing by themselves. The owner sends by hand.",
             )));
         }
         if mode == "vpn" {
-            list.push(kv_row(
+            list.push(kv_row_error(
                 "VPN answers at",
                 div()
                     .flex()
@@ -1298,12 +1609,15 @@ impl AppView {
                             .font_family(mono())
                             .child(Input::new(&inputs.probe_name).disabled(self.busy)),
                     ),
+                error_of(issues, &Field::VpnProbe)
+                    .or_else(|| error_of(issues, &Field::VpnProbeName)),
             ));
         }
         if form.schedule.is_some() {
-            list.push(kv_row(
+            list.push(kv_row_error(
                 "Every",
                 self.duration(&inputs.interval, Some("and at once on a change")),
+                error_of(issues, &Field::Interval),
             ));
         }
         section(
@@ -1313,7 +1627,13 @@ impl AppView {
         )
     }
 
-    fn checks(&self, form: &Form, before: Option<&Form>, cx: &Context<Self>) -> Div {
+    fn checks(
+        &self,
+        form: &Form,
+        before: Option<&Form>,
+        issues: &[FieldError],
+        cx: &Context<Self>,
+    ) -> Div {
         let (all, required, reported) = form.counts();
         let filters = seg2(
             [
@@ -1333,8 +1653,22 @@ impl AppView {
             })
             .collect(),
         );
+        let anchor = self.fv.add_anchor.clone();
         let add = div()
             .relative()
+            .child(
+                canvas(
+                    move |bounds, window, _| {
+                        anchor.set((
+                            f32::from(bounds.origin.y),
+                            f32::from(window.viewport_size().height),
+                        ));
+                    },
+                    |_, _, _, _| (),
+                )
+                .absolute()
+                .size_full(),
+            )
             .child(
                 Button::new("add-check")
                     .label("+ Add check")
@@ -1373,6 +1707,10 @@ impl AppView {
         let changed = before
             .map(|before| manifest::changed_controls(before, form))
             .unwrap_or_default();
+        let flagged: Vec<&str> = issues
+            .iter()
+            .filter_map(|issue| issue.field.control())
+            .collect();
         let head = |text: &'static str, width: f32| div().w(px(width)).flex_none().child(text);
         let mut table = div()
             .flex()
@@ -1423,9 +1761,20 @@ impl AppView {
                         .min_w_0()
                         .items_center()
                         .gap(px(8.))
-                        .when(changed.contains(&control.id), |name| {
-                            name.child(div().size(px(7.)).flex_none().rounded_full().bg(rgb(BLUE)))
-                        })
+                        .when_some(
+                            if flagged.contains(&control.id.as_str()) {
+                                Some(BAD)
+                            } else if changed.contains(&control.id) {
+                                Some(BLUE)
+                            } else {
+                                None
+                            },
+                            |name, color| {
+                                name.child(
+                                    div().size(px(7.)).flex_none().rounded_full().bg(rgb(color)),
+                                )
+                            },
+                        )
                         .child(
                             div()
                                 .font_weight(FontWeight::SEMIBOLD)
@@ -1490,11 +1839,24 @@ impl AppView {
                     || known.line.to_lowercase().contains(&search)
             })
             .collect();
-        let mut list = div()
+        let mut options_list = div()
+            .id("add-options")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .gap(px(2.))
+            .overflow_y_scroll()
+            .track_scroll(&self.fv.add_scroll);
+        let (button_top, window_height) = self.fv.add_anchor.get();
+        let place = popover_place(window_height, button_top);
+        let list = div()
             .absolute()
-            .top(px(40.))
+            .when(place.above, |popover| popover.bottom(px(POPOVER_TOP)))
+            .when(!place.above, |popover| popover.top(px(POPOVER_TOP)))
             .right_0()
             .w(px(420.))
+            .max_h(px(place.height))
             .flex()
             .flex_col()
             .gap(px(2.))
@@ -1521,7 +1883,7 @@ impl AppView {
                     .child("Not in the manifest yet"),
             );
         if options.is_empty() {
-            list = list.child(
+            options_list = options_list.child(
                 div()
                     .px(px(10.))
                     .py(px(8.))
@@ -1530,7 +1892,7 @@ impl AppView {
         }
         for (i, known) in options.into_iter().enumerate() {
             let id = known.id;
-            list = list.child(
+            options_list = options_list.child(
                 div()
                     .id(("add-option", i))
                     .flex()
@@ -1559,10 +1921,16 @@ impl AppView {
                     ),
             );
         }
-        list
+        list.child(options_list)
     }
 
-    fn panel(&self, form: &Form, before: Option<&Form>, cx: &Context<Self>) -> Div {
+    fn panel(
+        &self,
+        form: &Form,
+        before: Option<&Form>,
+        issues: &[FieldError],
+        cx: &Context<Self>,
+    ) -> Div {
         let shell = || {
             div()
                 .flex()
@@ -1583,7 +1951,7 @@ impl AppView {
             return shell().child(small("Pick a check in the table to see what it asks for."));
         };
         let old = before.and_then(|before| before.control(&control.id));
-        let field = |name: &'static str, body: Div| {
+        let field = |name: &'static str, body: Div, error: Option<String>| {
             column()
                 .gap(px(6.))
                 .child(
@@ -1594,6 +1962,7 @@ impl AppView {
                         .child(name),
                 )
                 .child(body)
+                .children(error.map(error_line))
         };
         let header = div()
             .flex()
@@ -1671,7 +2040,7 @@ impl AppView {
                     .child(Select::new(select).disabled(self.busy)),
                 OsInput::Limit(input) => {
                     let limited = matches!(current, Requirement::Max(_) | Requirement::Min(_));
-                    if limited || panel.pending[i] {
+                    if limited || panel.opened[i] {
                         div()
                             .flex()
                             .items_center()
@@ -1694,11 +2063,13 @@ impl AppView {
                             })
                             .child(ghost(("unset", i), "Not required").on_click(cx.listener(
                                 move |this, _, window, cx| {
-                                    let Some(index) = this.selected_index() else {
+                                    let (Some(index), Some(id)) =
+                                        (this.selected_index(), this.fv.selected.clone())
+                                    else {
                                         return;
                                     };
                                     if let Some(panel) = this.fv.panel.as_mut() {
-                                        panel.pending[i] = false;
+                                        panel.opened[i] = false;
                                     }
                                     let result = manifest::set_requirement(
                                         &this.draft,
@@ -1706,7 +2077,13 @@ impl AppView {
                                         os,
                                         &Requirement::Reported,
                                     );
-                                    this.edit_form(result, false, window, cx);
+                                    this.edit_field(
+                                        Field::Requirement(id, os),
+                                        result,
+                                        Rebuild::No,
+                                        window,
+                                        cx,
+                                    );
                                 },
                             )))
                     } else {
@@ -1730,7 +2107,9 @@ impl AppView {
                             })
                             .child(ghost(("set", i), "Set limit").on_click(cx.listener(
                                 move |this, _, window, cx| {
-                                    let Some(index) = this.selected_index() else {
+                                    let (Some(index), Some(id)) =
+                                        (this.selected_index(), this.fv.selected.clone())
+                                    else {
                                         return;
                                     };
                                     let typed =
@@ -1740,30 +2119,35 @@ impl AppView {
                                             }
                                             _ => String::new(),
                                         };
-                                    let max = Form::parse(&this.draft)
+                                    let control = Form::parse(&this.draft)
                                         .ok()
-                                        .and_then(|form| {
-                                            form.controls.get(index).map(|c| c.limit_is_max())
-                                        })
-                                        .unwrap_or(true);
-                                    match typed.parse::<i64>() {
-                                        Ok(n) => {
-                                            let requirement = if max {
-                                                Requirement::Max(n)
-                                            } else {
-                                                Requirement::Min(n)
-                                            };
+                                        .and_then(|form| form.controls.into_iter().nth(index));
+                                    match (typed.parse::<i64>(), control) {
+                                        (Ok(n), Some(control)) => {
                                             let result = manifest::set_requirement(
                                                 &this.draft,
                                                 index,
                                                 os,
-                                                &requirement,
+                                                &control.limit(os, n),
                                             );
-                                            this.edit_form(result, false, window, cx);
+                                            this.edit_field(
+                                                Field::Requirement(id, os),
+                                                result,
+                                                Rebuild::No,
+                                                window,
+                                                cx,
+                                            );
                                         }
-                                        Err(_) => {
+                                        _ => {
                                             if let Some(panel) = this.fv.panel.as_mut() {
-                                                panel.pending[i] = true;
+                                                panel.opened[i] = true;
+                                            }
+                                            if !typed.is_empty() {
+                                                this.fv.pending.record(
+                                                    Field::Requirement(id, os),
+                                                    Err("Type a whole number, or choose Not required."
+                                                        .into()),
+                                                );
                                             }
                                             cx.notify();
                                         }
@@ -1786,19 +2170,48 @@ impl AppView {
                             .text_color(rgb(INK_2))
                             .child(os.name()),
                     )
-                    .child(div().flex_1().min_w_0().child(body)),
+                    .child(
+                        column()
+                            .flex_1()
+                            .min_w_0()
+                            .gap(px(4.))
+                            .child(body)
+                            .children(
+                                error_of(issues, &Field::Requirement(control.id.clone(), os))
+                                    .map(error_line),
+                            ),
+                    ),
             );
         }
         requirements = requirements.child(os_rows);
-        let unit_note = control.limit_unit();
-        let _ = unit_note;
+        let id_body = match &panel.id {
+            Some(input) => div()
+                .font_family(mono())
+                .child(Input::new(input).disabled(self.busy)),
+            None => div()
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .child(
+                    div()
+                        .px(px(12.))
+                        .py(px(7.))
+                        .rounded(px(7.))
+                        .border_1()
+                        .border_color(rgb(RULE))
+                        .bg(rgb(CHIP))
+                        .font_family(mono())
+                        .text_color(rgb(INK_2))
+                        .child(control.id.clone()),
+                )
+                .child(small("A built-in check keeps its ID.")),
+        };
         shell()
             .child(header)
             .child(field(
                 "ID",
-                div()
-                    .font_family(mono())
-                    .child(Input::new(&panel.id).disabled(self.busy)),
+                id_body,
+                error_of(issues, &Field::Id(control.id.clone())),
             ))
             .child(field(
                 "Asked for by",
@@ -1815,12 +2228,14 @@ impl AppView {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .child(Input::new(&panel.source_ref).disabled(self.busy)),
+                            .child(Textarea::new(&panel.source_ref).disabled(self.busy)),
                     ),
+                None,
             ))
             .child(field(
                 "Why the contractor should care",
                 div().child(Textarea::new(&panel.rationale).disabled(self.busy)),
+                None,
             ))
             .child(field(
                 "Possible results",
@@ -1828,11 +2243,13 @@ impl AppView {
                     .gap(px(6.))
                     .child(values)
                     .child(small("The check defines these. Change them in TOML.")),
+                None,
             ))
             .child(field_heading(heading, requirements))
             .child(field(
                 "Time to fix",
                 self.duration(&panel.grace, Some("after the first failed result")),
+                error_of(issues, &Field::Grace(control.id.clone())),
             ))
             .child(div().flex_1())
             .child(
@@ -1850,16 +2267,29 @@ impl AppView {
     fn apply_bar(&self, cx: &Context<Self>) -> Div {
         let list = self.change_list();
         let changes = list.len();
-        let can_review = !(self.busy
-            || changes == 0
-            || self.draft.parse::<toml_edit::DocumentMut>().is_err()
-            || self.error.is_some());
+        let form = Form::parse(&self.draft).ok();
+        let issues = form
+            .as_ref()
+            .map(|form| manifest::problems(form, &self.fv.pending))
+            .unwrap_or_default();
+        let can_review = !(self.busy || changes == 0 || form.is_none() || !issues.is_empty());
         let shown = list.iter().take(2).cloned().collect::<Vec<_>>().join(" · ");
         let summary = if changes > 2 {
             format!("{shown} · and {} more", changes - 2)
         } else {
             shown
         };
+        let blocked = form.as_ref().zip(issues.first()).map(|(form, first)| {
+            let more = match issues.len() {
+                1 => String::new(),
+                rest => format!(" · and {} more", rest - 1),
+            };
+            format!(
+                "Fix first. {}: {}{more}",
+                first.field.label(form),
+                first.message
+            )
+        });
         div()
             .flex()
             .flex_none()
@@ -1884,14 +2314,14 @@ impl AppView {
                     .flex_1()
                     .min_w_0()
                     .text_size(px(13.))
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(if blocked.is_some() { BAD } else { MUTED }))
                     .overflow_hidden()
                     .text_ellipsis()
                     .whitespace_nowrap()
-                    .child(if changes == 0 {
-                        "Form and TOML edit the same text.".to_owned()
-                    } else {
-                        summary
+                    .child(match blocked {
+                        Some(blocked) => blocked,
+                        None if changes == 0 => "Form and TOML edit the same text.".to_owned(),
+                        None => summary,
                     }),
             )
             .child(
@@ -1930,4 +2360,31 @@ fn field_heading(heading: String, body: Div) -> Div {
                 .child(heading),
         )
         .child(body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PopoverPlace, popover_place};
+
+    fn place(above: bool, height: f32) -> PopoverPlace {
+        PopoverPlace { above, height }
+    }
+
+    #[test]
+    fn the_add_check_options_open_below_and_fit_the_window() {
+        assert_eq!(popover_place(860., 100.), place(false, 708.));
+        assert_eq!(popover_place(860., 608.), place(false, 200.));
+    }
+
+    #[test]
+    fn the_add_check_options_open_above_when_the_window_ends_just_below_the_button() {
+        assert_eq!(popover_place(860., 650.), place(true, 630.));
+        assert_eq!(popover_place(860., 700.), place(true, 680.));
+    }
+
+    #[test]
+    fn the_add_check_options_keep_200_px_in_a_window_that_is_too_small() {
+        assert_eq!(popover_place(300., 150.), place(true, 200.));
+        assert_eq!(popover_place(300., 120.), place(false, 200.));
+    }
 }

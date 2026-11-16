@@ -2,6 +2,7 @@
 //! changes one value and prints the document again, so comments and order stay as written.
 use crate::text::humanize;
 use chrono::{Datelike, NaiveDate};
+use std::collections::{BTreeMap, BTreeSet};
 use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, TableLike, Value};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -106,7 +107,7 @@ pub fn date_text(text: &str) -> String {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Os {
     Macos,
     Windows,
@@ -214,6 +215,30 @@ impl Output {
             Self::Unreadable => Vec::new(),
         }
     }
+
+    /// The results a requirement may name. A time check offers "null" when it can report that and
+    /// its own sentinels, never the word "time" or "unknown", which the core refuses there.
+    pub fn choices(&self) -> Vec<String> {
+        match self {
+            Self::Choices(values) | Self::Integer { values, .. } => values.clone(),
+            Self::Timestamp { nullable, values } => nullable
+                .then(|| "null".to_owned())
+                .into_iter()
+                .chain(values.iter().cloned())
+                .collect(),
+            Self::Unreadable => Vec::new(),
+        }
+    }
+
+    /// The whole numbers a number requirement may use. The core takes 32-bit numbers, so an
+    /// output the form cannot read falls back to that range.
+    pub fn number_range(&self) -> Option<(i64, i64)> {
+        match self {
+            Self::Integer { min, max, .. } => Some((*min, *max)),
+            Self::Unreadable => Some((i64::from(i32::MIN), i64::from(i32::MAX))),
+            Self::Choices(_) | Self::Timestamp { .. } => None,
+        }
+    }
 }
 
 /// What a manifest asks of one OS.
@@ -289,6 +314,23 @@ impl Control {
 
     pub fn grace_text(&self) -> String {
         Span::parse(&self.grace).map_or_else(|| self.grace.clone(), |span| span.short())
+    }
+
+    /// A built-in check keeps its ID: every client runs a check only under the ID it was signed
+    /// with.
+    pub fn id_locked(&self) -> bool {
+        self.check.starts_with("builtin:")
+    }
+
+    /// The number requirement for one OS. An OS that has a bound keeps its own operator; the
+    /// control's default applies only to an OS that had no bound.
+    pub fn limit(&self, os: Os, number: i64) -> Requirement {
+        match self.requirement(os) {
+            Requirement::Max(_) => Requirement::Max(number),
+            Requirement::Min(_) => Requirement::Min(number),
+            _ if self.limit_is_max() => Requirement::Max(number),
+            _ => Requirement::Min(number),
+        }
     }
 }
 
@@ -970,6 +1012,466 @@ pub fn changed_controls(before: &Form, after: &Form) -> Vec<String> {
         .collect()
 }
 
+/// A top-level key of the manifest that the form edits.
+const MODELLED_TOP: [&str; 9] = [
+    "issuer",
+    "valid_from",
+    "data_controller",
+    "claim_recipients",
+    "claim_max_age",
+    "claim_retention",
+    "unknown_grace",
+    "min_trust_level",
+    "disclosed_metadata",
+];
+const MODELLED_SCHEDULE: [&str; 4] = ["mode", "vpn_probe", "vpn_probe_name", "interval"];
+const MODELLED_CONTROL: [&str; 6] = [
+    "id",
+    "source",
+    "source_ref",
+    "rationale",
+    "required",
+    "grace",
+];
+
+fn differing(
+    old: Option<&serde_json::Value>,
+    new: Option<&serde_json::Value>,
+    skip: &[&str],
+    prefix: &str,
+    keys: &mut Vec<String>,
+) {
+    let empty = serde_json::Map::new();
+    let table = |value: Option<&serde_json::Value>| {
+        value
+            .and_then(serde_json::Value::as_object)
+            .cloned()
+            .unwrap_or_else(|| empty.clone())
+    };
+    let (old, new) = (table(old), table(new));
+    let names: BTreeSet<&String> = old.keys().chain(new.keys()).collect();
+    for name in names {
+        if !skip.contains(&name.as_str()) && old.get(name) != new.get(name) {
+            keys.push(format!("{prefix}{name}"));
+        }
+    }
+}
+
+/// The keys that differ between two manifests and that the form does not edit: "log",
+/// "firewall.output" and so on. Both texts must parse.
+pub fn other_edits(before: &str, after: &str) -> Vec<String> {
+    let read = |text: &str| toml_edit::de::from_str::<serde_json::Value>(text).ok();
+    let (Some(old), Some(new)) = (read(before), read(after)) else {
+        return Vec::new();
+    };
+    let mut keys = Vec::new();
+    let mut skip = MODELLED_TOP.to_vec();
+    skip.extend(["schedule", "control"]);
+    differing(Some(&old), Some(&new), &skip, "", &mut keys);
+    differing(
+        old.get("schedule"),
+        new.get("schedule"),
+        &MODELLED_SCHEDULE,
+        "schedule.",
+        &mut keys,
+    );
+    let controls = |value: &serde_json::Value| {
+        value
+            .get("control")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
+    let before_controls = controls(&old);
+    for control in controls(&new) {
+        let Some(id) = control.get("id").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let Some(was) = before_controls
+            .iter()
+            .find(|c| c.get("id").and_then(serde_json::Value::as_str) == Some(id))
+        else {
+            continue;
+        };
+        let prefix = format!("{id}.");
+        differing(
+            Some(was),
+            Some(&control),
+            &MODELLED_CONTROL,
+            &prefix,
+            &mut keys,
+        );
+        let os_keys = Os::ALL.map(Os::key);
+        differing(
+            was.get("required"),
+            control.get("required"),
+            &os_keys,
+            &format!("{prefix}required."),
+            &mut keys,
+        );
+    }
+    keys
+}
+
+/// The change list of the apply bar: what the form shows in words, then every edit it does not
+/// model, even when modelled edits exist.
+pub fn changes_between(before: &str, after: &str) -> Vec<String> {
+    let (Ok(old), Ok(new)) = (Form::parse(before), Form::parse(after)) else {
+        return if before == after {
+            Vec::new()
+        } else {
+            vec!["The TOML text changed".into()]
+        };
+    };
+    let mut list = changes(&old, &new);
+    let other = other_edits(before, after);
+    if !other.is_empty() {
+        list.push(format!("Other edits in TOML: {}", other.join(", ")));
+    }
+    if list.is_empty() && before != after {
+        list.push("Other edits in TOML: comments or layout".into());
+    }
+    list
+}
+
+/// Where a problem sits in the form.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Field {
+    ValidFrom,
+    MaxAge,
+    Retention,
+    UnknownGrace,
+    Send,
+    Interval,
+    VpnProbe,
+    VpnProbeName,
+    /// The check with this ID.
+    Id(String),
+    Grace(String),
+    Requirement(String, Os),
+}
+
+impl Field {
+    /// Fields of the selected check's panel. They go away with the panel.
+    pub fn in_panel(&self) -> bool {
+        matches!(self, Self::Id(_) | Self::Grace(_) | Self::Requirement(..))
+    }
+
+    /// The ID of the check this field belongs to.
+    pub fn control(&self) -> Option<&str> {
+        match self {
+            Self::Id(id) | Self::Grace(id) | Self::Requirement(id, _) => Some(id),
+            _ => None,
+        }
+    }
+
+    /// The name of the field, as the form shows it.
+    pub fn label(&self, form: &Form) -> String {
+        let name = |id: &str| {
+            form.control(id)
+                .map_or_else(|| id.to_owned(), Control::name)
+        };
+        match self {
+            Self::ValidFrom => "Valid from".into(),
+            Self::MaxAge => "A result is valid for".into(),
+            Self::Retention => "Results are kept for".into(),
+            Self::UnknownGrace => "Unknown is allowed for".into(),
+            Self::Send => "Send".into(),
+            Self::Interval => "Every".into(),
+            Self::VpnProbe => "VPN answers at".into(),
+            Self::VpnProbeName => "VPN shown as".into(),
+            Self::Id(id) => format!("{}: ID", name(id)),
+            Self::Grace(id) => format!("{}: time to fix", name(id)),
+            Self::Requirement(id, os) => format!("{}: {}", name(id), os.name()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FieldError {
+    pub field: Field,
+    pub message: String,
+}
+
+/// Input that the form could not turn into a value yet, with one message per field. The draft
+/// keeps the last good value, so the form must not offer review while any is left.
+#[derive(Clone, Debug, Default)]
+pub struct Pending(BTreeMap<Field, String>);
+
+impl Pending {
+    /// A good value clears the error of its own field only. A bad one replaces it.
+    pub fn record(&mut self, field: Field, outcome: Result<(), String>) {
+        match outcome {
+            Ok(()) => {
+                self.0.remove(&field);
+            }
+            Err(message) => {
+                self.0.insert(field, message);
+            }
+        }
+    }
+
+    pub fn get(&self, field: &Field) -> Option<&str> {
+        self.0.get(field).map(String::as_str)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    pub fn errors(&self) -> Vec<FieldError> {
+        self.0
+            .iter()
+            .map(|(field, message)| FieldError {
+                field: field.clone(),
+                message: message.clone(),
+            })
+            .collect()
+    }
+
+    /// The selected check got a new ID: its errors follow it.
+    pub fn rename_control(&mut self, old: &str, new: &str) {
+        let moved: Vec<Field> = self
+            .0
+            .keys()
+            .filter(|field| field.control() == Some(old))
+            .cloned()
+            .collect();
+        for field in moved {
+            let Some(message) = self.0.remove(&field) else {
+                continue;
+            };
+            let field = match field {
+                Field::Id(_) => Field::Id(new.to_owned()),
+                Field::Grace(_) => Field::Grace(new.to_owned()),
+                Field::Requirement(_, os) => Field::Requirement(new.to_owned(), os),
+                other => other,
+            };
+            self.0.insert(field, message);
+        }
+    }
+
+    /// The panel's inputs are gone, and so is the text they held.
+    pub fn drop_panel(&mut self) {
+        self.0.retain(|field, _| !field.in_panel());
+    }
+}
+
+/// Everything that stops a review: unparsed input first, then what the gateway or a client
+/// would refuse.
+pub fn problems(form: &Form, pending: &Pending) -> Vec<FieldError> {
+    let mut all = pending.errors();
+    all.extend(validate(form));
+    all
+}
+
+const SPAN_LIMIT: u64 = u64::MAX / (31 * 24 * 3600);
+
+/// A duration as the core reads it: whole hours, days, weeks or months.
+fn span_error(raw: &str) -> Option<String> {
+    let split = raw.find(|c: char| !c.is_ascii_digit()).unwrap_or(raw.len());
+    let (digits, suffix) = raw.split_at(split);
+    if !matches!(suffix, "h" | "d" | "w" | "mo") {
+        return Some("Use hours, days, weeks or months.".into());
+    }
+    match digits.parse::<u64>() {
+        Err(_) => Some("Type a whole number.".into()),
+        Ok(amount) if amount > SPAN_LIMIT => Some("This is too long.".into()),
+        Ok(_) => None,
+    }
+}
+
+fn span_is_zero(raw: &str) -> bool {
+    Span::parse(raw).is_some_and(|span| span.amount == 0)
+}
+
+/// The sending interval as the core reads it: whole minutes or hours, 5 minutes to 24 hours.
+fn interval_error(raw: &str) -> Option<String> {
+    let bad = || Some("Use whole minutes or hours, from 5 minutes to 24 hours.".to_owned());
+    let (digits, hours) = match (raw.strip_suffix('m'), raw.strip_suffix('h')) {
+        (Some(digits), _) => (digits, false),
+        (_, Some(digits)) => (digits, true),
+        _ => return bad(),
+    };
+    if digits.is_empty()
+        || digits.starts_with('0')
+        || !digits.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return bad();
+    }
+    let Ok(amount) = digits.parse::<u32>() else {
+        return bad();
+    };
+    let Some(minutes) = (if hours {
+        amount.checked_mul(60)
+    } else {
+        Some(amount)
+    }) else {
+        return bad();
+    };
+    if (5..=24 * 60).contains(&minutes) {
+        None
+    } else {
+        bad()
+    }
+}
+
+fn dns_name_ok(raw: &str) -> bool {
+    let label_ok = |label: &str| {
+        (1..=63).contains(&label.len())
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+    };
+    let last = raw.rsplit('.').next().unwrap_or_default();
+    let numeric_last = !last.is_empty() && last.bytes().all(|byte| byte.is_ascii_digit());
+    raw.len() <= 253 && raw.split('.').all(label_ok) && !numeric_last
+}
+
+/// A `host:port` as the core reads it.
+fn probe_error(raw: &str) -> Option<String> {
+    if raw.is_empty() {
+        return Some("Type the address that answers only on the company VPN, as host:port.".into());
+    }
+    let ok = raw.rsplit_once(':').is_some_and(|(host, port)| {
+        let port_ok = !port.is_empty()
+            && port.bytes().all(|byte| byte.is_ascii_digit())
+            && port.parse::<u16>().is_ok_and(|port| port != 0);
+        let host_ok = match host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+            Some(inner) => inner.parse::<std::net::Ipv6Addr>().is_ok(),
+            None => host.parse::<std::net::Ipv4Addr>().is_ok() || dns_name_ok(host),
+        };
+        port_ok && host_ok
+    });
+    (!ok).then(|| {
+        "Type host:port, such as 10.0.0.1:443. Put brackets around an IPv6 address.".into()
+    })
+}
+
+fn utc_timestamp(text: &str) -> bool {
+    text.ends_with('Z') && chrono::DateTime::parse_from_rfc3339(text).is_ok()
+}
+
+/// Why the core or a client would refuse this requirement for this output, if it would.
+fn requirement_error(control: &Control, requirement: &Requirement) -> Option<String> {
+    match requirement {
+        Requirement::Reported => None,
+        Requirement::Values(values) if values.is_empty() => {
+            Some("Choose a result, or Not required.".into())
+        }
+        Requirement::Values(values) => {
+            let allowed = |value: &String| match &control.output {
+                Output::Choices(outputs) => outputs.contains(value),
+                Output::Timestamp { nullable, values } => {
+                    values.contains(value) || utc_timestamp(value) || (value == "null" && *nullable)
+                }
+                Output::Integer { values, .. } => values.contains(value),
+                Output::Unreadable => true,
+            };
+            values.iter().find(|value| !allowed(value)).map(|value| {
+                format!(
+                    "{} cannot be required for this check.",
+                    value_label(control.builtin_id(), value, true)
+                )
+            })
+        }
+        Requirement::Max(number) | Requirement::Min(number) => {
+            match control.output.number_range() {
+                None => Some("This check reports no number.".into()),
+                Some((min, max)) if !(min..=max).contains(number) => {
+                    Some(format!("Type a whole number from {min} to {max}."))
+                }
+                Some(_) => None,
+            }
+        }
+    }
+}
+
+/// What the gateway and the clients would refuse in a manifest, for the parts the form edits.
+/// The limits come from the core's manifest checks and from the client's list of built-in checks.
+pub fn validate(form: &Form) -> Vec<FieldError> {
+    let mut errors = Vec::new();
+    let mut add = |field: Field, message: String| errors.push(FieldError { field, message });
+    for (field, raw) in [
+        (Field::MaxAge, &form.max_age),
+        (Field::Retention, &form.retention),
+        (Field::UnknownGrace, &form.unknown_grace),
+    ] {
+        if let Some(message) = span_error(raw) {
+            add(field, message);
+        }
+    }
+    if span_error(&form.unknown_grace).is_none() && span_is_zero(&form.unknown_grace) {
+        add(Field::UnknownGrace, "Type more than zero.".into());
+    }
+    if let Some(schedule) = &form.schedule {
+        if let Some(message) = interval_error(&schedule.interval) {
+            add(Field::Interval, message);
+        }
+        match schedule.mode.as_str() {
+            "vpn" => {
+                if let Some(message) = probe_error(&schedule.probe) {
+                    add(Field::VpnProbe, message);
+                }
+                if !schedule.name.is_empty() && !dns_name_ok(&schedule.name) {
+                    add(
+                        Field::VpnProbeName,
+                        "Type a DNS name such as vpn.example.org, not an IP address.".into(),
+                    );
+                }
+            }
+            "always" => {
+                if !schedule.probe.is_empty() || !schedule.name.is_empty() {
+                    add(
+                        Field::Send,
+                        "Always sends on any network, so it takes no VPN address.".into(),
+                    );
+                }
+            }
+            _ => add(
+                Field::Send,
+                "Choose Always or Only on the company VPN.".into(),
+            ),
+        }
+    }
+    let mut seen = BTreeSet::new();
+    for control in &form.controls {
+        let id = || Field::Id(control.id.clone());
+        if control.id.is_empty() || !seen.insert(control.id.as_str()) {
+            add(id(), "Every check needs its own ID.".into());
+        }
+        if !control.id_locked() {
+            add(id(), "The check must be builtin:<name>@<version>.".into());
+        } else if builtin(&control.id).is_none()
+            || control.check != format!("builtin:{}@1", control.id)
+        {
+            let message = match builtin(control.builtin_id()) {
+                Some(known) if known.id != control.id => format!(
+                    "A built-in check keeps its ID. Clients run {} only as {}.",
+                    control.check, known.id
+                ),
+                _ => format!("No client runs {}.", control.check),
+            };
+            add(id(), message);
+        }
+        if let Some(message) = span_error(&control.grace) {
+            add(Field::Grace(control.id.clone()), message);
+        }
+        for os in Os::ALL {
+            if let Some(message) = requirement_error(control, control.requirement(os)) {
+                add(Field::Requirement(control.id.clone(), os), message);
+            }
+        }
+    }
+    errors
+}
+
 fn document(text: &str) -> Result<DocumentMut, String> {
     text.parse::<DocumentMut>().map_err(|e| e.to_string())
 }
@@ -993,6 +1495,68 @@ fn array_of(items: &[String]) -> Value {
     Value::Array(array)
 }
 
+/// Adds an item behind the last one. In a list with one item per line the new item gets its own
+/// line, and a comment after the last comma stays with the item it follows.
+fn push_item(array: &mut Array, item: &str) {
+    let last_prefix = array
+        .iter()
+        .last()
+        .and_then(|value| value.decor().prefix())
+        .and_then(|prefix| prefix.as_str())
+        .map(str::to_owned);
+    let Some(prefix) = last_prefix.filter(|prefix| prefix.contains('\n')) else {
+        array.push(item);
+        return;
+    };
+    let indent = prefix.rsplit('\n').next().unwrap_or_default().to_owned();
+    let trailing = array.trailing().as_str().unwrap_or_default().to_owned();
+    let carried = if trailing.contains('\n') {
+        array.set_trailing("\n");
+        format!("{trailing}{indent}")
+    } else {
+        format!("\n{indent}")
+    };
+    let mut value = Value::from(item);
+    value.decor_mut().set_prefix(carried);
+    array.push_formatted(value);
+}
+
+/// Changes a list to hold `items`: drops the strings that are no longer listed and adds the new
+/// ones at the end. The items that stay keep their spacing and their comments.
+fn edit_list(array: &mut Array, items: &[String]) {
+    for at in (0..array.len()).rev() {
+        let gone = array
+            .get(at)
+            .and_then(Value::as_str)
+            .is_some_and(|text| !items.iter().any(|item| item == text));
+        if !gone {
+            continue;
+        }
+        let removed = array.remove(at);
+        let prefix = removed.decor().prefix().cloned();
+        if at == 0 {
+            let single_line = prefix
+                .as_ref()
+                .and_then(|prefix| prefix.as_str())
+                .is_some_and(|prefix| !prefix.contains('\n'));
+            if let (true, Some(prefix), Some(next)) = (single_line, prefix, array.get_mut(0)) {
+                next.decor_mut().set_prefix(prefix);
+            }
+        }
+    }
+    if array.is_empty() {
+        array.set_trailing("");
+        array.set_trailing_comma(false);
+    }
+    let listed: Vec<String> = array
+        .iter()
+        .filter_map(|value| value.as_str().map(str::to_owned))
+        .collect();
+    for item in items.iter().filter(|item| !listed.contains(item)) {
+        push_item(array, item);
+    }
+}
+
 pub fn set_top_text(text: &str, key: &str, value: &str) -> Result<String, String> {
     let mut document = document(text)?;
     put(document.as_table_mut(), key, Value::from(value));
@@ -1001,7 +1565,12 @@ pub fn set_top_text(text: &str, key: &str, value: &str) -> Result<String, String
 
 pub fn set_top_list(text: &str, key: &str, items: &[String]) -> Result<String, String> {
     let mut document = document(text)?;
-    put(document.as_table_mut(), key, array_of(items));
+    let table = document.as_table_mut();
+    if let Some(Item::Value(Value::Array(array))) = table.get_mut(key) {
+        edit_list(array, items);
+    } else {
+        put(table, key, array_of(items));
+    }
     Ok(document.to_string())
 }
 
@@ -1061,6 +1630,16 @@ pub fn set_control_text(
 ) -> Result<String, String> {
     let mut document = document(text)?;
     if key == "id" {
+        let locked = document
+            .get("control")
+            .and_then(Item::as_array_of_tables)
+            .and_then(|tables| tables.get(index))
+            .and_then(|table| table.get("check"))
+            .and_then(Item::as_str)
+            .is_some_and(|check| check.starts_with("builtin:"));
+        if locked {
+            return Err("A built-in check keeps its ID.".into());
+        }
         let duplicate = document
             .get("control")
             .and_then(Item::as_array_of_tables)

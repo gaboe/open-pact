@@ -56,7 +56,7 @@ done
 
 running() {
   ps -axww -o command= | OPEN_PACT_EXE="$dir/$1.app/Contents/MacOS/$1" awk '
-    exe = ENVIRON["OPEN_PACT_EXE"]
+    BEGIN { exe = ENVIRON["OPEN_PACT_EXE"] }
     index($0, exe) == 1 && (length($0) == length(exe) || substr($0, length(exe) + 1, 1) == " ") { found = 1 }
     END { exit !found }'
 }

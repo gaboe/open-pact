@@ -16,7 +16,13 @@ case "$*" in
   *'manifest get --version 1') cat "$fixtures/manifest.toml" ;;
   *'manifest get --version 2') cat "$fixtures/manifest-v2.toml" ;;
   *'manifest get') cat "$state"; if test -f "$fixtures/race.toml"; then mv "$fixtures/race.toml" "$fixtures/state.toml"; fi ;;
-  *'manifest set --note='*) previous=$(hash "$state"); cat > "$fixtures/state.toml"; applied "$previous" ;;
+  *'manifest set --note='*)
+    if test -f "$fixtures/refuse.txt"; then
+      cat > /dev/null
+      printf '{"error":"%s"}\n' "$(cat "$fixtures/refuse.txt")"
+      exit 1
+    fi
+    previous=$(hash "$state"); cat > "$fixtures/state.toml"; applied "$previous" ;;
   *'manifest activate 1 --json') previous=$(hash "$state"); cp "$fixtures/manifest.toml" "$fixtures/state.toml"; applied "$previous" ;;
   *'manifest activate 2 --json') previous=$(hash "$state"); cp "$fixtures/manifest-v2.toml" "$fixtures/state.toml"; applied "$previous" ;;
   *'devices list --json') cat "$fixtures/devices.json" ;;
