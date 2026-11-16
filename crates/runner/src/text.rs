@@ -352,7 +352,10 @@ fn span_delta(span: &str) -> Option<TimeDelta> {
 }
 
 const MEASURES: &[(&str, &str)] = &[
-    ("password_min_length", "Password is {} characters"),
+    (
+        "password_min_length",
+        "Password policy allows {} characters",
+    ),
     ("os_patch_age_days", "System updates are {} days old"),
     (
         "antimalware_signature_age_days",
@@ -638,7 +641,10 @@ mod tests {
             now,
             &prague,
         );
-        assert_eq!(view.title, "Password is 4 characters, at least 10 needed");
+        assert_eq!(
+            view.title,
+            "Password policy allows 4 characters, at least 10 needed"
+        );
         assert_eq!(
             view.note.as_deref(),
             Some("Access ends 17 Nov, 10:10 unless fixed")

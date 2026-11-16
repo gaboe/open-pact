@@ -86,6 +86,11 @@ impl Listing {
     }
 }
 
+/// Save may run only when the namespace on screen is final. While kubectl lists, the hidden text field would be saved.
+fn can_save(namespaces: &Listing, busy: bool) -> bool {
+    !busy && !matches!(namespaces, Listing::Loading)
+}
+
 type Choice = Entity<SelectState<Vec<SharedString>>>;
 
 struct AppView {
@@ -667,7 +672,7 @@ impl AppView {
         }
         view.child(actions()
                 .child(Button::new("reload-kube").label("Reload from kubectl").ghost().small().disabled(self.busy).on_click(cx.listener(|this, _, window, cx| this.load_contexts(window, cx))))
-                .child(Button::new("save").label("Save and open").primary().disabled(self.busy).on_click(cx.listener(|this, _, window, cx| {
+                .child(Button::new("save").label("Save and open").primary().disabled(!can_save(&self.namespaces, self.busy)).on_click(cx.listener(|this, _, window, cx| {
                     let settings = this.chosen(cx);
                     this.run(Operation::Setup(settings), window, cx);
                 }))))
@@ -1753,5 +1758,20 @@ fn snapshots(output: PathBuf) {
             app
         })
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Listing, can_save};
+
+    #[test]
+    fn save_waits_while_kubectl_lists_namespaces() {
+        let listed = Listing::Listed(vec!["open-pact".to_owned()]);
+        assert!(!can_save(&Listing::Loading, false));
+        assert!(!can_save(&listed, true));
+        assert!(can_save(&listed, false));
+        assert!(can_save(&Listing::Failed("forbidden".to_owned()), false));
+        assert!(can_save(&Listing::Idle, false));
     }
 }
