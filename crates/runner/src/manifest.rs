@@ -1172,6 +1172,10 @@ fn comments(text: &str) -> Vec<String> {
                     while at < bytes.len() && !bytes[at..].starts_with(&[quote; 3]) {
                         at += if basic && bytes[at] == b'\\' { 2 } else { 1 };
                     }
+                    // Up to two quotes before the closing run are content: the last three close.
+                    while at + 3 < bytes.len() && bytes[at + 3] == quote {
+                        at += 1;
+                    }
                     at += 3;
                 } else {
                     at += 1;
@@ -1433,9 +1437,12 @@ pub struct ManifestCheck {
 }
 
 impl ManifestCheck {
-    /// Starts a new question. Every earlier one is stale from now on.
+    /// Starts a new question. Every earlier one is stale from now on, and no draft has an answer
+    /// until its own reply lands.
     pub fn begin(&mut self) -> u64 {
         self.generation += 1;
+        self.checked.clear();
+        self.outcome = None;
         self.generation
     }
 

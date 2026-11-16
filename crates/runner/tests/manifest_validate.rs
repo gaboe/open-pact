@@ -354,3 +354,28 @@ fn text_the_panel_cannot_read_blocks_a_switch_and_text_of_the_form_does_not() {
         Some("number")
     );
 }
+
+#[test]
+fn a_new_question_hides_the_answer_to_the_older_one() {
+    let mut check = ManifestCheck::default();
+    let first = check.begin();
+    assert!(check.finish(first, "A", Ok(Vec::new())));
+    assert_eq!(check.result("A"), Some(Vec::new()));
+    let second = check.begin();
+    assert_eq!(check.result("A"), None, "the question about A is pending");
+    assert!(check.finish(second, "A", Err("refused".into())));
+    assert_eq!(check.result("A").map(|errors| errors.len()), Some(1));
+}
+
+#[test]
+fn a_comment_after_a_multiline_string_closed_by_extra_quotes_is_seen() {
+    let before = replaced(
+        "rationale = \"Lock the screen when you walk away, so nobody can read client data on an open laptop.\"",
+        "rationale = \"\"\"A quote: \"\"\"\" # old note",
+    );
+    let after = before.replace("# old note", "# new note");
+    assert_eq!(
+        manifest::changes_between(&before, &after),
+        ["Comments changed in TOML"]
+    );
+}

@@ -977,8 +977,10 @@ impl AppView {
                     .child(column().gap_1p5().child(label("Change note")).child(Input::new(&self.change_note)))
                     .child(note(format!("Saves the active TOML in {} first.", self.admin.backup_dir().display())))
                     .child(runs("runs", shell_line(&["kubectl", "exec", "-i", "deploy/open-pact-gateway", "--", "open-pact-gateway", "manifest", "set", &format!("--note={}", self.change_note.read(cx).value()), "--json"])))
-                    .child(actions().child(close.label("Cancel")).child(Button::new("apply").label("Apply manifest").primary().disabled(self.busy).on_click(cx.listener(|this, _, window, cx| {
-                        this.run(Operation::Apply(this.draft.clone(), this.change_note.read(cx).value().to_string(), admin::hash(&this.active)), window, cx);
+                    .child(actions().child(close.label("Cancel")).child(Button::new("apply").label("Apply manifest").primary().disabled(!self.review_open()).on_click(cx.listener(|this, _, window, cx| {
+                        if this.review_open() {
+                            this.run(Operation::Apply(this.draft.clone(), this.change_note.read(cx).value().to_string(), admin::hash(&this.active)), window, cx);
+                        }
                     }))));
             }
             Dialog::Restore(restore, text) => {

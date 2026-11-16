@@ -896,13 +896,16 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if id != self.fv.selected && self.panel_blocked() {
-            cx.notify();
-            return;
-        }
-        self.fv.selected = id;
+        let note = self.panel_note();
         self.fv.add_open = false;
-        self.build_panel(window, cx);
+        match panel_switch(self.fv.selected.as_deref(), id.as_deref(), note.is_some()) {
+            PanelSwitch::Keep => {}
+            PanelSwitch::Refuse => self.error = note,
+            PanelSwitch::Replace => {
+                self.fv.selected = id;
+                self.build_panel(window, cx);
+            }
+        }
         cx.notify();
     }
 
@@ -1217,16 +1220,28 @@ impl AppView {
 
     /// Why the check panel may not be replaced now. Its inputs hold text that is not a value yet,
     /// and a new panel would drop it without a word.
+    fn panel_note(&self) -> Option<String> {
+        let form = Form::parse(&self.draft).ok()?;
+        self.fv.pending.panel_blocks(&form)
+    }
+
     fn panel_blocked(&mut self) -> bool {
-        let Ok(form) = Form::parse(&self.draft) else {
-            return false;
-        };
-        let Some(note) = self.fv.pending.panel_blocks(&form) else {
+        let Some(note) = self.panel_note() else {
             return false;
         };
         self.fv.add_open = false;
         self.error = Some(note);
         true
+    }
+
+    /// Whether Review and apply may open: a draft that differs from the active one, confirmed by
+    /// the CLI for these exact bytes, with no check running, no error and no unread input.
+    pub fn review_open(&self) -> bool {
+        !(self.busy
+            || self.change_list().is_empty()
+            || Form::parse(&self.draft).is_err()
+            || self.fv.check.result(&self.draft).is_none()
+            || !self.problems().is_empty())
     }
 
     fn add_check(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -2407,8 +2422,7 @@ impl AppView {
         let form = Form::parse(&self.draft).ok();
         let problems = self.problems();
         let checking = self.fv.check.result(&self.draft).is_none();
-        let can_review =
-            !(self.busy || changes == 0 || form.is_none() || checking || !problems.is_empty());
+        let can_review = self.review_open();
         let shown = list.iter().take(2).cloned().collect::<Vec<_>>().join(" · ");
         let summary = if changes > 2 {
             format!("{shown} · and {} more", changes - 2)
@@ -2496,9 +2510,30 @@ fn field_heading(heading: String, body: Div) -> Div {
         .child(body)
 }
 
+/// What a click on a check row does to the open panel.
+#[derive(Debug, PartialEq, Eq)]
+enum PanelSwitch {
+    /// The open check. Its panel and its unread input stay.
+    Keep,
+    /// Another check, while the panel holds input that is not a value yet.
+    Refuse,
+    /// Another check, with nothing unread in the panel.
+    Replace,
+}
+
+fn panel_switch(selected: Option<&str>, requested: Option<&str>, blocked: bool) -> PanelSwitch {
+    if requested == selected {
+        PanelSwitch::Keep
+    } else if blocked {
+        PanelSwitch::Refuse
+    } else {
+        PanelSwitch::Replace
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{PopoverPlace, popover_place};
+    use super::{PanelSwitch, PopoverPlace, panel_switch, popover_place};
 
     fn place(above: bool, height: f32) -> PopoverPlace {
         PopoverPlace { above, height }
@@ -2520,5 +2555,24 @@ mod tests {
     fn the_add_check_options_keep_200_px_in_a_window_that_is_too_small() {
         assert_eq!(popover_place(300., 150.), place(true, 200.));
         assert_eq!(popover_place(300., 120.), place(false, 200.));
+    }
+
+    #[test]
+    fn clicking_the_open_check_keeps_its_panel_even_with_unread_input() {
+        assert_eq!(panel_switch(Some("a"), Some("a"), true), PanelSwitch::Keep);
+        assert_eq!(panel_switch(Some("a"), Some("a"), false), PanelSwitch::Keep);
+    }
+
+    #[test]
+    fn another_check_waits_while_the_panel_holds_unread_input() {
+        assert_eq!(
+            panel_switch(Some("a"), Some("b"), true),
+            PanelSwitch::Refuse
+        );
+        assert_eq!(
+            panel_switch(Some("a"), Some("b"), false),
+            PanelSwitch::Replace
+        );
+        assert_eq!(panel_switch(None, Some("b"), false), PanelSwitch::Replace);
     }
 }
