@@ -3572,6 +3572,13 @@ async fn accept(home: &Home, yes: bool, insecure_dev: bool) -> Result<ExitCode> 
         return Ok(ExitCode::from(2));
     }
     if new.hash() == &enrolment.manifest {
+        if read_home_file(&home.file("manifest.toml"))
+            .map_or(true, |bytes| ManifestHash::of(&bytes) != enrolment.manifest)
+        {
+            home.write("manifest.toml", published.toml.as_bytes())?;
+            println!("Restored manifest.toml from the gateway ({}).", new.hash());
+            return Ok(ExitCode::SUCCESS);
+        }
         println!(
             "This device already signed the manifest the gateway enforces ({}). Nothing to accept.",
             new.hash()

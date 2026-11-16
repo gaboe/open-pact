@@ -76,7 +76,7 @@ struct ManifestEvidence {
 
 #[derive(Debug, Serialize)]
 struct ScheduleEvidence {
-    owner_consented: bool,
+    owner_consented: Option<bool>,
     policy: String,
     policy_defined: bool,
     job: String,
@@ -147,8 +147,24 @@ async fn collect_with(
     now: DateTime<Utc>,
     inspect_job: impl FnOnce(&Home, &DeviceConfig) -> Result<JobStatus>,
 ) -> Result<Report> {
-    let config = DeviceConfig::load(home)?;
-    let tick: TickEvidence = home.read_json("report-state.json")?.unwrap_or_default();
+    let mut damaged = Vec::new();
+    let config = DeviceConfig::load(home).unwrap_or_else(|error| {
+        damaged.push(("device.json", error));
+        DeviceConfig::default()
+    });
+    let tick: TickEvidence = home
+        .read_json("report-state.json")
+        .unwrap_or_else(|error| {
+            damaged.push(("report-state.json", error));
+            None
+        })
+        .unwrap_or_default();
+    let job_log = home.read_text("schedule.log").unwrap_or_else(|error| {
+        damaged.push(("schedule.log", error));
+        None
+    });
+    let config_damaged = damaged.iter().any(|(file, _)| *file == "device.json");
+    let tick_damaged = damaged.iter().any(|(file, _)| *file == "report-state.json");
     let mut report = Report {
         schema_version: 1,
         observed_at: timestamp(now),
@@ -161,7 +177,7 @@ async fn collect_with(
         last_claim: None,
         manifest: None,
         schedule: ScheduleEvidence {
-            owner_consented: config.auto_send,
+            owner_consented: (!config_damaged).then_some(config.auto_send),
             policy: "unknown without a signed manifest".into(),
             policy_defined: false,
             job: if home.file(crate::schedule::APPLIED).exists() {
@@ -176,7 +192,7 @@ async fn collect_with(
                 .and_then(|time| DateTime::from_timestamp(time, 0))
                 .map(|time| ScheduledClaim { answered_at: timestamp(time), response: None }),
             last_job_note: tick.last_note.clone(),
-            last_job_log_line: home.read_text("schedule.log")?.and_then(|text| text.lines().rev().find(|line| !line.trim().is_empty()).map(|line| line.chars().take(512).collect())),
+            last_job_log_line: job_log.and_then(|text| text.lines().rev().find(|line| !line.trim().is_empty()).map(|line| line.chars().take(512).collect())),
         },
         log: "not verified by status; manual alarms are not saved".into(),
         issues: Vec::new(),
@@ -186,6 +202,15 @@ async fn collect_with(
         ],
     };
     let command = crate::client_command(&home.0);
+    for (file, error) in damaged {
+        report.damaged(file, &error, &command);
+    }
+    if config_damaged {
+        report
+            .limitations
+            .push("Automatic sending consent is unknown because device.json is damaged.".into());
+        report.schedule.job = "unknown; device.json is damaged".into();
+    }
     if let Some(note) = tick
         .last_note
         .as_deref()
@@ -200,39 +225,55 @@ async fn collect_with(
             "Review now.",
         );
     }
-    if let Some(note) = tick
-        .last_note
-        .as_deref()
-        .and_then(|note| note.strip_prefix("changed "))
-    {
-        report.issue(
-            Urgency::Action,
-            format!("The job last reported a changed manifest: {note}"),
-            "Refresh status online, then review the manifest if it still differs.",
-            &command,
-            "status --online",
-            "Unknown; the saved job note has no grace deadline.",
-        );
-    }
-    let enrolment: Option<Enrolment> = home.read_json("enrolment.json")?;
-    let Some(enrolment) = enrolment else {
-        report.issue(
-            Urgency::Action,
-            "This device is not enrolled.",
-            "Get an invitation from IT.",
-            &command,
-            "join <invitation from IT>",
-            "Not applicable before enrolment.",
-        );
-        report.finish();
-        return Ok(report);
-    };
+    let (enrolment, manifest) =
+        match read_generation(|file| match crate::read_home_file(&home.file(file)) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }) {
+            Ok(Generation::Enrolled(generation)) => {
+                let EnrolledGeneration {
+                    enrolment,
+                    manifest,
+                } = *generation;
+                (enrolment, manifest)
+            }
+            Ok(Generation::Busy) => {
+                report
+                    .limitations
+                    .push("busy: another command changed this device during status".into());
+                report.finish_unknown();
+                return Ok(report);
+            }
+            Err(error) => {
+                report.damaged("enrolment.json", &error, &command);
+                report.finish_unknown();
+                return Ok(report);
+            }
+            Ok(Generation::NotEnrolled) => {
+                report.issue(
+                    Urgency::Action,
+                    "This device is not enrolled.",
+                    "Get an invitation from IT.",
+                    &command,
+                    "join <invitation from IT>",
+                    "Not applicable before enrolment.",
+                );
+                report.finish_unknown();
+                return Ok(report);
+            }
+        };
     report.approval = ApprovalEvidence {
         state: enrolment.last_status,
         live: false,
         source: "saved on this device; not refreshed".into(),
     };
-    let manifest = match home.signed_manifest() {
+    let changed_note = tick
+        .last_note
+        .as_deref()
+        .and_then(|note| note.strip_prefix("changed "))
+        .filter(|hash| *hash != enrolment.manifest.as_str());
+    let manifest = match manifest {
         Ok(manifest) => Some(manifest),
         Err(error) => {
             report.issue(
@@ -270,7 +311,9 @@ async fn collect_with(
             .as_ref()
             .is_some_and(|schedule| matches!(schedule.policy, SendPolicy::Vpn { .. }))
         {
-            report.schedule.vpn = if home.file("report-state.json").exists() {
+            report.schedule.vpn = if tick_damaged {
+                "unknown; report-state.json is damaged".into()
+            } else if home.file("report-state.json").exists() {
                 format!(
                     "last job probe {}; time not recorded",
                     if tick.vpn_up { "answered" } else { "failed" }
@@ -295,10 +338,17 @@ async fn collect_with(
     if !online && manifest.is_some() {
         report.online_command = Some(format!("{command} status --online"));
     }
-    report.read_claim(home, manifest.as_ref(), now, &command, tick.last_success)?;
+    if let Err(error) = report.read_claim(home, &enrolment, manifest.as_ref(), now, &command) {
+        report.damaged("claims.jsonl", &error, &command);
+    }
     if online {
-        match inspect_job(home, &config) {
-            Ok(job) => report.job(job, &command),
+        match if config_damaged {
+            Ok(None)
+        } else {
+            inspect_job(home, &config).map(Some)
+        } {
+            Ok(None) => (),
+            Ok(Some(job)) => report.job(job, &command),
             Err(error) => {
                 report.schedule.job = format!("unknown; OS query failed: {error:#}");
                 report.issue(
@@ -351,7 +401,7 @@ async fn collect_with(
                             report.log =
                                 "checkpoint verified now; own-entry proofs not requested".into()
                         }
-                        Err(text) => {
+                        Err(LogFailure::Alarm(text)) => {
                             report.log =
                                 "ALARM; live checkpoint or pinned keys did not verify".into();
                             report.issue(
@@ -362,6 +412,21 @@ async fn collect_with(
                                 "log head",
                                 "Review now.",
                             );
+                        }
+                        Err(LogFailure::Unavailable(text)) => {
+                            report.log = "unknown; consistency proof unavailable".into();
+                            report.issue(
+                                Urgency::Action,
+                                text,
+                                "Connect the company network and retry.",
+                                &command,
+                                "status --online",
+                                "Unknown while the consistency proof is unavailable.",
+                            );
+                        }
+                        Err(LogFailure::Damaged(error)) => {
+                            report.log = "unknown; saved checkpoint is damaged".into();
+                            report.damaged(crate::LOG_CHECKPOINT, &error, &command);
                         }
                     }
                     if let Some(vpn) = live.vpn {
@@ -400,7 +465,7 @@ async fn collect_with(
         }
     } else {
         report.limitations.push("Local mode makes no network or OS job queries. Approval, manifest agreement, and live VPN state can have changed.".into());
-        if !config.auto_send && home.file(crate::schedule::APPLIED).exists() {
+        if !config_damaged && !config.auto_send && home.file(crate::schedule::APPLIED).exists() {
             report.issue(
                 Urgency::Action,
                 "An installation record remains while automatic sending is off.",
@@ -410,6 +475,21 @@ async fn collect_with(
                 "No grace deadline.",
             );
         }
+    }
+    if let Some(note) = changed_note
+        && !report
+            .manifest
+            .as_ref()
+            .is_some_and(|evidence| evidence.enforced.as_ref() == Some(&evidence.signed))
+    {
+        report.issue(
+            Urgency::Action,
+            format!("The job last reported a changed manifest: {note}"),
+            "Refresh status online, then review the manifest if it still differs.",
+            &command,
+            "status --online",
+            "Unknown; the saved job note has no grace deadline.",
+        );
     }
     match report.approval.state {
         Some(DeviceStatus::Pending) => report.issue(
@@ -442,8 +522,56 @@ async fn collect_with(
 struct Live {
     approval: Option<DeviceStatus>,
     enforced: Option<ManifestHash>,
-    log: std::result::Result<(), String>,
+    log: std::result::Result<(), LogFailure>,
     vpn: Option<bool>,
+}
+
+enum LogFailure {
+    Alarm(String),
+    Unavailable(String),
+    Damaged(anyhow::Error),
+}
+
+enum Generation {
+    NotEnrolled,
+    Enrolled(Box<EnrolledGeneration>),
+    Busy,
+}
+
+struct EnrolledGeneration {
+    enrolment: Enrolment,
+    manifest: Result<Manifest>,
+}
+
+fn read_generation(mut read: impl FnMut(&str) -> Result<Option<Vec<u8>>>) -> Result<Generation> {
+    for _ in 0..3 {
+        let before = read("enrolment.json")?;
+        let manifest = read("manifest.toml");
+        let after = read("enrolment.json")?;
+        if before != after {
+            continue;
+        }
+        let Some(bytes) = before else {
+            return Ok(Generation::NotEnrolled);
+        };
+        let enrolment: Enrolment = serde_json::from_slice(&bytes)?;
+        let manifest = manifest.and_then(|bytes| {
+            Ok(Manifest::parse(
+                &bytes.context("manifest.toml is missing")?,
+            )?)
+        });
+        if manifest
+            .as_ref()
+            .is_ok_and(|manifest| manifest.hash() != &enrolment.manifest)
+        {
+            continue;
+        }
+        return Ok(Generation::Enrolled(Box::new(EnrolledGeneration {
+            enrolment,
+            manifest,
+        })));
+    }
+    Ok(Generation::Busy)
 }
 
 async fn refresh(
@@ -464,27 +592,39 @@ async fn refresh(
         crate::get_json(&http, format!("{gateway}/v1/manifest")).await?;
     let enforced = ManifestHash::of(published.toml.as_bytes());
     let mut log = if published.company.key.fingerprint() != pins.company {
-        Err("The gateway company key differs from the pinned key.".into())
+        Err(LogFailure::Alarm(
+            "The gateway company key differs from the pinned key.".into(),
+        ))
     } else if !published.company.verify(&enforced) {
-        Err("The gateway manifest signature did not verify.".into())
+        Err(LogFailure::Alarm(
+            "The gateway manifest signature did not verify.".into(),
+        ))
     } else {
         let log_key = crate::get_text(&http, format!("{gateway}/v1/log/key")).await?;
         pins.differs(&published.company.key.fingerprint(), &log_key)
-            .map_or(Ok(()), Err)
+            .map_or(Ok(()), |text| Err(LogFailure::Alarm(text)))
     };
     if log.is_ok() {
         let checkpoint = crate::get_text(&http, format!("{gateway}/v1/log/checkpoint")).await?;
-        log = crate::verify_checkpoint_unstored(
-            &http,
-            gateway,
-            &pins.log,
-            manifest.body().log.as_ref(),
-            home.checkpoint()?.as_ref(),
-            &checkpoint,
-        )
-        .await?
-        .map(|_| ())
-        .map_err(|error| error.alarm_text());
+        log = match home.checkpoint() {
+            Err(error) => Err(LogFailure::Damaged(error)),
+            Ok(previous) => crate::verify_checkpoint_unstored(
+                &http,
+                gateway,
+                &pins.log,
+                manifest.body().log.as_ref(),
+                previous.as_ref(),
+                &checkpoint,
+            )
+            .await?
+            .map(|_| ())
+            .map_err(|error| match error {
+                crate::CheckpointVerifyError::Network(error) => LogFailure::Unavailable(format!(
+                    "No consistency proof from the gateway: {error:#}"
+                )),
+                crate::CheckpointVerifyError::Alarm(text) => LogFailure::Alarm(text),
+            }),
+        };
     }
     // Do not authenticate to a gateway whose pinned keys or signature changed.
     let approval = if log.is_ok() {
@@ -578,6 +718,25 @@ fn warning_deadline(message: &str, response_time: &str, now: DateTime<Utc>) -> S
 }
 
 impl Report {
+    fn damaged(&mut self, file: &str, error: &anyhow::Error, command: &str) {
+        let fact = format!("damaged: {file}");
+        self.limitations.push(format!("{fact}: {error:#}"));
+        self.issue(
+            Urgency::Action,
+            fact,
+            "Keep the file and tell IT.",
+            command,
+            "status",
+            "Review before trusting this evidence.",
+        );
+    }
+
+    fn finish_unknown(&mut self) {
+        self.issues.sort_by_key(|issue| issue.urgency);
+        self.verdict = Verdict::Unknown;
+        self.exit_code = 3;
+    }
+
     fn issue(
         &mut self,
         urgency: Urgency,
@@ -600,10 +759,10 @@ impl Report {
     fn read_claim(
         &mut self,
         home: &Home,
+        enrolment: &Enrolment,
         manifest: Option<&Manifest>,
         now: DateTime<Utc>,
         command: &str,
-        last_scheduled: Option<i64>,
     ) -> Result<()> {
         let (records, damaged) = locallog::read_lenient(&home.file("claims.jsonl"))?;
         if damaged > 0 {
@@ -625,7 +784,6 @@ impl Report {
         let verified = sent["jws"].as_str().and_then(|jws| verify_claim(jws).ok());
         let claim = verified.as_ref().map(|verified| verified.claim());
         let (outcome, warnings, reasons) = outcome_of(record)?;
-        self.name_scheduled_claim(&records, last_scheduled);
         let evidence = ClaimEvidence {
             sent_at: claim.map(|claim| timestamp(claim.time)),
             response_at: record.time.clone(),
@@ -691,7 +849,7 @@ impl Report {
             );
         }
         if let Some(claim) = claim {
-            if claim.device != home.enrolment()?.device {
+            if claim.device != enrolment.device {
                 self.issue(
                     Urgency::Action,
                     "The saved claim belongs to another device.",
@@ -731,28 +889,6 @@ impl Report {
         }
         self.last_claim = Some(evidence);
         Ok(())
-    }
-
-    fn name_scheduled_claim(&mut self, records: &[locallog::Record], last_scheduled: Option<i64>) {
-        let Some(scheduled) = self.schedule.last_scheduled_claim.as_mut() else {
-            return;
-        };
-        let Some(answered) = last_scheduled else {
-            return;
-        };
-        let near = |record: &&locallog::Record| {
-            DateTime::parse_from_rfc3339(&record.time)
-                .is_ok_and(|time| (time.timestamp() - answered).abs() <= 60)
-        };
-        match records.iter().rposition(|record| near(&record)) {
-            Some(index) if index + 1 == records.len() => self.schedule.last_scheduled_claim = None,
-            Some(index) => {
-                scheduled.response = outcome_of(&records[index])
-                    .ok()
-                    .map(|outcome| outcome.0.into());
-            }
-            None => (),
-        }
     }
 
     fn job(&mut self, job: JobStatus, command: &str) {
@@ -829,10 +965,10 @@ impl Report {
     }
 
     fn sending_text(&self) -> String {
-        let choice = if self.schedule.owner_consented {
-            "on"
-        } else {
-            "off"
+        let choice = match self.schedule.owner_consented {
+            Some(true) => "on",
+            Some(false) => "off",
+            None => "unknown",
         };
         let sent = self
             .last_claim
@@ -846,7 +982,7 @@ impl Report {
             .unwrap_or_else(|| "none recorded".into());
         let mut lines = vec![
             format!("Automatic sending: {choice}. Job: {}.", self.schedule.job),
-            if self.schedule.owner_consented || !self.schedule.policy_defined {
+            if self.schedule.owner_consented != Some(false) || !self.schedule.policy_defined {
                 format!("Signed schedule: {}.", self.schedule.policy)
             } else {
                 format!(
@@ -859,18 +995,10 @@ impl Report {
             format!("Last claim response: {last}."),
         ];
         if let Some(scheduled) = &self.schedule.last_scheduled_claim {
-            lines.push(match &scheduled.response {
-                Some(response) => {
-                    format!(
-                        "Last scheduled claim: {}, {response}.",
-                        scheduled.answered_at
-                    )
-                }
-                None => format!(
-                    "Last scheduled claim: answered at {}; its response is not in the local log.",
-                    scheduled.answered_at
-                ),
-            });
+            lines.push(format!(
+                "Last answered scheduled claim: {}.",
+                scheduled.answered_at
+            ));
         }
         if let Some(line) = &self.schedule.last_job_log_line {
             lines.push(format!("Last job log line (saved): {line}"));

@@ -100,7 +100,26 @@ impl Fixture {
             u64::try_from(Utc::now().timestamp()).unwrap(),
         );
         let stored_checkpoint = checkpoint.to_string();
-        let checkpoint = if state == "log_alarm" {
+        let checkpoint = if state == "proof_unavailable" {
+            let mut newer = company.sign(&crate::fake_gateway::checkpoint_of(
+                company.log.origin(),
+                &[
+                    open_pact_core::Entry {
+                        index: 0,
+                        kind: open_pact_core::EntryKind::ManifestPublished,
+                        data: json!({"manifest":signed.as_str()}),
+                    },
+                    open_pact_core::Entry {
+                        index: 1,
+                        kind: open_pact_core::EntryKind::ManifestPublished,
+                        data: json!({"manifest":signed.as_str()}),
+                    },
+                ],
+                2,
+            ));
+            witness.cosign(&mut newer, u64::try_from(Utc::now().timestamp()).unwrap());
+            newer.to_string()
+        } else if state == "log_alarm" {
             "not a checkpoint".into()
         } else {
             stored_checkpoint.clone()
@@ -117,6 +136,7 @@ impl Fixture {
             "GET /v1/log/checkpoint" => (200, checkpoint.clone()),
             "POST /v1/nonce" => (200, json!({"nonce":"status-nonce"}).to_string()),
             "POST /v1/device/status" => (200, json!({"state":approval}).to_string()),
+            "GET /v1/log/proof/consistency?from=1&to=2" => (503, "try later".into()),
             _ => not_found(),
         })
         .await;
@@ -285,8 +305,10 @@ fn check_snapshot(name: &str, rendered: &str) {
         std::fs::write(&path, rendered).unwrap();
     }
     assert_eq!(
-        std::fs::read_to_string(&path).unwrap(),
-        rendered,
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("\r\n", "\n"),
+        rendered.replace("\r\n", "\n"),
         "{}",
         path.display()
     );
@@ -476,7 +498,7 @@ fn access_spans_cover_the_gateway_formats() {
 }
 
 #[tokio::test]
-async fn the_last_scheduled_claim_names_its_result_unless_it_is_the_last_claim() {
+async fn a_nearby_manual_claim_does_not_supply_the_scheduled_result() {
     let fixture = Fixture::new("approved_ok").await;
     let path = fixture.home.file("claims.jsonl");
     let first = locallog::read(&path).unwrap().remove(0);
@@ -489,7 +511,7 @@ async fn the_last_scheduled_claim_names_its_result_unless_it_is_the_last_claim()
     )
     .unwrap();
     let mut records = locallog::read(&path).unwrap();
-    records[1].time = "2026-11-16T09:55:00Z".into();
+    records[1].time = "2026-11-16T09:50:30Z".into();
     let lines: String = records
         .iter()
         .map(|record| serde_json::to_string(record).unwrap() + "\n")
@@ -499,8 +521,293 @@ async fn the_last_scheduled_claim_names_its_result_unless_it_is_the_last_claim()
         .write("claims.jsonl", lines.as_bytes())
         .unwrap();
     let text = fixture.report(false).await.render();
-    assert!(text.contains("Last claim response: 2026-11-16T09:55:00Z, denied."));
-    assert!(text.contains("Last scheduled claim: 2026-11-16T09:50:00Z, accepted."));
+    assert!(text.contains("Last claim response: 2026-11-16T09:50:30Z, denied."));
+    assert!(text.contains("Last answered scheduled claim: 2026-11-16T09:50:00Z."));
+    assert!(
+        fixture
+            .report(false)
+            .await
+            .schedule
+            .last_scheduled_claim
+            .unwrap()
+            .response
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn resolved_manifest_notes_do_not_require_action() {
+    let fixture = Fixture::new("approved_ok").await;
+    fixture
+        .home
+        .write(
+            "report-state.json",
+            &serde_json::to_vec(
+                &json!({"vpn_up":true,"last_note":format!("changed {}",fixture.signed)}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(fixture.report(true).await.exit_code, 0);
+    assert!(
+        !fixture
+            .report(false)
+            .await
+            .issues
+            .iter()
+            .any(|issue| issue.message.contains("changed manifest"))
+    );
+    fixture.home.write("report-state.json", &serde_json::to_vec(&json!({"vpn_up":true,"last_note":format!("changed {}",ManifestHash::of(b"old policy"))})).unwrap()).unwrap();
+    assert!(
+        fixture
+            .report(false)
+            .await
+            .issues
+            .iter()
+            .any(|issue| issue.message.contains("changed manifest"))
+    );
+    assert_eq!(fixture.report(true).await.exit_code, 0);
+}
+
+#[tokio::test]
+async fn damaged_optional_files_preserve_text_and_json_reports() {
+    for file in [
+        "report-state.json",
+        "device.json",
+        "schedule.log",
+        "claims.jsonl",
+    ] {
+        let fixture = Fixture::new("approved_ok").await;
+        if file == "claims.jsonl" {
+            std::fs::remove_file(fixture.home.file(file)).unwrap();
+            locallog::append_with_status(&fixture.home.file(file), b"not json", b"{}", Some(200))
+                .unwrap();
+        } else {
+            fixture.home.write(file, b"\xff{").unwrap();
+        }
+        for online in [false, true] {
+            let report = fixture.report(online).await;
+            assert!(
+                report.render().contains(&format!("damaged: {file}")),
+                "{file}"
+            );
+            assert!(
+                serde_json::to_string(&report)
+                    .unwrap()
+                    .contains(&format!("damaged: {file}")),
+                "{file}"
+            );
+            assert!(report.manifest.is_some());
+            assert_eq!(report.exit_code, 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn damaged_enrolment_still_renders_an_unknown_report() {
+    let fixture = Fixture::new("approved_ok").await;
+    fixture.home.write("enrolment.json", b"{").unwrap();
+    let report = fixture.report(false).await;
+    assert_eq!(report.exit_code, 3);
+    assert!(report.render().contains("damaged: enrolment.json"));
+    assert!(
+        serde_json::to_string(&report)
+            .unwrap()
+            .contains("damaged: enrolment.json")
+    );
+}
+
+#[tokio::test]
+async fn mismatched_generations_report_busy_instead_of_mixing_facts() {
+    let fixture = Fixture::new("approved_ok").await;
+    let text = fixture
+        .home
+        .read_text("manifest.toml")
+        .unwrap()
+        .unwrap()
+        .replace("company.example", "next.example");
+    fixture
+        .home
+        .write("manifest.toml", text.as_bytes())
+        .unwrap();
+    let report = fixture.report(false).await;
+    assert_eq!(report.exit_code, 3);
+    assert!(
+        report
+            .render()
+            .contains("busy: another command changed this device during status")
+    );
+    assert!(report.manifest.is_none());
+}
+
+#[tokio::test]
+async fn generation_reads_retry_both_enrolment_changes_and_manifest_write_windows() {
+    let fixture = Fixture::new("approved_ok").await;
+    let before = std::fs::read(fixture.home.file("enrolment.json")).unwrap();
+    let manifest = fixture
+        .home
+        .read_text("manifest.toml")
+        .unwrap()
+        .unwrap()
+        .replace("company.example", "next.example")
+        .into_bytes();
+    let mut enrolled = fixture.home.enrolment().unwrap();
+    enrolled.manifest = ManifestHash::of(&manifest);
+    let after = serde_json::to_vec(&enrolled).unwrap();
+    for first_after in [&before, &after] {
+        let mut reads = std::collections::VecDeque::from([
+            ("enrolment.json", before.clone()),
+            ("manifest.toml", manifest.clone()),
+            ("enrolment.json", first_after.clone()),
+            ("enrolment.json", after.clone()),
+            ("manifest.toml", manifest.clone()),
+            ("enrolment.json", after.clone()),
+        ]);
+        let result = read_generation(|file| {
+            let (expected, bytes) = reads.pop_front().expect("too many reads");
+            assert_eq!(file, expected);
+            Ok(Some(bytes))
+        })
+        .unwrap();
+        let Generation::Enrolled(generation) = result else {
+            panic!("expected the stable second generation")
+        };
+        assert_eq!(generation.enrolment.manifest, enrolled.manifest);
+        assert_eq!(generation.manifest.unwrap().hash(), &enrolled.manifest);
+        assert!(reads.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn generation_reads_stop_after_three_changed_enrolments() {
+    let fixture = Fixture::new("approved_ok").await;
+    let manifest = std::fs::read(fixture.home.file("manifest.toml")).unwrap();
+    let mut enrolment_reads = 0;
+    let mut manifest_reads = 0;
+    let result = read_generation(|file| {
+        if file == "enrolment.json" {
+            enrolment_reads += 1;
+            Ok(Some(vec![enrolment_reads]))
+        } else {
+            assert_eq!(file, "manifest.toml");
+            manifest_reads += 1;
+            Ok(Some(manifest.clone()))
+        }
+    })
+    .unwrap();
+    assert!(matches!(result, Generation::Busy));
+    assert_eq!(enrolment_reads, 6);
+    assert_eq!(manifest_reads, 3);
+}
+
+#[tokio::test]
+async fn unreadable_optional_files_preserve_the_report() {
+    for file in [
+        "device.json",
+        "report-state.json",
+        "schedule.log",
+        "claims.jsonl",
+    ] {
+        let fixture = Fixture::new("approved_ok").await;
+        let _ = std::fs::remove_file(fixture.home.file(file));
+        std::fs::create_dir(fixture.home.file(file)).unwrap();
+        for online in [false, true] {
+            let report = fixture.report(online).await;
+            assert!(
+                report.render().contains(&format!("damaged: {file}")),
+                "{file}"
+            );
+            assert!(report.manifest.is_some());
+            assert_eq!(report.exit_code, 1);
+            if file == "device.json" {
+                assert!(report.render().contains("Automatic sending: unknown."));
+                assert!(
+                    serde_json::to_value(&report).unwrap()["schedule"]["owner_consented"].is_null()
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn damaged_checkpoint_is_a_local_problem_not_a_network_fix() {
+    let fixture = Fixture::new("approved_ok").await;
+    fixture
+        .home
+        .write(crate::LOG_CHECKPOINT, b"not a checkpoint")
+        .unwrap();
+    let report = fixture.report(true).await;
+    assert_eq!(report.exit_code, 1);
+    assert!(report.render().contains("damaged: log-checkpoint.txt"));
+    assert!(!report.render().contains("Connect the company network"));
+    assert!(
+        !fixture
+            .gateway
+            .requests()
+            .iter()
+            .any(|line| line.starts_with("POST "))
+    );
+}
+
+#[tokio::test]
+async fn unavailable_consistency_proof_is_not_a_log_alarm() {
+    let fixture = Fixture::new("proof_unavailable").await;
+    let report = fixture.report(true).await;
+    assert_eq!(report.exit_code, 1);
+    assert!(report.render().contains("consistency proof"));
+    assert!(!report.render().contains("ALARM"));
+    assert!(
+        !fixture
+            .gateway
+            .requests()
+            .iter()
+            .any(|line| line.starts_with("POST "))
+    );
+    assert!(
+        fixture
+            .gateway
+            .requests()
+            .iter()
+            .any(|line| line.contains("/proof/consistency"))
+    );
+}
+
+#[tokio::test]
+async fn accept_restores_missing_or_damaged_signed_manifest() {
+    for state in ["missing", "damaged", "different"] {
+        let fixture = Fixture::new("approved_ok").await;
+        let original = fixture.home.read_text("manifest.toml").unwrap().unwrap();
+        match state {
+            "missing" => std::fs::remove_file(fixture.home.file("manifest.toml")).unwrap(),
+            _ => {
+                let text = if state == "different" {
+                    original.replace("company.example", "other.example")
+                } else {
+                    "not a manifest".into()
+                };
+                fixture
+                    .home
+                    .write("manifest.toml", text.as_bytes())
+                    .unwrap();
+            }
+        }
+        assert_eq!(
+            crate::accept(&fixture.home, true, false).await.unwrap(),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            fixture.home.read_text("manifest.toml").unwrap().unwrap(),
+            original
+        );
+        assert!(
+            !fixture
+                .gateway
+                .requests()
+                .iter()
+                .any(|line| line.starts_with("POST "))
+        );
+        assert_eq!(fixture.report(true).await.exit_code, 0);
+    }
 }
 
 #[tokio::test]

@@ -262,7 +262,7 @@ The exit code tells a script what to do:
 | 0 | No known problem. Only an online report can return it: approved, same manifest, accepted last claim, and a job that matches your choice. |
 | 1 | Action needed. At least one item has a fix. |
 | 2 | Alarm. A log or key verification failed. Keep the checkpoint and tell IT. |
-| 3 | Unknown. Nothing is wrong on record, but some status is unconfirmed. A local report always ends here. |
+| 3 | Unknown. Some status is unconfirmed, or enrolment is missing or damaged. Local mode cannot return 0. It returns 1 or 2 when a recorded issue takes precedence, and otherwise returns 3. |
 
 `--json` prints the same evidence, items, and exit code as one JSON document. `schedule status` stays the detailed view of the schedule and the job.
 
