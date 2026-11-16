@@ -1,3 +1,4 @@
+# The Helm manifest is the first manifest. An active database version wins once set.
 image:
   repository: registry.example.com/open-pact-gateway
   tag: latest
