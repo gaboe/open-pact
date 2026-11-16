@@ -116,7 +116,7 @@ kubectl exec deploy/pact-gateway -- open-pact-gateway status --json
 
 ## Read results
 
-IT can read what devices reported without a database client. Both commands only read. They open the stored claims with the KEK, so they need `GATEWAY_KEK` in the gateway container, and they add no HTTP route. With `--json` each prints one JSON document. On an error it prints `{"error": "<text>"}` and exits 1.
+IT can read what devices reported without a database client. Both commands only read. They open the stored claims with the KEK, so they need `GATEWAY_KEK` in the gateway container, and they add no HTTP route. With `--json` each prints one JSON document. On an error it prints `{"error": "<text>"}`. Usage errors, such as `--limit 0`, print the same error document and exit 2. Other errors exit 1. These commands never migrate the database. On a database older than this gateway they print an error that says to start the gateway once, and they write nothing.
 
 ```sh
 kubectl exec deploy/pact-gateway -- open-pact-gateway claims list --json --device 0123456789ab --result warnings --limit 20
