@@ -30,11 +30,13 @@ impl Platform {
     }
 }
 
-/// A program and its arguments, as the Runner runs and the Terminal strip shows them.
+/// A program, its arguments, and the environment variables it adds, as the Runner runs and the
+/// Terminal strip shows them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Invocation {
     pub program: String,
     pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
 }
 
 impl Invocation {
@@ -42,6 +44,7 @@ impl Invocation {
         Self {
             program: program.into(),
             args: args(words),
+            env: Vec::new(),
         }
     }
 }
@@ -93,20 +96,72 @@ fn under_scoop(exe: &str) -> bool {
 
 /// The command that installs the newest release. `exe` is the path of the running app. There is
 /// none on Linux, where the apps have no installer.
+/// The folder a direct install goes to: the folder that holds the running `.app` bundle on macOS,
+/// and the folder of the exe on Windows.
+fn install_folder(platform: Platform, exe: &str) -> Option<&str> {
+    match platform {
+        Platform::Mac => {
+            let mut path = exe;
+            loop {
+                let folder = parent(path)?;
+                if last_segment(folder).ends_with(".app") {
+                    return parent(folder);
+                }
+                path = folder;
+            }
+        }
+        Platform::Windows => parent(exe),
+        Platform::Other => None,
+    }
+}
+
+fn parent(path: &str) -> Option<&str> {
+    path.rfind(['/', '\\'])
+        .map(|index| &path[..index])
+        .filter(|folder| !folder.is_empty())
+}
+
+fn last_segment(path: &str) -> &str {
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
+
+fn install_dir_env(platform: Platform, exe: &str) -> Vec<(String, String)> {
+    install_folder(platform, exe)
+        .map(|folder| vec![("OPEN_PACT_INSTALL_DIR".to_owned(), folder.to_owned())])
+        .unwrap_or_default()
+}
+
+/// Downloads the installer to a temporary file and runs it. A failed download fails the command.
+fn mac_installer_script() -> String {
+    format!(
+        "set -e; installer=$(mktemp) && trap 'rm -f \"$installer\"' EXIT && curl -fsSL -o \"$installer\" {RAW}/install-desktop.sh && sh \"$installer\""
+    )
+}
+
+fn windows_installer_script() -> String {
+    format!(
+        "$ErrorActionPreference = 'Stop'; $installer = Join-Path $env:TEMP ('open-pact-install-' + [Guid]::NewGuid().ToString('N') + '.ps1'); try {{ Invoke-WebRequest -UseBasicParsing -Uri '{RAW}/install-desktop.ps1' -OutFile $installer; Invoke-Expression (Get-Content -Raw -Path $installer) }} finally {{ Remove-Item -Path $installer -Force -ErrorAction SilentlyContinue }}"
+    )
+}
+
+/// The command that installs the newest release. `exe` is the path of the running app. There is
+/// none on Linux, where the apps have no installer. Only a direct install gets the folder of the
+/// running app; scoop keeps its own folder.
 pub fn update_invocation(platform: Platform, exe: &str) -> Option<Invocation> {
     match platform {
-        Platform::Mac => Some(Invocation::new(
-            "sh",
-            &["-c", &format!("curl -fsSL {RAW}/install-desktop.sh | sh")],
-        )),
+        Platform::Mac => Some(Invocation {
+            program: "sh".into(),
+            args: args(&["-c", &mac_installer_script()]),
+            env: install_dir_env(platform, exe),
+        }),
         Platform::Windows if under_scoop(exe) => Some(shell_invocation(
             platform,
             &format!("scoop update {SCOOP_PACKAGE}"),
         )),
-        Platform::Windows => Some(shell_invocation(
-            platform,
-            &format!("irm {RAW}/install-desktop.ps1 | iex"),
-        )),
+        Platform::Windows => Some(Invocation {
+            env: install_dir_env(platform, exe),
+            ..shell_invocation(platform, &windows_installer_script())
+        }),
         Platform::Other => None,
     }
 }
@@ -186,6 +241,7 @@ pub fn check(runner: &Runner) -> Result<Option<String>, String> {
 pub fn run(runner: &Runner, call: &Invocation) -> Result<(), String> {
     runner
         .with_timeout(Duration::from_secs(600))
+        .with_env(&call.env)
         .run(std::path::Path::new(&call.program), &call.args)
         .map(|_| ())
 }
@@ -266,10 +322,7 @@ mod tests {
         .unwrap();
         assert_eq!(mac.program, "sh");
         assert_eq!(mac.args[0], "-c");
-        assert_eq!(
-            mac.args[1],
-            "curl -fsSL https://raw.githubusercontent.com/gaboe/open-pact-desktop/main/scripts/install-desktop.sh | sh"
-        );
+        assert!(mac.args[1].contains("/scripts/install-desktop.sh"));
         let scoop = update_invocation(Platform::Windows, SCOOP).unwrap();
         assert_eq!(scoop.program, "powershell");
         assert_eq!(
@@ -287,16 +340,13 @@ mod tests {
             r"C:\Users\fictional\AppData\Local\open-pact-desktop\open-pact.exe",
         )
         .unwrap();
-        assert_eq!(
-            plain.args[2],
-            "irm https://raw.githubusercontent.com/gaboe/open-pact-desktop/main/scripts/install-desktop.ps1 | iex"
-        );
+        assert!(plain.args[2].contains("/scripts/install-desktop.ps1"));
         let other_package = update_invocation(
             Platform::Windows,
             r"C:\scoop\apps\another\current\open-pact.exe",
         )
         .unwrap();
-        assert!(other_package.args[2].starts_with("irm "));
+        assert!(other_package.args[2].contains("/scripts/install-desktop.ps1"));
         assert_eq!(
             update_invocation(Platform::Other, "/usr/bin/open-pact"),
             None
@@ -376,5 +426,91 @@ mod tests {
             ..with
         };
         assert_eq!(cli_notice(&blank).1, None);
+    }
+
+    #[test]
+    fn the_update_installs_into_the_folder_the_app_runs_from() {
+        let mac = update_invocation(
+            Platform::Mac,
+            "/Users/fictional/Tools/op/open-pact.app/Contents/MacOS/open-pact",
+        )
+        .unwrap();
+        assert_eq!(
+            mac.env,
+            [(
+                "OPEN_PACT_INSTALL_DIR".to_owned(),
+                "/Users/fictional/Tools/op".to_owned()
+            )]
+        );
+        let plain = update_invocation(
+            Platform::Windows,
+            r"C:\Users\fictional\AppData\Local\open-pact-desktop\open-pact.exe",
+        )
+        .unwrap();
+        assert_eq!(
+            plain.env,
+            [(
+                "OPEN_PACT_INSTALL_DIR".to_owned(),
+                r"C:\Users\fictional\AppData\Local\open-pact-desktop".to_owned()
+            )]
+        );
+        assert!(
+            update_invocation(Platform::Windows, SCOOP)
+                .unwrap()
+                .env
+                .is_empty()
+        );
+        let bare = update_invocation(Platform::Mac, "/Users/fictional/dev/open-pact").unwrap();
+        assert!(bare.env.is_empty());
+    }
+
+    #[cfg(unix)]
+    const FAKE_CURL_DOWNLOADS: &str = r#"out=; while [ $# -gt 0 ]; do if [ "$1" = -o ]; then out=$2; fi; shift; done; printf '%s\n' 'touch "$OPEN_PACT_TEST_MARKER"' > "$out""#;
+
+    #[cfg(unix)]
+    fn mac_update_with_fake_curl(name: &str, curl: &str) -> (bool, bool) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("open-pact-update-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("curl");
+        std::fs::write(&fake, format!("#!/bin/sh\n{curl}\n")).unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let marker = dir.join("ran");
+        let path = format!(
+            "{}:{}",
+            dir.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let call = update_invocation(
+            Platform::Mac,
+            "/Users/fictional/Applications/open-pact.app/Contents/MacOS/open-pact",
+        )
+        .unwrap();
+        let status = std::process::Command::new(&call.program)
+            .args(&call.args)
+            .env("PATH", path)
+            .env("OPEN_PACT_TEST_MARKER", &marker)
+            .status()
+            .unwrap();
+        let ran = marker.exists();
+        std::fs::remove_dir_all(&dir).unwrap();
+        (status.success(), ran)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_installer_download_fails_the_update() {
+        let (succeeded, ran) = mac_update_with_fake_curl("failed-download", "exit 22");
+        assert!(!succeeded);
+        assert!(!ran);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_update_runs_the_downloaded_installer() {
+        let (succeeded, ran) = mac_update_with_fake_curl("downloaded", FAKE_CURL_DOWNLOADS);
+        assert!(succeeded);
+        assert!(ran);
     }
 }

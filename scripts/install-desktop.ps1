@@ -48,8 +48,9 @@ try {
     if (-not (Test-Path (Join-Path $staged $file))) { Fail "the archive has no $file." }
   }
 
+  $target = [IO.Path]::GetFullPath($dir).TrimEnd('\')
   foreach ($app in $apps) {
-    $running = Get-Process -Name $app -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.StartsWith($dir, [StringComparison]::OrdinalIgnoreCase) }
+    $running = Get-Process -Name $app -ErrorAction SilentlyContinue | Where-Object { $_.Path -and ([IO.Path]::GetDirectoryName($_.Path).TrimEnd('\') -ieq $target) }
     if ($running) {
       Write-Host "Closing the running $app"
       $running | Stop-Process -Force

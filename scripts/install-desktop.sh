@@ -54,7 +54,12 @@ for app in $apps; do
   codesign --verify --deep --strict "$work/app/$app.app" 2>/dev/null || fail "the signature of $app.app is broken. Nothing was installed."
 done
 
-running() { pgrep -f "$dir/$1.app/Contents/MacOS/$1" >/dev/null 2>&1; }
+running() {
+  ps -axww -o command= | OPEN_PACT_EXE="$dir/$1.app/Contents/MacOS/$1" awk '
+    exe = ENVIRON["OPEN_PACT_EXE"]
+    index($0, exe) == 1 && (length($0) == length(exe) || substr($0, length(exe) + 1, 1) == " ") { found = 1 }
+    END { exit !found }'
+}
 for app in $apps; do
   if running "$app"; then
     say "Closing the running $app"

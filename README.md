@@ -35,7 +35,7 @@ Both releases bundle the `open-pact-client` version named in `cli-version`. The 
 
 ## Update
 
-Run the same install line again, or `scoop update open-pact-desktop`. Both apps also tell you: a strip at the top of the window says "open-pact desktop 0.1.1 is available" with an **Update** button. The button runs the installer above (or `scoop update open-pact-desktop` when the app lives in a scoop folder) and shows the command in the Terminal strip. Close both apps before `scoop update` on Windows, because Windows keeps a running program locked.
+Run the same install line again, or `scoop update open-pact-desktop`. Both apps also tell you: a strip at the top of the window says "open-pact desktop 0.1.1 is available" with an **Update** button. The button runs the installer above (or `scoop update open-pact-desktop` when the app lives in a scoop folder) and shows the command in the Terminal strip. A direct install goes to the folder that holds the running app. Close both apps before `scoop update` on Windows, because Windows keeps a running program locked.
 
 **What the update check sends.** At start, then every 24 hours, each app runs `curl -fsSL -m 5 https://api.github.com/repos/gaboe/open-pact-desktop/releases/latest` (`curl.exe` on Windows). That is a plain GET to GitHub. GitHub sees your IP address and the curl user agent. The apps send nothing about you, your company, or your device. A failed check shows nothing and stays in the Terminal strip. Set `OPEN_PACT_NO_UPDATE_CHECK=1` to turn the check off.
 

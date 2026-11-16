@@ -193,6 +193,7 @@ impl CommandLog {
 pub struct Runner {
     log: Arc<Mutex<Vec<CommandLog>>>,
     timeout: Option<Duration>,
+    env: Vec<(String, String)>,
 }
 
 fn stop_after(
@@ -217,6 +218,16 @@ impl Runner {
         Self {
             log: self.log.clone(),
             timeout: Some(timeout),
+            env: self.env.clone(),
+        }
+    }
+
+    /// A runner that shares this one's log and adds `env` to each command.
+    pub fn with_env(&self, env: &[(String, String)]) -> Self {
+        Self {
+            log: self.log.clone(),
+            timeout: self.timeout,
+            env: self.env.iter().chain(env.iter()).cloned().collect(),
         }
     }
 
@@ -278,6 +289,7 @@ impl Runner {
         let result = (|| {
             let mut child = command(program)
                 .args(args)
+                .envs(self.env.iter().map(|(key, value)| (key, value)))
                 .stdin(if input.is_some() {
                     Stdio::piped()
                 } else {
