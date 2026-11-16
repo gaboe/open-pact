@@ -6,6 +6,7 @@ mod devices;
 mod grace;
 mod invitations;
 mod keys;
+mod manifests;
 mod nonces;
 mod ratelimit;
 mod seal;
@@ -17,11 +18,11 @@ mod witness;
 
 use std::fmt::Display;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{ConnectInfo, Query, State, rejection::JsonRejection},
     http::{StatusCode, header},
     response::{Html, IntoResponse},
@@ -31,7 +32,7 @@ use clap::{Parser, Subcommand};
 use open_pact_core::{
     Checkpoint, Claim, CsrHash, Decision, Endorsement, EnrolRequest, Entry, EntryKind, Evaluation,
     FirstFailures, Invitation, LogCheckpoint, LogHash, LogKey, Manifest, Note, NoteSignature,
-    Pseudonym, PublicKey, Reason, SigningKey, Span, consistency_proof, inclusion_proof, root,
+    Pseudonym, PublicKey, Reason, SigningKey, consistency_proof, inclusion_proof, root,
     verified_trust_level, verify_claim,
 };
 use serde::Deserialize;
@@ -84,6 +85,11 @@ enum Command {
         #[command(subcommand)]
         command: DevicesCommand,
     },
+    /// Store, read or restore manifest versions
+    Manifest {
+        #[command(subcommand)]
+        command: manifests::Command,
+    },
     /// Show the gateway version, the manifest it enforces and how many devices are in each state
     Status {
         /// Print one JSON document. On a database error it prints {"error": ...} and exits non-zero
@@ -100,6 +106,11 @@ impl Cli {
             Some(
                 Command::Invite { json: true, .. }
                     | Command::Status { json: true }
+                    | Command::Manifest {
+                        command: manifests::Command::Set { json: true, .. }
+                            | manifests::Command::History { json: true }
+                            | manifests::Command::Activate { json: true, .. }
+                    }
                     | Command::Devices {
                         command: DevicesCommand::List { json: true }
                     }
@@ -138,17 +149,30 @@ type Reply = (StatusCode, Json<Value>);
 #[derive(Clone)]
 struct App {
     db: PgPool,
-    manifest: Arc<Manifest>,
-    toml: Arc<str>,
-    company: Endorsement,
+    enforced: Arc<Enforced>,
+    current: Arc<RwLock<Arc<Enforced>>>,
     keys: Arc<Keys>,
-    log: Arc<Log>,
     auto_approve: bool,
     limiter: Arc<Limiter>,
     nonce_limiter: Arc<Limiter>,
     max_nonces: i64,
     kek: Arc<SealingKey>,
+}
+
+struct Enforced {
     siem: Option<siem::Exporter>,
+    manifest: Arc<Manifest>,
+    toml: Arc<str>,
+    company: Endorsement,
+    log: Arc<Log>,
+    version: Option<i64>,
+}
+
+impl std::ops::Deref for App {
+    type Target = Enforced;
+    fn deref(&self) -> &Enforced {
+        &self.enforced
+    }
 }
 
 struct Log {
@@ -316,6 +340,15 @@ impl App {
         lines
             .iter()
             .map(|l| NoteSignature::parse(l).map_err(internal))
+            .filter(|signature| match signature {
+                Ok(signature) => self
+                    .log
+                    .witnesses
+                    .keys()
+                    .iter()
+                    .any(|key| matches!(key.verify(checkpoint, signature), Some(Ok(_)))),
+                Err(_) => true,
+            })
             .collect()
     }
 
@@ -352,14 +385,14 @@ impl App {
     }
 }
 
-async fn healthz(State(app): State<App>) -> impl IntoResponse {
+async fn healthz(Extension(app): Extension<App>) -> impl IntoResponse {
     match sqlx::query("SELECT 1").execute(&app.db).await {
         Ok(_) => (StatusCode::OK, "ok"),
         Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "db unavailable"),
     }
 }
 
-async fn manifest(State(app): State<App>) -> Json<Value> {
+async fn manifest(Extension(app): Extension<App>) -> Json<Value> {
     Json(json!({"toml": &*app.toml, "company": app.company}))
 }
 
@@ -373,14 +406,14 @@ async fn legacy_log() -> Reply {
     )
 }
 
-async fn log_key_text(State(app): State<App>) -> impl IntoResponse {
+async fn log_key_text(Extension(app): Extension<App>) -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
         format!("{}\n", app.log.key.vkey()),
     )
 }
 
-async fn log_checkpoint(State(app): State<App>) -> Result<impl IntoResponse, Reply> {
+async fn log_checkpoint(Extension(app): Extension<App>) -> Result<impl IntoResponse, Reply> {
     let note = app.checkpoint().await?;
     Ok((
         [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
@@ -389,7 +422,7 @@ async fn log_checkpoint(State(app): State<App>) -> Result<impl IntoResponse, Rep
 }
 
 async fn consistency(
-    State(app): State<App>,
+    Extension(app): Extension<App>,
     Query(q): Query<RangeQuery>,
 ) -> Result<Json<Value>, Reply> {
     let tree = app.tree().await?;
@@ -411,7 +444,7 @@ fn too_many(reason: &str) -> Reply {
 }
 
 async fn nonce(
-    State(app): State<App>,
+    Extension(app): Extension<App>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
 ) -> Result<Json<Value>, Reply> {
     let now = Instant::now();
@@ -436,11 +469,18 @@ async fn nonce(
 }
 
 /// Hourly, so a purge entry in the log is at most an hour late and the log does not grow per tick.
-async fn enforce_retention(db: PgPool, retention: Span) {
+async fn enforce_retention(app: App) {
     let mut tick = tokio::time::interval(Duration::from_secs(3600));
     loop {
         tick.tick().await;
-        match claims::purge(&db, &retention, chrono::Utc::now()).await {
+        let enforced = app.current.read().expect("manifest snapshot").clone();
+        match claims::purge(
+            &app.db,
+            &enforced.manifest.body().claim_retention,
+            chrono::Utc::now(),
+        )
+        .await
+        {
             Ok(purged) if purged.claims > 0 || purged.period_keys > 0 => eprintln!(
                 "retention_purge: {} claims, {} period keys",
                 purged.claims, purged.period_keys
@@ -465,7 +505,7 @@ async fn delete_expired_nonces(db: PgPool) {
 /// Every refused enrolment counts against the address, whether the body, a signature, the
 /// manifest or the invitation was wrong. Server errors do not count.
 async fn enroll(
-    State(app): State<App>,
+    Extension(app): Extension<App>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     body: Result<Json<EnrolRequest>, JsonRejection>,
 ) -> Result<Json<Value>, Reply> {
@@ -650,7 +690,7 @@ async fn authenticate_device(
 }
 
 async fn device_status(
-    State(app): State<App>,
+    Extension(app): Extension<App>,
     body: Result<Json<MyEntriesRequest>, JsonRejection>,
 ) -> Result<Json<Value>, Reply> {
     let Json(request) = body.map_err(|_| device_denied())?;
@@ -670,7 +710,7 @@ async fn device_status(
 /// signed the acceptance. The state, salt and grace clocks stay. Every other enrolment of the
 /// device goes, so one row remains. A repeat answers the same, and a lost response can be retried.
 async fn accept_manifest(
-    State(app): State<App>,
+    Extension(app): Extension<App>,
     body: Result<Json<AcceptRequest>, JsonRejection>,
 ) -> Result<Json<Value>, Reply> {
     let Json(req) = body.map_err(|e| denied(vec![e.body_text()]))?;
@@ -741,7 +781,7 @@ async fn accept_manifest(
 }
 
 async fn log_mine(
-    State(app): State<App>,
+    Extension(app): Extension<App>,
     body: Result<Json<MyEntriesRequest>, JsonRejection>,
 ) -> Result<Json<MyEntries>, Reply> {
     let Json(request) = body.map_err(|_| device_denied())?;
@@ -781,7 +821,7 @@ async fn log_mine(
 }
 
 async fn claim(
-    State(app): State<App>,
+    Extension(app): Extension<App>,
     body: Result<Json<ClaimRequest>, JsonRejection>,
 ) -> Result<Json<Value>, Reply> {
     let Ok(Json(ClaimRequest {
@@ -996,7 +1036,7 @@ fn stored_claim(claim: &Claim, certificate_pem: Option<&str>) -> anyhow::Result<
     Ok(payload)
 }
 
-async fn index(State(app): State<App>) -> Result<Html<String>, Reply> {
+async fn index(Extension(app): Extension<App>) -> Result<Html<String>, Reply> {
     let tree = app.tree().await?;
     Ok(Html(format!(
         include_str!("index.html"),
@@ -1014,7 +1054,16 @@ async fn index(State(app): State<App>) -> Result<Html<String>, Reply> {
 
 async fn publish_manifest(db: &PgPool, manifest: &Manifest) -> anyhow::Result<()> {
     let mut tx = db.begin().await?;
-    translog::lock(&mut tx).await?;
+    publish_manifest_in(&mut tx, manifest).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn publish_manifest_in(
+    tx: &mut sqlx::PgConnection,
+    manifest: &Manifest,
+) -> anyhow::Result<()> {
+    translog::lock(tx).await?;
     let published: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM log_entries WHERE kind = 'manifest_published' AND data->>'manifest' = $1)",
     )
@@ -1023,7 +1072,7 @@ async fn publish_manifest(db: &PgPool, manifest: &Manifest) -> anyhow::Result<()
     .await?;
     if !published {
         let entry = translog::append(
-            &mut tx,
+            &mut *tx,
             EntryKind::ManifestPublished,
             json!({ "manifest": manifest.hash() }),
         )
@@ -1034,7 +1083,6 @@ async fn publish_manifest(db: &PgPool, manifest: &Manifest) -> anyhow::Result<()
             manifest.hash()
         );
     }
-    tx.commit().await?;
     Ok(())
 }
 
@@ -1063,12 +1111,39 @@ fn witness_urls() -> Vec<String> {
 
 /// Re-sends the current checkpoint so the cosignatures stay younger than checkpoint_max_age
 /// while the log does not grow.
-async fn refresh_cosignatures(app: App, every: Duration) {
+fn witness_refresh(manifest: &Manifest, witnesses: &Witnesses) -> anyhow::Result<Option<Duration>> {
+    match manifest
+        .body()
+        .log
+        .as_ref()
+        .and_then(|p| p.checkpoint_max_age.min_duration())
+    {
+        Some(age) if !witnesses.urls().is_empty() => {
+            let quarter = u64::try_from(age.num_seconds() / 4).unwrap_or(600);
+            Ok(Some(Duration::from_secs(env_number(
+                "WITNESS_REFRESH_SECS",
+                quarter.clamp(10, 600),
+            )?)))
+        }
+        _ => Ok(None),
+    }
+}
+
+async fn refresh_cosignatures(mut app: App) {
+    let mut last = Instant::now();
+    let mut version = app.version;
     loop {
-        tokio::time::sleep(every).await;
-        let Ok(tree) = app.tree().await else {
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        app.enforced = app.current.read().expect("manifest snapshot").clone();
+        let Ok(Some(every)) = witness_refresh(&app.manifest, &app.log.witnesses) else {
             continue;
         };
+        if version == app.version && last.elapsed() < every {
+            continue;
+        }
+        version = app.version;
+        last = Instant::now();
+        let Ok(tree) = app.tree().await else { continue };
         let (checkpoint, note, _) = app.signed(&tree);
         let _ = app.witness(&checkpoint, &note, &tree).await;
     }
@@ -1182,6 +1257,8 @@ struct StatusDocument {
     auto_approve: bool,
     devices: devices::StateCounts,
     company_key_fingerprint: String,
+    manifest_source: &'static str,
+    manifest_version: Option<i64>,
 }
 
 async fn status(
@@ -1191,9 +1268,20 @@ async fn status(
     auto_approve: bool,
 ) -> anyhow::Result<StatusDocument> {
     let keys = Keys::load_or_create(db, kek).await?;
+    let active = manifests::active(db).await?;
     Ok(StatusDocument {
         version: env!("CARGO_PKG_VERSION"),
-        manifest_hash: manifest.hash().to_string(),
+        manifest_hash: active
+            .as_ref()
+            .map_or_else(|| manifest.hash().to_string(), |row| row.hash.clone()),
+        manifest_source: if active.is_some() {
+            "database"
+        } else if std::env::var_os("MANIFEST_PATH").is_some() {
+            "file"
+        } else {
+            "builtin"
+        },
+        manifest_version: active.map(|row| row.version),
         auto_approve,
         devices: devices::counts(db).await?,
         company_key_fingerprint: PublicKey::from(&keys.manifest).fingerprint(),
@@ -1247,12 +1335,60 @@ fn router(app: App) -> Router {
         .route("/v1/log/mine", post(log_mine))
         .route("/v1/device/status", post(device_status))
         .route("/v1/device/accept", post(accept_manifest))
-        .with_state(app)
+        .layer(axum::middleware::from_fn_with_state(app, snapshot))
+}
+
+async fn snapshot(
+    State(mut app): State<App>,
+    mut request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    app.enforced = app.current.read().expect("manifest snapshot").clone();
+    request.extensions_mut().insert(app);
+    next.run(request).await
+}
+
+async fn reload_manifest(app: &App) -> anyhow::Result<()> {
+    let Some(row) = manifests::active(&app.db).await? else {
+        return Ok(());
+    };
+    let current = app.current.read().expect("manifest snapshot").clone();
+    if current.version == Some(row.version) {
+        return Ok(());
+    }
+    let mut enforced = manifests::enforced(&row.toml, &app.keys, Some(row.version))?;
+    enforced.siem = siem::from_env(&enforced.manifest);
+    publish_manifest(&app.db, &enforced.manifest).await?;
+    eprintln!(
+        "enforcing database manifest version {} {}",
+        row.version,
+        enforced.manifest.hash()
+    );
+    *app.current.write().expect("manifest snapshot") = Arc::new(enforced);
+    Ok(())
+}
+
+async fn poll_manifest(app: App) {
+    let mut tick = tokio::time::interval(Duration::from_secs(10));
+    loop {
+        tick.tick().await;
+        if let Err(error) = reload_manifest(&app).await {
+            eprintln!("manifest reload: {error:#}");
+        }
+    }
 }
 
 async fn serve(db: PgPool) -> anyhow::Result<()> {
     let addr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
-    let (manifest_path, toml, manifest) = read_manifest()?;
+    let active = manifests::active(&db).await?;
+    let (manifest_path, toml, manifest) = match &active {
+        Some(row) => (
+            "database".into(),
+            row.toml.clone(),
+            Manifest::parse(row.toml.as_bytes())?,
+        ),
+        None => read_manifest()?,
+    };
     eprintln!("enforcing {manifest_path} {}", manifest.hash());
     if manifest.body().min_trust_level > open_pact_core::TrustLevel::L0 {
         eprintln!(
@@ -1295,16 +1431,7 @@ async fn serve(db: PgPool) -> anyhow::Result<()> {
             log.witnesses.urls().len()
         );
     }
-    let refresh = match policy.and_then(|p| p.checkpoint_max_age.min_duration()) {
-        Some(age) if !log.witnesses.urls().is_empty() => {
-            let quarter = u64::try_from(age.num_seconds() / 4).unwrap_or(600);
-            Some(Duration::from_secs(env_number(
-                "WITNESS_REFRESH_SECS",
-                quarter.clamp(10, 600),
-            )?))
-        }
-        _ => None,
-    };
+    witness_refresh(&manifest, &log.witnesses)?;
     publish_manifest(&db, &manifest).await?;
     let company = Endorsement::sign(&keys.manifest, manifest.hash());
     eprintln!("company key {}", company.key.fingerprint());
@@ -1330,28 +1457,29 @@ async fn serve(db: PgPool) -> anyhow::Result<()> {
         );
     }
     tokio::spawn(delete_expired_nonces(db.clone()));
-    tokio::spawn(enforce_retention(
-        db.clone(),
-        manifest.body().claim_retention.clone(),
-    ));
     let siem = siem::from_env(&manifest);
-    let app = App {
+    let enforced = Arc::new(Enforced {
         siem,
-        db,
         manifest: Arc::new(manifest),
         toml: toml.into(),
         company,
-        keys: Arc::new(keys),
         log: Arc::new(log),
+        version: active.map(|row| row.version),
+    });
+    let app = App {
+        enforced: enforced.clone(),
+        current: Arc::new(RwLock::new(enforced)),
+        db,
+        keys: Arc::new(keys),
         auto_approve,
         limiter: Arc::new(limiter),
         nonce_limiter: Arc::new(nonce_limiter),
         max_nonces,
         kek: Arc::new(kek),
     };
-    if let Some(every) = refresh {
-        tokio::spawn(refresh_cosignatures(app.clone(), every));
-    }
+    tokio::spawn(enforce_retention(app.clone()));
+    tokio::spawn(poll_manifest(app.clone()));
+    tokio::spawn(refresh_cosignatures(app.clone()));
     let app = router(app);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(
@@ -1447,9 +1575,13 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             )
             .await
         }
+        Command::Manifest { command } => manifests::run(&db, command).await,
         Command::Devices { command } => admin_devices(&db, command).await,
         Command::Status { json } => {
-            let (_, _, manifest) = read_manifest()?;
+            let manifest = match manifests::active(&db).await? {
+                Some(row) => Manifest::parse(row.toml.as_bytes())?,
+                None => read_manifest()?.2,
+            };
             let document = status(
                 &db,
                 &SealingKey::kek_from_env()?,
@@ -1518,6 +1650,54 @@ mod tests {
             };
             assert!(err.to_string().contains("TTL"), "{bad:?}: {err}");
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "needs TEST_DATABASE_URL and LOG_ORIGIN"]
+    async fn reloaded_manifest_requires_an_old_device_to_accept() {
+        let db = testdb::fresh().await;
+        let kek = SealingKey::new(&TEST_KEK);
+        let keys = Keys::load_or_create(&db, &kek).await.unwrap();
+        let old = manifest_a();
+        let enforced = Arc::new(manifests::enforced(&old, &keys, None).unwrap());
+        let app = App {
+            db: db.clone(),
+            enforced: enforced.clone(),
+            current: Arc::new(RwLock::new(enforced)),
+            keys: Arc::new(keys),
+            auto_approve: false,
+            limiter: Arc::new(Limiter::new(100, Duration::from_secs(60), 100)),
+            nonce_limiter: Arc::new(Limiter::new(100, Duration::from_secs(60), 100)),
+            max_nonces: 10000,
+            kek: Arc::new(kek),
+        };
+        let router = router(app.clone());
+        let (key, _) = enrolled_claim(&router, &db, &old).await;
+        manifests::set_for_test(&db, &app.keys, DEMO).await;
+        reload_manifest(&app).await.unwrap();
+        let response = router
+            .clone()
+            .oneshot(Request::get("/v1/manifest").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let document: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(document["toml"], DEMO);
+        let claim = fresh_claim(&router, &key, &Manifest::parse(old.as_bytes()).unwrap()).await;
+        let (_, body) = send_claim(&router, &key, &claim, None).await;
+        assert!(
+            body.to_string().contains("open-pact-client accept"),
+            "{body}"
+        );
+        let status = status(&db, &app.kek, &app.manifest, false).await.unwrap();
+        assert_eq!(status.manifest_source, "database");
+        assert_eq!(status.manifest_version, Some(1));
+        assert_eq!(
+            status.manifest_hash,
+            Manifest::parse(DEMO.as_bytes()).unwrap().hash().as_str()
+        );
     }
 
     #[tokio::test]
@@ -1644,14 +1824,19 @@ mod tests {
             cache: Mutex::default(),
         };
         let minute = Duration::from_secs(60);
-        let app = router(App {
+        let enforced = Arc::new(Enforced {
             siem: None,
-            db: db.clone(),
             company: Endorsement::sign(&keys.manifest, manifest.hash()),
             manifest: Arc::new(manifest),
             toml: toml.into(),
-            keys: Arc::new(keys),
             log: Arc::new(log),
+            version: None,
+        });
+        let app = router(App {
+            enforced: enforced.clone(),
+            current: Arc::new(RwLock::new(enforced)),
+            db: db.clone(),
+            keys: Arc::new(keys),
             auto_approve: false,
             limiter: Arc::new(Limiter::new(enrol_limit, minute, 100)),
             nonce_limiter: Arc::new(Limiter::new(nonce_limit, minute, 100)),
@@ -3187,6 +3372,8 @@ grace = "1d"
             json!({
                 "version": env!("CARGO_PKG_VERSION"),
                 "manifest_hash": manifest.hash().as_str(),
+                "manifest_source": "builtin",
+                "manifest_version": null,
                 "auto_approve": true,
                 "devices": {"pending": 1, "approved": 2, "revoked": 0},
                 "company_key_fingerprint": PublicKey::from(&keys.manifest).fingerprint(),

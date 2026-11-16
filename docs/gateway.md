@@ -195,3 +195,18 @@ Operators can read JSON lines directly from the database through `kubectl exec <
 | SIEM export is disabled | Check gateway logs for invalid sink configuration. Configure one sink. Verify the CA or file path. |
 | SIEM drop count increases | Restore receiver access. Inspect queue overflow. The in-memory queue cannot recover dropped events after restart. |
 | Wazuh cannot read file events | Set `GATEWAY_SIEM_FILE_MODE=0640` before the gateway creates the file. Grant the Wazuh group access to the parent directory. Add the gateway process to that group. Add the Wazuh agent to that group. |
+
+## Change the manifest without a redeploy
+
+The gateway keeps manifest versions in PostgreSQL. An active database version takes precedence over the Helm manifest or MANIFEST_PATH. Running gateways load the active version within 10 seconds. Devices that signed an earlier manifest use the existing accept flow.
+
+Use these four commands through kubectl. Replace the deployment name and version with your values. The set command reads the exact TOML text from stdin. It validates the manifest before it stores a version. The activate command restores a stored version.
+
+```sh
+kubectl exec -i deployment/open-pact-gateway -- open-pact-gateway manifest set --note "Policy update" --json < manifest.toml
+kubectl exec deployment/open-pact-gateway -- open-pact-gateway manifest history --json
+kubectl exec deployment/open-pact-gateway -- open-pact-gateway manifest get --version 1 > manifest-backup.toml
+kubectl exec deployment/open-pact-gateway -- open-pact-gateway manifest activate 1 --json
+```
+
+Omit --version to get the active manifest. Save a local backup with manifest get before each change. The history includes the version, hash, creation time, note and active state. The set and activate replies include the version, manifest_hash and previous_hash. Use status --json to read manifest_source and manifest_version. The source is database, file or builtin. The version is null for a file or the example manifest.
