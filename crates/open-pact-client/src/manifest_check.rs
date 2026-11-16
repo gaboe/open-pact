@@ -4,7 +4,7 @@
 use std::io::{Read, Write};
 use std::process::ExitCode;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use open_pact_core::{Error, Manifest};
 use serde::Serialize;
 
@@ -84,11 +84,14 @@ fn render(problems: Vec<Problem>, json: bool) -> String {
 
 pub(crate) fn run(json: bool) -> Result<ExitCode> {
     let mut bytes = Vec::new();
-    std::io::stdin()
-        .lock()
-        .read_to_end(&mut bytes)
-        .context("read the manifest from stdin")?;
-    let problems = problems(&bytes);
+    let problems = match std::io::stdin().lock().read_to_end(&mut bytes) {
+        Ok(_) => problems(&bytes),
+        Err(error) => vec![Problem {
+            message: format!("read the manifest from stdin: {error}"),
+            line: None,
+            key: None,
+        }],
+    };
     let code = if problems.is_empty() {
         ExitCode::SUCCESS
     } else {

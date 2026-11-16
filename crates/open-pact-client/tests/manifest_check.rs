@@ -157,3 +157,32 @@ fn a_usage_error_exits_2() {
     assert!(without_json.stdout.is_empty());
     assert!(String::from_utf8_lossy(&without_json.stderr).contains("--bogus"));
 }
+
+#[cfg(unix)]
+#[test]
+fn a_stdin_that_cannot_be_read_is_one_error() {
+    let directory = std::fs::File::open(env!("CARGO_MANIFEST_DIR")).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_open-pact-client"))
+        .args(["manifest", "check", "--json"])
+        .stdin(Stdio::from(directory))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let report = json(&output);
+    assert_eq!(report["ok"], false);
+    let error = &report["errors"][0];
+    assert_eq!(report["errors"].as_array().unwrap().len(), 1, "{report}");
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("read the manifest from stdin"),
+        "{report}"
+    );
+    assert!(error["line"].is_null(), "{report}");
+    assert!(error["key"].is_null(), "{report}");
+    assert!(output.stderr.is_empty());
+}
