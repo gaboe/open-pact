@@ -1,3 +1,5 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 use gpui::{prelude::*, *};
 use gpui_component::{
     Disableable, Sizable,
@@ -32,6 +34,7 @@ enum Operation {
 
 enum Outcome {
     Open(Option<PathBuf>, Option<Status>),
+    Installed(PathBuf, Status, Option<String>),
     Preview(Preview),
     Status(Status),
     Check(Check, Status),
@@ -128,11 +131,18 @@ impl AppView {
                         Operation::Install(also_terminal) => {
                             let path = client::installed_path()?;
                             client::install(&client.runner, &bundled, &path)?;
-                            if also_terminal {
-                                client::enable_terminal(&path)?;
-                            }
+                            let warning = if also_terminal {
+                                client::enable_terminal(&path).err().map(|error| {
+                                    format!(
+                                        "The tool is installed, but Terminal setup failed: {error}. Add {} to your PATH by hand.",
+                                        path.parent().map(|p| p.display().to_string()).unwrap_or_default()
+                                    )
+                                })
+                            } else {
+                                None
+                            };
                             client.executable = path.clone();
-                            Ok(Outcome::Open(Some(path), Some(client.status()?)))
+                            Ok(Outcome::Installed(path, client.status()?, warning))
                         }
                         Operation::Preview(inv) => client.preview(&inv).map(Outcome::Preview),
                         Operation::Join(inv, folders, auto) => {
@@ -177,6 +187,11 @@ impl AppView {
                             this.run(Operation::Join(String::new(), Vec::new(), automatic), cx);
                         }
                     }
+                    Ok(Outcome::Installed(path, status, warning)) => {
+                        this.client.executable = path;
+                        this.screen = Self::status_screen(status);
+                        this.error = warning;
+                    }
                     Ok(Outcome::Preview(preview)) => {
                         this.automatic = false;
                         this.folders.clear();
@@ -184,6 +199,10 @@ impl AppView {
                     }
                     Ok(Outcome::Status(status)) => this.screen = Self::status_screen(status),
                     Ok(Outcome::Check(check, status)) => {
+                        // A denied claim is a result, not a failure: show which checks failed.
+                        if !check.accepted {
+                            this.all_controls = true;
+                        }
                         this.last_check = Some(check);
                         this.screen = Self::status_screen(status);
                     }
@@ -267,7 +286,7 @@ impl AppView {
                 .child(div().text_color(rgb(INK_2)).child("Paste the invitation line that IT sent you. It starts with opi1: and works once, for 72 hours."))
                 .child(column().gap_1p5().child(label("Invitation")).child(Input::new(&self.invitation)))
                 .child(actions().child(self.action("continue", "Continue", |this, cx| Operation::Preview(this.invitation.read(cx).value().to_string()), cx)))
-                .child(runs("runs", "open-pact-client join --preview 'opi1:…'")),
+                .child(runs("runs", "open-pact-client join --preview -- 'opi1:…'")),
             Screen::Review(preview) => {
                 if self.folders.is_empty() {
                     self.folders = preview.folders.iter().map(|folder| cx.new(|cx| InputState::new(window, cx).default_value(folder.clone()))).collect();
@@ -300,7 +319,7 @@ impl AppView {
                     .child(actions()
                         .child(Button::new("cancel").label("Cancel").disabled(self.busy).on_click(cx.listener(|this, _, _, cx| { this.screen = Screen::Invitation; cx.notify(); })))
                         .child(self.action("join", "Sign and join", |this, cx| Operation::Join(this.invitation.read(cx).value().to_string(), this.folders.iter().map(|p| p.read(cx).value().to_string()).collect(), this.automatic), cx).disabled(self.busy || !matches)))
-                    .child(runs("runs", "open-pact-client join --yes --json --auto-send on|off 'opi1:…'"))
+                    .child(runs("runs", "open-pact-client join --yes --json --auto-send on|off -- 'opi1:…'"))
             }
             Screen::Joining(events) => column().gap(px(14.)).child(title("Joining your company"))
                 .child(column().gap_4().children(events.iter().map(step_view)))
@@ -327,6 +346,14 @@ impl AppView {
                 });
                 let signed = status.manifest.as_ref().map(|m| plain_value(&m["signed"]));
                 let agreement = status.manifest.as_ref().and_then(|m| agreement_text(&plain_value(&m["agreement"])));
+                if let Some(check) = self.last_check.as_ref().filter(|check| !check.accepted) {
+                    let reasons = if check.reasons.is_empty() {
+                        "The company did not accept the last check.".to_owned()
+                    } else {
+                        format!("The company did not accept the last check: {}", check.reasons.join("; "))
+                    };
+                    view = view.child(banner(reasons, BAD, BAD_WASH));
+                }
                 view = view
                     .child(actions().child(Button::new("checks").label(if self.all_controls { "Hide every check" } else { "Show every check" }).on_click(cx.listener(|this, _, _, cx| { this.all_controls = !this.all_controls; cx.notify(); })))
                         .child(self.action("check", "Check now", |_, _| Operation::Check, cx)))
@@ -358,7 +385,7 @@ impl AppView {
                 view.child(div().flex().gap_1()
                         .child(self.button("refresh", "Refresh status", |_, _| Operation::Status, false, cx).ghost().small())
                         .child(self.button("changes", "Review changes", |_, _| Operation::Changes, false, cx).ghost().small()))
-                    .child(column().gap_1().child(runs("opening runs", "open-pact-client status --json")).child(runs("Check now runs", "open-pact-client check --json")))
+                    .child(column().gap_1().child(runs("opening runs", "open-pact-client status --online --json")).child(runs("Check now runs", "open-pact-client check --json")))
             }
             Screen::Changed(changes) => {
                 let mut list = table();
@@ -478,6 +505,7 @@ fn main() {
         snapshots(PathBuf::from(output));
         return;
     }
+    runner::tool_path();
     let runner = Runner::default();
     let bundled = std::env::current_exe()
         .map_err(|e| e.to_string())
@@ -512,6 +540,9 @@ fn snapshots(output: PathBuf) {
     let mut good = status.clone();
     good.verdict = "no_known_problem".into();
     good.issues.clear();
+    let denied: Check =
+        serde_json::from_str(include_str!("../../../tests/fixtures/check-denied.json")).unwrap();
+    let denied_status = status.clone();
     let mut revoked = status.clone();
     revoked.approval.state = Some("revoked".into());
     for (name, screen) in [
@@ -545,10 +576,11 @@ fn snapshots(output: PathBuf) {
         ("client-5-good", Screen::Status(Box::new(good))),
         ("client-6-changed", Screen::Changed(changes)),
         ("client-7-revoked", Screen::Status(Box::new(revoked))),
+        ("client-8-denied", Screen::Status(Box::new(denied_status))),
     ] {
         snapshot(&output, name, 520., 740., |window, cx| {
             cx.new(|cx| {
-                AppView::new(
+                let mut app = AppView::new(
                     screen,
                     Client {
                         runner: Runner::default(),
@@ -557,7 +589,12 @@ fn snapshots(output: PathBuf) {
                     "open-pact-client".into(),
                     window,
                     cx,
-                )
+                );
+                if name == "client-8-denied" {
+                    app.last_check = Some(denied.clone());
+                    app.all_controls = true;
+                }
+                app
             })
         });
     }

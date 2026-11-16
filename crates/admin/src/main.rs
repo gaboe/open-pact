@@ -1,3 +1,5 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 use gpui::{prelude::*, *};
 use gpui_component::{
     Disableable, Sizable,
@@ -7,9 +9,12 @@ use gpui_component::{
 };
 use runner::{
     Runner,
-    admin::{self, Admin, Device, Gateway, History, Invitation, Restore, Settings},
+    admin::{
+        self, Admin, Device, Gateway, History, Invitation, Restore, Settings, WriteError, Written,
+    },
     desktop::*,
     manifest::{self, Field, Kind},
+    shell_line, shell_quote,
     text::*,
 };
 #[cfg(all(feature = "snapshot", target_os = "macos"))]
@@ -53,10 +58,10 @@ struct Overview {
 enum Outcome {
     Setup(Settings, String, Overview, History),
     Refresh(Overview, String),
-    Applied(String, String, History),
+    Applied(Written, String, Option<History>, Option<String>),
     Synced(History),
     RestorePreview(Restore, String, String),
-    WriteFailed(String, Option<String>, Option<Gateway>),
+    WriteFailed(WriteError, Option<String>, Option<Gateway>),
     Device(Vec<Device>),
     Invitation(Invitation),
 }
@@ -90,12 +95,22 @@ struct AppView {
 impl AppView {
     fn new(settings: Settings, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let setup = [
-            settings.context.clone(),
-            settings.namespace.clone(),
-            settings.backup_dir.display().to_string(),
+            (settings.context.clone(), ""),
+            (settings.namespace.clone(), ""),
+            (
+                settings.backup_dir.display().to_string(),
+                "Empty uses a folder for this cluster and namespace",
+            ),
+            (settings.kubectl.clone(), "Empty searches PATH"),
         ]
         .into_iter()
-        .map(|value| cx.new(|cx| InputState::new(window, cx).default_value(value)))
+        .map(|(value, hint)| {
+            cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder(hint)
+                    .default_value(value)
+            })
+        })
         .collect();
         let editor = cx.new(|cx| TextareaState::new(window, cx).rows(18));
         let editor_subscription = cx.subscribe(&editor, |this, state, event: &InputEvent, cx| {
@@ -213,24 +228,32 @@ impl AppView {
                 fn overview(admin: &Admin) -> Result<Overview, String> {
                     Ok(Overview { gateway: admin.gateway()?, devices: admin.devices()?, deployment: admin.deployment()? })
                 }
-                fn applied(admin: &Admin, hash: String) -> Result<Outcome, String> {
-                    let active = admin.manifest(None)?;
-                    if admin::hash(&active) != hash { return Err("Another manifest became active. Reload and review the current manifest.".into()); }
-                    let history = admin.sync()?;
-                    Ok(Outcome::Applied(hash, active, history))
+                fn applied(admin: &Admin, written: Written) -> Result<Outcome, WriteError> {
+                    let active = admin.manifest(None).map_err(WriteError::Unknown)?;
+                    if admin::hash(&active) != written.hash { return Err(WriteError::Unknown("Another manifest became active after the write. Reload and review the current manifest.".into())); }
+                    // The write is confirmed. A failed history sync must not turn it into an unconfirmed write.
+                    let (history, sync_problem) = match admin.sync() {
+                        Ok(history) => (Some(history), None),
+                        Err(error) => (None, Some(format!("The manifest was saved, but the history sync failed: {error}"))),
+                    };
+                    let notice = match (&written.overwritten, sync_problem) {
+                        (Some(previous), problem) => Some([Some(format!("Another admin's manifest {previous} was active when you applied and is now replaced. It stays in the server history. Check History.")), problem].into_iter().flatten().collect::<Vec<_>>().join(" ")),
+                        (None, problem) => problem,
+                    };
+                    Ok(Outcome::Applied(written, active, history, notice))
                 }
-                fn written(admin: &Admin, result: Result<String, String>) -> Result<Outcome, String> {
-                    match result.and_then(|hash| applied(admin, hash)) {
+                fn written(admin: &Admin, result: Result<Written, WriteError>) -> Result<Outcome, String> {
+                    match result.and_then(|written| applied(admin, written)) {
                         Ok(outcome) => Ok(outcome),
                         Err(error) => Ok(Outcome::WriteFailed(error, admin.manifest(None).ok(), admin.gateway().ok())),
                     }
                 }
                 match operation {
                     Operation::Setup(settings) => {
-                        if settings.context.trim().is_empty() || settings.namespace.trim().is_empty() || !settings.backup_dir.is_absolute() {
-                            return Err("Enter a kube context, namespace, and absolute backup folder path".into());
+                        if settings.context.trim().is_empty() || settings.namespace.trim().is_empty() || !settings.backup_folder().is_absolute() {
+                            return Err("Enter a kube context, namespace, and an absolute backup folder path (or leave it empty).".into());
                         }
-                        admin.settings = settings.clone();
+                        admin.use_settings(settings.clone());
                         let active = admin.manifest(None)?;
                         manifest::fields(&active)?;
                         let overview = overview(&admin)?;
@@ -259,10 +282,13 @@ impl AppView {
                 this.busy = false;
                 match result {
                     Ok(Outcome::Setup(settings, active, overview, history)) => {
-                        this.admin.settings = settings; this.active = active.clone(); this.draft = active;
-                        this.overview = Some(overview); this.history = Some(history);
+                        this.admin.use_settings(settings); this.active = active.clone(); this.draft = active;
+                        this.overview = Some(overview);
+                        let skipped = history.warnings.len();
+                        this.history = Some(history);
                         this.editor.update(cx, |state, cx| state.set_value(this.draft.clone(), window, cx));
-                        this.build_fields(window, cx); this.screen = Screen::Overview; this.status = None;
+                        this.build_fields(window, cx); this.screen = Screen::Overview;
+                        this.status = (skipped > 0).then(|| format!("Skipped {skipped} backup file(s). See Manifest, then History."));
                     }
                     Ok(Outcome::Refresh(overview, active)) => {
                         if this.draft == this.active {
@@ -274,7 +300,7 @@ impl AppView {
                     }
                     Ok(Outcome::WriteFailed(error, stored, gateway)) => {
                         this.dialog = None;
-                        this.error = Some(format!("{error} The write outcome is unconfirmed."));
+                        this.error = Some(error.to_string());
                         this.status = Some(match stored {
                             Some(stored) => { let hash = admin::hash(&stored); this.active = stored; format!("Reloaded stored manifest {hash}. Your draft is retained. Review it before retrying.") }
                             None => "Could not reload the stored manifest. Refresh before retrying.".into(),
@@ -285,12 +311,15 @@ impl AppView {
                     Ok(Outcome::RestorePreview(restore, text, active)) => {
                         this.active = active; this.dialog = Some(Dialog::Restore(restore, text)); this.status = None;
                     }
-                    Ok(Outcome::Applied(hash, active, history)) => {
-                        this.active = active.clone(); this.draft = active; this.history = Some(history); this.dialog = None;
+                    Ok(Outcome::Applied(written, active, history, notice)) => {
+                        let hash = written.hash;
+                        this.active = active.clone(); this.draft = active; this.dialog = None;
+                        if history.is_some() { this.history = history; }
+                        this.error = notice;
                         this.editor.update(cx, |state, cx| state.set_value(this.draft.clone(), window, cx));
                         this.build_fields(window, cx);
                         if let Some(overview) = &mut this.overview { overview.gateway.manifest_hash = hash.clone(); }
-                        this.status = Some(format!("Manifest {hash} is in force."));
+                        this.status = Some("Saved. The gateway loads it within 10 seconds.".into());
                     }
                     Ok(Outcome::Device(devices)) => {
                         this.dialog = None;
@@ -349,10 +378,10 @@ impl AppView {
     fn setup_screen(&self, cx: &Context<Self>) -> Div {
         column().max_w(px(640.)).gap(px(14.)).child(title("Where is your gateway?"))
             .child(div().text_color(rgb(INK_2)).child("The admin app uses your kubectl access. It saves a local backup before each manifest change and syncs the server history."))
-            .children(["Cluster", "Namespace", "Local backup folder"].into_iter().enumerate().map(|(i, name)| column().gap_1p5().child(label(name)).child(Input::new(&self.setup[i]))))
+            .children(["Cluster", "Namespace", "Local backup folder", "kubectl path (optional)"].into_iter().enumerate().map(|(i, name)| column().gap_1p5().child(label(name)).child(Input::new(&self.setup[i]))))
             .child(actions().child(Button::new("save").label("Save and open").primary().disabled(self.busy).on_click(cx.listener(|this, _, window, cx| {
                 let values: Vec<_> = this.setup.iter().map(|state| state.read(cx).value().to_string()).collect();
-                this.run(Operation::Setup(Settings { context: values[0].clone(), namespace: values[1].clone(), backup_dir: values[2].clone().into() }), window, cx);
+                this.run(Operation::Setup(Settings { context: values[0].clone(), namespace: values[1].clone(), backup_dir: values[2].trim().into(), kubectl: values[3].trim().into() }), window, cx);
             }))))
             .child(runs("runs", "kubectl exec deploy/open-pact-gateway -- open-pact-gateway status --json"))
             .child(runs("and", "kubectl exec deploy/open-pact-gateway -- open-pact-gateway manifest history --json"))
@@ -737,7 +766,7 @@ impl AppView {
                             .label("Open folder")
                             .small()
                             .on_click(cx.listener(|this, _, _, cx| {
-                                cx.reveal_path(&this.admin.settings.backup_dir)
+                                cx.reveal_path(&this.admin.backup_dir())
                             })),
                     ),
             );
@@ -748,6 +777,9 @@ impl AppView {
             "Last sync {}",
             readable_local(&history.synced_at)
         )));
+        for warning in &history.warnings {
+            view = view.child(banner(warning.clone(), BAD, BAD_WASH));
+        }
         let mut versions = table();
         for (i, version) in history.versions.iter().enumerate() {
             let selected = Restore::Server(version.clone());
@@ -962,8 +994,8 @@ impl AppView {
                     .child(diff_view(&manifest::diff(&self.active, &self.draft)))
                     .child(note("Devices must sign the new manifest. Until they do, their results are refused."))
                     .child(column().gap_1p5().child(label("Change note")).child(Input::new(&self.change_note)))
-                    .child(note(format!("Saves the active TOML in {} first.", self.admin.settings.backup_dir.display())))
-                    .child(runs("runs", format!("kubectl exec -i deploy/open-pact-gateway -- open-pact-gateway manifest set --note {:?} --json", self.change_note.read(cx).value())))
+                    .child(note(format!("Saves the active TOML in {} first.", self.admin.backup_dir().display())))
+                    .child(runs("runs", shell_line(&["kubectl", "exec", "-i", "deploy/open-pact-gateway", "--", "open-pact-gateway", "manifest", "set", &format!("--note={}", self.change_note.read(cx).value()), "--json"])))
                     .child(actions().child(close.label("Cancel")).child(Button::new("apply").label("Apply manifest").primary().disabled(self.busy).on_click(cx.listener(|this, _, window, cx| {
                         this.run(Operation::Apply(this.draft.clone(), this.change_note.read(cx).value().to_string(), admin::hash(&this.active)), window, cx);
                     }))));
@@ -974,10 +1006,10 @@ impl AppView {
                     .child(diff_view(&manifest::diff(&self.active, &text)))
                     .child(note("Devices must sign the restored manifest before sending results. The current active manifest is backed up first."))
                     .child(match &restore {
-                        Restore::Server(version) => runs("runs", format!("open-pact-gateway manifest activate {} --json", version.version)),
+                        Restore::Server(version) => runs("runs", format!("kubectl exec deploy/open-pact-gateway -- open-pact-gateway manifest activate {} --json", version.version)),
                         Restore::Local(backup) => runs("restores", backup.path.display().to_string()),
                     })
-                    .when(matches!(restore, Restore::Local(_)), |view| view.child(note("Activates its server version if present; otherwise pipes this file to manifest set --note restore --json.")))
+                    .when(matches!(restore, Restore::Local(_)), |view| view.child(note(format!("Activates its server version if present; otherwise pipes this file to manifest set {} --json.", shell_quote(&format!("--note={}", admin::restore_note(&restore)))))))
                     .child(actions().child(close.label("Cancel")).child(Button::new("restore-confirm").label("Restore").primary().disabled(self.busy).on_click(cx.listener(move |this, _, window, cx| {
                         this.run(Operation::Restore(selected.clone(), admin::hash(&this.active)), window, cx);
                     }))));
@@ -992,9 +1024,7 @@ impl AppView {
                 };
                 let command = format!(
                     "kubectl {}",
-                    self.admin
-                        .gateway_args(&["devices", action, &target])
-                        .join(" ")
+                    shell_line(&self.admin.gateway_args(&["devices", action, &target]))
                 );
                 let confirm = Button::new("device-action")
                     .label(if revoke { "Revoke" } else { "Approve" })
@@ -1061,9 +1091,9 @@ impl AppView {
                         .child(runs(
                             "runs",
                             format!(
-                                "open-pact-gateway invite --ttl {} --note {:?} --json",
-                                self.ttl,
-                                self.invitation_note.read(cx).value()
+                                "kubectl exec deploy/open-pact-gateway -- open-pact-gateway invite --ttl {} {} --json",
+                                shell_quote(&self.ttl),
+                                shell_quote(&format!("--note={}", self.invitation_note.read(cx).value()))
                             ),
                         ))
                         .child(
@@ -1337,6 +1367,7 @@ fn main() {
         snapshots(PathBuf::from(output));
         return;
     }
+    runner::tool_path();
     let settings = Settings::load();
     launch("open-pact admin", 1040., 760., move |window, cx| {
         cx.new(|cx| {
@@ -1389,7 +1420,7 @@ fn snapshots(output: PathBuf) {
     ] {
         snapshot(&output, name, 1040., 800., |window, cx| {
             cx.new(|cx| {
-            let mut app = AppView::new(Settings { backup_dir: "/fictional/backups".into(), context: "test-cluster".into(), namespace: "open-pact".into() }, window, cx);
+            let mut app = AppView::new(Settings { backup_dir: "/fictional/backups".into(), context: "test-cluster".into(), namespace: "open-pact".into(), ..Settings::default() }, window, cx);
             app.screen = screen; app.form = form; app.dialog = dialog;
             app.show_history = name == "admin-f-history";
                 app.active = include_str!("../../../tests/fixtures/manifest.toml").into();
@@ -1403,7 +1434,7 @@ fn snapshots(output: PathBuf) {
                 devices: serde_json::from_str(include_str!("../../../tests/fixtures/devices.json")).unwrap(),
                 deployment: serde_json::json!({"status":{"conditions":[{"type":"Available","status":"True"}]}}),
             });
-            app.history = Some(History { versions: serde_json::from_str(include_str!("../../../tests/fixtures/history.json")).unwrap(), backups: vec![admin::Backup { path: "/fictional/backups/20261116T100000Z-v1-example.toml".into(), manifest_hash: admin::hash(&app.active) }], synced_at: "2026-11-16T12:30:00Z".into() });
+            app.history = Some(History { versions: serde_json::from_str(include_str!("../../../tests/fixtures/history.json")).unwrap(), backups: vec![admin::Backup { path: "/fictional/backups/20261116T100000Z-v1-example.toml".into(), manifest_hash: admin::hash(&app.active) }], synced_at: "2026-11-16T12:30:00Z".into(), warnings: if name == "admin-f-history" { vec!["Skipped backup 20261116T101500.000Z-0123456789ab.toml: its content does not match the hash in its name. Move it out of the folder and sync again.".into()] } else { Vec::new() } });
             app
         })
         });

@@ -1,0 +1,7 @@
+{"step":1,"title":"Read invitation","state":"done"}
+{"step":2,"title":"Signed and enrolled","state":"done"}
+{"step":3,"title":"Waiting for approval","state":"waiting","detail":{"device_code":"0a1b2c3d"}}
+{"step":4,"title":"Approved","state":"done"}
+{"step":5,"title":"Certificate installed","state":"done"}
+{"step":6,"title":"First check and claim","state":"done"}
+{"result":"denied","device":"fictional-a","manifest_hash":"sha256:97e1594a"}

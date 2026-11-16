@@ -1,0 +1,1 @@
+{"sent_at":"2026-11-16T11:48:00Z","accepted":false,"warnings":[],"reasons":["Password is 4 characters, 10 needed"],"controls":[{"id":"password_min_length","value":4,"ok":false}]}

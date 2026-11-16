@@ -1,4 +1,4 @@
-use crate::{Runner, args, find_on_path};
+use crate::{Runner, args, command_error, find_on_path};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -108,32 +108,18 @@ pub struct Client {
 }
 
 impl Client {
+    /// A preview whose company key differs from the invitation comes with exit code 1.
     pub fn preview(&self, invitation: &str) -> Result<Preview, String> {
-        self.runner
-            .json(&self.executable, &args(&["join", "--preview", invitation]))
+        self.runner.report(
+            &self.executable,
+            &args(&["join", "--preview", "--", invitation]),
+        )
     }
 
+    /// Status uses nonzero exits for actionable reports as well as errors.
     pub fn status(&self) -> Result<Status, String> {
-        // Status uses nonzero exits for actionable reports as well as errors.
-        let output = self
-            .runner
-            .run(&self.executable, &args(&["status", "--json"]));
-        let stdout = match output {
-            Ok(log) => log.stdout,
-            Err(error) => {
-                let log = self.runner.logs().pop().ok_or_else(|| error.clone())?;
-                if log.stdout.trim().is_empty() {
-                    return Err(error);
-                }
-                log.stdout
-            }
-        };
-        serde_json::from_str(&stdout).map_err(|e| {
-            serde_json::from_str::<Value>(&stdout)
-                .ok()
-                .and_then(|v| v.get("error")?.as_str().map(str::to_owned))
-                .unwrap_or_else(|| format!("Invalid status JSON: {e}"))
-        })
+        self.runner
+            .report(&self.executable, &args(&["status", "--online", "--json"]))
     }
 
     pub fn join(
@@ -154,36 +140,51 @@ impl Client {
             words.extend(args(&["--folder", folder]));
         }
         if !invitation.is_empty() {
-            words.push(invitation.into());
+            words.extend(args(&["--", invitation]));
         }
         let mut parse_error = None;
         let mut completed = false;
-        self.runner.stream(
-            &self.executable,
-            &words,
-            |line| match serde_json::from_str::<JoinEvent>(line) {
+        let mut last_error = None;
+        // A denied first claim ends with a result line and exit code 1. A join that stops early
+        // ends with an {"error":…} line and exit code 1.
+        let log = self.runner.stream_any(&self.executable, &words, |line| {
+            if let Some(error) = serde_json::from_str::<Value>(line)
+                .ok()
+                .and_then(|value| value.get("error")?.as_str().map(str::to_owned))
+            {
+                last_error = Some(error);
+                return;
+            }
+            match serde_json::from_str::<JoinEvent>(line) {
                 Ok(value) => {
                     completed |= matches!(value, JoinEvent::Result { .. });
                     event(value);
                 }
                 Err(error) => parse_error = Some(format!("Invalid join event: {error}")),
-            },
-        )?;
+            }
+        })?;
+        if completed {
+            return match parse_error {
+                Some(error) => Err(error),
+                None => Ok(()),
+            };
+        }
+        if let Some(error) = last_error {
+            return Err(error);
+        }
         if let Some(error) = parse_error {
             return Err(error);
         }
-        if !completed {
-            return Err(
-                "Join ended without a final result. Reopen status to confirm what is stored."
-                    .into(),
-            );
+        if log.exit != Some(0) {
+            return Err(command_error(&log));
         }
-        Ok(())
+        Err("Join ended without a final result. Reopen status to confirm what is stored.".into())
     }
 
+    /// A denied claim comes with exit code 1 and a complete report.
     pub fn check(&self) -> Result<Check, String> {
         self.runner
-            .json(&self.executable, &args(&["check", "--json"]))
+            .report(&self.executable, &args(&["check", "--json"]))
     }
 
     pub fn changes(&self) -> Result<Changes, String> {
@@ -247,15 +248,44 @@ pub fn version(runner: &Runner, path: &Path) -> Result<String, String> {
         .into())
 }
 
+/// Orders `open-pact-client 0.6.0` style version lines. A prerelease sorts before its release.
+fn version_key(text: &str) -> Option<(Vec<u64>, bool)> {
+    let token = text.split_whitespace().last()?;
+    let token = token.strip_prefix('v').unwrap_or(token);
+    let token = token.split('+').next()?;
+    let (core, prerelease) = match token.split_once('-') {
+        Some((core, _)) => (core, true),
+        None => (token, false),
+    };
+    let mut numbers = core
+        .split('.')
+        .map(|part| part.parse::<u64>().ok())
+        .collect::<Option<Vec<_>>>()?;
+    if numbers.len() < 3 {
+        numbers.resize(3, 0);
+    }
+    Some((numbers, !prerelease))
+}
+
+pub fn at_least(found: &str, wanted: &str) -> bool {
+    match (version_key(found), version_key(wanted)) {
+        (Some(found), Some(wanted)) => found >= wanted,
+        _ => found == wanted,
+    }
+}
+
+/// Uses a CLI on PATH or in the install folder when it is as new as the bundled one. Returns
+/// `None` when there is none or only an older one, so the caller installs the bundled copy.
 pub fn resolve_cli(runner: &Runner, bundled: &Path) -> Result<Option<PathBuf>, String> {
     let wanted = version(runner, bundled)?;
+    let usable = |path: &Path| version(runner, path).is_ok_and(|found| at_least(&found, &wanted));
     if let Some(path) = find_on_path(cli_name())
-        && version(runner, &path).is_ok_and(|v| v == wanted)
+        && usable(&path)
     {
         return Ok(Some(path));
     }
     let installed = installed_path()?;
-    if installed.is_file() && version(runner, &installed).is_ok_and(|v| v == wanted) {
+    if installed.is_file() && usable(&installed) {
         return Ok(Some(installed));
     }
     Ok(None)
@@ -301,18 +331,24 @@ pub fn terminal_path(profile: &Path, directory: &Path) -> Result<(), String> {
     writeln!(file, "{line}").map_err(|e| e.to_string())
 }
 
+/// zsh reads ~/.zprofile. A login bash reads ~/.bash_profile when it exists and skips ~/.profile.
+pub fn profile_name(shell: &str, home: &Path) -> &'static str {
+    if shell.ends_with("zsh") {
+        ".zprofile"
+    } else if home.join(".bash_profile").exists() {
+        ".bash_profile"
+    } else {
+        ".profile"
+    }
+}
+
 pub fn enable_terminal(destination: &Path) -> Result<(), String> {
     let directory = destination.parent().ok_or("Invalid CLI location")?;
     #[cfg(unix)]
     {
         let home = dirs::home_dir().ok_or("Cannot locate the home directory")?;
         let shell = std::env::var("SHELL").unwrap_or_default();
-        let profile = if shell.ends_with("zsh") {
-            ".zprofile"
-        } else {
-            ".profile"
-        };
-        terminal_path(&home.join(profile), directory)
+        terminal_path(&home.join(profile_name(&shell, &home)), directory)
     }
     #[cfg(windows)]
     {
@@ -346,6 +382,43 @@ pub fn enable_terminal(destination: &Path) -> Result<(), String> {
                     vtype: kind,
                 },
             )
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        broadcast_environment_change();
+        Ok(())
+    }
+}
+
+/// Tells Explorer and new terminals to reread the user environment.
+#[cfg(windows)]
+fn broadcast_environment_change() {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn SendMessageTimeoutW(
+            window: isize,
+            message: u32,
+            wparam: usize,
+            lparam: isize,
+            flags: u32,
+            timeout: u32,
+            result: *mut usize,
+        ) -> isize;
+    }
+    const HWND_BROADCAST: isize = 0xffff;
+    const WM_SETTINGCHANGE: u32 = 0x001a;
+    const SMTO_ABORTIFHUNG: u32 = 0x0002;
+    let name: Vec<u16> = "Environment\0".encode_utf16().collect();
+    let mut result = 0usize;
+    // SAFETY: `name` is a NUL-terminated UTF-16 string that outlives the call, and `result` is a
+    // valid pointer for the duration of the call.
+    unsafe {
+        SendMessageTimeoutW(
+            HWND_BROADCAST,
+            WM_SETTINGCHANGE,
+            0,
+            name.as_ptr() as isize,
+            SMTO_ABORTIFHUNG,
+            5000,
+            &mut result,
+        );
     }
 }

@@ -3,6 +3,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -10,7 +11,11 @@ use std::time::{Duration, Instant};
 pub struct Settings {
     pub context: String,
     pub namespace: String,
+    /// Empty means the default folder for this context and namespace.
     pub backup_dir: PathBuf,
+    /// Empty means search PATH for kubectl.
+    #[serde(default)]
+    pub kubectl: String,
 }
 
 impl Default for Settings {
@@ -18,14 +23,54 @@ impl Default for Settings {
         Self {
             context: String::new(),
             namespace: "open-pact".into(),
-            backup_dir: dirs::data_local_dir()
-                .unwrap_or_default()
-                .join("open-pact-admin/backups"),
+            backup_dir: PathBuf::new(),
+            kubectl: String::new(),
         }
     }
 }
 
+fn folder_name(text: &str) -> String {
+    let name: String = text
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if name.is_empty() || name.chars().all(|c| c == '.') {
+        "_".into()
+    } else {
+        name
+    }
+}
+
 impl Settings {
+    /// The chosen backup folder, or one folder per context and namespace so that backups of
+    /// another cluster are never offered for restore.
+    pub fn backup_folder(&self) -> PathBuf {
+        if !self.backup_dir.as_os_str().is_empty() {
+            return self.backup_dir.clone();
+        }
+        dirs::data_local_dir()
+            .unwrap_or_default()
+            .join("open-pact-admin/backups")
+            .join(folder_name(&self.context))
+            .join(folder_name(&self.namespace))
+    }
+
+    pub fn kubectl_program(&self) -> PathBuf {
+        let chosen = self.kubectl.trim();
+        if chosen.is_empty() {
+            "kubectl".into()
+        } else {
+            chosen.into()
+        }
+    }
+
     pub fn path() -> Result<PathBuf, String> {
         Ok(dirs::config_dir()
             .ok_or("Cannot locate the OS config directory")?
@@ -119,7 +164,49 @@ pub struct History {
     pub versions: Vec<Version>,
     pub backups: Vec<Backup>,
     pub synced_at: String,
+    /// Backup files that were skipped, each with the reason.
+    pub warnings: Vec<String>,
 }
+
+/// A manifest write that the gateway confirmed.
+#[derive(Clone, Debug)]
+pub struct Written {
+    pub hash: String,
+    /// The hash of a manifest that another admin made active after this review. It was replaced,
+    /// and it stays in the server history.
+    pub overwritten: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub enum WriteError {
+    /// Stopped before anything was sent to the gateway.
+    Refused(String),
+    /// The gateway may or may not have stored the manifest.
+    Unknown(String),
+}
+
+fn sentence(text: &str) -> String {
+    let text = text.trim();
+    if text.ends_with(['.', '!', '?']) {
+        text.into()
+    } else {
+        format!("{text}.")
+    }
+}
+
+impl fmt::Display for WriteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Refused(message) => write!(f, "{} Nothing was written.", sentence(message)),
+            Self::Unknown(message) if message.contains("unconfirmed") => f.write_str(message),
+            Self::Unknown(message) => {
+                write!(f, "{} The write outcome is unconfirmed.", sentence(message))
+            }
+        }
+    }
+}
+
+impl std::error::Error for WriteError {}
 
 #[derive(Clone, Debug)]
 pub enum Restore {
@@ -148,25 +235,31 @@ fn hash12(hash: &str) -> Result<&str, String> {
     Ok(&bytes[..12])
 }
 
+/// A backup name ends with the first 12 hex characters of its manifest hash. A file with such a
+/// name must contain the manifest that the name says.
+fn check_name(name: &str, text: &str) -> Result<(), String> {
+    let stem = name.strip_suffix(".toml").unwrap_or(name);
+    let tail = stem.rsplit('-').next().unwrap_or_default();
+    if tail.len() == 12 && tail.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        let actual = hash(text);
+        if !actual["sha256:".len()..].starts_with(&tail.to_ascii_lowercase()) {
+            return Err(format!(
+                "Skipped backup {name}: its content does not match the hash in its name. Move it out of the folder and sync again."
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Writes through a temporary file and a rename, so a crash never leaves a partial file under
+/// a backup name.
 fn save_backup(directory: &Path, filename: &str, text: &str) -> Result<PathBuf, String> {
     use std::io::Write;
     std::fs::create_dir_all(directory).map_err(|e| e.to_string())?;
     let path = directory.join(filename);
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-    {
-        Ok(mut file) => {
-            file.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
-            file.sync_all().map_err(|e| e.to_string())?;
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            if std::fs::symlink_metadata(&path)
-                .map_err(|e| e.to_string())?
-                .file_type()
-                .is_symlink()
-            {
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
                 return Err("Backup path is a symbolic link".into());
             }
             if std::fs::read_to_string(&path).map_err(|e| e.to_string())? != text {
@@ -175,19 +268,53 @@ fn save_backup(directory: &Path, filename: &str, text: &str) -> Result<PathBuf, 
                     path.display()
                 ));
             }
+            return Ok(path);
         }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.to_string()),
     }
+    let temporary = directory.join(format!(".{filename}.part"));
+    let mut file = std::fs::File::create(&temporary).map_err(|e| e.to_string())?;
+    file.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
+    file.sync_all().map_err(|e| e.to_string())?;
+    drop(file);
+    std::fs::rename(&temporary, &path).map_err(|e| {
+        let _ = std::fs::remove_file(&temporary);
+        e.to_string()
+    })?;
     Ok(path)
+}
+
+pub fn restore_note(restore: &Restore) -> String {
+    match restore {
+        Restore::Local(backup) => format!(
+            "restore {}",
+            backup
+                .path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+        ),
+        Restore::Server(version) => format!("restore version {}", version.version),
+    }
 }
 
 impl Admin {
     pub fn new(runner: Runner, settings: Settings) -> Self {
         Self {
-            runner,
+            runner: runner.with_timeout(Duration::from_secs(60)),
+            kubectl: settings.kubectl_program(),
             settings,
-            kubectl: "kubectl".into(),
         }
+    }
+
+    pub fn use_settings(&mut self, settings: Settings) {
+        self.kubectl = settings.kubectl_program();
+        self.settings = settings;
+    }
+
+    pub fn backup_dir(&self) -> PathBuf {
+        self.settings.backup_folder()
     }
 
     pub fn kube_args(&self, words: &[&str]) -> Vec<String> {
@@ -234,7 +361,7 @@ impl Admin {
     pub fn invite(&self, ttl: &str, note: &str) -> Result<Invitation, String> {
         self.runner.json(
             &self.kubectl,
-            &self.gateway_args(&["invite", "--ttl", ttl, "--note", note, "--json"]),
+            &self.gateway_args(&["invite", "--ttl", ttl, &format!("--note={note}"), "--json"]),
         )
     }
 
@@ -255,7 +382,7 @@ impl Admin {
         if let Some(version) = version {
             words.extend(args(&["--version", &version.to_string()]));
         }
-        Ok(self.runner.raw(&self.kubectl, &words)?.stdout)
+        Ok(self.runner.run(&self.kubectl, &words)?.stdout)
     }
 
     pub fn history(&self) -> Result<Vec<Version>, String> {
@@ -266,29 +393,45 @@ impl Admin {
     }
 
     pub fn backups(&self) -> Result<Vec<Backup>, String> {
-        if !self.settings.backup_dir.exists() {
-            return Ok(Vec::new());
+        Ok(self.scan_backups()?.0)
+    }
+
+    fn scan_backups(&self) -> Result<(Vec<Backup>, Vec<String>), String> {
+        let directory = self.backup_dir();
+        if !directory.exists() {
+            return Ok((Vec::new(), Vec::new()));
         }
         let mut backups = Vec::new();
-        for entry in std::fs::read_dir(&self.settings.backup_dir).map_err(|e| e.to_string())? {
+        let mut warnings = Vec::new();
+        for entry in std::fs::read_dir(&directory).map_err(|e| e.to_string())? {
             let entry = entry.map_err(|e| e.to_string())?;
-            if entry.file_type().map_err(|e| e.to_string())?.is_file()
-                && entry.path().extension().is_some_and(|ext| ext == "toml")
+            if !entry.file_type().map_err(|e| e.to_string())?.is_file()
+                || entry.path().extension().is_none_or(|ext| ext != "toml")
             {
-                let text = std::fs::read_to_string(entry.path()).map_err(|e| e.to_string())?;
-                backups.push(Backup {
-                    path: entry.path(),
-                    manifest_hash: hash(&text),
-                });
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            match std::fs::read_to_string(entry.path()) {
+                Err(error) => warnings.push(format!("Skipped backup {name}: {error}.")),
+                Ok(text) => match check_name(&name, &text) {
+                    Err(warning) => warnings.push(warning),
+                    Ok(()) => backups.push(Backup {
+                        path: entry.path(),
+                        manifest_hash: hash(&text),
+                    }),
+                },
             }
         }
         backups.sort_by(|left, right| right.path.cmp(&left.path));
-        Ok(backups)
+        warnings.sort();
+        Ok((backups, warnings))
     }
 
     pub fn sync(&self) -> Result<History, String> {
-        std::fs::create_dir_all(&self.settings.backup_dir).map_err(|e| e.to_string())?;
+        let directory = self.backup_dir();
+        std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
         let versions = self.history()?;
+        let mut warnings = Vec::new();
         for version in &versions {
             let time = DateTime::parse_from_rfc3339(&version.created_at)
                 .map_err(|e| format!("Invalid server version time: {e}"))?
@@ -300,18 +443,12 @@ impl Admin {
                 version.version,
                 hash12(&version.manifest_hash)?
             );
-            let path = self.settings.backup_dir.join(&filename);
-            if path.exists() {
-                if std::fs::symlink_metadata(&path)
-                    .map_err(|e| e.to_string())?
-                    .file_type()
-                    .is_symlink()
-                    || hash(&std::fs::read_to_string(path).map_err(|e| e.to_string())?)
-                        != version.manifest_hash
-                {
-                    return Err(format!(
-                        "Local backup for version {} does not match the server.",
-                        version.version
+            let path = directory.join(&filename);
+            if let Ok(metadata) = std::fs::symlink_metadata(&path) {
+                // A file with the wrong content is reported by the folder scan below.
+                if metadata.file_type().is_symlink() {
+                    warnings.push(format!(
+                        "Skipped backup {filename}: it is a symbolic link. Move it out of the folder and sync again."
                     ));
                 }
                 continue;
@@ -323,12 +460,15 @@ impl Admin {
                     version.version
                 ));
             }
-            save_backup(&self.settings.backup_dir, &filename, &text)?;
+            save_backup(&directory, &filename, &text)?;
         }
+        let (backups, scanned) = self.scan_backups()?;
+        warnings.extend(scanned);
         Ok(History {
             versions,
-            backups: self.backups()?,
+            backups,
             synced_at: Utc::now().to_rfc3339(),
+            warnings,
         })
     }
 
@@ -341,17 +481,18 @@ impl Admin {
             Restore::Local(backup) => {
                 let path = backup.path.canonicalize().map_err(|e| e.to_string())?;
                 let directory = self
-                    .settings
-                    .backup_dir
+                    .backup_dir()
                     .canonicalize()
                     .map_err(|e| e.to_string())?;
                 if path.parent() != Some(directory.as_path()) {
                     return Err("Backup is outside the configured folder".into());
                 }
-                (
-                    std::fs::read_to_string(path).map_err(|e| e.to_string())?,
-                    &backup.manifest_hash,
-                )
+                let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+                check_name(
+                    &path.file_name().unwrap_or_default().to_string_lossy(),
+                    &text,
+                )?;
+                (text, &backup.manifest_hash)
             }
         };
         if hash(&text) != *expected {
@@ -373,7 +514,7 @@ impl Admin {
             Utc::now().format("%Y%m%dT%H%M%S%.3fZ"),
             hash12(&current_hash)?
         );
-        save_backup(&self.settings.backup_dir, &filename, &current)?;
+        save_backup(&self.backup_dir(), &filename, &current)?;
         Ok(())
     }
 
@@ -386,8 +527,7 @@ impl Admin {
             "open-pact-gateway",
             "manifest",
             "set",
-            "--note",
-            note,
+            &format!("--note={note}"),
             "--json",
         ]);
         let output = self.runner.input(&self.kubectl, &words, text)?;
@@ -396,28 +536,45 @@ impl Admin {
         })
     }
 
+    fn confirm(
+        &self,
+        result: Applied,
+        expected: &str,
+        reviewed_hash: &str,
+        timeout: Duration,
+        what: &str,
+    ) -> Result<Written, WriteError> {
+        if result.manifest_hash != expected {
+            return Err(WriteError::Unknown(format!(
+                "The {what} returned an unexpected hash. Refresh status before retrying."
+            )));
+        }
+        // The gateway has no expected-previous argument, so another admin's write between the
+        // backup check and this write is found only here.
+        let overwritten = result
+            .previous_hash
+            .filter(|previous| previous != reviewed_hash);
+        self.wait_for(expected, timeout)
+            .map(|hash| Written { hash, overwritten })
+            .map_err(WriteError::Unknown)
+    }
+
     pub fn apply(
         &self,
         text: &str,
         note: &str,
         reviewed_hash: &str,
         timeout: Duration,
-    ) -> Result<String, String> {
+    ) -> Result<Written, WriteError> {
         text.parse::<toml_edit::DocumentMut>()
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| WriteError::Refused(e.to_string()))?;
         if note.trim().is_empty() {
-            return Err("Enter a change note".into());
+            return Err(WriteError::Refused("Enter a change note.".into()));
         }
-        self.backup_active(reviewed_hash)?;
-        let result = self.set(text, note)?;
-        let expected = hash(text);
-        if result.manifest_hash != expected {
-            return Err(
-                "The gateway write returned an unexpected hash. Refresh status before retrying."
-                    .into(),
-            );
-        }
-        self.wait_for(&expected, timeout)
+        self.backup_active(reviewed_hash)
+            .map_err(WriteError::Refused)?;
+        let result = self.set(text, note).map_err(WriteError::Unknown)?;
+        self.confirm(result, &hash(text), reviewed_hash, timeout, "gateway write")
     }
 
     pub fn restore(
@@ -425,10 +582,11 @@ impl Admin {
         restore: &Restore,
         reviewed_hash: &str,
         timeout: Duration,
-    ) -> Result<String, String> {
-        let text = self.restore_text(restore)?;
-        self.backup_active(reviewed_hash)?;
-        let versions = self.history()?;
+    ) -> Result<Written, WriteError> {
+        let text = self.restore_text(restore).map_err(WriteError::Refused)?;
+        self.backup_active(reviewed_hash)
+            .map_err(WriteError::Refused)?;
+        let versions = self.history().map_err(WriteError::Refused)?;
         let expected = hash(&text);
         let server = versions.iter().find(|version| match restore {
             Restore::Server(selected) => {
@@ -437,33 +595,22 @@ impl Admin {
             Restore::Local(_) => version.manifest_hash == expected,
         });
         let result: Applied = if let Some(version) = server {
-            self.runner.json(
-                &self.kubectl,
-                &self.gateway_args(&[
-                    "manifest",
-                    "activate",
-                    &version.version.to_string(),
-                    "--json",
-                ]),
-            )?
+            self.runner
+                .json(
+                    &self.kubectl,
+                    &self.gateway_args(&[
+                        "manifest",
+                        "activate",
+                        &version.version.to_string(),
+                        "--json",
+                    ]),
+                )
+                .map_err(WriteError::Unknown)?
         } else {
-            let name = match restore {
-                Restore::Local(backup) => backup
-                    .path
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned(),
-                Restore::Server(version) => format!("version {}", version.version),
-            };
-            self.set(&text, &format!("restore {name}"))?
+            self.set(&text, &restore_note(restore))
+                .map_err(WriteError::Unknown)?
         };
-        if result.manifest_hash != expected {
-            return Err(
-                "The restore returned an unexpected hash. Refresh status before retrying.".into(),
-            );
-        }
-        self.wait_for(&expected, timeout)
+        self.confirm(result, &expected, reviewed_hash, timeout, "restore")
     }
 
     pub fn wait_for(&self, expected: &str, timeout: Duration) -> Result<String, String> {

@@ -3,11 +3,14 @@ set -eu
 fixtures=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 case "$*" in
   --version) printf '%s\n' 'open-pact-client 0.6.0' ;;
-  'status --json') cat "$fixtures/status.json"; exit 2 ;;
-  'join --preview opi1:expired') printf '%s\n' '{"error":"This invitation expired on 14 Nov. Ask IT for a new one."}'; exit 1 ;;
-  'join --preview '*) cat "$fixtures/preview.json" ;;
+  'status --online --json') cat "$fixtures/status.json"; exit 2 ;;
+  'join --preview -- opi1:expired') printf '%s\n' '{"error":"This invitation expired on 14 Nov. Ask IT for a new one."}'; exit 1 ;;
+  'join --preview -- opi1:mismatch') cat "$fixtures/preview-mismatch.json"; exit 1 ;;
+  'join --preview -- '*) cat "$fixtures/preview.json" ;;
+  'join --yes --json '*' -- opi1:denied') cat "$fixtures/join-denied.ndjson"; exit 1 ;;
+  'join --yes --json '*' -- opi1:broken') cat "$fixtures/join-error.ndjson"; exit 1 ;;
   'join --yes --json '*) cat "$fixtures/join.ndjson" ;;
-  'check --json') cat "$fixtures/check.json" ;;
+  'check --json') if test -f "$fixtures/denied"; then cat "$fixtures/check-denied.json"; exit 1; fi; cat "$fixtures/check.json" ;;
   'accept --preview') cat "$fixtures/changes.json" ;;
   'accept --yes'|'schedule on'|'schedule off') printf '%s\n' '{}' ;;
   *) printf '%s\n' '{"error":"Unexpected fixture command"}'; exit 1 ;;

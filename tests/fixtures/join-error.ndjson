@@ -1,0 +1,3 @@
+{"step":1,"title":"Read invitation","state":"done"}
+{"step":2,"title":"Signed and enrolled","state":"done"}
+{"error":"The VPN probe failed, so the first check was not sent."}

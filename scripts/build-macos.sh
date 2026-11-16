@@ -5,6 +5,8 @@ cli=${1:?Usage: scripts/build-macos.sh /path/to/open-pact-client}
 case "$cli" in /*) ;; *) cli="$(pwd)/$cli" ;; esac
 test -x "$cli"
 cargo build --release --workspace
+version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+test -n "$version"
 target=$(cargo metadata --format-version 1 --no-deps | bun -e 'console.log((await Bun.stdin.json()).target_directory)')
 mkdir -p dist
 for binary in open-pact open-pact-admin; do
@@ -19,7 +21,7 @@ for binary in open-pact open-pact-admin; do
 <key>CFBundleIdentifier</key><string>org.open-pact.$binary</string>
 <key>CFBundleName</key><string>$binary</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>0.6.0</string>
+<key>CFBundleShortVersionString</key><string>$version</string>
 <key>NSHighResolutionCapable</key><true/>
 </dict></plist>
 EOF

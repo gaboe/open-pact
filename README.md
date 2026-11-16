@@ -6,7 +6,7 @@ The apps only run `open-pact-client` and `kubectl`. They never call the gateway 
 
 ## Build the apps
 
-Install Rust 1.99 or later. Windows also needs LLVM with `llvm-rc` on PATH.
+Install Rust 1.99 or later. The macOS bundle script also needs `bun`. Windows also needs LLVM with `llvm-rc` on PATH.
 
 ```sh
 cargo build --workspace
@@ -14,7 +14,7 @@ cargo run -p open-pact-app
 cargo run -p open-pact-admin
 ```
 
-For an unbundled client build, put `open-pact-client` next to the app executable. The app compares CLI versions. A matching CLI on PATH skips installation. Otherwise the app installs the bundled CLI to `~/.local/bin` on macOS or `%LOCALAPPDATA%\open-pact` on Windows.
+For an unbundled client build, put `open-pact-client` next to the app executable. At start, each app reads the login shell PATH once (`$SHELL -lc`, 5 second limit; Homebrew and `/usr/local/bin` are added when that fails), because an app started from Finder has only the short system PATH. Every child process gets that PATH. The client then compares CLI versions. A CLI on that PATH, or in the install folder, that is as new as the bundled one skips installation. With none, or only an older one, the app installs the bundled CLI to `~/.local/bin` on macOS or `%LOCALAPPDATA%\open-pact` on Windows.
 
 On macOS, make ad hoc signed bundles with the installed CLI.
 
@@ -26,11 +26,11 @@ The bundles appear in `dist`. The client bundle contains the CLI in `Contents/He
 
 ## Set up the admin app
 
-Install `kubectl`. Enter the cluster, namespace, and local backup folder. The default backup folder is `open-pact-admin/backups` in the OS app data directory. The app saves settings in the OS config directory under `open-pact-admin/settings.json`.
+Install `kubectl`. Enter the cluster and namespace. Leave the kubectl path empty to search PATH, or enter the full path. Leave the local backup folder empty to use `open-pact-admin/backups/<cluster>/<namespace>` in the OS app data directory, or enter an absolute path. The app saves settings in the OS config directory under `open-pact-admin/settings.json`.
 
-Form and TOML edit one text. Review shows the diff and commands before applying. Apply saves the active TOML locally, pipes the new TOML to `manifest set --note <note> --json` through `kubectl exec -i`, and polls gateway status for up to 60 seconds. The gateway picks up the change without a restart.
+Form and TOML edit one text. Review shows the diff and commands before applying. Apply saves the active TOML locally, pipes the new TOML to `manifest set --note=<note> --json` through `kubectl exec -i`, and polls gateway status for up to 60 seconds. The gateway loads the stored manifest within 10 seconds, without a restart. Every kubectl call stops after 60 seconds. If another admin made a different manifest active after your review, the app says so and names its hash. That manifest stays in the server history.
 
-History sync runs on app open and with **Sync now**. It downloads every missing server version and checks its hash. Each server version and local backup has a **Restore** action. Restore shows a diff against the active manifest and asks once. Server versions use `manifest activate`; a local file absent from server history uses `manifest set`. Every write backs up the active manifest first.
+History sync runs on app open and with **Sync now**. It downloads every missing server version and checks its hash. A backup file whose content does not match the hash in its name is skipped with a warning and is never offered for restore. Each server version and local backup has a **Restore** action. Restore shows a diff against the active manifest and asks once. Server versions use `manifest activate`; a local file absent from server history uses `manifest set`. Every write backs up the active manifest first.
 
 A lost write response leaves the outcome unknown. Refresh gateway status before retrying. The app needs the gateway manifest version commands and the client JSON commands.
 
