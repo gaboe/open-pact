@@ -1,11 +1,13 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod form;
+
+use form::FormState;
 use gpui::{prelude::*, *};
 use gpui_component::{
     Disableable, Sizable,
     button::{Button, ButtonVariants},
-    checkbox::Checkbox,
-    input::{Input, InputEvent, InputState, Textarea, TextareaState},
+    input::{EditorState, Input, InputEvent, InputState},
     select::{Select, SelectEvent, SelectState},
 };
 use runner::{
@@ -14,8 +16,7 @@ use runner::{
         self, Admin, Device, Gateway, History, Invitation, Restore, Settings, WriteError, Written,
     },
     desktop::*,
-    manifest::{self, Field, Kind},
-    shell_line, shell_quote,
+    manifest, shell_line, shell_quote,
     text::*,
     update::UpdateState,
 };
@@ -111,10 +112,8 @@ struct AppView {
     kubectl_loaded: String,
     setup_subscriptions: Vec<Subscription>,
     draft: String,
-    editor: Entity<TextareaState>,
-    fields: Vec<(Field, Entity<InputState>)>,
-    lists: std::collections::HashMap<usize, Vec<Entity<InputState>>>,
-    subscriptions: Vec<Subscription>,
+    editor: Entity<EditorState>,
+    fv: FormState,
     editor_subscription: Option<Subscription>,
     active: String,
     history: Option<History>,
@@ -177,13 +176,22 @@ impl AppView {
             ),
         ];
         let kubectl_loaded = settings.kubectl.clone();
-        let editor = cx.new(|cx| TextareaState::new(window, cx).rows(18));
-        let editor_subscription = cx.subscribe(&editor, |this, state, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::Change) {
-                this.draft = state.read(cx).value().to_string();
-                cx.notify();
-            }
-        });
+        let editor = cx.new(|cx| EditorState::new(window, cx).language("toml"));
+        let editor_subscription = cx.subscribe_in(
+            &editor,
+            window,
+            |this, state, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::Change) {
+                    let value = state.read(cx).value().to_string();
+                    if value != this.draft {
+                        this.draft = value;
+                        this.show_draft(window, cx);
+                        cx.notify();
+                    }
+                }
+            },
+        );
+        let fv = FormState::new(window, cx);
         Self {
             admin: Admin::new(Runner::default(), settings),
             screen: Screen::Setup,
@@ -200,9 +208,7 @@ impl AppView {
             setup_subscriptions,
             draft: String::new(),
             editor,
-            fields: Vec::new(),
-            lists: std::collections::HashMap::new(),
-            subscriptions: Vec::new(),
+            fv,
             editor_subscription: Some(editor_subscription),
             active: String::new(),
             history: None,
@@ -366,74 +372,6 @@ impl AppView {
         }
     }
 
-    fn build_fields(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.subscriptions.clear();
-        self.fields.clear();
-        self.lists.clear();
-        let Ok(fields) = manifest::fields(&self.draft) else {
-            return;
-        };
-        for field in fields {
-            if field.kind == Kind::List {
-                let mut items = Vec::new();
-                for (index, value) in manifest::list_items(&field)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .enumerate()
-                {
-                    let input = cx.new(|cx| InputState::new(window, cx).default_value(value));
-                    let edited = field.clone();
-                    self.subscriptions.push(cx.subscribe_in(
-                        &input,
-                        window,
-                        move |this, input, event: &InputEvent, window, cx| {
-                            if matches!(event, InputEvent::Change) {
-                                match manifest::edit_list(
-                                    &this.draft,
-                                    &edited,
-                                    manifest::ListEdit::Set(index, &input.read(cx).value()),
-                                ) {
-                                    Ok(text) => {
-                                        this.draft = text.clone();
-                                        this.error = None;
-                                        this.editor.update(cx, |state, cx| {
-                                            state.set_value(text, window, cx)
-                                        });
-                                    }
-                                    Err(error) => this.error = Some(error),
-                                }
-                                cx.notify();
-                            }
-                        },
-                    ));
-                    items.push(input);
-                }
-                self.lists.insert(self.fields.len(), items);
-            }
-            let input = cx.new(|cx| InputState::new(window, cx).default_value(field.value.clone()));
-            let edited = field.clone();
-            self.subscriptions.push(cx.subscribe_in(
-                &input,
-                window,
-                move |this, input, event: &InputEvent, window, cx| {
-                    if matches!(event, InputEvent::Change) {
-                        match manifest::set_field(&this.draft, &edited, &input.read(cx).value()) {
-                            Ok(text) => {
-                                this.draft = text.clone();
-                                this.error = None;
-                                this.editor
-                                    .update(cx, |state, cx| state.set_value(text, window, cx));
-                            }
-                            Err(error) => this.error = Some(error),
-                        }
-                        cx.notify();
-                    }
-                },
-            ));
-            self.fields.push((field, input));
-        }
-    }
-
     fn run(&mut self, operation: Operation, window: &mut Window, cx: &mut Context<Self>) {
         if self.busy {
             return;
@@ -475,7 +413,7 @@ impl AppView {
                         }
                         admin.use_settings(settings.clone());
                         let active = admin.manifest(None)?;
-                        manifest::fields(&active)?;
+                        manifest::Form::parse(&active)?;
                         let overview = overview(&admin)?;
                         let history = admin.sync()?;
                         settings.save()?;
@@ -506,15 +444,15 @@ impl AppView {
                         this.overview = Some(overview);
                         let skipped = history.warnings.len();
                         this.history = Some(history);
-                        this.editor.update(cx, |state, cx| state.set_value(this.draft.clone(), window, cx));
-                        this.build_fields(window, cx); this.screen = Screen::Overview;
+                        this.show_draft(window, cx);
+                        this.build_form(window, cx); this.screen = Screen::Overview;
                         this.status = (skipped > 0).then(|| format!("Skipped {skipped} backup file(s). See Manifest, then History."));
                     }
                     Ok(Outcome::Refresh(overview, active)) => {
                         if this.draft == this.active {
                             this.draft = active.clone();
-                            this.editor.update(cx, |state, cx| state.set_value(this.draft.clone(), window, cx));
-                            this.build_fields(window, cx);
+                            this.show_draft(window, cx);
+                            this.build_form(window, cx);
                         }
                         this.active = active; this.overview = Some(overview); this.status = Some("Gateway and active manifest refreshed.".into());
                     }
@@ -536,8 +474,8 @@ impl AppView {
                         this.active = active.clone(); this.draft = active; this.dialog = None;
                         if history.is_some() { this.history = history; }
                         this.error = notice;
-                        this.editor.update(cx, |state, cx| state.set_value(this.draft.clone(), window, cx));
-                        this.build_fields(window, cx);
+                        this.show_draft(window, cx);
+                        this.build_form(window, cx);
                         if let Some(overview) = &mut this.overview { overview.gateway.manifest_hash = hash.clone(); }
                         this.status = Some("Saved. The gateway loads it within 10 seconds.".into());
                     }
@@ -553,46 +491,6 @@ impl AppView {
             });
         }).detach();
         cx.notify();
-    }
-
-    fn edit_draft(
-        &mut self,
-        result: Result<String, String>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        match result {
-            Ok(text) => {
-                self.draft = text.clone();
-                self.editor
-                    .update(cx, |state, cx| state.set_value(text, window, cx));
-                self.build_fields(window, cx);
-            }
-            Err(error) => self.error = Some(error),
-        }
-        cx.notify();
-    }
-
-    fn change_count(&self) -> usize {
-        let (Ok(before), Ok(after)) = (
-            manifest::fields(&self.active),
-            manifest::fields(&self.draft),
-        ) else {
-            return usize::from(self.active != self.draft);
-        };
-        let changed = after
-            .iter()
-            .filter(|field| {
-                !before
-                    .iter()
-                    .any(|old| old.path == field.path && old.value == field.value)
-            })
-            .count();
-        let removed = before
-            .iter()
-            .filter(|old| !after.iter().any(|field| field.path == old.path))
-            .count();
-        changed + removed
     }
 
     fn setup_screen(&self, cx: &Context<Self>) -> Div {
@@ -784,7 +682,7 @@ impl AppView {
             )
             .child(label("Latest results"));
         let mut results = table().child(result_header());
-        for device in &overview.devices {
+        for device in admin::latest_results(&overview.devices) {
             let result = result_text(device.last_result.as_ref());
             let reasons = reasons_text(device.last_reasons.as_ref());
             results = results.child(result_row(
@@ -806,242 +704,23 @@ impl AppView {
             .child(column().gap_1().child(runs("runs", "kubectl get deploy/open-pact-gateway -o json")).child(runs("and", "kubectl exec deploy/open-pact-gateway -- open-pact-gateway devices list --json")))
     }
 
-    fn manifest_screen(&self, cx: &Context<Self>) -> Div {
-        if self.show_history {
-            return column()
-                .gap(px(14.))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_3()
-                        .child(title("Manifest").flex_1())
-                        .child(ghost("back-editor", "Back to editor").on_click(cx.listener(
-                            |this, _, _, cx| {
-                                this.show_history = false;
-                                cx.notify();
-                            },
-                        ))),
-                )
-                .child(self.history_screen(cx));
-        }
-        let parse_error = self.draft.parse::<toml_edit::DocumentMut>().err();
-        let form_blocked = parse_error.is_some() || self.busy;
-        let mut view = column().gap(px(18.)).child(
-            div()
-                .flex()
-                .items_center()
-                .gap_3()
-                .child(title("Manifest").flex_1())
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_1p5()
-                        .text_size(px(13.))
-                        .text_color(rgb(MUTED))
-                        .child("in force")
-                        .child(hash_chip(&admin::hash(&self.active))),
-                )
-                .child(seg(vec![
-                    seg_item("form", "Form", self.form)
-                        .when(form_blocked, |item| item.opacity(0.45))
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            if this.busy || this.draft.parse::<toml_edit::DocumentMut>().is_err() {
-                                return;
-                            }
-                            this.form = true;
-                            this.build_fields(window, cx);
+    fn manifest_history(&self, cx: &Context<Self>) -> Div {
+        column()
+            .gap(px(14.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(title("Manifest").flex_1())
+                    .child(ghost("back-editor", "Back to editor").on_click(cx.listener(
+                        |this, _, _, cx| {
+                            this.show_history = false;
                             cx.notify();
-                        })),
-                    seg_item("toml", "TOML", !self.form)
-                        .when(self.busy, |item| item.opacity(0.45))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            if !this.busy {
-                                this.form = false;
-                                cx.notify();
-                            }
-                        })),
-                ]))
-                .child(
-                    ghost("history-view", "History").on_click(cx.listener(|this, _, _, cx| {
-                        this.show_history = true;
-                        cx.notify();
-                    })),
-                ),
-        );
-        if self.form {
-            let original = manifest::fields(&self.active).unwrap_or_default();
-            let mut groups: Vec<(String, Vec<Div>)> = Vec::new();
-            for (i, (field, state)) in self.fields.iter().enumerate() {
-                let changed = original
-                    .iter()
-                    .find(|old| old.path == field.path)
-                    .is_none_or(|old| old.value != state.read(cx).value().as_str());
-                let mut control = column().w(px(180.)).gap_1().child(
-                    note(field.label.clone()).text_color(rgb(if changed { BLUE } else { MUTED })),
-                );
-                if field.kind == Kind::Bool {
-                    let field = field.clone();
-                    let checked = state.read(cx).value() == "true";
-                    control = control.child(
-                        Checkbox::new(("bool", i))
-                            .label(if checked { "On" } else { "Off" })
-                            .checked(checked)
-                            .disabled(self.busy)
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                let result = manifest::set_field(
-                                    &this.draft,
-                                    &field,
-                                    if checked { "false" } else { "true" },
-                                );
-                                this.edit_draft(result, window, cx);
-                            })),
-                    );
-                } else if field.kind == Kind::List {
-                    for (index, item) in self.lists.get(&i).into_iter().flatten().enumerate() {
-                        let edited = field.clone();
-                        control = control.child(
-                            div()
-                                .flex()
-                                .gap_1()
-                                .items_center()
-                                .child(div().flex_1().child(Input::new(item).disabled(self.busy)))
-                                .child(
-                                    Button::new(("remove-item", i * 10000 + index))
-                                        .label("Remove")
-                                        .small()
-                                        .disabled(self.busy)
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            let result = manifest::edit_list(
-                                                &this.draft,
-                                                &edited,
-                                                manifest::ListEdit::Remove(index),
-                                            );
-                                            this.edit_draft(result, window, cx);
-                                        })),
-                                ),
-                        );
-                    }
-                    let edited = field.clone();
-                    control = control.child(
-                        ghost(("add-item", i), "Add item")
-                            .disabled(self.busy)
-                            .self_start()
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                let result = manifest::edit_list(
-                                    &this.draft,
-                                    &edited,
-                                    manifest::ListEdit::Add,
-                                );
-                                this.edit_draft(result, window, cx);
-                            })),
-                    );
-                } else {
-                    control = control.child(Input::new(state).disabled(self.busy));
-                }
-                if let Some((_, controls)) =
-                    groups.iter_mut().find(|(key, _)| *key == field.section)
-                {
-                    controls.push(control);
-                } else {
-                    groups.push((field.section.clone(), vec![control]));
-                }
-            }
-            let mut grid = div().flex().flex_col().border_t_1().border_color(rgb(RULE));
-            for (section, controls) in groups {
-                grid = grid.child(
-                    div()
-                        .flex()
-                        .gap_4()
-                        .py(px(11.))
-                        .border_b_1()
-                        .border_color(rgb(RULE_2))
-                        .child(
-                            div()
-                                .w(px(160.))
-                                .flex_shrink_0()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(INK_2))
-                                .child(section),
-                        )
-                        .child(div().flex().flex_wrap().gap_4().flex_1().children(controls)),
-                );
-            }
-            view = view.child(grid);
-        } else {
-            view = view.child(Textarea::new(&self.editor).disabled(self.busy));
-        }
-        if let Some(error) = parse_error {
-            let line = error.span().map_or(1, |span| {
-                self.draft[..span.start.min(self.draft.len())]
-                    .matches('\n')
-                    .count()
-                    + 1
-            });
-            view = view.child(error_block(format!(
-                "Line {line}: {}. Fix it to switch back to Form or apply.",
-                error.message()
-            )));
-        }
-        let changes = self.change_count();
-        let can_review = !(self.busy
-            || changes == 0
-            || self.draft.parse::<toml_edit::DocumentMut>().is_err()
-            || self.error.is_some());
-        view.child(
-            div()
-                .flex()
-                .items_center()
-                .gap_3()
-                .px_4()
-                .py_3()
-                .rounded(px(10.))
-                .bg(rgb(SIDE))
-                .border_1()
-                .border_color(rgb(RULE))
-                .child(
-                    div()
-                        .flex_1()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            div()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child(match changes {
-                                    0 => "No changes.".to_owned(),
-                                    1 => "1 change.".to_owned(),
-                                    n => format!("{n} changes."),
-                                }),
-                        )
-                        .child(note("Form and TOML edit the same text.")),
-                )
-                .child(
-                    Button::new("discard")
-                        .label("Discard")
-                        .disabled(self.busy || changes == 0)
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.draft = this.active.clone();
-                            this.editor.update(cx, |state, cx| {
-                                state.set_value(this.draft.clone(), window, cx)
-                            });
-                            this.build_fields(window, cx);
-                            this.error = None;
-                            cx.notify();
-                        })),
-                )
-                .child(
-                    Button::new("review")
-                        .label("Review and apply")
-                        .primary()
-                        .disabled(!can_review)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.dialog = Some(Dialog::Apply);
-                            cx.notify();
-                        })),
-                ),
-        )
+                        },
+                    ))),
+            )
+            .child(self.history_screen(cx))
     }
 
     fn history_screen(&self, cx: &Context<Self>) -> Div {
@@ -1544,9 +1223,11 @@ impl Render for AppView {
         let content = match self.screen {
             Screen::Setup => self.setup_screen(cx),
             Screen::Overview => self.overview_screen(cx),
-            Screen::Manifest => self.manifest_screen(cx),
+            Screen::Manifest if self.show_history => self.manifest_history(cx),
+            Screen::Manifest => self.manifest_editor(cx),
             Screen::Devices => self.devices_screen(cx),
         };
+        let wide = self.screen == Screen::Manifest && !self.show_history;
         let sidebar = div()
             .flex()
             .flex_col()
@@ -1613,21 +1294,33 @@ impl Render for AppView {
                             })),
                     ),
             );
-        let mut main = column()
-            .id("admin-main")
-            .flex_1()
-            .h_full()
-            .min_w_0()
-            .overflow_y_scroll()
-            .gap(px(18.))
-            .px(px(28.))
-            .py(px(24.))
-            .child(content);
-        if let Some(status) = &self.status {
-            main = main.child(note(status.clone()));
-        }
-        if let Some(error) = &self.error {
-            main = main.child(banner(error.clone(), BAD, BAD_WASH));
+        let mut main = if wide {
+            div()
+                .id("admin-main")
+                .flex()
+                .flex_1()
+                .h_full()
+                .min_w_0()
+                .child(content)
+        } else {
+            column()
+                .id("admin-main")
+                .flex_1()
+                .h_full()
+                .min_w_0()
+                .overflow_y_scroll()
+                .gap(px(18.))
+                .px(px(28.))
+                .py(px(24.))
+                .child(content)
+        };
+        if !wide {
+            if let Some(status) = &self.status {
+                main = main.child(note(status.clone()));
+            }
+            if let Some(error) = &self.error {
+                main = main.child(banner(error.clone(), BAD, BAD_WASH));
+            }
         }
         let mut root = div()
             .relative()
@@ -1678,7 +1371,7 @@ fn main() {
     }
     runner::tool_path();
     let settings = Settings::load();
-    launch("open-pact admin", 1040., 760., move |window, cx| {
+    launch("open-pact admin", 1360., 860., move |window, cx| {
         cx.new(|cx| {
             let mut app = AppView::new(settings.clone().unwrap_or_default(), window, cx);
             app.load_contexts(window, cx);
@@ -1708,6 +1401,8 @@ fn snapshots(output: PathBuf) {
         ("admin-a-overview", Screen::Overview, true, None),
         ("admin-b-form", Screen::Manifest, true, None),
         ("admin-c-toml", Screen::Manifest, false, None),
+        ("admin-m-number-check", Screen::Manifest, true, None),
+        ("admin-n-add-check", Screen::Manifest, true, None),
         ("admin-d-apply", Screen::Manifest, true, Some(Dialog::Apply)),
         (
             "admin-e-invitation",
@@ -1735,7 +1430,22 @@ fn snapshots(output: PathBuf) {
             )),
         ),
     ] {
-        snapshot(&output, name, 1040., 800., |window, cx| {
+        let (width, height) = if screen == Screen::Manifest {
+            (
+                1440.,
+                if matches!(
+                    name,
+                    "admin-b-form" | "admin-m-number-check" | "admin-n-add-check"
+                ) {
+                    1700.
+                } else {
+                    880.
+                },
+            )
+        } else {
+            (1040., 800.)
+        };
+        snapshot(&output, name, width, height, |window, cx| {
             cx.new(|cx| {
             let mut app = AppView::new(Settings { context: "test-cluster".into(), namespace: "open-pact".into(), ..Settings::default() }, window, cx);
             app.admin.backup_root = "/fictional/backups".into();
@@ -1744,10 +1454,12 @@ fn snapshots(output: PathBuf) {
             if name == "admin-k-update" { app.update = UpdateState::Available("0.1.1".into()); }
                 app.active = include_str!("../../../tests/fixtures/manifest.toml").into();
                 app.draft = app.active.clone();
-            if name == "admin-d-apply" || name == "admin-b-form" { app.draft = include_str!("../../../tests/fixtures/manifest-v2.toml").into(); }
-            if !form { app.draft = "manifest_version = 1\n[schedule]\nmode = \"vpn\"\ninterval = \"55m\n".into(); }
-            app.editor.update(cx, |state, cx| state.set_value(app.draft.clone(), window, cx));
-            app.build_fields(window, cx);
+            if matches!(name, "admin-d-apply" | "admin-b-form" | "admin-m-number-check" | "admin-n-add-check") { app.draft = include_str!("../../../tests/fixtures/manifest-v2.toml").into(); }
+            if !form { app.draft = include_str!("../../../tests/fixtures/manifest-v2.toml").replace("issuer = \"Example Company, IT security\"", "issuer = \"Example Company, IT security"); }
+            app.fv.selected = match name { "admin-m-number-check" => Some("os_patch_age_days".to_owned()), "admin-b-form" | "admin-n-add-check" => Some("screen_lock".to_owned()), _ => None };
+            app.fv.add_open = name == "admin-n-add-check";
+            app.show_draft(window, cx);
+            app.build_form(window, cx);
             app.overview = Some(Overview {
                 gateway: serde_json::from_str(include_str!("../../../tests/fixtures/gateway.json")).unwrap(),
                 devices: serde_json::from_str(include_str!("../../../tests/fixtures/devices.json")).unwrap(),

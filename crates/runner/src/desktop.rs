@@ -474,7 +474,48 @@ pub fn init(cx: &mut App) {
         theme.primary_foreground = rgb(0xffffff).into();
         theme.radius = px(8.);
         theme.border = rgb(FIELD_BORDER).into();
+        theme.highlight_theme = toml_highlight_theme();
     });
+}
+
+pub const KEY_INK: &str = "#7A3E9D";
+pub const STRING_INK: &str = "#2E7D4F";
+pub const COMMENT_INK: &str = "#8A8478";
+pub const NUMBER_INK: &str = "#B4560E";
+
+/// The code editor colours of the approved design (.k1, .s1, .c1, .n1 in design.html), applied
+/// to the tree-sitter TOML highlights.
+pub fn toml_highlight_theme() -> std::sync::Arc<gpui_component::highlighter::HighlightTheme> {
+    use gpui_component::highlighter::HighlightTheme;
+    let base = HighlightTheme::default_light();
+    let mut json = serde_json::to_value(&*base).expect("highlight theme as JSON");
+    let style = json["style"].as_object_mut().expect("theme style");
+    style.insert("editor.background".into(), "#FBFAF7".into());
+    style.insert("editor.foreground".into(), "#16202B".into());
+    style.insert("editor.line_number".into(), "#A39C8E".into());
+    style.insert("editor.active_line.background".into(), "#F2EFE8".into());
+    style.insert("editor.active_line_number".into(), "#5B6573".into());
+    let syntax = style
+        .entry("syntax")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .expect("syntax colours");
+    for (name, hex) in [
+        ("type", KEY_INK),
+        ("property", KEY_INK),
+        ("string", STRING_INK),
+        ("string.special", STRING_INK),
+        ("comment", COMMENT_INK),
+        ("number", NUMBER_INK),
+        ("boolean", NUMBER_INK),
+        ("operator", "#3B4757"),
+        ("punctuation", "#3B4757"),
+        ("punctuation.bracket", "#3B4757"),
+        ("punctuation.delimiter", "#3B4757"),
+    ] {
+        syntax.insert(name.into(), serde_json::json!({ "color": hex }));
+    }
+    std::sync::Arc::new(serde_json::from_value(json).expect("highlight theme from JSON"))
 }
 
 /// Both apps hold no background work (the scheduled job is a separate OS task), so closing the

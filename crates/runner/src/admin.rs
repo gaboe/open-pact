@@ -118,6 +118,29 @@ pub struct Device {
     pub last_reasons: Option<Value>,
 }
 
+/// The devices the Overview lists: revoked ones left out, the newest result first, and devices
+/// without a result last.
+pub fn latest_results(devices: &[Device]) -> Vec<&Device> {
+    let claimed = |device: &Device| {
+        device
+            .last_claim_at
+            .as_deref()
+            .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
+            .map(|at| at.with_timezone(&Utc))
+    };
+    let mut shown: Vec<&Device> = devices
+        .iter()
+        .filter(|device| device.state != "revoked")
+        .collect();
+    shown.sort_by_key(|device| {
+        (
+            device.last_result.is_none(),
+            std::cmp::Reverse(claimed(device)),
+        )
+    });
+    shown
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Gateway {
     pub version: String,

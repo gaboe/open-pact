@@ -6,7 +6,7 @@ use runner::{
 };
 use runner::{
     admin::Settings,
-    manifest::{self, Kind},
+    manifest::{self, Filter, Form, Os, Output, Requirement, Span, date_text, parse_date},
 };
 #[cfg(unix)]
 use std::path::PathBuf;
@@ -98,63 +98,337 @@ fn admin_screens_use_context_namespace_and_gateway_json() {
     }
 }
 
-#[test]
-fn every_toml_value_has_an_editable_control() {
-    let text = "name = \"Example\"\nnumber = 3\nratio = 0.5\nactive = true\nlist = [1, 2]\n[table]\ninline = { threshold = 10 }\n[[controls]]\nid = \"disk\"\nrequired = true\n";
-    let fields = manifest::fields(text).unwrap();
-    assert_eq!(fields.len(), 8);
-    for field in fields {
-        let value = match field.kind {
-            Kind::Text => "Changed",
-            Kind::Number => "15",
-            Kind::Bool => "false",
-            Kind::List => "[3, 4]",
-        };
-        let changed = manifest::set_field(text, &field, value).unwrap();
-        let new_fields = manifest::fields(&changed).unwrap();
-        assert_eq!(
-            new_fields
-                .iter()
-                .find(|f| f.path == field.path)
-                .unwrap()
-                .value,
-            value
-        );
-    }
+const MANIFEST: &str = include_str!("../../../tests/fixtures/manifest.toml");
+const MANIFEST_V2: &str = include_str!("../../../tests/fixtures/manifest-v2.toml");
+
+fn form(text: &str) -> Form {
+    Form::parse(text).unwrap()
 }
 
 #[test]
-fn form_labels_use_readable_names() {
-    let text = "manifest_version = 1\n[schedule]\ninterval = \"55m\"\n[[controls]]\nid = \"disk\"\nrequire = { min = 10 }\n";
-    let labels: Vec<_> = manifest::fields(text)
-        .unwrap()
-        .into_iter()
-        .map(|field| (field.section, field.label))
-        .collect();
+fn durations_round_trip_exactly() {
+    for text in ["24h", "1mo", "7d", "55m", "0d", "2w", "90m"] {
+        assert_eq!(Span::parse(text).unwrap().print(), text);
+    }
+    for text in ["", "h", "5", "5x", "-1d", "1 d"] {
+        assert!(Span::parse(text).is_none(), "{text}");
+    }
+    let hour = Span::parse("1mo").unwrap();
+    assert_eq!(hour.words(), "1 month");
+    assert_eq!(Span::parse("24h").unwrap().words(), "24 hours");
+    assert_eq!(Span::parse("1d").unwrap().short(), "1 d");
+    assert_eq!(date_text("2026-10-01"), "1 Oct 2026");
+    assert_eq!(parse_date("1 Oct 2026"), parse_date("2026-10-01"));
+}
+
+#[test]
+fn requirements_read_as_words() {
+    let form = form(MANIFEST);
+    let control = |id: &str| form.control(id).unwrap();
     assert_eq!(
-        labels,
-        [
-            ("Manifest", "Manifest version"),
-            ("Automatic sending", "Interval"),
-            ("Checks", "Check 1 · ID"),
-            ("Checks", "Check 1 · Require · Min"),
-        ]
-        .map(|(section, label)| (section.to_owned(), label.to_owned()))
+        control("screen_lock").requirement_text(Os::Macos),
+        "≤ 5 min"
+    );
+    assert_eq!(
+        control("os_patch_age_days").requirement_text(Os::Linux),
+        "≤ 30 days"
+    );
+    assert_eq!(
+        control("password_min_length").requirement_text(Os::Windows),
+        "≥ 10"
+    );
+    assert_eq!(
+        control("disk_encryption").requirement_text(Os::Macos),
+        "Full"
+    );
+    assert_eq!(
+        control("preboot_auth").requirement_text(Os::Macos),
+        "User secret"
+    );
+    assert_eq!(
+        control("antimalware_full_scan_age_days").requirement_text(Os::Macos),
+        "reported"
+    );
+    assert_eq!(
+        control("log_oldest_record_days").requirement_text(Os::Windows),
+        "≥ 90 days"
+    );
+    assert_eq!(
+        control("log_oldest_record_days").requirement_text(Os::Macos),
+        "n/a"
+    );
+    assert_eq!(
+        control("log_oldest_record_days").requirement_text(Os::Linux),
+        "reported"
+    );
+    assert_eq!(control("screen_lock").name(), "Screen lock");
+    assert_eq!(control("screen_lock").grace_text(), "1 d");
+    let tags: Vec<_> = ["disk_encryption", "firewall", "os_supported"]
+        .map(|id| manifest::source_tag(&control(id).source))
+        .into();
+    assert_eq!(tags, ["Contract", "Policy", "Standard"]);
+    let multiple = Requirement::Values(vec!["le_5min".into(), "le_15min".into()]);
+    assert_eq!(
+        manifest::requirement_text(control("screen_lock"), &multiple),
+        "≤ 5 min or ≤ 15 min"
+    );
+    assert_eq!(
+        manifest::value_label("screen_lock", "le_5min", true),
+        "Locks within 5 min"
     );
 }
 
 #[test]
-fn list_editor_adds_edits_and_removes_items() {
-    use manifest::ListEdit;
-    let text = "folders = [\"one\", \"two\"]\n";
-    let field = manifest::fields(text).unwrap().remove(0);
-    assert_eq!(manifest::list_items(&field).unwrap(), ["one", "two"]);
-    let changed = manifest::edit_list(text, &field, ListEdit::Set(0, "new path")).unwrap();
-    let changed = manifest::edit_list(&changed, &field, ListEdit::Remove(1)).unwrap();
-    let changed = manifest::edit_list(&changed, &field, ListEdit::Add).unwrap();
-    let items = manifest::list_items(&manifest::fields(&changed).unwrap().remove(0)).unwrap();
-    assert_eq!(items, ["new path", ""]);
-    assert!(manifest::edit_list(&changed, &field, ListEdit::Remove(9)).is_err());
+fn the_form_reads_every_section() {
+    let form = form(MANIFEST);
+    assert_eq!(form.issuer, "Example Company, IT security");
+    assert_eq!(form.max_age, "24h");
+    assert_eq!(form.retention, "1mo");
+    assert_eq!(form.unknown_grace, "7d");
+    assert_eq!(form.trust, "L0");
+    assert_eq!(
+        form.recipients,
+        ["Company IT security", "Auditor on request"]
+    );
+    assert!(!form.metadata.contains(&"virtualized".to_owned()));
+    let schedule = form.schedule.as_ref().unwrap();
+    assert_eq!(
+        (schedule.mode.as_str(), schedule.interval.as_str()),
+        ("vpn", "55m")
+    );
+    assert_eq!(schedule.probe, "10.0.0.1:443");
+    assert_eq!(form.controls.len(), 21);
+    let (all, required, reported) = form.counts();
+    assert_eq!(all, required + reported);
+    assert!(reported > 0 && required > reported);
+    assert_eq!(form.visible(Filter::All, "").len(), all);
+    assert_eq!(form.visible(Filter::Required, "").len(), required);
+    assert_eq!(form.visible(Filter::Reported, "").len(), reported);
+    assert_eq!(form.visible(Filter::All, "SCREEN"), [2]);
+    assert_eq!(form.visible(Filter::All, "os_patch"), [3]);
+    assert_eq!(
+        form.visible(Filter::All, "no such check"),
+        Vec::<usize>::new()
+    );
+    assert!(Form::parse("name = ").is_err());
+}
+
+#[test]
+fn edits_keep_comments_and_order() {
+    let mut text = MANIFEST.to_owned();
+    text = manifest::set_top_text(&text, "issuer", "Example Company, Security").unwrap();
+    text = manifest::set_top_text(&text, "min_trust_level", "L1").unwrap();
+    text = manifest::set_top_list(&text, "claim_recipients", &["One".to_owned()]).unwrap();
+    text = manifest::set_schedule(&text, "interval", "2h").unwrap();
+    text = manifest::set_control_text(&text, 0, "grace", "2d").unwrap();
+    text = manifest::set_requirement(&text, 3, Os::Windows, &Requirement::Max(21)).unwrap();
+    text = manifest::set_requirement(
+        &text,
+        2,
+        Os::Linux,
+        &Requirement::Values(vec!["le_15min".into()]),
+    )
+    .unwrap();
+    text = manifest::set_requirement(&text, 1, Os::Macos, &Requirement::Reported).unwrap();
+    for kept in [
+        "# Example manifest. Fictional.",
+        "# demo only: software device keys are L0",
+        "# Illustrative V3.1 baseline.",
+        "# Demo only: this witness key comes from a public seed",
+    ] {
+        assert!(text.contains(kept), "{kept}\n{text}");
+    }
+    assert!(
+        text.contains("min_trust_level = \"L1\"               # demo only"),
+        "{text}"
+    );
+    assert!(text.contains("claim_recipients = [\"One\"]"), "{text}");
+    assert!(text.contains("interval = \"2h\""), "{text}");
+    assert!(
+        text.contains(
+            "required = { macos = { max = 30 }, windows = { max = 21 }, linux = { max = 30 } }"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "required = { macos = \"le_5min\", windows = \"le_5min\", linux = \"le_15min\" }"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("required = { windows = \"on\", linux = \"on\" }"),
+        "{text}"
+    );
+    let after = form(&text);
+    assert_eq!(after.issuer, "Example Company, Security");
+    assert_eq!(after.controls[0].grace, "2d");
+    assert_eq!(
+        after.controls[1].requirement(Os::Macos),
+        &Requirement::Reported
+    );
+    let order =
+        |text: &str| -> Vec<String> { form(text).controls.into_iter().map(|c| c.id).collect() };
+    assert_eq!(order(&text), order(MANIFEST));
+    let keys = |text: &str| -> Vec<String> {
+        text.lines()
+            .filter_map(|line| line.split_once(" = ").map(|(key, _)| key.to_owned()))
+            .collect()
+    };
+    assert_eq!(keys(&text), keys(MANIFEST));
+    assert!(manifest::set_control_text(&text, 0, "id", "firewall").is_err());
+    assert!(manifest::set_control_text(&text, 99, "grace", "1d").is_err());
+}
+
+#[test]
+fn optional_text_is_removed_when_cleared() {
+    let text = manifest::set_control_text(MANIFEST, 0, "source_ref", "").unwrap();
+    assert!(!form(&text).controls[0].source_ref.contains("Client"));
+    assert!(!text.contains("security annex"));
+    let text = manifest::set_control_text(&text, 1, "rationale", "Keep it on.").unwrap();
+    assert_eq!(form(&text).controls[1].rationale, "Keep it on.");
+}
+
+#[test]
+fn a_check_is_added_as_reported_and_removed_again() {
+    let before = form(MANIFEST);
+    let addable = manifest::addable(&before);
+    let ids: Vec<_> = addable.iter().map(|known| known.id).collect();
+    assert_eq!(
+        ids,
+        [
+            "password_set",
+            "web_protection",
+            "process_audit",
+            "remote_wipe",
+            "powershell_logging"
+        ]
+    );
+    let (text, index) = manifest::add_control(MANIFEST, "remote_wipe").unwrap();
+    let after = form(&text);
+    assert_eq!(index, 21);
+    let added = &after.controls[index];
+    assert_eq!(added.id, "remote_wipe");
+    assert_eq!(added.check, "builtin:remote_wipe@1");
+    assert_eq!(
+        added.output,
+        Output::Choices(["on", "off", "n/a", "unknown"].map(String::from).into())
+    );
+    assert!(!added.is_required());
+    assert_eq!(added.source, "company_policy");
+    assert!(text.contains("required = {}"), "{text}");
+    assert!(text.contains("# Demo only: this witness key"));
+    assert!(manifest::add_control(&text, "remote_wipe").is_err());
+    assert!(manifest::add_control(MANIFEST, "unknown_check").is_err());
+    let integer = manifest::add_control(MANIFEST, "password_set").unwrap().0;
+    assert!(form(&integer).controls.last().is_some());
+    let removed = manifest::remove_control(&text, index).unwrap();
+    assert_eq!(form(&removed), before);
+    assert!(removed.contains("# Illustrative V3.1 baseline."));
+    assert!(manifest::remove_control(&removed, index).is_err());
+    assert_eq!(
+        manifest::changes(&before, &after),
+        ["Added check: Remote wipe"]
+    );
+    assert_eq!(
+        manifest::changes(&after, &before),
+        ["Removed check: Remote wipe"]
+    );
+}
+
+#[test]
+fn changed_rows_and_the_change_list_are_in_words() {
+    let (before, after) = (form(MANIFEST), form(MANIFEST_V2));
+    assert_eq!(
+        manifest::changes(&before, &after),
+        ["OS updates: macOS 30 → 14 days"]
+    );
+    assert_eq!(
+        manifest::changed_controls(&before, &after),
+        ["os_patch_age_days"]
+    );
+    assert!(manifest::changes(&before, &before).is_empty());
+    let mut text = manifest::set_top_text(MANIFEST, "claim_max_age", "12h").unwrap();
+    text = manifest::set_top_text(&text, "valid_from", "2026-11-02").unwrap();
+    text = manifest::set_control_text(&text, 2, "source", "standard").unwrap();
+    text = manifest::set_control_text(&text, 2, "grace", "2w").unwrap();
+    text = manifest::set_requirement(&text, 2, Os::Windows, &Requirement::Reported).unwrap();
+    text = manifest::set_top_list(
+        &text,
+        "disclosed_metadata",
+        &form(&text)
+            .metadata
+            .into_iter()
+            .filter(|key| key != "log_checkpoint")
+            .chain(["virtualized".to_owned()])
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    assert_eq!(
+        manifest::changes(&before, &form(&text)),
+        [
+            "Valid from: 1 Oct 2026 → 2 Nov 2026",
+            "A result is valid for: 24 hours → 12 hours",
+            "Sent with each result: added Runs in a virtual machine",
+            "Sent with each result: removed Log checkpoint",
+            "Screen lock: asked for by Customer contract → Standard",
+            "Screen lock: Windows ≤ 5 min → reported",
+            "Screen lock: time to fix 1 day → 2 weeks",
+        ]
+    );
+}
+
+#[test]
+fn sending_mode_follows_the_core_rules() {
+    let always = manifest::set_send_mode(MANIFEST, "always").unwrap();
+    assert!(!always.contains("vpn_probe"));
+    assert_eq!(form(&always).schedule.unwrap().mode, "always");
+    let back = manifest::set_send_mode(&always, "vpn").unwrap();
+    assert!(back.contains("vpn_probe = \"\""));
+    let probe = manifest::set_schedule(&back, "vpn_probe", "10.0.0.2:443").unwrap();
+    assert_eq!(form(&probe).schedule.unwrap().probe, "10.0.0.2:443");
+    let none = "manifest_version = 1\n";
+    let created = manifest::set_send_mode(none, "always").unwrap();
+    assert_eq!(form(&created).schedule.unwrap().interval, "1h");
+}
+
+#[test]
+fn the_overview_lists_live_devices_by_newest_result() {
+    use runner::admin::{Device, latest_results};
+    let mut devices: Vec<Device> =
+        serde_json::from_str(include_str!("../../../tests/fixtures/devices.json")).unwrap();
+    let device = |pseudonym: &str, state: &str, claim: Option<&str>| {
+        let mut device = devices[0].clone();
+        device.pseudonym = pseudonym.into();
+        device.state = state.into();
+        device.last_claim_at = claim.map(str::to_owned);
+        device.last_result = claim.map(|_| serde_json::json!("accepted"));
+        device
+    };
+    devices.splice(
+        0..0,
+        [
+            device("revoked-new", "revoked", Some("2026-11-16T13:00:00Z")),
+            device("revoked-none", "revoked", None),
+            device("approved-none", "approved", None),
+            device("approved-newest", "approved", Some("2026-11-16T12:30:00Z")),
+        ],
+    );
+    let names: Vec<_> = latest_results(&devices)
+        .iter()
+        .map(|d| d.pseudonym.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "approved-newest",
+            "fictional-a",
+            "fictional-b",
+            "approved-none",
+            "fictional-c"
+        ]
+    );
+    assert!(latest_results(&[]).is_empty());
 }
 
 #[test]
