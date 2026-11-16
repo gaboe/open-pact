@@ -1,0 +1,23 @@
+Action needed. See the items below.
+Observed: 2026-11-16T10:00:00Z (online).
+
+1. No claim response is recorded yet.
+   Fix: Run the signed checks and send the first claim.
+   Run: open-pact-client --home '/home/example/pact' check
+   Deadline: Unknown until the gateway answers a claim.
+
+Device: approved (gateway refreshed now).
+Automatic sending: on. Job: installed and current; OS checked now.
+Signed schedule: every 55 minutes on any network, and at once when a check result changes.
+VPN: not required by the signed schedule.
+Last claim sent: none confirmed in the local log.
+Last claim response: none recorded.
+Manifest agreement: yes; gateway checked now.
+Signed: sha256:<signed>
+Enforced: sha256:<signed>
+
+Log: checkpoint verified now; own-entry proofs not requested.
+Current checks: unknown; status does not run checks or send a claim.
+Note: An accepted saved response does not prove a verified certificate install.
+Note: Exact grace deadlines are unavailable; the gateway returns text, not first-failure times.
+Exit: 1

@@ -8,6 +8,7 @@ mod locallog;
 mod schedule;
 #[cfg(target_os = "macos")]
 mod secure_enclave;
+mod status;
 mod ui;
 
 use std::cell::Cell;
@@ -59,6 +60,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Show the device status without running checks or sending a claim
+    Status(status::Options),
     /// Check the gateway against the invitation from IT, show the manifest, sign it and enrol
     Join {
         /// The opi1: invitation string from IT
@@ -3849,9 +3852,10 @@ async fn run(cli: Cli) -> Result<ExitCode> {
     #[cfg(windows)]
     if !matches!(
         &cli.command,
-        Command::Manifest {
-            command: ManifestCommand::Show
-        }
+        Command::Status(_)
+            | Command::Manifest {
+                command: ManifestCommand::Show
+            }
     ) {
         match home.recover_vpn_at_startup() {
             Ok(true) => {}
@@ -3864,6 +3868,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         }
     }
     match cli.command {
+        Command::Status(options) => status::run(&home, options, cli.insecure_dev).await,
         Command::Join {
             invitation,
             yes,

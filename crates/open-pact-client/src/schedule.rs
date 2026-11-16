@@ -1863,6 +1863,40 @@ pub(crate) async fn turn_off(home: &Home, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum JobStatus {
+    Current,
+    Missing,
+    Outdated,
+    Leftover,
+    Absent,
+    SystemUnconfirmed,
+}
+
+pub(crate) fn inspect_job(home: &Home, config: &DeviceConfig) -> Result<JobStatus> {
+    if config.auto_send && config.run_as == RunAs::System {
+        return Ok(JobStatus::SystemUnconfirmed);
+    }
+    let desired = config.auto_send.then(|| Applied {
+        run_as: config.run_as,
+        executable: std::env::current_exe().unwrap_or_default(),
+        user_home: None,
+    });
+    let home = Home(schedule_home(&home.0, true)?);
+    let observed = observe(&home, desired.as_ref(), false)?;
+    let applied = read_applied(&home)?;
+    Ok(
+        match reconcile(desired.as_ref(), applied.as_ref(), &observed) {
+            Change::None if desired.is_some() => JobStatus::Current,
+            Change::None => JobStatus::Absent,
+            Change::Install => JobStatus::Missing,
+            Change::Update => JobStatus::Outdated,
+            Change::Remove => JobStatus::Leftover,
+        },
+    )
+}
+
 /// `schedule status`: the owner's choice, the company's policy and the state of the job.
 async fn status(home: &Home) -> Result<()> {
     let config = DeviceConfig::load_or_migrate(home, crate::user_profile().as_deref(), false)?;

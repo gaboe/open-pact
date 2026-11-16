@@ -1,0 +1,21 @@
+Action needed. See the items below.
+Observed: 2026-11-16T10:00:00Z (online).
+
+1. This device is not enrolled.
+   Fix: Get an invitation from IT.
+   Run: open-pact-client --home '/home/example/pact' join <invitation from IT>
+   Deadline: Not applicable before enrolment.
+
+Device: unknown (not enrolled).
+Automatic sending: off. Job: no installation record; OS job not checked.
+Signed schedule: unknown without a signed manifest.
+VPN: not probed.
+Last claim sent: none confirmed in the local log.
+Last claim response: none recorded.
+Manifest agreement: no enrolled manifest.
+
+Log: not verified by status; manual alarms are not saved.
+Current checks: unknown; status does not run checks or send a claim.
+Note: An accepted saved response does not prove a verified certificate install.
+Note: Exact grace deadlines are unavailable; the gateway returns text, not first-failure times.
+Exit: 1

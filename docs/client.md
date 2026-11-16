@@ -230,6 +230,42 @@ Run `open-pact-client schedule off` with the same absolute `--home` before delet
 
 Limited Windows operations leave orphaned protected state and the shared binary unchanged. To remove those leftovers, run `schedule off` from an elevated PowerShell prompt. SYSTEM removal needs elevation and uses the existing protected state lock. A held lock stops task removal and asks you to retry. Removal cleans up the shared binary only when no SYSTEM task uses it. If cleanup fails, retry `schedule off` after the client stops or Windows restarts.
 
+## Show the device status
+
+Run `status` to see where the device stands. It reads the client home and prints a summary. It never runs the checks, never sends a claim, never accepts a manifest, and writes no file.
+
+```sh
+open-pact-client status
+open-pact-client status --online
+open-pact-client status --json
+```
+
+The summary shows:
+
+- a headline: no known problem, action needed, log alarm, or some status unknown
+- one numbered item for each problem, with the fix, the command to run, and the deadline
+- whether IT approved, left pending, or revoked this device
+- your choice for automatic sending, the state of the job, the signed schedule, and the VPN probe
+- the send time and the response time of the last claim, and whether the gateway accepted or denied it
+- the time of the last claim that the scheduled job sent, when it differs from the last claim
+- whether the manifest you signed is the manifest the gateway enforces
+- the state of the transparency log
+
+The local view is the default. It reads only the files in the client home and makes no network or OS query. It marks approval and manifest agreement as saved or unknown, and it prints the `status --online` command to refresh them. `--online` asks the gateway for the current approval, manifest, and log checkpoint, probes the VPN address from the signed schedule, and asks the OS about the job. It authenticates to the gateway only after the pinned keys and the checkpoint verify, and it stops with an alarm when they do not. It does not store the checkpoint.
+
+`status` cannot tell you that the device is compliant now. Only `check` runs the checks and gets a new answer. The gateway words its grace warning as a time left, for example `access ends in 23h`. The summary adds the absolute time, which is the time of the response plus that span. The gateway rounds the span down, so the time is approximate. Without such a span in the warning, the deadline is unknown.
+
+The exit code tells a script what to do:
+
+| Code | Meaning |
+| --- | --- |
+| 0 | No known problem. Only an online report can return it: approved, same manifest, accepted last claim, and a job that matches your choice. |
+| 1 | Action needed. At least one item has a fix. |
+| 2 | Alarm. A log or key verification failed. Keep the checkpoint and tell IT. |
+| 3 | Unknown. Nothing is wrong on record, but some status is unconfirmed. A local report always ends here. |
+
+`--json` prints the same evidence, items, and exit code as one JSON document. `schedule status` stays the detailed view of the schedule and the job.
+
 ## Understand what leaves the device
 
 `join` sends the invitation, signed manifest, owner and device public keys, and signatures that bind the owner, device, invitation, and manifest. It sends no private keys.
