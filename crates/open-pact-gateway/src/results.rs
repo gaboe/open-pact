@@ -31,7 +31,7 @@ const BATCH: i64 = 200;
 pub enum Command {
     /// List stored claims, newest first
     List {
-        /// Print {"claims": [...], "unreadable": n}. On an error it prints {"error": ...} and exits 1
+        /// Print {"claims": [...], "unreadable": n}. On an error it prints {"error": ...}. Usage errors exit 2, other errors exit 1
         #[arg(long)]
         json: bool,
         /// Only claims of this device: at least 8 hex digits of its pseudonym
@@ -50,7 +50,7 @@ pub enum Command {
     /// Show every check of one claim against the manifest it was made under
     Show {
         id: i64,
-        /// Print one JSON document. On an error it prints {"error": ...} and exits 1
+        /// Print one JSON document. On an error it prints {"error": ...}. Usage errors exit 2, other errors exit 1
         #[arg(long)]
         json: bool,
     },
@@ -390,7 +390,7 @@ pub async fn show(
                     first_failed_at: first_failed_at.copied().map(stamp),
                     deadline: span
                         .zip(first_failed_at)
-                        .and_then(|(span, first)| span.after(*first))
+                        .and_then(|(span, first)| first.checked_add_signed(span.min_duration()?))
                         .map(stamp),
                 });
             }
@@ -995,6 +995,76 @@ grace = "1d"
             "the gateway holds no start for it"
         );
         assert_eq!(disk.deadline, None);
+    }
+
+    /// A month of grace ends when the evaluator stops accepting the failure: 28 days, not a
+    /// calendar month.
+    #[tokio::test]
+    #[ignore = "needs TEST_DATABASE_URL"]
+    async fn show_deadline_of_a_month_grace_is_the_day_the_evaluator_stops_accepting() {
+        let db = testdb::fresh().await;
+        let toml = manifest_toml()
+            .replace(
+                "required = { linux = \"on\" }\ngrace = \"1d\"",
+                "required = { linux = \"on\" }\ngrace = \"1mo\"",
+            )
+            .replace("unknown_grace = \"7d\"", "unknown_grace = \"1mo\"");
+        let manifest = Manifest::parse(toml.as_bytes()).unwrap();
+        sqlx::query("INSERT INTO manifest_versions (toml, hash, active) VALUES ($1, $2, false)")
+            .bind(&toml)
+            .bind(manifest.hash().as_str())
+            .execute(&db)
+            .await
+            .unwrap();
+        let device = Pseudonym::of(&PublicKey::from(&dev_key::generate()));
+        testdb::enrolled_device(&db, device.as_str(), manifest.hash().as_str()).await;
+        sqlx::query(
+            "INSERT INTO control_failures (pseudonym, manifest_hash, control, first_failed_at) VALUES ($1, $2, 'firewall', $3)",
+        )
+        .bind(device.as_str())
+        .bind(manifest.hash().as_str())
+        .bind(at("2026-10-01T08:00:00Z"))
+        .execute(&db)
+        .await
+        .unwrap();
+        let evaluated = at("2026-10-30T08:00:00Z");
+        let off = put(
+            &db,
+            "12mo",
+            &claim(
+                &device,
+                manifest.hash(),
+                Os::Linux,
+                evaluated,
+                &[("disk_encryption", "full"), ("firewall", "off")],
+            ),
+            false,
+        )
+        .await;
+        let unknown = put(
+            &db,
+            "12mo",
+            &claim(
+                &device,
+                manifest.hash(),
+                Os::Linux,
+                evaluated,
+                &[("disk_encryption", "full"), ("firewall", "unknown")],
+            ),
+            false,
+        )
+        .await;
+
+        let kek = SealingKey::new(&KEK);
+        for id in [off, unknown] {
+            let detail = show(&db, &kek, None, id).await.unwrap();
+            let firewall = detail.controls.iter().find(|c| c.id == "firewall").unwrap();
+            assert_eq!(
+                firewall.deadline.as_deref(),
+                Some("2026-10-29T08:00:00Z"),
+                "claim {id}"
+            );
+        }
     }
 
     #[tokio::test]

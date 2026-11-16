@@ -1563,6 +1563,31 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
+/// The claims commands only read, so they do not migrate. A schema older than this gateway fails
+/// with a hint, and nothing is written.
+async fn check_schema_current(db: &PgPool) -> anyhow::Result<()> {
+    let table: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NOT NULL")
+        .fetch_one(db)
+        .await?;
+    let applied: Vec<i64> = if table {
+        sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE success")
+            .fetch_all(db)
+            .await?
+    } else {
+        Vec::new()
+    };
+    let older = sqlx::migrate!("./migrations")
+        .migrations
+        .iter()
+        .any(|migration| !applied.contains(&migration.version));
+    if older {
+        anyhow::bail!(
+            "the database schema is older than this gateway; start the gateway once to migrate it"
+        );
+    }
+    Ok(())
+}
+
 /// The error line for a command line that does not parse, when it asked for JSON. Help and version
 /// output, and the errors of a command line that did not ask for JSON, stay as clap prints them.
 fn usage_error_line(args: &[std::ffi::OsString], error: &clap::Error) -> Option<String> {
@@ -1582,8 +1607,13 @@ fn usage_error_line(args: &[std::ffi::OsString], error: &clap::Error) -> Option<
 
 async fn run(cli: Cli) -> anyhow::Result<()> {
     let db = connect(&std::env::var("DATABASE_URL")?).await?;
-    sqlx::migrate!("./migrations").run(&db).await?;
-    match cli.command.unwrap_or(Command::Serve) {
+    let command = cli.command.unwrap_or(Command::Serve);
+    if matches!(command, Command::Claims { .. }) {
+        check_schema_current(&db).await?;
+    } else {
+        sqlx::migrate!("./migrations").run(&db).await?;
+    }
+    match command {
         Command::Serve => serve(db).await,
         Command::Invite {
             json,
