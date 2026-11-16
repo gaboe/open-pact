@@ -105,14 +105,14 @@ kubectl exec deploy/pact-gateway -- open-pact-gateway status --json
 
 `invite --json` prints `{"invitation": "opi1:…", "expires_at": "2026-11-05T10:00:00Z", "company_key_fingerprint": "sha256:…", "note": "Example laptop"}` and nothing on stderr.
 
-`status --json` reads the manifest the same way `serve` does (`MANIFEST_PATH`, or the example manifest) and `AUTO_APPROVE`:
+`status --json` reads the manifest the same way `serve` does. The active database version takes precedence. Without one, the gateway reads `MANIFEST_PATH`, or the example manifest when that variable is unset. Status also reports `AUTO_APPROVE`:
 
 ```json
-{"version": "0.6.0", "manifest_hash": "sha256:…", "auto_approve": false,
+{"version": "0.6.0", "manifest_hash": "sha256:…", "manifest_source": "database", "manifest_version": 3, "auto_approve": false,
  "devices": {"pending": 1, "approved": 12, "revoked": 0}, "company_key_fingerprint": "sha256:…"}
 ```
 
-`devices` counts distinct pseudonyms per state. Without `--json`, `status` prints the same facts as text.
+`manifest_source` is `database`, `file` for `MANIFEST_PATH`, or `builtin` for the image's example manifest. `manifest_version` is the active database version, or `null` for either file source. `devices` counts distinct pseudonyms per state. Without `--json`, `status` prints the same facts as text.
 
 ## Run a witness
 
