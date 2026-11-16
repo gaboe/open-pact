@@ -2668,8 +2668,7 @@ grace = "1d"
         assert_eq!(accepted.hash(), signed.hash());
 
         let error = consented_manifest(&enforced, signed.hash(), Some(DEMO))
-            .err()
-            .expect("a different manifest must require consent");
+            .expect_err("a different manifest must require consent");
         assert_eq!(
             error,
             format!(
@@ -2683,9 +2682,8 @@ grace = "1d"
 
     #[test]
     fn gateway_main_semantics_log_origin_rejects_empty_value() {
-        let error = parse_log_origin(Some(String::new()))
-            .err()
-            .expect("an empty log origin is invalid");
+        let error =
+            parse_log_origin(Some(String::new())).expect_err("an empty log origin is invalid");
 
         assert_eq!(
             error.to_string(),
@@ -2706,8 +2704,7 @@ grace = "1d"
             ),
         ] {
             let error = parse_log_origin(Some(origin.into()))
-                .err()
-                .expect("invalid log origin characters must be rejected");
+                .expect_err("invalid log origin characters must be rejected");
             assert_eq!(error.to_string(), expected);
         }
 
@@ -2847,8 +2844,7 @@ grace = "1d"
             "FICTIONAL",
         )
         .await
-        .err()
-        .expect("a disallowed URL scheme must be rejected");
+        .expect_err("a disallowed URL scheme must be rejected");
 
         assert_eq!(
             error.to_string(),
@@ -2870,8 +2866,7 @@ grace = "1d"
 
         let error = log_entries(&db, u64::MAX, 1, &mut output)
             .await
-            .err()
-            .expect("an overflowing log range must be rejected");
+            .expect_err("an overflowing log range must be rejected");
 
         assert_eq!(
             error.to_string(),
