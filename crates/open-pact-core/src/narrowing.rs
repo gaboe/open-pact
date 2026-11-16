@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use crate::{Manifest, Metadata, Os, Output};
+use crate::{Manifest, Metadata, Os, Output, Schedule};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Violation {
@@ -44,6 +44,14 @@ pub enum Violation {
 
 fn added<T: Ord + Clone>(old: &BTreeSet<T>, new: &BTreeSet<T>) -> Vec<T> {
     new.difference(old).cloned().collect()
+}
+
+pub fn schedule_widened(old: Option<&Schedule>, new: Option<&Schedule>) -> bool {
+    new.is_some_and(|now| {
+        old.is_none_or(|was| {
+            was.policy != now.policy || now.interval.as_secs() < was.interval.as_secs()
+        })
+    })
 }
 
 pub fn is_narrowing(old: &Manifest, new: &Manifest) -> Result<(), Vec<Violation>> {
@@ -131,11 +139,7 @@ pub fn is_narrowing(old: &Manifest, new: &Manifest) -> Result<(), Vec<Violation>
     if new.log != old.log {
         v.push(Violation::WitnessPolicyChanged);
     }
-    if let Some(now) = &new.schedule
-        && old.schedule.as_ref().is_none_or(|was| {
-            was.policy != now.policy || now.interval.as_secs() < was.interval.as_secs()
-        })
-    {
+    if schedule_widened(old.schedule.as_ref(), new.schedule.as_ref()) {
         v.push(Violation::ScheduleWidened);
     }
 
@@ -211,6 +215,38 @@ mod tests {
             Err(vec![Violation::ScheduleWidened])
         );
         assert_eq!(is_narrowing(&new, &old), Ok(()));
+    }
+
+    #[test]
+    fn schedule_widening_matches_the_signed_schedule_policy() {
+        let vpn_55m: Schedule =
+            toml::from_str("mode = \"vpn\"\nvpn_probe = \"10.0.0.1:443\"\ninterval = \"55m\"")
+                .unwrap();
+        let vpn_30m: Schedule =
+            toml::from_str("mode = \"vpn\"\nvpn_probe = \"10.0.0.1:443\"\ninterval = \"30m\"")
+                .unwrap();
+        let vpn_2h: Schedule =
+            toml::from_str("mode = \"vpn\"\nvpn_probe = \"10.0.0.1:443\"\ninterval = \"2h\"")
+                .unwrap();
+        let vpn_other_probe: Schedule =
+            toml::from_str("mode = \"vpn\"\nvpn_probe = \"10.0.0.2:443\"\ninterval = \"55m\"")
+                .unwrap();
+        let vpn_other_name: Schedule = toml::from_str(
+            "mode = \"vpn\"\nvpn_probe = \"10.0.0.1:443\"\nvpn_probe_name = \"other.example.org\"\ninterval = \"55m\"",
+        )
+        .unwrap();
+        let always_55m: Schedule = toml::from_str("mode = \"always\"\ninterval = \"55m\"").unwrap();
+
+        assert!(schedule_widened(None, Some(&vpn_55m)));
+        assert!(!schedule_widened(Some(&vpn_55m), None));
+        assert!(schedule_widened(Some(&vpn_55m), Some(&always_55m)));
+        assert!(schedule_widened(Some(&always_55m), Some(&vpn_55m)));
+        assert!(schedule_widened(Some(&vpn_55m), Some(&vpn_other_probe)));
+        assert!(schedule_widened(Some(&vpn_55m), Some(&vpn_other_name)));
+        assert!(schedule_widened(Some(&vpn_55m), Some(&vpn_30m)));
+        assert!(!schedule_widened(Some(&vpn_55m), Some(&vpn_2h)));
+        assert!(!schedule_widened(Some(&vpn_55m), Some(&vpn_55m)));
+        assert!(!schedule_widened(None, None));
     }
 
     #[test]

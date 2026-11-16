@@ -1904,7 +1904,7 @@ async fn status(home: &Home) -> Result<()> {
             Change::Install => format!("The job is not installed. Run `{command} schedule on`."),
             Change::Update => format!("The job is out of date. Run `{command} schedule on`."),
             Change::Remove => format!(
-                "A job from an earlier setup remains. Run `{command} schedule off` to remove it."
+                "The job is installed, but it sends nothing while automatic sending is off. Run `{command} schedule on` to agree to the signed schedule, or `{command} schedule off` to remove the job."
             ),
         }
     );

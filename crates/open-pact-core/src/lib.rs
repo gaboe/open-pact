@@ -34,7 +34,7 @@ pub use manifest::{
     LogPolicy, Manifest, ManifestBody, Maximum, Metadata, Minimum, Os, Output, ProbeAddress,
     ProbeName, Schedule, SendPolicy, Source, Span, TimestampOutput, TrustLevel, Witness,
 };
-pub use narrowing::{Violation, is_narrowing};
+pub use narrowing::{Violation, is_narrowing, schedule_widened};
 pub use note::{Checkpoint, LogKey, Note, NoteSignature, WitnessKey};
 pub use own_entries::{
     DeviceAuthPurpose, DeviceStatus, EntryWithProof, MyEntries, MyEntriesRequest,
