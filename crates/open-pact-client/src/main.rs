@@ -51,6 +51,7 @@ mod device_key;
 mod fake_gateway;
 mod json_out;
 mod locallog;
+mod manifest_check;
 mod schedule;
 #[cfg(target_os = "macos")]
 mod secure_enclave;
@@ -116,6 +117,9 @@ impl Cli {
                     | Command::Join { json: true, .. }
                     | Command::Check { json: true, .. }
                     | Command::Accept { preview: true, .. }
+                    | Command::Manifest {
+                        command: ManifestCommand::Check { json: true }
+                    }
             ),
         }
     }
@@ -178,7 +182,7 @@ enum Command {
         #[command(subcommand)]
         command: FoldersCommand,
     },
-    /// Show the manifest this device signed and where its full text is
+    /// Show the manifest this device signed, or check a manifest draft
     Manifest {
         #[command(subcommand)]
         command: ManifestCommand,
@@ -219,6 +223,12 @@ enum FoldersCommand {
 enum ManifestCommand {
     /// Show the signed manifest stored on this device
     Show,
+    /// Check a manifest draft from stdin with the rules clients and the gateway apply. Needs no home or network
+    Check {
+        /// Print one JSON document: ok, and the errors with their line and key
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -4413,6 +4423,12 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         schedule::probe_command(address, name.as_deref()).await?;
         return Ok(ExitCode::SUCCESS);
     }
+    if let Command::Manifest {
+        command: ManifestCommand::Check { json },
+    } = &cli.command
+    {
+        return manifest_check::run(*json);
+    }
     let home = Home::new(cli.home)?;
     #[cfg(windows)]
     if recovers_vpn_first(&cli.command) {
@@ -4524,6 +4540,9 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             print!("{}", manifest_show(&home)?);
             Ok(ExitCode::SUCCESS)
         }
+        Command::Manifest {
+            command: ManifestCommand::Check { .. },
+        } => unreachable!("handled before the home is read"),
         Command::Schedule { command } => {
             schedule::run(&home, command).await?;
             Ok(ExitCode::SUCCESS)
@@ -4560,7 +4579,7 @@ fn recovers_vpn_first(command: &Command) -> bool {
         command,
         Command::Status(_)
             | Command::Manifest {
-                command: ManifestCommand::Show
+                command: ManifestCommand::Show | ManifestCommand::Check { .. }
             }
             | Command::Join { preview: true, .. }
             | Command::Accept { preview: true, .. }

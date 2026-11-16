@@ -64,3 +64,15 @@ pub enum Error {
     #[error("key file {path}: {reason}")]
     KeyFile { path: String, reason: String },
 }
+
+impl Error {
+    /// The dotted manifest path a manifest error names, such as `log.witness_quorum` or
+    /// `controls.firewall.check`, or `None` when the error names none.
+    pub fn manifest_key(&self) -> Option<String> {
+        match self {
+            Self::ManifestToml(error) => manifest::key_named_by(error.message()),
+            Self::InvalidManifest(message) => manifest::key_named_by(message),
+            _ => None,
+        }
+    }
+}
