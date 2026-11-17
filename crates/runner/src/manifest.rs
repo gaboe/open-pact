@@ -656,8 +656,12 @@ pub const BUILTINS: [Builtin; 26] = [
         about: "A lost or stolen device gives away its files when the disk is not \
             encrypted. On macOS the client runs fdesetup status to see whether \
             FileVault is on, and on Windows it reads the BitLocker protection state \
-            of the system drive. On Linux it runs lsblk and checks that every \
-            mounted writable disk sits on an encrypted volume.",
+            of the system drive. On Linux it runs lsblk -s and counts a disk as \
+            encrypted only when every path from it to its physical devices crosses \
+            an active encryption layer; it checks each writable, non-removable disk \
+            that is mounted or used as swap, and skips the boot mounts /boot, \
+            /boot/efi and /efi, loop, optical and RAM-backed devices, and \
+            non-persistent filesystems such as tmpfs and overlay.",
     },
     Builtin {
         id: "firewall",
@@ -683,12 +687,13 @@ pub const BUILTINS: [Builtin; 26] = [
         max: true,
         noun: "",
         group: Group::SignIn,
-        about: "A device that stays unlocked gives access to anyone nearby. The client \
-            measures how long the device can sit idle before it asks for a password. \
-            On macOS it runs sysadminctl -screenLock status; on Windows it reads the \
-            machine inactivity limit, else the secure screen saver of each signed-in \
-            user; on Linux it reads the GNOME settings with gsettings or the KDE \
-            kscreenlockerrc file.",
+        about: "A device that stays unlocked gives access to anyone nearby. On macOS \
+            the client runs sysadminctl -screenLock status and reads only the password \
+            delay that applies after the screen saver starts or the display turns off; \
+            on Windows it reads the machine inactivity limit, else the secure screen \
+            saver of each signed-in user; on Linux it reads the GNOME settings with \
+            gsettings or the KDE kscreenlockerrc file. The macOS result does not show \
+            the idle time that starts the screen saver or turns off the display.",
     },
     Builtin {
         id: "os_patch_age_days",

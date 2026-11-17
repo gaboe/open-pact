@@ -277,6 +277,13 @@ fn error_line(message: impl Into<SharedString>) -> Div {
         .child(message.into())
 }
 
+/// The draft after the Valid from picker changes. A picked day is written as YYYY-MM-DD. A
+/// cleared picker writes an empty date, so the old date leaves the draft and the CLI refuses the
+/// field.
+fn valid_from_draft(draft: &str, picked: Option<String>) -> Result<String, String> {
+    manifest::set_top_text(draft, "valid_from", &picked.unwrap_or_default())
+}
+
 /// The first message for a field. Unparsed input comes before what the manifest check finds.
 fn error_of(issues: &[FieldError], field: &Field) -> Option<String> {
     issues
@@ -587,11 +594,8 @@ impl AppView {
             window,
             |this, _, event: &DatePickerEvent, window, cx| {
                 let DatePickerEvent::Change(value) = event;
-                let Some(day) = value.start() else {
-                    return;
-                };
-                let text = day.format("%Y-%m-%d").to_string();
-                let result = manifest::set_top_text(&this.draft, "valid_from", &text);
+                let picked = value.start().map(|day| day.format("%Y-%m-%d").to_string());
+                let result = valid_from_draft(&this.draft, picked);
                 this.edit_field(Field::ValidFrom, result, Rebuild::No, window, cx);
             },
         );
@@ -2737,5 +2741,21 @@ mod tests {
             PanelSwitch::Replace
         );
         assert_eq!(panel_switch(None, Some("b"), false), PanelSwitch::Replace);
+    }
+
+    #[test]
+    fn clearing_valid_from_empties_the_draft_date() {
+        let draft = include_str!("../../../tests/fixtures/manifest.toml");
+        let cleared = super::valid_from_draft(draft, None).unwrap();
+        let form = runner::manifest::Form::parse(&cleared).unwrap();
+        assert_eq!(form.valid_from, "");
+    }
+
+    #[test]
+    fn picking_valid_from_writes_the_day() {
+        let draft = include_str!("../../../tests/fixtures/manifest.toml");
+        let picked = super::valid_from_draft(draft, Some("2026-11-05".to_owned())).unwrap();
+        let form = runner::manifest::Form::parse(&picked).unwrap();
+        assert_eq!(form.valid_from, "2026-11-05");
     }
 }
