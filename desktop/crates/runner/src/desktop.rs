@@ -257,7 +257,7 @@ pub fn start_update<V: 'static>(
     let exe = std::env::current_exe()
         .map(|path| path.display().to_string())
         .unwrap_or_default();
-    let Some(call) = update::update_invocation(Platform::current(), &exe) else {
+    let Some(call) = update::update_invocation(Platform::current(), &exe, &version) else {
         return;
     };
     *current = UpdateState::Running(version.clone());

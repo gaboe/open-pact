@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 from pathlib import Path
 
@@ -13,6 +14,10 @@ RELEASE_FILES = {
     "mac_x86_64": "open-pact-client-x86_64-apple-darwin",
     "windows_x86_64": "open-pact-client-x86_64-pc-windows-msvc.exe",
 }
+
+
+def desktop_zip(version: str) -> str:
+    return f"open-pact-desktop-{version}-windows-x64.zip"
 
 
 def read_checksums(path: Path, required_files: set[str] | None = None) -> dict[str, str]:
@@ -119,6 +124,44 @@ def scoop_manifest(version: str, digest: str, placeholder: bool, url: str | None
 '''
 
 
+def desktop_scoop_manifest(version: str, digest: str) -> str:
+    """The Scoop manifest of the desktop apps.
+
+    It has no "bin" entry: the app installs and owns its copy of the client, so a second
+    open-pact-client shim would collide with the shim of the open-pact package.
+    """
+    repo = "https://github.com/gaboe/open-pact"
+    manifest = {
+        "version": version,
+        "description": "Desktop apps for open-pact: join a company and check this device, and edit deployment manifests",
+        "homepage": repo,
+        "license": "MIT",
+        "architecture": {
+            "64bit": {
+                "url": f"{repo}/releases/download/v{version}/{desktop_zip(version)}",
+                "hash": digest,
+            }
+        },
+        "shortcuts": [
+            ["open-pact.exe", "open-pact"],
+            ["open-pact-admin.exe", "open-pact admin"],
+        ],
+        "checkver": {"github": repo},
+        "autoupdate": {
+            "architecture": {
+                "64bit": {
+                    "url": f"{repo}/releases/download/v$version/{desktop_zip('$version')}",
+                }
+            },
+            "hash": {
+                "url": f"{repo}/releases/download/v$version/SHA256SUMS",
+                "regex": "$sha256\\s+$basename",
+            },
+        },
+    }
+    return json.dumps(manifest, indent=2) + "\n"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("version", help="release version without the v prefix")
@@ -127,6 +170,11 @@ def main() -> None:
     parser.add_argument("--scoop-dir", type=Path, required=True)
     parser.add_argument("--scoop-url", help="override the Scoop download URL")
     parser.add_argument("--scoop-only", action="store_true", help="write only the Scoop manifest")
+    parser.add_argument(
+        "--desktop",
+        action="store_true",
+        help="also write open-pact-desktop.json; the checksums must list the Windows desktop zip",
+    )
     parser.add_argument(
         "--placeholder-hashes",
         action="store_true",
@@ -137,7 +185,11 @@ def main() -> None:
         parser.error("version must be a semantic version without a v prefix")
     if not args.scoop_only and args.homebrew_dir is None:
         parser.error("--homebrew-dir is required unless --scoop-only is set")
-    required_files = {RELEASE_FILES["windows_x86_64"]} if args.scoop_only else None
+    required_files = (
+        {RELEASE_FILES["windows_x86_64"]} if args.scoop_only else set(RELEASE_FILES.values())
+    )
+    if args.desktop:
+        required_files.add(desktop_zip(args.version))
     checksums = read_checksums(args.checksums, required_files)
     if args.homebrew_dir is not None:
         args.homebrew_dir.mkdir(parents=True, exist_ok=True)
@@ -159,9 +211,22 @@ def main() -> None:
         ),
         encoding="utf-8",
     )
+    if args.desktop:
+        desktop_path = args.scoop_dir / "open-pact-desktop.json"
+        desktop_path.write_text(
+            desktop_scoop_manifest(
+                args.version,
+                "PLACEHOLDER"
+                if args.placeholder_hashes
+                else checksums[desktop_zip(args.version)],
+            ),
+            encoding="utf-8",
+        )
     if not args.scoop_only:
         print(formula_path)
     print(manifest_path)
+    if args.desktop:
+        print(desktop_path)
 
 
 if __name__ == "__main__":

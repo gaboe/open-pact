@@ -1,15 +1,18 @@
 #!/bin/sh
 # Install or update the open-pact desktop apps on macOS.
 #
-#   curl -fsSL https://raw.githubusercontent.com/gaboe/open-pact-desktop/main/scripts/install-desktop.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/gaboe/open-pact/vX.Y.Z/desktop/scripts/install-desktop.sh | sh
+#
+# vX.Y.Z is the tag of the release to install. The script of a tag installs the latest release,
+# or the release named in OPEN_PACT_DESKTOP_VERSION.
 #
 # The apps are not notarized by Apple. A zip downloaded in a browser is marked as coming from the
 # internet, and macOS then blocks an app it cannot verify. A download made here with curl carries
-# no such mark, so the apps open without that dialog. The zip is checked against the SHA-256
-# published with the same release, and each app's signature is verified, before anything is
-# replaced.
+# no such mark, so the apps open without that dialog. The zip is checked against its line in the
+# SHA256SUMS file of the same release, and each app's signature is verified, before anything is
+# replaced. The release signs SHA256SUMS with Cosign (see docs/client.md, "Verify a release").
 #
-# Run the same line again to update. OPEN_PACT_DESKTOP_VERSION=0.1.0 installs one version;
+# Run the same line again to update. OPEN_PACT_DESKTOP_VERSION=0.8.0 installs one version;
 # OPEN_PACT_INSTALL_DIR changes the folder (default ~/Applications); OPEN_PACT_NO_OPEN=1 skips
 # opening the client.
 set -eu
@@ -17,7 +20,7 @@ set -eu
 # stop the update halfway.
 trap '' PIPE
 
-repo=gaboe/open-pact-desktop
+repo=gaboe/open-pact
 dir=${OPEN_PACT_INSTALL_DIR:-$HOME/Applications}
 apps="open-pact open-pact-admin"
 
@@ -42,8 +45,8 @@ trap 'rm -rf "$work"' EXIT
 say "Downloading $name"
 if [ -t 2 ]; then progress=--progress-bar; else progress=-sS; fi
 curl -fL $progress -o "$work/$name" "$url" || fail "the download failed."
-curl -fsSL -o "$work/$name.sha256" "$url.sha256" || fail "the checksum file is missing for $name."
-want=$(awk '{print $1}' "$work/$name.sha256")
+curl -fsSL -o "$work/SHA256SUMS" "${url%/*}/SHA256SUMS" || fail "the release has no SHA256SUMS file."
+want=$(awk -v n="$name" '$2 == n { print $1 }' "$work/SHA256SUMS")
 got=$(shasum -a 256 "$work/$name" | awk '{print $1}')
 [ -n "$want" ] && [ "$want" = "$got" ] || fail "the download does not match its checksum. Nothing was installed."
 say "Checksum matches."

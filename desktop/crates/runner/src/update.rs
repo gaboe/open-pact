@@ -5,11 +5,11 @@ use crate::{Runner, args, client::version_key};
 use serde_json::Value;
 use std::time::Duration;
 
-pub const REPOSITORY: &str = "gaboe/open-pact-desktop";
+pub const REPOSITORY: &str = "gaboe/open-pact";
 pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
 pub const CHECK_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
 const SCOOP_PACKAGE: &str = "open-pact-desktop";
-const RAW: &str = "https://raw.githubusercontent.com/gaboe/open-pact-desktop/main/scripts";
+const RAW: &str = "https://raw.githubusercontent.com/gaboe/open-pact";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Platform {
@@ -131,27 +131,35 @@ fn install_dir_env(platform: Platform, exe: &str) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
+/// The folder of the install scripts in the source of the release `version`, not of `main`.
+fn scripts_url(version: &str) -> String {
+    format!("{RAW}/v{version}/desktop/scripts")
+}
+
 /// Downloads the installer to a temporary file and runs it. A failed download fails the command.
-fn mac_installer_script() -> String {
+fn mac_installer_script(version: &str) -> String {
+    let scripts = scripts_url(version);
     format!(
-        "set -e; installer=$(mktemp) && trap 'rm -f \"$installer\"' EXIT && curl -fsSL -o \"$installer\" {RAW}/install-desktop.sh && sh \"$installer\""
+        "set -e; installer=$(mktemp) && trap 'rm -f \"$installer\"' EXIT && curl -fsSL -o \"$installer\" {scripts}/install-desktop.sh && sh \"$installer\""
     )
 }
 
-fn windows_installer_script() -> String {
+fn windows_installer_script(version: &str) -> String {
+    let scripts = scripts_url(version);
     format!(
-        "$ErrorActionPreference = 'Stop'; $installer = Join-Path $env:TEMP ('open-pact-install-' + [Guid]::NewGuid().ToString('N') + '.ps1'); try {{ Invoke-WebRequest -UseBasicParsing -Uri '{RAW}/install-desktop.ps1' -OutFile $installer; Invoke-Expression (Get-Content -Raw -Path $installer) }} finally {{ Remove-Item -Path $installer -Force -ErrorAction SilentlyContinue }}"
+        "$ErrorActionPreference = 'Stop'; $installer = Join-Path $env:TEMP ('open-pact-install-' + [Guid]::NewGuid().ToString('N') + '.ps1'); try {{ Invoke-WebRequest -UseBasicParsing -Uri '{scripts}/install-desktop.ps1' -OutFile $installer; Invoke-Expression (Get-Content -Raw -Path $installer) }} finally {{ Remove-Item -Path $installer -Force -ErrorAction SilentlyContinue }}"
     )
 }
 
-/// The command that installs the newest release. `exe` is the path of the running app. There is
-/// none on Linux, where the apps have no installer. Only a direct install gets the folder of the
-/// running app; scoop keeps its own folder.
-pub fn update_invocation(platform: Platform, exe: &str) -> Option<Invocation> {
+/// The command that installs the newest release, `version`. The install script comes from the
+/// tag of that release. `exe` is the path of the running app. There is none on Linux, where the
+/// apps have no installer. Only a direct install gets the folder of the running app; scoop keeps
+/// its own folder.
+pub fn update_invocation(platform: Platform, exe: &str, version: &str) -> Option<Invocation> {
     match platform {
         Platform::Mac => Some(Invocation {
             program: "sh".into(),
-            args: args(&["-c", &mac_installer_script()]),
+            args: args(&["-c", &mac_installer_script(version)]),
             env: install_dir_env(platform, exe),
         }),
         Platform::Windows if under_scoop(exe) => Some(shell_invocation(
@@ -160,7 +168,7 @@ pub fn update_invocation(platform: Platform, exe: &str) -> Option<Invocation> {
         )),
         Platform::Windows => Some(Invocation {
             env: install_dir_env(platform, exe),
-            ..shell_invocation(platform, &windows_installer_script())
+            ..shell_invocation(platform, &windows_installer_script(version))
         }),
         Platform::Other => None,
     }
@@ -307,7 +315,7 @@ mod tests {
                 "-fsSL",
                 "-m",
                 "5",
-                "https://api.github.com/repos/gaboe/open-pact-desktop/releases/latest"
+                "https://api.github.com/repos/gaboe/open-pact/releases/latest"
             ]
         );
         assert_eq!(check_invocation(Platform::Windows).program, "curl.exe");
@@ -318,12 +326,14 @@ mod tests {
         let mac = update_invocation(
             Platform::Mac,
             "/Users/fictional/Applications/open-pact.app/Contents/MacOS/open-pact",
+            "0.8.1",
         )
         .unwrap();
         assert_eq!(mac.program, "sh");
         assert_eq!(mac.args[0], "-c");
-        assert!(mac.args[1].contains("/scripts/install-desktop.sh"));
-        let scoop = update_invocation(Platform::Windows, SCOOP).unwrap();
+        assert!(mac.args[1].contains("/open-pact/v0.8.1/desktop/scripts/install-desktop.sh"));
+        assert!(!mac.args[1].contains("/main/"));
+        let scoop = update_invocation(Platform::Windows, SCOOP, "0.8.1").unwrap();
         assert_eq!(scoop.program, "powershell");
         assert_eq!(
             scoop.args,
@@ -332,23 +342,28 @@ mod tests {
         let custom = update_invocation(
             Platform::Windows,
             r"D:\Tools\Scoop\APPS\open-pact-desktop\1.0\open-pact-admin.exe",
+            "0.8.1",
         )
         .unwrap();
         assert!(custom.args[2].starts_with("scoop update"));
         let plain = update_invocation(
             Platform::Windows,
             r"C:\Users\fictional\AppData\Local\open-pact-desktop\open-pact.exe",
+            "0.8.1",
         )
         .unwrap();
-        assert!(plain.args[2].contains("/scripts/install-desktop.ps1"));
+        assert!(plain.args[2].contains("/open-pact/v0.8.1/desktop/scripts/install-desktop.ps1"));
         let other_package = update_invocation(
             Platform::Windows,
             r"C:\scoop\apps\another\current\open-pact.exe",
+            "0.8.1",
         )
         .unwrap();
-        assert!(other_package.args[2].contains("/scripts/install-desktop.ps1"));
+        assert!(
+            other_package.args[2].contains("/open-pact/v0.8.1/desktop/scripts/install-desktop.ps1")
+        );
         assert_eq!(
-            update_invocation(Platform::Other, "/usr/bin/open-pact"),
+            update_invocation(Platform::Other, "/usr/bin/open-pact", "0.8.1"),
             None
         );
     }
@@ -420,6 +435,7 @@ mod tests {
         let mac = update_invocation(
             Platform::Mac,
             "/Users/fictional/Tools/op/open-pact.app/Contents/MacOS/open-pact",
+            "0.8.1",
         )
         .unwrap();
         assert_eq!(
@@ -432,6 +448,7 @@ mod tests {
         let plain = update_invocation(
             Platform::Windows,
             r"C:\Users\fictional\AppData\Local\open-pact-desktop\open-pact.exe",
+            "0.8.1",
         )
         .unwrap();
         assert_eq!(
@@ -442,12 +459,13 @@ mod tests {
             )]
         );
         assert!(
-            update_invocation(Platform::Windows, SCOOP)
+            update_invocation(Platform::Windows, SCOOP, "0.8.1")
                 .unwrap()
                 .env
                 .is_empty()
         );
-        let bare = update_invocation(Platform::Mac, "/Users/fictional/dev/open-pact").unwrap();
+        let bare =
+            update_invocation(Platform::Mac, "/Users/fictional/dev/open-pact", "0.8.1").unwrap();
         assert!(bare.env.is_empty());
     }
 
@@ -472,6 +490,7 @@ mod tests {
         let call = update_invocation(
             Platform::Mac,
             "/Users/fictional/Applications/open-pact.app/Contents/MacOS/open-pact",
+            "0.8.1",
         )
         .unwrap();
         let status = std::process::Command::new(&call.program)

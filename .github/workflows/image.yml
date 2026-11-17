@@ -158,5 +158,8 @@ jobs:
             body=$(gh release view "$TAG" --json body --jq .body)
             gh release edit "$TAG" --notes "${body}"$'\n\n'"${note}"
           else
-            gh release create "$TAG" --verify-tag --title "$TAG" --notes "$note"
+            # client-release.yml publishes the release after it uploads every asset.
+            flag=
+            if [[ "$TAG" == *-* ]]; then flag=--prerelease; fi
+            gh release create "$TAG" --verify-tag --draft --title "$TAG" --notes "$note" $flag
           fi

@@ -39,7 +39,7 @@ Run the verification script with a release tag:
 scripts/verify-client-release.sh v0.7.1
 ```
 
-The script checks every checksum and Sigstore bundle. It keeps the verified files in a private temporary directory when verification succeeds. It removes the directory if verification fails. It prints the directory path on the last line. Copy that path for the install command.
+The script checks every checksum and Sigstore bundle. For a release that has them, it also checks the desktop app zips (`open-pact-desktop-<version>-macos.zip` and `open-pact-desktop-<version>-windows-x64.zip`). The desktop installers, `desktop/scripts/install-desktop.sh` and `install-desktop.ps1`, check the zip against its line in `SHA256SUMS` but do not verify the Cosign signature. It keeps the verified files in a private temporary directory when verification succeeds. It removes the directory if verification fails. It prints the directory path on the last line. Copy that path for the install command.
 
 Set `verified_dir` to the printed path:
 
