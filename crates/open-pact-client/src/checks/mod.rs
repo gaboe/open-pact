@@ -173,6 +173,17 @@ const BUILTIN_ABOUT: &[(&str, u32, &str)] = &[
             the idle time that starts the screen saver or turns off the display.",
     ),
     (
+        "screen_lock",
+        2,
+        "A device that stays unlocked gives access to anyone nearby. The client \
+            reports whole minutes, or none when the screen never locks. On macOS it \
+            adds the password delay from sysadminctl -screenLock status to the shorter of \
+            the screen saver idle time and the display sleep time from pmset, rounded up \
+            to whole minutes; on Windows it reads the machine inactivity limit, \
+            else the secure screen saver of each signed-in user; on Linux it reads the \
+            GNOME settings with gsettings or the KDE kscreenlockerrc file.",
+    ),
+    (
         "os_supported",
         1,
         "An OS that no longer gets vendor updates collects security holes that \
@@ -986,7 +997,7 @@ mod tests {
 
     #[test]
     fn every_builtin_has_a_non_empty_default_text() {
-        for (id, version) in BUILTINS {
+        for (id, version) in BUILTINS.iter().chain(LATER_VERSIONS) {
             let check = format!("builtin:{id}@{version}");
             assert!(
                 builtin_about(&check).is_some_and(|text| !text.trim().is_empty()),
@@ -996,11 +1007,16 @@ mod tests {
     }
 
     #[test]
-    fn default_texts_are_the_builtins_in_order() {
-        let keys: Vec<(&str, u32)> = builtin_defaults()
+    fn default_texts_cover_exactly_the_builtins() {
+        let mut keys: Vec<(&str, u32)> = builtin_defaults()
             .map(|(id, version, _)| (id, version))
             .collect();
-        assert_eq!(keys, BUILTINS);
+        let mut builtins: Vec<(&str, u32)> =
+            BUILTINS.iter().chain(LATER_VERSIONS).copied().collect();
+        keys.sort_unstable();
+        builtins.sort_unstable();
+        assert_eq!(keys, builtins);
+        assert!(builtin_about("builtin:screen_lock@2").is_some());
     }
 
     #[test]
