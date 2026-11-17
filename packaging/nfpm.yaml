@@ -6,7 +6,7 @@ section: utils
 priority: optional
 maintainer: Open Pact contributors
 description: Verifiable security checks for personally owned devices.
-license: Apache-2.0
+license: MIT
 contents:
   - src: ./dist/open-pact-client-x86_64-unknown-linux-musl
     dst: /usr/bin/open-pact-client

@@ -108,7 +108,7 @@ The gateway image is reproducible: a pinned toolchain and builder, a static musl
 
 ## License
 
-This project is licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE).
+This project is licensed under the MIT License. See [LICENSE](LICENSE). Earlier releases were published under the Apache License, Version 2.0.
 
 ## Gateway API
 

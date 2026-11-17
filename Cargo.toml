@@ -7,7 +7,7 @@ exclude = ["desktop"]
 version = "0.7.1"
 edition = "2024"
 rust-version = "1.89"
-license = "Apache-2.0"
+license = "MIT"
 
 [workspace.dependencies]
 open-pact-core = { path = "crates/open-pact-core", version = "0.7.1" }

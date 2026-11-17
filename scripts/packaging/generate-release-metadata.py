@@ -48,7 +48,7 @@ def formula(version: str, hashes: dict[str, str], placeholder: bool) -> str:
 class OpenPact < Formula
   desc "Verifiable security checks for personally owned devices"
   homepage "https://github.com/gaboe/open-pact"
-  license "Apache-2.0"
+  license "MIT"
   depends_on :macos
 
   on_macos do
@@ -93,7 +93,7 @@ def scoop_manifest(version: str, digest: str, placeholder: bool, url: str | None
   "version": "{version}",
   "description": "{note}",
   "homepage": "https://github.com/gaboe/open-pact",
-  "license": "Apache-2.0",
+  "license": "MIT",
   "architecture": {{
     "64bit": {{
       "url": "{download_url}",
