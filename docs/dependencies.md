@@ -15,7 +15,7 @@ Rule for a change: a new direct dependency needs a line in this file. A security
 | `ed25519-dalek` | Witness checkpoint signatures (tree head notes). |
 | `sha2` | SHA-256 and SHA-512 digests for hashes and log entries. |
 | `base64`, `hex` | Wire encodings of keys, signatures and hashes. |
-| `chrono` | Validity windows and timestamps. Features: `serde`, `clock`, `std` only. |
+| `time` | Validity windows and RFC 3339 timestamps. Features: `macros`, `parsing`. Replaced `chrono` (RUSTSEC-2026-0543, unmaintained). |
 | `thiserror` | Error enums for manifest, invitation and narrowing checks. |
 
 ## open-pact-client
@@ -27,7 +27,7 @@ Rule for a change: a new direct dependency needs a line in this file. A security
 | `tokio` | Runtime, `process` (run OS probes), `signal` (Ctrl-C), `time`, `net` (loopback probe), `sync` (oneshot). `sync` is now listed explicitly instead of coming in through `reqwest`. |
 | `reqwest` | HTTPS client for the gateway. `rustls-tls` only, no default features, redirects off. |
 | `clap` | Command line. Features: `derive` plus defaults; colour and "did you mean" suggestions stay on for owners. |
-| `chrono` | Timestamps in claims and local log. Features: `clock` only. |
+| `time` | Timestamps in claims and local log. Default features only. |
 | `anyhow` | Error context in the binary. |
 | `uuid` | Random temporary file names (`v4`). |
 | `base64`, `hex`, `sha2` | Encode and hash claim payloads, log entries and Linux package index files. |
