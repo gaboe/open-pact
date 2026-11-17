@@ -48,30 +48,37 @@ fn added<T: Ord + Clone>(old: &BTreeSet<T>, new: &BTreeSet<T>) -> Vec<T> {
     new.difference(old).cloned().collect()
 }
 
-/// True when the new schedule asks more of the owner than the one the owner signed: it sends where
-/// the old one did not, sends there more often, checks more often on the VPN, probes another
-/// address, or sends a claim at once on connect where the old one waited for its interval. Sending
-/// less, or checking less, is never a widening.
+/// True when the new schedule asks more of the owner than the one the owner signed. It counts as
+/// more when a send or check period rises at the VPN or elsewhere, when the VPN interval is shorter
+/// as written, when it probes another address, or when it sends a claim at once on connect where
+/// the old one waited for its interval. A rate that falls, or a removed part, is never a widening.
 pub fn schedule_widened(old: Option<&Schedule>, new: Option<&Schedule>) -> bool {
     new.is_some_and(|now| {
         old.is_none_or(|was| {
-            let sends_more = [Place::Vpn, Place::Elsewhere].into_iter().any(|place| {
-                match (was.period(place), now.period(place)) {
-                    (_, None) => false,
-                    (None, Some(_)) => true,
-                    (Some(was), Some(now)) => now < was,
-                }
-            });
-            let checks_more = match (was.vpn_check_period(), now.vpn_check_period()) {
-                (Some(was), Some(now)) => now < was,
-                _ => false,
-            };
+            let at = [Place::Vpn, Place::Elsewhere];
+            let sends_more = at
+                .into_iter()
+                .any(|place| rises(was.period(place), now.period(place)))
+                || rises(was.vpn_interval(), now.vpn_interval());
+            let checks_more = at
+                .into_iter()
+                .any(|place| rises(was.check_period(place), now.check_period(place)));
             let new_probe = now.probe().is_some() && was.probe() != now.probe();
             let connects_sooner = was.on_connect() == Some(OnConnect::WaitForInterval)
                 && now.on_connect() == Some(OnConnect::Send);
             sends_more || checks_more || new_probe || connects_sooner
         })
     })
+}
+
+/// Whether a rate rises: it appears where there was none, or it gets shorter. A rate that goes
+/// away does not rise.
+fn rises<T: Ord>(was: Option<T>, now: Option<T>) -> bool {
+    match (was, now) {
+        (_, None) => false,
+        (None, Some(_)) => true,
+        (Some(was), Some(now)) => now < was,
+    }
 }
 
 pub fn is_narrowing(old: &Manifest, new: &Manifest) -> Result<(), Vec<Violation>> {
@@ -373,6 +380,43 @@ mod tests {
             Err(vec![Violation::ScheduleWidened])
         );
         assert_eq!(is_narrowing(&both, &vpn), Ok(()));
+    }
+
+    #[test]
+    fn removing_the_vpn_part_widens_when_the_any_network_part_checks_more() {
+        // The any-network part checks every 5 minutes wherever it applies, so dropping a VPN part
+        // that checked every 10 minutes raises the check rate on the VPN.
+        let old = places(
+            "[vpn]\nprobe = \"10.0.0.1:443\"\ncheck = \"10m\"\ninterval = \"1h\"\n[always]\ninterval = \"1h\"\n",
+        );
+        assert!(schedule_widened(
+            Some(&old),
+            Some(&places("[always]\ninterval = \"1h\"\n"))
+        ));
+        assert!(schedule_widened(
+            Some(&old),
+            Some(&places("mode = \"always\"\ninterval = \"1h\""))
+        ));
+        // With the default check period the same removal checks no more and sends no more.
+        let default_check = places(
+            "[vpn]\nprobe = \"10.0.0.1:443\"\ninterval = \"1h\"\n[always]\ninterval = \"1h\"\n",
+        );
+        assert!(!schedule_widened(
+            Some(&default_check),
+            Some(&places("[always]\ninterval = \"1h\"\n"))
+        ));
+    }
+
+    #[test]
+    fn a_shorter_vpn_interval_widens_even_when_the_any_network_interval_is_shorter() {
+        let old = places(
+            "[vpn]\nprobe = \"10.0.0.1:443\"\ninterval = \"1h\"\n[always]\ninterval = \"5m\"\n",
+        );
+        let new = places(
+            "[vpn]\nprobe = \"10.0.0.1:443\"\ninterval = \"30m\"\n[always]\ninterval = \"5m\"\n",
+        );
+        assert!(schedule_widened(Some(&old), Some(&new)));
+        assert!(!schedule_widened(Some(&new), Some(&old)));
     }
 
     #[test]

@@ -774,6 +774,19 @@ impl Schedule {
         }
     }
 
+    /// How often the job runs its local checks at this place, or `None` when it checks nothing
+    /// there. The VPN part sets the rate on the VPN. The part for any network checks every 5
+    /// minutes wherever it applies: on the VPN when no VPN part sets the rate, and elsewhere.
+    pub fn check_period(&self, place: Place) -> Option<CheckPeriod> {
+        let any_network = self.always_interval().is_some();
+        match place {
+            Place::Vpn => self
+                .vpn_check_period()
+                .or(any_network.then_some(CheckPeriod::DEFAULT)),
+            Place::Elsewhere => any_network.then_some(CheckPeriod::DEFAULT),
+        }
+    }
+
     /// Whether a claim may go at this place at all: periodic, on a change, or on connect.
     pub fn may_send(&self, place: Place) -> bool {
         self.period(place).is_some()
