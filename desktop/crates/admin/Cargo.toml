@@ -1,0 +1,25 @@
+[package]
+name = "open-pact-admin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+snapshot = ["runner/snapshot", "gpui/test-support", "gpui-platform/test-support"]
+
+[build-dependencies]
+winresource = "0.1"
+
+[dependencies]
+runner = { workspace = true, features = ["desktop"] }
+serde_json.workspace = true
+toml_edit.workspace = true
+gpui.workspace = true
+gpui-component.workspace = true
+gpui-platform.workspace = true
+gpui-kit-assets.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+gpui-apple.workspace = true

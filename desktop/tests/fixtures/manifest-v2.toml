@@ -1,0 +1,181 @@
+# Example manifest. Fictional.
+manifest_version = 1
+issuer = "Example Company, IT security"
+valid_from = "2026-10-01"
+claim_max_age = "24h"
+claim_retention = "1mo"
+claim_recipients = ["Company IT security", "Auditor on request"]
+disclosed_metadata = ["manifest_hash", "device_pseudonym", "device_key", "nonce", "time", "client_version", "os", "trust_level", "vpn_certificate_request", "log_checkpoint"]
+data_controller = "Example Company Ltd., dpo@company.example"
+min_trust_level = "L0"               # demo only: software device keys are L0
+unknown_grace = "7d"
+
+[[control]]
+id = "disk_encryption"
+reference = "Client contract, security annex, 4.2"
+description = "A lost laptop must not expose client data."
+check = "builtin:disk_encryption@1"
+output = ["full", "partial", "none", "unknown"]
+required = { macos = "full", windows = "full", linux = "full" }
+grace = "0d"
+
+[[control]]
+id = "firewall"
+check = "builtin:firewall@1"
+output = ["on", "off", "unknown"]
+required = { macos = "on", windows = "on", linux = "on" }
+grace = "1d"
+
+[[control]]
+id = "screen_lock"
+reference = "Flow-down of RTS 2024/1774 Art. 13(l)"
+description = "Lock the screen when you walk away, so nobody can read client data on an open laptop."
+check = "builtin:screen_lock@1"
+output = ["le_5min", "le_15min", "gt_15min", "none", "unknown"]
+required = { macos = "le_5min", windows = "le_5min", linux = "le_5min" }
+grace = "1d"
+
+[[control]]
+id = "os_patch_age_days"
+description = "Limit the age of the last whole-system OS update."
+check = "builtin:os_patch_age_days@1"
+output = { integer = { min = 0, max = 3650 } }
+required = { macos = { max = 14 }, windows = { max = 30 }, linux = { max = 30 } }
+grace = "1d"
+
+[[control]]
+id = "os_supported"
+check = "builtin:os_supported@1"
+output = ["yes", "no", "unknown"]
+required = { macos = "yes", windows = "yes", linux = "yes" }
+grace = "14d"
+
+# Illustrative V3.1 baseline. The empty requirements below report values only.
+
+[[control]]
+id = "antimalware_active"
+check = "builtin:antimalware_active@1"
+output = ["yes", "no", "unknown"]
+required = { macos = "yes", windows = "yes", linux = "yes" }
+grace = "1d"
+
+[[control]]
+id = "preboot_auth"
+check = "builtin:preboot_auth@1"
+output = ["user_secret", "hardware_only", "none", "unknown"]
+required = { macos = "user_secret", windows = "user_secret", linux = "user_secret" }
+grace = "1d"
+
+[[control]]
+id = "antimalware_signature_age_days"
+check = "builtin:antimalware_signature_age_days@1"
+output = { integer = { min = 0, max = 3650 } }
+required = { macos = { max = 3 }, windows = { max = 3 }, linux = { max = 3 } }
+grace = "1d"
+
+[[control]]
+id = "antimalware_full_scan_age_days"
+check = "builtin:antimalware_full_scan_age_days@1"
+output = { integer = { min = 0, max = 3650 }, values = ["n/a"] }
+required = {}
+grace = "1d"
+
+[[control]]
+id = "log_oldest_record_days"
+check = "builtin:log_oldest_record_days@1"
+output = { integer = { min = 0, max = 2147483647 }, values = ["n/a"] }
+required = { windows = { min = 90 }, macos = "n/a" }
+grace = "1d"
+
+[[control]]
+id = "managed_repos_outside"
+description = "Keep managed repositories inside the folders declared on this device."
+check = "builtin:managed_repos_outside@1"
+remotes = ["github.com/example-org/"]
+output = { integer = { min = 0, max = 2147483647 } }
+required = { macos = { max = 0 }, windows = { max = 0 }, linux = { max = 0 } }
+grace = "0d"
+
+[[control]]
+id = "managed_repos_total"
+description = "Count all managed repositories with a matching remote."
+check = "builtin:managed_repos_total@1"
+remotes = ["github.com/example-org/"]
+output = { integer = { min = 0, max = 2147483647 } }
+required = {}
+grace = "1d"
+
+[[control]]
+id = "log_cleared"
+check = "builtin:log_cleared@1"
+output = { timestamp = true, nullable = true, values = ["n/a"] }
+required = { windows = "null", macos = "n/a", linux = "n/a" }
+grace = "1d"
+
+[[control]]
+id = "os_auto_updates"
+check = "builtin:os_auto_updates@1"
+output = ["on", "off", "unknown"]
+required = { macos = "on", windows = "on", linux = "on" }
+grace = "1d"
+
+[[control]]
+id = "antimalware_realtime"
+check = "builtin:antimalware_realtime@1"
+output = ["on", "off", "unknown"]
+required = { macos = "on", windows = "on", linux = "on" }
+grace = "1d"
+
+[[control]]
+id = "antimalware_active_threats"
+check = "builtin:antimalware_active_threats@1"
+output = { integer = { min = 0, max = 2147483647 }, values = ["n/a"] }
+required = { windows = { max = 0 }, macos = "n/a" }
+grace = "1d"
+
+[[control]]
+id = "work_account"
+check = "builtin:work_account@1"
+output = ["standard", "admin", "unknown"]
+required = {}
+grace = "1d"
+
+[[control]]
+id = "uptime_days"
+check = "builtin:uptime_days@1"
+output = { integer = { min = 0, max = 2147483647 } }
+required = {}
+grace = "1d"
+
+[[control]]
+id = "password_min_length"
+check = "builtin:password_min_length@1"
+output = { integer = { min = 0, max = 2147483647 }, values = ["none"] }
+required = { macos = { min = 10 }, windows = { min = 10 }, linux = { min = 10 } }
+grace = "1d"
+
+[[control]]
+id = "secure_boot"
+check = "builtin:secure_boot@1"
+output = ["on", "off", "unknown"]
+required = { macos = "on", windows = "on", linux = "on" }
+grace = "3d"
+
+[[control]]
+id = "auto_login"
+check = "builtin:auto_login@1"
+output = ["off", "on", "unknown"]
+required = { macos = "off", windows = "off", linux = "off" }
+grace = "0d"
+
+[log]
+# Demo only: this witness key comes from a public seed, so anyone can forge its cosignatures.
+# A real deployment lists witnesses run by someone other than the gateway operator.
+witnesses = [{ name = "witness.example.org/demo", key = "witness.example.org/demo+10c00e9a+BDnDJtIcX1p95tKTK+ggaN1dSvTB9a0EYGVntufeUB5t" }]
+witness_quorum = 1
+checkpoint_max_age = "1h"
+
+[schedule.vpn]
+probe = "10.0.0.1:443"
+probe_name = "vpn.example.org"
+interval = "55m"

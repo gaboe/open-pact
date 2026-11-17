@@ -1,0 +1,28 @@
+#!/bin/sh
+set -eu
+fixtures=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+case "$*" in
+  --version) printf '%s\n' 'open-pact-client 0.6.0' ;;
+  'status --online --json') if test -f "$fixtures/approved-no-claim"; then cat "$fixtures/status-approved-no-claim.json"; exit 1; fi; cat "$fixtures/status.json"; exit 2 ;;
+  'join --preview -- opi1:expired') printf '%s\n' '{"error":"This invitation expired on 14 Nov. Ask IT for a new one."}'; exit 1 ;;
+  'join --preview -- opi1:mismatch') cat "$fixtures/preview-mismatch.json"; exit 1 ;;
+  'join --preview -- '*) cat "$fixtures/preview.json" ;;
+  'join --yes --json '*' -- opi1:denied') cat "$fixtures/join-denied.ndjson"; exit 1 ;;
+  'join --yes --json '*' -- opi1:broken') cat "$fixtures/join-error.ndjson"; exit 1 ;;
+  'join --yes --json '*) cat "$fixtures/join.ndjson" ;;
+  'check --json') if test -f "$fixtures/denied"; then cat "$fixtures/check-denied.json"; exit 1; fi; cat "$fixtures/check.json" ;;
+  'manifest check --json')
+    # The answer follows a marker comment in the draft, so tests need no shared state.
+    draft=$(cat)
+    case "$draft" in
+      *'# fixture:old-cli'*) printf '%s\n' "error: unrecognized subcommand 'check'" >&2; exit 2 ;;
+      *'# fixture:keys'*) printf '%s\n' '{"ok":false,"errors":[{"message":"controls.os_patch_age_days: required.windows 3651 is above the output range","line":null,"key":"controls.os_patch_age_days.required.windows"}]}'; exit 1 ;;
+      *'# fixture:line'*)
+        line=$(printf '%s\n' "$draft" | grep -n 'fixture:line' | head -n 1 | cut -d: -f1)
+        printf '{"ok":false,"errors":[{"message":"invalid TOML value","line":%s,"key":null}]}\n' "$line"; exit 1 ;;
+      *) printf '%s\n' '{"ok":true,"errors":[]}' ;;
+    esac ;;
+  'accept --preview') cat "$fixtures/changes.json" ;;
+  'accept --yes'|'schedule on'|'schedule off') printf '%s\n' '{}' ;;
+  *) printf '%s\n' '{"error":"Unexpected fixture command"}'; exit 1 ;;
+esac

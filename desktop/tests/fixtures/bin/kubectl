@@ -1,0 +1,38 @@
+#!/bin/sh
+set -eu
+fixtures=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+state="$fixtures/state.toml"
+if ! test -f "$state"; then state="$fixtures/manifest.toml"; fi
+hash() { shasum -a 256 "$1" | cut -d ' ' -f 1; }
+applied() { printf '{"version":3,"manifest_hash":"sha256:%s","previous_hash":"sha256:%s"}\n' "$(hash "$fixtures/state.toml")" "$1"; }
+case "$*" in
+  'config get-contexts -o name') printf '%s\n' test-cluster staging-cluster locked-cluster ;;
+  'config current-context') printf '%s\n' staging-cluster ;;
+  'get namespaces -o name --context test-cluster') printf '%s\n' namespace/default namespace/kube-system namespace/open-pact ;;
+  'get namespaces -o name --context staging-cluster') printf '%s\n' namespace/default namespace/team-a ;;
+  'get namespaces -o name --context empty-cluster') ;;
+  'get namespaces -o name --context locked-cluster') printf '%s\n' 'Error from server (Forbidden): namespaces is forbidden: User "fictional-user" cannot list resource "namespaces" in API group "" at the cluster scope' >&2; exit 1 ;;
+  *'manifest history --json') cat "$fixtures/history.json" ;;
+  *'manifest get --version 1') cat "$fixtures/manifest.toml" ;;
+  *'manifest get --version 2') cat "$fixtures/manifest-v2.toml" ;;
+  *'manifest get') cat "$state"; if test -f "$fixtures/race.toml"; then mv "$fixtures/race.toml" "$fixtures/state.toml"; fi ;;
+  *'manifest set --note='*)
+    if test -f "$fixtures/refuse.txt"; then
+      cat > /dev/null
+      printf '{"error":"%s"}\n' "$(cat "$fixtures/refuse.txt")"
+      exit 1
+    fi
+    previous=$(hash "$state"); cat > "$fixtures/state.toml"; applied "$previous" ;;
+  *'manifest activate 1 --json') previous=$(hash "$state"); cp "$fixtures/manifest.toml" "$fixtures/state.toml"; applied "$previous" ;;
+  *'manifest activate 2 --json') previous=$(hash "$state"); cp "$fixtures/manifest-v2.toml" "$fixtures/state.toml"; applied "$previous" ;;
+  *'--context old-gateway-cluster'*'claims '*) printf '%s\n' '{"error":"error: unrecognized subcommand '"'"'claims'"'"'"}'; exit 2 ;;
+  *'claims list --json'*) cat "$fixtures/claims.json" ;;
+  *'claims show 4814 --json') cat "$fixtures/claim.json" ;;
+  *'claims show '*' --json') printf '%s\n' '{"error":"no claim with id 5"}'; exit 1 ;;
+  *'devices list --json') cat "$fixtures/devices.json" ;;
+  *'status --json') printf '{"version":"0.6.0","manifest_hash":"sha256:%s","auto_approve":false,"devices":{},"company_key_fingerprint":"fictional","manifest_source":"database","manifest_version":1}\n' "$(hash "$state")" ;;
+  *'invite --ttl '*) cat "$fixtures/invitation.json" ;;
+  *'devices approve '*|*'devices revoke '*) printf '%s\n' '{}' ;;
+  *'get deploy/open-pact-gateway -o json') printf '%s\n' '{"metadata":{"generation":1},"status":{"availableReplicas":1,"conditions":[{"type":"Available","status":"True"}]}}' ;;
+  *) printf '%s\n' '{"error":"Unexpected fixture command"}'; exit 1 ;;
+esac

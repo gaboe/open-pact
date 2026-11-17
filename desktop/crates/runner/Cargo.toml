@@ -1,0 +1,33 @@
+[package]
+name = "runner"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+desktop = ["dep:gpui", "dep:gpui-component", "dep:gpui-platform", "dep:gpui-kit-assets", "dep:gpui-apple"]
+snapshot = ["desktop", "gpui/test-support", "gpui-platform/test-support"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+toml_edit.workspace = true
+dirs.workspace = true
+sha2 = "0.10"
+chrono = { version = "0.4", features = ["serde"] }
+similar = "2"
+gpui = { workspace = true, optional = true }
+gpui-component = { workspace = true, optional = true }
+gpui-platform = { workspace = true, optional = true }
+gpui-kit-assets = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+gpui-apple = { workspace = true, optional = true }
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.56"
+
+[dev-dependencies]
+tempfile = "3"

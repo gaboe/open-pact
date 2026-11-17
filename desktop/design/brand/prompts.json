@@ -1,0 +1,30 @@
+{
+  "mode": "built-in imagegen",
+  "variants": [
+    {
+      "name": "seal-check",
+      "prompt": "Use case: logo-brand. Asset type: desktop app icon mark. Input images: Image 1 is the GTrack icon, Image 2 is the GTop icon; use them only as family style references. Scene/backdrop: calm warm paper #F4F2EC rounded squircle tile with full margins, tile about 80% of a square 1024x1024 canvas. Subject: bold lowercase “p” in ink #1B2430; its bowl is a round seal stamp, with one small blue #2F63C8 check mark in the counter. Style/medium: flat, calm, minimal app icon, restrained soft tile shadow. Composition: centered mark, fully contained. Color palette: warm paper tile #F4F2EC, ink #1B2430, blue #2F63C8 as the only accent. Text (verbatim): lowercase “p” only. Constraints: exactly 1024x1024 PNG, full uncropped tile and margins, no other text or letters, no watermark, no extra colors.",
+      "attempts": 1
+    },
+    {
+      "name": "interlocking-pact",
+      "prompt": "Use case: logo-brand. Asset type: desktop app icon mark. Input images: Image 1 is the GTrack icon, Image 2 is the GTop icon; use them only as family style references. Scene/backdrop: calm warm paper #F4F2EC rounded squircle tile with full margins, tile about 80% of a square 1024x1024 canvas. Subject: bold ink #1B2430 lowercase “p”; two simple interlocking rings form the “o” and the bowl of the p, expressing two sides of an agreement. Style/medium: flat, calm, minimal app icon, restrained soft tile shadow. Composition: centered and readable at small size, fully contained. Color palette: warm paper #F4F2EC, ink #1B2430 and blue #2F63C8 as the only accent; blue used sparingly. Text (verbatim): lowercase “p” only. Constraints: exactly 1024x1024 PNG, full uncropped tile and margins, no other text or letters, no watermark, no extra colors.",
+      "attempts": 1
+    },
+    {
+      "name": "stem-check",
+      "prompt": "Use case: logo-brand. Asset type: desktop app icon mark. Input images: Image 1 is the GTrack icon, Image 2 is the GTop icon; use them only as family style references. Scene/backdrop: calm warm paper #F4F2EC rounded squircle tile with full margins, tile about 80% of a square 1024x1024 canvas. Subject: bold lowercase “p” in ink #1B2430, with a short blue #2F63C8 check tick merged cleanly into the foot of its stem. Style/medium: flat, calm, minimal app icon, restrained soft tile shadow. Composition: centered mark, fully contained and readable at small size. Color palette: warm paper #F4F2EC, ink #1B2430, blue #2F63C8 as the only accent. Text (verbatim): lowercase “p” only. Constraints: exactly 1024x1024 PNG, full uncropped tile and margins, no other text or letters, no watermark, no extra colors.",
+      "attempts": 1
+    },
+    {
+      "name": "shield-counter",
+      "prompt": "Use case: logo-brand. Asset type: desktop app icon mark. Input images: Image 1 is the GTrack icon, Image 2 is the GTop icon; use them only as family style references. Scene/backdrop: calm warm paper #F4F2EC rounded squircle tile with full margins, tile about 80% of a square 1024x1024 canvas. Subject: bold lowercase “p” in ink #1B2430 with a simple calm shield-like counter inside the bowl, using blue #2F63C8 only as a restrained shield detail. Style/medium: flat, calm, minimal app icon, restrained soft tile shadow. Composition: centered mark, fully contained, strong simple silhouette. Color palette: warm paper #F4F2EC, ink #1B2430, blue #2F63C8 as the only accent. Text (verbatim): lowercase “p” only. Constraints: exactly 1024x1024 PNG, full uncropped tile and margins, no other text or letters, no watermark, no extra colors.",
+      "attempts": 1
+    },
+    {
+      "name": "open-pact-admin",
+      "prompt": "Edit the provided 1024x1024 app icon. Preserve the existing warm off-white rounded squircle tile, its soft shadow, and the exact interlocking dark ink lowercase ‘p’ and blue ring mark. Add one small circular admin badge over the lower-right area of the tile, clearly inside the tile edge: solid ink #1B2430 circle with a simple white key glyph centered inside. Keep the badge modest, about 16% of canvas width, and ensure the main logo remains unobstructed. Keep the flat, calm icon style. No words, letters, or other elements. Return a square 1024x1024 image.",
+      "attempts": 1
+    }
+  ]
+}

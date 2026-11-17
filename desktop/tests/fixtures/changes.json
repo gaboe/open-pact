@@ -1,0 +1,1 @@
+{"signed_hash":"sha256:old","published_hash":"sha256:new","changes":[{"id":"Password length","before":8,"after":10},{"id":"Send results automatically","before":"2h","after":"55m"}],"schedule_widened":true}
