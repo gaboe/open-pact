@@ -928,6 +928,7 @@ fn gsettings_bool(out: &str) -> Option<bool> {
     }
 }
 
+#[cfg(test)]
 pub fn parse_gnome_lock(lock_enabled: &str, idle_delay: &str, lock_delay: &str) -> &'static str {
     gnome_lock_state(lock_enabled, idle_delay, lock_delay).bucket()
 }
@@ -946,6 +947,7 @@ fn gnome_lock_state(lock_enabled: &str, idle_delay: &str, lock_delay: &str) -> L
     Lock::Seconds(idle.saturating_add(delay))
 }
 
+#[cfg(test)]
 pub fn parse_kscreenlocker(ini: &str) -> &'static str {
     kscreenlocker_lock(ini).bucket()
 }
