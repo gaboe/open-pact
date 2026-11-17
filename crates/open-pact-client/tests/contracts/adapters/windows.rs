@@ -72,9 +72,9 @@ pub(super) fn batch() -> Option<&'static Batch> {
 
 pub(crate) fn run(id: &str, case: &Case) -> ControlValue {
     if id == "os_patch_age_days"
-        && let Ok(last) = chrono::DateTime::parse_from_rfc3339(case.text(0))
+        && let Some(last) = open_pact_core::timestamp::parse_rfc3339(case.text(0))
     {
-        return contract_patch_age(last.with_timezone(&chrono::Utc), case.now());
+        return contract_patch_age(last, case.now());
     }
     CURRENT.with(|current| *current.borrow_mut() = Some((id.into(), case.name.clone())));
     let check = crate::checks::legacy_registry(open_pact_core::Os::Windows)

@@ -2,6 +2,7 @@ mod claims;
 use open_pact_core::{
     AcceptRequest, DeviceAuthPurpose, EntryWithProof, MyEntries, MyEntriesRequest, evaluate_under,
 };
+use time::OffsetDateTime;
 mod devices;
 mod grace;
 mod invitations;
@@ -68,7 +69,7 @@ enum Command {
         json: bool,
         /// How long the invitation stays valid: 30m, 72h, 7d (at most 30d)
         #[arg(long, default_value = "72h", value_parser = invitations::parse_ttl)]
-        ttl: chrono::Duration,
+        ttl: time::Duration,
         /// Who the invitation is for. Stays in the gateway database, never in the log
         #[arg(long, default_value = "")]
         note: String,
@@ -483,7 +484,7 @@ async fn enforce_retention(app: App) {
         match claims::purge(
             &app.db,
             &enforced.manifest.body().claim_retention,
-            chrono::Utc::now(),
+            OffsetDateTime::now_utc(),
         )
         .await
         {
@@ -882,7 +883,7 @@ async fn claim(
                     &mut tx,
                     &claim.device,
                     manifest_hash,
-                    chrono::Utc::now(),
+                    OffsetDateTime::now_utc(),
                     devices::ClaimResult::Denied,
                     &reasons,
                 )
@@ -895,7 +896,7 @@ async fn claim(
     } else {
         app.manifest.clone()
     };
-    let now = chrono::Utc::now();
+    let now = OffsetDateTime::now_utc();
     let first_failures = if enrolled {
         grace::load(&mut tx, &claim.device, manifest_hash)
             .await
@@ -946,7 +947,7 @@ async fn claim(
             .claim_max_age
             .min_duration()
             .map_or(time::Duration::DAY, |max| {
-                time::Duration::seconds(max.num_seconds()).min(time::Duration::DAY)
+                time::Duration::seconds(max.whole_seconds()).min(time::Duration::DAY)
             });
         let cn = claim.device.as_str().trim_start_matches("pseudonym:");
         match app.keys.ca.issue(csr, cn, validity) {
@@ -1126,7 +1127,7 @@ fn witness_refresh(manifest: &Manifest, witnesses: &Witnesses) -> anyhow::Result
         .and_then(|p| p.checkpoint_max_age.min_duration())
     {
         Some(age) if !witnesses.urls().is_empty() => {
-            let quarter = u64::try_from(age.num_seconds() / 4).unwrap_or(600);
+            let quarter = u64::try_from(age.whole_seconds() / 4).unwrap_or(600);
             Ok(Some(Duration::from_secs(env_number(
                 "WITNESS_REFRESH_SECS",
                 quarter.clamp(10, 600),
@@ -1221,7 +1222,7 @@ async fn invite(
     db: &PgPool,
     kek: &SealingKey,
     url: &str,
-    ttl: chrono::Duration,
+    ttl: time::Duration,
     note: &str,
     json: bool,
     out: &mut impl std::io::Write,
@@ -1234,7 +1235,7 @@ async fn invite(
     let (code, expires) = invitations::create(db, ttl, note).await?;
     let company = PublicKey::from(&keys.manifest);
     let invitation = Invitation::new(url, &company, &log_key(&keys)?, code);
-    let expires_at = expires.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let expires_at = open_pact_core::timestamp::rfc3339_secs(expires);
     if json {
         let document = InviteDocument {
             invitation: invitation.encode(),
@@ -2092,7 +2093,8 @@ mod tests {
             device,
             device_key,
             nonce: nonce["nonce"].as_str().unwrap().into(),
-            time: chrono::DateTime::from_timestamp(chrono::Utc::now().timestamp(), 0).unwrap(),
+            time: OffsetDateTime::from_unix_timestamp(OffsetDateTime::now_utc().unix_timestamp())
+                .unwrap(),
             client: "open-pact-client 0.0.1".into(),
             os: open_pact_core::Os::Linux,
             trust_level: open_pact_core::TrustLevel::L0,
@@ -2229,7 +2231,7 @@ mod tests {
         for key in [&first, &second] {
             let owner = open_pact_core::dev_key::generate();
             let note = "private owner at example.org";
-            let (code, _) = invitations::create(&db, chrono::Duration::hours(1), note)
+            let (code, _) = invitations::create(&db, time::Duration::hours(1), note)
                 .await
                 .unwrap();
             private_values.extend([
@@ -2494,14 +2496,12 @@ grace = "1d"
         ] {
             assert!(warnings.contains(part), "{part} missing from {warnings}");
         }
-        let (received, delete_after): (
-            chrono::DateTime<chrono::Utc>,
-            chrono::DateTime<chrono::Utc>,
-        ) = sqlx::query_as("SELECT received_at, delete_after FROM claims")
-            .fetch_one(&db)
-            .await
-            .unwrap();
-        let kept = (delete_after - received).num_days();
+        let (received, delete_after): (OffsetDateTime, OffsetDateTime) =
+            sqlx::query_as("SELECT received_at, delete_after FROM claims")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        let kept = (delete_after - received).whole_days();
         assert!(
             (180..=185).contains(&kept),
             "a claim under A keeps A's 6mo retention, not B's 12mo: {kept} days"
@@ -3423,7 +3423,7 @@ grace = "1d"
             &db,
             &SealingKey::new(&TEST_KEK),
             "ftp://fictional.example/path",
-            chrono::Duration::hours(1),
+            time::Duration::hours(1),
             "FICTIONAL",
             false,
             &mut Vec::new(),
@@ -3522,7 +3522,7 @@ grace = "1d"
             &db,
             &kek,
             "https://pact.example.com",
-            chrono::Duration::hours(72),
+            time::Duration::hours(72),
             "MacBook, K. Example",
             true,
             &mut out,
@@ -3536,8 +3536,8 @@ grace = "1d"
         assert_eq!(document["note"], "MacBook, K. Example");
         assert_eq!(document["company_key_fingerprint"], invitation.company);
         let expires = document["expires_at"].as_str().unwrap();
-        let expires: chrono::DateTime<chrono::Utc> = expires.parse().unwrap();
-        let hours = (expires - chrono::Utc::now()).num_hours();
+        let expires = open_pact_core::timestamp::parse_rfc3339(expires).unwrap();
+        let hours = (expires - OffsetDateTime::now_utc()).whole_hours();
         assert!((70..=72).contains(&hours), "{hours}");
 
         let mut plain = Vec::new();
@@ -3545,7 +3545,7 @@ grace = "1d"
             &db,
             &kek,
             "https://pact.example.com",
-            chrono::Duration::hours(1),
+            time::Duration::hours(1),
             "",
             false,
             &mut plain,

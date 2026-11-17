@@ -1329,12 +1329,17 @@ pub(crate) async fn tick_with_scan(
     let compliance = prepared.compliance().clone();
     state.observe_compliance(&compliance);
     state.event_pending |= state.new_events(events);
-    let now = chrono::Utc::now().timestamp();
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
     if let Some(trigger) = state.due(now, authorization.schedule.interval.as_secs()) {
         save(state_home, STATE, &state)?;
         let outcome = prepared.send(home, async || may_send(policy).await).await?;
         note_outcome(home, &mut state, trigger, &outcome);
-        state.record(&outcome, chrono::Utc::now().timestamp(), events, compliance);
+        state.record(
+            &outcome,
+            time::OffsetDateTime::now_utc().unix_timestamp(),
+            events,
+            compliance,
+        );
     } else if !state.baseline().security_log_cleared || !state.baseline().antimalware_detection {
         state.establish_baseline(events);
     }
@@ -1435,7 +1440,7 @@ fn append_job_log(home: &Home, line: &str) -> std::io::Result<()> {
     writeln!(
         options.open(&path)?,
         "{} {line}",
-        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        open_pact_core::timestamp::rfc3339_secs(time::OffsetDateTime::now_utc())
     )
 }
 
@@ -1952,11 +1957,11 @@ async fn status(home: &Home) -> Result<()> {
     );
     if let Some(state) = schedule_home.read_json::<State>(STATE)?
         && let Some(last) = state.last_success
-        && let Some(time) = chrono::DateTime::from_timestamp(last, 0)
+        && let Some(time) = time::OffsetDateTime::from_unix_timestamp(last).ok()
     {
         println!(
             "Last claim the gateway answered: {}.",
-            time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            open_pact_core::timestamp::rfc3339_secs(time)
         );
     }
     Ok(())
@@ -3691,7 +3696,7 @@ Write-Output 'refused'
             STATE,
             &State {
                 vpn_up: true,
-                last_success: Some(chrono::Utc::now().timestamp()),
+                last_success: Some(time::OffsetDateTime::now_utc().unix_timestamp()),
                 ..State::default()
             },
         )
@@ -3768,7 +3773,7 @@ Write-Output 'refused'
             &State {
                 vpn_up: false,
                 reconnect_pending: false,
-                last_success: Some(chrono::Utc::now().timestamp() - 2 * 3600),
+                last_success: Some(time::OffsetDateTime::now_utc().unix_timestamp() - 2 * 3600),
                 last_events: None,
                 event_baseline: None,
                 ..State::default()
@@ -3782,7 +3787,7 @@ Write-Output 'refused'
         let connected: State = home.read_json(STATE).unwrap().unwrap();
         assert!(connected.vpn_up);
         assert!(connected.reconnect_pending);
-        assert!(connected.should_send(chrono::Utc::now().timestamp(), 55 * 60));
+        assert!(connected.should_send(time::OffsetDateTime::now_utc().unix_timestamp(), 55 * 60));
         drop(listener);
         let reserved = tokio::net::TcpSocket::new_v4().unwrap();
         reserved.bind("127.0.0.1:0".parse().unwrap()).unwrap();

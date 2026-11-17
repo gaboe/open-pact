@@ -253,7 +253,7 @@ mod tests {
             device: Pseudonym::of(&device_key),
             device_key,
             nonce: format!("n{nonce}"),
-            time: "2026-11-03T08:12:44Z".parse().unwrap(),
+            time: open_pact_core::timestamp::parse_rfc3339("2026-11-03T08:12:44Z").unwrap(),
             client: "open-pact-client test".into(),
             os: Os::Macos,
             trust_level: key.trust_level(),

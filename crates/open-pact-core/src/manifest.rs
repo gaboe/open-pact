@@ -1,10 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
+use time::{Date, Duration, OffsetDateTime};
 
-use crate::{Error, ManifestHash, WitnessKey};
+use crate::{Error, ManifestHash, WitnessKey, timestamp};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -132,31 +132,24 @@ impl Span {
         }
     }
 
-    pub fn min_duration(&self) -> Option<chrono::TimeDelta> {
-        chrono::TimeDelta::try_seconds(i64::try_from(self.min_secs()).ok()?)
+    pub fn min_duration(&self) -> Option<Duration> {
+        timestamp::seconds(i64::try_from(self.min_secs()).ok()?)
     }
 
     /// The instant this span before `t`, in calendar months for `mo`, so `12mo` before
     /// 2026-10-15 is 2025-10-15. `None` when that is before the start of the calendar.
-    pub fn before(
-        &self,
-        t: chrono::DateTime<chrono::Utc>,
-    ) -> Option<chrono::DateTime<chrono::Utc>> {
+    pub fn before(&self, t: OffsetDateTime) -> Option<OffsetDateTime> {
         match self.unit {
-            Unit::Month => {
-                t.checked_sub_months(chrono::Months::new(u32::try_from(self.amount).ok()?))
-            }
-            _ => t.checked_sub_signed(self.min_duration()?),
+            Unit::Month => timestamp::add_months(t, -i64::from(u32::try_from(self.amount).ok()?)),
+            _ => t.checked_sub(self.min_duration()?),
         }
     }
 
     /// The instant this span after `t`, in calendar months for `mo`. `None` past the calendar.
-    pub fn after(&self, t: chrono::DateTime<chrono::Utc>) -> Option<chrono::DateTime<chrono::Utc>> {
+    pub fn after(&self, t: OffsetDateTime) -> Option<OffsetDateTime> {
         match self.unit {
-            Unit::Month => {
-                t.checked_add_months(chrono::Months::new(u32::try_from(self.amount).ok()?))
-            }
-            _ => t.checked_add_signed(self.min_duration()?),
+            Unit::Month => timestamp::add_months(t, i64::from(u32::try_from(self.amount).ok()?)),
+            _ => t.checked_add(self.min_duration()?),
         }
     }
 
@@ -362,7 +355,7 @@ pub struct TimestampOutput {
 }
 
 fn utc_timestamp(text: &str) -> bool {
-    text.ends_with('Z') && chrono::DateTime::parse_from_rfc3339(text).is_ok()
+    text.ends_with('Z') && timestamp::is_rfc3339(text)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -580,7 +573,8 @@ pub struct Control {
 pub struct ManifestBody {
     pub manifest_version: u32,
     pub issuer: String,
-    pub valid_from: NaiveDate,
+    #[serde(with = "crate::timestamp::serde_date")]
+    pub valid_from: Date,
     pub claim_max_age: Span,
     pub claim_retention: Span,
     pub claim_recipients: BTreeSet<String>,
@@ -1082,6 +1076,7 @@ impl Manifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::timestamp::ToRfc3339;
 
     const DEMO: &str = include_str!("../../../examples/manifest.toml");
 
@@ -1302,7 +1297,7 @@ mod tests {
 
     #[test]
     fn before_counts_calendar_months_and_exact_hours() {
-        let t: chrono::DateTime<chrono::Utc> = "2026-03-31T10:00:00Z".parse().unwrap();
+        let t: OffsetDateTime = timestamp::parse_rfc3339("2026-03-31T10:00:00Z").unwrap();
         let span = |s: &str| Span::try_from(s.to_string()).unwrap();
         assert_eq!(
             span("12mo").before(t).unwrap().to_rfc3339(),
@@ -1517,5 +1512,116 @@ mod tests {
             Manifest::parse(DEMO.as_bytes()).unwrap().hash(),
             Manifest::parse(changed.as_bytes()).unwrap().hash()
         );
+    }
+
+    mod timestamp_pins {
+        use super::*;
+
+        fn at(s: &str) -> OffsetDateTime {
+            timestamp::parse_rfc3339(s).unwrap()
+        }
+
+        fn span(s: &str) -> Span {
+            Span::try_from(s.to_string()).unwrap()
+        }
+
+        fn with_valid_from(value: &str) -> Result<Manifest, Error> {
+            let text = DEMO.replace(
+                "valid_from = \"2026-10-01\"",
+                &format!("valid_from = {value}"),
+            );
+            Manifest::parse(text.as_bytes())
+        }
+
+        #[test]
+        fn calendar_months_clamp_to_the_last_day_of_the_month() {
+            let leap = at("2024-02-29T10:00:00Z");
+            assert_eq!(
+                span("12mo").before(leap).unwrap().to_rfc3339(),
+                "2023-02-28T10:00:00+00:00"
+            );
+            assert_eq!(
+                span("12mo").after(leap).unwrap().to_rfc3339(),
+                "2025-02-28T10:00:00+00:00"
+            );
+            assert_eq!(
+                span("1mo")
+                    .after(at("2026-01-31T23:59:59.5Z"))
+                    .unwrap()
+                    .to_rfc3339(),
+                "2026-02-28T23:59:59.500+00:00"
+            );
+            assert_eq!(
+                span("1mo")
+                    .before(at("2026-03-31T10:00:00.25Z"))
+                    .unwrap()
+                    .to_rfc3339(),
+                "2026-02-28T10:00:00.250+00:00"
+            );
+            assert_eq!(
+                span("3mo")
+                    .before(at("2026-05-31T00:00:00Z"))
+                    .unwrap()
+                    .to_rfc3339(),
+                "2026-02-28T00:00:00+00:00"
+            );
+            assert_eq!(
+                span("0mo").after(leap).unwrap().to_rfc3339(),
+                "2024-02-29T10:00:00+00:00"
+            );
+        }
+
+        #[test]
+        fn fixed_spans_keep_fractions_and_stop_past_the_chrono_range() {
+            let t = at("2026-03-31T10:00:00.5Z");
+            assert_eq!(
+                span("36h").after(t).unwrap().to_rfc3339(),
+                "2026-04-01T22:00:00.500+00:00"
+            );
+            assert_eq!(
+                span("2w").before(t).unwrap().to_rfc3339(),
+                "2026-03-17T10:00:00.500+00:00"
+            );
+            assert!(span("100000000000d").min_duration().is_some());
+            assert_eq!(span("200000000000d").min_duration(), None);
+            assert!(span("200000000000d").after(t).is_none());
+        }
+
+        #[test]
+        fn rfc3339_timestamp_check_accepts_the_spellings_chrono_reads() {
+            for (text, expected) in [
+                ("2026-10-12T09:00:00Z", true),
+                ("2026-10-12T09:00:00.5Z", true),
+                ("2026-10-12T09:00:00.123456789Z", true),
+                ("2026-10-12T09:00:00+00:00", false),
+                ("2026-10-12T09:00:00z", false),
+                ("2026-10-12t09:00:00Z", true),
+                ("2026-10-12 09:00:00Z", true),
+                // chrono read a leap second; the time crate has none, so it is refused.
+                ("2026-10-12T23:59:60Z", true),
+                ("2026-02-30T00:00:00Z", false),
+                ("2026-10-12T09:00Z", false),
+                ("unknown", false),
+            ] {
+                assert_eq!(utc_timestamp(text), expected, "{text}");
+            }
+        }
+
+        #[test]
+        fn valid_from_reads_iso_dates_and_writes_them_back() {
+            let m = with_valid_from("\"2026-10-01\"").unwrap();
+            assert_eq!(
+                serde_json::to_value(m.body()).unwrap()["valid_from"],
+                "2026-10-01"
+            );
+            for (value, accepted) in [
+                ("\"2026-1-5\"", true),
+                ("\"2026-02-30\"", false),
+                ("\"2026-10-01T00:00:00Z\"", false),
+                ("2026-10-01", false),
+            ] {
+                assert_eq!(with_valid_from(value).is_ok(), accepted, "{value}");
+            }
+        }
     }
 }
