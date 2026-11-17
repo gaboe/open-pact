@@ -1,0 +1,10612 @@
+/// Under `--json` a command prints JSON and nothing else. These stand in for the standard macros:
+/// text goes to a note buffer while JSON output is on. Textual scope covers every module below.
+macro_rules! println {
+    () => {
+        if $crate::json_out::active() {
+            $crate::json_out::note_line(String::new());
+        } else {
+            ::std::println!();
+        }
+    };
+    ($($arg:tt)*) => {
+        if $crate::json_out::active() {
+            $crate::json_out::note_line(format!($($arg)*));
+        } else {
+            ::std::println!($($arg)*);
+        }
+    };
+}
+
+/// A warning that cannot be written must not stop the command, so this one ignores a stderr that is
+/// closed or full. `std::eprintln!` panics there.
+macro_rules! eprintln {
+    () => {{
+        use ::std::io::Write as _;
+        let _ = ::std::writeln!(::std::io::stderr());
+    }};
+    ($($arg:tt)*) => {{
+        use ::std::io::Write as _;
+        if $crate::json_out::active() {
+            $crate::json_out::note_line(format!($($arg)*));
+        }
+        let _ = ::std::writeln!(::std::io::stderr(), $($arg)*);
+    }};
+}
+
+macro_rules! print {
+    ($($arg:tt)*) => {
+        if $crate::json_out::active() {
+            $crate::json_out::note_partial(format!($($arg)*));
+        } else {
+            ::std::print!($($arg)*);
+        }
+    };
+}
+
+mod checks;
+mod claim;
+mod device_config;
+mod device_key;
+#[cfg(test)]
+mod fake_gateway;
+mod json_out;
+mod locallog;
+mod manifest_check;
+mod schedule;
+#[cfg(target_os = "macos")]
+mod secure_enclave;
+mod status;
+mod timings;
+mod ui;
+mod update;
+
+use std::cell::Cell;
+use std::collections::BTreeMap;
+use std::future::Future;
+use std::io::{IsTerminal, Write};
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+use std::time::Duration;
+
+use anyhow::{Context, Result, bail};
+use clap::{Parser, Subcommand};
+use device_key::DeviceKey;
+use open_pact_core::{
+    AcceptRequest, DeviceAuthPurpose, DeviceStatus, MyEntries, MyEntriesRequest,
+    device_auth_statement,
+};
+use open_pact_core::{
+    Checkpoint, Endorsement, EnrolRequest, Entry, EntryKind, Invitation, LogCheckpoint, LogHash,
+    LogKey, LogPolicy, Manifest, ManifestHash, Metadata, Note, Os, Pseudonym, SignedManifest,
+    Virtualized, dev_key, schedule_widened, verify_claim, verify_consistency, verify_cosignatures,
+    verify_inclusion,
+};
+#[cfg(test)]
+use open_pact_core::{Claim, PublicKey};
+use rcgen::{CertificateParams, DistinguishedName, KeyPair};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+#[cfg(test)]
+use serde_json::json;
+use sha2::{Digest, Sha256};
+
+#[derive(Parser)]
+#[command(
+    name = "open-pact-client",
+    version,
+    about = "Prove this device meets the company's signed manifest, nothing more"
+)]
+struct Cli {
+    /// Directory for keys, the signed manifest and logs [default: ~/.config/open-pact]
+    #[arg(long, global = true)]
+    home: Option<PathBuf>,
+    /// Allow a plain http:// gateway other than localhost. For development only
+    #[arg(long, global = true)]
+    insecure_dev: bool,
+    #[command(subcommand)]
+    command: Command,
+}
+
+impl Cli {
+    /// The command prints JSON, so a failure before it starts is JSON too.
+    fn prints_json(&self) -> bool {
+        match &self.command {
+            Command::Status(options) => options.json(),
+            command => matches!(
+                command,
+                Command::Join { preview: true, .. }
+                    | Command::Join { json: true, .. }
+                    | Command::Check { json: true, .. }
+                    | Command::Accept { preview: true, .. }
+                    | Command::Manifest {
+                        command: ManifestCommand::Check { json: true }
+                    }
+            ),
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Show the device status without running checks or sending a claim
+    Status(status::Options),
+    /// Check the gateway against the invitation from IT, show the manifest, sign it and enrol
+    Join {
+        /// The opi1: invitation string from IT
+        invitation: Option<String>,
+        /// Sign without asking
+        #[arg(long)]
+        yes: bool,
+        /// Keep a new device key in a file (trust level L0) even when a Secure Enclave is available
+        #[arg(long)]
+        software_key: bool,
+        /// Print the device code and exit without waiting for IT
+        #[arg(long)]
+        no_wait: bool,
+        /// Show what joining would sign, as JSON, and stop. Signs nothing, writes no file, sends no POST
+        #[arg(
+            long,
+            requires = "invitation",
+            conflicts_with_all = ["yes", "software_key", "no_wait", "json"]
+        )]
+        preview: bool,
+        /// Print one JSON line per wizard step event. Needs --yes; nothing is asked
+        #[arg(long, requires = "yes")]
+        json: bool,
+        /// With --json: a folder that holds your repositories, for the manifest's repository checks. Repeatable
+        #[arg(long = "folder", requires = "json")]
+        folders: Vec<PathBuf>,
+        /// With --json: send claims automatically (on) or not (off) [default: off]
+        #[arg(long, requires = "json", value_enum)]
+        auto_send: Option<Toggle>,
+    },
+    /// Run the manifest's checks, send a signed claim and fetch a VPN certificate
+    Check {
+        /// Print the claim that would be sent. Make GET requests only and write no file
+        #[arg(long)]
+        dry_run: bool,
+        /// With --dry-run: also print the wall time of the run and the CPU time of this process
+        /// and its child processes
+        #[arg(long, requires = "dry_run")]
+        timings: bool,
+        /// After sending, print the result as JSON
+        #[arg(long, conflicts_with = "dry_run")]
+        json: bool,
+    },
+    /// Review a changed manifest from the gateway, sign it and move this device to it
+    Accept {
+        /// Sign without asking
+        #[arg(long)]
+        yes: bool,
+        /// Print what accepting would change, as JSON, and stop. Signs nothing, writes no file
+        #[arg(long, conflicts_with = "yes")]
+        preview: bool,
+    },
+    /// Choose the folders that hold your repositories, for the manifest's repository checks
+    Folders {
+        #[command(subcommand)]
+        command: FoldersCommand,
+    },
+    /// Show the manifest this device signed, or check a manifest draft
+    Manifest {
+        #[command(subcommand)]
+        command: ManifestCommand,
+    },
+    /// Turn automatic sending of claims on or off, or show its state
+    Schedule {
+        #[command(subcommand)]
+        command: schedule::Command,
+    },
+    /// Transparency log and local claim log
+    Log {
+        #[command(subcommand)]
+        command: LogCommand,
+    },
+    /// Show how to stop the scheduled claims and remove the client
+    Stop,
+    /// Destroy the device key before full uninstall or rotation
+    DeleteDeviceKey,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum Toggle {
+    On,
+    Off,
+}
+
+#[derive(Subcommand)]
+enum FoldersCommand {
+    /// Show the folders
+    List,
+    /// Add a folder that holds repositories. `~` is your home folder
+    Add { path: PathBuf },
+    /// Remove a folder
+    Remove { path: PathBuf },
+}
+
+#[derive(Subcommand)]
+enum ManifestCommand {
+    /// Show the signed manifest stored on this device
+    Show,
+    /// Check a manifest draft from stdin with the rules clients and the gateway apply. Needs no home or network
+    Check {
+        /// Print one JSON document: ok, and the errors with their line and key
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the built-in checks this client runs, with their default text. Needs no home or network
+    Builtins {
+        /// Print one JSON array: each check, its id and its default text
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum LogCommand {
+    /// Print the last verified, gateway-signed log checkpoint held on this device
+    Head,
+    /// Fetch and verify the inclusion proof of one log entry [default: this device's enrolment]
+    Prove { index: Option<u64> },
+    /// Print every claim this device sent and the gateway's response
+    Show,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Enrolment {
+    gateway: String,
+    manifest: ManifestHash,
+    device: Pseudonym,
+    salt: String,
+    /// Where the log holds this enrolment's entries. A hint only: every check verifies them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    log_entries: Option<OwnEntries>,
+    /// The last device status this client learned from a signed gateway request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_status: Option<DeviceStatus>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct OwnEntries {
+    manifest: u64,
+    enrolment: u64,
+}
+
+#[derive(Deserialize)]
+struct PublishedManifest {
+    toml: String,
+    company: Endorsement,
+}
+
+#[derive(Deserialize)]
+struct Proof {
+    proof: Vec<LogHash>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Approval {
+    Pending,
+    Approved,
+    Revoked,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ApprovalProgress {
+    Pending,
+    ProofPending,
+    Approved,
+    Revoked,
+}
+
+struct ApprovalWaitOptions {
+    poll_interval: Duration,
+    interruptible: bool,
+    show_waiting: bool,
+    initial: Option<std::result::Result<ApprovalProgress, WaitError>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JoinOrigin {
+    Enrolled,
+    Resumed,
+}
+
+#[derive(Deserialize)]
+struct DeviceStatusResponse {
+    state: Approval,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApprovalWait {
+    Approved,
+    Revoked,
+    Interrupted,
+}
+
+#[derive(Clone, Copy)]
+enum ClaimResult {
+    Accepted,
+    Denied,
+    ResponseUnverified,
+}
+
+#[derive(Clone, Copy)]
+struct JoinOptions {
+    insecure_dev: bool,
+    no_wait: bool,
+    poll_interval: Duration,
+}
+
+#[derive(Debug)]
+enum WaitError {
+    Network,
+    Alarm(String),
+    Fatal(anyhow::Error),
+}
+
+#[derive(Debug)]
+enum CheckpointVerifyError {
+    Network(anyhow::Error),
+    Alarm(String),
+}
+
+impl CheckpointVerifyError {
+    fn alarm_text(self) -> String {
+        match self {
+            Self::Network(error) => {
+                format!("no consistency proof from the gateway: {error:#}")
+            }
+            Self::Alarm(message) => message,
+        }
+    }
+}
+
+impl WaitError {
+    fn from_error(error: anyhow::Error) -> Self {
+        if error.chain().any(|cause| {
+            cause
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(is_retryable_http_error)
+        }) {
+            Self::Network
+        } else {
+            Self::Fatal(error)
+        }
+    }
+
+    fn body_error(_error: reqwest::Error) -> Self {
+        Self::Network
+    }
+}
+
+const APPROVAL_POLL_INTERVAL: Duration = Duration::from_secs(10);
+
+fn is_retryable_http_error(error: &reqwest::Error) -> bool {
+    !error.is_decode()
+        && (error.is_connect()
+            || error.is_timeout()
+            || error.is_request()
+            || error.is_body()
+            || error
+                .status()
+                .is_some_and(|status| status.is_server_error()))
+}
+
+const LOG_KEY: &str = "log-key.txt";
+const COMPANY_KEY: &str = "company-key.txt";
+const LOG_CHECKPOINT: &str = "log-checkpoint.txt";
+/// The manifest the owner reads before signing: the one `join` shows, or the one `accept` shows.
+const PENDING_MANIFEST: &str = "manifest-to-sign.toml";
+
+/// A copy of a manifest in the home, so the owner can open and read all of it while the client
+/// waits for a yes. It is removed when the question is answered.
+struct ReadingCopy(PathBuf);
+
+impl ReadingCopy {
+    fn write(home: &Home, toml: &str) -> Result<Self> {
+        Ok(Self(std::path::absolute(
+            home.write(PENDING_MANIFEST, toml.as_bytes())?,
+        )?))
+    }
+}
+
+impl Drop for ReadingCopy {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+const LEGACY_LOG_HEAD: &str = "log-head.json";
+
+#[derive(Deserialize)]
+struct Nonce {
+    nonce: String,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "status", rename_all = "lowercase")]
+enum Response {
+    Accepted {
+        warnings: Vec<String>,
+        certificate_pem: Option<String>,
+        ca_pem: String,
+        log_checkpoint: Option<String>,
+    },
+    Denied {
+        reasons: Vec<String>,
+    },
+}
+
+struct Home(PathBuf);
+
+tokio::task_local! {
+    static WIZARD_STEP: Cell<u8>;
+    static WIZARD_APPROVAL_WAIT: Cell<bool>;
+}
+
+fn wizard_step(step: u8, title: &str) {
+    let _ = WIZARD_STEP.try_with(|current| current.set(step));
+    if json_out::active() {
+        json_out::step_started(step, title);
+    } else {
+        ui::step(step, 6, title);
+    }
+}
+
+fn set_wizard_step(step: u8) {
+    let _ = WIZARD_STEP.try_with(|current| current.set(step));
+}
+
+async fn run_wizard<F>(
+    home: &Home,
+    invitation: Option<&str>,
+    no_wait: bool,
+    operation: F,
+) -> Result<ExitCode>
+where
+    F: Future<Output = Result<ExitCode>>,
+{
+    if !wizard_enabled(no_wait) {
+        return operation.await;
+    }
+
+    let initial_step = if home.file("enrolment.json").exists() {
+        4
+    } else {
+        1
+    };
+    WIZARD_STEP
+        .scope(Cell::new(initial_step), WIZARD_APPROVAL_WAIT.scope(Cell::new(false), async {
+            tokio::select! {
+                signal = tokio::signal::ctrl_c(), if !WIZARD_APPROVAL_WAIT.try_with(Cell::get).unwrap_or(false) => match signal {
+                    Ok(()) => {
+                        print_stopped(home, invitation);
+                        if json_out::active() {
+                            json_out::exit_interrupted();
+                        }
+                        let _ = std::io::stdout().flush();
+                        std::process::exit(130);
+                    }
+                    Err(error) => Err(error.into()),
+                },
+                result = operation => {
+                    if !json_out::active()
+                        && !matches!(&result, Ok(code) if *code == ExitCode::SUCCESS)
+                    {
+                        print_stopped(home, invitation);
+                    }
+                    result
+                },
+            }
+        }))
+        .await
+}
+
+fn print_stopped(home: &Home, invitation: Option<&str>) {
+    let step = WIZARD_STEP.try_with(Cell::get).unwrap_or(1);
+    print_stopped_at(home, invitation, step);
+}
+
+fn print_stopped_at(home: &Home, invitation: Option<&str>, step: u8) {
+    let command = client_command(&home.0);
+    let enrolled = home
+        .read_json::<Enrolment>("enrolment.json")
+        .ok()
+        .flatten()
+        .is_some();
+    let continuation = if enrolled {
+        format!("{command} join")
+    } else if let Some(invitation) = invitation {
+        format!("{command} join {}", shell_quote_arg(invitation))
+    } else {
+        format!("{command} join {}", shell_quote_arg("<invitation from IT>"))
+    };
+    println!("{}", stopped_message(step, &continuation));
+}
+
+fn stopped_message(step: u8, continuation: &str) -> String {
+    format!("Stopped at [{step}/6]. Continue with: {continuation}")
+}
+
+/// The directory of VPN credential generations, the selected generation, and its files,
+/// CA first.
+const VPN_DIR: &str = "vpn";
+const VPN_CURRENT: &str = "current";
+#[cfg(windows)]
+const VPN_FLAT_STALE: &str = "flat-copies-stale";
+const VPN_FILES: [&str; 2] = ["ca.pem", "vpn-cert.pem"];
+/// Written (and synced) in the client home before a removal deletes anything. While it exists,
+/// recovery finishes the deletion and never restores the pair; only the install of a later
+/// accepted claim removes it.
+const VPN_REMOVAL_MARKER: &str = "vpn-removal-pending";
+
+#[cfg(test)]
+thread_local! {
+    /// The number of install steps left before a test interrupts the process, if it does.
+    static INTERRUPT_AFTER: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(all(test, windows))]
+thread_local! {
+    static VPN_RENAME_ERROR: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Where an interruption could leave the installed files half changed. A test can stop the
+/// install here as if the process were killed.
+fn interruption_point() {
+    #[cfg(test)]
+    INTERRUPT_AFTER.with(|left| match left.get() {
+        Some(0 | 1) => {
+            left.set(None);
+            panic!("interrupted");
+        }
+        Some(n) => left.set(Some(n - 1)),
+        None => {}
+    });
+}
+
+fn read_home_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    #[cfg(windows)]
+    {
+        use std::io::Read;
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(0x00200000) // FILE_FLAG_OPEN_REPARSE_POINT
+            .open(path)?;
+        if file.metadata()?.file_attributes() & 0x400 != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "home file is a reparse point",
+            ));
+        }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }
+    #[cfg(not(windows))]
+    std::fs::read(path)
+}
+
+#[cfg(windows)]
+struct VpnLock(std::fs::File);
+
+#[cfg(windows)]
+impl Drop for VpnLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
+/// Removes a file or a link. Returns whether there was one.
+fn remove_file_if_exists(path: &Path) -> Result<bool> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e).with_context(|| path.display().to_string()),
+    }
+}
+
+impl Home {
+    fn new(dir: Option<PathBuf>) -> Result<Home> {
+        match dir {
+            Some(dir) => Ok(Home(dir)),
+            None => {
+                let home = std::env::var_os("HOME").context("HOME is not set")?;
+                Ok(Home(PathBuf::from(home).join(".config/open-pact")))
+            }
+        }
+    }
+
+    fn file(&self, name: &str) -> PathBuf {
+        self.0.join(name)
+    }
+
+    fn read_json<T: for<'de> Deserialize<'de>>(&self, name: &str) -> Result<Option<T>> {
+        let path = self.file(name);
+        match read_home_file(&path) {
+            Ok(bytes) => Ok(Some(
+                serde_json::from_slice(&bytes).with_context(|| format!("{}", path.display()))?,
+            )),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).with_context(|| format!("{}", path.display())),
+        }
+    }
+
+    /// Replaces `name` in one step: the bytes go to a synced temporary file beside it, which is
+    /// renamed over it. A crash leaves the old file or the new one, never a part of either.
+    fn write(&self, name: &str, bytes: &[u8]) -> Result<PathBuf> {
+        let path = self.file(name);
+        let temp = write_temporary(&path, bytes, None)?;
+        if let Err(error) = std::fs::rename(&temp, &path) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(error).with_context(|| format!("{}", path.display()));
+        }
+        Ok(path)
+    }
+
+    /// Installs a VPN CA and certificate as one generation (R7-L2).
+    /// Unix selects it through a symlink, with flat paths linked into that generation.
+    /// Windows selects it through a pointer file, then copies the flat files one at a time.
+    /// Windows flat copies may lag after a failed replacement; recovery retries them.
+    fn install_vpn_pair(&self, ca: &[u8], cert: &[u8]) -> Result<()> {
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (ca, cert);
+            bail!("installing the VPN pair is not supported on this OS yet");
+        }
+        #[cfg(windows)]
+        {
+            let _lock = self.lock_vpn()?;
+            self.recover_vpn_locked()?;
+            self.clear_vpn_removal_marker()?;
+            let vpn = self.file(VPN_DIR);
+            if self.vpn_generation(VPN_CURRENT)?.is_none()
+                && let (Ok(old_ca), Ok(old_cert)) = (
+                    read_home_file(&self.file(VPN_FILES[0])),
+                    read_home_file(&self.file(VPN_FILES[1])),
+                )
+            {
+                let baseline = self.write_windows_vpn_generation(&old_ca, &old_cert)?;
+                Self::replace_vpn_file(&vpn.join(VPN_CURRENT), baseline.as_bytes())?;
+            }
+            let generation = self.write_windows_vpn_generation(ca, cert)?;
+            if let Some(current) = self.vpn_generation(VPN_CURRENT)? {
+                Self::replace_vpn_file(&vpn.join("previous"), current.as_bytes())?;
+            }
+            Self::replace_vpn_file(&vpn.join(VPN_CURRENT), generation.as_bytes())?;
+            self.recover_vpn_locked()
+        }
+        #[cfg(unix)]
+        {
+            self.recover_vpn()?;
+            self.clear_vpn_removal_marker()?;
+            if !self.file(VPN_DIR).join(VPN_CURRENT).exists()
+                && let (Ok(ca), Ok(cert)) = (
+                    std::fs::read(self.file(VPN_FILES[0])),
+                    std::fs::read(self.file(VPN_FILES[1])),
+                )
+            {
+                self.switch_vpn_generation(&ca, &cert)?;
+                self.link_vpn_files()?;
+            }
+            self.switch_vpn_generation(ca, cert)?;
+            self.link_vpn_files()?;
+            self.recover_vpn()
+        }
+    }
+
+    /// Writes a new generation and points `vpn/current` at it.
+    #[cfg(unix)]
+    fn switch_vpn_generation(&self, ca: &[u8], cert: &[u8]) -> Result<()> {
+        let vpn = self.file(VPN_DIR);
+        let generation = format!(
+            "{}-{}",
+            chrono::Utc::now().timestamp_nanos_opt().context("clock")?,
+            std::process::id()
+        );
+        let dir = vpn.join(&generation);
+        std::fs::create_dir_all(&dir).with_context(|| dir.display().to_string())?;
+        for (name, bytes) in VPN_FILES.iter().zip([ca, cert]) {
+            let mut file = std::fs::File::create(dir.join(name))?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            interruption_point();
+        }
+        std::fs::File::open(&dir)?.sync_all()?;
+        let link = vpn.join(format!(".{VPN_CURRENT}.{}.tmp", std::process::id()));
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&generation, &link)?;
+        interruption_point();
+        std::fs::rename(&link, vpn.join(VPN_CURRENT))
+            .with_context(|| vpn.join(VPN_CURRENT).display().to_string())?;
+        interruption_point();
+        std::fs::File::open(&vpn)?.sync_all()?;
+        Ok(())
+    }
+
+    /// Deletes the installed VPN generation: the documented files, `vpn/current` and every
+    /// generation. Returns whether it deleted anything. A durable marker goes first, so an
+    /// interrupted deletion is finished by recovery and never undone. A later accepted claim
+    /// installs a new pair and clears the marker. The caller holds the claim lock.
+    fn remove_vpn_pair(&self) -> Result<bool> {
+        #[cfg(not(any(unix, windows)))]
+        {
+            Ok(false)
+        }
+        #[cfg(windows)]
+        {
+            if !self.vpn_removal_pending() && !self.vpn_pair_present() {
+                return Ok(false);
+            }
+            let _lock = self.lock_vpn()?;
+            self.begin_vpn_removal()?;
+            self.finish_vpn_removal()
+        }
+        #[cfg(unix)]
+        {
+            if !self.vpn_removal_pending() && !self.vpn_pair_present() {
+                return Ok(false);
+            }
+            self.begin_vpn_removal()?;
+            self.finish_vpn_removal()
+        }
+    }
+
+    /// Whether a removal would delete something: any file of the pair is still there.
+    fn vpn_removal_owed(&self) -> bool {
+        #[cfg(any(unix, windows))]
+        {
+            self.vpn_pair_present()
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            false
+        }
+    }
+
+    fn vpn_removal_pending(&self) -> bool {
+        std::fs::symlink_metadata(self.file(VPN_REMOVAL_MARKER)).is_ok()
+    }
+
+    /// Whether any generation, temporary file or documented file exists.
+    #[cfg(any(unix, windows))]
+    fn vpn_pair_present(&self) -> bool {
+        VPN_FILES
+            .iter()
+            .any(|name| std::fs::symlink_metadata(self.file(name)).is_ok())
+            || std::fs::read_dir(self.file(VPN_DIR)).is_ok_and(|mut entries| {
+                entries.any(|entry| entry.is_ok_and(|entry| entry.file_name() != "write.lock"))
+            })
+    }
+
+    /// Records the intent to delete, durably: the file and then its directory entry reach disk
+    /// before anything is deleted.
+    #[cfg(any(unix, windows))]
+    fn begin_vpn_removal(&self) -> Result<()> {
+        if self.vpn_removal_pending() {
+            return Ok(());
+        }
+        let path = self.file(VPN_REMOVAL_MARKER);
+        let mut file = std::fs::File::create(&path).with_context(|| path.display().to_string())?;
+        file.write_all(b"removing\n")?;
+        file.sync_all()?;
+        drop(file);
+        #[cfg(unix)]
+        std::fs::File::open(&self.0)?.sync_all()?;
+        interruption_point();
+        Ok(())
+    }
+
+    /// Removes the marker once a new pair is about to be installed.
+    #[cfg(any(unix, windows))]
+    fn clear_vpn_removal_marker(&self) -> Result<()> {
+        if remove_file_if_exists(&self.file(VPN_REMOVAL_MARKER))? {
+            #[cfg(unix)]
+            std::fs::File::open(&self.0)?.sync_all()?;
+        }
+        Ok(())
+    }
+
+    /// Completes a marked deletion; safe to repeat after any interruption. Returns whether this
+    /// call deleted anything. On Windows the caller holds the VPN lock.
+    #[cfg(any(unix, windows))]
+    fn finish_vpn_removal(&self) -> Result<bool> {
+        let vpn = self.file(VPN_DIR);
+        let mut removed = false;
+        // Windows: the pointers go first, so that no recovery can copy the pair back. Unix: the
+        // documented files are links into `vpn/current`, so they go first.
+        #[cfg(windows)]
+        for pointer in [VPN_CURRENT, "previous"] {
+            removed |= remove_file_if_exists(&vpn.join(pointer))?;
+            interruption_point();
+        }
+        for name in VPN_FILES {
+            removed |= remove_file_if_exists(&self.file(name))?;
+            interruption_point();
+        }
+        #[cfg(unix)]
+        {
+            removed |= remove_file_if_exists(&vpn.join(VPN_CURRENT))?;
+            interruption_point();
+        }
+        removed |= self.remove_vpn_leftovers(&vpn)?;
+        Ok(removed)
+    }
+
+    /// Every generation, and every temporary file, below `vpn/`. Keeps the directory and the
+    /// Windows write lock.
+    #[cfg(any(unix, windows))]
+    fn remove_vpn_leftovers(&self, vpn: &Path) -> Result<bool> {
+        let entries = match std::fs::read_dir(vpn) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e).with_context(|| vpn.display().to_string()),
+        };
+        let mut removed = false;
+        for entry in entries {
+            let entry = entry?;
+            if entry.file_name() == "write.lock" {
+                continue;
+            }
+            let path = entry.path();
+            if entry.file_type()?.is_dir() {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            }
+            .with_context(|| path.display().to_string())?;
+            removed = true;
+            interruption_point();
+        }
+        Ok(removed)
+    }
+
+    /// Makes each documented VPN file a link into `vpn/current/`, replacing a plain file.
+    #[cfg(unix)]
+    fn link_vpn_files(&self) -> Result<()> {
+        for name in VPN_FILES {
+            let target = Path::new(VPN_DIR).join(VPN_CURRENT).join(name);
+            let path = self.file(name);
+            if std::fs::read_link(&path).is_ok_and(|t| t == target) {
+                continue;
+            }
+            let link = self.file(&format!(".{name}.{}.tmp", std::process::id()));
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink(&target, &link)?;
+            std::fs::rename(&link, &path).with_context(|| path.display().to_string())?;
+            interruption_point();
+        }
+        std::fs::File::open(&self.0)?.sync_all()?;
+        Ok(())
+    }
+
+    /// Restores one whole VPN pair after an interrupted install: keeps only the generation
+    /// `vpn/current` points at, and links the documented files to it. Does nothing in a home
+    /// that has never installed a generation.
+    #[cfg(unix)]
+    fn recover_vpn(&self) -> Result<()> {
+        if self.vpn_removal_pending() {
+            self.finish_vpn_removal()?;
+            return Ok(());
+        }
+        let vpn = self.file(VPN_DIR);
+        let entries = match std::fs::read_dir(&vpn) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e).with_context(|| vpn.display().to_string()),
+        };
+        let current = std::fs::read_link(vpn.join(VPN_CURRENT)).ok();
+        for entry in entries {
+            let entry = entry?;
+            let name = PathBuf::from(entry.file_name());
+            if name == Path::new(VPN_CURRENT) || current.as_ref() == Some(&name) {
+                continue;
+            }
+            let path = entry.path();
+            if entry.file_type()?.is_dir() {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            }
+            .with_context(|| path.display().to_string())?;
+        }
+        if current.is_some() {
+            self.link_vpn_files()?;
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn write_windows_vpn_generation(&self, ca: &[u8], cert: &[u8]) -> Result<String> {
+        let vpn = self.file(VPN_DIR);
+        let generation = format!(
+            "{}-{}",
+            chrono::Utc::now().timestamp_nanos_opt().context("clock")?,
+            std::process::id()
+        );
+        let dir = vpn.join(&generation);
+        std::fs::create_dir(&dir)?;
+        for (name, bytes) in VPN_FILES.iter().zip([ca, cert]) {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(dir.join(name))?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            interruption_point();
+        }
+        Ok(generation)
+    }
+
+    #[cfg(windows)]
+    fn replace_vpn_file(path: &Path, bytes: &[u8]) -> Result<()> {
+        let temp = path.with_file_name(format!(
+            ".{}.{}-{}.tmp",
+            path.file_name().context("VPN file name")?.to_string_lossy(),
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().context("clock")?
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        interruption_point();
+        // Rust uses MoveFileExW with MOVEFILE_REPLACE_EXISTING on Windows.
+        #[cfg(test)]
+        VPN_RENAME_ERROR.with(|target| -> Result<()> {
+            if target.borrow().as_deref() == Some(path) {
+                target.replace(None);
+                return Err(std::io::Error::from_raw_os_error(32).into());
+            }
+            Ok(())
+        })?;
+        std::fs::rename(&temp, path).with_context(|| path.display().to_string())?;
+        interruption_point();
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn lock_vpn(&self) -> Result<VpnLock> {
+        let file = self.open_vpn_lock()?;
+        file.lock().context("lock VPN files")?;
+        Ok(VpnLock(file))
+    }
+
+    #[cfg(windows)]
+    fn try_lock_vpn(&self) -> Result<Option<VpnLock>> {
+        let file = self.open_vpn_lock()?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(VpnLock(file))),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(error)) => Err(error).context("lock VPN files"),
+        }
+    }
+
+    #[cfg(windows)]
+    fn open_vpn_lock(&self) -> Result<std::fs::File> {
+        let vpn = self.file(VPN_DIR);
+        std::fs::create_dir_all(&vpn)?;
+        Ok(std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(vpn.join("write.lock"))?)
+    }
+
+    #[cfg(windows)]
+    fn recover_vpn_at_startup(&self) -> Result<bool> {
+        if !self.file(VPN_DIR).exists() && !self.vpn_removal_pending() {
+            return Ok(true);
+        }
+        let Some(_lock) = self.try_lock_vpn()? else {
+            return Ok(false);
+        };
+        self.recover_vpn_locked()?;
+        Ok(true)
+    }
+
+    #[cfg(windows)]
+    fn recover_vpn(&self) -> Result<()> {
+        // A command such as uninstall must not recreate a missing home.
+        if !self.file(VPN_DIR).exists() && !self.vpn_removal_pending() {
+            return Ok(());
+        }
+        let _lock = self.lock_vpn()?;
+        self.recover_vpn_locked()
+    }
+
+    #[cfg(windows)]
+    fn vpn_generation(&self, pointer: &str) -> Result<Option<String>> {
+        match read_home_file(&self.file(VPN_DIR).join(pointer)) {
+            Ok(bytes) => {
+                let name = String::from_utf8(bytes).context("VPN generation is not UTF-8")?;
+                if name.is_empty() || !name.bytes().all(|b| b.is_ascii_digit() || b == b'-') {
+                    bail!("invalid VPN generation name");
+                }
+                Ok(Some(name))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).context("read VPN generation"),
+        }
+    }
+
+    #[cfg(windows)]
+    fn recover_vpn_locked(&self) -> Result<()> {
+        if self.vpn_removal_pending() {
+            self.finish_vpn_removal()?;
+            return Ok(());
+        }
+        let vpn = self.file(VPN_DIR);
+        let current = self.vpn_generation(VPN_CURRENT)?;
+        let previous = self.vpn_generation("previous")?;
+        // Read the complete selected pair before changing either documented file.
+        let pair = current
+            .as_ref()
+            .map(|name| -> Result<_> {
+                let dir = vpn.join(name);
+                Ok([
+                    read_home_file(&dir.join(VPN_FILES[0]))?,
+                    read_home_file(&dir.join(VPN_FILES[1]))?,
+                ])
+            })
+            .transpose()?;
+        if let Some(pair) = pair {
+            for (name, bytes) in VPN_FILES.iter().zip(pair) {
+                let path = self.file(name);
+                let refresh = (|| -> Result<()> {
+                    match read_home_file(&path) {
+                        Ok(existing) if existing == bytes => return Ok(()),
+                        Ok(_) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(e).with_context(|| path.display().to_string()),
+                    }
+                    Self::replace_vpn_file(&path, &bytes)
+                })();
+                if let Err(error) = refresh {
+                    let marker = vpn.join(VPN_FLAT_STALE);
+                    let marker_error = std::fs::write(&marker, b"stale").err();
+                    return Err(error).with_context(|| {
+                        let message = format!(
+                            "cannot replace {}; close the program that holds it and run check again",
+                            path.display()
+                        );
+                        match marker_error {
+                            Some(marker_error) => format!(
+                                "{message}; could not record stale flat copies at {}: {marker_error}",
+                                marker.display()
+                            ),
+                            None => message,
+                        }
+                    });
+                }
+            }
+            std::fs::remove_file(vpn.join(VPN_FLAT_STALE)).or_else(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    Ok(())
+                } else {
+                    Err(error)
+                }
+            })?;
+        }
+        for parent in [&self.0, &vpn] {
+            let entries = match std::fs::read_dir(parent) {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e).with_context(|| parent.display().to_string()),
+            };
+            for entry in entries {
+                let entry = entry?;
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                let temporary = if parent == &vpn {
+                    (name.starts_with(".current.") || name.starts_with(".previous."))
+                        && name.ends_with(".tmp")
+                } else {
+                    VPN_FILES
+                        .iter()
+                        .any(|file| name.starts_with(&format!(".{file}.")))
+                        && name.ends_with(".tmp")
+                };
+                let old_generation = parent == &vpn
+                    && entry.file_type()?.is_dir()
+                    && current.as_deref() != Some(name.as_ref())
+                    && previous.as_deref() != Some(name.as_ref());
+                if old_generation {
+                    std::fs::remove_dir_all(entry.path())?;
+                } else if temporary {
+                    std::fs::remove_file(entry.path())?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn recover_vpn(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn read_text(&self, name: &str) -> Result<Option<String>> {
+        let path = self.file(name);
+        match std::fs::read_to_string(&path) {
+            Ok(text) => Ok(Some(text)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).with_context(|| format!("{}", path.display())),
+        }
+    }
+
+    /// The last checkpoint this device verified. It was verified when stored, so it is trusted as is.
+    fn checkpoint(&self) -> Result<Option<Checkpoint>> {
+        self.read_text(LOG_CHECKPOINT)?
+            .map(|text| -> Result<Checkpoint> {
+                let note = Note::parse(&text)?;
+                Ok(Checkpoint::parse(&note.text)?)
+            })
+            .transpose()
+            .with_context(|| format!("{}", self.file(LOG_CHECKPOINT).display()))
+    }
+
+    /// A v0.1.0 hash-chain head with no Merkle checkpoint next to it.
+    fn has_legacy_log_head(&self) -> bool {
+        self.file(LEGACY_LOG_HEAD).exists() && !self.file(LOG_CHECKPOINT).exists()
+    }
+
+    /// The manifest this owner signed: the stored text, checked against the signed hash.
+    fn signed_manifest(&self) -> Result<Manifest> {
+        let enrolment = self.enrolment()?;
+        let manifest = Manifest::parse(&read_home_file(&self.file("manifest.toml"))?)?;
+        if manifest.hash() != &enrolment.manifest {
+            return Err(stored_manifest_mismatch(
+                self,
+                manifest.hash(),
+                &enrolment.manifest,
+            ));
+        }
+        Ok(manifest)
+    }
+
+    fn enrolment(&self) -> Result<Enrolment> {
+        self.read_json("enrolment.json")?
+            .context("not enrolled; run `open-pact-client join <invitation from IT>` first")
+    }
+}
+
+fn current_os() -> Result<Os> {
+    match std::env::consts::OS {
+        "macos" => Ok(Os::Macos),
+        "windows" => Ok(Os::Windows),
+        "linux" => Ok(Os::Linux),
+        other => bail!("unsupported OS {other}"),
+    }
+}
+
+fn virtualized() -> Virtualized {
+    let probe = if cfg!(target_os = "macos") {
+        std::process::Command::new("sysctl")
+            .args(["-n", "kern.hv_vmm_present"])
+            .output()
+    } else {
+        std::process::Command::new("systemd-detect-virt")
+            .arg("--quiet")
+            .output()
+    };
+    match probe {
+        Ok(out) if cfg!(target_os = "macos") && out.stdout.trim_ascii() == b"1" => Virtualized::Yes,
+        Ok(out) if !cfg!(target_os = "macos") && out.status.success() => Virtualized::Yes,
+        _ => Virtualized::No,
+    }
+}
+
+fn collect_results(
+    manifest: &Manifest,
+    os: Os,
+    device_config: Option<&device_config::DeviceConfig>,
+    repo_scan: Option<&checks::repos::RepoScan>,
+) -> BTreeMap<String, open_pact_core::ControlValue> {
+    disclosable(
+        manifest,
+        os,
+        checks::run(os, &manifest.body().controls, device_config, repo_scan),
+    )
+}
+
+/// Manifest validation allows remotes only on repository controls and requires them there.
+fn scans_repositories(manifest: &Manifest) -> bool {
+    manifest
+        .body()
+        .controls
+        .iter()
+        .any(|control| !control.remotes.is_empty())
+}
+
+async fn scan_repositories(
+    home: &Home,
+    manifest: &Manifest,
+    config: Option<&device_config::DeviceConfig>,
+) -> Result<Option<checks::repos::RepoScan>> {
+    scan_repositories_from(home, None, manifest, config, true).await
+}
+
+/// Scans below `root`, or below the current user's home when `root` is `None`. A scan that is
+/// not `store`d leaves the home untouched.
+async fn scan_repositories_from(
+    home: &Home,
+    root: Option<&Path>,
+    manifest: &Manifest,
+    config: Option<&device_config::DeviceConfig>,
+    store: bool,
+) -> Result<Option<checks::repos::RepoScan>> {
+    if !scans_repositories(manifest) {
+        if store {
+            checks::repos::forget(&home.0)?;
+        }
+        return Ok(None);
+    }
+    let root = match root {
+        Some(root) => root.to_path_buf(),
+        None => repository_scan_root(home)?,
+    };
+    let folders = config.map_or_else(Vec::new, |config| config.folders.clone());
+    let patterns = manifest
+        .body()
+        .controls
+        .iter()
+        .flat_map(|control| control.remotes.iter().map(ToString::to_string))
+        .collect::<Vec<_>>();
+    let state = home.0.clone();
+    let scan_root = root.clone();
+    let scan =
+        tokio::task::spawn_blocking(move || checks::repos::scan(&scan_root, &folders, &patterns))
+            .await
+            .context("repository scan task stopped")??;
+    if store {
+        checks::repos::store(&state, &scan)?;
+    }
+    Ok(Some(scan))
+}
+
+fn repository_scan_root(_home: &Home) -> Result<PathBuf> {
+    #[cfg(test)]
+    {
+        Ok(_home.0.clone())
+    }
+    #[cfg(not(test))]
+    {
+        std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+            .map(PathBuf::from)
+            .context("user home is not set")
+    }
+}
+
+fn stored_repo_scan(home: &Home) -> Result<Option<checks::repos::RepoScan>> {
+    checks::repos::load(&home.0, chrono::Utc::now().timestamp())
+}
+
+fn proposal_repo_scan(home: &Home) -> Result<Option<checks::repos::RepoScan>> {
+    let now = chrono::Utc::now().timestamp();
+    Ok(checks::repos::load_attempt(&home.0)?
+        .filter(|scan| scan.partial || checks::repos::fresh(scan, now)))
+}
+
+fn disclosable(
+    manifest: &Manifest,
+    _os: Os,
+    mut all: BTreeMap<String, open_pact_core::ControlValue>,
+) -> BTreeMap<String, open_pact_core::ControlValue> {
+    manifest
+        .body()
+        .controls
+        .iter()
+        .filter_map(|c| {
+            let value = all.remove(&c.id)?;
+            if c.output.contains(&value) {
+                return Some((c.id.clone(), value));
+            }
+            if value == "n/a" {
+                let unknown = open_pact_core::ControlValue::from("unknown");
+                if c.output.contains(&unknown) {
+                    return Some((c.id.clone(), unknown));
+                }
+            }
+            None
+        })
+        .collect()
+}
+
+/// Probes and sends `virtualized` only if the signed manifest discloses it.
+fn disclosable_virtualized(
+    manifest: &Manifest,
+    probe: impl FnOnce() -> Virtualized,
+) -> Option<Virtualized> {
+    manifest.body().discloses(Metadata::Virtualized).then(probe)
+}
+
+/// The checkpoint goes into the claim only if the signed manifest discloses it.
+fn disclosable_checkpoint(manifest: &Manifest, cp: Option<Checkpoint>) -> Option<LogCheckpoint> {
+    cp.filter(|_| manifest.body().discloses(Metadata::LogCheckpoint))
+        .map(|cp| LogCheckpoint {
+            size: cp.size,
+            root: cp.root,
+        })
+}
+
+fn base(gateway: &str) -> &str {
+    gateway.trim_end_matches('/')
+}
+
+fn check_scheme(gateway: &str, insecure_dev: bool) -> Result<()> {
+    let url = reqwest::Url::parse(gateway).with_context(|| format!("gateway URL {gateway:?}"))?;
+    let host = url.host_str().unwrap_or_default().trim_matches(['[', ']']);
+    let local = host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    match url.scheme() {
+        "https" => Ok(()),
+        "http" if local || insecure_dev => Ok(()),
+        "http" => bail!(
+            "refusing plain http:// to {gateway}: the invitation code and claims would travel unencrypted. \
+             Use https://, or --insecure-dev for a development gateway"
+        ),
+        other => bail!("unsupported gateway URL scheme {other:?}"),
+    }
+}
+
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The API never redirects, so a redirect cannot move the client from https to http. A stalled
+/// gateway ends the request, so a scheduled run cannot hang for ever.
+fn http_client() -> Result<reqwest::Client> {
+    http_client_with(HTTP_CONNECT_TIMEOUT, HTTP_REQUEST_TIMEOUT)
+}
+
+fn http_client_with(connect: Duration, request: Duration) -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(connect)
+        .timeout(request)
+        .build()?)
+}
+
+async fn get_text(http: &reqwest::Client, url: String) -> Result<String> {
+    http.get(&url)
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?
+        .error_for_status()?
+        .text()
+        .await
+        .with_context(|| format!("GET {url}"))
+}
+
+async fn get_json<T: for<'de> Deserialize<'de>>(http: &reqwest::Client, url: String) -> Result<T> {
+    http.get(&url)
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?
+        .error_for_status()?
+        .json()
+        .await
+        .with_context(|| format!("GET {url}"))
+}
+
+fn write_summary(
+    output: &mut impl Write,
+    manifest: &Manifest,
+    company_fingerprint: &str,
+    os: Os,
+) -> std::io::Result<()> {
+    let b = manifest.body();
+    let list = |set: &mut dyn Iterator<Item = String>| set.collect::<Vec<_>>().join(", ");
+    writeln!(
+        output,
+        "  Issuer       {}, valid from {}",
+        b.issuer, b.valid_from
+    )?;
+    writeln!(output, "  Controller   {}", b.data_controller)?;
+    writeln!(
+        output,
+        "  Recipients   {}",
+        list(&mut b.claim_recipients.iter().cloned())
+    )?;
+    writeln!(output, "  Retention    claims kept {}", b.claim_retention)?;
+    writeln!(
+        output,
+        "  Metadata     {}",
+        list(&mut b.disclosed_metadata.iter().map(ToString::to_string))
+    )?;
+    writeln!(
+        output,
+        "  Claims       valid {}, unknown results tolerated for {}, minimum trust {:?}",
+        b.claim_max_age, b.unknown_grace, b.min_trust_level
+    )?;
+    writeln!(output, "  Manifest     {}", manifest.hash())?;
+    match &b.schedule {
+        Some(schedule) => writeln!(output, "  {schedule}")?,
+        None => writeln!(
+            output,
+            "  Automatic claims: none. You send claims by hand with `check`"
+        )?,
+    }
+    writeln!(
+        output,
+        "  Company key  {}  (matches your invitation)",
+        company_fingerprint
+    )?;
+    if let Some(policy) = &b.log {
+        let witnesses = list(&mut policy.witnesses.iter().map(|w| w.name.clone()));
+        writeln!(
+            output,
+            "  Witnesses    {}",
+            if witnesses.is_empty() {
+                "none"
+            } else {
+                &witnesses
+            }
+        )?;
+        writeln!(output, "  Quorum       {}", policy.witness_quorum)?;
+        writeln!(
+            output,
+            "  Split views  {}",
+            if policy.allow_split_views {
+                "allowed"
+            } else {
+                "not allowed"
+            }
+        )?;
+    }
+    let required = |c: &&open_pact_core::Control| c.required.get(&os).map(ToString::to_string);
+    let (not_applicable, applicable): (Vec<_>, Vec<_>) = b
+        .controls
+        .iter()
+        .partition(|c| required(c).as_deref() == Some("n/a"));
+    let (enforced, reported): (Vec<_>, Vec<_>) =
+        applicable.into_iter().partition(|c| required(c).is_some());
+    let width = b.controls.iter().map(|c| c.id.len()).max().unwrap_or(0);
+    let ui = ui::styled();
+    let mut show = |title: String, controls: &[&open_pact_core::Control]| -> std::io::Result<()> {
+        if controls.is_empty() {
+            return Ok(());
+        }
+        writeln!(output, "\n  {}", ui::bold(&title, ui))?;
+        for c in controls {
+            let rule = required(c).map_or(String::new(), |r| format!("must be {r}, "));
+            writeln!(output, "    {:<width$}  {rule}grace {}", c.id, c.grace)?;
+            for pattern in &c.remotes {
+                writeln!(
+                    output,
+                    "    {:<width$}  counts repositories from {pattern}",
+                    ""
+                )?;
+            }
+            if let Some(why) = c
+                .description
+                .as_deref()
+                .or_else(|| open_pact_core::builtin_about(&c.check))
+            {
+                writeln!(output, "    {:<width$}  why: {why}", "")?;
+            }
+            writeln!(output, "    {:<width$}  reports: {}", "", c.output)?;
+        }
+        Ok(())
+    };
+    show(
+        format!("Required on this {os} device ({})", enforced.len()),
+        &enforced,
+    )?;
+    show(
+        format!("Reported, not required ({})", reported.len()),
+        &reported,
+    )?;
+    if !not_applicable.is_empty() {
+        writeln!(
+            output,
+            "\n  {}\n    {}",
+            ui::bold(
+                &format!("Not checked on {os}, always n/a ({})", not_applicable.len()),
+                ui
+            ),
+            list(&mut not_applicable.iter().map(|c| c.id.clone()))
+        )?;
+    }
+    writeln!(output)?;
+    Ok(())
+}
+
+/// Prints the manifest summary. Under `--json` it goes to the note buffer like any other text, so
+/// stdout keeps only JSON.
+fn print_summary(manifest: &Manifest, company_fingerprint: &str, os: Os) -> Result<()> {
+    let mut text = Vec::new();
+    write_summary(&mut text, manifest, company_fingerprint, os)?;
+    print!("{}", String::from_utf8(text)?);
+    Ok(())
+}
+
+/// One built-in check in `manifest builtins --json`. The fields print in this order.
+#[derive(Serialize)]
+struct BuiltinEntry<'a> {
+    check: String,
+    id: &'a str,
+    about: &'a str,
+}
+
+/// The built-in checks this client runs with their default text, in BUILTINS order: one line per
+/// check, or with `json` one array.
+fn manifest_builtins(json: bool) -> Result<String> {
+    let entries: Vec<BuiltinEntry> = open_pact_core::builtin_defaults()
+        .map(|(id, version, about)| BuiltinEntry {
+            check: format!("builtin:{id}@{version}"),
+            id,
+            about,
+        })
+        .collect();
+    if json {
+        return Ok(format!("{}\n", serde_json::to_string(&entries)?));
+    }
+    Ok(entries
+        .iter()
+        .map(|entry| format!("{}  {}\n", entry.check, entry.about))
+        .collect())
+}
+
+fn manifest_show(home: &Home) -> Result<String> {
+    let enrolment = home.enrolment()?;
+    let manifest_path = std::path::absolute(home.file("manifest.toml"))?;
+    let manifest = home.signed_manifest()?;
+    let company = home.read_text(COMPANY_KEY)?.context(
+        "this device has no pinned company key; run `open-pact-client join <invitation from IT>`",
+    )?;
+    let mut output = Vec::new();
+    write_summary(&mut output, &manifest, company.trim(), current_os()?)?;
+    writeln!(output, "Signed hash  {}", enrolment.manifest)?;
+    writeln!(
+        output,
+        "Full text    {}  (open it and read all of it)",
+        manifest_path.display()
+    )?;
+    if let Some(index) = enrolment.log_entries.map(|entries| entries.manifest) {
+        writeln!(output, "Transparency log entry  #{index}")?;
+    } else {
+        writeln!(
+            output,
+            "Transparency log entry index is not stored locally. Verify it with: {} log prove",
+            client_command(&home.0)
+        )?;
+    }
+    Ok(String::from_utf8(output)?)
+}
+
+async fn confirm_yes_by_default(question: &str) -> Result<bool> {
+    let question = question.to_string();
+    let (send, receive) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let input = std::io::stdin();
+        let mut output = std::io::stdout();
+        let result = confirm_yes_by_default_from(&question, &mut input.lock(), &mut output);
+        let _ = send.send(result);
+    });
+    Ok(receive.await.context("confirmation input stopped")??)
+}
+
+async fn confirm(question: &str) -> Result<bool> {
+    let question = question.to_string();
+    let (send, receive) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let input = std::io::stdin();
+        let mut output = std::io::stdout();
+        let result = confirm_from(question, &mut input.lock(), &mut output);
+        let _ = send.send(result);
+    });
+    Ok(receive.await.context("confirmation input stopped")??)
+}
+
+fn confirm_from(
+    question: String,
+    input: &mut impl std::io::BufRead,
+    output: &mut impl Write,
+) -> std::io::Result<bool> {
+    loop {
+        write!(output, "{question} [y/N] ")?;
+        output.flush()?;
+        let mut answer = String::new();
+        if input.read_line(&mut answer)? == 0 {
+            return Ok(false);
+        }
+        match answer.trim().to_ascii_lowercase().as_str() {
+            "" | "n" | "no" => return Ok(false),
+            "y" | "yes" => return Ok(true),
+            _ => writeln!(output, "Answer y or n.")?,
+        }
+    }
+}
+
+fn confirm_yes_by_default_from(
+    question: &str,
+    input: &mut impl std::io::BufRead,
+    output: &mut impl Write,
+) -> std::io::Result<bool> {
+    loop {
+        write!(output, "{question} [Y/n] ")?;
+        output.flush()?;
+        let mut answer = String::new();
+        if input.read_line(&mut answer)? == 0 {
+            return Ok(false);
+        }
+        match answer.trim().to_ascii_lowercase().as_str() {
+            "" | "y" | "yes" => return Ok(true),
+            "n" | "no" => return Ok(false),
+            _ => writeln!(output, "Answer y or n.")?,
+        }
+    }
+}
+
+enum LogSync {
+    Verified(Checkpoint, OwnEntries),
+    /// The gateway holds the acceptance of the manifest it enforces, which this device has not
+    /// signed yet. The owner runs `accept`; nothing is wrong with the log.
+    AcceptPending(ManifestHash),
+    Alarm(String),
+}
+
+fn alarm(e: impl std::fmt::Display) -> LogSync {
+    LogSync::Alarm(e.to_string())
+}
+
+fn read_optional_file(path: &Path) -> Result<Option<Vec<u8>>> {
+    match read_home_file(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
+    }
+}
+
+fn write_temporary(
+    path: &Path,
+    bytes: &[u8],
+    permissions: Option<std::fs::Permissions>,
+) -> Result<PathBuf> {
+    use std::fs::OpenOptions;
+
+    let parent = path.parent().context("file has no parent directory")?;
+    std::fs::create_dir_all(parent)?;
+    let name = path
+        .file_name()
+        .context("file has no name")?
+        .to_string_lossy();
+    let temporary = parent.join(format!("{name}.{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| -> Result<PathBuf> {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&temporary)
+            .with_context(|| format!("create {}", temporary.display()))?;
+        if let Some(permissions) = permissions {
+            file.set_permissions(permissions)?;
+        }
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        Ok(temporary.clone())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+/// The folder of the user's own profile, where `~` points.
+fn user_profile() -> Option<PathBuf> {
+    std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from)
+}
+
+/// What the owner chose in wizard step 5.
+#[derive(Debug, PartialEq)]
+struct SetupChoices {
+    auto_send: bool,
+    run_as: device_config::RunAs,
+    folders: Vec<PathBuf>,
+}
+
+/// What step 5 knows before it asks.
+struct SetupContext {
+    manifest: Manifest,
+    os: Os,
+    current: device_config::DeviceConfig,
+    /// What the repository scan found, in words, or nothing.
+    overview: String,
+    /// Folders that hold the repositories the scan found.
+    suggested: Vec<PathBuf>,
+    /// Folders from an `open-pact.toml` of an earlier client.
+    legacy: Vec<PathBuf>,
+    user_home: Option<PathBuf>,
+}
+
+fn folder_list(folders: &[PathBuf]) -> String {
+    folders
+        .iter()
+        .map(|folder| folder.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The owner's choices: automatic sending (only when the manifest defines it), who runs the job
+/// (Windows only), and repository folders (only when the manifest has a repository control).
+fn setup_questions(
+    context: &SetupContext,
+    input: &mut impl std::io::BufRead,
+    output: &mut impl Write,
+) -> Result<SetupChoices> {
+    let mut auto_send = false;
+    let mut run_as = context.current.run_as;
+    if let Some(schedule) = &context.manifest.body().schedule {
+        writeln!(output, "  {schedule}")?;
+        let question = if schedule.probe().is_some() {
+            "Send claims automatically while on the company VPN?"
+        } else {
+            "Send claims automatically as the manifest says?"
+        };
+        auto_send = confirm_yes_by_default_from(question, input, output)?;
+        if auto_send && context.os == Os::Windows {
+            run_as = if confirm_from(
+                "Run the job as SYSTEM instead of as you? SYSTEM needs an elevated PowerShell prompt"
+                    .into(),
+                input,
+                output,
+            )? {
+                device_config::RunAs::System
+            } else {
+                device_config::RunAs::User
+            };
+        }
+    } else {
+        writeln!(
+            output,
+            "  The company did not define automatic sending. You send claims by hand with `check`."
+        )?;
+    }
+    let mut folders = context.current.folders.clone();
+    if scans_repositories(&context.manifest) {
+        writeln!(
+            output,
+            "\n  The manifest counts repositories by their remote. It needs the folders that hold them."
+        )?;
+        write!(output, "{}", context.overview)?;
+        if !folders.is_empty() {
+            writeln!(output, "  Your folders now: {}", folder_list(&folders))?;
+        }
+        let new_in = |folders: &[PathBuf], candidates: &[PathBuf]| {
+            candidates
+                .iter()
+                .filter(|folder| !folders.contains(folder))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let legacy = new_in(&folders, &context.legacy);
+        if !legacy.is_empty()
+            && confirm_yes_by_default_from(
+                &format!(
+                    "Import these folders from {}: {}?",
+                    device_config::LEGACY_FILE,
+                    folder_list(&legacy)
+                ),
+                input,
+                output,
+            )?
+        {
+            folders.extend(legacy);
+        }
+        let suggested = new_in(&folders, &context.suggested);
+        if !suggested.is_empty()
+            && confirm_yes_by_default_from(
+                &format!(
+                    "Use these folders for the repository checks: {}?",
+                    folder_list(&suggested)
+                ),
+                input,
+                output,
+            )?
+        {
+            folders.extend(suggested);
+        }
+        loop {
+            write!(
+                output,
+                "Another folder that holds repositories (empty line to finish): "
+            )?;
+            output.flush()?;
+            let mut line = String::new();
+            if input.read_line(&mut line)? == 0 || line.trim().is_empty() {
+                break;
+            }
+            match device_config::absolute_folder(
+                Path::new(line.trim()),
+                context.user_home.as_deref(),
+            ) {
+                Ok(folder) if folders.contains(&folder) => {
+                    writeln!(output, "{} is already listed.", folder.display())?
+                }
+                Ok(folder) => folders.push(folder),
+                Err(error) => writeln!(output, "{error:#}")?,
+            }
+        }
+    }
+    Ok(SetupChoices {
+        auto_send,
+        run_as,
+        folders,
+    })
+}
+
+/// The choices `join --json` was given. Like the questions, it takes folders only when the manifest
+/// counts repositories, and automatic sending only when the manifest defines it.
+fn setup_answers(context: &SetupContext, answers: &json_out::Answers) -> SetupChoices {
+    let auto_send = context.manifest.body().schedule.is_some() && answers.auto_send;
+    let mut folders = context.current.folders.clone();
+    if scans_repositories(&context.manifest) {
+        for folder in &answers.folders {
+            if !folders.contains(folder) {
+                folders.push(folder.clone());
+            }
+        }
+    }
+    SetupChoices {
+        auto_send,
+        run_as: context.current.run_as,
+        folders,
+    }
+}
+
+/// Saves the choices and installs or removes the job to match.
+async fn apply_setup(home: &Home, choices: SetupChoices) -> Result<()> {
+    let was_on = {
+        let _claim_lock = claim::lock(home).await?;
+        let mut config =
+            device_config::DeviceConfig::load_or_migrate(home, user_profile().as_deref(), true)?;
+        let was_on = config.auto_send;
+        config.folders = choices.folders;
+        config.run_as = choices.run_as;
+        config.setup_answered = true;
+        config.save(home)?;
+        was_on
+    };
+    if choices.auto_send {
+        if let Err(error) = schedule::turn_on(home, Some(choices.run_as), false).await {
+            println!(
+                "The job was not installed: {error:#}\nRun `{} schedule on` when you can.",
+                client_command(&home.0)
+            );
+        }
+    } else if was_on {
+        schedule::turn_off(home, false).await?;
+    }
+    Ok(())
+}
+
+/// Wizard step 5: the owner's few choices, then the first check.
+async fn setup_device(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
+    wizard_step(5, "Set up this device");
+    let manifest = home.signed_manifest()?;
+    let os = current_os()?;
+    let user_home = user_profile();
+    let scan = proposal_repo_scan(home)?;
+    let context = SetupContext {
+        os,
+        current: device_config::DeviceConfig::load_or_migrate(home, user_home.as_deref(), true)?,
+        overview: scan
+            .as_ref()
+            .zip(user_home.as_deref())
+            .map_or_else(String::new, |(scan, user_home)| {
+                device_config::managed_repo_summary(scan, user_home)
+            }),
+        suggested: scan
+            .as_ref()
+            .zip(user_home.as_deref())
+            .map_or_else(Vec::new, |(scan, user_home)| {
+                device_config::suggested_folders(scan, user_home)
+            }),
+        legacy: device_config::legacy_folders(home, user_home.as_deref()),
+        manifest,
+        user_home,
+    };
+    let choices = if let Some(answers) = json_out::answers() {
+        setup_answers(&context, &answers)
+    } else {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let input = std::io::stdin();
+            let mut output = std::io::stdout();
+            let _ = send.send(setup_questions(&context, &mut input.lock(), &mut output));
+        });
+        receive.await.context("setup questions stopped")??
+    };
+    let detail = serde_json::json!({ "auto_send": choices.auto_send, "folders": choices.folders });
+    apply_setup(home, choices).await?;
+    json_out::step_done(5, Some(detail));
+    first_claim(home, insecure_dev).await
+}
+
+/// Wizard step 6: ask once more, then run the first check.
+async fn first_claim(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
+    set_wizard_step(6);
+    if json_out::active() {
+        wizard_step(6, "First check and claim");
+        let outcome = check_run(home, insecure_dev, false).await?;
+        let detail = match json_out::claim() {
+            Some(report) => serde_json::to_value(report)?,
+            None => json_out::not_sent_detail(&outcome.failure_text()),
+        };
+        json_out::step_done(6, Some(detail));
+        return Ok(outcome.exit_code());
+    }
+    if !confirm_yes_by_default("Send the first claim now?").await? {
+        print_stopped_at(home, None, 6);
+        return Ok(ExitCode::SUCCESS);
+    }
+    wizard_step(6, "First check and claim");
+    check_impl(home, insecure_dev, false).await
+}
+
+/// `folders list|add|remove`: the owner's repository folders.
+async fn folders(home: &Home, command: FoldersCommand) -> Result<ExitCode> {
+    let user_home = user_profile();
+    let mut config =
+        device_config::DeviceConfig::load_or_migrate(home, user_home.as_deref(), false)?;
+    if let FoldersCommand::List = command {
+        if config.folders.is_empty() {
+            println!(
+                "No folders. Add one with `{} folders add <path>`.",
+                client_command(&home.0)
+            );
+        }
+        for folder in &config.folders {
+            println!("{}", folder.display());
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    let _claim_lock = claim::lock(home).await?;
+    config = device_config::DeviceConfig::load_or_migrate(home, user_home.as_deref(), true)?;
+    match command {
+        FoldersCommand::List => unreachable!("handled above"),
+        FoldersCommand::Add { path } => {
+            let folder = device_config::absolute_folder(&path, user_home.as_deref())?;
+            if !folder.is_dir() {
+                println!("note: {} is not an existing folder yet.", folder.display());
+            }
+            if config.add_folder(folder.clone()) {
+                config.save(home)?;
+                println!("Added {}.", folder.display());
+            } else {
+                println!("{} is already listed.", folder.display());
+            }
+            if home
+                .signed_manifest()
+                .is_ok_and(|manifest| !scans_repositories(&manifest))
+            {
+                println!(
+                    "The manifest you signed has no repository control, so no check uses folders now."
+                );
+            }
+        }
+        FoldersCommand::Remove { path } => {
+            let folder = device_config::absolute_folder(&path, user_home.as_deref())?;
+            if !config.remove_folder(&folder) {
+                bail!("{} is not listed", folder.display());
+            }
+            config.save(home)?;
+            println!("Removed {}.", folder.display());
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn after_approval(home: &Home, insecure_dev: bool, wizard: bool) -> Result<ExitCode> {
+    if !wizard {
+        print_approved_next_step(&client_command(&home.0));
+        return Ok(ExitCode::SUCCESS);
+    }
+    match wizard_resume(home)? {
+        WizardResume::Setup => return setup_device(home, insecure_dev).await,
+        WizardResume::Complete => {
+            println!("This device setup is complete.");
+            json_out::steps_skipped(&[5, 6]);
+            return Ok(ExitCode::SUCCESS);
+        }
+        WizardResume::FirstCheck => json_out::steps_skipped(&[5]),
+    }
+    first_claim(home, insecure_dev).await
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WizardResume {
+    Setup,
+    FirstCheck,
+    Complete,
+}
+
+fn wizard_resume(home: &Home) -> Result<WizardResume> {
+    // Only step 5 sets `setup_answered`. An import or a command can create the file without it. A file
+    // that does not read counts as answered, because step 5 would only fail on it again.
+    let configured = match device_config::DeviceConfig::load(home) {
+        Ok(config) => config.setup_answered,
+        Err(_) => true,
+    };
+    let (records, damaged) = match locallog::read_lenient(&home.file("claims.jsonl")) {
+        Ok(history) => history,
+        Err(error) => {
+            println!(
+                "warning: could not read claim history; wizard completion cannot be confirmed ({error})"
+            );
+            return Ok(if configured {
+                WizardResume::FirstCheck
+            } else {
+                WizardResume::Setup
+            });
+        }
+    };
+    if damaged > 0 {
+        println!(
+            "warning: skipped {damaged} damaged claim history record(s); checked valid records for wizard completion"
+        );
+    }
+    if !configured {
+        return Ok(WizardResume::Setup);
+    }
+    let Some(record) = records.last() else {
+        return Ok(WizardResume::FirstCheck);
+    };
+    if !record
+        .status
+        .is_some_and(|status| (200..300).contains(&status))
+    {
+        return Ok(WizardResume::FirstCheck);
+    }
+    let response = record.response()?;
+    let Ok(Response::Accepted {
+        certificate_pem: Some(certificate),
+        ca_pem,
+        ..
+    }) = serde_json::from_slice::<Response>(&response)
+    else {
+        return Ok(WizardResume::FirstCheck);
+    };
+    let installed_certificate = read_optional_file(&home.file("vpn-cert.pem"))
+        .ok()
+        .flatten();
+    let installed_ca = read_optional_file(&home.file("ca.pem")).ok().flatten();
+    if installed_certificate.as_deref() == Some(certificate.as_bytes())
+        && installed_ca.as_deref() == Some(ca_pem.as_bytes())
+    {
+        Ok(WizardResume::Complete)
+    } else {
+        Ok(WizardResume::FirstCheck)
+    }
+}
+struct Pins {
+    company: String,
+    log: LogKey,
+}
+
+impl Pins {
+    fn load(home: &Home) -> Result<Pins> {
+        let (Some(company), Some(log)) = (home.read_text(COMPANY_KEY)?, home.read_text(LOG_KEY)?)
+        else {
+            bail!(
+                "this device has no pinned company key and log key; run `open-pact-client join <invitation from IT>`"
+            );
+        };
+        Ok(Pins {
+            company: company.trim().to_string(),
+            log: LogKey::parse(log.trim())?,
+        })
+    }
+
+    fn save(&self, home: &Home) -> Result<()> {
+        home.write(COMPANY_KEY, format!("{}\n", self.company).as_bytes())?;
+        home.write(LOG_KEY, format!("{}\n", self.log.vkey()).as_bytes())?;
+        Ok(())
+    }
+
+    /// What differs between the pinned keys and the ones a gateway serves, if anything.
+    fn differs(&self, company: &str, log: &str) -> Option<String> {
+        if company != self.company {
+            return Some(format!(
+                "the company key changed: pinned {}, gateway now shows {company}",
+                self.company
+            ));
+        }
+        if log.trim() != self.log.vkey() {
+            return Some(format!(
+                "the log key changed: pinned {}, gateway now shows {}",
+                self.log.vkey(),
+                log.trim()
+            ));
+        }
+        None
+    }
+
+    async fn compare(&self, http: &reqwest::Client, gateway: &str) -> Result<Option<String>> {
+        let published: PublishedManifest =
+            get_json(http, format!("{}/v1/manifest", base(gateway))).await?;
+        let log = get_text(http, format!("{}/v1/log/key", base(gateway))).await?;
+        Ok(self.differs(&published.company.key.fingerprint(), &log))
+    }
+}
+
+/// Fetches the gateway's checkpoint and verifies it against the one stored on this device.
+async fn sync_checkpoint(
+    http: &reqwest::Client,
+    home: &Home,
+    gateway: &str,
+    policy: Option<&LogPolicy>,
+) -> Result<Result<Checkpoint, String>> {
+    sync_checkpoint_with(http, home, gateway, policy, true).await
+}
+
+/// `sync_checkpoint`, which with `store` false verifies the checkpoint and keeps nothing.
+async fn sync_checkpoint_with(
+    http: &reqwest::Client,
+    home: &Home,
+    gateway: &str,
+    policy: Option<&LogPolicy>,
+    store: bool,
+) -> Result<Result<Checkpoint, String>> {
+    let pins = Pins::load(home)?;
+    if let Some(changed) = pins.compare(http, gateway).await? {
+        return Ok(Err(changed));
+    }
+    let prev = home.checkpoint()?;
+    let text = get_text(http, format!("{}/v1/log/checkpoint", base(gateway))).await?;
+    let checked = if store {
+        verify_checkpoint(http, home, gateway, &pins.log, policy, prev.as_ref(), &text).await?
+    } else {
+        verify_checkpoint_unstored(http, gateway, &pins.log, policy, prev.as_ref(), &text).await?
+    };
+    let new = match checked {
+        Ok(new) => new,
+        Err(e) => return Ok(Err(e.alarm_text())),
+    };
+    if policy.is_none_or(|p| p.allow_split_views) {
+        eprintln!(
+            "\n!!! WARNING: SPLIT VIEWS ALLOWED !!!\n\
+             The signed manifest sets allow_split_views = true and lists no witnesses. The gateway \
+             could show this device another log history than other devices (a split view) and \
+             nothing here would notice.\n"
+        );
+    }
+    Ok(Ok(new))
+}
+
+/// Verifies a checkpoint note from the gateway: the pinned log key, the manifest's witness policy,
+/// and that it extends `prev`, the last checkpoint this device verified. The first checkpoint
+/// trusts the same signature and witness policy. Stores the note only if all hold.
+async fn verify_checkpoint(
+    http: &reqwest::Client,
+    home: &Home,
+    gateway: &str,
+    key: &LogKey,
+    policy: Option<&LogPolicy>,
+    prev: Option<&Checkpoint>,
+    text: &str,
+) -> Result<Result<Checkpoint, CheckpointVerifyError>> {
+    let checked = verify_checkpoint_unstored(http, gateway, key, policy, prev, text).await?;
+    if checked.is_ok() {
+        home.write(LOG_CHECKPOINT, text.as_bytes())?;
+    }
+    Ok(checked)
+}
+
+/// The checks of `verify_checkpoint` without storing the note.
+async fn verify_checkpoint_unstored(
+    http: &reqwest::Client,
+    gateway: &str,
+    key: &LogKey,
+    policy: Option<&LogPolicy>,
+    prev: Option<&Checkpoint>,
+    text: &str,
+) -> Result<Result<Checkpoint, CheckpointVerifyError>> {
+    let now = u64::try_from(chrono::Utc::now().timestamp()).context("clock")?;
+    let new = match Note::parse(text).and_then(|note| {
+        let checkpoint = key.verify(&note)?;
+        verify_cosignatures(policy, &checkpoint, &note, now)?;
+        Ok(checkpoint)
+    }) {
+        Ok(checkpoint) => checkpoint,
+        Err(e) => return Ok(Err(CheckpointVerifyError::Alarm(e.to_string()))),
+    };
+    let checked = match prev {
+        None => Ok(()),
+        Some(old) if old.size == new.size => {
+            verify_consistency(old.size, new.size, &old.root, &new.root, &[])
+                .map_err(|e| CheckpointVerifyError::Alarm(e.to_string()))
+        }
+        Some(old) => {
+            let url = format!(
+                "{}/v1/log/proof/consistency?from={}&to={}",
+                base(gateway),
+                old.size,
+                new.size
+            );
+            let proof = async {
+                let response = http.get(&url).send().await.map_err(|error| {
+                    let error = anyhow::Error::from(error);
+                    if error.chain().any(|cause| {
+                        cause
+                            .downcast_ref::<reqwest::Error>()
+                            .is_some_and(is_retryable_http_error)
+                    }) {
+                        CheckpointVerifyError::Network(error)
+                    } else {
+                        CheckpointVerifyError::Alarm(error.to_string())
+                    }
+                })?;
+                let response = response.error_for_status().map_err(|error| {
+                    let error = anyhow::Error::from(error);
+                    if error.chain().any(|cause| {
+                        cause
+                            .downcast_ref::<reqwest::Error>()
+                            .is_some_and(is_retryable_http_error)
+                    }) {
+                        CheckpointVerifyError::Network(error)
+                    } else {
+                        CheckpointVerifyError::Alarm(error.to_string())
+                    }
+                })?;
+                let bytes = response
+                    .bytes()
+                    .await
+                    .map_err(|error| CheckpointVerifyError::Network(error.into()))?;
+                serde_json::from_slice::<Proof>(&bytes).map_err(|error| {
+                    CheckpointVerifyError::Alarm(format!(
+                        "GET {url}: error decoding response body: {error}"
+                    ))
+                })
+            }
+            .await;
+            match proof {
+                Ok(p) => verify_consistency(old.size, new.size, &old.root, &new.root, &p.proof)
+                    .map_err(|e| CheckpointVerifyError::Alarm(e.to_string())),
+                Err(CheckpointVerifyError::Network(error)) => {
+                    Err(CheckpointVerifyError::Network(error))
+                }
+                Err(CheckpointVerifyError::Alarm(message)) => Err(CheckpointVerifyError::Alarm(
+                    format!("no consistency proof from the gateway: {message}"),
+                )),
+            }
+        }
+    };
+    if let Err(e) = checked {
+        return Ok(Err(e));
+    }
+    Ok(Ok(new))
+}
+
+fn signed_manifest_entry(enrolment: &Enrolment) -> impl Fn(&Entry) -> bool + '_ {
+    |e: &Entry| {
+        e.kind == EntryKind::ManifestPublished && e.data["manifest"] == enrolment.manifest.as_str()
+    }
+}
+
+fn own_enrolment_entry(commitment: &str) -> impl Fn(&Entry) -> bool + '_ {
+    move |e: &Entry| e.kind == EntryKind::DeviceEnrolled && e.data["commitment"] == commitment
+}
+
+async fn fetch_my_entries(
+    http: &reqwest::Client,
+    home: &Home,
+    enrolment: &Enrolment,
+) -> Result<MyEntries> {
+    let device = DeviceKey::load(&home.0)?;
+    let gateway = base(&enrolment.gateway);
+    let nonce: Nonce = http
+        .post(format!("{gateway}/v1/nonce"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let statement =
+        device_auth_statement(DeviceAuthPurpose::LogMine, &enrolment.device, &nonce.nonce);
+    let request = MyEntriesRequest {
+        pseudonym: enrolment.device.clone(),
+        nonce: nonce.nonce,
+        device_key: device.public_key(),
+        signature: device.sign(&statement)?,
+    };
+    let response = http
+        .post(format!("{gateway}/v1/log/mine"))
+        .json(&request)
+        .send()
+        .await?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(anyhow::anyhow!(
+            "The gateway does not support this client version. Ask IT to update the gateway to 0.4.0 or later."
+        ));
+    }
+    Ok(response.error_for_status()?.json().await?)
+}
+
+async fn status_after_log_denial(
+    http: &reqwest::Client,
+    home: &Home,
+    enrolment: &Enrolment,
+) -> Result<DeviceStatus> {
+    let device = DeviceKey::load(&home.0)?;
+    let gateway = base(&enrolment.gateway);
+    let nonce: Nonce = http
+        .post(format!("{gateway}/v1/nonce"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let statement = device_auth_statement(
+        DeviceAuthPurpose::DeviceStatus,
+        &enrolment.device,
+        &nonce.nonce,
+    );
+    let request = MyEntriesRequest {
+        pseudonym: enrolment.device.clone(),
+        nonce: nonce.nonce,
+        device_key: device.public_key(),
+        signature: device.sign(&statement)?,
+    };
+    #[derive(Deserialize)]
+    struct Status {
+        state: DeviceStatus,
+    }
+    let status: Status = http
+        .post(format!("{gateway}/v1/device/status"))
+        .json(&request)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    Ok(status.state)
+}
+
+async fn fetch_my_entries_for_wait(
+    http: &reqwest::Client,
+    home: &Home,
+    enrolment: &Enrolment,
+) -> std::result::Result<MyEntries, WaitError> {
+    let device = DeviceKey::load(&home.0).map_err(WaitError::Fatal)?;
+    let gateway = base(&enrolment.gateway);
+    let nonce_bytes = http
+        .post(format!("{gateway}/v1/nonce"))
+        .send()
+        .await
+        .map_err(|error| WaitError::from_error(error.into()))?
+        .error_for_status()
+        .map_err(|error| WaitError::from_error(error.into()))?
+        .bytes()
+        .await
+        .map_err(WaitError::body_error)?;
+    let nonce: Nonce =
+        serde_json::from_slice(&nonce_bytes).map_err(|error| WaitError::Fatal(error.into()))?;
+    let statement =
+        device_auth_statement(DeviceAuthPurpose::LogMine, &enrolment.device, &nonce.nonce);
+    let request = MyEntriesRequest {
+        pseudonym: enrolment.device.clone(),
+        nonce: nonce.nonce,
+        device_key: device.public_key(),
+        signature: device.sign(&statement).map_err(WaitError::Fatal)?,
+    };
+    let response = http
+        .post(format!("{gateway}/v1/log/mine"))
+        .json(&request)
+        .send()
+        .await
+        .map_err(|error| WaitError::from_error(error.into()))?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(WaitError::Fatal(anyhow::anyhow!(
+            "The gateway does not support this client version. Ask IT to update the gateway to 0.4.0 or later."
+        )));
+    }
+    let bytes = response
+        .error_for_status()
+        .map_err(|error| WaitError::from_error(error.into()))?
+        .bytes()
+        .await
+        .map_err(WaitError::body_error)?;
+    serde_json::from_slice(&bytes).map_err(|error| WaitError::Fatal(error.into()))
+}
+
+fn verify_my_entries(
+    response: &MyEntries,
+    enrolment: &Enrolment,
+    commitment: &str,
+    cp: &Checkpoint,
+    enforced: &ManifestHash,
+) -> Result<OwnEntries, OwnEntriesError> {
+    let alarm = |error: String| OwnEntriesError::Alarm(error);
+    for item in std::iter::once(&response.manifest).chain(&response.device) {
+        if item.entry.index >= cp.size {
+            return Err(alarm("own entry is outside the checkpoint".into()));
+        }
+        verify_inclusion(
+            &item.entry.leaf_hash(),
+            item.entry.index,
+            cp.size,
+            &item.proof,
+            &cp.root,
+        )
+        .map_err(|e| alarm(e.to_string()))?;
+    }
+    if response.device.iter().any(|item| {
+        !matches!(
+            item.entry.kind,
+            EntryKind::DeviceEnrolled
+                | EntryKind::DeviceApproved
+                | EntryKind::DeviceRevoked
+                | EntryKind::ManifestAccepted
+        ) || item.entry.data["commitment"] != commitment
+    }) {
+        return Err(alarm("the gateway returned another device's entry".into()));
+    }
+    if !signed_manifest_entry(enrolment)(&response.manifest.entry) {
+        // The operator's publish alone does not show an owner signed the enforced manifest. Only
+        // this device's acceptance in the log does.
+        let accepted_for_this_device = response.device.iter().any(|item| {
+            item.entry.kind == EntryKind::ManifestAccepted
+                && item.entry.data["commitment"] == commitment
+                && item.entry.data["manifest"] == enforced.as_str()
+        });
+        let accepted_elsewhere = accepted_for_this_device
+            && response.manifest.entry.kind == EntryKind::ManifestPublished
+            && response.manifest.entry.data["manifest"] == enforced.as_str();
+        return Err(if accepted_elsewhere {
+            OwnEntriesError::AcceptPending
+        } else {
+            alarm("the gateway returned a different manifest entry".into())
+        });
+    }
+    let enrolled = response
+        .device
+        .iter()
+        .find(|item| own_enrolment_entry(commitment)(&item.entry))
+        .ok_or_else(|| alarm("the log has no entry for this device's enrolment".into()))?;
+    Ok(OwnEntries {
+        manifest: response.manifest.entry.index,
+        enrolment: enrolled.entry.index,
+    })
+}
+
+/// Why this device's own log entries did not verify.
+#[derive(Debug)]
+enum OwnEntriesError {
+    /// A fault the owner must see as a transparency log alarm.
+    Alarm(String),
+    /// The log holds an owner's acceptance of the manifest the gateway enforces, and this device has
+    /// not signed it. The log is intact; the device is behind.
+    AcceptPending,
+}
+
+impl std::fmt::Display for OwnEntriesError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OwnEntriesError::Alarm(error) => f.write_str(error),
+            OwnEntriesError::AcceptPending => {
+                f.write_str("the gateway holds an acceptance of the manifest it enforces")
+            }
+        }
+    }
+}
+
+/// Verifies this device's entries against an authenticated checkpoint. `enforced` is the manifest
+/// the gateway enforces; it differs from the signed one while an owner has not accepted it yet.
+#[cfg(test)]
+async fn check_own_entries(
+    http: &reqwest::Client,
+    home: &Home,
+    enrolment: &mut Enrolment,
+    enforced: &ManifestHash,
+    cp: &mut Checkpoint,
+) -> Result<Result<OwnEntries, OwnEntriesError>> {
+    check_own_entries_with(http, home, enrolment, enforced, cp, true).await
+}
+
+/// `check_own_entries`. With `store` false it writes no file: the checkpoint and the enrolment
+/// change only in memory.
+async fn check_own_entries_with(
+    http: &reqwest::Client,
+    home: &Home,
+    enrolment: &mut Enrolment,
+    enforced: &ManifestHash,
+    cp: &mut Checkpoint,
+    store: bool,
+) -> Result<Result<OwnEntries, OwnEntriesError>> {
+    let response = fetch_my_entries(http, home, enrolment).await?;
+    let pins = Pins::load(home)?;
+    let manifest = Manifest::parse(&read_home_file(&home.file("manifest.toml"))?)?;
+    let checked = if store {
+        verify_checkpoint(
+            http,
+            home,
+            &enrolment.gateway,
+            &pins.log,
+            manifest.body().log.as_ref(),
+            Some(cp),
+            &response.checkpoint,
+        )
+        .await?
+    } else {
+        verify_checkpoint_unstored(
+            http,
+            &enrolment.gateway,
+            &pins.log,
+            manifest.body().log.as_ref(),
+            Some(cp),
+            &response.checkpoint,
+        )
+        .await?
+    };
+    let next = match checked {
+        Ok(next) => next,
+        Err(error) => return Ok(Err(OwnEntriesError::Alarm(error.alarm_text()))),
+    };
+    let own = match verify_my_entries(
+        &response,
+        enrolment,
+        &commitment(enrolment)?,
+        &next,
+        enforced,
+    ) {
+        Ok(own) => own,
+        Err(error) => return Ok(Err(error)),
+    };
+    if enrolment
+        .log_entries
+        .is_some_and(|stored| stored.manifest != own.manifest || stored.enrolment != own.enrolment)
+    {
+        return Ok(Err(OwnEntriesError::Alarm(
+            "the gateway changed this device's log entry indexes".into(),
+        )));
+    }
+    *cp = next;
+    enrolment.log_entries = Some(own);
+    if store {
+        home.write("enrolment.json", &serde_json::to_vec_pretty(&enrolment)?)?;
+    }
+    Ok(Ok(own))
+}
+
+/// Verifies the new checkpoint against the stored one, then this enrolment's entries in it.
+/// `enforced` is the manifest the gateway enforces now.
+async fn sync_log(
+    http: &reqwest::Client,
+    home: &Home,
+    manifest: &Manifest,
+    enforced: &ManifestHash,
+    enrolment: &mut Enrolment,
+) -> Result<LogSync> {
+    sync_log_with(http, home, manifest, enforced, enrolment, true).await
+}
+
+/// `sync_log`. With `store` false the checkpoint and the enrolment stay as they are on disk.
+async fn sync_log_with(
+    http: &reqwest::Client,
+    home: &Home,
+    manifest: &Manifest,
+    enforced: &ManifestHash,
+    enrolment: &mut Enrolment,
+    store: bool,
+) -> Result<LogSync> {
+    let gateway = enrolment.gateway.clone();
+    let policy = manifest.body().log.as_ref();
+    let mut cp = match sync_checkpoint_with(http, home, &gateway, policy, store).await? {
+        Ok(cp) => cp,
+        Err(e) => return Ok(alarm(e)),
+    };
+    Ok(
+        match check_own_entries_with(http, home, enrolment, enforced, &mut cp, store).await? {
+            Ok(own) => LogSync::Verified(cp, own),
+            Err(OwnEntriesError::Alarm(e)) => alarm(e),
+            Err(OwnEntriesError::AcceptPending) => LogSync::AcceptPending(enforced.clone()),
+        },
+    )
+}
+
+/// A root as the checkpoint text shows it.
+fn b64(root: &LogHash) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(root.0)
+}
+
+fn report_log(sync: LogSync, home: &Home) -> bool {
+    match sync {
+        LogSync::Verified(cp, own) => {
+            println!(
+                "Transparency log verified: checkpoint size {} root {}",
+                cp.size,
+                b64(&cp.root)
+            );
+            println!(
+                "Inclusion proofs verified: the manifest you signed (#{}) and your enrolment (#{})",
+                own.manifest, own.enrolment
+            );
+            true
+        }
+        LogSync::AcceptPending(enforced) => {
+            println!(
+                "{}",
+                manifest_change_notice(&enforced, &client_command(&home.0))
+            );
+            false
+        }
+        LogSync::Alarm(e) => {
+            let bar = "!".repeat(72);
+            eprintln!(
+                "\n{bar}\n!! TRANSPARENCY LOG ALARM\n!! The gateway's keys or history do not match the copy on this device.\n!! {e}"
+            );
+            eprintln!(
+                "!! Keep {}: it is the last checkpoint the gateway signed for you.\n!! Compare it with colleagues: open-pact-client log head\n{bar}\n",
+                home.file(LOG_CHECKPOINT).display()
+            );
+            false
+        }
+    }
+}
+
+fn print_log_upgrade(home: &Home) {
+    eprintln!(
+        "The transparency log format was upgraded: it is now a Merkle tree with signed checkpoints.\n\
+         {} holds a head in the old hash-chain format, which cannot be compared with a checkpoint.\n\
+         This is not a log alarm. Run `open-pact-client join <invitation>` again to review the\n\
+         manifest and pin the new log.",
+        home.file(LEGACY_LOG_HEAD).display()
+    );
+}
+
+async fn fetch_device_status(
+    http: &reqwest::Client,
+    home: &Home,
+    enrolment: &Enrolment,
+) -> std::result::Result<Approval, WaitError> {
+    let device = DeviceKey::load(&home.0).map_err(WaitError::Fatal)?;
+    let nonce_bytes = http
+        .post(format!("{}/v1/nonce", base(&enrolment.gateway)))
+        .send()
+        .await
+        .map_err(|e| WaitError::from_error(e.into()))?
+        .error_for_status()
+        .map_err(|e| WaitError::from_error(e.into()))?
+        .bytes()
+        .await
+        .map_err(WaitError::body_error)?;
+    let nonce: Nonce =
+        serde_json::from_slice(&nonce_bytes).map_err(|e| WaitError::Fatal(e.into()))?;
+    let statement = device_auth_statement(
+        DeviceAuthPurpose::DeviceStatus,
+        &enrolment.device,
+        &nonce.nonce,
+    );
+    let request = MyEntriesRequest {
+        pseudonym: enrolment.device.clone(),
+        nonce: nonce.nonce,
+        device_key: device.public_key(),
+        signature: device.sign(&statement).map_err(WaitError::Fatal)?,
+    };
+    let bytes = http
+        .post(format!("{}/v1/device/status", base(&enrolment.gateway)))
+        .json(&request)
+        .send()
+        .await
+        .map_err(|e| WaitError::from_error(e.into()))?
+        .error_for_status()
+        .map_err(|e| WaitError::from_error(e.into()))?
+        .bytes()
+        .await
+        .map_err(WaitError::body_error)?;
+    let response: DeviceStatusResponse =
+        serde_json::from_slice(&bytes).map_err(|e| WaitError::Fatal(e.into()))?;
+    Ok(response.state)
+}
+
+fn remember_device_status(home: &Home, status: DeviceStatus) -> Result<()> {
+    let mut enrolment = home.enrolment()?;
+    if enrolment.last_status == Some(status) {
+        return Ok(());
+    }
+    enrolment.last_status = Some(status);
+    home.write("enrolment.json", &serde_json::to_vec_pretty(&enrolment)?)?;
+    Ok(())
+}
+
+/// Verifies the gateway checkpoint and every private entry before trusting an approval entry.
+async fn verify_approval_entry(
+    http: &reqwest::Client,
+    home: &Home,
+    enrolment: &Enrolment,
+    manifest: &Manifest,
+) -> std::result::Result<bool, WaitError> {
+    let response = fetch_my_entries_for_wait(http, home, enrolment).await?;
+    let pins = Pins::load(home).map_err(WaitError::Fatal)?;
+    let prev = home.checkpoint().map_err(WaitError::Fatal)?;
+    let checkpoint = match verify_checkpoint(
+        http,
+        home,
+        &enrolment.gateway,
+        &pins.log,
+        manifest.body().log.as_ref(),
+        prev.as_ref(),
+        &response.checkpoint,
+    )
+    .await
+    .map_err(WaitError::Fatal)?
+    {
+        Ok(checkpoint) => checkpoint,
+        Err(CheckpointVerifyError::Network(_)) => return Err(WaitError::Network),
+        Err(CheckpointVerifyError::Alarm(error)) => return Err(WaitError::Alarm(error)),
+    };
+    let commitment = commitment(enrolment).map_err(WaitError::Fatal)?;
+    if let Err(error) = verify_my_entries(
+        &response,
+        enrolment,
+        &commitment,
+        &checkpoint,
+        &enrolment.manifest,
+    ) {
+        return Err(WaitError::Alarm(error.to_string()));
+    }
+    Ok(response.device.iter().any(|item| {
+        item.entry.kind == EntryKind::DeviceApproved && item.entry.data["commitment"] == commitment
+    }))
+}
+
+async fn poll_approval(
+    http: &reqwest::Client,
+    home: &Home,
+    enrolment: &Enrolment,
+    manifest: &Manifest,
+) -> std::result::Result<ApprovalProgress, WaitError> {
+    let status = fetch_device_status(http, home, enrolment).await?;
+    let stored = match status {
+        Approval::Pending => DeviceStatus::Pending,
+        Approval::Approved => DeviceStatus::Approved,
+        Approval::Revoked => DeviceStatus::Revoked,
+    };
+    remember_device_status(home, stored).map_err(WaitError::Fatal)?;
+    match status {
+        Approval::Pending => Ok(ApprovalProgress::Pending),
+        Approval::Revoked => Ok(ApprovalProgress::Revoked),
+        Approval::Approved => match verify_approval_entry(http, home, enrolment, manifest).await {
+            Ok(true) => Ok(ApprovalProgress::Approved),
+            Ok(false) => Ok(ApprovalProgress::ProofPending),
+            Err(error) => Err(error),
+        },
+    }
+}
+
+fn print_waiting_line(message: &str) {
+    if json_out::active() {
+        return;
+    }
+    let mut stdout = std::io::stdout().lock();
+    if stdout.is_terminal() {
+        let _ = write!(stdout, "\r\x1b[2K  {message}");
+        let _ = stdout.flush();
+    } else {
+        println!("  {message}");
+    }
+}
+
+#[cfg(test)]
+async fn wait_for_approval(
+    http: &reqwest::Client,
+    home: &Home,
+    enrolment: &Enrolment,
+    manifest: &Manifest,
+    poll_interval: Duration,
+    interruptible: bool,
+) -> Result<Result<ApprovalWait, String>> {
+    wait_for_approval_with_status(
+        http,
+        home,
+        enrolment,
+        manifest,
+        ApprovalWaitOptions {
+            poll_interval,
+            interruptible,
+            show_waiting: true,
+            initial: None,
+        },
+    )
+    .await
+}
+
+async fn wait_for_approval_with_status(
+    http: &reqwest::Client,
+    home: &Home,
+    enrolment: &Enrolment,
+    manifest: &Manifest,
+    options: ApprovalWaitOptions,
+) -> Result<Result<ApprovalWait, String>> {
+    let ApprovalWaitOptions {
+        poll_interval,
+        interruptible,
+        show_waiting,
+        initial,
+    } = options;
+    let first_message = match initial.as_ref() {
+        Some(Ok(ApprovalProgress::ProofPending)) => {
+            "IT approved the device. Waiting for the signed log proof..."
+        }
+        _ => "Waiting for IT approval...",
+    };
+    if show_waiting {
+        print_waiting_line(first_message);
+    }
+    let mut warning_printed = false;
+    let mut first_poll = true;
+    let mut initial = initial;
+    loop {
+        if !first_poll {
+            if interruptible {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => return Ok(Ok(ApprovalWait::Interrupted)),
+                    _ = tokio::time::sleep(poll_interval) => {}
+                }
+            } else {
+                tokio::time::sleep(poll_interval).await;
+            }
+        }
+        let first = first_poll;
+        first_poll = false;
+        let progress_result = if let Some(initial) = initial.take() {
+            initial
+        } else if interruptible {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => return Ok(Ok(ApprovalWait::Interrupted)),
+                result = poll_approval(http, home, enrolment, manifest) => result,
+            }
+        } else {
+            poll_approval(http, home, enrolment, manifest).await
+        };
+        let progress = match progress_result {
+            Ok(progress) => progress,
+            Err(WaitError::Network) => {
+                if !warning_printed {
+                    eprintln!("warning: could not reach the gateway for IT approval; retrying");
+                    warning_printed = true;
+                }
+                continue;
+            }
+            Err(WaitError::Alarm(error)) => return Ok(Err(error)),
+            Err(WaitError::Fatal(error)) => return Err(error),
+        };
+        match progress {
+            ApprovalProgress::Revoked => return Ok(Ok(ApprovalWait::Revoked)),
+            ApprovalProgress::Approved => return Ok(Ok(ApprovalWait::Approved)),
+            ApprovalProgress::Pending if !first && show_waiting => {
+                print_waiting_line("Waiting for IT approval...")
+            }
+            ApprovalProgress::Pending => {}
+            ApprovalProgress::ProofPending if show_waiting => {
+                print_waiting_line("IT approved the device. Waiting for the signed log proof...")
+            }
+            ApprovalProgress::ProofPending => {}
+        }
+    }
+}
+
+fn print_approved_next_step(command: &str) {
+    println!("\n  {}", ui::bold(approval_confirmation(), ui::styled()));
+    println!("\n{}", approved_next_hint(command));
+}
+
+fn approved_next_hint(command: &str) -> String {
+    format!(
+        "Next: {command} check\nThen, if the company allows automatic sending: {command} schedule on"
+    )
+}
+
+fn approval_confirmation() -> &'static str {
+    "This device is approved."
+}
+
+fn step_four_intro(
+    progress: Option<ApprovalProgress>,
+    device_code: &str,
+    scans_repositories: bool,
+) -> String {
+    match progress {
+        Some(ApprovalProgress::Approved) => "  This device is already approved.\n".to_string(),
+        Some(ApprovalProgress::ProofPending) => String::new(),
+        _ if scans_repositories => format!(
+            "  {device_code}\n\n  Read this code to IT. IT approves the device with it.\n  The client now looks for managed repositories in your home folder to suggest folders for the repository checks.\n"
+        ),
+        _ => {
+            format!("  {device_code}\n\n  Read this code to IT. IT approves the device with it.\n")
+        }
+    }
+}
+
+fn approval_scan_output(
+    scan: Option<&checks::repos::RepoScan>,
+    user_home: &Path,
+    wait_message: Option<&str>,
+) -> String {
+    let mut output = scan.map_or_else(String::new, |scan| {
+        device_config::managed_repo_summary(scan, user_home)
+    });
+    if let Some(message) = wait_message {
+        output.push_str(&format!("  {message}\n"));
+    }
+    output
+}
+
+fn approval_exit(wait: ApprovalWait, command: &str) -> ExitCode {
+    match wait {
+        ApprovalWait::Approved => {
+            print_approved_next_step(command);
+            ExitCode::SUCCESS
+        }
+        ApprovalWait::Revoked => {
+            println!("\nThis device was revoked. Contact IT before you continue.");
+            ExitCode::FAILURE
+        }
+        ApprovalWait::Interrupted => {
+            println!("\n{}", stopped_message(4, &format!("{command} join")));
+            ExitCode::from(130)
+        }
+    }
+}
+
+async fn wait_after_join(
+    http: &reqwest::Client,
+    home: &Home,
+    enrolment: &Enrolment,
+    manifest: &Manifest,
+    options: JoinOptions,
+    wizard: bool,
+    origin: JoinOrigin,
+) -> Result<ExitCode> {
+    let command = client_command(&home.0);
+    let wizard = wizard && !options.no_wait;
+    if options.no_wait {
+        wizard_step(4, "Wait for IT approval");
+        json_out::step_waiting(
+            serde_json::json!({ "device_code": device_code(&enrolment.device) }),
+        );
+        let code = ui::device_code_line(&device_code(&enrolment.device), ui::styled());
+        print!(
+            "{}",
+            step_four_intro(None, &code, scans_repositories(manifest))
+        );
+        if current_os()? == Os::Macos && scans_repositories(manifest) {
+            println!("  If macOS asks for access to a folder, you can deny it.");
+        }
+        let config = device_config::DeviceConfig::load_or_migrate(home, None, false)?;
+        if let Some(scan) = scan_repositories(home, manifest, Some(&config)).await? {
+            print!(
+                "{}",
+                device_config::managed_repo_summary(&scan, &repository_scan_root(home)?)
+            );
+        }
+        println!("\nNext, after IT approves:");
+        println!("  1. {command} join, which asks your few choices and sends the first claim");
+        println!("  or, without the wizard: {command} check, then {command} schedule on");
+        print_claim_log_status(home, None, Some("IT has not approved this device yet"));
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let resumed = origin == JoinOrigin::Resumed;
+    let _ = WIZARD_APPROVAL_WAIT.try_with(|active| active.set(true));
+    wizard_step(
+        4,
+        if resumed {
+            "Review managed repositories"
+        } else {
+            "Wait for IT approval"
+        },
+    );
+    let config = match device_config::DeviceConfig::load_or_migrate(home, None, false) {
+        Ok(config) => Some(config),
+        Err(_) if resumed && wizard => None,
+        Err(error) => return Err(error),
+    };
+    let scan = scan_repositories(home, manifest, config.as_ref());
+    tokio::pin!(scan);
+    let result = tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            println!("\n{}", stopped_message(4, &format!("{command} join")));
+            if json_out::active() {
+                json_out::exit_interrupted();
+            }
+            let _ = std::io::stdout().flush();
+            std::process::exit(130);
+        }
+        result = async {
+            let mut completed_scan = None;
+            let initial = if resumed {
+                let poll = poll_approval(http, home, enrolment, manifest);
+                tokio::pin!(poll);
+                Some(tokio::select! {
+                    result = &mut poll => result,
+                    result = &mut scan => {
+                        completed_scan = Some(result?);
+                        poll.await
+                    }
+                })
+            } else {
+                None
+            };
+            let initial_progress = initial
+                .as_ref()
+                .and_then(|result| result.as_ref().ok().copied());
+            let code = ui::device_code_line(&device_code(&enrolment.device), ui::styled());
+            let intro_code = if matches!(
+                initial_progress,
+                Some(ApprovalProgress::Approved | ApprovalProgress::ProofPending)
+            ) {
+                ""
+            } else {
+                json_out::step_waiting(
+                    serde_json::json!({ "device_code": device_code(&enrolment.device) }),
+                );
+                &code
+            };
+            print!(
+                "{}",
+                step_four_intro(initial_progress, intro_code, scans_repositories(manifest))
+            );
+            if current_os()? == Os::Macos && scans_repositories(manifest) {
+                println!("  If macOS asks for access to a folder, you can deny it.");
+            }
+            let wait_message = if wizard {
+                match initial_progress {
+                    Some(ApprovalProgress::Approved | ApprovalProgress::Revoked) => None,
+                    Some(ApprovalProgress::ProofPending) => {
+                        Some("IT approved the device. Waiting for the signed log proof...")
+                    }
+                    _ => Some("The client is still waiting for IT approval. Keep this window open."),
+                }
+            } else {
+                None
+            };
+
+            let approval = wait_for_approval_with_status(
+                http,
+                home,
+                enrolment,
+                manifest,
+                ApprovalWaitOptions {
+                    poll_interval: options.poll_interval,
+                    interruptible: false,
+                    show_waiting: !wizard
+                        && !matches!(
+                            initial_progress,
+                            Some(ApprovalProgress::Approved | ApprovalProgress::Revoked)
+                        ),
+                    initial,
+                },
+            );
+            tokio::pin!(approval);
+            let approval = if let Some(scan) = completed_scan {
+                print!(
+                    "{}",
+                    approval_scan_output(scan.as_ref(), &repository_scan_root(home)?, wait_message)
+                );
+                approval.await?
+            } else {
+                tokio::select! {
+                    result = &mut scan => {
+                        let scan = result?;
+                        print!(
+                            "{}",
+                            approval_scan_output(scan.as_ref(), &repository_scan_root(home)?, wait_message)
+                        );
+                        approval.await?
+                    }
+                    result = &mut approval => {
+                        let result = result?;
+                        if matches!(&result, Ok(ApprovalWait::Approved)) {
+                            let scan = scan.await?;
+                            print!(
+                                "{}",
+                                approval_scan_output(scan.as_ref(), &repository_scan_root(home)?, wait_message)
+                            );
+                        }
+                        result
+                    }
+                }
+            };
+            Ok::<_, anyhow::Error>(approval)
+        } => result,
+    };
+    let _ = WIZARD_APPROVAL_WAIT.try_with(|active| active.set(false));
+    let approval = result?;
+    match approval {
+        Ok(ApprovalWait::Approved) if wizard => {
+            println!("\n  {}", ui::bold(approval_confirmation(), ui::styled()));
+            json_out::step_done(4, Some(serde_json::json!({ "state": "approved" })));
+            after_approval(home, options.insecure_dev, true).await
+        }
+        Ok(wait) => {
+            let code = approval_exit(wait, &command);
+            if wait == ApprovalWait::Interrupted && !wizard {
+                let _ = std::io::stdout().flush();
+                std::process::exit(130);
+            }
+            match wait {
+                ApprovalWait::Approved => {
+                    print_claim_log_status(home, None, Some("setup and check have not run yet"))
+                }
+                ApprovalWait::Revoked => {
+                    print_claim_log_status(home, None, Some("IT revoked this device"));
+                }
+                ApprovalWait::Interrupted => {}
+            }
+            Ok(code)
+        }
+        Err(error) => {
+            eprintln!(
+                "\nTRANSPARENCY LOG ALARM: the gateway's signed history or proof does not match.\n!! {error}"
+            );
+            print_claim_log_status(home, None, Some("the approval proof did not verify"));
+            Ok(ExitCode::from(2))
+        }
+    }
+}
+
+fn wizard_enabled(no_wait: bool) -> bool {
+    !no_wait
+        && (json_out::active()
+            || (std::io::stdin().is_terminal() && std::io::stdout().is_terminal()))
+}
+
+async fn continue_saved_join(
+    http: &reqwest::Client,
+    home: &Home,
+    enrolment: &Enrolment,
+    manifest: &Manifest,
+    options: JoinOptions,
+    origin: JoinOrigin,
+) -> Result<ExitCode> {
+    let wizard = wizard_enabled(options.no_wait);
+    wait_after_join(http, home, enrolment, manifest, options, wizard, origin).await
+}
+
+async fn resume_join(
+    home: &Home,
+    insecure_dev: bool,
+    no_wait: bool,
+    poll_interval: Duration,
+) -> Result<ExitCode> {
+    let enrolment: Enrolment = home
+        .read_json("enrolment.json")?
+        .context("join needs the invitation until this device is enrolled")?;
+    check_scheme(&enrolment.gateway, insecure_dev)?;
+    Pins::load(home)
+        .context("this device has no pinned gateway keys; run join with the invitation")?;
+    let http = http_client()?;
+    let published: PublishedManifest =
+        match get_json(&http, format!("{}/v1/manifest", base(&enrolment.gateway))).await {
+            Ok(published) => published,
+            Err(error) => return Err(error),
+        };
+    let manifest = Manifest::parse(published.toml.as_bytes())?;
+    if !published.company.verify(manifest.hash()) {
+        bail!("the company signature does not match this manifest; refusing to resume");
+    }
+    if manifest.hash() != &enrolment.manifest {
+        bail!("the gateway manifest no longer matches this device's enrolment");
+    }
+    let stored_manifest = Manifest::parse(&read_home_file(&home.file("manifest.toml"))?)?;
+    if stored_manifest.hash() != &enrolment.manifest {
+        bail!("manifest.toml no longer matches the hash you signed");
+    }
+    let checkpoint = match sync_checkpoint(
+        &http,
+        home,
+        &enrolment.gateway,
+        manifest.body().log.as_ref(),
+    )
+    .await
+    {
+        Ok(checkpoint) => checkpoint,
+        Err(error) => return Err(error),
+    };
+    if let Err(error) = checkpoint {
+        report_log(alarm(error), home);
+        print_claim_log_status(home, None, Some("the log checkpoint did not verify"));
+        return Ok(ExitCode::from(2));
+    }
+    json_out::steps_skipped(&[1, 2, 3]);
+    continue_saved_join(
+        &http,
+        home,
+        &enrolment,
+        &manifest,
+        JoinOptions {
+            insecure_dev,
+            no_wait,
+            poll_interval,
+        },
+        JoinOrigin::Resumed,
+    )
+    .await
+}
+
+async fn join(
+    home: &Home,
+    invitation: &str,
+    yes: bool,
+    software_key: bool,
+    insecure_dev: bool,
+    no_wait: bool,
+    poll_interval: Duration,
+) -> Result<ExitCode> {
+    let invitation = Invitation::decode(invitation)?;
+    let gateway = invitation.gateway.as_str();
+    check_scheme(gateway, insecure_dev)?;
+    #[cfg(unix)]
+    if unsafe { libc::geteuid() } == 0 {
+        println!(
+            "You are running join as root, for example with sudo. The client would then check \
+             root's settings instead of yours and keep its keys in root's home. Run join without \
+             sudo, as the account that uses this device."
+        );
+        if !yes && !confirm("Continue as root anyway?").await? {
+            if !wizard_enabled(no_wait) {
+                println!("Stopped. Nothing was sent.");
+            }
+            return Ok(ExitCode::FAILURE);
+        }
+    }
+    let wanted = Pins {
+        company: invitation.company.clone(),
+        log: invitation.log_key(),
+    };
+    if let Ok(pinned) = Pins::load(home)
+        && let Some(changed) = pinned.differs(&wanted.company, &wanted.log.vkey())
+    {
+        report_log(
+            alarm(format!(
+                "{changed} (the new invitation). Use a separate --home for another company"
+            )),
+            home,
+        );
+        return Ok(ExitCode::from(2));
+    }
+    let saved_enrolment = home.read_json::<Enrolment>("enrolment.json")?;
+    let same_gateway_enrolment = saved_enrolment
+        .as_ref()
+        .is_some_and(|saved| saved.gateway == gateway);
+    let invitation_step_shown = !same_gateway_enrolment;
+    if invitation_step_shown {
+        wizard_step(1, "Check the invitation");
+    }
+    let http = http_client()?;
+    let published: PublishedManifest =
+        match get_json(&http, format!("{}/v1/manifest", base(gateway))).await {
+            Ok(published) => published,
+            Err(error) => return Err(error),
+        };
+    let manifest = Manifest::parse(published.toml.as_bytes())?;
+    if !published.company.verify(manifest.hash()) {
+        bail!("the company signature does not match this manifest; refusing to show it");
+    }
+    let log = match get_text(&http, format!("{}/v1/log/key", base(gateway))).await {
+        Ok(log) => log,
+        Err(error) => return Err(error),
+    };
+    if let Some(mismatch) = wanted.differs(&published.company.key.fingerprint(), &log) {
+        bail!(
+            "{gateway} is not the gateway in your invitation: {}. Nothing was sent. \
+             Ask IT for a new invitation and report this",
+            mismatch.replace(" changed: pinned ", " differs: the invitation names ")
+        );
+    }
+    open_pact_core::check_supported(&manifest).map_err(|e| {
+        anyhow::anyhow!("{e}; refusing to show or sign this manifest. Nothing was sent")
+    })?;
+    let saved_enrolment_matches = saved_enrolment
+        .as_ref()
+        .is_some_and(|saved| saved.gateway == gateway && saved.manifest == *manifest.hash());
+    if !saved_enrolment_matches && !invitation_step_shown {
+        wizard_step(1, "Check the invitation");
+    }
+    wanted.save(home)?;
+    json_out::step_done(
+        1,
+        Some(serde_json::json!({
+            "gateway": gateway,
+            "company_key_fingerprint": published.company.key.fingerprint(),
+        })),
+    );
+    if !saved_enrolment_matches {
+        println!("  The gateway keys match your invitation.");
+        for line in invitation.describe().lines() {
+            println!("  {line}");
+        }
+    }
+    if home.has_legacy_log_head() {
+        std::fs::remove_file(home.file(LEGACY_LOG_HEAD))?;
+        println!("Removed the old hash-chain log head; this device now pins the Merkle log.");
+    }
+    let checkpoint = match sync_checkpoint(&http, home, gateway, manifest.body().log.as_ref()).await
+    {
+        Ok(checkpoint) => checkpoint,
+        Err(error) => return Err(error),
+    };
+    if let Err(e) = checkpoint {
+        report_log(alarm(e), home);
+        print_claim_log_status(home, None, Some("the log checkpoint did not verify"));
+        return Ok(ExitCode::from(2));
+    }
+    if let Some(existing) = saved_enrolment
+        .filter(|existing| existing.gateway == gateway && existing.manifest == *manifest.hash())
+    {
+        match DeviceKey::load(&home.0) {
+            Ok(device) if Pseudonym::of(&device.public_key()) == existing.device => {
+                json_out::steps_skipped(&[1, 2, 3]);
+                return continue_saved_join(
+                    &http,
+                    home,
+                    &existing,
+                    &manifest,
+                    JoinOptions {
+                        insecure_dev,
+                        no_wait,
+                        poll_interval,
+                    },
+                    JoinOrigin::Resumed,
+                )
+                .await;
+            }
+            Ok(_) => bail!(
+                "This home has an enrolment for a different device key. Run open-pact-client join with a new invitation after removing the old enrolment. Recovery command: `{}` delete-device-key",
+                client_command(&home.0)
+            ),
+            Err(error)
+                if error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                }) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let os = current_os()?;
+    wizard_step(2, "Review and sign the manifest");
+    let reading = ReadingCopy::write(home, &published.toml)?;
+    print_summary(&manifest, &published.company.key.fingerprint(), os)?;
+    println!(
+        "  Read the whole manifest before you sign: {}\n",
+        reading.0.display()
+    );
+    if !yes && !confirm("Sign this manifest as the device owner?").await? {
+        if !wizard_enabled(no_wait) {
+            println!("Not signed. Nothing was sent. Run join again when you want to enrol.");
+        }
+        return Ok(ExitCode::FAILURE);
+    }
+    drop(reading);
+    json_out::step_done(
+        2,
+        Some(serde_json::json!({ "manifest_hash": manifest.hash() })),
+    );
+    wizard_step(3, "Enrol this device");
+    let owner = dev_key::load_or_create(&home.file("owner-dev.pem"))?;
+    let device = DeviceKey::load_or_create(&home.0, software_key)?;
+    let signed = SignedManifest {
+        toml: published.toml.clone(),
+        company: published.company,
+        owner: Endorsement::sign(&owner, manifest.hash()),
+    };
+    let request = EnrolRequest::sign_with(
+        signed,
+        invitation.code.clone(),
+        &owner,
+        &device.public_key(),
+        |statement| device.sign(statement),
+    )?;
+    let resp = match http
+        .post(format!("{}/v1/enroll", base(gateway)))
+        .json(&request)
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => return Err(error.into()),
+    };
+    let status = resp.status();
+    let body: Value = resp.json().await?;
+    if !status.is_success() {
+        println!("Enrolment refused ({status}): {body}");
+        return Ok(ExitCode::FAILURE);
+    }
+    home.write("manifest.toml", published.toml.as_bytes())?;
+    let log_entries = match (
+        body["manifest_log_index"].as_u64(),
+        body["log_index"].as_u64(),
+    ) {
+        (Some(manifest), Some(enrolment)) => Some(OwnEntries {
+            manifest,
+            enrolment,
+        }),
+        _ => None,
+    };
+    let enrolment = Enrolment {
+        gateway: gateway.to_string(),
+        manifest: manifest.hash().clone(),
+        device: Pseudonym::of(&device.public_key()),
+        salt: body["salt"].as_str().context("salt")?.to_string(),
+        log_entries,
+        last_status: match body["state"].as_str() {
+            Some("pending") => Some(DeviceStatus::Pending),
+            Some("approved") => Some(DeviceStatus::Approved),
+            Some("revoked") => Some(DeviceStatus::Revoked),
+            _ => None,
+        },
+    };
+    home.write("enrolment.json", &serde_json::to_vec_pretty(&enrolment)?)?;
+    let client_home = std::path::absolute(&home.0).unwrap_or_else(|_| home.0.clone());
+    println!("  Signed       {}  (the manifest above)", manifest.hash());
+    println!("  Enrolled as  {}", enrolment.device);
+    json_out::step_done(
+        3,
+        Some(serde_json::json!({ "device": enrolment.device, "state": body["state"] })),
+    );
+    println!(
+        "  Device key   {}, trust level {:?} (asserted by this client; without attestation the gateway counts it as L0)",
+        device.describe(),
+        device.trust_level()
+    );
+    if let Some(index) = body["log_index"].as_u64() {
+        println!(
+            "  Public log   enrolment is entry #{index}. Prove it with: open-pact-client log prove"
+        );
+    }
+    println!(
+        "               The log records only sha256(salt || pseudonym). The salt stays in enrolment.json."
+    );
+    println!("  Client home  {}", client_home.display());
+    let state = body["state"].as_str();
+    if state == Some("revoked") {
+        println!("This device was revoked. Contact IT before you continue.");
+        return Ok(ExitCode::FAILURE);
+    }
+    if matches!(state, Some("pending" | "approved")) {
+        return continue_saved_join(
+            &http,
+            home,
+            &enrolment,
+            &manifest,
+            JoinOptions {
+                insecure_dev,
+                no_wait,
+                poll_interval,
+            },
+            JoinOrigin::Enrolled,
+        )
+        .await;
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn device_code(device: &Pseudonym) -> String {
+    device.as_str().trim_start_matches("pseudonym:")[..12].to_string()
+}
+
+/// How to stop the scheduled claims. On Windows the command carries the full path of this
+/// program, because the elevated prompt a SYSTEM job needs may not find it by name.
+fn stop_instructions(home: &Path, windows: bool) -> String {
+    if windows {
+        format!(
+            "Run this from PowerShell to stop the scheduled claims:\n  {}\nA job that runs as SYSTEM needs an elevated PowerShell prompt.",
+            schedule::apply_command(home, "schedule off")
+        )
+    } else {
+        format!(
+            "Run `{} schedule off` to stop the scheduled claims.",
+            client_command(home)
+        )
+    }
+}
+
+/// The command prefix the owner types next: with `--home` only when join used another home.
+fn client_command(home: &Path) -> String {
+    match Home::new(None) {
+        Ok(default) if default.0 == home => "open-pact-client".to_string(),
+        _ => format!(
+            "open-pact-client --home {}",
+            shell_quote_arg(&home.display().to_string())
+        ),
+    }
+}
+
+#[cfg(windows)]
+fn shell_quote_arg(argument: &str) -> String {
+    format!("'{}'", argument.replace('\'', "''"))
+}
+
+#[cfg(not(windows))]
+fn shell_quote_arg(argument: &str) -> String {
+    format!("'{}'", argument.replace('\'', "'\\''"))
+}
+
+/// A certificate request for the VPN key with an empty subject and no attributes: it carries the
+/// public key and nothing else. Returns the PEM and the DER.
+fn vpn_csr(home: &Home) -> Result<(String, Vec<u8>)> {
+    let path = home.file("vpn-key.pem");
+    let key = if path.exists() {
+        KeyPair::from_pem(&std::fs::read_to_string(&path)?)?
+    } else {
+        let key = KeyPair::generate()?;
+        std::fs::create_dir_all(&home.0)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        options
+            .open(&path)?
+            .write_all(key.serialize_pem().as_bytes())?;
+        key
+    };
+    let mut params = CertificateParams::default();
+    params.distinguished_name = DistinguishedName::new();
+    let csr = params.serialize_request(&key)?;
+    Ok((csr.pem()?, csr.der().to_vec()))
+}
+
+/// Checks the VPN CA and client certificate that will replace the installed pair, so a pair a
+/// VPN client could not use never replaces a working one (R6-L1, R7-L1). Each must be exactly
+/// one DER certificate, valid now, with no critical extension this check does not know. The CA
+/// must be a CA that may sign certificates. The certificate must carry this device's VPN key,
+/// name the CA as its issuer, verify under the CA's key, and be a client certificate that is
+/// not a CA, may sign, and is for client authentication. Returns a description of the
+/// certificate.
+fn check_vpn_pair(ca_pem: &str, cert_pem: &str, vpn_key: &KeyPair) -> Result<String> {
+    let ca_der = pem_certificate(ca_pem).context("ca_pem")?;
+    let ca = whole_certificate(&ca_der).context("ca_pem")?;
+    if !ca.is_ca() || !ca.validity().is_valid() {
+        bail!("ca_pem is not a CA certificate valid now");
+    }
+    if !ca.key_usage()?.is_some_and(|ku| ku.value.key_cert_sign()) {
+        bail!("ca_pem may not sign certificates");
+    }
+    let cert_der = pem_certificate(cert_pem).context("certificate_pem")?;
+    let cert = whole_certificate(&cert_der).context("certificate_pem")?;
+    if !cert.validity().is_valid() {
+        bail!("certificate_pem is not valid now");
+    }
+    if cert.public_key().raw != rcgen::PublicKeyData::subject_public_key_info(vpn_key).as_slice() {
+        bail!("certificate_pem is not for this device's VPN key");
+    }
+    if cert.issuer().as_raw() != ca.subject().as_raw() {
+        bail!("certificate_pem names another issuer than ca_pem");
+    }
+    cert.verify_signature(Some(ca.public_key()))
+        .map_err(|e| anyhow::anyhow!("certificate_pem was not issued by ca_pem: {e}"))?;
+    if cert.is_ca() {
+        bail!("certificate_pem is a CA certificate");
+    }
+    if !cert
+        .key_usage()?
+        .is_some_and(|ku| ku.value.digital_signature())
+    {
+        bail!("certificate_pem may not sign");
+    }
+    if !cert
+        .extended_key_usage()?
+        .is_some_and(|eku| eku.value.client_auth)
+    {
+        bail!("certificate_pem is not for client authentication");
+    }
+    Ok(format!(
+        "subject {}, expires {}",
+        cert.subject(),
+        cert.validity().not_after
+    ))
+}
+
+/// A certificate that is all of `der`, with no critical extension other than the basic
+/// constraints, key usages and subject names that `check_vpn_pair` reads or allows.
+fn whole_certificate(der: &[u8]) -> Result<x509_parser::certificate::X509Certificate<'_>> {
+    use x509_parser::oid_registry::{
+        OID_X509_EXT_BASIC_CONSTRAINTS, OID_X509_EXT_EXTENDED_KEY_USAGE, OID_X509_EXT_KEY_USAGE,
+        OID_X509_EXT_SUBJECT_ALT_NAME,
+    };
+    let (rest, cert) = x509_parser::parse_x509_certificate(der)?;
+    if !rest.is_empty() {
+        bail!("{} bytes follow the certificate", rest.len());
+    }
+    let known = [
+        OID_X509_EXT_BASIC_CONSTRAINTS,
+        OID_X509_EXT_KEY_USAGE,
+        OID_X509_EXT_EXTENDED_KEY_USAGE,
+        OID_X509_EXT_SUBJECT_ALT_NAME,
+    ];
+    if let Some(ext) = cert
+        .extensions()
+        .iter()
+        .find(|ext| ext.critical && !known.contains(&ext.oid))
+    {
+        bail!("unknown critical extension {}", ext.oid);
+    }
+    Ok(cert)
+}
+
+/// The DER of a text that is exactly one PEM certificate block.
+fn pem_certificate(text: &str) -> Result<Vec<u8>> {
+    let (rest, pem) = x509_parser::pem::parse_x509_pem(text.as_bytes())?;
+    if pem.label != "CERTIFICATE" || !rest.iter().all(u8::is_ascii_whitespace) {
+        bail!("not a single PEM certificate");
+    }
+    Ok(pem.contents)
+}
+
+fn print_hints(
+    manifest: &Manifest,
+    results: &BTreeMap<String, open_pact_core::ControlValue>,
+    os: Os,
+) {
+    for c in &manifest.body().controls {
+        let (Some(required), Some(value)) = (c.required.get(&os), results.get(&c.id)) else {
+            continue;
+        };
+        if required.contains(value) {
+            continue;
+        }
+        if let Some(hint) = checks::fix_hint(&c.id, &value.to_string(), os) {
+            println!("  fix {}: {hint}", c.id);
+        }
+    }
+}
+
+async fn check(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
+    check_impl(home, insecure_dev, true).await
+}
+
+/// Shows the request `check` would send now. It makes GET requests only and writes no file.
+async fn check_dry_run(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
+    let preview = match check_preview(home, insecure_dev).await {
+        Ok(preview) => preview,
+        Err(error) if error.is::<claim::LegacyLogHead>() => {
+            print_log_upgrade(home);
+            return Ok(ExitCode::FAILURE);
+        }
+        Err(error) => return Err(error),
+    };
+    match preview {
+        claim::Preview::Request {
+            request,
+            last_status,
+        } => {
+            eprintln!(
+                "Dry run: GET requests only. No signed request was sent and no file was written. This is the claim that `check` \
+                 would send now. The nonce, the time and the VPN certificate request are filled in when it is sent."
+            );
+            println!("{}", serde_json::to_string_pretty(&request)?);
+            if let Some(status) = last_status {
+                println!(
+                    "Last known status: {status}. check asks the gateway again; if the status still holds, check sends nothing."
+                );
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        claim::Preview::NotSent(outcome) => {
+            let why = outcome
+                .why_nothing_is_sent()
+                .unwrap_or_else(|| "the gateway turned the claim away".to_owned());
+            eprintln!("Dry run: `check` would send no claim now, because {why}.");
+            Ok(outcome.exit_code())
+        }
+    }
+}
+
+async fn check_preview(home: &Home, insecure_dev: bool) -> Result<claim::Preview> {
+    claim::prepare(home, None, claim::ScanPolicy::Preview, insecure_dev)
+        .await?
+        .dry_run(home)
+        .await
+}
+
+async fn check_impl(home: &Home, insecure_dev: bool, show_resume_hint: bool) -> Result<ExitCode> {
+    match check_run(home, insecure_dev, show_resume_hint).await {
+        Ok(outcome) => Ok(outcome.exit_code()),
+        Err(error) if error.is::<claim::LegacyLogHead>() => {
+            print_log_upgrade(home);
+            Ok(ExitCode::FAILURE)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// `check --json`: sends the claim like `check` and prints what happened as one JSON document.
+async fn check_json(
+    home: &Home,
+    insecure_dev: bool,
+    json: std::sync::Arc<json_out::Json>,
+) -> ExitCode {
+    json_out::scope(json, async {
+        match check_run(home, insecure_dev, false).await {
+            Ok(outcome) => {
+                match json_out::claim() {
+                    Some(report) => json_out::document(&report),
+                    None => json_out::error(&outcome.failure_text()),
+                }
+                json_out::settle(outcome.exit_code())
+            }
+            Err(error) => json_out::settle(json_out::failed(&format!("{error:#}"))),
+        }
+    })
+    .await
+}
+
+async fn check_run(
+    home: &Home,
+    insecure_dev: bool,
+    show_resume_hint: bool,
+) -> Result<claim::Outcome> {
+    let _claim_lock = claim::lock(home).await?;
+    let prepared = claim::prepare(home, None, claim::ScanPolicy::Always, insecure_dev).await?;
+    if let Some(notice) = device_config::legacy_notice(
+        home,
+        device_config::Surface::Check,
+        &client_command(&home.0),
+        &device_config::DeviceConfig::load(home).unwrap_or_default(),
+    ) {
+        println!("{notice}\n");
+    }
+    prepared.print_local_report();
+    if show_resume_hint {
+        let command = client_command(&home.0);
+        match wizard_resume(home)? {
+            WizardResume::Setup => {
+                println!("Wizard step [5/6] is unfinished. Continue with: {command} join");
+            }
+            WizardResume::FirstCheck => {
+                println!("Wizard step [6/6] is unfinished. Continue with: {command} join");
+            }
+            WizardResume::Complete => {}
+        }
+    }
+    prepared.send(home, async || true).await
+}
+
+/// The hash of the manifest the gateway enforces now.
+async fn enforced_manifest(http: &reqwest::Client, gateway: &str) -> Result<ManifestHash> {
+    let published: PublishedManifest =
+        get_json(http, format!("{}/v1/manifest", base(gateway))).await?;
+    Ok(ManifestHash::of(published.toml.as_bytes()))
+}
+
+fn manifest_change_notice(enforced: &ManifestHash, command: &str) -> String {
+    format!(
+        "The manifest changed: the gateway now enforces {enforced}. Run `{command} accept` to \
+         review and sign it. Controls the new manifest adds or tightens fail now, and access ends \
+         when their grace runs out."
+    )
+}
+
+/// The error when `manifest.toml` is not the text `enrolment.json` signed. An accept that stopped
+/// after it wrote one of the two files leaves exactly this state.
+pub(crate) fn stored_manifest_mismatch(
+    home: &Home,
+    stored: &ManifestHash,
+    signed: &ManifestHash,
+) -> anyhow::Error {
+    anyhow::anyhow!(
+        "manifest.toml ({stored}) and enrolment.json (signed {signed}) disagree. An accept may have \
+         stopped part way. Run `{} accept` to finish it.",
+        client_command(&home.0)
+    )
+}
+
+/// The requirement of a control on every operating system, its grace and its output. Operating
+/// systems with the same requirement share one clause.
+fn control_rule(c: &open_pact_core::Control) -> String {
+    let mut clauses: Vec<(String, Vec<String>)> = Vec::new();
+    for os in Os::ALL {
+        let requirement = match c.required.get(&os) {
+            Some(required) => format!("must be {required}"),
+            None => "not required".into(),
+        };
+        match clauses.iter_mut().find(|(text, _)| *text == requirement) {
+            Some((_, systems)) => systems.push(os.to_string()),
+            None => clauses.push((requirement, vec![os.to_string()])),
+        }
+    }
+    let clauses = clauses
+        .iter()
+        .map(|(text, systems)| format!("{text} on {}", systems.join(", ")))
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!("{clauses} (grace {}, reports {})", c.grace, c.output)
+}
+
+/// One difference between the manifest a device signed and the one the gateway enforces now.
+/// `before` or `after` is null for a control that was added or removed.
+#[derive(Debug, PartialEq, Serialize)]
+struct ManifestChange {
+    id: String,
+    before: Option<String>,
+    after: Option<String>,
+    #[serde(skip)]
+    line: String,
+}
+
+/// A control as the owner reads it in a change: its rule and its check.
+fn control_state(c: &open_pact_core::Control) -> String {
+    format!("{}; check {}", control_rule(c), c.check)
+}
+
+/// What `new` changes against `old`, the manifest this device signed, one line per change.
+fn manifest_changes(old: &Manifest, new: &Manifest) -> Vec<String> {
+    manifest_change_list(old, new)
+        .into_iter()
+        .map(|change| change.line)
+        .collect()
+}
+
+fn manifest_change_list(old: &Manifest, new: &Manifest) -> Vec<ManifestChange> {
+    let (was, now) = (old.body(), new.body());
+    let mut changes = Vec::new();
+    for c in &now.controls {
+        match was.control(&c.id) {
+            None => changes.push(ManifestChange {
+                id: c.id.clone(),
+                before: None,
+                after: Some(control_state(c)),
+                line: format!("added control {}: {}", c.id, control_rule(c)),
+            }),
+            Some(before) if control_rule(before) != control_rule(c) || before.check != c.check => {
+                let mut line = format!("changed control {}:", c.id);
+                if control_rule(before) != control_rule(c) {
+                    line += &format!(" {} (was {})", control_rule(c), control_rule(before));
+                }
+                if before.check != c.check {
+                    line += &format!(" check {} (was {})", c.check, before.check);
+                }
+                changes.push(ManifestChange {
+                    id: c.id.clone(),
+                    before: Some(control_state(before)),
+                    after: Some(control_state(c)),
+                    line,
+                });
+            }
+            Some(_) => {}
+        }
+    }
+    for c in &was.controls {
+        if now.control(&c.id).is_none() {
+            changes.push(ManifestChange {
+                id: c.id.clone(),
+                before: Some(control_state(c)),
+                after: None,
+                line: format!("removed control {}", c.id),
+            });
+        }
+    }
+    let list = |items: Vec<String>| items.join(", ");
+    let mut term = |id: &str, name: &str, before: String, after: String| {
+        if before != after {
+            changes.push(ManifestChange {
+                id: id.to_owned(),
+                line: format!("{name}: {after} (was {before})"),
+                before: Some(before),
+                after: Some(after),
+            });
+        }
+    };
+    term(
+        "disclosed_metadata",
+        "disclosed metadata",
+        list(
+            was.disclosed_metadata
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+        ),
+        list(
+            now.disclosed_metadata
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+        ),
+    );
+    term(
+        "claim_retention",
+        "claim retention",
+        was.claim_retention.to_string(),
+        now.claim_retention.to_string(),
+    );
+    term(
+        "claim_recipients",
+        "claim recipients",
+        list(was.claim_recipients.iter().cloned().collect()),
+        list(now.claim_recipients.iter().cloned().collect()),
+    );
+    term(
+        "data_controller",
+        "data controller",
+        was.data_controller.clone(),
+        now.data_controller.clone(),
+    );
+    term("issuer", "issuer", was.issuer.clone(), now.issuer.clone());
+    term(
+        "valid_from",
+        "valid from",
+        was.valid_from.to_string(),
+        now.valid_from.to_string(),
+    );
+    term(
+        "claim_max_age",
+        "claims valid for",
+        was.claim_max_age.to_string(),
+        now.claim_max_age.to_string(),
+    );
+    term(
+        "unknown_grace",
+        "unknown results tolerated for",
+        was.unknown_grace.to_string(),
+        now.unknown_grace.to_string(),
+    );
+    term(
+        "min_trust_level",
+        "minimum trust level",
+        format!("{:?}", was.min_trust_level),
+        format!("{:?}", now.min_trust_level),
+    );
+    let schedule_words = |manifest: &open_pact_core::ManifestBody| {
+        manifest.schedule.as_ref().map_or_else(
+            || "none".to_owned(),
+            |schedule| {
+                let text = schedule.to_string();
+                text.strip_prefix("Automatic claims: ")
+                    .unwrap_or(&text)
+                    .to_owned()
+            },
+        )
+    };
+    term(
+        "schedule",
+        "automatic claims",
+        schedule_words(was),
+        schedule_words(now),
+    );
+    // A parsed manifest always has its log policy.
+    let (was_log, now_log) = (
+        was.log
+            .as_ref()
+            .expect("a parsed manifest has a log policy"),
+        now.log
+            .as_ref()
+            .expect("a parsed manifest has a log policy"),
+    );
+    let witnesses = |log: &open_pact_core::LogPolicy| {
+        log.witnesses
+            .iter()
+            .map(|w| w.name.clone())
+            .collect::<Vec<_>>()
+    };
+    term(
+        "log_witnesses",
+        "log witnesses",
+        list(witnesses(was_log)),
+        list(witnesses(now_log)),
+    );
+    term(
+        "log_witness_quorum",
+        "log witness quorum",
+        was_log.witness_quorum.to_string(),
+        now_log.witness_quorum.to_string(),
+    );
+    term(
+        "log_allows_split_views",
+        "log allows split views",
+        was_log.allow_split_views.to_string(),
+        now_log.allow_split_views.to_string(),
+    );
+    term(
+        "log_checkpoint_max_age",
+        "log checkpoint max age",
+        was_log.checkpoint_max_age.to_string(),
+        now_log.checkpoint_max_age.to_string(),
+    );
+    changes
+}
+
+/// Shows the manifest the gateway enforces and what it changes, asks the owner, and sends the
+/// owner's and the device's signatures. The device keeps its approval; no invitation is needed.
+async fn accept(home: &Home, yes: bool, insecure_dev: bool) -> Result<ExitCode> {
+    let _claim_lock = claim::lock(home).await?;
+    let mut enrolment = home.enrolment()?;
+    check_scheme(&enrolment.gateway, insecure_dev)?;
+    let gateway = base(&enrolment.gateway).to_string();
+    let command = client_command(&home.0);
+    let http = http_client()?;
+    let published: PublishedManifest = get_json(&http, format!("{gateway}/v1/manifest")).await?;
+    let new = Manifest::parse(published.toml.as_bytes())?;
+    if !published.company.verify(new.hash()) {
+        bail!("the company signature does not match this manifest; refusing to show it");
+    }
+    let log = get_text(&http, format!("{gateway}/v1/log/key")).await?;
+    let company = published.company.key.fingerprint();
+    if let Some(changed) = Pins::load(home)?.differs(&company, &log) {
+        report_log(alarm(changed), home);
+        return Ok(ExitCode::from(2));
+    }
+    if new.hash() == &enrolment.manifest {
+        if read_home_file(&home.file("manifest.toml"))
+            .map_or(true, |bytes| ManifestHash::of(&bytes) != enrolment.manifest)
+        {
+            home.write("manifest.toml", published.toml.as_bytes())?;
+            println!("Restored manifest.toml from the gateway ({}).", new.hash());
+            return Ok(ExitCode::SUCCESS);
+        }
+        println!(
+            "This device already signed the manifest the gateway enforces ({}). Nothing to accept.",
+            new.hash()
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    let old = Manifest::parse(&read_home_file(&home.file("manifest.toml"))?)?;
+    // A stored new manifest means an earlier accept stopped after the gateway confirmed it.
+    let resumed = old.hash() == new.hash();
+    if old.hash() != &enrolment.manifest && !resumed {
+        bail!("manifest.toml no longer matches the hash you signed");
+    }
+    open_pact_core::check_supported(&new).map_err(|e| {
+        anyhow::anyhow!("{e}; refusing to show or sign this manifest. Nothing was sent")
+    })?;
+    let checkpoint =
+        sync_checkpoint(&http, home, &enrolment.gateway, new.body().log.as_ref()).await?;
+    if let Err(error) = checkpoint {
+        report_log(alarm(error), home);
+        return Ok(ExitCode::from(2));
+    }
+    let turn_off_auto_send = !resumed
+        && schedule_widened(old.body().schedule.as_ref(), new.body().schedule.as_ref())
+        && device_config::DeviceConfig::load(home)?.auto_send;
+    let _reading;
+    if !resumed {
+        let os = current_os()?;
+        let reading = ReadingCopy::write(home, &published.toml)?;
+        println!("The gateway now enforces a new manifest:\n");
+        print_summary(&new, &company, os)?;
+        println!("Changes against the manifest you signed ({}):", old.hash());
+        let changes = manifest_changes(&old, &new);
+        if changes.is_empty() {
+            println!(
+                "  none in controls, disclosed metadata, retention, recipients, controller or automatic claims"
+            );
+        }
+        for change in changes {
+            println!("  {change}");
+        }
+        println!(
+            "Read the whole new manifest before you sign: {}\n",
+            reading.0.display()
+        );
+        if turn_off_auto_send {
+            println!(
+                "Signing turns automatic sending off until you run `{command} schedule on` again, because the new manifest adds automatic sending, sends more often, or changes where it sends."
+            );
+        }
+        _reading = reading;
+        if !yes && !confirm("Sign the new manifest as the device owner?").await? {
+            println!("Not signed. Nothing was sent. Run {command} accept when you are ready.");
+            return Ok(ExitCode::FAILURE);
+        }
+    }
+    let owner = dev_key::load(&home.file("owner-dev.pem"))?;
+    let device = DeviceKey::load(&home.0)?;
+    let nonce: Nonce = http
+        .post(format!("{gateway}/v1/nonce"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let request = AcceptRequest::sign_with(
+        enrolment.manifest.clone(),
+        new.hash().clone(),
+        nonce.nonce,
+        &owner,
+        &device.public_key(),
+        |statement| device.sign(statement),
+    )?;
+    let response = http
+        .post(format!("{gateway}/v1/device/accept"))
+        .json(&request)
+        .send()
+        .await?;
+    let status = response.status();
+    let body: Value = response.json().await.unwrap_or(Value::Null);
+    if !status.is_success() {
+        println!("Acceptance refused ({status}): {body}");
+        return Ok(ExitCode::FAILURE);
+    }
+    // The job reads this switch and manifest.toml under the claim lock, so the switch goes off just before manifest.toml changes.
+    let turned_off = if turn_off_auto_send {
+        let mut config = device_config::DeviceConfig::load(home)?;
+        config.auto_send = false;
+        config.save(home)?;
+        Some(config.run_as)
+    } else {
+        None
+    };
+    home.write("manifest.toml", published.toml.as_bytes())?;
+    enrolment.manifest = new.hash().clone();
+    enrolment.log_entries = None;
+    home.write("enrolment.json", &serde_json::to_vec_pretty(&enrolment)?)?;
+    println!("  Signed       {}  (the manifest above)", new.hash());
+    if let Some(state) = body["state"].as_str() {
+        println!("  Device       {state}");
+    }
+    if let Some(run_as) = turned_off {
+        if let Some(schedule) = &new.body().schedule {
+            println!("{schedule}");
+        }
+        match run_as {
+            device_config::RunAs::System => println!(
+                "Automatic sending is off. Run `{command} schedule on --system` from an elevated prompt to agree to this schedule."
+            ),
+            device_config::RunAs::User => println!(
+                "Automatic sending is off. Run `{command} schedule on` to agree to this schedule."
+            ),
+        }
+    }
+    if turned_off.is_none()
+        && let Some(schedule) = &new.body().schedule
+        && let Ok(config) = device_config::DeviceConfig::load(home)
+        && config.auto_send
+    {
+        println!("{schedule}");
+        for line in schedule::next_due_text(home, config.run_as, schedule) {
+            println!("{line}");
+        }
+    }
+    println!("Next: run {command} check to send a claim under the new manifest.");
+    Ok(ExitCode::SUCCESS)
+}
+
+/// What `accept --preview` prints.
+#[derive(Debug, Serialize)]
+struct AcceptPreview {
+    signed_hash: ManifestHash,
+    published_hash: ManifestHash,
+    changes: Vec<ManifestChange>,
+    schedule_widened: bool,
+}
+
+/// `accept --preview`: the changes of the manifest the gateway enforces against the one this
+/// device signed. It makes GET requests only, signs nothing and writes no file.
+async fn accept_preview(home: &Home, insecure_dev: bool) -> Result<AcceptPreview> {
+    let enrolment = home.enrolment()?;
+    check_scheme(&enrolment.gateway, insecure_dev)?;
+    let gateway = base(&enrolment.gateway).to_string();
+    let http = http_client()?;
+    let published: PublishedManifest = get_json(&http, format!("{gateway}/v1/manifest")).await?;
+    let new = Manifest::parse(published.toml.as_bytes())?;
+    if !published.company.verify(new.hash()) {
+        bail!("the company signature does not match this manifest; refusing to show it");
+    }
+    let log = get_text(&http, format!("{gateway}/v1/log/key")).await?;
+    if let Some(changed) = Pins::load(home)?.differs(&published.company.key.fingerprint(), &log) {
+        bail!("{changed}");
+    }
+    let unchanged = |changes| AcceptPreview {
+        signed_hash: enrolment.manifest.clone(),
+        published_hash: new.hash().clone(),
+        changes,
+        schedule_widened: false,
+    };
+    if new.hash() == &enrolment.manifest {
+        return Ok(unchanged(Vec::new()));
+    }
+    let old = Manifest::parse(&read_home_file(&home.file("manifest.toml"))?)?;
+    if old.hash() == new.hash() {
+        // An earlier accept stopped after the gateway confirmed it. Nothing is left to compare.
+        return Ok(unchanged(Vec::new()));
+    }
+    if old.hash() != &enrolment.manifest {
+        bail!("manifest.toml no longer matches the hash you signed");
+    }
+    open_pact_core::check_supported(&new).map_err(|e| {
+        anyhow::anyhow!("{e}; refusing to show or sign this manifest. Nothing was sent")
+    })?;
+    if let Err(error) = sync_checkpoint_with(
+        &http,
+        home,
+        &enrolment.gateway,
+        new.body().log.as_ref(),
+        false,
+    )
+    .await?
+    {
+        bail!("{error}");
+    }
+    Ok(AcceptPreview {
+        signed_hash: enrolment.manifest.clone(),
+        published_hash: new.hash().clone(),
+        changes: manifest_change_list(&old, &new),
+        schedule_widened: schedule_widened(
+            old.body().schedule.as_ref(),
+            new.body().schedule.as_ref(),
+        ),
+    })
+}
+
+/// Runs `accept --preview` and prints its document, or its error.
+async fn accept_preview_json(
+    home: &Home,
+    insecure_dev: bool,
+    json: std::sync::Arc<json_out::Json>,
+) -> ExitCode {
+    json_out::scope(json, async {
+        match accept_preview(home, insecure_dev).await {
+            Ok(preview) => {
+                json_out::document(&preview);
+                json_out::settle(ExitCode::SUCCESS)
+            }
+            Err(error) => json_out::settle(json_out::failed(&format!("{error:#}"))),
+        }
+    })
+    .await
+}
+
+#[derive(Debug, Serialize)]
+struct PreviewCompany {
+    name: String,
+    key_fingerprint: String,
+    matches_invitation: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct PreviewControl {
+    id: String,
+    title: String,
+    requirement: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rationale: Option<String>,
+}
+
+/// What `join --preview` prints: the manifest as the owner would sign it.
+#[derive(Debug, Serialize)]
+struct JoinPreview {
+    company: PreviewCompany,
+    gateway: String,
+    manifest_hash: ManifestHash,
+    controls: Vec<PreviewControl>,
+    disclosed_metadata: Vec<String>,
+    schedule: Option<open_pact_core::Schedule>,
+    folders: Vec<PathBuf>,
+}
+
+/// The id of a control in words: `password_min_length` is "Password min length".
+fn control_title(id: &str) -> String {
+    let mut words = id.replace('_', " ");
+    if let Some(first) = words.get_mut(..1) {
+        first.make_ascii_uppercase();
+    }
+    words
+}
+
+/// What a control asks of this system: its rule, `n/a`, or `report only`.
+fn requirement_text(control: &open_pact_core::Control, os: Os) -> String {
+    control
+        .required
+        .get(&os)
+        .map_or_else(|| "report only".into(), ToString::to_string)
+}
+
+/// `join --preview`: everything join does up to showing the manifest, and then nothing. It makes
+/// GET requests only, signs nothing and writes no file. A gateway that does not match the
+/// invitation is reported in `matches_invitation`, and the exit code is 1.
+async fn join_preview(
+    home: &Home,
+    invitation: &str,
+    insecure_dev: bool,
+) -> Result<(JoinPreview, bool)> {
+    let invitation = Invitation::decode(invitation)?;
+    let gateway = invitation.gateway.as_str();
+    check_scheme(gateway, insecure_dev)?;
+    let wanted = Pins {
+        company: invitation.company.clone(),
+        log: invitation.log_key(),
+    };
+    if let Ok(pinned) = Pins::load(home)
+        && let Some(changed) = pinned.differs(&wanted.company, &wanted.log.vkey())
+    {
+        bail!("{changed} (the new invitation). Use a separate --home for another company");
+    }
+    let http = http_client()?;
+    let published: PublishedManifest =
+        get_json(&http, format!("{}/v1/manifest", base(gateway))).await?;
+    let manifest = Manifest::parse(published.toml.as_bytes())?;
+    if !published.company.verify(manifest.hash()) {
+        bail!("the company signature does not match this manifest; refusing to show it");
+    }
+    let log = get_text(&http, format!("{}/v1/log/key", base(gateway))).await?;
+    let fingerprint = published.company.key.fingerprint();
+    let matches = wanted.differs(&fingerprint, &log).is_none();
+    open_pact_core::check_supported(&manifest).map_err(|e| {
+        anyhow::anyhow!("{e}; refusing to show or sign this manifest. Nothing was sent")
+    })?;
+    let os = current_os()?;
+    let body = manifest.body();
+    let user_home = user_profile();
+    let mut folders =
+        device_config::DeviceConfig::load_or_migrate(home, user_home.as_deref(), false)
+            .unwrap_or_default()
+            .folders;
+    if let Some(scan) = scan_repositories_from(home, None, &manifest, None, false).await?
+        && let Some(user_home) = user_home.as_deref()
+    {
+        for folder in device_config::suggested_folders(&scan, user_home) {
+            if !folders.contains(&folder) {
+                folders.push(folder);
+            }
+        }
+    }
+    let preview = JoinPreview {
+        company: PreviewCompany {
+            name: body.issuer.clone(),
+            key_fingerprint: fingerprint,
+            matches_invitation: matches,
+        },
+        gateway: invitation.gateway.clone(),
+        manifest_hash: manifest.hash().clone(),
+        controls: body
+            .controls
+            .iter()
+            .map(|control| PreviewControl {
+                id: control.id.clone(),
+                title: control_title(&control.id),
+                requirement: requirement_text(control, os),
+                rationale: control.description.clone(),
+            })
+            .collect(),
+        disclosed_metadata: body
+            .disclosed_metadata
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        schedule: body.schedule.clone(),
+        folders,
+    };
+    Ok((preview, matches))
+}
+
+async fn join_preview_json(
+    home: &Home,
+    invitation: &str,
+    insecure_dev: bool,
+    json: std::sync::Arc<json_out::Json>,
+) -> ExitCode {
+    json_out::scope(json, async {
+        match join_preview(home, invitation, insecure_dev).await {
+            Ok((preview, matches)) => {
+                json_out::document(&preview);
+                json_out::settle(if matches {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::FAILURE
+                })
+            }
+            Err(error) => json_out::settle(json_out::failed(&format!("{error:#}"))),
+        }
+    })
+    .await
+}
+
+/// What a finished `join --json` reached: `done` when the device is approved and its first claim
+/// was accepted, `approved` when IT approved it, `enrolled` before that.
+fn join_result(home: &Home, enrolment: &Enrolment) -> &'static str {
+    if enrolment.last_status != Some(DeviceStatus::Approved) {
+        "enrolled"
+    } else if matches!(wizard_resume(home), Ok(WizardResume::Complete)) {
+        "done"
+    } else {
+        "approved"
+    }
+}
+
+/// `join --json`: the wizard with its questions answered by flags, one JSON line per step event
+/// and a last line that says how far it got. A failure ends with `{"error": ...}`.
+async fn join_json(
+    home: &Home,
+    invitation: Option<&str>,
+    software_key: bool,
+    no_wait: bool,
+    insecure_dev: bool,
+    poll_interval: Duration,
+    json: std::sync::Arc<json_out::Json>,
+) -> ExitCode {
+    json_out::scope(json, async {
+        let operation = async {
+            match invitation {
+                Some(invitation) => {
+                    join(
+                        home,
+                        invitation,
+                        true,
+                        software_key,
+                        insecure_dev,
+                        no_wait,
+                        poll_interval,
+                    )
+                    .await
+                }
+                None => resume_join(home, insecure_dev, no_wait, poll_interval).await,
+            }
+        };
+        let code = match run_wizard(home, invitation, no_wait, operation).await {
+            Ok(code) => code,
+            Err(error) => return json_out::settle(json_out::failed(&format!("{error:#}"))),
+        };
+        let enrolment = home.read_json::<Enrolment>("enrolment.json").ok().flatten();
+        let denied_claim = json_out::claim().is_some_and(|report| !report.accepted);
+        let code = match enrolment {
+            Some(enrolment) if code == ExitCode::SUCCESS || denied_claim => {
+                json_out::finish(
+                    join_result(home, &enrolment),
+                    &enrolment.device,
+                    &enrolment.manifest,
+                );
+                code
+            }
+            _ => {
+                json_out::error(
+                    &json_out::last_note().unwrap_or_else(|| "join did not finish".to_owned()),
+                );
+                code
+            }
+        };
+        json_out::settle(code)
+    })
+    .await
+}
+
+fn print_claim_log_status(
+    home: &Home,
+    claim: Option<(String, ClaimResult, usize)>,
+    reason: Option<&str>,
+) {
+    println!("{}", claim_log_status_text(home, claim, reason));
+}
+
+fn claim_log_status_text(
+    home: &Home,
+    claim: Option<(String, ClaimResult, usize)>,
+    reason: Option<&str>,
+) -> String {
+    let path = home.file("claims.jsonl");
+    let command = client_command(&home.0);
+    let summary = match claim {
+        Some((time, result, controls)) => {
+            let outcome = match result {
+                ClaimResult::Accepted => "accepted",
+                ClaimResult::Denied => "denied",
+                ClaimResult::ResponseUnverified => "accepted response not verified",
+            };
+            format!("  Last claim: {time}, {outcome}, {controls} controls.")
+        }
+        None => format!(
+            "  No claim was sent because {}.",
+            reason.unwrap_or("the check stopped before it sent a claim")
+        ),
+    };
+    format!(
+        "\nLocal claim log: {}\n  It holds every claim this device sent and each response, byte for byte.\n  Show it with: {command} log show\n{summary}",
+        path.display()
+    )
+}
+
+fn log_head(home: &Home) -> Result<()> {
+    if home.has_legacy_log_head() {
+        print_log_upgrade(home);
+    }
+    let text = home
+        .read_text(LOG_CHECKPOINT)?
+        .context("no log checkpoint yet; run join or check")?;
+    print!("{text}");
+    if let Ok(pins) = Pins::load(home) {
+        println!("\npinned company key {}", pins.company);
+        println!("pinned log key {}", pins.log.vkey());
+    }
+    Ok(())
+}
+
+fn commitment(enrolment: &Enrolment) -> Result<String> {
+    let mut h = Sha256::new();
+    h.update(hex::decode(&enrolment.salt).context("salt in enrolment.json")?);
+    h.update(enrolment.device.as_str());
+    Ok(format!("sha256:{}", hex::encode(h.finalize())))
+}
+
+async fn log_prove(home: &Home, index: Option<u64>, insecure_dev: bool) -> Result<ExitCode> {
+    let mut enrolment = home.enrolment()?;
+    check_scheme(&enrolment.gateway, insecure_dev)?;
+    if home.has_legacy_log_head() {
+        print_log_upgrade(home);
+        return Ok(ExitCode::FAILURE);
+    }
+    let manifest = Manifest::parse(&std::fs::read(home.file("manifest.toml"))?)?;
+    if manifest.hash() != &enrolment.manifest {
+        bail!("manifest.toml no longer matches the hash you signed");
+    }
+    let http = http_client()?;
+    let enforced = enrolment.manifest.clone();
+    let sync = sync_log(&http, home, &manifest, &enforced, &mut enrolment).await?;
+    let LogSync::Verified(cp, own) = sync else {
+        report_log(sync, home);
+        return Ok(ExitCode::from(2));
+    };
+    let index = index.unwrap_or(own.enrolment);
+    let response = fetch_my_entries(&http, home, &enrolment).await?;
+    let pins = Pins::load(home)?;
+    let cp = match verify_checkpoint(
+        &http,
+        home,
+        &enrolment.gateway,
+        &pins.log,
+        manifest.body().log.as_ref(),
+        Some(&cp),
+        &response.checkpoint,
+    )
+    .await?
+    {
+        Ok(cp) => cp,
+        Err(error) => {
+            report_log(alarm(error.alarm_text()), home);
+            return Ok(ExitCode::from(2));
+        }
+    };
+    let signed = enrolment.manifest.clone();
+    if let Err(error) = verify_my_entries(
+        &response,
+        &enrolment,
+        &commitment(&enrolment)?,
+        &cp,
+        &signed,
+    ) {
+        report_log(alarm(error.to_string()), home);
+        return Ok(ExitCode::from(2));
+    }
+    let item = std::iter::once(&response.manifest)
+        .chain(response.device.iter())
+        .find(|item| item.entry.index == index)
+        .context("that entry is not available to this device")?;
+    let (entry, proof) = (&item.entry, &item.proof);
+    println!("Entry #{} {}", entry.index, serde_json::to_string(&entry)?);
+    println!(
+        "Leaf hash  {}  (sha256 of 0x00 || JCS({{kind, data}}))",
+        entry.leaf_hash()
+    );
+    println!("Proof      {} hashes", proof.len());
+    for h in proof {
+        println!("           {h}");
+    }
+    println!(
+        "INCLUDED in the checkpoint this device verified: size {} root {}",
+        cp.size,
+        b64(&cp.root)
+    );
+    if index == own.enrolment {
+        println!(
+            "This entry is your enrolment: sha256(salt || pseudonym) from enrolment.json matches."
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn log_show(path: &Path) -> Result<()> {
+    let records = locallog::read(path)?;
+    if records.is_empty() {
+        println!("No claims sent yet.");
+    }
+    for r in records {
+        println!("== {}  sent sha256:{}", r.time, r.sent_sha256);
+        let sent: Value = serde_json::from_slice(&r.sent()?)?;
+        match sent["jws"].as_str().map(verify_claim) {
+            Some(Ok(verified)) => println!("{}", serde_json::to_string_pretty(verified.claim())?),
+            _ => println!("{sent}"),
+        }
+        println!("-- response");
+        println!("{}\n", String::from_utf8_lossy(&r.response()?));
+    }
+    Ok(())
+}
+
+async fn run(cli: Cli) -> Result<ExitCode> {
+    if let Command::Schedule {
+        command: schedule::Command::Probe { address, name },
+    } = &cli.command
+    {
+        schedule::probe_command(address, name.as_deref()).await?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    if let Command::Manifest {
+        command: ManifestCommand::Check { json },
+    } = &cli.command
+    {
+        return manifest_check::run(*json);
+    }
+    if let Command::Manifest {
+        command: ManifestCommand::Builtins { json },
+    } = &cli.command
+    {
+        std::io::stdout().write_all(manifest_builtins(*json)?.as_bytes())?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    let home = Home::new(cli.home)?;
+    #[cfg(windows)]
+    if recovers_vpn_first(&cli.command) {
+        match home.recover_vpn_at_startup() {
+            Ok(true) => {}
+            Ok(false) => {
+                eprintln!(
+                    "warning: VPN recovery skipped because another process holds the VPN lock"
+                )
+            }
+            Err(error) => eprintln!("warning: VPN recovery failed: {error:#}"),
+        }
+    }
+    match cli.command {
+        Command::Status(options) => status::run(&home, options, cli.insecure_dev).await,
+        Command::Join {
+            invitation,
+            preview: true,
+            ..
+        } => Ok(join_preview_json(
+            &home,
+            invitation.as_deref().expect("clap requires the invitation"),
+            cli.insecure_dev,
+            json_out::Json::new(std::io::stdout(), json_out::Answers::default()),
+        )
+        .await),
+        Command::Join {
+            invitation,
+            software_key,
+            no_wait,
+            json: true,
+            folders,
+            auto_send,
+            ..
+        } => Ok(join_json(
+            &home,
+            invitation.as_deref(),
+            software_key,
+            no_wait,
+            cli.insecure_dev,
+            APPROVAL_POLL_INTERVAL,
+            json_out::Json::new(
+                std::io::stdout(),
+                json_out::Answers {
+                    auto_send: auto_send == Some(Toggle::On),
+                    folders: folders
+                        .iter()
+                        .map(|folder| {
+                            device_config::absolute_folder(folder, user_profile().as_deref())
+                        })
+                        .collect::<Result<_>>()?,
+                },
+            ),
+        )
+        .await),
+        Command::Join {
+            invitation,
+            yes,
+            software_key,
+            no_wait,
+            ..
+        } => match invitation {
+            Some(invitation) => {
+                run_wizard(
+                    &home,
+                    Some(&invitation),
+                    no_wait,
+                    join(
+                        &home,
+                        &invitation,
+                        yes,
+                        software_key,
+                        cli.insecure_dev,
+                        no_wait,
+                        APPROVAL_POLL_INTERVAL,
+                    ),
+                )
+                .await
+            }
+            None => {
+                run_wizard(
+                    &home,
+                    None,
+                    no_wait,
+                    resume_join(&home, cli.insecure_dev, no_wait, APPROVAL_POLL_INTERVAL),
+                )
+                .await
+            }
+        },
+        Command::Check { json: true, .. } => Ok(check_json(
+            &home,
+            cli.insecure_dev,
+            json_out::Json::new(std::io::stdout(), json_out::Answers::default()),
+        )
+        .await),
+        Command::Check { dry_run: false, .. } => check(&home, cli.insecure_dev).await,
+        Command::Check {
+            dry_run: true,
+            timings,
+            ..
+        } => {
+            let started = std::time::Instant::now();
+            let result = check_dry_run(&home, cli.insecure_dev).await;
+            if timings {
+                eprintln!("{}", timings::measure(started.elapsed()));
+            }
+            result
+        }
+        Command::Accept { preview: true, .. } => Ok(accept_preview_json(
+            &home,
+            cli.insecure_dev,
+            json_out::Json::new(std::io::stdout(), json_out::Answers::default()),
+        )
+        .await),
+        Command::Accept { yes, .. } => accept(&home, yes, cli.insecure_dev).await,
+        Command::Folders { command } => folders(&home, command).await,
+        Command::Manifest {
+            command: ManifestCommand::Show,
+        } => {
+            print!("{}", manifest_show(&home)?);
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Manifest {
+            command: ManifestCommand::Check { .. } | ManifestCommand::Builtins { .. },
+        } => unreachable!("handled before the home is read"),
+        Command::Schedule { command } => {
+            schedule::run(&home, command).await?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Log {
+            command: LogCommand::Head,
+        } => log_head(&home).map(|()| ExitCode::SUCCESS),
+        Command::Log {
+            command: LogCommand::Prove { index },
+        } => log_prove(&home, index, cli.insecure_dev).await,
+        Command::Log {
+            command: LogCommand::Show,
+        } => log_show(&home.file("claims.jsonl")).map(|()| ExitCode::SUCCESS),
+        Command::DeleteDeviceKey => {
+            DeviceKey::delete(&home.0)?;
+            println!("Device key deleted.");
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Stop => {
+            println!("{}", stop_instructions(&home.0, cfg!(windows)));
+            println!(
+                "Before deleting the home or binary, run `open-pact-client delete-device-key` with the same --home."
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+    }
+}
+
+/// Whether the command repairs an interrupted VPN installation before it runs. A command that only
+/// reads, or that promises to write no file, does not.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn recovers_vpn_first(command: &Command) -> bool {
+    !matches!(
+        command,
+        Command::Status(_)
+            | Command::Manifest {
+                command: ManifestCommand::Show | ManifestCommand::Check { .. }
+            }
+            | Command::Join { preview: true, .. }
+            | Command::Accept { preview: true, .. }
+    )
+}
+
+/// Whether the command line asked for JSON output, so a failure to parse it is JSON too.
+fn args_ask_for_json(args: &[std::ffi::OsString]) -> bool {
+    args.iter()
+        .skip(1)
+        .take_while(|arg| *arg != "--")
+        .any(|arg| arg == "--json" || arg == "--preview")
+}
+
+/// The error line for a command line that does not parse, when it asked for JSON. Help and version
+/// output, and the errors of a command line that did not ask for JSON, stay as clap prints them.
+fn usage_error_line(args: &[std::ffi::OsString], error: &clap::Error) -> Option<String> {
+    if !error.use_stderr() || !args_ask_for_json(args) {
+        return None;
+    }
+    let text = error.to_string();
+    let first = text.split("\n\n").next().unwrap_or_default().trim();
+    let first = first.strip_prefix("error: ").unwrap_or(first);
+    Some(serde_json::json!({ "error": first }).to_string())
+}
+
+/// Polls `future` so that a panic in it comes back as an error.
+async fn catch_panic(future: impl Future<Output = Result<ExitCode>>) -> Result<ExitCode> {
+    let mut future = std::pin::pin!(future);
+    std::future::poll_fn(|cx| {
+        let polled =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| future.as_mut().poll(cx)));
+        match polled {
+            Ok(poll) => poll,
+            Err(payload) => {
+                let text = payload
+                    .downcast_ref::<&str>()
+                    .map(|text| (*text).to_owned())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown cause".to_owned());
+                std::task::Poll::Ready(Err(anyhow::anyhow!("internal error: {text}")))
+            }
+        }
+    })
+    .await
+}
+
+pub fn run_cli() -> ExitCode {
+    // Windows gives the main thread 1 MiB, which the debug CLI future can exceed.
+    std::thread::Builder::new()
+        .name("open-pact-client".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("build the CLI runtime")
+                .block_on(cli_main())
+        })
+        .expect("start the CLI thread")
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
+async fn cli_main() -> ExitCode {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let cli = match Cli::try_parse_from(&args) {
+        Ok(cli) => cli,
+        Err(error) => match usage_error_line(&args, &error) {
+            Some(line) => {
+                let _ = writeln!(std::io::stdout(), "{line}");
+                return ExitCode::from(2);
+            }
+            None => error.exit(),
+        },
+    };
+    let json = cli.prints_json();
+    // Keep Rust's ignored SIGPIPE for JSON: a closed stderr must not kill usable stdout.
+    // Text commands still exit quietly when their stdout pipe closes, such as `log show | head`.
+    #[cfg(unix)]
+    if !json {
+        unsafe {
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        }
+    }
+    let result = if json {
+        catch_panic(run(cli)).await
+    } else {
+        run(cli).await
+    };
+    match result {
+        Ok(code) => code,
+        Err(e) if json => {
+            let line = serde_json::json!({ "error": format!("{e:#}") });
+            let _ = writeln!(std::io::stdout(), "{line}");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::device_config::DeviceConfig;
+
+    #[test]
+    fn confirmation_reprompts_until_it_gets_a_valid_yes_or_no() {
+        let mut input = std::io::Cursor::new(b"  asi y  \n YES \n".as_slice());
+        let mut output = Vec::new();
+
+        assert!(confirm_from("Write open-pact.toml?".into(), &mut input, &mut output).unwrap());
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(output.matches("Write open-pact.toml? [y/N] ").count(), 2);
+        assert_eq!(output.matches("Answer y or n.\n").count(), 1);
+    }
+
+    #[test]
+    fn confirmation_accepts_no_and_keeps_empty_input_as_the_default() {
+        for (answer, expected) in [(" N \n", false), ("No\n", false), ("\n", false)] {
+            let mut input = std::io::Cursor::new(answer.as_bytes());
+            let mut output = Vec::new();
+            assert_eq!(
+                confirm_from("Write open-pact.toml?".into(), &mut input, &mut output).unwrap(),
+                expected,
+                "{answer:?}"
+            );
+            assert!(
+                !String::from_utf8(output)
+                    .unwrap()
+                    .contains("Answer y or n.")
+            );
+        }
+    }
+
+    #[test]
+    fn review_stop_message_names_step_six() {
+        assert_eq!(
+            stopped_message(6, "open-pact-client join"),
+            "Stopped at [6/6]. Continue with: open-pact-client join"
+        );
+    }
+
+    #[test]
+    fn local_claim_log_summary_explains_the_file_and_last_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+        let text = claim_log_status_text(
+            &home,
+            Some(("2026-11-05T12:00:00Z".into(), ClaimResult::Accepted, 21)),
+            None,
+        );
+        assert!(text.contains(&home.file("claims.jsonl").display().to_string()));
+        assert!(text.contains("every claim this device sent"));
+        assert!(text.contains("log show"));
+        assert!(text.contains("2026-11-05T12:00:00Z, accepted, 21 controls"));
+        let unverified = claim_log_status_text(
+            &home,
+            Some((
+                "2026-11-05T12:00:00Z".into(),
+                ClaimResult::ResponseUnverified,
+                21,
+            )),
+            None,
+        );
+        assert!(unverified.contains("Local claim log:"));
+        assert!(unverified.contains("Show it with:"));
+        assert!(unverified.contains("accepted response not verified"));
+        assert!(!unverified.contains("No claim was sent"));
+        let empty =
+            claim_log_status_text(&home, None, Some("the device is waiting for IT approval"));
+        assert!(empty.contains("No claim was sent because the device is waiting for IT approval."));
+    }
+
+    #[test]
+    fn approval_interruption_uses_the_interrupt_exit_status() {
+        assert_eq!(
+            approval_exit(ApprovalWait::Interrupted, "open-pact-client"),
+            ExitCode::from(130)
+        );
+    }
+
+    #[test]
+    fn approval_interruption_names_step_four_and_its_continuation() {
+        assert_eq!(
+            stopped_message(4, "open-pact-client join"),
+            "Stopped at [4/6]. Continue with: open-pact-client join"
+        );
+    }
+
+    #[test]
+    fn step_four_prints_scan_summary_before_the_waiting_message() {
+        let home = Path::new("/home/example");
+        let scan = checks::repos::RepoScan {
+            scanned_at: chrono::Utc::now().timestamp(),
+            managed_repos_outside: 2,
+            managed_repos_total: 2,
+            outside_paths: Vec::new(),
+            managed_paths: Some(vec![home.join("work/one"), home.join("work/two")]),
+            partial: true,
+            access_denied: false,
+            causes: Vec::new(),
+        };
+        let output = approval_scan_output(
+            Some(&scan),
+            home,
+            Some("The client is still waiting for IT approval. Keep this window open."),
+        );
+        let found = output.find("Found 2 managed repositories:").unwrap();
+        let locations = output.find("~/work (2)").unwrap();
+        let partial = output.find("scan was partial").unwrap();
+        let waiting = output.find("still waiting for IT approval").unwrap();
+        assert!(
+            found < locations && locations < partial && partial < waiting,
+            "{output}"
+        );
+        assert!(!approval_scan_output(Some(&scan), home, None).contains("still waiting"));
+    }
+
+    #[test]
+    fn step_four_intro_distinguishes_approved_resume_from_pending_approval() {
+        let approved = step_four_intro(Some(ApprovalProgress::Approved), "CODE", true);
+        assert!(approved.contains("This device is already approved."));
+        assert!(!approved.contains("Read this code to IT"));
+        assert!(!approved.contains("Keep this window open"));
+
+        let pending = step_four_intro(Some(ApprovalProgress::Pending), "CODE", true);
+        assert!(pending.contains("CODE"));
+        assert!(pending.contains("Read this code to IT. IT approves the device with it."));
+    }
+
+    #[tokio::test]
+    async fn manifest_without_repository_controls_skips_the_repository_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+        let repo = dir.path().join("work/app");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::write(
+            repo.join(".git/config"),
+            "[remote \"origin\"]\n url = git@github.com:example-org/app.git\n",
+        )
+        .unwrap();
+        let with_controls = include_str!("../../../examples/manifest.toml").replace("\r\n", "\n");
+        let without_controls = ["managed_repos_outside", "managed_repos_total"]
+            .iter()
+            .fold(with_controls.clone(), |toml, id| {
+                let start = toml.find(&format!("[[control]]\nid = \"{id}\"\n")).unwrap();
+                let end = start + toml[start..].find("\n\n").unwrap() + 2;
+                format!("{}{}", &toml[..start], &toml[end..])
+            });
+        let without_controls = Manifest::parse(without_controls.as_bytes()).unwrap();
+        assert!(!scans_repositories(&without_controls));
+        assert!(!step_four_intro(None, "CODE", false).contains("looks for managed repositories"));
+
+        fs::write(home.file("repo-scan.json"), "{}").unwrap();
+        assert!(
+            scan_repositories(&home, &without_controls, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(!home.file("repo-scan.json").exists());
+
+        let with_controls = Manifest::parse(with_controls.as_bytes()).unwrap();
+        let scan = scan_repositories(&home, &with_controls, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(scan.managed_repos_total, 1);
+        assert!(home.file("repo-scan.json").is_file());
+    }
+
+    #[test]
+    fn wizard_resume_requires_a_verified_first_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+        assert_eq!(wizard_resume(&home).unwrap(), WizardResume::Setup);
+        fs::write(home.file(device_config::FILE), "{}").unwrap();
+        assert_eq!(
+            wizard_resume(&home).unwrap(),
+            WizardResume::Setup,
+            "a device.json that step 5 never answered does not skip step 5"
+        );
+        fs::write(
+            home.file(device_config::FILE),
+            r#"{"setup_answered": true}"#,
+        )
+        .unwrap();
+        assert_eq!(wizard_resume(&home).unwrap(), WizardResume::FirstCheck);
+        locallog::append(&home.file("claims.jsonl"), b"sent", b"upstream unavailable").unwrap();
+        assert_eq!(wizard_resume(&home).unwrap(), WizardResume::FirstCheck);
+
+        let certificate = "fictional certificate";
+        let ca = "fictional certificate authority";
+        let response = serde_json::to_vec(&json!({
+            "status": "accepted",
+            "warnings": [],
+            "certificate_pem": certificate,
+            "ca_pem": ca,
+            "log_checkpoint": "fictional verified checkpoint"
+        }))
+        .unwrap();
+        locallog::append_with_status(
+            &home.file("claims.jsonl"),
+            b"failed HTTP exchange",
+            &response,
+            Some(502),
+        )
+        .unwrap();
+        assert_eq!(wizard_resume(&home).unwrap(), WizardResume::FirstCheck);
+        locallog::append_with_status(
+            &home.file("claims.jsonl"),
+            b"verified claim",
+            &response,
+            Some(200),
+        )
+        .unwrap();
+        assert_eq!(wizard_resume(&home).unwrap(), WizardResume::FirstCheck);
+        fs::write(home.file("vpn-cert.pem"), certificate).unwrap();
+        fs::write(home.file("ca.pem"), ca).unwrap();
+        assert_eq!(wizard_resume(&home).unwrap(), WizardResume::Complete);
+
+        let valid = fs::read_to_string(home.file("claims.jsonl"))
+            .unwrap()
+            .lines()
+            .last()
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+        let mut bad_hash: Value = serde_json::from_slice(&valid).unwrap();
+        bad_hash["sent_sha256"] = json!("00".repeat(32));
+        let mut history = serde_json::to_vec(&bad_hash).unwrap();
+        history.push(b'\n');
+        history.extend_from_slice(&valid);
+        history.push(b'\n');
+        history.extend_from_slice(b"{\"time\":\n");
+        fs::write(home.file("claims.jsonl"), &history).unwrap();
+        let (valid_records, damaged) = locallog::read_lenient(&home.file("claims.jsonl")).unwrap();
+        assert_eq!(valid_records.len(), 1);
+        assert_eq!(damaged, 2);
+        assert_eq!(wizard_resume(&home).unwrap(), WizardResume::Complete);
+        assert_eq!(fs::read(home.file("claims.jsonl")).unwrap(), history);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn printed_home_argument_survives_posix_shell_parsing() {
+        let path = Path::new("/tmp/client home's;$(fictional)");
+        let quoted = shell_quote_arg(&path.display().to_string());
+        let output = std::process::Command::new("sh")
+            .args(["-c", &format!("printf %s {quoted}")])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let expected = path.to_string_lossy();
+        assert_eq!(output.stdout, expected.as_bytes());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn printed_home_argument_uses_powershell_quoting() {
+        assert_eq!(shell_quote_arg("C:\\client home's"), "'C:\\client home''s'");
+    }
+    use std::fs;
+
+    #[test]
+    fn plain_http_only_to_this_machine_unless_insecure_dev() {
+        for ok in [
+            "https://pact.example.com",
+            "http://localhost:8080",
+            "http://127.0.0.1:8080/",
+            "http://[::1]:8080",
+        ] {
+            assert!(check_scheme(ok, false).is_ok(), "{ok}");
+        }
+        for bad in [
+            "http://pact.example.com",
+            "http://localhost.pact.example.com",
+            "http://10.0.0.1",
+        ] {
+            assert!(check_scheme(bad, false).is_err(), "{bad}");
+            assert!(check_scheme(bad, true).is_ok(), "{bad}");
+        }
+        assert!(check_scheme("ftp://pact.example.com", true).is_err());
+    }
+
+    #[test]
+    fn a_changed_company_key_or_log_key_is_reported() {
+        let fingerprint = || PublicKey::from(&dev_key::generate()).fingerprint();
+        let log = |k: &PublicKey| LogKey::new("pact.example.com/log", k);
+        let (log_a, log_b) = (
+            log(&PublicKey::from(&dev_key::generate())),
+            log(&PublicKey::from(&dev_key::generate())),
+        );
+        let company = fingerprint();
+        let pins = Pins {
+            company: company.clone(),
+            log: log_a.clone(),
+        };
+        assert_eq!(pins.differs(&company, &format!("{}\n", log_a.vkey())), None);
+        let other = fingerprint();
+        assert!(
+            pins.differs(&other, &log_a.vkey())
+                .unwrap()
+                .starts_with("the company key changed")
+        );
+        assert!(
+            pins.differs(&company, &log_b.vkey())
+                .unwrap()
+                .starts_with("the log key changed")
+        );
+    }
+
+    #[test]
+    fn sends_declared_results_even_without_an_os_requirement() {
+        let toml = include_str!("../../../examples/manifest.toml").replace(
+            r#"required = { macos = "on", windows = "on", linux = "on" }"#,
+            r#"required = { macos = "on" }"#,
+        );
+        let manifest = Manifest::parse(toml.as_bytes()).unwrap();
+        let all = BTreeMap::from(
+            [
+                ("disk_encryption", "full"),
+                ("firewall", "on"),
+                ("screen_lock", "le_5min"),
+                ("os_supported", "unknown"),
+                ("antimalware_active", "yes"),
+            ]
+            .map(|(k, v)| (k.to_string(), v.into())),
+        );
+        let ids = |os| -> Vec<String> {
+            disclosable(&manifest, os, all.clone())
+                .into_keys()
+                .collect()
+        };
+        assert_eq!(
+            ids(Os::Macos),
+            [
+                "antimalware_active",
+                "disk_encryption",
+                "firewall",
+                "os_supported",
+                "screen_lock"
+            ]
+        );
+        assert_eq!(
+            ids(Os::Linux),
+            [
+                "antimalware_active",
+                "disk_encryption",
+                "firewall",
+                "os_supported",
+                "screen_lock"
+            ]
+        );
+    }
+
+    #[test]
+    fn sends_numeric_results_only_within_declared_bounds() {
+        use open_pact_core::ControlValue;
+        let manifest = Manifest::parse(include_bytes!("../../../examples/manifest.toml")).unwrap();
+        for (value, expected) in [
+            (ControlValue::Integer(0), true),
+            (ControlValue::Integer(3650), true),
+            (ControlValue::Integer(-1), false),
+            (ControlValue::Integer(3651), false),
+            ("unknown".into(), true),
+            ("30".into(), false),
+        ] {
+            let all = BTreeMap::from([("os_patch_age_days".into(), value.clone())]);
+            let sent = disclosable(&manifest, Os::Linux, all);
+            assert_eq!(sent.get("os_patch_age_days"), expected.then_some(&value));
+        }
+    }
+
+    #[test]
+    fn substitutes_unknown_when_na_is_not_disclosed_but_unknown_is() {
+        let template = include_str!("../../../examples/manifest.toml");
+        let (body, log) = template.split_once("[log]").unwrap();
+        let mut fixture = body.split("[[control]]").next().unwrap().to_string();
+        for id in [
+            "antimalware_active_threats",
+            "antimalware_full_scan_age_days",
+        ] {
+            fixture.push_str(&format!("\n[[control]]\nid = \"{id}\"\nsource = \"company_policy\"\ncheck = \"builtin:{id}@1\"\noutput = {{ integer = {{ min = 0, max = 3650 }} }}\nrequired = {{ macos = {{ max = 0 }} }}\ngrace = \"1d\"\n"));
+        }
+        fixture.push_str("\n[[control]]\nid = \"web_protection\"\nsource = \"company_policy\"\ncheck = \"builtin:web_protection@1\"\noutput = [\"on\", \"off\", \"unknown\"]\nrequired = {}\ngrace = \"1d\"\n");
+        fixture.push_str(&format!("\n[log]{log}"));
+        let manifest = Manifest::parse(fixture.as_bytes()).unwrap();
+        let all = BTreeMap::from([
+            ("antimalware_active_threats".into(), "n/a".into()),
+            ("antimalware_full_scan_age_days".into(), "n/a".into()),
+            ("web_protection".into(), "n/a".into()),
+        ]);
+
+        let sent = disclosable(&manifest, Os::Macos, all);
+
+        assert_eq!(sent["antimalware_active_threats"], "unknown");
+        assert_eq!(sent["antimalware_full_scan_age_days"], "unknown");
+        assert_eq!(sent["web_protection"], "unknown");
+
+        let key = PublicKey::from(&dev_key::generate());
+        let time = "2026-10-20T12:00:00Z".parse().unwrap();
+        let claim = Claim {
+            manifest: manifest.hash().clone(),
+            device: Pseudonym::of(&key),
+            device_key: key,
+            nonce: "n".into(),
+            time,
+            client: "open-pact-client 0.0.1".into(),
+            os: Os::Macos,
+            trust_level: open_pact_core::TrustLevel::L0,
+            virtualized: Some(Virtualized::No),
+            results: sent,
+            csr_sha256: None,
+            log_checkpoint: None,
+        };
+        let decision = open_pact_core::evaluate(
+            &manifest,
+            &claim,
+            time,
+            &open_pact_core::FirstFailures::new(),
+        )
+        .decision;
+        let open_pact_core::Decision::Allow { warnings } = decision else {
+            panic!("unknown detection results should receive unknown_grace");
+        };
+        let warnings = warnings.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings.iter().any(|warning| {
+            warning.starts_with("antimalware_active_threats = unknown")
+                && warning.ends_with("access ends in 7d")
+        }));
+        assert!(warnings.iter().any(|warning| {
+            warning.starts_with("antimalware_full_scan_age_days = unknown")
+                && warning.ends_with("access ends in 7d")
+        }));
+    }
+
+    #[test]
+    fn keeps_na_when_declared_and_omits_na_when_unknown_is_not_declared() {
+        let template = include_str!("../../../examples/manifest.toml").replace("\r\n", "\n");
+        let manifest = Manifest::parse(template.as_bytes()).unwrap();
+        let all = BTreeMap::from([
+            ("antimalware_active_threats".into(), "n/a".into()),
+            ("antimalware_full_scan_age_days".into(), "n/a".into()),
+        ]);
+        let sent = disclosable(&manifest, Os::Macos, all);
+        assert_eq!(sent["antimalware_active_threats"], "n/a");
+        assert_eq!(sent["antimalware_full_scan_age_days"], "n/a");
+
+        let no_fallback = template
+            .split("[[control]]")
+            .map(|block| {
+                if block.starts_with("\nid = \"antimalware_active_threats\"")
+                    || block.starts_with("\nid = \"antimalware_full_scan_age_days\"")
+                {
+                    block
+                        .lines()
+                        .map(|line| {
+                            if line.starts_with("output = ") {
+                                "output = [\"0\", \"1\"]"
+                            } else if line.starts_with("required = ") {
+                                "required = {}"
+                            } else {
+                                line
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                        + "\n"
+                } else {
+                    block.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("[[control]]");
+        let manifest = Manifest::parse(no_fallback.as_bytes()).unwrap();
+        let all = BTreeMap::from([
+            ("antimalware_active_threats".into(), "n/a".into()),
+            ("antimalware_full_scan_age_days".into(), "n/a".into()),
+        ]);
+        assert!(disclosable(&manifest, Os::Macos, all).is_empty());
+    }
+
+    #[test]
+    fn sends_log_checkpoint_only_if_the_manifest_discloses_it() {
+        let toml = include_str!("../../../examples/manifest.toml");
+        let cp = Checkpoint {
+            origin: "pact.example.com/log".into(),
+            size: 3,
+            root: LogHash([1; 32]),
+        };
+        let listed = Manifest::parse(toml.as_bytes()).unwrap();
+        assert_eq!(
+            disclosable_checkpoint(&listed, Some(cp.clone())),
+            Some(LogCheckpoint {
+                size: 3,
+                root: LogHash([1; 32])
+            })
+        );
+        let unlisted = toml.replace(r#", "log_checkpoint"]"#, "]");
+        assert_ne!(unlisted, toml);
+        let unlisted = Manifest::parse(unlisted.as_bytes()).unwrap();
+        assert_eq!(disclosable_checkpoint(&unlisted, Some(cp)), None);
+    }
+
+    use fake_gateway::{
+        Company, DEMO_MANIFEST, FakeGateway, Witness, checkpoint_of, not_found, serve_log, snapshot,
+    };
+
+    fn approval_fixture(
+        home: &Home,
+        company: &Company,
+        witness: &Witness,
+    ) -> (Manifest, Enrolment, Vec<Entry>, String, String) {
+        let manifest = Manifest::parse(&fs::read(home.file("manifest.toml")).unwrap()).unwrap();
+        let enrolment = home.enrolment().unwrap();
+        let entries = vec![
+            Entry {
+                index: 0,
+                kind: EntryKind::ManifestPublished,
+                data: json!({"manifest": enrolment.manifest.as_str()}),
+            },
+            Entry {
+                index: 1,
+                kind: EntryKind::DeviceEnrolled,
+                data: json!({"commitment": commitment(&enrolment).unwrap()}),
+            },
+            Entry {
+                index: 2,
+                kind: EntryKind::DeviceApproved,
+                data: json!({"commitment": commitment(&enrolment).unwrap()}),
+            },
+        ];
+        let mut before_approval = company.sign(&checkpoint_of(company.log.origin(), &entries, 2));
+        let now = u64::try_from(chrono::Utc::now().timestamp()).unwrap();
+        witness.cosign(&mut before_approval, now);
+        let before_approval = before_approval.to_string();
+        home.write(LOG_CHECKPOINT, before_approval.as_bytes())
+            .unwrap();
+        let mut approved = company.sign(&checkpoint_of(company.log.origin(), &entries, 3));
+        witness.cosign(&mut approved, now);
+        let approved = approved.to_string();
+        (manifest, enrolment, entries, before_approval, approved)
+    }
+
+    fn my_entries_response(checkpoint: &str, entries: &[Entry], size: usize) -> String {
+        let leaves: Vec<_> = entries.iter().map(Entry::leaf_hash).collect();
+        serde_json::to_string(&MyEntries {
+            checkpoint: checkpoint.into(),
+            manifest: open_pact_core::EntryWithProof {
+                entry: entries[0].clone(),
+                proof: open_pact_core::inclusion_proof(&leaves[..size], 0).unwrap(),
+            },
+            device: entries[1..size]
+                .iter()
+                .map(|entry| open_pact_core::EntryWithProof {
+                    entry: entry.clone(),
+                    proof: open_pact_core::inclusion_proof(&leaves[..size], entry.index).unwrap(),
+                })
+                .collect(),
+        })
+        .unwrap()
+    }
+
+    fn put_gateway_in_enrolment(home: &Home, enrolment: &mut Enrolment, url: &str) {
+        enrolment.gateway = url.to_string();
+        home.write("enrolment.json", &serde_json::to_vec(enrolment).unwrap())
+            .unwrap();
+    }
+
+    #[test]
+    fn home_reader_returns_file_bytes_and_missing_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data");
+        std::fs::write(&path, b"fixture").unwrap();
+        assert_eq!(read_home_file(&path).unwrap(), b"fixture");
+        assert_eq!(
+            read_home_file(&dir.path().join("missing"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn manifest_show_prints_the_signed_summary_and_does_not_change_the_home() {
+        let company = Company::new();
+        let dir = tempfile::tempdir().unwrap();
+        let home = enrolled_home(dir.path(), "https://gateway.example", &company);
+        let output_without_index = manifest_show(&home).unwrap();
+        assert!(output_without_index.contains("log prove"));
+        let mut enrolment = home.enrolment().unwrap();
+        enrolment.log_entries = Some(OwnEntries {
+            manifest: 12,
+            enrolment: 13,
+        });
+        home.write("enrolment.json", &serde_json::to_vec(&enrolment).unwrap())
+            .unwrap();
+        let before = home_files(&home);
+
+        let output = manifest_show(&home).unwrap();
+
+        assert!(output.contains("Issuer       company.example"));
+        assert!(output.contains("Company key  "));
+        assert!(output.contains(&format!("Signed hash  {}", enrolment.manifest)));
+        assert!(output.contains(&format!(
+            "Full text    {}  (open it and read all of it)",
+            std::path::absolute(home.file("manifest.toml"))
+                .unwrap()
+                .display()
+        )));
+        assert!(output.contains(
+            "Automatic claims: only while vpn.example.org answers at 10.0.0.1:443, every 55 minutes, and at once when a check result changes"
+        ));
+        assert!(output.contains("Transparency log entry  #12"));
+        assert_eq!(home_files(&home), before);
+    }
+
+    #[test]
+    fn manifest_show_rejects_a_manifest_that_differs_from_the_signed_hash() {
+        let company = Company::new();
+        let dir = tempfile::tempdir().unwrap();
+        let home = enrolled_home(dir.path(), "https://gateway.example", &company);
+        let changed =
+            DEMO_MANIFEST.replace("issuer = \"company.example\"", "issuer = \"other.example\"");
+        assert_ne!(
+            Manifest::parse(changed.as_bytes()).unwrap().hash(),
+            &home.enrolment().unwrap().manifest
+        );
+        fs::write(home.file("manifest.toml"), changed).unwrap();
+
+        let error = manifest_show(&home).unwrap_err();
+
+        assert!(
+            error.to_string().contains("disagree") && error.to_string().contains("accept"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn manifest_show_without_enrolment_points_to_join() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+
+        let error = manifest_show(&home).unwrap_err();
+
+        assert!(error.to_string().contains("run `open-pact-client join"));
+    }
+
+    fn home_files(home: &Home) -> Vec<(String, Vec<u8>)> {
+        let mut files = fs::read_dir(&home.0)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (
+                    path.file_name().unwrap().to_string_lossy().into_owned(),
+                    fs::read(path).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        files.sort_by(|left, right| left.0.cmp(&right.0));
+        files
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn home_reader_refuses_reparse_point_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("file");
+        let link = dir.path().join("link");
+        std::fs::write(&file, b"fixture").unwrap();
+        std::os::windows::fs::symlink_file(&file, &link).unwrap();
+        assert_eq!(
+            read_home_file(&link).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
+
+    /// A device enrolled at `gateway` under the demo manifest, with a certificate from an earlier check.
+    fn enrolled_home(dir: &Path, gateway: &str, company: &Company) -> Home {
+        enrolled_home_with(dir, gateway, company, DEMO_MANIFEST)
+    }
+
+    fn enrolled_home_with(dir: &Path, gateway: &str, company: &Company, toml: &str) -> Home {
+        let home = Home(dir.to_path_buf());
+        let manifest = Manifest::parse(toml.as_bytes()).unwrap();
+        let device = DeviceKey::load_or_create(dir, true).unwrap();
+        let enrolment = Enrolment {
+            gateway: gateway.into(),
+            manifest: manifest.hash().clone(),
+            device: Pseudonym::of(&device.public_key()),
+            salt: "00".repeat(32),
+            log_entries: None,
+            last_status: None,
+        };
+        home.write("enrolment.json", &serde_json::to_vec(&enrolment).unwrap())
+            .unwrap();
+        home.write("manifest.toml", toml.as_bytes()).unwrap();
+        Pins {
+            company: company.fingerprint(),
+            log: company.log.clone(),
+        }
+        .save(&home)
+        .unwrap();
+        home.write("ca.pem", b"earlier CA").unwrap();
+        home.write("vpn-cert.pem", b"earlier certificate").unwrap();
+        home
+    }
+
+    #[tokio::test]
+    async fn check_reports_device_state_after_private_log_denial_under_path_prefix() {
+        for state in ["pending", "revoked"] {
+            let company = Company::new();
+            let witness = Witness::new();
+            let toml = witnessed_manifest(&witness);
+            let published = Company::published(&toml, &company.key);
+            let log = company.log.vkey();
+            let mut checkpoint = Note::parse(&company.empty_checkpoint()).unwrap();
+            witness.cosign(
+                &mut checkpoint,
+                u64::try_from(chrono::Utc::now().timestamp()).unwrap(),
+            );
+            let checkpoint = checkpoint.to_string();
+            let gateway = FakeGateway::start(move |line, _| match line {
+                "GET /api/v1/manifest" => (200, published.clone()),
+                "GET /api/v1/log/key" => (200, log.clone()),
+                "GET /api/v1/log/checkpoint" => (200, checkpoint.clone()),
+                "POST /api/v1/nonce" => (200, json!({"nonce":"state-nonce"}).to_string()),
+                "POST /api/v1/log/mine" => (403, json!({"status":"denied"}).to_string()),
+                "POST /api/v1/device/status" => (200, json!({"state":state}).to_string()),
+                _ => not_found(),
+            })
+            .await;
+            let dir = tempfile::tempdir().unwrap();
+            let gateway_url = format!("{}/api", gateway.url);
+            let home = enrolled_home_with(dir.path(), &gateway_url, &company, &toml);
+            fs::write(home.file("claims.jsonl"), b"{\"time\":\n").unwrap();
+            assert_eq!(
+                check(&home, true).await.unwrap(),
+                ExitCode::FAILURE,
+                "{state}"
+            );
+            assert_eq!(
+                gateway.posts(),
+                [
+                    "POST /api/v1/nonce",
+                    "POST /api/v1/log/mine",
+                    "POST /api/v1/nonce",
+                    "POST /api/v1/device/status"
+                ]
+            );
+            assert!(!home.file("vpn-key.pem").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn first_checkpoint_requires_gateway_and_witness_signatures_without_public_entries() {
+        for case in ["valid", "wrong gateway", "missing witness", "wrong witness"] {
+            let company = Company::new();
+            let witness = Witness::new();
+            let toml = witnessed_manifest(&witness);
+            let manifest = Manifest::parse(toml.as_bytes()).unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let home = enrolled_home_with(dir.path(), "", &company, &toml);
+            let cp = checkpoint_of(
+                company.log.origin(),
+                &[Entry {
+                    index: 0,
+                    kind: EntryKind::ManifestPublished,
+                    data: json!({"manifest": manifest.hash()}),
+                }],
+                1,
+            );
+            let mut note = if case == "wrong gateway" {
+                Company::new().sign(&cp)
+            } else {
+                company.sign(&cp)
+            };
+            let now = u64::try_from(chrono::Utc::now().timestamp()).unwrap();
+            if case != "missing witness" {
+                witness.cosign(&mut note, now);
+            }
+            if case == "wrong witness" {
+                note.signatures.last_mut().unwrap().payload[12] ^= 1;
+            }
+            let published = Company::published(&toml, &company.key);
+            let log = company.log.vkey();
+            let note = note.to_string();
+            let gateway = FakeGateway::start(move |line, _| match line {
+                "GET /v1/manifest" => (200, published.clone()),
+                "GET /v1/log/key" => (200, log.clone()),
+                "GET /v1/log/checkpoint" => (200, note.clone()),
+                _ => not_found(),
+            })
+            .await;
+            let result = sync_checkpoint(
+                &http_client().unwrap(),
+                &home,
+                &gateway.url,
+                manifest.body().log.as_ref(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.is_ok(), case == "valid", "{case}: {result:?}");
+            assert_eq!(home.checkpoint().unwrap().is_some(), case == "valid");
+            assert_eq!(
+                gateway.requests(),
+                [
+                    "GET /v1/manifest",
+                    "GET /v1/log/key",
+                    "GET /v1/log/checkpoint"
+                ]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn own_entries_use_private_endpoint_and_reject_bad_proofs() {
+        for (corrupt, stored) in [(false, false), (false, true), (true, false)] {
+            let company = Company::new();
+            let witness = Witness::new();
+            let toml = witnessed_manifest(&witness);
+            let dir = tempfile::tempdir().unwrap();
+            let home = enrolled_home_with(dir.path(), "", &company, &toml);
+            let mut enrolment = home.enrolment().unwrap();
+            if stored {
+                enrolment.log_entries = Some(OwnEntries {
+                    manifest: 0,
+                    enrolment: 1,
+                });
+            }
+            let mine = commitment(&enrolment).unwrap();
+            let entries = vec![
+                Entry {
+                    index: 0,
+                    kind: EntryKind::ManifestPublished,
+                    data: json!({"manifest": enrolment.manifest}),
+                },
+                Entry {
+                    index: 1,
+                    kind: EntryKind::DeviceEnrolled,
+                    data: json!({"commitment": mine}),
+                },
+                Entry {
+                    index: 2,
+                    kind: EntryKind::DeviceApproved,
+                    data: json!({"commitment": mine}),
+                },
+            ];
+            let mut cp = checkpoint_of(company.log.origin(), &entries, 3);
+            let leaves: Vec<_> = entries.iter().map(Entry::leaf_hash).collect();
+            let mut note = company.sign(&cp);
+            witness.cosign(
+                &mut note,
+                u64::try_from(chrono::Utc::now().timestamp()).unwrap(),
+            );
+            let mut response = MyEntries {
+                checkpoint: note.to_string(),
+                manifest: open_pact_core::EntryWithProof {
+                    entry: entries[0].clone(),
+                    proof: open_pact_core::inclusion_proof(&leaves, 0).unwrap(),
+                },
+                device: entries[1..]
+                    .iter()
+                    .map(|entry| open_pact_core::EntryWithProof {
+                        entry: entry.clone(),
+                        proof: open_pact_core::inclusion_proof(&leaves, entry.index).unwrap(),
+                    })
+                    .collect(),
+            };
+            if corrupt {
+                response.device[1].proof[0] = LogHash([0; 32]);
+            }
+            let response = serde_json::to_string(&response).unwrap();
+            let gateway = FakeGateway::start(move |line, _| match line {
+                "POST /v1/nonce" => (200, json!({"nonce":"own-entry-nonce"}).to_string()),
+                "POST /v1/log/mine" => (200, response.clone()),
+                _ => not_found(),
+            })
+            .await;
+            enrolment.gateway = gateway.url.clone();
+            let enforced = enrolment.manifest.clone();
+            let result = check_own_entries(
+                &http_client().unwrap(),
+                &home,
+                &mut enrolment,
+                &enforced,
+                &mut cp,
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.is_ok(), !corrupt, "{result:?}");
+            assert_eq!(gateway.requests(), ["POST /v1/nonce", "POST /v1/log/mine"]);
+            assert_eq!(enrolment.log_entries.is_some(), !corrupt);
+        }
+    }
+
+    #[tokio::test]
+    async fn join_retries_a_dropped_or_truncated_status_response() {
+        for (first_status, first_body) in
+            [(0, String::new()), (598, r#"{"state":"pending""#.into())]
+        {
+            let company = Company::new();
+            let dir = tempfile::tempdir().unwrap();
+            let home = enrolled_home(dir.path(), "", &company);
+            let enrolment = home.enrolment().unwrap();
+            let manifest = Manifest::parse(DEMO_MANIFEST.as_bytes()).unwrap();
+            let gateway = FakeGateway::start(move |line, nth| match line {
+                "POST /v1/nonce" => (200, json!({"nonce":format!("network-{nth}")}).to_string()),
+                "POST /v1/device/status" if nth == 0 => (first_status, first_body.clone()),
+                "POST /v1/device/status" => (200, r#"{"state":"revoked"}"#.into()),
+                _ => not_found(),
+            })
+            .await;
+            let mut enrolment = enrolment;
+            put_gateway_in_enrolment(&home, &mut enrolment, &gateway.url);
+
+            let waited = wait_for_approval(
+                &http_client().unwrap(),
+                &home,
+                &enrolment,
+                &manifest,
+                Duration::from_millis(1),
+                false,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+            assert_eq!(waited, ApprovalWait::Revoked);
+            assert_eq!(
+                gateway
+                    .requests()
+                    .iter()
+                    .filter(|request| request.as_str() == "POST /v1/device/status")
+                    .count(),
+                2
+            );
+            assert!(
+                !gateway
+                    .requests()
+                    .iter()
+                    .any(|request| request == "POST /v1/log/mine")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn join_stops_on_a_complete_malformed_status_response() {
+        let company = Company::new();
+        let dir = tempfile::tempdir().unwrap();
+        let home = enrolled_home(dir.path(), "", &company);
+        let mut enrolment = home.enrolment().unwrap();
+        let manifest = Manifest::parse(DEMO_MANIFEST.as_bytes()).unwrap();
+        let gateway = FakeGateway::start(|line, nth| match line {
+            "POST /v1/nonce" => (200, json!({"nonce":format!("malformed-{nth}")}).to_string()),
+            "POST /v1/device/status" => (200, "not json".into()),
+            _ => not_found(),
+        })
+        .await;
+        put_gateway_in_enrolment(&home, &mut enrolment, &gateway.url);
+
+        let error = wait_for_approval(
+            &http_client().unwrap(),
+            &home,
+            &enrolment,
+            &manifest,
+            Duration::from_millis(1),
+            false,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("expected ident"), "{error}");
+        assert_eq!(
+            gateway
+                .requests()
+                .iter()
+                .filter(|request| request.as_str() == "POST /v1/device/status")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn join_retries_a_transient_consistency_proof_fetch_failure() {
+        let company = Company::new();
+        let witness = Witness::new();
+        let toml = witnessed_manifest(&witness);
+        let dir = tempfile::tempdir().unwrap();
+        let home = enrolled_home_with(dir.path(), "", &company, &toml);
+        let (manifest, mut enrolment, entries, _, approved_checkpoint) =
+            approval_fixture(&home, &company, &witness);
+        let response = my_entries_response(&approved_checkpoint, &entries, 3);
+        let gateway = FakeGateway::start(move |line, nth| match line {
+            "POST /v1/nonce" => (200, json!({"nonce":format!("proof-{nth}")}).to_string()),
+            "POST /v1/device/status" => (200, r#"{"state":"approved"}"#.into()),
+            "POST /v1/log/mine" => (200, response.clone()),
+            line if line.starts_with("GET /v1/log/proof/consistency?") && nth == 0 => {
+                (503, "{}".into())
+            }
+            line => serve_log(&entries, line).unwrap_or_else(not_found),
+        })
+        .await;
+        put_gateway_in_enrolment(&home, &mut enrolment, &gateway.url);
+
+        let waited = wait_for_approval(
+            &http_client().unwrap(),
+            &home,
+            &enrolment,
+            &manifest,
+            Duration::from_millis(1),
+            false,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(waited, ApprovalWait::Approved);
+        assert_eq!(
+            gateway
+                .requests()
+                .iter()
+                .filter(|request| request.as_str() == "POST /v1/device/status")
+                .count(),
+            2
+        );
+        assert_eq!(
+            gateway
+                .requests()
+                .iter()
+                .filter(|request| request.starts_with("GET /v1/log/proof/consistency?"))
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn join_refuses_to_resume_an_enrolment_with_another_device_key() {
+        let company = Company::new();
+        let witness = Witness::new();
+        let manifest = witnessed_manifest(&witness);
+        let published = Company::published(&manifest, &company.key);
+        let log = company.log.vkey();
+        let mut checkpoint = Note::parse(&company.empty_checkpoint()).unwrap();
+        witness.cosign(
+            &mut checkpoint,
+            u64::try_from(chrono::Utc::now().timestamp()).unwrap(),
+        );
+        let checkpoint = checkpoint.to_string();
+        let gateway = FakeGateway::start(move |line, _| match line {
+            "GET /v1/manifest" => (200, published.clone()),
+            "GET /v1/log/key" => (200, format!("{log}\n")),
+            "GET /v1/log/checkpoint" => (200, checkpoint.clone()),
+            _ => not_found(),
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let home = enrolled_home_with(dir.path(), &gateway.url, &company, &manifest);
+        DeviceKey::delete(dir.path()).unwrap();
+        DeviceKey::load_or_create(dir.path(), true).unwrap();
+        let invitation = Invitation::new(
+            &gateway.url,
+            &PublicKey::from(&company.key),
+            &company.log,
+            open_pact_core::InvitationCode::from_bytes([7; 32]),
+        )
+        .encode();
+
+        let error = join(
+            &home,
+            &invitation,
+            true,
+            true,
+            false,
+            true,
+            APPROVAL_POLL_INTERVAL,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("This home has an enrolment for a different device key."));
+        assert!(error.contains("delete-device-key"));
+        assert!(
+            !gateway
+                .requests()
+                .iter()
+                .any(|request| request == "POST /v1/enroll" || request == "POST /v1/device/status")
+        );
+    }
+
+    #[tokio::test]
+    async fn join_reenrols_after_the_saved_device_key_is_deleted() {
+        let witness = Witness::new();
+        let toml = witnessed_manifest(&witness);
+        let company = Company::new();
+        let published = Company::published(&toml, &company.key);
+        let log = company.log.vkey();
+        let mut checkpoint = company.sign(&Checkpoint {
+            origin: company.log.origin().into(),
+            size: 1,
+            root: LogHash([3; 32]),
+        });
+        witness.cosign(
+            &mut checkpoint,
+            u64::try_from(chrono::Utc::now().timestamp()).unwrap(),
+        );
+        let checkpoint = checkpoint.to_string();
+        let checkpoint_for_gateway = checkpoint.clone();
+        let gateway = FakeGateway::start(move |line, _| match line {
+            "GET /v1/manifest" => (200, published.clone()),
+            "GET /v1/log/key" => (200, format!("{log}\n")),
+            "GET /v1/log/checkpoint" => (200, checkpoint_for_gateway.clone()),
+            "POST /v1/enroll" => (
+                200,
+                json!({"salt":"11".repeat(32),"state":"pending"}).to_string(),
+            ),
+            _ => not_found(),
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let home = enrolled_home_with(dir.path(), &gateway.url, &company, &toml);
+        home.write(LOG_CHECKPOINT, checkpoint.as_bytes()).unwrap();
+        let original = home.enrolment().unwrap();
+        let old_invitation = Invitation::new(
+            &gateway.url,
+            &PublicKey::from(&company.key),
+            &company.log,
+            open_pact_core::InvitationCode::from_bytes([7; 32]),
+        )
+        .encode();
+
+        DeviceKey::delete(dir.path()).unwrap();
+        DeviceKey::load_or_create(dir.path(), true).unwrap();
+        let mismatch = join(
+            &home,
+            &old_invitation,
+            true,
+            true,
+            false,
+            true,
+            APPROVAL_POLL_INTERVAL,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(mismatch.contains("This home has an enrolment for a different device key."));
+        assert!(gateway.posts().is_empty(), "mismatch must not enrol");
+
+        DeviceKey::delete(dir.path()).unwrap();
+        let new_invitation = Invitation::new(
+            &gateway.url,
+            &PublicKey::from(&company.key),
+            &company.log,
+            open_pact_core::InvitationCode::from_bytes([8; 32]),
+        )
+        .encode();
+        let exit = join(
+            &home,
+            &new_invitation,
+            true,
+            true,
+            false,
+            true,
+            APPROVAL_POLL_INTERVAL,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(exit, ExitCode::SUCCESS);
+        assert_eq!(gateway.posts(), vec!["POST /v1/enroll"]);
+        let replacement = home.enrolment().unwrap();
+        assert_ne!(replacement.device, original.device);
+        assert!(dir.path().join("device-dev.pem").exists());
+    }
+
+    #[tokio::test]
+    async fn check_reports_consistency_proof_url_and_json_error() {
+        let company = Company::new();
+        let dir = tempfile::tempdir().unwrap();
+        let home = enrolled_home(dir.path(), "", &company);
+        let new = Checkpoint {
+            origin: company.log.origin().into(),
+            size: 2,
+            root: LogHash([1; 32]),
+        };
+        let new_note = company.sign(&new).to_string();
+        let old = Checkpoint {
+            origin: company.log.origin().into(),
+            size: 1,
+            root: LogHash([2; 32]),
+        };
+        let gateway = FakeGateway::start(|line, _| {
+            if line.starts_with("GET /v1/log/proof/consistency?") {
+                (200, "not json".into())
+            } else {
+                not_found()
+            }
+        })
+        .await;
+        let error = verify_checkpoint(
+            &http_client().unwrap(),
+            &home,
+            &gateway.url,
+            &company.log,
+            None,
+            Some(&old),
+            &new_note,
+        )
+        .await
+        .unwrap()
+        .unwrap_err()
+        .alarm_text();
+
+        assert!(error.contains(&format!(
+            "GET {}/v1/log/proof/consistency?from=1&to=2",
+            gateway.url
+        )));
+        assert!(
+            error.contains("expected ident at line 1 column 2"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn join_waits_for_approval_and_verifies_its_log_entry() {
+        let company = Company::new();
+        let witness = Witness::new();
+        let toml = witnessed_manifest(&witness);
+        let dir = tempfile::tempdir().unwrap();
+        let home = enrolled_home_with(dir.path(), "", &company, &toml);
+        let (_manifest, mut enrolment, entries, before_approval, approved_checkpoint) =
+            approval_fixture(&home, &company, &witness);
+        let response = my_entries_response(&approved_checkpoint, &entries, 3);
+        let entries_for_log = entries.clone();
+        let published = Company::published(&toml, &company.key);
+        let log_key = company.log.vkey();
+        let gateway = FakeGateway::start(move |line, nth| match line {
+            "GET /v1/manifest" => (200, published.clone()),
+            "GET /v1/log/key" => (200, format!("{log_key}\n")),
+            "GET /v1/log/checkpoint" => (
+                200,
+                if nth == 0 {
+                    before_approval.clone()
+                } else {
+                    approved_checkpoint.clone()
+                },
+            ),
+            "POST /v1/nonce" => (200, json!({"nonce":format!("approval-{nth}")}).to_string()),
+            "POST /v1/device/status" => (
+                200,
+                json!({"state": if nth == 0 { "pending" } else { "approved" }}).to_string(),
+            ),
+            "POST /v1/log/mine" => (200, response.clone()),
+            _ => serve_log(&entries_for_log, line).unwrap_or_else(not_found),
+        })
+        .await;
+        put_gateway_in_enrolment(&home, &mut enrolment, &gateway.url);
+        let invitation = Invitation::new(
+            &gateway.url,
+            &PublicKey::from(&company.key),
+            &company.log,
+            open_pact_core::InvitationCode::from_bytes([7; 32]),
+        )
+        .encode();
+
+        let code = join(
+            &home,
+            &invitation,
+            true,
+            true,
+            false,
+            false,
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(approval_confirmation(), "This device is approved.");
+        assert_eq!(
+            approved_next_hint("open-pact-client"),
+            "Next: open-pact-client check\nThen, if the company allows automatic sending: open-pact-client schedule on"
+        );
+        let requests = gateway.requests();
+        assert!(!requests.iter().any(|request| request == "POST /v1/enroll"));
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.as_str() == "POST /v1/device/status")
+                .count(),
+            2
+        );
+        let second_status = requests
+            .iter()
+            .rposition(|request| request == "POST /v1/device/status")
+            .unwrap();
+        let log_read = requests
+            .iter()
+            .position(|request| request == "POST /v1/log/mine")
+            .unwrap();
+        assert!(
+            second_status < log_read,
+            "approval status precedes private log read"
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.as_str() == "POST /v1/log/mine")
+                .count(),
+            1
+        );
+        assert!(
+            !requests.iter().any(|request| request == "POST /v1/claim"),
+            "a non-terminal join stops before finish and check"
+        );
+        let resumed = resume_join(&home, false, false, Duration::from_millis(1))
+            .await
+            .unwrap();
+        assert_eq!(resumed, ExitCode::SUCCESS);
+        let resumed_requests = gateway.requests();
+        assert!(
+            !resumed_requests
+                .iter()
+                .any(|request| request == "POST /v1/enroll")
+        );
+        assert!(
+            !resumed_requests
+                .iter()
+                .any(|request| request == "POST /v1/claim")
+        );
+    }
+
+    fn with_repository_control(toml: &str) -> String {
+        let controlled = toml.replacen(
+            "[log]",
+            "[[control]]\nid = \"managed_repos_total\"\nsource = \"company_policy\"\ncheck = \"builtin:managed_repos_total@1\"\nremotes = [\"github.com/example-org/\"]\noutput = { integer = { min = 0, max = 2147483647 } }\nrequired = {}\ngrace = \"1d\"\n\n[log]",
+            1,
+        );
+        assert_ne!(
+            controlled, toml,
+            "the [log] anchor moved, so no repository control was added"
+        );
+        controlled
+    }
+
+    #[tokio::test]
+    async fn approved_resume_checks_status_when_wizard_is_disabled() {
+        const CHILD: &str = "OPEN_PACT_APPROVED_RESUME_TEST_CHILD";
+
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::approved_resume_checks_status_when_wizard_is_disabled",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{stdout}\n{stderr}");
+            assert!(
+                stdout.contains("This device is already approved."),
+                "{stdout}\n{stderr}"
+            );
+            assert!(
+                !stdout.contains("Read this code to IT"),
+                "{stdout}\n{stderr}"
+            );
+            assert!(
+                stdout.contains("Next: open-pact-client --home "),
+                "{stdout}\n{stderr}"
+            );
+            assert!(stdout.contains("Local claim log:"), "{stdout}\n{stderr}");
+            return;
+        }
+
+        let company = Company::new();
+        let witness = Witness::new();
+        let toml = witnessed_manifest(&witness);
+        let dir = tempfile::tempdir().unwrap();
+        let home = enrolled_home_with(dir.path(), "", &company, &toml);
+        let (manifest, mut enrolment, entries, _, approved_checkpoint) =
+            approval_fixture(&home, &company, &witness);
+        let response = my_entries_response(&approved_checkpoint, &entries, 3);
+        let entries_for_log = entries.clone();
+        let log_key = company.log.vkey();
+        let gateway = FakeGateway::start(move |line, _| match line {
+            "GET /v1/log/key" => (200, format!("{log_key}\n")),
+            "GET /v1/log/checkpoint" => (200, approved_checkpoint.clone()),
+            "POST /v1/nonce" => (200, json!({"nonce":"resume"}).to_string()),
+            "POST /v1/device/status" => (200, json!({"state":"approved"}).to_string()),
+            "POST /v1/log/mine" => (200, response.clone()),
+            _ => serve_log(&entries_for_log, line).unwrap_or_else(not_found),
+        })
+        .await;
+        put_gateway_in_enrolment(&home, &mut enrolment, &gateway.url);
+        home.write(device_config::FILE, br#"{"setup_answered": true}"#)
+            .unwrap();
+        let accepted_claim = serde_json::to_vec(&json!({
+            "status": "accepted",
+            "warnings": [],
+            "certificate_pem": "earlier certificate",
+            "ca_pem": "earlier CA",
+            "log_checkpoint": "fictional verified checkpoint"
+        }))
+        .unwrap();
+        locallog::append_with_status(
+            &home.file("claims.jsonl"),
+            b"completed setup",
+            &accepted_claim,
+            Some(200),
+        )
+        .unwrap();
+        assert_eq!(wizard_resume(&home).unwrap(), WizardResume::Complete);
+
+        let code = wait_after_join(
+            &http_client().unwrap(),
+            &home,
+            &enrolment,
+            &manifest,
+            JoinOptions {
+                insecure_dev: true,
+                no_wait: false,
+                poll_interval: APPROVAL_POLL_INTERVAL,
+            },
+            false,
+            JoinOrigin::Resumed,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        let requests = gateway.requests();
+        let status = requests
+            .iter()
+            .position(|request| request == "POST /v1/device/status")
+            .unwrap();
+        let proof = requests
+            .iter()
+            .position(|request| request == "POST /v1/log/mine")
+            .unwrap();
+        assert!(status < proof, "status is checked before its signed proof");
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.as_str() == "POST /v1/device/status")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resumed_join_scans_while_first_status_response_is_pending() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let company = Company::new();
+        let witness = Witness::new();
+        let toml = with_repository_control(&witnessed_manifest(&witness));
+        let dir = tempfile::tempdir().unwrap();
+        let home = enrolled_home_with(dir.path(), "", &company, &toml);
+        let (manifest, mut enrolment, entries, _, approved_checkpoint) =
+            approval_fixture(&home, &company, &witness);
+        let entries_for_log = entries.clone();
+        let log_key = company.log.vkey();
+        let started = Arc::new(AtomicBool::new(false));
+        let pending = Arc::new(AtomicBool::new(false));
+        let handler_started = started.clone();
+        let handler_pending = pending.clone();
+        let gateway = FakeGateway::start(move |line, nth| match line {
+            "GET /v1/log/key" => (200, format!("{log_key}\n")),
+            "GET /v1/log/checkpoint" => (200, approved_checkpoint.clone()),
+            "POST /v1/nonce" => (200, json!({"nonce":format!("delayed-{nth}")}).to_string()),
+            "POST /v1/device/status" if nth == 0 => {
+                handler_pending.store(true, Ordering::Release);
+                handler_started.store(true, Ordering::Release);
+                std::thread::sleep(Duration::from_millis(400));
+                handler_pending.store(false, Ordering::Release);
+                (200, json!({"state":"pending"}).to_string())
+            }
+            "POST /v1/device/status" => (200, json!({"state":"revoked"}).to_string()),
+            _ => serve_log(&entries_for_log, line).unwrap_or_else(not_found),
+        })
+        .await;
+        put_gateway_in_enrolment(&home, &mut enrolment, &gateway.url);
+
+        let scan_file = home.file("repo-scan.json");
+        let monitor_started = started.clone();
+        let monitor_pending = pending.clone();
+        let scan_monitor = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while !monitor_started.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            while monitor_pending.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+                if scan_file.is_file() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            false
+        });
+        let http = http_client().unwrap();
+        let result = wait_after_join(
+            &http,
+            &home,
+            &enrolment,
+            &manifest,
+            JoinOptions {
+                insecure_dev: true,
+                no_wait: false,
+                poll_interval: Duration::from_millis(1),
+            },
+            true,
+            JoinOrigin::Resumed,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, ExitCode::FAILURE);
+        assert!(
+            scan_monitor.join().unwrap(),
+            "the scan cache appears before the delayed status response returns"
+        );
+        assert_eq!(
+            gateway
+                .requests()
+                .iter()
+                .filter(|request| request.as_str() == "POST /v1/device/status")
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resumed_join_keeps_its_status_request_when_the_scan_finishes_first() {
+        let company = Company::new();
+        let witness = Witness::new();
+        let toml = with_repository_control(&witnessed_manifest(&witness));
+        let dir = tempfile::tempdir().unwrap();
+        let home = enrolled_home_with(dir.path(), "", &company, &toml);
+        let (manifest, mut enrolment, entries, _, approved_checkpoint) =
+            approval_fixture(&home, &company, &witness);
+        let response = my_entries_response(&approved_checkpoint, &entries, 3);
+        let entries_for_log = entries.clone();
+        let log_key = company.log.vkey();
+        // A scan of this tree outlasts the nonce and the first status request, so the scan
+        // finishes while that request is still open.
+        let tree = home.file("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        for i in 0..4000 {
+            std::fs::create_dir(tree.join(format!("{i:04}"))).unwrap();
+        }
+        let scan_file = home.file("repo-scan.json");
+        let gateway = FakeGateway::start(move |line, nth| match line {
+            "GET /v1/log/key" => (200, format!("{log_key}\n")),
+            "GET /v1/log/checkpoint" => (200, approved_checkpoint.clone()),
+            "POST /v1/nonce" => (200, json!({"nonce":"resume"}).to_string()),
+            "POST /v1/device/status" if nth == 0 => {
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                while !scan_file.is_file() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                (200, json!({"state":"approved"}).to_string())
+            }
+            "POST /v1/device/status" => (200, json!({"state":"approved"}).to_string()),
+            "POST /v1/log/mine" => (200, response.clone()),
+            _ => serve_log(&entries_for_log, line).unwrap_or_else(not_found),
+        })
+        .await;
+        put_gateway_in_enrolment(&home, &mut enrolment, &gateway.url);
+        home.write(device_config::FILE, br#"{"setup_answered": true}"#)
+            .unwrap();
+        let accepted_claim = serde_json::to_vec(&json!({
+            "status": "accepted",
+            "warnings": [],
+            "certificate_pem": "earlier certificate",
+            "ca_pem": "earlier CA",
+            "log_checkpoint": "fictional verified checkpoint"
+        }))
+        .unwrap();
+        locallog::append_with_status(
+            &home.file("claims.jsonl"),
+            b"completed setup",
+            &accepted_claim,
+            Some(200),
+        )
+        .unwrap();
+        assert_eq!(wizard_resume(&home).unwrap(), WizardResume::Complete);
+
+        let code = wait_after_join(
+            &http_client().unwrap(),
+            &home,
+            &enrolment,
+            &manifest,
+            JoinOptions {
+                insecure_dev: true,
+                no_wait: false,
+                poll_interval: APPROVAL_POLL_INTERVAL,
+            },
+            false,
+            JoinOrigin::Resumed,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(home.file("repo-scan.json").is_file(), "the scan ran");
+        let requests = gateway.requests();
+        let status = requests
+            .iter()
+            .position(|request| request == "POST /v1/device/status")
+            .unwrap();
+        let proof = requests
+            .iter()
+            .position(|request| request == "POST /v1/log/mine")
+            .unwrap();
+        assert!(status < proof, "status is checked before its signed proof");
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.as_str() == "POST /v1/device/status")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn join_invitation_argument_is_optional_for_a_saved_enrolment() {
+        let cli = Cli::try_parse_from(["open-pact-client", "join"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Join {
+                invitation: None,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn join_waits_until_the_approval_entry_reaches_the_signed_checkpoint() {
+        let company = Company::new();
+        let witness = Witness::new();
+        let toml = witnessed_manifest(&witness);
+        let dir = tempfile::tempdir().unwrap();
+        let home = enrolled_home_with(dir.path(), "", &company, &toml);
+        let (manifest, mut enrolment, entries, before_approval, approved_checkpoint) =
+            approval_fixture(&home, &company, &witness);
+        let lagging_response = my_entries_response(&before_approval, &entries, 2);
+        let approved_response = my_entries_response(&approved_checkpoint, &entries, 3);
+        let entries_for_log = entries.clone();
+        let gateway = FakeGateway::start(move |line, nth| match line {
+            "POST /v1/nonce" => (200, json!({"nonce":format!("lag-{nth}")}).to_string()),
+            "POST /v1/device/status" => (200, r#"{"state":"approved"}"#.into()),
+            "POST /v1/log/mine" if nth == 0 => (200, lagging_response.clone()),
+            "POST /v1/log/mine" => (200, approved_response.clone()),
+            _ => serve_log(&entries_for_log, line).unwrap_or_else(not_found),
+        })
+        .await;
+        put_gateway_in_enrolment(&home, &mut enrolment, &gateway.url);
+
+        let waited = wait_for_approval(
+            &http_client().unwrap(),
+            &home,
+            &enrolment,
+            &manifest,
+            Duration::from_millis(1),
+            false,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(waited, ApprovalWait::Approved);
+        assert_eq!(
+            gateway
+                .requests()
+                .iter()
+                .filter(|request| request.as_str() == "POST /v1/log/mine")
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn join_stops_when_it_revokes_a_waiting_device() {
+        let company = Company::new();
+        let dir = tempfile::tempdir().unwrap();
+        let home = enrolled_home(dir.path(), "", &company);
+        let manifest = Manifest::parse(DEMO_MANIFEST.as_bytes()).unwrap();
+        let mut enrolment = home.enrolment().unwrap();
+        let gateway = FakeGateway::start(|line, nth| match line {
+            "POST /v1/nonce" => (200, json!({"nonce":format!("revoked-{nth}")}).to_string()),
+            "POST /v1/device/status" => (
+                200,
+                json!({"state": if nth == 0 { "pending" } else { "revoked" }}).to_string(),
+            ),
+            _ => not_found(),
+        })
+        .await;
+        put_gateway_in_enrolment(&home, &mut enrolment, &gateway.url);
+
+        let waited = wait_for_approval(
+            &http_client().unwrap(),
+            &home,
+            &enrolment,
+            &manifest,
+            Duration::from_millis(1),
+            false,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(waited, ApprovalWait::Revoked);
+        assert_eq!(approval_exit(waited, "open-pact-client"), ExitCode::FAILURE);
+        assert!(
+            !gateway
+                .requests()
+                .iter()
+                .any(|request| request == "POST /v1/log/mine")
+        );
+    }
+
+    #[tokio::test]
+    async fn join_no_wait_does_not_poll_status() {
+        let company = Company::new();
+        let dir = tempfile::tempdir().unwrap();
+        let home = enrolled_home(dir.path(), "", &company);
+        let mut enrolment = home.enrolment().unwrap();
+        let manifest = Manifest::parse(DEMO_MANIFEST.as_bytes()).unwrap();
+        let gateway = FakeGateway::start(|_, _| not_found()).await;
+        put_gateway_in_enrolment(&home, &mut enrolment, &gateway.url);
+
+        let code = wait_after_join(
+            &http_client().unwrap(),
+            &home,
+            &enrolment,
+            &manifest,
+            JoinOptions {
+                insecure_dev: true,
+                no_wait: true,
+                poll_interval: APPROVAL_POLL_INTERVAL,
+            },
+            false,
+            JoinOrigin::Enrolled,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(gateway.posts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn old_gateway_returns_a_clear_version_error_without_fetching_the_full_log() {
+        let company = Company::new();
+        let toml = witnessed_manifest(&Witness::new());
+        let dir = tempfile::tempdir().unwrap();
+        let home = enrolled_home_with(dir.path(), "", &company, &toml);
+        let mut enrolment = home.enrolment().unwrap();
+        let mut cp = Checkpoint {
+            origin: company.log.origin().into(),
+            size: 1,
+            root: LogHash([0; 32]),
+        };
+        let gateway = FakeGateway::start(|line, _| match line {
+            "POST /v1/nonce" => (200, json!({"nonce":"old-gateway-nonce"}).to_string()),
+            "POST /v1/log/mine" => not_found(),
+            _ => not_found(),
+        })
+        .await;
+        enrolment.gateway = gateway.url.clone();
+
+        let enforced = enrolment.manifest.clone();
+        let error = check_own_entries(
+            &http_client().unwrap(),
+            &home,
+            &mut enrolment,
+            &enforced,
+            &mut cp,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "The gateway does not support this client version. Ask IT to update the gateway to 0.4.0 or later."
+        );
+        assert_eq!(gateway.requests(), ["POST /v1/nonce", "POST /v1/log/mine"]);
+    }
+
+    #[tokio::test]
+    async fn http_client_gives_up_on_a_gateway_that_never_answers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1/manifest", listener.local_addr().unwrap());
+        let _silent = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        let http = http_client_with(Duration::from_secs(5), Duration::from_millis(300)).unwrap();
+        let started = std::time::Instant::now();
+        let error = http.get(&url).send().await.unwrap_err();
+        assert!(error.is_timeout(), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn check_after_a_log_alarm_sends_nothing_and_writes_no_file() {
+        let company = Company::new();
+        let attacker = dev_key::generate();
+        let log = company.log.vkey();
+        let gateway = FakeGateway::start(move |line, _| match line {
+            "GET /v1/manifest" => (200, Company::published(DEMO_MANIFEST, &attacker)),
+            "GET /v1/log/key" => (200, format!("{log}\n")),
+            "POST /v1/nonce" => (200, r#"{"nonce":"n"}"#.into()),
+            "POST /v1/claim" => (
+                200,
+                r#"{"status":"accepted","warnings":[],"certificate_pem":null,"ca_pem":"attacker CA"}"#
+                    .into(),
+            ),
+            _ => not_found(),
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let home = enrolled_home(dir.path(), &gateway.url, &company);
+        let before = snapshot(dir.path());
+
+        let code = check(&home, false).await;
+
+        assert_eq!(gateway.posts(), Vec::<String>::new(), "no nonce, no claim");
+        let mut after = snapshot(dir.path());
+        after.remove("repo-scan.json");
+        assert_eq!(after, before, "no CA, certificate, key or log written");
+        assert!(home.file("repo-scan.json").is_file());
+        assert_eq!(code.unwrap(), ExitCode::from(2));
+    }
+
+    /// The demo manifest with only the cheap `os_supported` check and `witness` as its one witness.
+    fn witnessed_manifest(witness: &Witness) -> String {
+        let manifest = DEMO_MANIFEST.replace("\r\n", "\n");
+        let first = manifest.find("[[control]]").unwrap();
+        let kept = manifest.find("[[control]]\nid = \"os_supported\"").unwrap();
+        let log = manifest.find("[log]").unwrap();
+        let end = manifest[kept + 1..log]
+            .find("[[control]]")
+            .map_or(log, |next| kept + 1 + next);
+        let toml = format!(
+            "{}{}{}",
+            &manifest[..first],
+            &manifest[kept..end],
+            &manifest[log..]
+        );
+        let demo = toml
+            .lines()
+            .find(|l| l.starts_with("witnesses = "))
+            .unwrap();
+        toml.replace(
+            demo,
+            &format!(
+                r#"witnesses = [{{ name = "witness.example.org/test", key = "{}" }}]"#,
+                witness.key.vkey()
+            ),
+        )
+    }
+
+    /// Runs `check` against a gateway with an honest, witnessed log of the device's manifest and
+    /// enrolment that grows by one entry while the claim is processed. `response` gives the
+    /// `log_checkpoint` of the accepted claim response from the log's entries.
+    /// Returns the exit code, the files before the check, the files after it and the certificate
+    /// the response carried.
+    async fn check_with_response_checkpoint(
+        response: impl FnOnce(&Company, &Witness, &[Entry], u64) -> Option<String>,
+        pair: impl FnOnce(&KeyPair) -> VpnPair,
+        device_config: Option<&str>,
+    ) -> (
+        Result<ExitCode>,
+        BTreeMap<String, Vec<u8>>,
+        BTreeMap<String, Vec<u8>>,
+        VpnPair,
+    ) {
+        let (code, before, after, pair, _) =
+            check_under(|signed| signed.to_string(), response, pair, device_config).await;
+        (code, before, after, pair)
+    }
+
+    /// `check_with_response_checkpoint` for a gateway that enforces `enforced(signed manifest)`.
+    /// Also returns the body of the claim request.
+    async fn check_under(
+        enforced: impl FnOnce(&str) -> String,
+        response: impl FnOnce(&Company, &Witness, &[Entry], u64) -> Option<String>,
+        pair: impl FnOnce(&KeyPair) -> VpnPair,
+        device_config: Option<&str>,
+    ) -> (
+        Result<ExitCode>,
+        BTreeMap<String, Vec<u8>>,
+        BTreeMap<String, Vec<u8>>,
+        VpnPair,
+        String,
+    ) {
+        let (code, before, after, pair, claim, _) =
+            check_under_previewed(false, enforced, response, pair, device_config).await;
+        (code, before, after, pair, claim)
+    }
+
+    /// A device enrolled at a gateway with an honest, witnessed log. The claim sits in the gateway's
+    /// reply to `POST /v1/claim` unless `reply` gives another body.
+    struct ClaimFixture {
+        dir: tempfile::TempDir,
+        home: Home,
+        gateway: FakeGateway,
+        pair: VpnPair,
+    }
+
+    async fn claim_fixture_replying(
+        reply: Option<&str>,
+        enforced: impl FnOnce(&str) -> String,
+        response: impl FnOnce(&Company, &Witness, &[Entry], u64) -> Option<String>,
+        pair: impl FnOnce(&KeyPair) -> VpnPair,
+        device_config: Option<&str>,
+        schedule: Option<&str>,
+    ) -> ClaimFixture {
+        let (company, witness) = (Company::new(), Witness::new());
+        let toml = witnessed_manifest(&witness);
+        let toml = match schedule {
+            Some(table) => with_schedule(&toml, table),
+            None => toml,
+        };
+        let manifest = Manifest::parse(toml.as_bytes()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let device = DeviceKey::load_or_create(dir.path(), true).unwrap();
+        let mine = commitment(&Enrolment {
+            gateway: String::new(),
+            manifest: manifest.hash().clone(),
+            device: Pseudonym::of(&device.public_key()),
+            salt: "00".repeat(32),
+            log_entries: None,
+            last_status: None,
+        })
+        .unwrap();
+        let entries = vec![
+            Entry {
+                index: 0,
+                kind: EntryKind::ManifestPublished,
+                data: json!({ "manifest": manifest.hash().as_str() }),
+            },
+            Entry {
+                index: 1,
+                kind: EntryKind::DeviceEnrolled,
+                data: json!({ "commitment": mine }),
+            },
+            Entry {
+                index: 2,
+                kind: EntryKind::DeviceApproved,
+                data: json!({ "device": "another" }),
+            },
+        ];
+        let now = u64::try_from(chrono::Utc::now().timestamp()).unwrap();
+        let mut before_claim = company.sign(&checkpoint_of(company.log.origin(), &entries, 2));
+        witness.cosign(&mut before_claim, now);
+        let before_claim = before_claim.to_string();
+        let vpn_key = KeyPair::generate().unwrap();
+        std::fs::write(dir.path().join("vpn-key.pem"), vpn_key.serialize_pem()).unwrap();
+        let pair = pair(&vpn_key);
+        let mut claim = json!({
+            "status": "accepted",
+            "warnings": [],
+            "certificate_pem": pair.cert,
+            "ca_pem": pair.ca,
+        });
+        if let Some(text) = response(&company, &witness, &entries, now) {
+            claim["log_checkpoint"] = text.into();
+        }
+        let (published, log) = (
+            Company::published(&enforced(&toml), &company.key),
+            company.log.vkey(),
+        );
+        let (claim, stored) = (
+            reply.map_or_else(|| claim.to_string(), str::to_owned),
+            before_claim.clone(),
+        );
+        let leaves: Vec<_> = entries[..2].iter().map(Entry::leaf_hash).collect();
+        let mine_response = serde_json::to_string(&MyEntries {
+            checkpoint: before_claim.clone(),
+            manifest: open_pact_core::EntryWithProof {
+                entry: entries[0].clone(),
+                proof: open_pact_core::inclusion_proof(&leaves, 0).unwrap(),
+            },
+            device: vec![open_pact_core::EntryWithProof {
+                entry: entries[1].clone(),
+                proof: open_pact_core::inclusion_proof(&leaves, 1).unwrap(),
+            }],
+        })
+        .unwrap();
+        let gateway = FakeGateway::start(move |line, _| match line {
+            "GET /v1/manifest" => (200, published.clone()),
+            "GET /v1/log/key" => (200, format!("{log}\n")),
+            "GET /v1/log/checkpoint" => (200, stored.clone()),
+            "POST /v1/nonce" => (200, r#"{"nonce":"n"}"#.into()),
+            "POST /v1/claim" => (200, claim.clone()),
+            "POST /v1/log/mine" => (200, mine_response.clone()),
+            _ => serve_log(&entries, line).unwrap_or_else(not_found),
+        })
+        .await;
+        let home = enrolled_home_with(dir.path(), &gateway.url, &company, &toml);
+        home.write(LOG_CHECKPOINT, before_claim.as_bytes()).unwrap();
+        if let Some(config) = device_config {
+            home.write(crate::device_config::FILE, config.as_bytes())
+                .unwrap();
+        }
+        ClaimFixture {
+            dir,
+            home,
+            gateway,
+            pair,
+        }
+    }
+
+    /// `check_under`, which also runs `check --dry-run` first when `preview` is set. The dry run
+    /// sends GET requests only and leaves the home as it was. Returns its request as the last value.
+    async fn check_under_previewed(
+        preview: bool,
+        enforced: impl FnOnce(&str) -> String,
+        response: impl FnOnce(&Company, &Witness, &[Entry], u64) -> Option<String>,
+        pair: impl FnOnce(&KeyPair) -> VpnPair,
+        device_config: Option<&str>,
+    ) -> (
+        Result<ExitCode>,
+        BTreeMap<String, Vec<u8>>,
+        BTreeMap<String, Vec<u8>>,
+        VpnPair,
+        String,
+        Option<Value>,
+    ) {
+        let ClaimFixture {
+            dir,
+            home,
+            gateway,
+            pair,
+        } = claim_fixture_replying(None, enforced, response, pair, device_config, None).await;
+        let mut expected_posts: Vec<&str> = Vec::new();
+        let previewed = if preview {
+            let before_preview = snapshot(dir.path());
+            let claim::Preview::Request { request, .. } =
+                check_preview(&home, false).await.unwrap()
+            else {
+                panic!("the dry run stopped where check would send");
+            };
+            assert_eq!(
+                gateway.posts(),
+                expected_posts,
+                "the dry run sends no signed request"
+            );
+            assert!(
+                gateway
+                    .requests()
+                    .iter()
+                    .all(|request| request.starts_with("GET ")),
+                "the dry run sends GET requests only: {:?}",
+                gateway.requests()
+            );
+            assert_eq!(snapshot(dir.path()), before_preview, "no file written");
+            Some(request)
+        } else {
+            None
+        };
+        let before = snapshot(dir.path());
+
+        let code = check(&home, false).await;
+        #[cfg(windows)]
+        if code.as_ref().is_err() || code.as_ref().is_ok_and(|code| *code != ExitCode::SUCCESS) {
+            assert!(
+                !home.file(VPN_DIR).exists(),
+                "rejected response wrote VPN state"
+            );
+        }
+
+        let posts = gateway.posts();
+        expected_posts.extend([
+            "POST /v1/nonce",
+            "POST /v1/log/mine",
+            "POST /v1/nonce",
+            "POST /v1/claim",
+        ]);
+        assert_eq!(posts, expected_posts, "the claim was sent");
+        let claim = gateway.bodies("POST /v1/claim").remove(0);
+        (code, before, snapshot(dir.path()), pair, claim, previewed)
+    }
+
+    /// What the claim of `request`, the body `check` posted, says apart from the fields the
+    /// sender fills in at sending time.
+    fn sent_claim(request: &Value) -> Value {
+        let jws = verify_claim(request["jws"].as_str().unwrap()).unwrap();
+        let mut claim = serde_json::to_value(jws.claim()).unwrap();
+        for field in ["nonce", "time", "csr_sha256"] {
+            claim.as_object_mut().unwrap().remove(field);
+        }
+        claim
+    }
+
+    fn previewed_claim(preview: &Value) -> Value {
+        let mut claim = preview["claim"].clone();
+        for field in ["nonce", "time", "csr_sha256"] {
+            assert!(
+                claim[field]
+                    .as_str()
+                    .is_some_and(|text| text.starts_with('<')),
+                "{field} is a placeholder"
+            );
+            claim.as_object_mut().unwrap().remove(field);
+        }
+        claim
+    }
+
+    #[tokio::test]
+    async fn check_dry_run_shows_the_claim_check_sends_and_changes_nothing() {
+        for (manifest_changed, enforced) in [
+            (
+                false,
+                (|signed: &str| signed.to_string()) as fn(&str) -> String,
+            ),
+            (true, with_password_rule),
+        ] {
+            let (code, _, _, _, sent, preview) =
+                check_under_previewed(true, enforced, grown_checkpoint, valid_pair, None).await;
+            assert_eq!(code.unwrap(), ExitCode::SUCCESS);
+            let (sent, preview) = (
+                serde_json::from_str::<Value>(&sent).unwrap(),
+                preview.unwrap(),
+            );
+            let claim = sent_claim(&sent);
+            assert!(!claim["results"].as_object().unwrap().is_empty());
+            assert!(
+                claim["log_checkpoint"].is_object(),
+                "the comparison covers the log checkpoint"
+            );
+            assert_eq!(previewed_claim(&preview), claim);
+            assert_eq!(preview.get("manifest_toml"), sent.get("manifest_toml"));
+            assert_eq!(preview.get("manifest_toml").is_some(), manifest_changed);
+            assert!(preview.get("jws").is_none());
+        }
+    }
+
+    const EARLIER_PAIR: [&[u8]; 2] = [b"earlier CA", b"earlier certificate"];
+
+    fn earlier_pair(fixture: &ClaimFixture) -> [Vec<u8>; 2] {
+        ["ca.pem", "vpn-cert.pem"].map(|name| std::fs::read(fixture.home.file(name)).unwrap())
+    }
+
+    /// `toml` with its `[schedule]` table replaced by `table`.
+    fn with_schedule(toml: &str, table: &str) -> String {
+        format!("{}\n{table}\n", &toml[..toml.find("\n[schedule]").unwrap()])
+    }
+
+    fn every_55_minutes() -> open_pact_core::Interval {
+        open_pact_core::Interval::try_from("55m".to_owned()).unwrap()
+    }
+
+    fn always_every_55_minutes() -> open_pact_core::Schedule {
+        open_pact_core::Schedule::legacy_always(every_55_minutes())
+    }
+
+    fn vpn_schedule(probe: &str) -> open_pact_core::Schedule {
+        open_pact_core::Schedule::legacy_vpn(
+            open_pact_core::Probe {
+                address: open_pact_core::ProbeAddress::try_from(probe.to_owned()).unwrap(),
+                name: None,
+            },
+            every_55_minutes(),
+        )
+    }
+
+    /// An address that accepts connections while the listener lives.
+    fn open_probe() -> (std::net::TcpListener, String) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        (listener, address)
+    }
+
+    /// An address that refuses connections while the socket lives.
+    fn refused_probe() -> (tokio::net::TcpSocket, String) {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let address = socket.local_addr().unwrap().to_string();
+        (socket, address)
+    }
+
+    /// The owner's saved agreement to automatic sending.
+    const AGREED: &str = r#"{"auto_send": true}"#;
+
+    fn vpn_table(probe: &str) -> String {
+        format!("[schedule]\nmode = \"vpn\"\nvpn_probe = \"{probe}\"\ninterval = \"55m\"")
+    }
+
+    async fn tick_once(fixture: &ClaimFixture, probe: &str) -> Result<()> {
+        tick_under(fixture, &vpn_schedule(probe)).await
+    }
+
+    async fn tick_under(fixture: &ClaimFixture, schedule: &open_pact_core::Schedule) -> Result<()> {
+        let mut config = DeviceConfig::load(&fixture.home)?;
+        config.auto_send = true;
+        config.save(&fixture.home)?;
+        let authorization = schedule::ScheduleAuthorization {
+            manifest_hash: fixture.home.enrolment()?.manifest,
+            schedule: schedule.clone(),
+            owner_consented: config.auto_send,
+            self_removal: false,
+        };
+        schedule::tick(
+            &fixture.home,
+            &Home(fixture.dir.path().to_path_buf()),
+            None,
+            &authorization,
+            checks::EventMarkerReads::default,
+        )
+        .await
+    }
+
+    fn schedule_state(fixture: &ClaimFixture) -> Value {
+        fixture
+            .home
+            .read_json("report-state.json")
+            .unwrap()
+            .expect("the tick saved its state")
+    }
+
+    fn claim_posts(fixture: &ClaimFixture) -> usize {
+        fixture
+            .gateway
+            .posts()
+            .iter()
+            .filter(|line| *line == "POST /v1/claim")
+            .count()
+    }
+
+    fn job_log_text(fixture: &ClaimFixture) -> String {
+        std::fs::read_to_string(fixture.home.file("schedule.log")).unwrap_or_default()
+    }
+
+    async fn scheduled_fixture(
+        reply: Option<&str>,
+        enforced: impl FnOnce(&str) -> String,
+        response: impl FnOnce(&Company, &Witness, &[Entry], u64) -> Option<String>,
+    ) -> ClaimFixture {
+        claim_fixture_replying(reply, enforced, response, valid_pair, None, None).await
+    }
+
+    fn unchanged(signed: &str) -> String {
+        signed.to_string()
+    }
+
+    #[tokio::test]
+    async fn a_scheduled_tick_on_the_vpn_sends_one_claim_and_installs_the_pair() {
+        let fixture = scheduled_fixture(None, unchanged, grown_checkpoint).await;
+        let (_probe, address) = open_probe();
+        tick_once(&fixture, &address).await.unwrap();
+        assert_eq!(claim_posts(&fixture), 1);
+        assert_eq!(
+            locallog::read(&fixture.home.file("claims.jsonl"))
+                .unwrap()
+                .len(),
+            1
+        );
+        let [ca, cert] = earlier_pair(&fixture);
+        assert_eq!(ca, fixture.pair.ca.as_bytes());
+        assert_eq!(cert, fixture.pair.cert.as_deref().unwrap().as_bytes());
+        let state = schedule_state(&fixture);
+        assert!(state["last_success"].is_number());
+        assert_eq!(state["reconnect_pending"], false);
+        assert_eq!(job_log_text(&fixture), "", "nothing needs the owner");
+
+        tick_once(&fixture, &address).await.unwrap();
+        assert_eq!(claim_posts(&fixture), 1, "no trigger is due again so soon");
+    }
+
+    #[tokio::test]
+    async fn a_scheduled_tick_discards_scan_results_after_the_signed_policy_changes() {
+        let always = "[schedule]\nmode = \"always\"\ninterval = \"55m\"";
+        for (change, replacement) in [
+            ("VPN policy", Some(vpn_table("127.0.0.1:9"))),
+            ("no schedule", None),
+        ] {
+            let fixture = claim_fixture_replying(
+                None,
+                unchanged,
+                grown_checkpoint,
+                valid_pair,
+                Some(AGREED),
+                Some(always),
+            )
+            .await;
+            let before = fixture.home.signed_manifest().unwrap();
+            let authorization = schedule::ScheduleAuthorization {
+                manifest_hash: before.hash().clone(),
+                schedule: before.body().schedule.clone().unwrap(),
+                owner_consented: true,
+                self_removal: false,
+            };
+            let original = std::fs::read_to_string(fixture.home.file("manifest.toml")).unwrap();
+            let text = if let Some(replacement) = replacement {
+                with_schedule(&original, &replacement)
+            } else {
+                original.split("\n[schedule]").next().unwrap().to_owned()
+            };
+            let mut enrolment = fixture.home.enrolment().unwrap();
+            let accepted = Manifest::parse(text.as_bytes()).unwrap();
+            enrolment.manifest = accepted.hash().clone();
+            let home = &fixture.home;
+            schedule::tick_with_scan(
+                home,
+                home,
+                None,
+                &authorization,
+                checks::EventMarkerReads::default,
+                async move {
+                    home.write("manifest.toml", text.as_bytes())?;
+                    home.write("enrolment.json", &serde_json::to_vec(&enrolment)?)?;
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                fixture.gateway.requests(),
+                Vec::<String>::new(),
+                "{change}: the stale tick sends no gateway requests"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_scheduled_tick_off_the_vpn_contacts_no_gateway() {
+        let fixture = scheduled_fixture(None, unchanged, grown_checkpoint).await;
+        let (_socket, address) = refused_probe();
+        tick_once(&fixture, &address).await.unwrap();
+        assert_eq!(fixture.gateway.requests(), Vec::<String>::new());
+        assert!(!fixture.home.file("claims.jsonl").exists());
+        assert!(schedule_state(&fixture)["last_success"].is_null());
+    }
+
+    /// A probe address that accepts `answers` connections and then refuses.
+    fn probe_answering(answers: usize) -> (std::thread::JoinHandle<()>, String) {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = probe.local_addr().unwrap().to_string();
+        let closed = std::thread::spawn(move || {
+            for _ in 0..answers {
+                drop(probe.accept().unwrap().0);
+            }
+            drop(probe);
+        });
+        (closed, address)
+    }
+
+    #[tokio::test]
+    async fn a_scheduled_tick_whose_probe_fails_at_send_start_contacts_no_gateway() {
+        let fixture = scheduled_fixture(None, unchanged, grown_checkpoint).await;
+        let (closed, address) = probe_answering(1);
+        tick_once(&fixture, &address).await.unwrap();
+        closed.join().unwrap();
+        assert_eq!(
+            fixture.gateway.requests(),
+            Vec::<String>::new(),
+            "no manifest, checkpoint, nonce or log request leaves the device off the VPN"
+        );
+        assert!(!fixture.home.file("claims.jsonl").exists());
+        assert_eq!(earlier_pair(&fixture), EARLIER_PAIR);
+        let state = schedule_state(&fixture);
+        assert_eq!(state["vpn_up"], false);
+        assert_eq!(state["reconnect_pending"], true, "the reconnect stays due");
+    }
+
+    #[tokio::test]
+    async fn a_scheduled_tick_sends_no_claim_when_the_vpn_drops_before_the_post() {
+        let fixture = scheduled_fixture(None, unchanged, grown_checkpoint).await;
+        let (closed, address) = probe_answering(2);
+        tick_once(&fixture, &address).await.unwrap();
+        closed.join().unwrap();
+        assert_eq!(claim_posts(&fixture), 0);
+        assert_eq!(
+            fixture.gateway.posts(),
+            ["POST /v1/nonce", "POST /v1/log/mine"],
+            "only the log question went out before the last probe"
+        );
+        assert!(!fixture.home.file("claims.jsonl").exists());
+        assert_eq!(earlier_pair(&fixture), EARLIER_PAIR);
+        let state = schedule_state(&fixture);
+        assert_eq!(state["vpn_up"], false);
+        assert_eq!(state["reconnect_pending"], true, "the reconnect stays due");
+    }
+
+    #[tokio::test]
+    async fn a_reconnect_inside_the_interval_sends_no_second_claim() {
+        let fixture = scheduled_fixture(None, unchanged, grown_checkpoint).await;
+        let (_open, open) = open_probe();
+        let (_socket, refused) = refused_probe();
+        tick_once(&fixture, &open).await.unwrap();
+        assert_eq!(claim_posts(&fixture), 1);
+        for _ in 0..3 {
+            tick_once(&fixture, &refused).await.unwrap();
+            tick_once(&fixture, &open).await.unwrap();
+        }
+        assert_eq!(
+            claim_posts(&fixture),
+            1,
+            "the probe came back three times and no claim went out"
+        );
+        assert_eq!(schedule_state(&fixture)["reconnect_pending"], true);
+    }
+
+    #[tokio::test]
+    async fn a_waiting_device_is_not_asked_again_before_the_interval() {
+        let company = Company::new();
+        let witness = Witness::new();
+        let toml = witnessed_manifest(&witness);
+        let published = Company::published(&toml, &company.key);
+        let log = company.log.vkey();
+        let checkpoint = cosigned_empty_checkpoint(&company, &witness);
+        let gateway = FakeGateway::start(move |line, _| match line {
+            "GET /v1/manifest" => (200, published.clone()),
+            "GET /v1/log/key" => (200, log.clone()),
+            "GET /v1/log/checkpoint" => (200, checkpoint.clone()),
+            "POST /v1/nonce" => (200, json!({"nonce":"n"}).to_string()),
+            "POST /v1/log/mine" => (403, json!({"status":"denied"}).to_string()),
+            "POST /v1/device/status" => (200, json!({"state":"revoked"}).to_string()),
+            _ => not_found(),
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let home = enrolled_home_with(dir.path(), &gateway.url, &company, &toml);
+        home.write(device_config::FILE, AGREED.as_bytes()).unwrap();
+        let (_open, address) = open_probe();
+        let schedule = vpn_schedule(&address);
+        let authorization = schedule::ScheduleAuthorization {
+            manifest_hash: home.enrolment().unwrap().manifest,
+            schedule,
+            owner_consented: true,
+            self_removal: false,
+        };
+        let tick = || {
+            schedule::tick(
+                &home,
+                &home,
+                None,
+                &authorization,
+                checks::EventMarkerReads::default,
+            )
+        };
+        tick().await.unwrap();
+        let first = gateway.requests().len();
+        assert!(first > 0);
+        for _ in 0..3 {
+            tick().await.unwrap();
+        }
+        assert_eq!(
+            gateway.requests().len(),
+            first,
+            "no second attempt inside the interval"
+        );
+        let log = std::fs::read_to_string(home.file("schedule.log")).unwrap();
+        assert_eq!(log.matches("IT revoked this device").count(), 1, "{log}");
+    }
+
+    #[tokio::test]
+    async fn a_scheduled_run_skips_its_tick_while_another_command_holds_the_claim_lock() {
+        let (_probe, address) = open_probe();
+        let fixture = claim_fixture_replying(
+            None,
+            unchanged,
+            grown_checkpoint,
+            valid_pair,
+            Some(AGREED),
+            Some(&vpn_table(&address)),
+        )
+        .await;
+        let run = || {
+            schedule::run(
+                &fixture.home,
+                schedule::Command::Run {
+                    system: false,
+                    user_home: None,
+                },
+            )
+        };
+        let held = claim::try_lock(&fixture.home).unwrap().unwrap();
+        run().await.unwrap();
+        assert_eq!(fixture.gateway.requests(), Vec::<String>::new());
+        assert!(!fixture.home.file("report-state.json").exists());
+        drop(held);
+        run().await.unwrap();
+        assert_eq!(claim_posts(&fixture), 1);
+    }
+
+    #[tokio::test]
+    async fn a_denied_scheduled_claim_counts_as_delivered_and_tells_the_owner() {
+        let reply = r#"{"status":"denied","reasons":["firewall must be on"]}"#;
+        let fixture = scheduled_fixture(Some(reply), unchanged, grown_checkpoint).await;
+        let (_probe, address) = open_probe();
+        tick_once(&fixture, &address).await.unwrap();
+        assert_eq!(claim_posts(&fixture), 1);
+        assert!(schedule_state(&fixture)["last_success"].is_number());
+        assert_eq!(earlier_pair(&fixture), EARLIER_PAIR);
+        let log = job_log_text(&fixture);
+        assert!(
+            log.contains("denied") && log.contains("firewall must be on"),
+            "{log}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_scheduled_claim_under_a_changed_manifest_tells_the_owner_to_accept() {
+        let fixture = scheduled_fixture(None, with_password_rule, grown_checkpoint).await;
+        let (_probe, address) = open_probe();
+        tick_once(&fixture, &address).await.unwrap();
+        assert_eq!(claim_posts(&fixture), 1);
+        let log = job_log_text(&fixture);
+        assert!(
+            log.contains("The manifest changed") && log.contains("accept"),
+            "{log}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_scheduled_log_alarm_is_noted_and_installs_nothing() {
+        let fixture = scheduled_fixture(None, unchanged, |_, _, _, _| None).await;
+        let (_probe, address) = open_probe();
+        tick_once(&fixture, &address).await.unwrap();
+        assert_eq!(earlier_pair(&fixture), EARLIER_PAIR);
+        let state = schedule_state(&fixture);
+        assert!(state["last_success"].is_null());
+        assert!(
+            state["last_attempt"].is_number(),
+            "the gateway answered, so the next attempt waits for the interval"
+        );
+        assert_eq!(state["reconnect_pending"], false);
+        let log = job_log_text(&fixture);
+        assert!(log.contains("TRANSPARENCY LOG ALARM"), "{log}");
+        tick_once(&fixture, &address).await.unwrap();
+        assert_eq!(
+            job_log_text(&fixture)
+                .matches("TRANSPARENCY LOG ALARM")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_scheduled_run_that_cannot_reach_the_gateway_keeps_the_trigger_and_logs_the_error() {
+        let (_probe, address) = open_probe();
+        let fixture = claim_fixture_replying(
+            None,
+            unchanged,
+            grown_checkpoint,
+            valid_pair,
+            Some(AGREED),
+            Some(&vpn_table(&address)),
+        )
+        .await;
+        let (_socket, refused) = refused_probe();
+        let mut enrolment: Enrolment = fixture.home.enrolment().unwrap();
+        enrolment.gateway = format!("http://{refused}");
+        fixture
+            .home
+            .write("enrolment.json", &serde_json::to_vec(&enrolment).unwrap())
+            .unwrap();
+        let error = schedule::run(
+            &fixture.home,
+            schedule::Command::Run {
+                system: false,
+                user_home: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("/v1/manifest"), "{error:#}");
+        let state = schedule_state(&fixture);
+        assert!(state["last_success"].is_null());
+        assert_eq!(state["reconnect_pending"], true);
+        assert!(job_log_text(&fixture).contains("error:"));
+    }
+
+    #[tokio::test]
+    async fn a_scan_reads_the_given_user_home_and_not_the_client_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().join("client"));
+        let profile = dir.path().join("profile");
+        let repo = profile.join("work/app");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::write(
+            repo.join(".git/config"),
+            "[remote \"origin\"]\n url = git@github.com:example-org/app.git\n",
+        )
+        .unwrap();
+        fs::create_dir_all(&home.0).unwrap();
+        let manifest =
+            Manifest::parse(include_str!("../../../examples/manifest.toml").as_bytes()).unwrap();
+        let own = scan_repositories(&home, &manifest, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(own.managed_repos_total, 0);
+        let given = scan_repositories_from(&home, Some(&profile), &manifest, None, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(given.managed_repos_total, 1);
+    }
+
+    const PASSWORD_RULE: &str = r#"[[control]]
+id = "password_min_length"
+source = "company_policy"
+check = "builtin:password_min_length@1"
+output = { integer = { min = 0, max = 2147483647 }, values = ["none"] }
+required = { macos = { min = 10 }, windows = { min = 10 }, linux = { min = 10 } }
+grace = "1d"
+"#;
+
+    /// `toml` with the password rule added before its log section.
+    fn with_password_rule(toml: &str) -> String {
+        let at = toml.find("[log]").unwrap();
+        format!("{}{PASSWORD_RULE}\n{}", &toml[..at], &toml[at..])
+    }
+
+    #[tokio::test]
+    async fn check_sends_the_signed_manifest_and_names_accept_when_the_gateway_enforces_another() {
+        let (code, _, _, _, claim) =
+            check_under(with_password_rule, grown_checkpoint, valid_pair, None).await;
+        assert_eq!(code.unwrap(), ExitCode::SUCCESS);
+        let claim: Value = serde_json::from_str(&claim).unwrap();
+        let signed = claim["manifest_toml"].as_str().expect("manifest_toml sent");
+        let jws = verify_claim(claim["jws"].as_str().unwrap()).unwrap();
+        assert_eq!(&jws.claim().manifest, &ManifestHash::of(signed.as_bytes()));
+        assert!(!signed.contains("password_min_length"));
+        assert!(!jws.claim().results.contains_key("password_min_length"));
+
+        let (code, _, _, _, claim) = check_under(
+            |signed| signed.to_string(),
+            grown_checkpoint,
+            valid_pair,
+            None,
+        )
+        .await;
+        assert_eq!(code.unwrap(), ExitCode::SUCCESS);
+        assert!(
+            serde_json::from_str::<Value>(&claim).unwrap()["manifest_toml"].is_null(),
+            "an unchanged manifest is not sent"
+        );
+    }
+
+    /// A gateway that refuses status for this device must not end `check` with a bare HTTP 403
+    /// when the manifest changed: the owner learns to run accept.
+    #[tokio::test]
+    async fn check_names_accept_instead_of_an_http_error_when_the_manifest_changed() {
+        let company = Company::new();
+        let witness = Witness::new();
+        let toml = witnessed_manifest(&witness);
+        let published = Company::published(&with_password_rule(&toml), &company.key);
+        let log = company.log.vkey();
+        let mut checkpoint = Note::parse(&company.empty_checkpoint()).unwrap();
+        witness.cosign(
+            &mut checkpoint,
+            u64::try_from(chrono::Utc::now().timestamp()).unwrap(),
+        );
+        let checkpoint = checkpoint.to_string();
+        let gateway = FakeGateway::start(move |line, _| match line {
+            "GET /v1/manifest" => (200, published.clone()),
+            "GET /v1/log/key" => (200, log.clone()),
+            "GET /v1/log/checkpoint" => (200, checkpoint.clone()),
+            "POST /v1/nonce" => (200, json!({"nonce":"n"}).to_string()),
+            "POST /v1/log/mine" | "POST /v1/device/status" => {
+                (403, json!({"status":"denied"}).to_string())
+            }
+            _ => not_found(),
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let home = enrolled_home_with(dir.path(), &gateway.url, &company, &toml);
+        assert_eq!(check(&home, true).await.unwrap(), ExitCode::FAILURE);
+        assert_eq!(
+            gateway.posts(),
+            [
+                "POST /v1/nonce",
+                "POST /v1/log/mine",
+                "POST /v1/nonce",
+                "POST /v1/device/status"
+            ]
+        );
+        let enforced = ManifestHash::of(with_password_rule(&toml).as_bytes());
+        let notice = manifest_change_notice(&enforced, "open-pact-client");
+        assert!(notice.contains(enforced.as_str()), "{notice}");
+        assert!(notice.contains("Run `open-pact-client accept`"), "{notice}");
+    }
+
+    fn accept_home(
+        gateway: &str,
+        company: &Company,
+        toml: &str,
+    ) -> (tempfile::TempDir, open_pact_core::SigningKey) {
+        let dir = tempfile::tempdir().unwrap();
+        enrolled_home_with(dir.path(), gateway, company, toml);
+        let owner = dev_key::generate();
+        dev_key::save(&dir.path().join("owner-dev.pem"), &owner).unwrap();
+        (dir, owner)
+    }
+
+    async fn accept_schedule_change(
+        auto_send: bool,
+        interval: &str,
+        status: u16,
+    ) -> (tempfile::TempDir, Result<ExitCode>) {
+        let company = Company::new();
+        let witness = Witness::new();
+        let old = witnessed_manifest(&witness);
+        let new_toml = old.replacen(
+            "interval = \"55m\"",
+            &format!("interval = \"{interval}\""),
+            1,
+        );
+        assert_ne!(old, new_toml);
+        let published = Company::published(&new_toml, &company.key);
+        let new = Manifest::parse(new_toml.as_bytes()).unwrap();
+        let log = company.log.vkey();
+        let checkpoint = cosigned_empty_checkpoint(&company, &witness);
+        let reply =
+            json!({"status":"accepted","state":"approved","manifest": new.hash()}).to_string();
+        let gateway = FakeGateway::start(move |line, _| match line {
+            "GET /v1/manifest" => (200, published.clone()),
+            "GET /v1/log/key" => (200, format!("{log}\n")),
+            "GET /v1/log/checkpoint" => (200, checkpoint.clone()),
+            "POST /v1/nonce" => (200, json!({"nonce":"accept-nonce"}).to_string()),
+            "POST /v1/device/accept" => (status, reply.clone()),
+            _ => not_found(),
+        })
+        .await;
+        let (dir, _) = accept_home(&gateway.url, &company, &old);
+        let home = Home(dir.path().to_path_buf());
+        let mut config = device_config::DeviceConfig::load(&home).unwrap();
+        config.auto_send = auto_send;
+        config.save(&home).unwrap();
+
+        let result = accept(&home, true, false).await;
+        (dir, result)
+    }
+
+    #[tokio::test]
+    async fn accept_turns_automatic_sending_off_when_the_schedule_shortens() {
+        let (dir, result) = accept_schedule_change(true, "30m", 200).await;
+        assert_eq!(result.unwrap(), ExitCode::SUCCESS);
+        let home = Home(dir.path().to_path_buf());
+        assert!(!device_config::DeviceConfig::load(&home).unwrap().auto_send);
+    }
+
+    #[tokio::test]
+    async fn accept_keeps_automatic_sending_on_when_the_schedule_lengthens() {
+        let (dir, result) = accept_schedule_change(true, "2h", 200).await;
+        assert_eq!(result.unwrap(), ExitCode::SUCCESS);
+        let home = Home(dir.path().to_path_buf());
+        assert!(device_config::DeviceConfig::load(&home).unwrap().auto_send);
+    }
+
+    #[tokio::test]
+    async fn accept_keeps_automatic_sending_on_when_the_gateway_refuses() {
+        let (dir, result) = accept_schedule_change(true, "30m", 409).await;
+        assert_eq!(result.unwrap(), ExitCode::FAILURE);
+        let home = Home(dir.path().to_path_buf());
+        assert!(device_config::DeviceConfig::load(&home).unwrap().auto_send);
+    }
+
+    #[tokio::test]
+    async fn accept_keeps_automatic_sending_off_when_the_gateway_refuses() {
+        let (dir, result) = accept_schedule_change(false, "30m", 409).await;
+        assert_eq!(result.unwrap(), ExitCode::FAILURE);
+        let home = Home(dir.path().to_path_buf());
+        assert!(!device_config::DeviceConfig::load(&home).unwrap().auto_send);
+    }
+
+    #[tokio::test]
+    async fn accept_keeps_automatic_sending_off_when_it_was_already_off() {
+        let (dir, result) = accept_schedule_change(false, "30m", 200).await;
+        assert_eq!(result.unwrap(), ExitCode::SUCCESS);
+        let home = Home(dir.path().to_path_buf());
+        assert!(!device_config::DeviceConfig::load(&home).unwrap().auto_send);
+    }
+
+    #[tokio::test]
+    async fn a_dropped_accept_connection_keeps_automatic_sending_on() {
+        let (dir, result) = accept_schedule_change(true, "30m", 0).await;
+        assert!(result.is_err());
+        let home = Home(dir.path().to_path_buf());
+        assert!(device_config::DeviceConfig::load(&home).unwrap().auto_send);
+        let stored = std::fs::read_to_string(home.file("manifest.toml")).unwrap();
+        assert!(stored.contains("interval = \"55m\""));
+        assert!(!stored.contains("interval = \"30m\""));
+    }
+
+    /// A checkpoint of the empty log that `witness` has cosigned, as the gateway serves it.
+    fn cosigned_empty_checkpoint(company: &Company, witness: &Witness) -> String {
+        let mut checkpoint = Note::parse(&company.empty_checkpoint()).unwrap();
+        witness.cosign(
+            &mut checkpoint,
+            u64::try_from(chrono::Utc::now().timestamp()).unwrap(),
+        );
+        checkpoint.to_string()
+    }
+
+    #[tokio::test]
+    async fn accept_signs_the_new_manifest_and_moves_the_enrolment() {
+        let company = Company::new();
+        let witness = Witness::new();
+        let old = witnessed_manifest(&witness);
+        let new_toml = with_password_rule(&old);
+        assert_ne!(old, new_toml);
+        let published = Company::published(&new_toml, &company.key);
+        let new = Manifest::parse(new_toml.as_bytes()).unwrap();
+        let log = company.log.vkey();
+        let checkpoint = cosigned_empty_checkpoint(&company, &witness);
+        let reply =
+            json!({"status":"accepted","state":"approved","manifest": new.hash()}).to_string();
+        let gateway = FakeGateway::start(move |line, _| match line {
+            "GET /v1/manifest" => (200, published.clone()),
+            "GET /v1/log/key" => (200, format!("{log}\n")),
+            "GET /v1/log/checkpoint" => (200, checkpoint.clone()),
+            "POST /v1/nonce" => (200, json!({"nonce":"accept-nonce"}).to_string()),
+            "POST /v1/device/accept" => (200, reply.clone()),
+            _ => not_found(),
+        })
+        .await;
+        let (dir, owner) = accept_home(&gateway.url, &company, &old);
+        let home = Home(dir.path().to_path_buf());
+        let device = DeviceKey::load(&home.0).unwrap();
+
+        assert_eq!(accept(&home, true, false).await.unwrap(), ExitCode::SUCCESS);
+        assert_eq!(
+            gateway.posts(),
+            ["POST /v1/nonce", "POST /v1/device/accept"]
+        );
+        let sent: AcceptRequest =
+            serde_json::from_str(&gateway.bodies("POST /v1/device/accept")[0]).unwrap();
+        sent.verify().unwrap();
+        assert_eq!(sent.previous, ManifestHash::of(old.as_bytes()));
+        assert_eq!(&sent.manifest, new.hash());
+        assert_eq!(sent.nonce, "accept-nonce");
+        assert_eq!(sent.owner.key, PublicKey::from(&owner));
+        assert_eq!(sent.device_key, device.public_key());
+        assert_eq!(
+            std::fs::read_to_string(home.file("manifest.toml")).unwrap(),
+            new_toml
+        );
+        let enrolment = home.enrolment().unwrap();
+        assert_eq!(&enrolment.manifest, new.hash());
+        assert!(enrolment.log_entries.is_none());
+
+        assert_eq!(accept(&home, true, false).await.unwrap(), ExitCode::SUCCESS);
+        assert_eq!(gateway.posts().len(), 2, "nothing is left to accept");
+    }
+
+    #[tokio::test]
+    async fn a_refused_acceptance_keeps_the_signed_manifest() {
+        let company = Company::new();
+        let witness = Witness::new();
+        let old = witnessed_manifest(&witness);
+        let published = Company::published(&with_password_rule(&old), &company.key);
+        let log = company.log.vkey();
+        let checkpoint = cosigned_empty_checkpoint(&company, &witness);
+        let gateway = FakeGateway::start(move |line, _| match line {
+            "GET /v1/manifest" => (200, published.clone()),
+            "GET /v1/log/key" => (200, log.clone()),
+            "GET /v1/log/checkpoint" => (200, checkpoint.clone()),
+            "POST /v1/nonce" => (200, json!({"nonce":"n"}).to_string()),
+            "POST /v1/device/accept" => (403, json!({"status":"denied"}).to_string()),
+            _ => not_found(),
+        })
+        .await;
+        let (dir, _) = accept_home(&gateway.url, &company, &old);
+        let before = snapshot(dir.path());
+        let home = Home(dir.path().to_path_buf());
+        assert_eq!(accept(&home, true, false).await.unwrap(), ExitCode::FAILURE);
+        // The checkpoint the gateway signed is verified and kept whatever the owner decides.
+        let mut after = snapshot(dir.path());
+        after.remove("log-checkpoint.txt");
+        let mut before = before;
+        before.remove("log-checkpoint.txt");
+        assert_eq!(after, before);
+    }
+
+    /// F2: the gateway committed an acceptance whose response was lost, so this device still holds
+    /// the manifest it signed before. `check` names `accept` and returns the notice exit code, not
+    /// the log alarm, and sends no claim.
+    #[tokio::test]
+    async fn check_names_accept_when_the_gateway_already_moved_the_device() {
+        let company = Company::new();
+        let witness = Witness::new();
+        let old = witnessed_manifest(&witness);
+        let new_toml = with_password_rule(&old);
+        let new_hash = ManifestHash::of(new_toml.as_bytes());
+        let dir = tempfile::tempdir().unwrap();
+        let home = enrolled_home_with(dir.path(), "", &company, &old);
+        let mut enrolment = home.enrolment().unwrap();
+        let mine = commitment(&enrolment).unwrap();
+        let entries = vec![
+            Entry {
+                index: 0,
+                kind: EntryKind::ManifestPublished,
+                data: json!({"manifest": new_hash}),
+            },
+            Entry {
+                index: 1,
+                kind: EntryKind::DeviceEnrolled,
+                data: json!({"commitment": mine}),
+            },
+            Entry {
+                index: 2,
+                kind: EntryKind::ManifestAccepted,
+                data: json!({"commitment": mine, "manifest": new_hash}),
+            },
+        ];
+        let leaves: Vec<_> = entries.iter().map(Entry::leaf_hash).collect();
+        let mut note = company.sign(&checkpoint_of(company.log.origin(), &entries, 3));
+        witness.cosign(
+            &mut note,
+            u64::try_from(chrono::Utc::now().timestamp()).unwrap(),
+        );
+        let checkpoint = note.to_string();
+        let response = serde_json::to_string(&MyEntries {
+            checkpoint: checkpoint.clone(),
+            manifest: open_pact_core::EntryWithProof {
+                entry: entries[0].clone(),
+                proof: open_pact_core::inclusion_proof(&leaves, 0).unwrap(),
+            },
+            device: entries[1..]
+                .iter()
+                .map(|entry| open_pact_core::EntryWithProof {
+                    entry: entry.clone(),
+                    proof: open_pact_core::inclusion_proof(&leaves, entry.index).unwrap(),
+                })
+                .collect(),
+        })
+        .unwrap();
+        let published = Company::published(&new_toml, &company.key);
+        let log = company.log.vkey();
+        let gateway = FakeGateway::start(move |line, _| match line {
+            "GET /v1/manifest" => (200, published.clone()),
+            "GET /v1/log/key" => (200, log.clone()),
+            "GET /v1/log/checkpoint" => (200, checkpoint.clone()),
+            "POST /v1/nonce" => (200, json!({"nonce":"lost-response"}).to_string()),
+            "POST /v1/log/mine" => (200, response.clone()),
+            _ => not_found(),
+        })
+        .await;
+        enrolment.gateway = gateway.url.clone();
+        home.write(
+            "enrolment.json",
+            &serde_json::to_vec_pretty(&enrolment).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(check(&home, true).await.unwrap(), ExitCode::FAILURE);
+        assert_eq!(
+            gateway.posts(),
+            ["POST /v1/nonce", "POST /v1/log/mine"],
+            "no claim is sent under the manifest the gateway no longer enforces"
+        );
+        assert_eq!(home.enrolment().unwrap().manifest, enrolment.manifest);
+        assert_eq!(
+            std::fs::read_to_string(home.file("manifest.toml")).unwrap(),
+            old
+        );
+    }
+
+    /// The gateway enforces a manifest this device has not signed, and the log holds no acceptance
+    /// of it for this device. No owner accepted it, so `check` raises the log alarm, not the notice
+    /// to run `accept`, and sends no claim.
+    #[tokio::test]
+    async fn check_alarms_when_the_enforced_manifest_has_no_acceptance_for_this_device() {
+        let company = Company::new();
+        let witness = Witness::new();
+        let old = witnessed_manifest(&witness);
+        let new_toml = with_password_rule(&old);
+        let new_hash = ManifestHash::of(new_toml.as_bytes());
+        let dir = tempfile::tempdir().unwrap();
+        let home = enrolled_home_with(dir.path(), "", &company, &old);
+        let mut enrolment = home.enrolment().unwrap();
+        let mine = commitment(&enrolment).unwrap();
+        let entries = vec![
+            Entry {
+                index: 0,
+                kind: EntryKind::ManifestPublished,
+                data: json!({"manifest": new_hash}),
+            },
+            Entry {
+                index: 1,
+                kind: EntryKind::DeviceEnrolled,
+                data: json!({"commitment": mine}),
+            },
+        ];
+        let leaves: Vec<_> = entries.iter().map(Entry::leaf_hash).collect();
+        let mut note = company.sign(&checkpoint_of(company.log.origin(), &entries, 2));
+        witness.cosign(
+            &mut note,
+            u64::try_from(chrono::Utc::now().timestamp()).unwrap(),
+        );
+        let checkpoint = note.to_string();
+        let response = serde_json::to_string(&MyEntries {
+            checkpoint: checkpoint.clone(),
+            manifest: open_pact_core::EntryWithProof {
+                entry: entries[0].clone(),
+                proof: open_pact_core::inclusion_proof(&leaves, 0).unwrap(),
+            },
+            device: entries[1..]
+                .iter()
+                .map(|entry| open_pact_core::EntryWithProof {
+                    entry: entry.clone(),
+                    proof: open_pact_core::inclusion_proof(&leaves, entry.index).unwrap(),
+                })
+                .collect(),
+        })
+        .unwrap();
+        let published = Company::published(&new_toml, &company.key);
+        let log = company.log.vkey();
+        let gateway = FakeGateway::start(move |line, _| match line {
+            "GET /v1/manifest" => (200, published.clone()),
+            "GET /v1/log/key" => (200, log.clone()),
+            "GET /v1/log/checkpoint" => (200, checkpoint.clone()),
+            "POST /v1/nonce" => (200, json!({"nonce":"no-acceptance"}).to_string()),
+            "POST /v1/log/mine" => (200, response.clone()),
+            _ => not_found(),
+        })
+        .await;
+        enrolment.gateway = gateway.url.clone();
+        home.write(
+            "enrolment.json",
+            &serde_json::to_vec_pretty(&enrolment).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(check(&home, true).await.unwrap(), ExitCode::from(2));
+        assert_eq!(
+            gateway.posts(),
+            ["POST /v1/nonce", "POST /v1/log/mine"],
+            "no claim is sent under a manifest no owner accepted"
+        );
+        assert_eq!(home.enrolment().unwrap().manifest, enrolment.manifest);
+        assert_eq!(
+            std::fs::read_to_string(home.file("manifest.toml")).unwrap(),
+            old
+        );
+    }
+
+    /// F2: an acceptance stopped after it wrote manifest.toml and before it wrote enrolment.json.
+    /// `check` names `accept` as the way to finish it.
+    #[tokio::test]
+    async fn check_names_accept_when_manifest_toml_and_enrolment_disagree() {
+        let company = Company::new();
+        let witness = Witness::new();
+        let old = witnessed_manifest(&witness);
+        let new_toml = with_password_rule(&old);
+        let dir = tempfile::tempdir().unwrap();
+        let home = enrolled_home_with(dir.path(), "http://127.0.0.1:9", &company, &old);
+        home.write("manifest.toml", new_toml.as_bytes()).unwrap();
+
+        let error = format!("{:#}", check(&home, true).await.unwrap_err());
+        assert!(
+            error.contains("disagree") && error.contains("accept` to finish it"),
+            "{error}"
+        );
+        assert!(error.contains("open-pact-client"), "{error}");
+    }
+
+    #[test]
+    fn home_write_replaces_a_file_and_leaves_no_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+        home.write("enrolment.json", b"first").unwrap();
+        home.write("enrolment.json", b"second").unwrap();
+        assert_eq!(
+            std::fs::read(home.file("enrolment.json")).unwrap(),
+            b"second"
+        );
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["enrolment.json"]);
+    }
+
+    #[test]
+    fn manifest_changes_list_controls_and_consent_terms() {
+        let demo = DEMO_MANIFEST.replace("\r\n", "\n");
+        let old = Manifest::parse(demo.replace(PASSWORD_RULE, "").as_bytes()).unwrap();
+        let new_toml = demo
+            .replace(
+                "required = { macos = { max = 30 }, windows = { max = 30 }, linux = { max = 30 } }\ngrace = \"1d\"",
+                "required = { macos = { max = 14 }, windows = { max = 14 }, linux = { max = 14 } }\ngrace = \"1d\"",
+            )
+            .replace(r#"claim_retention = "12mo""#, r#"claim_retention = "18mo""#)
+            .replace(r#", "virtualized", "log_checkpoint"]"#, r#", "log_checkpoint"]"#)
+            .replace(r#""Company IT security", "#, "")
+            .replace("Company Ltd.,", "Company Group Ltd.,")
+            .replace(r#"min_trust_level = "L0""#, r#"min_trust_level = "L1""#);
+        let start = new_toml.find("[[control]]\nid = \"uptime_days\"").unwrap();
+        let end = start + new_toml[start..].find("\n\n").unwrap() + 2;
+        let new_toml = format!("{}{}", &new_toml[..start], &new_toml[end..]);
+        let new = Manifest::parse(new_toml.as_bytes()).unwrap();
+        assert_eq!(
+            manifest_changes(&old, &new),
+            [
+                "changed control os_patch_age_days: must be <= 14 on macos, windows, linux (grace 1d, reports integer 0..=3650, unknown) (was must be <= 30 on macos, windows, linux (grace 1d, reports integer 0..=3650, unknown))",
+                "added control password_min_length: must be >= 10 on macos, windows, linux (grace 1d, reports integer 0..=2147483647, unknown, none)",
+                "removed control uptime_days",
+                "disclosed metadata: manifest_hash, device_pseudonym, device_key, nonce, time, client_version, os, trust_level, vpn_certificate_request, log_checkpoint (was manifest_hash, device_pseudonym, device_key, nonce, time, client_version, os, trust_level, vpn_certificate_request, virtualized, log_checkpoint)",
+                "claim retention: 18mo (was 12mo)",
+                "claim recipients: auditor on request (was Company IT security, auditor on request)",
+                "data controller: Company Group Ltd., dpo@company.example (was Company Ltd., dpo@company.example)",
+                "minimum trust level: L1 (was L0)",
+            ]
+        );
+        assert!(manifest_changes(&new, &new).is_empty());
+        // A requirement that differs on one system names that system, and the others it shares.
+        let demo = Manifest::parse(DEMO_MANIFEST.as_bytes()).unwrap();
+        let windows_only = Manifest::parse(
+            DEMO_MANIFEST.replace(
+                "required = { macos = { max = 30 }, windows = { max = 30 }, linux = { max = 30 } }",
+                "required = { macos = { max = 30 }, windows = { max = 14 }, linux = { max = 30 } }",
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            manifest_changes(&demo, &windows_only),
+            [
+                "changed control os_patch_age_days: must be <= 30 on macos, linux; must be <= 14 on windows (grace 1d, reports integer 0..=3650, unknown) (was must be <= 30 on macos, windows, linux (grace 1d, reports integer 0..=3650, unknown))"
+            ]
+        );
+        // Wording that changes no requirement, grace, output or check is not a change.
+        let reworded = Manifest::parse(
+            DEMO_MANIFEST
+                .replace(
+                    "rationale = \"A lost laptop must not expose client data.\"",
+                    "rationale = \"Reworded for clarity.\"",
+                )
+                .as_bytes(),
+        )
+        .unwrap();
+        assert_ne!(reworded.hash(), demo.hash());
+        assert!(manifest_changes(&demo, &reworded).is_empty());
+    }
+
+    /// A VPN certificate and the CA a claim response carries.
+    struct VpnPair {
+        cert: Option<String>,
+        ca: String,
+    }
+
+    /// A fictional VPN CA as the gateway makes it: a CA that signs certificates, unless `is_ca`
+    /// is false.
+    fn test_ca(is_ca: bool) -> (CertificateParams, KeyPair) {
+        test_ca_with(is_ca, |_| {})
+    }
+
+    fn test_ca_with(
+        is_ca: bool,
+        edit: impl FnOnce(&mut CertificateParams),
+    ) -> (CertificateParams, KeyPair) {
+        let mut params = CertificateParams::new(vec![]).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "fictional VPN CA");
+        if is_ca {
+            params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Constrained(0));
+            params.key_usages = vec![
+                rcgen::KeyUsagePurpose::KeyCertSign,
+                rcgen::KeyUsagePurpose::CrlSign,
+            ];
+        }
+        edit(&mut params);
+        (params, KeyPair::generate().unwrap())
+    }
+
+    fn ca_pem((params, key): &(CertificateParams, KeyPair)) -> String {
+        params.self_signed(key).unwrap().pem()
+    }
+
+    /// A client certificate for `key` issued by `ca` as the gateway issues it, expired since 2020
+    /// if `expired`.
+    fn issue_to(key: &KeyPair, ca: &(CertificateParams, KeyPair), expired: bool) -> String {
+        issue_with(key, ca, |leaf| {
+            if expired {
+                leaf.not_before = rcgen::date_time_ymd(2020, 1, 1);
+                leaf.not_after = rcgen::date_time_ymd(2020, 2, 1);
+            }
+        })
+    }
+
+    fn issue_with(
+        key: &KeyPair,
+        (params, ca_key): &(CertificateParams, KeyPair),
+        edit: impl FnOnce(&mut CertificateParams),
+    ) -> String {
+        let mut leaf = CertificateParams::new(vec![]).unwrap();
+        leaf.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+        leaf.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+        edit(&mut leaf);
+        leaf.signed_by(key, &rcgen::Issuer::from_params(params, ca_key))
+            .unwrap()
+            .pem()
+    }
+
+    /// A certificate for the device's VPN key, issued by the CA that comes with it.
+    fn valid_pair(vpn: &KeyPair) -> VpnPair {
+        let ca = test_ca(true);
+        VpnPair {
+            cert: Some(issue_to(vpn, &ca, false)),
+            ca: ca_pem(&ca),
+        }
+    }
+
+    /// A valid pair whose certificate gets the extra leaf settings of `edit`.
+    fn pair_with(vpn: &KeyPair, edit: impl FnOnce(&mut CertificateParams)) -> VpnPair {
+        let ca = test_ca(true);
+        VpnPair {
+            cert: Some(issue_with(vpn, &ca, edit)),
+            ca: ca_pem(&ca),
+        }
+    }
+
+    /// A PEM certificate block around `der`.
+    fn pem_of(der: &[u8]) -> String {
+        use base64::Engine as _;
+        let text = base64::engine::general_purpose::STANDARD.encode(der);
+        let lines: Vec<&str> = text
+            .as_bytes()
+            .chunks(64)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect();
+        format!(
+            "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+            lines.join("\n")
+        )
+    }
+
+    fn grown_checkpoint(
+        company: &Company,
+        witness: &Witness,
+        entries: &[Entry],
+        now: u64,
+    ) -> Option<String> {
+        let mut grown = company.sign(&checkpoint_of(company.log.origin(), entries, 3));
+        witness.cosign(&mut grown, now);
+        Some(grown.to_string())
+    }
+
+    /// R6-L1: a replacement certificate and CA are checked before either installed file
+    /// changes, so a bad pair in an accepted response leaves the working pair in place.
+    #[tokio::test]
+    async fn check_keeps_the_installed_pair_if_the_new_one_is_invalid() {
+        type Pair = fn(&KeyPair) -> VpnPair;
+        let cases: [(&str, Pair); 14] = [
+            ("malformed certificate", |vpn| VpnPair {
+                cert: Some("FICTIONAL NOT A CERTIFICATE".into()),
+                ..valid_pair(vpn)
+            }),
+            ("malformed CA", |vpn| VpnPair {
+                ca: "FICTIONAL NOT A CA".into(),
+                ..valid_pair(vpn)
+            }),
+            ("certificate for another key", |_| {
+                valid_pair(&KeyPair::generate().unwrap())
+            }),
+            ("certificate from another CA", |vpn| VpnPair {
+                ca: ca_pem(&test_ca(true)),
+                ..valid_pair(vpn)
+            }),
+            ("expired certificate", |vpn| {
+                let ca = test_ca(true);
+                VpnPair {
+                    cert: Some(issue_to(vpn, &ca, true)),
+                    ca: ca_pem(&ca),
+                }
+            }),
+            ("CA that is not a CA", |vpn| {
+                let ca = test_ca(false);
+                VpnPair {
+                    cert: Some(issue_to(vpn, &ca, false)),
+                    ca: ca_pem(&ca),
+                }
+            }),
+            ("certificate and CA swapped", |vpn| {
+                let pair = valid_pair(vpn);
+                VpnPair {
+                    cert: Some(pair.ca),
+                    ca: pair.cert.unwrap(),
+                }
+            }),
+            // R7-L1: each pair below is unusable for a VPN client, though the old checks pass it.
+            ("no certificate for the request sent", |vpn| VpnPair {
+                cert: None,
+                ..valid_pair(vpn)
+            }),
+            ("server-only certificate", |vpn| {
+                pair_with(vpn, |leaf| {
+                    leaf.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+                })
+            }),
+            ("certificate that may not sign", |vpn| {
+                pair_with(vpn, |leaf| {
+                    leaf.key_usages = vec![rcgen::KeyUsagePurpose::KeyEncipherment];
+                })
+            }),
+            ("certificate with an unknown critical extension", |vpn| {
+                pair_with(vpn, |leaf| {
+                    let mut ext =
+                        rcgen::CustomExtension::from_oid_content(&[2, 25, 7, 7], vec![5, 0]);
+                    ext.set_criticality(true);
+                    leaf.custom_extensions = vec![ext];
+                })
+            }),
+            ("issuer name that is not the CA's", |vpn| {
+                let ca = test_ca(true);
+                let renamed = test_ca_with(true, |p| {
+                    p.distinguished_name = rcgen::DistinguishedName::new();
+                    p.distinguished_name
+                        .push(rcgen::DnType::CommonName, "fictional other CA");
+                });
+                VpnPair {
+                    cert: Some(issue_to(
+                        vpn,
+                        &(renamed.0, KeyPair::from_pem(&ca.1.serialize_pem()).unwrap()),
+                        false,
+                    )),
+                    ca: ca_pem(&ca),
+                }
+            }),
+            ("CA that may not sign certificates", |vpn| {
+                let ca = test_ca_with(true, |p| {
+                    p.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+                });
+                VpnPair {
+                    cert: Some(issue_to(vpn, &ca, false)),
+                    ca: ca_pem(&ca),
+                }
+            }),
+            ("certificate with bytes after its DER", |vpn| {
+                let pair = valid_pair(vpn);
+                let mut der = pem_certificate(pair.cert.as_deref().unwrap()).unwrap();
+                der.extend([0, 0]);
+                VpnPair {
+                    cert: Some(pem_of(&der)),
+                    ..pair
+                }
+            }),
+        ];
+        let mut accepted = Vec::new();
+        for (case, pair) in cases {
+            let (code, before, after, _) =
+                check_with_response_checkpoint(grown_checkpoint, pair, None).await;
+            let failed = code.as_ref().is_err() || code.as_ref().unwrap() != &ExitCode::SUCCESS;
+            let kept = ["ca.pem", "vpn-cert.pem", "vpn-key.pem"]
+                .iter()
+                .all(|file| after[*file] == before[*file]);
+            if !failed || !kept {
+                accepted.push(case);
+            }
+        }
+        assert_eq!(accepted, [""; 0], "cases that replaced the installed pair");
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn invalid_device_config_still_sends_all_manifest_controls() {
+        use base64::Engine;
+        let (code, _, after, _) = check_with_response_checkpoint(
+            grown_checkpoint,
+            valid_pair,
+            Some("{\"folders\": \"not a list\"}"),
+        )
+        .await;
+        assert_eq!(code.unwrap(), ExitCode::SUCCESS);
+        let record: locallog::Record = serde_json::from_slice(&after["claims.jsonl"]).unwrap();
+        let sent: Value = serde_json::from_slice(&record.sent().unwrap()).unwrap();
+        let payload = sent["jws"].as_str().unwrap().split('.').nth(1).unwrap();
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload)
+            .unwrap();
+        let claim: Value = serde_json::from_slice(&bytes).unwrap();
+        let manifest = Manifest::parse(&after["manifest.toml"]).unwrap();
+        assert_eq!(
+            claim["results"].as_object().unwrap().len(),
+            manifest.body().controls.len()
+        );
+        assert!(!String::from_utf8(bytes).unwrap().contains("not a list"));
+    }
+
+    #[tokio::test]
+    async fn check_installs_the_certificate_of_a_verified_response_checkpoint() {
+        let (code, before, after, pair) =
+            check_with_response_checkpoint(grown_checkpoint, valid_pair, None).await;
+        assert_eq!(code.unwrap(), ExitCode::SUCCESS);
+        assert_eq!(after["ca.pem"], pair.ca.as_bytes());
+        assert_eq!(after["vpn-cert.pem"], pair.cert.unwrap().as_bytes());
+        let stored = Note::parse(std::str::from_utf8(&after[LOG_CHECKPOINT]).unwrap()).unwrap();
+        assert_eq!(Checkpoint::parse(&stored.text).unwrap().size, 3);
+        assert_ne!(after[LOG_CHECKPOINT], before[LOG_CHECKPOINT]);
+    }
+
+    #[tokio::test]
+    async fn check_installs_nothing_if_the_response_checkpoint_fails_verification() {
+        type Respond = fn(&Company, &Witness, &[Entry], u64) -> Option<String>;
+        fn signed(company: &Company, witness: &Witness, cp: Checkpoint, at: u64) -> Option<String> {
+            let mut note = company.sign(&cp);
+            witness.cosign(&mut note, at);
+            Some(note.to_string())
+        }
+        let cases: [(&str, Respond); 8] = [
+            ("not a checkpoint", |_, _, _, _| {
+                Some("NOT A CHECKPOINT".into())
+            }),
+            ("no checkpoint", |_, _, _, _| None),
+            ("a fork at the stored size", |c, w, e, now| {
+                let fork = Checkpoint {
+                    root: LogHash([7; 32]),
+                    ..checkpoint_of(c.log.origin(), e, 2)
+                };
+                signed(c, w, fork, now)
+            }),
+            ("a grown fork", |c, w, e, now| {
+                let fork = Checkpoint {
+                    root: LogHash([7; 32]),
+                    ..checkpoint_of(c.log.origin(), e, 3)
+                };
+                signed(c, w, fork, now)
+            }),
+            ("a rollback", |c, w, e, now| {
+                signed(c, w, checkpoint_of(c.log.origin(), e, 1), now)
+            }),
+            ("no witness cosignature", |c, _, e, _| {
+                Some(c.sign(&checkpoint_of(c.log.origin(), e, 3)).to_string())
+            }),
+            ("a stale cosignature", |c, w, e, now| {
+                signed(c, w, checkpoint_of(c.log.origin(), e, 3), now - 2 * 3600)
+            }),
+            ("another log key", |c, w, e, now| {
+                signed(&Company::new(), w, checkpoint_of(c.log.origin(), e, 3), now)
+            }),
+        ];
+        for (case, response) in cases {
+            let (code, before, after, _) =
+                check_with_response_checkpoint(response, valid_pair, None).await;
+            assert_eq!(code.unwrap(), ExitCode::from(2), "{case}: log alarm");
+            for file in ["ca.pem", "vpn-cert.pem", LOG_CHECKPOINT] {
+                assert_eq!(after[file], before[file], "{case}: {file} unchanged");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn join_pins_the_manifest_response_it_shows_and_signs() {
+        let company = Company::new();
+        let attacker = dev_key::generate();
+        let forged = DEMO_MANIFEST.replace(
+            r#"data_controller = "Company Ltd., dpo@company.example""#,
+            r#"data_controller = "Someone else""#,
+        );
+        assert_ne!(forged, DEMO_MANIFEST);
+        let real = Company::published(DEMO_MANIFEST, &company.key);
+        let (log, checkpoint) = (company.log.vkey(), company.empty_checkpoint());
+        let gateway = FakeGateway::start(move |line, nth| match line {
+            "GET /v1/manifest" if nth == 0 => (200, Company::published(&forged, &attacker)),
+            "GET /v1/manifest" => (200, real.clone()),
+            "GET /v1/log/key" => (200, format!("{log}\n")),
+            "GET /v1/log/checkpoint" => (200, checkpoint.clone()),
+            _ => not_found(),
+        })
+        .await;
+        let invitation = Invitation::new(
+            &gateway.url,
+            &PublicKey::from(&company.key),
+            &company.log,
+            open_pact_core::InvitationCode::from_bytes([7; 32]),
+        )
+        .encode();
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+
+        let joined = join(
+            &home,
+            &invitation,
+            true,
+            true,
+            false,
+            true,
+            APPROVAL_POLL_INTERVAL,
+        )
+        .await;
+
+        assert_eq!(gateway.posts(), Vec::<String>::new(), "no enrolment sent");
+        assert!(!home.file(COMPANY_KEY).exists(), "nothing pinned");
+        let error = format!("{:#}", joined.expect_err("join must fail"));
+        assert!(error.contains("company key differs"), "{error}");
+    }
+
+    async fn join_with_manifest(toml: String) -> (FakeGateway, anyhow::Result<ExitCode>) {
+        let company = Company::new();
+        let published = Company::published(&toml, &company.key);
+        let (log, checkpoint) = (company.log.vkey(), company.empty_checkpoint());
+        let gateway = FakeGateway::start(move |line, _| match line {
+            "GET /v1/manifest" => (200, published.clone()),
+            "GET /v1/log/key" => (200, format!("{log}\n")),
+            "GET /v1/log/checkpoint" => (200, checkpoint.clone()),
+            _ => not_found(),
+        })
+        .await;
+        let invitation = Invitation::new(
+            &gateway.url,
+            &PublicKey::from(&company.key),
+            &company.log,
+            open_pact_core::InvitationCode::from_bytes([7; 32]),
+        )
+        .encode();
+        let dir = tempfile::tempdir().unwrap();
+        let joined = join(
+            &Home(dir.path().to_path_buf()),
+            &invitation,
+            true,
+            true,
+            false,
+            true,
+            APPROVAL_POLL_INTERVAL,
+        )
+        .await;
+        (gateway, joined)
+    }
+
+    #[tokio::test]
+    async fn join_refuses_a_builtin_this_client_does_not_implement() {
+        for (from, to) in [
+            (
+                r#"check = "builtin:disk_encryption@1""#,
+                r#"check = "builtin:nonexistent@999""#,
+            ),
+            (
+                r#"check = "builtin:disk_encryption@1""#,
+                r#"check = "builtin:disk_encryption@2""#,
+            ),
+            (r#"id = "firewall""#, r#"id = "installed_apps""#),
+        ] {
+            assert!(DEMO_MANIFEST.contains(from));
+            let (gateway, joined) = join_with_manifest(DEMO_MANIFEST.replace(from, to)).await;
+            assert_eq!(
+                gateway.posts(),
+                Vec::<String>::new(),
+                "{to}: nothing signed or sent"
+            );
+            let error = format!("{:#}", joined.expect_err(to));
+            assert!(error.contains("does not implement"), "{error}");
+        }
+    }
+
+    /// R7-L2: wherever an install of a new VPN pair is interrupted, the recovery at the next
+    /// start shows one whole pair, the earlier or the new, through the documented paths.
+    #[cfg(unix)]
+    #[test]
+    fn an_interrupted_vpn_install_leaves_one_whole_pair() {
+        let read = |home: &Home| {
+            ["ca.pem", "vpn-cert.pem"].map(|name| std::fs::read(home.file(name)).unwrap())
+        };
+        let earlier = [b"earlier CA".to_vec(), b"earlier certificate".to_vec()];
+        let new = [b"new CA".to_vec(), b"new certificate".to_vec()];
+        type Setup = fn(&Home);
+        let layouts: [(&str, Setup); 2] = [
+            ("plain files", |home| {
+                home.write("ca.pem", b"earlier CA").unwrap();
+                home.write("vpn-cert.pem", b"earlier certificate").unwrap();
+            }),
+            ("an installed pair", |home| {
+                home.install_vpn_pair(b"earlier CA", b"earlier certificate")
+                    .unwrap();
+            }),
+        ];
+        let mut mixed = Vec::new();
+        for (layout, setup) in layouts {
+            for step in 1.. {
+                let dir = tempfile::tempdir().unwrap();
+                let home = Home(dir.path().to_path_buf());
+                setup(&home);
+                INTERRUPT_AFTER.with(|left| left.set(Some(step)));
+                let finished = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    home.install_vpn_pair(b"new CA", b"new certificate")
+                }))
+                .is_ok();
+                INTERRUPT_AFTER.with(|left| left.set(None));
+                home.recover_vpn().unwrap();
+                let pair = read(&home);
+                if pair != earlier && pair != new {
+                    mixed.push(format!("{layout}, step {step}"));
+                }
+                if finished {
+                    assert_eq!(pair, new, "{layout}: installed");
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            mixed,
+            [""; 0].map(String::from),
+            "interruptions that left a mixed pair"
+        );
+    }
+
+    #[cfg(windows)]
+    fn selected_windows_vpn_pair(home: &Home) -> Option<[Vec<u8>; 2]> {
+        let vpn = home.file(VPN_DIR);
+        let generation = match std::fs::read_to_string(vpn.join(VPN_CURRENT)) {
+            Ok(generation) => generation,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(error) => panic!("{error}"),
+        };
+        Some(VPN_FILES.map(|name| std::fs::read(vpn.join(&generation).join(name)).unwrap()))
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_vpn_install_and_recovery_survive_every_interruption() {
+        let earlier = [b"earlier CA".to_vec(), b"earlier certificate".to_vec()];
+        let new = [b"new CA".to_vec(), b"new certificate".to_vec()];
+        for layout in ["empty", "plain files", "installed"] {
+            let mut completed = false;
+            for step in 1..=32 {
+                let dir = tempfile::tempdir().unwrap();
+                let home = Home(dir.path().join("fictional-home"));
+                if layout == "installed" {
+                    home.install_vpn_pair(&earlier[0], &earlier[1]).unwrap();
+                } else if layout == "plain files" {
+                    for (name, bytes) in VPN_FILES.iter().zip(&earlier) {
+                        home.write(name, bytes).unwrap();
+                    }
+                }
+                INTERRUPT_AFTER.with(|left| left.set(Some(step)));
+                let result = std::panic::catch_unwind(|| home.install_vpn_pair(&new[0], &new[1]));
+                INTERRUPT_AFTER.with(|left| left.set(None));
+                let finished = match result {
+                    Ok(result) => {
+                        result.unwrap();
+                        true
+                    }
+                    Err(_) => false,
+                };
+                let selected = selected_windows_vpn_pair(&home);
+                assert!(
+                    selected.is_none()
+                        || selected.as_ref() == Some(&earlier)
+                        || selected.as_ref() == Some(&new)
+                );
+                if layout == "installed" {
+                    assert!(selected.is_some());
+                }
+                // Recovery can itself stop while repairing either documented file.
+                for recovery_step in 1..=5 {
+                    INTERRUPT_AFTER.with(|left| left.set(Some(recovery_step)));
+                    let result = std::panic::catch_unwind(|| home.recover_vpn());
+                    INTERRUPT_AFTER.with(|left| left.set(None));
+                    if let Ok(result) = result {
+                        result.unwrap();
+                    }
+                    assert_eq!(selected_windows_vpn_pair(&home), selected);
+                }
+                home.recover_vpn().unwrap();
+                home.recover_vpn().unwrap();
+                if let Some(selected) = &selected {
+                    assert_eq!(
+                        VPN_FILES.map(|name| std::fs::read(home.file(name)).unwrap()),
+                        *selected
+                    );
+                } else if layout == "plain files" {
+                    assert_eq!(
+                        VPN_FILES.map(|name| std::fs::read(home.file(name)).unwrap()),
+                        earlier
+                    );
+                } else {
+                    assert!(VPN_FILES.iter().all(|name| !home.file(name).exists()));
+                }
+                let generations: Vec<_> = std::fs::read_dir(home.file(VPN_DIR))
+                    .unwrap()
+                    .map(|entry| entry.unwrap())
+                    .filter(|entry| entry.file_type().unwrap().is_dir())
+                    .collect();
+                for entry in &generations {
+                    let name = entry.file_name().into_string().unwrap();
+                    assert!(
+                        Some(&name) == home.vpn_generation(VPN_CURRENT).unwrap().as_ref()
+                            || Some(&name) == home.vpn_generation("previous").unwrap().as_ref()
+                    );
+                }
+                assert!(generations.len() <= 2);
+                assert!(!std::fs::read_dir(&home.0).unwrap().any(|entry| {
+                    entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .ends_with(".tmp")
+                }));
+                if finished {
+                    assert_eq!(selected, Some(new.clone()));
+                    completed = true;
+                    break;
+                }
+            }
+            assert!(completed, "{layout}: did not reach a complete installation");
+        }
+    }
+
+    #[test]
+    fn removing_the_vpn_pair_deletes_every_generation_and_the_documented_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+        assert!(!home.remove_vpn_pair().unwrap(), "nothing installed yet");
+        home.install_vpn_pair(b"CA one", b"certificate one")
+            .unwrap();
+        home.install_vpn_pair(b"CA two", b"certificate two")
+            .unwrap();
+        assert!(home.file(VPN_FILES[1]).exists());
+        assert!(home.remove_vpn_pair().unwrap());
+        for name in VPN_FILES {
+            assert!(
+                std::fs::symlink_metadata(home.file(name)).is_err(),
+                "{name} is gone"
+            );
+        }
+        let vpn = home.file(VPN_DIR);
+        assert!(!vpn.join(VPN_CURRENT).exists());
+        assert!(
+            std::fs::read_dir(&vpn)
+                .unwrap()
+                .all(|entry| { entry.unwrap().file_name() == "write.lock" }),
+            "no generation is left"
+        );
+        assert!(
+            !home.remove_vpn_pair().unwrap(),
+            "a second removal finds nothing"
+        );
+        home.recover_vpn().unwrap();
+        assert!(
+            !home.file(VPN_FILES[1]).exists(),
+            "recovery does not bring it back"
+        );
+        // A later accepted claim installs a new pair as before.
+        home.install_vpn_pair(b"CA three", b"certificate three")
+            .unwrap();
+        assert_eq!(std::fs::read(home.file(VPN_FILES[0])).unwrap(), b"CA three");
+        assert_eq!(
+            std::fs::read(home.file(VPN_FILES[1])).unwrap(),
+            b"certificate three"
+        );
+    }
+
+    /// Every interruption of a removal, then recovery: the pair never comes back, and the
+    /// marker stays until a later install clears it. Runs on every OS.
+    #[test]
+    fn an_interrupted_vpn_removal_is_finished_by_recovery_and_never_restored() {
+        let mut completed = false;
+        for layout in ["generations", "plain files"] {
+            completed = false;
+            for step in 1..=32 {
+                let dir = tempfile::tempdir().unwrap();
+                let home = Home(dir.path().join("fictional-home"));
+                if layout == "generations" {
+                    home.install_vpn_pair(b"CA one", b"certificate one")
+                        .unwrap();
+                    home.install_vpn_pair(b"CA two", b"certificate two")
+                        .unwrap();
+                } else {
+                    std::fs::create_dir_all(&home.0).unwrap();
+                    for name in VPN_FILES {
+                        std::fs::write(home.file(name), b"plain").unwrap();
+                    }
+                }
+                INTERRUPT_AFTER.with(|left| left.set(Some(step)));
+                let result = std::panic::catch_unwind(|| home.remove_vpn_pair());
+                INTERRUPT_AFTER.with(|left| left.set(None));
+                let finished = result.is_ok();
+                assert!(home.vpn_removal_pending(), "{layout} step {step}: marked");
+                // Recovery can be interrupted too.
+                for recovery_step in 1..=4 {
+                    INTERRUPT_AFTER.with(|left| left.set(Some(recovery_step)));
+                    let _ = std::panic::catch_unwind(|| home.recover_vpn());
+                    INTERRUPT_AFTER.with(|left| left.set(None));
+                }
+                home.recover_vpn().unwrap();
+                for name in VPN_FILES {
+                    assert!(
+                        std::fs::symlink_metadata(home.file(name)).is_err(),
+                        "{layout} step {step}: {name} is gone"
+                    );
+                }
+                assert!(
+                    std::fs::read_dir(home.file(VPN_DIR))
+                        .map(|mut entries| entries
+                            .all(|entry| entry.unwrap().file_name() == "write.lock"))
+                        .unwrap_or(true),
+                    "{layout} step {step}: no generation is left"
+                );
+                assert!(home.vpn_removal_pending());
+                // A later accepted claim installs again and clears the marker.
+                home.install_vpn_pair(b"CA three", b"certificate three")
+                    .unwrap();
+                assert!(!home.vpn_removal_pending());
+                assert_eq!(
+                    std::fs::read(home.file(VPN_FILES[1])).unwrap(),
+                    b"certificate three"
+                );
+                if finished {
+                    completed = true;
+                    break;
+                }
+            }
+            assert!(completed, "{layout}: removal never finished");
+        }
+        assert!(completed);
+    }
+
+    #[test]
+    fn removing_the_vpn_pair_also_removes_plain_files_of_an_old_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+        for name in VPN_FILES {
+            std::fs::write(home.file(name), b"plain").unwrap();
+        }
+        assert!(home.remove_vpn_pair().unwrap());
+        assert!(VPN_FILES.iter().all(|name| !home.file(name).exists()));
+    }
+
+    const PASSWORD_SET_RULE: &str = r#"[[control]]
+id = "password_set"
+source = "company_policy"
+check = "builtin:password_set@1"
+output = ["yes", "no", "unknown"]
+required = { macos = "yes", windows = "yes", linux = "yes" }
+grace = "1d"
+"#;
+
+    #[tokio::test]
+    async fn a_failed_control_past_its_grace_deletes_the_vpn_certificate_and_sends_a_claim_at_once()
+    {
+        // `password_set` reads `unknown` on every OS, so it fails the same way everywhere.
+        let (_probe, address) = open_probe();
+        let table = format!("{PASSWORD_SET_RULE}\n{}", vpn_table(&address));
+        let denied = r#"{"status":"denied","reasons":["password_set = unknown, yes required, unknown_grace 7d ended"]}"#;
+        let fixture = claim_fixture_replying(
+            Some(denied),
+            unchanged,
+            grown_checkpoint,
+            valid_pair,
+            Some(AGREED),
+            Some(&table),
+        )
+        .await;
+        assert_eq!(earlier_pair(&fixture), EARLIER_PAIR);
+        // The device has failed `password_set` for thirty days, longer than `unknown_grace`.
+        let since = chrono::Utc::now().timestamp() - 30 * 86_400;
+        fixture
+            .home
+            .write(
+                "report-state.json",
+                json!({ "vpn_up": true, "last_success": null, "first_failed": { "password_set": since } })
+                    .to_string()
+                    .as_bytes(),
+            )
+            .unwrap();
+        let schedule = fixture
+            .home
+            .signed_manifest()
+            .unwrap()
+            .body()
+            .schedule
+            .clone()
+            .unwrap();
+        let authorization = schedule::ScheduleAuthorization {
+            manifest_hash: fixture.home.enrolment().unwrap().manifest,
+            schedule,
+            owner_consented: true,
+            self_removal: true,
+        };
+        let tick = || {
+            schedule::tick(
+                &fixture.home,
+                &fixture.home,
+                None,
+                &authorization,
+                checks::EventMarkerReads::default,
+            )
+        };
+        tick().await.unwrap();
+        for name in ["ca.pem", "vpn-cert.pem"] {
+            assert!(
+                std::fs::symlink_metadata(fixture.home.file(name)).is_err(),
+                "{name} was deleted and the denied claim installed no new one"
+            );
+        }
+        assert_eq!(
+            claim_posts(&fixture),
+            1,
+            "the claim went out in the same wake"
+        );
+        let log = job_log_text(&fixture);
+        assert_eq!(
+            log.matches("Removed the VPN certificate").count(),
+            1,
+            "{log}"
+        );
+        assert!(log.contains("password_set"), "{log}");
+        assert!(schedule_state(&fixture)["last_success"].is_number());
+        tick().await.unwrap();
+        assert_eq!(claim_posts(&fixture), 1, "nothing is due the next minute");
+        assert_eq!(
+            job_log_text(&fixture)
+                .matches("Removed the VPN certificate")
+                .count(),
+            1,
+            "the removal is logged once"
+        );
+    }
+
+    /// A removal that cannot finish (`ca.pem` is a non-empty directory, so deleting it fails on
+    /// every OS) does not keep the claim from the gateway.
+    #[tokio::test]
+    async fn a_blocked_removal_does_not_stop_the_claim_from_reaching_the_gateway() {
+        let (_probe, address) = open_probe();
+        let denied = r#"{"status":"denied","reasons":["fictional denial"]}"#;
+        let fixture = claim_fixture_replying(
+            Some(denied),
+            unchanged,
+            grown_checkpoint,
+            valid_pair,
+            Some(AGREED),
+            None,
+        )
+        .await;
+        std::fs::remove_file(fixture.home.file(VPN_FILES[0])).unwrap();
+        std::fs::create_dir(fixture.home.file(VPN_FILES[0])).unwrap();
+        std::fs::write(fixture.home.file(VPN_FILES[0]).join("held"), b"x").unwrap();
+        fixture.home.begin_vpn_removal().unwrap();
+        assert!(
+            fixture.home.recover_vpn().is_err(),
+            "the removal is blocked"
+        );
+        tick_once(&fixture, &address).await.unwrap();
+        assert_eq!(claim_posts(&fixture), 1, "the claim reached the gateway");
+        let log = job_log_text(&fixture);
+        assert!(
+            log.contains("Could not finish the VPN certificate removal"),
+            "{log}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_accepted_claim_after_the_removal_installs_a_new_certificate() {
+        let (_probe, address) = open_probe();
+        let table = format!("{PASSWORD_SET_RULE}\n{}", vpn_table(&address));
+        let fixture = claim_fixture_replying(
+            None,
+            unchanged,
+            grown_checkpoint,
+            valid_pair,
+            Some(AGREED),
+            Some(&table),
+        )
+        .await;
+        let since = chrono::Utc::now().timestamp() - 30 * 86_400;
+        fixture
+            .home
+            .write(
+                "report-state.json",
+                json!({ "vpn_up": true, "last_success": null, "first_failed": { "password_set": since } })
+                    .to_string()
+                    .as_bytes(),
+            )
+            .unwrap();
+        let schedule = fixture
+            .home
+            .signed_manifest()
+            .unwrap()
+            .body()
+            .schedule
+            .clone()
+            .unwrap();
+        let authorization = schedule::ScheduleAuthorization {
+            manifest_hash: fixture.home.enrolment().unwrap().manifest,
+            schedule,
+            owner_consented: true,
+            self_removal: true,
+        };
+        schedule::tick(
+            &fixture.home,
+            &fixture.home,
+            None,
+            &authorization,
+            checks::EventMarkerReads::default,
+        )
+        .await
+        .unwrap();
+        let [ca, cert] = earlier_pair(&fixture);
+        assert_eq!(ca, fixture.pair.ca.as_bytes());
+        assert_eq!(cert, fixture.pair.cert.as_deref().unwrap().as_bytes());
+        assert!(job_log_text(&fixture).contains("Removed the VPN certificate"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_vpn_recovery_repairs_flat_files_and_removes_stale_generations() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+        home.install_vpn_pair(b"fictional CA", b"fictional certificate")
+            .unwrap();
+        let selected = selected_windows_vpn_pair(&home).unwrap();
+        std::fs::write(home.file(VPN_FILES[0]), b"stale CA").unwrap();
+        std::fs::remove_file(home.file(VPN_FILES[1])).unwrap();
+        let vpn = home.file(VPN_DIR);
+        std::fs::create_dir(vpn.join("123-456")).unwrap();
+        std::fs::write(vpn.join("123-456/ca.pem"), b"unfinished").unwrap();
+        std::fs::write(vpn.join(".current.123.tmp"), b"unfinished").unwrap();
+        std::fs::write(home.file(".ca.pem.123.tmp"), b"unfinished").unwrap();
+        home.recover_vpn().unwrap();
+        assert_eq!(
+            VPN_FILES.map(|name| std::fs::read(home.file(name)).unwrap()),
+            selected
+        );
+        assert_eq!(std::fs::read_dir(vpn).unwrap().count(), 3);
+        assert!(!home.file(".ca.pem.123.tmp").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_vpn_reader_retries_after_two_switches() {
+        for switches in [1, 2] {
+            let dir = tempfile::tempdir().unwrap();
+            let home = Home(dir.path().to_path_buf());
+            home.install_vpn_pair(b"CA one", b"certificate one")
+                .unwrap();
+            let vpn = home.file(VPN_DIR);
+            let first = home.vpn_generation(VPN_CURRENT).unwrap().unwrap();
+            let mut attempts = 0;
+            let pair = loop {
+                attempts += 1;
+                let before = home.vpn_generation(VPN_CURRENT).unwrap().unwrap();
+                let ca = std::fs::read(vpn.join(&before).join(VPN_FILES[0]));
+                if attempts == 1 {
+                    home.install_vpn_pair(b"CA two", b"certificate two")
+                        .unwrap();
+                    assert!(vpn.join(&first).join(VPN_FILES[1]).exists());
+                    if switches == 2 {
+                        home.install_vpn_pair(b"CA three", b"certificate three")
+                            .unwrap();
+                        assert!(!vpn.join(&first).exists());
+                    }
+                }
+                let cert = std::fs::read(vpn.join(&before).join(VPN_FILES[1]));
+                let after = home.vpn_generation(VPN_CURRENT).unwrap().unwrap();
+                if before == after
+                    && let (Ok(ca), Ok(cert)) = (ca, cert)
+                {
+                    break [ca, cert];
+                }
+                assert!(attempts < 10);
+            };
+            assert_eq!(attempts, 2);
+            assert_eq!(Some(pair), selected_windows_vpn_pair(&home));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_vpn_sharing_violation_keeps_new_generation_and_retries_flat_copies() {
+        use std::os::windows::fs::OpenOptionsExt;
+        for native in [false, true] {
+            for baseline in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let home = Home(dir.path().to_path_buf());
+                let old = [b"old CA".to_vec(), b"old certificate".to_vec()];
+                if baseline {
+                    for (name, bytes) in VPN_FILES.iter().zip(&old) {
+                        home.write(name, bytes).unwrap();
+                    }
+                } else {
+                    home.install_vpn_pair(&old[0], &old[1]).unwrap();
+                }
+                let held = if native {
+                    Some(
+                        std::fs::OpenOptions::new()
+                            .read(true)
+                            .share_mode(1 | 2)
+                            .open(home.file(VPN_FILES[1]))
+                            .unwrap(),
+                    )
+                } else {
+                    VPN_RENAME_ERROR.with(|target| target.replace(Some(home.file(VPN_FILES[1]))));
+                    None
+                };
+                let error = home
+                    .install_vpn_pair(b"new CA", b"new certificate")
+                    .unwrap_err();
+                let message = format!("{error:#}");
+                assert!(message.contains("vpn-cert.pem"), "{message}");
+                assert!(
+                    message.contains("close the program that holds it and run check again"),
+                    "{message}"
+                );
+                assert!(
+                    error
+                        .chain()
+                        .any(
+                            |cause| cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                                match error.raw_os_error() {
+                                    Some(32) => true,
+                                    Some(5) => native,
+                                    _ => false,
+                                }
+                            })
+                        ),
+                    "{message}"
+                );
+                let new = [b"new CA".to_vec(), b"new certificate".to_vec()];
+                assert_eq!(selected_windows_vpn_pair(&home), Some(new.clone()));
+                assert_eq!(std::fs::read(home.file(VPN_FILES[0])).unwrap(), new[0]);
+                assert_eq!(std::fs::read(home.file(VPN_FILES[1])).unwrap(), old[1]);
+                assert!(home.file(VPN_DIR).join(VPN_FLAT_STALE).exists());
+                drop(held);
+                home.recover_vpn().unwrap();
+                assert_eq!(
+                    VPN_FILES.map(|name| std::fs::read(home.file(name)).unwrap()),
+                    new
+                );
+                assert!(!home.file(VPN_DIR).join(VPN_FLAT_STALE).exists());
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_vpn_lock_serializes_install_and_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+        home.install_vpn_pair(b"CA one", b"certificate one")
+            .unwrap();
+        let guard = home.lock_vpn().unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            for recover in [false, true] {
+                let home = &home;
+                let started = started_tx.clone();
+                let done = done_tx.clone();
+                scope.spawn(move || {
+                    started.send(()).unwrap();
+                    if recover {
+                        home.recover_vpn().unwrap();
+                    } else {
+                        home.install_vpn_pair(b"CA two", b"certificate two")
+                            .unwrap();
+                    }
+                    done.send(()).unwrap();
+                });
+            }
+            started_rx.recv().unwrap();
+            started_rx.recv().unwrap();
+            assert!(
+                done_rx
+                    .recv_timeout(std::time::Duration::from_millis(100))
+                    .is_err()
+            );
+            assert_eq!(selected_windows_vpn_pair(&home).unwrap()[0], b"CA one");
+            drop(guard);
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+        });
+        assert_eq!(selected_windows_vpn_pair(&home).unwrap()[0], b"CA two");
+        home.recover_vpn().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_vpn_startup_recovers_for_log_and_warns_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+        home.install_vpn_pair(b"CA one", b"certificate one")
+            .unwrap();
+        home.write(LOG_CHECKPOINT, b"fictional checkpoint").unwrap();
+        home.write(VPN_FILES[0], b"interrupted flat copy").unwrap();
+        let home_path = dir.path().to_path_buf();
+        let cli = move || {
+            Cli::parse_from([
+                "open-pact-client",
+                "--home",
+                home_path.to_str().unwrap(),
+                "log",
+                "head",
+            ])
+        };
+        let lock = home.lock_vpn().unwrap();
+        assert!(!home.recover_vpn_at_startup().unwrap());
+        let handle = tokio::runtime::Handle::current();
+        let cli_for_task = cli.clone();
+        let run_while_locked =
+            tokio::task::spawn_blocking(move || handle.block_on(run(cli_for_task())));
+        let timely =
+            tokio::time::timeout(std::time::Duration::from_secs(1), run_while_locked).await;
+        drop(lock);
+        assert!(timely.is_ok(), "log command must not wait for the VPN lock");
+        assert_eq!(timely.unwrap().unwrap().unwrap(), ExitCode::SUCCESS);
+        assert_eq!(
+            std::fs::read(home.file(VPN_FILES[0])).unwrap(),
+            b"interrupted flat copy"
+        );
+        assert_eq!(run(cli()).await.unwrap(), ExitCode::SUCCESS);
+        assert_eq!(std::fs::read(home.file(VPN_FILES[0])).unwrap(), b"CA one");
+        std::fs::write(home.file(VPN_DIR).join(VPN_CURRENT), b"../invalid").unwrap();
+        assert_eq!(run(cli()).await.unwrap(), ExitCode::SUCCESS);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_vpn_recovery_rejects_an_invalid_or_incomplete_selection_before_copying() {
+        for pointer in ["../outside", "", "123-456"] {
+            let dir = tempfile::tempdir().unwrap();
+            let home = Home(dir.path().to_path_buf());
+            let vpn = home.file(VPN_DIR);
+            std::fs::create_dir_all(vpn.join("123-456")).unwrap();
+            std::fs::write(vpn.join("123-456/ca.pem"), b"fictional new CA").unwrap();
+            std::fs::write(vpn.join(VPN_CURRENT), pointer).unwrap();
+            home.write(VPN_FILES[0], b"fictional old CA").unwrap();
+            home.write(VPN_FILES[1], b"fictional old certificate")
+                .unwrap();
+            assert!(home.recover_vpn().is_err());
+            assert_eq!(
+                std::fs::read(home.file(VPN_FILES[0])).unwrap(),
+                b"fictional old CA"
+            );
+            assert_eq!(
+                std::fs::read(home.file(VPN_FILES[1])).unwrap(),
+                b"fictional old certificate"
+            );
+        }
+    }
+
+    #[test]
+    fn the_vpn_certificate_request_carries_only_the_public_key() {
+        use x509_parser::certification_request::X509CertificationRequest;
+        use x509_parser::prelude::FromDer;
+        let dir = tempfile::tempdir().unwrap();
+        let (pem, der) = vpn_csr(&Home(dir.path().to_path_buf())).unwrap();
+        let (_, parsed) = x509_parser::pem::parse_x509_pem(pem.as_bytes()).unwrap();
+        assert_eq!(parsed.contents, der);
+        let (rest, csr) = X509CertificationRequest::from_der(&der).unwrap();
+        assert!(rest.is_empty());
+        let info = &csr.certification_request_info;
+        assert_eq!(info.subject.iter().count(), 0, "empty subject");
+        assert!(info.attributes().is_empty(), "no attributes or extensions");
+    }
+
+    #[test]
+    fn probes_and_sends_virtualized_only_if_the_manifest_discloses_it() {
+        let listed = Manifest::parse(DEMO_MANIFEST.as_bytes()).unwrap();
+        assert_eq!(
+            disclosable_virtualized(&listed, || Virtualized::Yes),
+            Some(Virtualized::Yes)
+        );
+        let unlisted = DEMO_MANIFEST.replace(r#""virtualized", "#, "");
+        assert_ne!(unlisted, DEMO_MANIFEST);
+        let unlisted = Manifest::parse(unlisted.as_bytes()).unwrap();
+        assert_eq!(
+            disclosable_virtualized(&unlisted, || panic!("probed")),
+            None
+        );
+    }
+
+    fn demo_manifest() -> String {
+        DEMO_MANIFEST.replace("\r\n", "\n")
+    }
+
+    fn without_repository_controls() -> String {
+        ["managed_repos_outside", "managed_repos_total"]
+            .iter()
+            .fold(demo_manifest(), |toml, id| {
+                let start = toml.find(&format!("[[control]]\nid = \"{id}\"\n")).unwrap();
+                let end = start + toml[start..].find("\n\n").unwrap() + 2;
+                format!("{}{}", &toml[..start], &toml[end..])
+            })
+    }
+
+    fn without_schedule() -> String {
+        let toml = demo_manifest();
+        toml[..toml.find("\n[schedule]").unwrap()].to_owned()
+    }
+
+    fn always_schedule() -> String {
+        with_schedule(
+            &demo_manifest(),
+            "[schedule]\nmode = \"always\"\ninterval = \"1h\"",
+        )
+    }
+
+    fn setup_context(toml: &str, os: Os) -> SetupContext {
+        SetupContext {
+            manifest: Manifest::parse(toml.as_bytes()).unwrap(),
+            os,
+            current: device_config::DeviceConfig::default(),
+            overview: "  No managed repositories found.\n".into(),
+            suggested: Vec::new(),
+            legacy: Vec::new(),
+            user_home: Some(PathBuf::from("/home/example")),
+        }
+    }
+
+    fn answer(context: &SetupContext, input: &str) -> (SetupChoices, String) {
+        let mut output = Vec::new();
+        let choices = setup_questions(context, &mut input.as_bytes(), &mut output).unwrap();
+        (choices, String::from_utf8(output).unwrap())
+    }
+
+    #[test]
+    fn step_five_asks_about_a_vpn_schedule_and_repository_folders() {
+        let context = setup_context(&demo_manifest(), Os::Macos);
+        let (choices, output) = answer(&context, "\n~/work\n\n");
+        assert_eq!(
+            choices,
+            SetupChoices {
+                auto_send: true,
+                run_as: device_config::RunAs::User,
+                folders: vec![PathBuf::from("/home/example/work")],
+            }
+        );
+        assert!(output.contains(
+            "Automatic claims: only while vpn.example.org answers at 10.0.0.1:443, every 55 minutes, and at once when a check result changes"
+        ));
+        assert!(output.contains("Send claims automatically while on the company VPN? [Y/n] "));
+        assert!(output.contains("No managed repositories found."));
+        assert!(output.contains("Another folder that holds repositories"));
+        assert!(!output.contains("SYSTEM"), "macOS has no SYSTEM job");
+    }
+
+    #[test]
+    fn step_five_reads_the_policy_line_before_it_asks_for_always() {
+        let context = setup_context(&always_schedule(), Os::Linux);
+        let (choices, output) = answer(&context, "n\n\n");
+        assert!(!choices.auto_send);
+        let policy = output
+            .find("Automatic claims: every 1 hour on any network, and at once when a check result changes")
+            .unwrap();
+        let question = output
+            .find("Send claims automatically as the manifest says? [Y/n] ")
+            .unwrap();
+        assert!(policy < question);
+    }
+
+    #[test]
+    fn step_five_does_not_ask_about_a_schedule_the_manifest_lacks() {
+        let context = setup_context(&without_schedule(), Os::Macos);
+        let (choices, output) = answer(&context, "~/work\n\n");
+        assert!(!choices.auto_send);
+        assert_eq!(choices.folders, [PathBuf::from("/home/example/work")]);
+        assert!(!output.contains("Send claims automatically"));
+        assert!(output.contains("The company did not define automatic sending"));
+    }
+
+    #[test]
+    fn step_five_does_not_ask_for_folders_without_a_repository_control() {
+        let context = setup_context(&without_repository_controls(), Os::Macos);
+        let (choices, output) = answer(&context, "\n");
+        assert!(choices.auto_send && choices.folders.is_empty());
+        assert!(!output.contains("folder"));
+        let context = setup_context(
+            &with_schedule(&without_repository_controls(), ""),
+            Os::Macos,
+        );
+        let (choices, output) = answer(&context, "");
+        assert_eq!(
+            choices,
+            SetupChoices {
+                auto_send: false,
+                run_as: device_config::RunAs::User,
+                folders: Vec::new(),
+            }
+        );
+        assert!(!output.contains("folder") && !output.contains("Send claims"));
+    }
+
+    #[test]
+    fn step_five_asks_who_runs_the_job_only_on_windows_and_only_after_a_yes() {
+        let context = setup_context(&demo_manifest(), Os::Windows);
+        let (choices, output) = answer(&context, "y\ny\n\n");
+        assert!(choices.auto_send);
+        assert_eq!(choices.run_as, device_config::RunAs::System);
+        assert!(output.contains("Run the job as SYSTEM instead of as you?"));
+        let (choices, _) = answer(&context, "y\n\n\n");
+        assert_eq!(
+            choices.run_as,
+            device_config::RunAs::User,
+            "the default is you"
+        );
+        let (choices, output) = answer(&context, "n\n\n");
+        assert!(!choices.auto_send && !output.contains("SYSTEM"));
+    }
+
+    #[test]
+    fn step_five_offers_old_and_found_folders_and_keeps_the_owners_no() {
+        let mut context = setup_context(&demo_manifest(), Os::Macos);
+        context.legacy = vec![PathBuf::from("/srv/code")];
+        context.suggested = vec![PathBuf::from("/home/example/work")];
+        let (choices, output) = answer(&context, "y\ny\ny\n\n");
+        assert_eq!(
+            choices.folders,
+            [
+                PathBuf::from("/srv/code"),
+                PathBuf::from("/home/example/work")
+            ]
+        );
+        assert!(output.contains("Import these folders from open-pact.toml: /srv/code? [Y/n] "));
+        assert!(
+            output.contains(
+                "Use these folders for the repository checks: /home/example/work? [Y/n] "
+            )
+        );
+        let (choices, _) = answer(&context, "n\nn\nn\n\n");
+        assert!(!choices.auto_send && choices.folders.is_empty());
+        let (choices, output) = answer(&context, "y\nn\nn\n~/work\n~/work\n\n");
+        assert_eq!(choices.folders, [PathBuf::from("/home/example/work")]);
+        assert!(output.contains("is already listed"));
+    }
+
+    #[test]
+    fn step_five_keeps_the_folders_the_owner_already_chose() {
+        let mut context = setup_context(&demo_manifest(), Os::Macos);
+        context.current.folders = vec![PathBuf::from("/srv/code")];
+        context.suggested = vec![PathBuf::from("/srv/code")];
+        let (choices, output) = answer(&context, "y\n\n");
+        assert_eq!(choices.folders, [PathBuf::from("/srv/code")]);
+        assert!(output.contains("Your folders now: /srv/code"));
+        assert!(!output.contains("Use these folders"));
+    }
+
+    #[tokio::test]
+    async fn step_five_saves_the_choices_and_counts_as_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+        assert_eq!(wizard_resume(&home).unwrap(), WizardResume::Setup);
+        apply_setup(
+            &home,
+            SetupChoices {
+                auto_send: false,
+                run_as: device_config::RunAs::User,
+                folders: vec![PathBuf::from("/srv/code")],
+            },
+        )
+        .await
+        .unwrap();
+        let config = device_config::DeviceConfig::load(&home).unwrap();
+        assert_eq!(config.folders, [PathBuf::from("/srv/code")]);
+        assert!(!config.auto_send);
+        assert_eq!(wizard_resume(&home).unwrap(), WizardResume::FirstCheck);
+    }
+
+    #[tokio::test]
+    async fn the_folders_command_lists_adds_and_removes() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().join("client"));
+        fs::create_dir_all(&home.0).unwrap();
+        let work = dir.path().join("work");
+        let add = |path: &Path| FoldersCommand::Add { path: path.into() };
+        assert_eq!(folders(&home, add(&work)).await.unwrap(), ExitCode::SUCCESS);
+        assert_eq!(
+            device_config::DeviceConfig::load(&home).unwrap().folders,
+            std::slice::from_ref(&work)
+        );
+        let _ = folders(&home, add(&work)).await.unwrap();
+        assert_eq!(
+            device_config::DeviceConfig::load(&home)
+                .unwrap()
+                .folders
+                .len(),
+            1
+        );
+        let _ = folders(&home, FoldersCommand::List).await.unwrap();
+        let _ = folders(&home, FoldersCommand::Remove { path: work.clone() })
+            .await
+            .unwrap();
+        assert!(
+            device_config::DeviceConfig::load(&home)
+                .unwrap()
+                .folders
+                .is_empty()
+        );
+        let error = folders(&home, FoldersCommand::Remove { path: work })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("is not listed"));
+    }
+
+    #[test]
+    fn accept_lists_a_schedule_change_like_any_other_change() {
+        let old = Manifest::parse(demo_manifest().as_bytes()).unwrap();
+        let faster = Manifest::parse(
+            demo_manifest()
+                .replace("interval = \"55m\"", "interval = \"30m\"")
+                .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            manifest_changes(&old, &faster),
+            [
+                "automatic claims: only while vpn.example.org answers at 10.0.0.1:443, every 30 minutes, and at once when a check result changes (was only while vpn.example.org answers at 10.0.0.1:443, every 55 minutes, and at once when a check result changes)"
+            ]
+        );
+        let none = Manifest::parse(without_schedule().as_bytes()).unwrap();
+        assert_eq!(
+            manifest_changes(&none, &old),
+            [
+                "automatic claims: only while vpn.example.org answers at 10.0.0.1:443, every 55 minutes, and at once when a check result changes (was none)"
+            ]
+        );
+        assert_eq!(
+            manifest_changes(&old, &none),
+            [
+                "automatic claims: none (was only while vpn.example.org answers at 10.0.0.1:443, every 55 minutes, and at once when a check result changes)"
+            ]
+        );
+        assert!(manifest_changes(&old, &old).is_empty());
+    }
+
+    #[test]
+    fn manifest_builtins_json_is_one_entry_per_builtin_in_order() {
+        let text = manifest_builtins(true).unwrap();
+        let entries: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
+        assert_eq!(entries.len(), open_pact_core::builtin_defaults().count());
+        let (id, version, about) = open_pact_core::builtin_defaults().next().unwrap();
+        assert!(text.starts_with(&format!(
+            r#"[{{"check":"builtin:{id}@{version}","id":"{id}","about":"#
+        )));
+        assert_eq!(
+            entries[0],
+            serde_json::json!({"check": format!("builtin:{id}@{version}"), "id": id, "about": about})
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.as_object().unwrap().len() == 3)
+        );
+    }
+
+    #[test]
+    fn manifest_builtins_text_prints_the_check_then_its_text_on_one_line() {
+        let text = manifest_builtins(false).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), open_pact_core::builtin_defaults().count());
+        let (id, version, about) = open_pact_core::builtin_defaults().next().unwrap();
+        assert_eq!(lines[0], format!("builtin:{id}@{version}  {about}"));
+    }
+
+    #[test]
+    fn the_review_summary_shows_the_default_text_of_a_builtin_without_a_description() {
+        let summary = |toml: &str| {
+            let manifest = Manifest::parse(toml.as_bytes()).unwrap();
+            let mut output = Vec::new();
+            write_summary(&mut output, &manifest, "sha256:fictional", Os::Macos).unwrap();
+            String::from_utf8(output).unwrap()
+        };
+        let firewall = open_pact_core::builtin_about("builtin:firewall@1").unwrap();
+        assert!(summary(&demo_manifest()).contains(&format!("why: {firewall}\n")));
+        let owner_words = demo_manifest().replace(
+            "check = \"builtin:firewall@1\"",
+            "check = \"builtin:firewall@1\"\ndescription = \"Our own words.\"",
+        );
+        let with_description = summary(&owner_words);
+        assert!(with_description.contains("why: Our own words.\n"));
+        assert!(!with_description.contains(firewall));
+    }
+
+    #[test]
+    fn the_review_summary_states_the_automatic_claims_in_plain_words() {
+        let summary = |toml: &str| {
+            let manifest = Manifest::parse(toml.as_bytes()).unwrap();
+            let mut output = Vec::new();
+            write_summary(&mut output, &manifest, "sha256:fictional", Os::Macos).unwrap();
+            String::from_utf8(output).unwrap()
+        };
+        assert!(summary(&demo_manifest()).contains(
+            "  Automatic claims: only while vpn.example.org answers at 10.0.0.1:443, every 55 minutes, and at once when a check result changes\n"
+        ));
+        assert!(
+            summary(&always_schedule()).contains("  Automatic claims: every 1 hour on any network, and at once when a check result changes\n")
+        );
+        assert!(
+            summary(&without_schedule())
+                .contains("  Automatic claims: none. You send claims by hand with `check`\n")
+        );
+    }
+
+    #[test]
+    fn the_reading_copy_is_in_the_home_until_the_question_is_answered() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+        let copy = ReadingCopy::write(&home, "manifest_version = 1\n").unwrap();
+        assert!(copy.0.is_absolute());
+        assert_eq!(
+            fs::read_to_string(&copy.0).unwrap(),
+            "manifest_version = 1\n"
+        );
+        let path = copy.0.clone();
+        drop(copy);
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn a_scheduled_run_follows_the_signed_manifest_while_an_accept_is_pending() {
+        let (_probe, open) = open_probe();
+        let (_closed, refused) = refused_probe();
+        let refused_table = vpn_table(&refused);
+        let fixture = claim_fixture_replying(
+            None,
+            |signed| with_schedule(&with_password_rule(signed), &refused_table),
+            grown_checkpoint,
+            valid_pair,
+            Some(AGREED),
+            Some(&vpn_table(&open)),
+        )
+        .await;
+        let stored = std::fs::read(fixture.home.file("manifest.toml")).unwrap();
+        schedule::run(
+            &fixture.home,
+            schedule::Command::Run {
+                system: false,
+                user_home: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            claim_posts(&fixture),
+            1,
+            "the probe of the signed manifest answers, the probe of the pending one does not"
+        );
+        let log = job_log_text(&fixture);
+        assert!(
+            log.contains("The manifest changed") && log.contains("accept"),
+            "{log}"
+        );
+        assert_eq!(
+            std::fs::read(fixture.home.file("manifest.toml")).unwrap(),
+            stored,
+            "only accept replaces the signed manifest"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_scheduled_tick_under_always_sends_without_a_probe() {
+        let fixture = scheduled_fixture(None, unchanged, grown_checkpoint).await;
+        tick_under(&fixture, &always_every_55_minutes())
+            .await
+            .unwrap();
+        assert_eq!(claim_posts(&fixture), 1);
+        assert!(schedule_state(&fixture)["last_success"].is_number());
+        tick_under(&fixture, &always_every_55_minutes())
+            .await
+            .unwrap();
+        assert_eq!(claim_posts(&fixture), 1, "the interval has not passed");
+    }
+
+    #[tokio::test]
+    async fn the_job_reads_always_from_the_signed_manifest() {
+        let fixture = claim_fixture_replying(
+            None,
+            unchanged,
+            grown_checkpoint,
+            valid_pair,
+            Some(AGREED),
+            Some("[schedule]\nmode = \"always\"\ninterval = \"1h\""),
+        )
+        .await;
+        schedule::run(
+            &fixture.home,
+            schedule::Command::Run {
+                system: false,
+                user_home: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(claim_posts(&fixture), 1);
+    }
+
+    /// A saved pending or revoked status does not hide the claim. `check` asks the gateway again,
+    /// and the dry run cannot, so it prints the claim and the saved status.
+    #[tokio::test]
+    async fn check_dry_run_prints_the_claim_when_the_saved_status_is_pending_or_revoked() {
+        for (state, status) in [
+            (DeviceStatus::Pending, "pending"),
+            (DeviceStatus::Revoked, "revoked"),
+        ] {
+            let company = Company::new();
+            let witness = Witness::new();
+            let toml = witnessed_manifest(&witness);
+            let published = Company::published(&toml, &company.key);
+            let log = company.log.vkey();
+            let checkpoint = cosigned_empty_checkpoint(&company, &witness);
+            let gateway = FakeGateway::start(move |line, _| match line {
+                "GET /v1/manifest" => (200, published.clone()),
+                "GET /v1/log/key" => (200, log.clone()),
+                "GET /v1/log/checkpoint" => (200, checkpoint.clone()),
+                _ => not_found(),
+            })
+            .await;
+            let dir = tempfile::tempdir().unwrap();
+            let home = enrolled_home_with(dir.path(), &gateway.url, &company, &toml);
+            let mut enrolment = home.enrolment().unwrap();
+            enrolment.last_status = Some(state);
+            home.write("enrolment.json", &serde_json::to_vec(&enrolment).unwrap())
+                .unwrap();
+            let before = snapshot(dir.path());
+
+            let claim::Preview::Request {
+                request,
+                last_status,
+            } = check_preview(&home, true).await.unwrap()
+            else {
+                panic!("{status}: the dry run printed no claim");
+            };
+            assert_eq!(last_status, Some(status));
+            assert!(
+                request["claim"].is_object(),
+                "{status}: the claim is printed"
+            );
+            assert_eq!(
+                gateway.posts(),
+                Vec::<String>::new(),
+                "{status}: no signed request"
+            );
+            assert!(
+                gateway
+                    .requests()
+                    .iter()
+                    .all(|request| request.starts_with("GET ")),
+                "{status}: only GET requests: {:?}",
+                gateway.requests()
+            );
+            assert_eq!(snapshot(dir.path()), before, "{status}: no file written");
+            assert_eq!(
+                check_dry_run(&home, true).await.unwrap(),
+                ExitCode::SUCCESS,
+                "{status}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn check_dry_run_reports_a_log_alarm_like_check() {
+        let company = Company::new();
+        let attacker = dev_key::generate();
+        let log = company.log.vkey();
+        let gateway = FakeGateway::start(move |line, _| match line {
+            "GET /v1/manifest" => (200, Company::published(DEMO_MANIFEST, &attacker)),
+            "GET /v1/log/key" => (200, format!("{log}\n")),
+            _ => not_found(),
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let home = enrolled_home(dir.path(), &gateway.url, &company);
+        let before = snapshot(dir.path());
+        let preview = check_preview(&home, false).await.unwrap();
+        let claim::Preview::NotSent(claim::Outcome::Alarm(_)) = preview else {
+            panic!("a changed company key must stop the dry run");
+        };
+        assert_eq!(gateway.posts(), Vec::<String>::new());
+        let mut after = snapshot(dir.path());
+        after.remove("repo-scan.json");
+        assert_eq!(after, before);
+        assert_eq!(
+            check_dry_run(&home, false).await.unwrap(),
+            ExitCode::from(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_upgraded_home_keeps_the_old_folders_through_the_job_and_check() {
+        for job_first in [true, false] {
+            let fixture = scheduled_fixture(None, unchanged, grown_checkpoint).await;
+            let home = &fixture.home;
+            home.write(
+                device_config::LEGACY_FILE,
+                b"[managed_repos]\nfolders = ['/srv/code']\n",
+            )
+            .unwrap();
+            let expected = vec![std::path::absolute("/srv/code").unwrap()];
+            let job = || {
+                schedule::run(
+                    home,
+                    schedule::Command::Run {
+                        system: false,
+                        user_home: None,
+                    },
+                )
+            };
+            if job_first {
+                job().await.unwrap();
+            }
+            assert_eq!(check(home, false).await.unwrap(), ExitCode::SUCCESS);
+            if !job_first {
+                job().await.unwrap();
+            }
+            let config = device_config::DeviceConfig::load(home).unwrap();
+            assert_eq!(config.folders, expected, "job first: {job_first}");
+            assert!(!config.setup_answered, "step 5 is still open");
+            assert_eq!(
+                wizard_resume(home).unwrap(),
+                WizardResume::Setup,
+                "join still asks step 5"
+            );
+            assert!(home.file(device_config::LEGACY_FILE).exists());
+            assert!(
+                !fs::read_to_string(home.file(device_config::FILE))
+                    .unwrap()
+                    .contains("legacy"),
+                "the notice flags are not in device.json"
+            );
+        }
+    }
+
+    #[test]
+    fn stop_names_the_elevated_prompt_on_windows_and_a_plain_command_elsewhere() {
+        let home = Path::new("/home/example/pact");
+        let windows = stop_instructions(home, true);
+        assert!(
+            windows.contains("schedule off") && windows.contains("elevated PowerShell prompt"),
+            "{windows}"
+        );
+        #[cfg(windows)]
+        assert!(
+            windows.contains(
+                &std::env::current_exe()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            ),
+            "the full path of this program: {windows}"
+        );
+        let elsewhere = stop_instructions(home, false);
+        assert!(
+            elsewhere.contains("open-pact-client") && elsewhere.contains("schedule off"),
+            "{elsewhere}"
+        );
+        assert!(!elsewhere.contains("elevated"));
+    }
+
+    // ----- JSON output for the desktop apps -----
+
+    fn json_capture() -> (json_out::testing::Capture, std::sync::Arc<json_out::Json>) {
+        let capture = json_out::testing::Capture::default();
+        let json = json_out::Json::new(capture.clone(), json_out::Answers::default());
+        (capture, json)
+    }
+
+    #[test]
+    fn json_flags_need_the_flags_they_depend_on() {
+        let parse = |args: &[&str]| {
+            let mut all = vec!["open-pact-client"];
+            all.extend_from_slice(args);
+            Cli::try_parse_from(all).map(|_| ())
+        };
+        assert!(parse(&["join", "--preview", "opi1:x"]).is_ok());
+        assert!(
+            parse(&["join", "--preview"]).is_err(),
+            "preview needs the invitation"
+        );
+        assert!(parse(&["join", "--preview", "--yes", "opi1:x"]).is_err());
+        assert!(
+            parse(&[
+                "join",
+                "--json",
+                "--yes",
+                "--folder",
+                "/a",
+                "--auto-send",
+                "on"
+            ])
+            .is_ok()
+        );
+        assert!(
+            parse(&["join", "--json"]).is_err(),
+            "--json asks nothing, so it needs --yes"
+        );
+        assert!(parse(&["join", "--yes", "--folder", "/a"]).is_err());
+        assert!(parse(&["join", "--yes", "--auto-send", "on"]).is_err());
+        assert!(parse(&["join", "--json", "--yes", "--auto-send", "maybe"]).is_err());
+        assert!(parse(&["check", "--json"]).is_ok());
+        assert!(parse(&["check", "--json", "--dry-run"]).is_err());
+        assert!(parse(&["check", "--dry-run", "--timings"]).is_ok());
+        assert!(
+            parse(&["check", "--timings"]).is_err(),
+            "timings belong to the dry run: a real check writes files and sends"
+        );
+        assert!(parse(&["accept", "--preview"]).is_ok());
+        assert!(parse(&["accept", "--preview", "--yes"]).is_err());
+    }
+
+    #[tokio::test]
+    async fn text_output_goes_to_the_notes_while_json_is_on() {
+        let (capture, json) = json_capture();
+        json_out::scope(json, async {
+            println!("first");
+            print!("par");
+            println!("tial");
+            assert_eq!(json_out::last_note().as_deref(), Some("partial"));
+        })
+        .await;
+        assert_eq!(
+            capture.text(),
+            "",
+            "text output never reaches the JSON stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_json_prints_the_accepted_claim() {
+        let fixture = claim_fixture_replying(
+            None,
+            |signed| signed.to_string(),
+            grown_checkpoint,
+            valid_pair,
+            None,
+            None,
+        )
+        .await;
+        let (capture, json) = json_capture();
+
+        let code = check_json(&fixture.home, false, json).await;
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        let report: Value = serde_json::from_str(&capture.text()).expect("one JSON document");
+        assert_eq!(report["accepted"], true);
+        assert!(report["sent_at"].as_str().unwrap().ends_with('Z'));
+        assert_eq!(report["warnings"], json!([]));
+        assert_eq!(report["reasons"], json!([]));
+        let controls = report["controls"].as_array().unwrap();
+        assert_eq!(controls.len(), 1);
+        assert_eq!(controls[0]["id"], "os_supported");
+        assert!(controls[0]["ok"].is_boolean());
+        assert!(controls[0].get("value").is_some());
+        assert!(
+            fixture
+                .gateway
+                .posts()
+                .contains(&"POST /v1/claim".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn check_json_prints_the_reasons_of_a_denied_claim() {
+        let denied = json!({"status":"denied","reasons":["password too short"]}).to_string();
+        let fixture = claim_fixture_replying(
+            Some(&denied),
+            |signed| signed.to_string(),
+            grown_checkpoint,
+            valid_pair,
+            None,
+            None,
+        )
+        .await;
+        let (capture, json) = json_capture();
+
+        let code = check_json(&fixture.home, false, json).await;
+
+        assert_eq!(code, ExitCode::FAILURE);
+        let report: Value = serde_json::from_str(&capture.text()).unwrap();
+        assert_eq!(report["accepted"], false);
+        assert_eq!(report["reasons"], json!(["password too short"]));
+        assert_eq!(report["warnings"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn check_json_reports_a_failure_as_an_error_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let (capture, json) = json_capture();
+
+        let code = check_json(&Home(dir.path().to_path_buf()), false, json).await;
+
+        assert_eq!(code, ExitCode::FAILURE);
+        let report: Value = serde_json::from_str(&capture.text()).unwrap();
+        assert!(
+            report["error"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty()),
+            "{report}"
+        );
+        assert_eq!(report.as_object().unwrap().len(), 1);
+    }
+
+    /// A gateway that serves the demo manifest signed by `company`, and an invitation to it.
+    async fn preview_gateway(company: &Company, toml: &str) -> (FakeGateway, Invitation) {
+        let published = Company::published(toml, &company.key);
+        let log = company.log.vkey();
+        let gateway = FakeGateway::start(move |line, _| match line {
+            "GET /v1/manifest" => (200, published.clone()),
+            "GET /v1/log/key" => (200, format!("{log}\n")),
+            _ => not_found(),
+        })
+        .await;
+        let invitation = Invitation::new(
+            &gateway.url,
+            &PublicKey::from(&company.key),
+            &company.log,
+            open_pact_core::InvitationCode::from_bytes([7; 32]),
+        );
+        (gateway, invitation)
+    }
+
+    #[tokio::test]
+    async fn join_preview_describes_the_manifest_and_writes_and_sends_nothing() {
+        let company = Company::new();
+        let toml = DEMO_MANIFEST.to_string();
+        let manifest = Manifest::parse(toml.as_bytes()).unwrap();
+        let (gateway, invitation) = preview_gateway(&company, &toml).await;
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+        let before = snapshot(dir.path());
+        let (capture, json) = json_capture();
+
+        let code = join_preview_json(&home, &invitation.encode(), false, json).await;
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(snapshot(dir.path()), before, "no file written");
+        assert!(gateway.posts().is_empty(), "{:?}", gateway.posts());
+        let preview: Value = serde_json::from_str(&capture.text()).expect("one JSON document");
+        assert_eq!(preview["company"]["name"], manifest.body().issuer.as_str());
+        assert_eq!(preview["company"]["key_fingerprint"], company.fingerprint());
+        assert_eq!(preview["company"]["matches_invitation"], true);
+        assert_eq!(preview["gateway"], gateway.url);
+        assert_eq!(preview["manifest_hash"], manifest.hash().as_str());
+        let controls = preview["controls"].as_array().unwrap();
+        assert_eq!(controls.len(), manifest.body().controls.len());
+        let total = controls
+            .iter()
+            .find(|control| control["id"] == "managed_repos_total")
+            .unwrap();
+        assert_eq!(total["title"], "Managed repos total");
+        assert!(
+            controls
+                .iter()
+                .all(|control| control["requirement"].is_string())
+        );
+        assert_eq!(
+            preview["disclosed_metadata"].as_array().unwrap().len(),
+            manifest.body().disclosed_metadata.len()
+        );
+        assert_eq!(
+            preview["schedule"],
+            serde_json::to_value(&manifest.body().schedule).unwrap()
+        );
+        assert_eq!(preview["schedule"]["mode"], "vpn");
+        assert_eq!(preview["folders"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn join_preview_names_a_gateway_that_is_not_the_one_in_the_invitation() {
+        let company = Company::new();
+        let (gateway, invitation) = preview_gateway(&company, DEMO_MANIFEST).await;
+        let other = Company::new();
+        let wrong = Invitation::new(
+            &gateway.url,
+            &PublicKey::from(&other.key),
+            &company.log,
+            open_pact_core::InvitationCode::from_bytes([7; 32]),
+        );
+        assert_ne!(wrong.company, invitation.company);
+        let dir = tempfile::tempdir().unwrap();
+        let (capture, json) = json_capture();
+
+        let code = join_preview_json(
+            &Home(dir.path().to_path_buf()),
+            &wrong.encode(),
+            false,
+            json,
+        )
+        .await;
+
+        assert_eq!(code, ExitCode::FAILURE);
+        let preview: Value = serde_json::from_str(&capture.text()).unwrap();
+        assert_eq!(preview["company"]["matches_invitation"], false);
+        assert!(gateway.posts().is_empty());
+        assert!(snapshot(dir.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn join_preview_reports_a_bad_invitation_as_an_error_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let (capture, json) = json_capture();
+
+        let code = join_preview_json(
+            &Home(dir.path().to_path_buf()),
+            "not an invitation",
+            false,
+            json,
+        )
+        .await;
+
+        assert_eq!(code, ExitCode::FAILURE);
+        let report: Value = serde_json::from_str(&capture.text()).unwrap();
+        assert!(
+            report["error"].as_str().unwrap().contains("opi1:"),
+            "{report}"
+        );
+    }
+
+    #[tokio::test]
+    async fn join_preview_lists_the_configured_folders() {
+        let company = Company::new();
+        let toml = DEMO_MANIFEST.to_string();
+        let (_gateway, invitation) = preview_gateway(&company, &toml).await;
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+        let config = DeviceConfig {
+            folders: vec![PathBuf::from("/example/work")],
+            ..DeviceConfig::default()
+        };
+        config.save(&home).unwrap();
+        let before = snapshot(dir.path());
+        let (capture, json) = json_capture();
+
+        let code = join_preview_json(&home, &invitation.encode(), false, json).await;
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        let preview: Value = serde_json::from_str(&capture.text()).unwrap();
+        assert_eq!(preview["folders"], json!(["/example/work"]));
+        assert_eq!(snapshot(dir.path()), before);
+    }
+
+    /// A gateway that serves a witnessed manifest and enrols a device as pending, and an invitation to it.
+    async fn witnessed_join_fixture() -> (FakeGateway, String) {
+        let witness = Witness::new();
+        let toml = witnessed_manifest(&witness);
+        let company = Company::new();
+        let published = Company::published(&toml, &company.key);
+        let log = company.log.vkey();
+        let mut checkpoint = company.sign(&Checkpoint {
+            origin: company.log.origin().into(),
+            size: 1,
+            root: LogHash([3; 32]),
+        });
+        witness.cosign(
+            &mut checkpoint,
+            u64::try_from(chrono::Utc::now().timestamp()).unwrap(),
+        );
+        let checkpoint = checkpoint.to_string();
+        let gateway = FakeGateway::start(move |line, _| match line {
+            "GET /v1/manifest" => (200, published.clone()),
+            "GET /v1/log/key" => (200, format!("{log}\n")),
+            "GET /v1/log/checkpoint" => (200, checkpoint.clone()),
+            "POST /v1/enroll" => (
+                200,
+                json!({"salt":"11".repeat(32),"state":"pending"}).to_string(),
+            ),
+            _ => not_found(),
+        })
+        .await;
+        let invitation = Invitation::new(
+            &gateway.url,
+            &PublicKey::from(&company.key),
+            &company.log,
+            open_pact_core::InvitationCode::from_bytes([7; 32]),
+        )
+        .encode();
+        (gateway, invitation)
+    }
+
+    #[tokio::test]
+    async fn join_json_prints_the_wizard_events_until_it_waits_for_it() {
+        let (gateway, invitation) = witnessed_join_fixture().await;
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+        let (capture, json) = json_capture();
+
+        let code = join_json(
+            &home,
+            Some(&invitation),
+            true,
+            true,
+            false,
+            Duration::from_millis(1),
+            json,
+        )
+        .await;
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(gateway.posts(), vec!["POST /v1/enroll"]);
+        let lines = capture.lines();
+        let steps: Vec<(u64, &str)> = lines
+            .iter()
+            .filter_map(|line| Some((line["step"].as_u64()?, line["state"].as_str()?)))
+            .collect();
+        assert_eq!(
+            steps,
+            [
+                (1, "started"),
+                (1, "done"),
+                (2, "started"),
+                (2, "done"),
+                (3, "started"),
+                (3, "done"),
+                (4, "started"),
+                (4, "waiting"),
+            ],
+            "{lines:?}"
+        );
+        assert_eq!(lines[0]["title"], "Check the invitation");
+        assert_eq!(lines[1]["detail"]["gateway"], gateway.url);
+        let waiting = &lines[lines.len() - 2];
+        let code = waiting["detail"]["device_code"].as_str().unwrap();
+        assert_eq!(code.len(), 12);
+        assert!(code.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        let enrolment = home.enrolment().unwrap();
+        assert_eq!(code, device_code(&enrolment.device));
+        let last = lines.last().unwrap();
+        assert_eq!(last["result"], "enrolled");
+        assert_eq!(last["device"], enrolment.device.as_str());
+        assert_eq!(last["manifest_hash"], enrolment.manifest.as_str());
+    }
+
+    #[tokio::test]
+    async fn join_json_reports_a_refused_enrolment_as_an_error_line() {
+        let witness = Witness::new();
+        let toml = witnessed_manifest(&witness);
+        let company = Company::new();
+        let published = Company::published(&toml, &company.key);
+        let log = company.log.vkey();
+        let mut checkpoint = company.sign(&Checkpoint {
+            origin: company.log.origin().into(),
+            size: 1,
+            root: LogHash([3; 32]),
+        });
+        witness.cosign(
+            &mut checkpoint,
+            u64::try_from(chrono::Utc::now().timestamp()).unwrap(),
+        );
+        let checkpoint = checkpoint.to_string();
+        let gateway = FakeGateway::start(move |line, _| match line {
+            "GET /v1/manifest" => (200, published.clone()),
+            "GET /v1/log/key" => (200, format!("{log}\n")),
+            "GET /v1/log/checkpoint" => (200, checkpoint.clone()),
+            "POST /v1/enroll" => (403, json!({"status":"denied"}).to_string()),
+            _ => not_found(),
+        })
+        .await;
+        let invitation = Invitation::new(
+            &gateway.url,
+            &PublicKey::from(&company.key),
+            &company.log,
+            open_pact_core::InvitationCode::from_bytes([7; 32]),
+        )
+        .encode();
+        let dir = tempfile::tempdir().unwrap();
+        let (capture, json) = json_capture();
+
+        let code = join_json(
+            &Home(dir.path().to_path_buf()),
+            Some(&invitation),
+            true,
+            false,
+            false,
+            Duration::from_millis(1),
+            json,
+        )
+        .await;
+
+        assert_eq!(code, ExitCode::FAILURE);
+        let lines = capture.lines();
+        let last = lines.last().unwrap();
+        assert!(
+            last["error"]
+                .as_str()
+                .unwrap()
+                .contains("Enrolment refused"),
+            "{lines:?}"
+        );
+        assert!(lines.iter().all(|line| line.get("result").is_none()));
+    }
+
+    #[tokio::test]
+    async fn join_json_runs_setup_and_the_first_claim_from_its_flags() {
+        let fixture = claim_fixture_replying(
+            None,
+            |signed| signed.to_string(),
+            grown_checkpoint,
+            valid_pair,
+            None,
+            None,
+        )
+        .await;
+        let capture = json_out::testing::Capture::default();
+        let json = json_out::Json::new(
+            capture.clone(),
+            json_out::Answers {
+                auto_send: false,
+                folders: vec![PathBuf::from("/example/work")],
+            },
+        );
+
+        let code = json_out::scope(json, async {
+            after_approval(&fixture.home, false, true).await.unwrap()
+        })
+        .await;
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        let lines = capture.lines();
+        let steps: Vec<(u64, &str)> = lines
+            .iter()
+            .filter_map(|line| Some((line["step"].as_u64()?, line["state"].as_str()?)))
+            .collect();
+        assert_eq!(
+            steps,
+            [(5, "started"), (5, "done"), (6, "started"), (6, "done")]
+        );
+        assert_eq!(lines[1]["detail"]["auto_send"], false);
+        assert_eq!(
+            lines[1]["detail"]["folders"],
+            json!([]),
+            "the manifest has no repository control, so the folder answer is not used"
+        );
+        assert_eq!(lines[3]["detail"]["accepted"], true);
+        assert_eq!(lines[3]["detail"]["controls"][0]["id"], "os_supported");
+        assert!(DeviceConfig::load(&fixture.home).unwrap().setup_answered);
+        assert!(
+            fixture
+                .gateway
+                .posts()
+                .contains(&"POST /v1/claim".to_string())
+        );
+    }
+
+    #[test]
+    fn setup_answers_follow_the_manifest_like_the_questions() {
+        let context = |toml: &str| SetupContext {
+            manifest: Manifest::parse(toml.as_bytes()).unwrap(),
+            os: Os::Linux,
+            current: DeviceConfig {
+                folders: vec![PathBuf::from("/example/kept")],
+                ..DeviceConfig::default()
+            },
+            overview: String::new(),
+            suggested: Vec::new(),
+            legacy: Vec::new(),
+            user_home: None,
+        };
+        let answers = json_out::Answers {
+            auto_send: true,
+            folders: vec![
+                PathBuf::from("/example/new"),
+                PathBuf::from("/example/kept"),
+            ],
+        };
+
+        let plain = setup_answers(&context(&witnessed_manifest(&Witness::new())), &answers);
+        assert!(
+            plain.auto_send,
+            "the demo manifest defines automatic sending"
+        );
+        assert_eq!(plain.folders, [PathBuf::from("/example/kept")]);
+
+        let repositories = setup_answers(&context(DEMO_MANIFEST), &answers);
+        assert_eq!(
+            repositories.folders,
+            [
+                PathBuf::from("/example/kept"),
+                PathBuf::from("/example/new")
+            ]
+        );
+
+        let off = setup_answers(&context(DEMO_MANIFEST), &json_out::Answers::default());
+        assert!(
+            !off.auto_send,
+            "automatic sending is off unless the flag says on"
+        );
+    }
+
+    #[tokio::test]
+    async fn accept_preview_lists_the_changes_and_writes_and_sends_nothing() {
+        let company = Company::new();
+        let witness = Witness::new();
+        let old = witnessed_manifest(&witness);
+        let new_toml =
+            with_password_rule(&old).replacen("interval = \"55m\"", "interval = \"30m\"", 1);
+        let published = Company::published(&new_toml, &company.key);
+        let new = Manifest::parse(new_toml.as_bytes()).unwrap();
+        let log = company.log.vkey();
+        let checkpoint = cosigned_empty_checkpoint(&company, &witness);
+        let gateway = FakeGateway::start(move |line, _| match line {
+            "GET /v1/manifest" => (200, published.clone()),
+            "GET /v1/log/key" => (200, format!("{log}\n")),
+            "GET /v1/log/checkpoint" => (200, checkpoint.clone()),
+            _ => not_found(),
+        })
+        .await;
+        let (dir, _) = accept_home(&gateway.url, &company, &old);
+        let home = Home(dir.path().to_path_buf());
+        let before = snapshot(dir.path());
+        let (capture, json) = json_capture();
+
+        let code = accept_preview_json(&home, false, json).await;
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(snapshot(dir.path()), before, "no file written");
+        assert!(gateway.posts().is_empty(), "{:?}", gateway.posts());
+        let preview: Value = serde_json::from_str(&capture.text()).expect("one JSON document");
+        assert_eq!(
+            preview["signed_hash"],
+            ManifestHash::of(old.as_bytes()).as_str()
+        );
+        assert_eq!(preview["published_hash"], new.hash().as_str());
+        let changes = preview["changes"].as_array().unwrap();
+        let password = changes
+            .iter()
+            .find(|change| change["id"] == "password_min_length")
+            .expect("the added control");
+        assert!(password["before"].is_null());
+        assert!(password["after"].as_str().unwrap().contains("must be"));
+        let schedule = changes
+            .iter()
+            .find(|change| change["id"] == "schedule")
+            .unwrap();
+        assert!(schedule["before"].as_str().unwrap().contains("55 minutes"));
+        assert!(schedule["after"].as_str().unwrap().contains("30 minutes"));
+        assert!(changes.iter().all(|change| change.get("line").is_none()));
+        assert_eq!(preview["schedule_widened"], true);
+    }
+
+    #[tokio::test]
+    async fn accept_preview_of_an_unchanged_manifest_has_no_changes() {
+        let company = Company::new();
+        let witness = Witness::new();
+        let toml = witnessed_manifest(&witness);
+        let published = Company::published(&toml, &company.key);
+        let log = company.log.vkey();
+        let gateway = FakeGateway::start(move |line, _| match line {
+            "GET /v1/manifest" => (200, published.clone()),
+            "GET /v1/log/key" => (200, format!("{log}\n")),
+            _ => not_found(),
+        })
+        .await;
+        let (dir, _) = accept_home(&gateway.url, &company, &toml);
+        let (capture, json) = json_capture();
+
+        let code = accept_preview_json(&Home(dir.path().to_path_buf()), false, json).await;
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        let preview: Value = serde_json::from_str(&capture.text()).unwrap();
+        assert_eq!(preview["signed_hash"], preview["published_hash"]);
+        assert_eq!(preview["changes"], json!([]));
+        assert_eq!(preview["schedule_widened"], false);
+    }
+
+    #[test]
+    fn manifest_changes_keep_their_lines_and_get_ids() {
+        let plain = witnessed_manifest(&Witness::new());
+        let old = Manifest::parse(plain.as_bytes()).unwrap();
+        let new = Manifest::parse(with_password_rule(&plain).as_bytes()).unwrap();
+        let list = manifest_change_list(&old, &new);
+        assert_eq!(
+            manifest_changes(&old, &new),
+            list.iter()
+                .map(|change| change.line.clone())
+                .collect::<Vec<_>>()
+        );
+        let added = list
+            .iter()
+            .find(|change| change.id == "password_min_length");
+        assert!(added.is_some_and(|change| change.before.is_none() && change.after.is_some()));
+        let removed = manifest_change_list(&new, &old);
+        let gone = removed
+            .iter()
+            .find(|change| change.id == "password_min_length");
+        assert!(gone.is_some_and(|change| change.before.is_some() && change.after.is_none()));
+    }
+    // ----- JSON output stays clean on the real stdout and stderr -----
+
+    const CHILD: &str = "OPEN_PACT_JSON_TEST_CHILD";
+    const BEGIN: &str = "BEGIN-JSON-OUTPUT";
+    const END: &str = "END-JSON-OUTPUT";
+
+    /// True in the child process that `run_child` starts for the test `name`.
+    fn in_child(name: &str) -> bool {
+        std::env::var(CHILD).as_deref() == Ok(name)
+    }
+
+    /// Runs the test `name` again in a child of this test binary, so the test sees the real stdout
+    /// and stderr of a process. The parent test judges the child's output.
+    fn run_child(name: &str, stderr: std::process::Stdio) -> std::process::Output {
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &format!("tests::{name}"), "--nocapture"])
+            .args(["--test-threads=1"])
+            .env(CHILD, name)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(stderr)
+            .output()
+            .unwrap()
+    }
+
+    /// The lines the child wrote to its stdout between its markers.
+    fn marked_lines(stdout: &str) -> Vec<&str> {
+        stdout
+            .lines()
+            .skip_while(|line| *line != BEGIN)
+            .skip(1)
+            .take_while(|line| *line != END)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn child_join_json_on_the_real_stdout() {
+        if !in_child("child_join_json_on_the_real_stdout") {
+            return;
+        }
+        let (_gateway, invitation) = witnessed_join_fixture().await;
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+        println!("\n{BEGIN}");
+        let code = join_json(
+            &home,
+            Some(&invitation),
+            true,
+            true,
+            false,
+            Duration::from_millis(1),
+            json_out::Json::new(std::io::stdout(), json_out::Answers::default()),
+        )
+        .await;
+        println!("{END}");
+        assert_eq!(code, ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn a_new_join_with_json_writes_only_json_to_the_real_stdout() {
+        let output = run_child(
+            "child_join_json_on_the_real_stdout",
+            std::process::Stdio::null(),
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{stdout}");
+        let lines = marked_lines(&stdout);
+        assert!(lines.len() > 8, "{stdout}");
+        for line in &lines {
+            let value: Value = serde_json::from_str(line)
+                .unwrap_or_else(|error| panic!("stdout holds {line:?}: {error}"));
+            assert!(value.is_object(), "{line}");
+        }
+        assert!(
+            lines.last().unwrap().contains("\"result\":\"enrolled\""),
+            "{lines:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn child_warning_on_a_broken_stderr() {
+        if !in_child("child_warning_on_a_broken_stderr") {
+            return;
+        }
+        let (capture, json) = json_capture();
+        let code = json_out::scope(json, async {
+            eprintln!("warning: fictional split view");
+            json_out::failed("fictional failure")
+        })
+        .await;
+        println!("\n{BEGIN}\nSURVIVED\n{END}");
+        assert_eq!(code, ExitCode::FAILURE);
+        assert_eq!(capture.lines(), [json!({"error": "fictional failure"})]);
+    }
+
+    #[test]
+    fn a_warning_on_a_broken_stderr_does_not_panic() {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        let output = run_child(
+            "child_warning_on_a_broken_stderr",
+            std::process::Stdio::from(writer),
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{stdout}");
+        assert_eq!(marked_lines(&stdout), ["SURVIVED"]);
+    }
+
+    #[tokio::test]
+    async fn a_panic_in_a_command_comes_back_as_an_error() {
+        let result = catch_panic(async { panic!("fictional panic") }).await;
+        let text = format!("{:#}", result.expect_err("a panic is an error"));
+        assert!(text.contains("fictional panic"), "{text}");
+        let result = catch_panic(async { Ok(ExitCode::SUCCESS) }).await;
+        assert!(matches!(result, Ok(code) if code == ExitCode::SUCCESS));
+    }
+
+    struct Broken;
+
+    impl Write for Broken {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("fictional full disk"))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_document_that_cannot_be_written_fails_the_command() {
+        let company = Company::new();
+        let toml = DEMO_MANIFEST.to_string();
+        let (_gateway, invitation) = preview_gateway(&company, &toml).await;
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+        let json = json_out::Json::new(Broken, json_out::Answers::default());
+
+        let code = join_preview_json(&home, &invitation.encode(), false, json).await;
+
+        assert_eq!(code, ExitCode::FAILURE);
+    }
+
+    #[tokio::test]
+    async fn a_failed_write_is_remembered_until_the_command_ends() {
+        let json = json_out::Json::new(Broken, json_out::Answers::default());
+        let (before, after) = json_out::scope(json, async {
+            let before = json_out::write_failure();
+            json_out::document(&json!({"fictional": true}));
+            (before, json_out::write_failure())
+        })
+        .await;
+        assert_eq!(before, None);
+        assert!(after.is_some_and(|error| error.contains("fictional full disk")));
+    }
+
+    #[test]
+    fn startup_vpn_recovery_skips_the_commands_that_write_no_file() {
+        let parse = |args: &[&str]| {
+            let mut all = vec!["open-pact-client"];
+            all.extend_from_slice(args);
+            Cli::try_parse_from(all).unwrap()
+        };
+        for skipped in [
+            &["status"][..],
+            &["manifest", "show"],
+            &["join", "--preview", "opi1:fictional"],
+            &["accept", "--preview"],
+        ] {
+            assert!(!recovers_vpn_first(&parse(skipped).command), "{skipped:?}");
+        }
+        for recovering in [
+            &["check"][..],
+            &["check", "--json"],
+            &["join", "opi1:fictional"],
+            &["accept"],
+        ] {
+            assert!(
+                recovers_vpn_first(&parse(recovering).command),
+                "{recovering:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_command_line_that_does_not_parse_gets_a_json_error_when_it_asked_for_json() {
+        let line = |args: &[&str]| {
+            let mut all = vec!["open-pact-client"];
+            all.extend_from_slice(args);
+            let all: Vec<std::ffi::OsString> = all.into_iter().map(Into::into).collect();
+            let error = Cli::try_parse_from(&all).map(|_| ()).unwrap_err();
+            usage_error_line(&all, &error)
+        };
+        for args in [
+            &["join", "--json", "--yes", "--auto-send", "maybe"][..],
+            &["join", "--preview"],
+            &["check", "--json", "--bogus"],
+            &["status", "--json", "--bogus"],
+        ] {
+            let text = line(args).unwrap_or_else(|| panic!("{args:?} has no JSON error"));
+            let document: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(document.as_object().unwrap().len(), 1, "{text}");
+            assert!(!document["error"].as_str().unwrap().is_empty(), "{text}");
+            assert!(!text.contains('\n'), "{text}");
+        }
+        assert_eq!(line(&["join", "--bogus"]), None);
+        assert_eq!(line(&["check", "--bogus"]), None);
+    }
+}

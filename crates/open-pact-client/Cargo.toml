@@ -5,6 +5,14 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[lib]
+name = "open_pact_client"
+path = "src/lib.rs"
+
+[[bin]]
+name = "open-pact-client"
+path = "src/main.rs"
+
 [dependencies]
 open-pact-core.workspace = true
 serde.workspace = true
