@@ -1,1 +1,2 @@
 crates/open-pact-client/tests/status/*.txt text eol=lf
+crates/open-pact-client/tests/fixtures/release-*/** -text
