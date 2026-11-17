@@ -4,7 +4,7 @@ use std::io::Read;
 
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 
-use super::buckets;
+use super::buckets::{self, Lock};
 use super::exec::{Ran, run, run_status};
 
 const UFW_CONF: &str = "/etc/ufw/ufw.conf";
@@ -58,19 +58,29 @@ pub fn firewall() -> &'static str {
     )
 }
 
+/// `screen_lock@1`.
 pub fn screen_lock() -> &'static str {
+    lock().bucket()
+}
+
+/// `screen_lock@2`: the same setting in whole minutes.
+pub fn screen_lock_minutes() -> open_pact_core::ControlValue {
+    lock().minutes()
+}
+
+fn lock() -> Lock {
     let desktop = std::env::var("XDG_CURRENT_DESKTOP")
         .unwrap_or_default()
         .to_lowercase();
     if desktop.contains("kde") {
         let Some(home) = std::env::var_os("HOME") else {
-            return "unknown";
+            return Lock::Unknown;
         };
         let path = std::path::Path::new(&home).join(".config/kscreenlockerrc");
         return match fs::read_to_string(path) {
-            Ok(text) => parse_kscreenlocker(&text),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => parse_kscreenlocker(""),
-            Err(_) => "unknown",
+            Ok(text) => kscreenlocker_lock(&text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => kscreenlocker_lock(""),
+            Err(_) => Lock::Unknown,
         };
     }
     if desktop.contains("gnome") || desktop.contains("ubuntu") {
@@ -80,11 +90,11 @@ pub fn screen_lock() -> &'static str {
             get("org.gnome.desktop.session", "idle-delay"),
             get("org.gnome.desktop.screensaver", "lock-delay"),
         ) else {
-            return "unknown";
+            return Lock::Unknown;
         };
-        return parse_gnome_lock(&enabled, &idle, &delay);
+        return gnome_lock_state(&enabled, &idle, &delay);
     }
-    "unknown"
+    Lock::Unknown
 }
 
 pub fn os_supported() -> &'static str {
@@ -919,20 +929,28 @@ fn gsettings_bool(out: &str) -> Option<bool> {
 }
 
 pub fn parse_gnome_lock(lock_enabled: &str, idle_delay: &str, lock_delay: &str) -> &'static str {
+    gnome_lock_state(lock_enabled, idle_delay, lock_delay).bucket()
+}
+
+fn gnome_lock_state(lock_enabled: &str, idle_delay: &str, lock_delay: &str) -> Lock {
     let (Some(enabled), Some(idle), Some(delay)) = (
         gsettings_bool(lock_enabled),
         gsettings_number(idle_delay),
         gsettings_number(lock_delay),
     ) else {
-        return "unknown";
+        return Lock::Unknown;
     };
     if !enabled || idle == 0 {
-        return "none";
+        return Lock::None;
     }
-    buckets::lock_delay(idle.saturating_add(delay))
+    Lock::Seconds(idle.saturating_add(delay))
 }
 
 pub fn parse_kscreenlocker(ini: &str) -> &'static str {
+    kscreenlocker_lock(ini).bucket()
+}
+
+fn kscreenlocker_lock(ini: &str) -> Lock {
     let mut in_daemon = false;
     let mut autolock = true;
     let mut timeout_min: u64 = 5;
@@ -950,9 +968,9 @@ pub fn parse_kscreenlocker(ini: &str) -> &'static str {
         }
     }
     if !autolock {
-        return "none";
+        return Lock::None;
     }
-    buckets::lock_delay(timeout_min.saturating_mul(60))
+    Lock::Seconds(timeout_min.saturating_mul(60))
 }
 
 fn os_release_field<'a>(text: &'a str, key: &str) -> Option<&'a str> {
@@ -1473,6 +1491,36 @@ sde1      part 1 0 ext4 /mnt/archive
         assert_eq!(parse_kscreenlocker("[Daemon]\nAutolock=false\n"), "none");
         assert_eq!(parse_kscreenlocker(""), "le_5min");
         assert_eq!(parse_kscreenlocker("[Daemon]\nTimeout=30\n"), "gt_15min");
+    }
+
+    #[test]
+    fn lock_minutes_round_up_and_keep_none_and_unknown() {
+        use open_pact_core::ControlValue::Integer;
+        assert_eq!(
+            gnome_lock_state("true\n", "uint32 300\n", "uint32 1\n").minutes(),
+            Integer(6)
+        );
+        assert_eq!(
+            gnome_lock_state("true\n", "uint32 600\n", "uint32 0\n").minutes(),
+            Integer(10)
+        );
+        assert_eq!(
+            gnome_lock_state("false\n", "uint32 300\n", "uint32 0\n").minutes(),
+            "none"
+        );
+        assert_eq!(
+            gnome_lock_state("", "uint32 300\n", "uint32 0\n").minutes(),
+            "unknown"
+        );
+        assert_eq!(kscreenlocker_lock("").minutes(), Integer(5));
+        assert_eq!(
+            kscreenlocker_lock("[Daemon]\nTimeout=12\n").minutes(),
+            Integer(12)
+        );
+        assert_eq!(
+            kscreenlocker_lock("[Daemon]\nAutolock=false\n").minutes(),
+            "none"
+        );
     }
 
     #[test]

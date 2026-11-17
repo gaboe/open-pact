@@ -1,6 +1,6 @@
 use chrono::{NaiveDate, Utc};
 
-use super::buckets;
+use super::buckets::{self, Lock};
 use super::exec::run;
 
 const SOCKETFILTERFW: &str = "/usr/libexec/ApplicationFirewall/socketfilterfw";
@@ -15,8 +15,28 @@ pub fn firewall() -> &'static str {
     run(SOCKETFILTERFW, &["--getglobalstate"]).map_or("unknown", |t| parse_firewall(&t))
 }
 
+/// `screen_lock@1`: the password delay only, as `sysadminctl -screenLock` reports it. It does not
+/// read what starts the screen saver or turns the display off.
 pub fn screen_lock() -> &'static str {
-    run("sysadminctl", &["-screenLock", "status"]).map_or("unknown", |t| parse_screen_lock(&t))
+    password_delay().bucket()
+}
+
+/// `screen_lock@2`: the time from the last input to a locked screen, in whole minutes. That is
+/// the shorter of the screen saver idle time and the display sleep time, plus the password delay.
+pub fn screen_lock_minutes() -> open_pact_core::ControlValue {
+    let saver = run(
+        "defaults",
+        &["-currentHost", "read", "com.apple.screensaver", "idleTime"],
+    )
+    .map_or(Lock::Unknown, |text| parse_saver_idle(&text));
+    let display =
+        run("pmset", &["-g", "custom"]).map_or(Lock::Unknown, |text| parse_display_sleep(&text));
+    total_lock(password_delay(), first_idle_trigger(saver, display)).minutes()
+}
+
+fn password_delay() -> Lock {
+    run("sysadminctl", &["-screenLock", "status"])
+        .map_or(Lock::Unknown, |t| parse_password_delay(&t))
 }
 
 pub fn os_supported() -> &'static str {
@@ -68,12 +88,18 @@ pub fn parse_firewall(out: &str) -> &'static str {
     }
 }
 
+#[cfg(test)]
 pub fn parse_screen_lock(out: &str) -> &'static str {
+    parse_password_delay(out).bucket()
+}
+
+/// The password delay in `sysadminctl -screenLock status`. `None` when no password is required.
+pub fn parse_password_delay(out: &str) -> Lock {
     if out.contains("screenLock is off") {
-        return "none";
+        return Lock::None;
     }
     if out.contains("delay is immediate") {
-        return "le_5min";
+        return Lock::Seconds(0);
     }
     let mut words = out
         .split("delay is ")
@@ -82,13 +108,61 @@ pub fn parse_screen_lock(out: &str) -> &'static str {
         .into_iter()
         .flatten();
     let Some(n) = words.next().and_then(|n| n.parse::<u64>().ok()) else {
-        return "unknown";
+        return Lock::Unknown;
     };
     let seconds = match words.next() {
         Some(unit) if unit.starts_with("min") => n.saturating_mul(60),
         _ => n,
     };
-    buckets::lock_delay(seconds)
+    Lock::Seconds(seconds)
+}
+
+/// The screen saver idle time in seconds, from `defaults read com.apple.screensaver idleTime`.
+/// Zero means the screen saver never starts. A key that is not set cannot be read.
+pub fn parse_saver_idle(out: &str) -> Lock {
+    match out.trim().parse::<u64>() {
+        Ok(0) => Lock::None,
+        Ok(seconds) => Lock::Seconds(seconds),
+        Err(_) => Lock::Unknown,
+    }
+}
+
+/// The display sleep time from `pmset -g custom`, which lists minutes for each power source.
+/// Zero means never. The longest source decides, because the device can run on any of them.
+pub fn parse_display_sleep(out: &str) -> Lock {
+    let mut found: Option<Lock> = None;
+    for line in out.lines() {
+        let mut words = line.split_whitespace();
+        if words.next() != Some("displaysleep") {
+            continue;
+        }
+        let lock = match words.next().and_then(|n| n.parse::<u64>().ok()) {
+            Some(0) => Lock::None,
+            Some(minutes) => Lock::Seconds(minutes.saturating_mul(60)),
+            None => Lock::Unknown,
+        };
+        found = Some(found.map_or(lock, |earlier| earlier.weaker(lock)));
+    }
+    found.unwrap_or(Lock::Unknown)
+}
+
+/// Whichever of the two idle triggers fires first. One that is off leaves the other.
+pub fn first_idle_trigger(saver: Lock, display: Lock) -> Lock {
+    match (saver, display) {
+        (Lock::Unknown, _) | (_, Lock::Unknown) => Lock::Unknown,
+        (Lock::None, other) | (other, Lock::None) => other,
+        (Lock::Seconds(a), Lock::Seconds(b)) => Lock::Seconds(a.min(b)),
+    }
+}
+
+/// The time from the last input to a locked screen. Without a trigger or without a password
+/// requirement nothing locks the screen. An unreadable part makes the total unknown.
+pub fn total_lock(password: Lock, idle: Lock) -> Lock {
+    match (password, idle) {
+        (Lock::None, _) | (_, Lock::None) => Lock::None,
+        (Lock::Unknown, _) | (_, Lock::Unknown) => Lock::Unknown,
+        (Lock::Seconds(delay), Lock::Seconds(idle)) => Lock::Seconds(idle.saturating_add(delay)),
+    }
 }
 
 pub fn parse_os_supported(version: &str) -> &'static str {
@@ -169,6 +243,66 @@ mod tests {
         );
         assert_eq!(parse_screen_lock(&line("is off")), "none");
         assert_eq!(parse_screen_lock("garbage"), "unknown");
+    }
+
+    #[test]
+    fn the_saver_idle_time_is_seconds_and_zero_means_never() {
+        assert_eq!(parse_saver_idle("600\n"), Lock::Seconds(600));
+        assert_eq!(parse_saver_idle("0\n"), Lock::None);
+        for text in [
+            "",
+            "The domain/default pair of (com.apple.screensaver, idleTime) does not exist",
+            "-5",
+        ] {
+            assert_eq!(parse_saver_idle(text), Lock::Unknown, "{text}");
+        }
+    }
+
+    #[test]
+    fn the_display_sleep_time_is_the_longest_of_the_power_sources() {
+        let pmset = |battery: &str, ac: &str| {
+            format!(
+                "Battery Power:\n sleep                1\n displaysleep         {battery}\nAC Power:\n sleep                0\n displaysleep         {ac} (display sleep prevented by powerd)\n"
+            )
+        };
+        assert_eq!(parse_display_sleep(&pmset("2", "10")), Lock::Seconds(600));
+        assert_eq!(parse_display_sleep(&pmset("2", "0")), Lock::None);
+        assert_eq!(parse_display_sleep(&pmset("x", "10")), Lock::Unknown);
+        assert_eq!(parse_display_sleep("sleep 1\n"), Lock::Unknown);
+        assert_eq!(parse_display_sleep(""), Lock::Unknown);
+    }
+
+    #[test]
+    fn the_total_lock_is_the_first_idle_trigger_plus_the_password_delay() {
+        use Lock::{None as Off, Seconds, Unknown};
+        for (saver, display, idle) in [
+            (Seconds(600), Seconds(300), Seconds(300)),
+            (Seconds(120), Seconds(300), Seconds(120)),
+            (Off, Seconds(300), Seconds(300)),
+            (Seconds(300), Off, Seconds(300)),
+            (Off, Off, Off),
+            (Unknown, Seconds(300), Unknown),
+            (Seconds(300), Unknown, Unknown),
+        ] {
+            assert_eq!(first_idle_trigger(saver, display), idle);
+        }
+        for (password, idle, total) in [
+            (Seconds(0), Seconds(300), Seconds(300)),
+            (Seconds(60), Seconds(300), Seconds(360)),
+            (Off, Seconds(300), Off),
+            (Seconds(60), Off, Off),
+            (Unknown, Off, Off),
+            (Off, Unknown, Off),
+            (Unknown, Seconds(300), Unknown),
+            (Seconds(60), Unknown, Unknown),
+        ] {
+            assert_eq!(total_lock(password, idle), total, "{password:?} {idle:?}");
+        }
+        assert_eq!(
+            total_lock(Seconds(1), Seconds(300)).minutes(),
+            open_pact_core::ControlValue::Integer(6),
+            "301 seconds round up to 6 minutes"
+        );
     }
 
     #[test]

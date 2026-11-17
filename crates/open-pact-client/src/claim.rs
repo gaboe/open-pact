@@ -387,6 +387,11 @@ impl Prepared {
         &self.compliance
     }
 
+    /// What each check found.
+    pub(crate) fn results(&self) -> &BTreeMap<String, ControlValue> {
+        &self.results
+    }
+
     /// The table of results, and what the repository scan could not read.
     pub(crate) fn print_local_report(&self) {
         device_config::print_table(

@@ -56,6 +56,7 @@ mod schedule;
 #[cfg(target_os = "macos")]
 mod secure_enclave;
 mod status;
+mod timings;
 mod ui;
 mod update;
 
@@ -164,6 +165,10 @@ enum Command {
         /// Print the claim that would be sent. Make GET requests only and write no file
         #[arg(long)]
         dry_run: bool,
+        /// With --dry-run: also print the wall time of the run and the CPU time of this process
+        /// and its child processes
+        #[arg(long, requires = "dry_run")]
+        timings: bool,
         /// After sending, print the result as JSON
         #[arg(long, conflicts_with = "dry_run")]
         json: bool,
@@ -583,6 +588,15 @@ impl Drop for VpnLock {
     }
 }
 
+/// Removes a file or a link. Returns whether there was one.
+fn remove_file_if_exists(path: &Path) -> Result<bool> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e).with_context(|| path.display().to_string()),
+    }
+}
+
 impl Home {
     fn new(dir: Option<PathBuf>) -> Result<Home> {
         match dir {
@@ -696,6 +710,71 @@ impl Home {
             .with_context(|| vpn.join(VPN_CURRENT).display().to_string())?;
         interruption_point();
         std::fs::File::open(&vpn)?.sync_all()?;
+        Ok(())
+    }
+
+    /// Deletes the installed VPN generation: the documented files, `vpn/current` and every
+    /// generation. Returns whether a pair was installed. A later accepted claim installs a new
+    /// one. The caller holds the claim lock.
+    fn remove_vpn_pair(&self) -> Result<bool> {
+        #[cfg(not(any(unix, windows)))]
+        {
+            Ok(false)
+        }
+        #[cfg(windows)]
+        {
+            let vpn = self.file(VPN_DIR);
+            if !vpn.exists() && !VPN_FILES.iter().any(|name| self.file(name).exists()) {
+                return Ok(false);
+            }
+            let _lock = self.lock_vpn()?;
+            let mut removed = false;
+            // The pointers go first, so that no recovery can copy the pair back.
+            for pointer in [VPN_CURRENT, "previous"] {
+                removed |= remove_file_if_exists(&vpn.join(pointer))?;
+            }
+            for name in VPN_FILES {
+                removed |= remove_file_if_exists(&self.file(name))?;
+            }
+            self.remove_vpn_leftovers(&vpn)?;
+            Ok(removed)
+        }
+        #[cfg(unix)]
+        {
+            let mut removed = false;
+            // The documented files are links into `vpn/current`: they go first.
+            for name in VPN_FILES {
+                removed |= remove_file_if_exists(&self.file(name))?;
+            }
+            let vpn = self.file(VPN_DIR);
+            removed |= remove_file_if_exists(&vpn.join(VPN_CURRENT))?;
+            self.remove_vpn_leftovers(&vpn)?;
+            Ok(removed)
+        }
+    }
+
+    /// Every generation, and every temporary file, below `vpn/`. Keeps the directory and the
+    /// Windows write lock.
+    #[cfg(any(unix, windows))]
+    fn remove_vpn_leftovers(&self, vpn: &Path) -> Result<()> {
+        let entries = match std::fs::read_dir(vpn) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e).with_context(|| vpn.display().to_string()),
+        };
+        for entry in entries {
+            let entry = entry?;
+            if entry.file_name() == "write.lock" {
+                continue;
+            }
+            let path = entry.path();
+            if entry.file_type()?.is_dir() {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            }
+            .with_context(|| path.display().to_string())?;
+        }
         Ok(())
     }
 
@@ -3961,6 +4040,15 @@ async fn accept(home: &Home, yes: bool, insecure_dev: bool) -> Result<ExitCode> 
             ),
         }
     }
+    if turned_off.is_none()
+        && let Some(schedule) = &new.body().schedule
+        && device_config::DeviceConfig::load(home).is_ok_and(|config| config.auto_send)
+    {
+        println!("{schedule}");
+        for line in schedule::next_due_text(home, schedule) {
+            println!("{line}");
+        }
+    }
     println!("Next: run {command} check to send a claim under the new manifest.");
     Ok(ExitCode::SUCCESS)
 }
@@ -4524,7 +4612,18 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         )
         .await),
         Command::Check { dry_run: false, .. } => check(&home, cli.insecure_dev).await,
-        Command::Check { dry_run: true, .. } => check_dry_run(&home, cli.insecure_dev).await,
+        Command::Check {
+            dry_run: true,
+            timings,
+            ..
+        } => {
+            let started = std::time::Instant::now();
+            let result = check_dry_run(&home, cli.insecure_dev).await;
+            if timings {
+                eprintln!("{}", timings::measure(started.elapsed()));
+            }
+            result
+        }
         Command::Accept { preview: true, .. } => Ok(accept_preview_json(
             &home,
             cli.insecure_dev,
@@ -6898,6 +6997,7 @@ mod tests {
             manifest_hash: fixture.home.enrolment()?.manifest,
             schedule: schedule.clone(),
             owner_consented: config.auto_send,
+            self_removal: false,
         };
         schedule::tick(
             &fixture.home,
@@ -6987,6 +7087,7 @@ mod tests {
                 manifest_hash: before.hash().clone(),
                 schedule: before.body().schedule.clone().unwrap(),
                 owner_consented: true,
+                self_removal: false,
             };
             let original = std::fs::read_to_string(fixture.home.file("manifest.toml")).unwrap();
             let text = if let Some(replacement) = replacement {
@@ -7126,6 +7227,7 @@ mod tests {
             manifest_hash: home.enrolment().unwrap().manifest,
             schedule,
             owner_consented: true,
+            self_removal: false,
         };
         let tick = || {
             schedule::tick(
@@ -8398,6 +8500,204 @@ grace = "1d"
         }
     }
 
+    #[test]
+    fn removing_the_vpn_pair_deletes_every_generation_and_the_documented_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+        assert!(!home.remove_vpn_pair().unwrap(), "nothing installed yet");
+        home.install_vpn_pair(b"CA one", b"certificate one")
+            .unwrap();
+        home.install_vpn_pair(b"CA two", b"certificate two")
+            .unwrap();
+        assert!(home.file(VPN_FILES[1]).exists());
+        assert!(home.remove_vpn_pair().unwrap());
+        for name in VPN_FILES {
+            assert!(
+                std::fs::symlink_metadata(home.file(name)).is_err(),
+                "{name} is gone"
+            );
+        }
+        let vpn = home.file(VPN_DIR);
+        assert!(!vpn.join(VPN_CURRENT).exists());
+        assert!(
+            std::fs::read_dir(&vpn)
+                .unwrap()
+                .all(|entry| { entry.unwrap().file_name() == "write.lock" }),
+            "no generation is left"
+        );
+        assert!(
+            !home.remove_vpn_pair().unwrap(),
+            "a second removal finds nothing"
+        );
+        home.recover_vpn().unwrap();
+        assert!(
+            !home.file(VPN_FILES[1]).exists(),
+            "recovery does not bring it back"
+        );
+        // A later accepted claim installs a new pair as before.
+        home.install_vpn_pair(b"CA three", b"certificate three")
+            .unwrap();
+        assert_eq!(std::fs::read(home.file(VPN_FILES[0])).unwrap(), b"CA three");
+        assert_eq!(
+            std::fs::read(home.file(VPN_FILES[1])).unwrap(),
+            b"certificate three"
+        );
+    }
+
+    #[test]
+    fn removing_the_vpn_pair_also_removes_plain_files_of_an_old_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+        for name in VPN_FILES {
+            std::fs::write(home.file(name), b"plain").unwrap();
+        }
+        assert!(home.remove_vpn_pair().unwrap());
+        assert!(VPN_FILES.iter().all(|name| !home.file(name).exists()));
+    }
+
+    const PASSWORD_SET_RULE: &str = r#"[[control]]
+id = "password_set"
+source = "company_policy"
+check = "builtin:password_set@1"
+output = ["yes", "no", "unknown"]
+required = { macos = "yes", windows = "yes", linux = "yes" }
+grace = "1d"
+"#;
+
+    #[tokio::test]
+    async fn a_failed_control_past_its_grace_deletes_the_vpn_certificate_and_sends_a_claim_at_once()
+    {
+        // `password_set` reads `unknown` on every OS, so it fails the same way everywhere.
+        let (_probe, address) = open_probe();
+        let table = format!("{PASSWORD_SET_RULE}\n{}", vpn_table(&address));
+        let denied = r#"{"status":"denied","reasons":["password_set = unknown, yes required, unknown_grace 7d ended"]}"#;
+        let fixture = claim_fixture_replying(
+            Some(denied),
+            unchanged,
+            grown_checkpoint,
+            valid_pair,
+            Some(AGREED),
+            Some(&table),
+        )
+        .await;
+        assert_eq!(earlier_pair(&fixture), EARLIER_PAIR);
+        // The device has failed `password_set` for thirty days, longer than `unknown_grace`.
+        let since = chrono::Utc::now().timestamp() - 30 * 86_400;
+        fixture
+            .home
+            .write(
+                "report-state.json",
+                json!({ "vpn_up": true, "last_success": null, "first_failed": { "password_set": since } })
+                    .to_string()
+                    .as_bytes(),
+            )
+            .unwrap();
+        let schedule = fixture
+            .home
+            .signed_manifest()
+            .unwrap()
+            .body()
+            .schedule
+            .clone()
+            .unwrap();
+        let authorization = schedule::ScheduleAuthorization {
+            manifest_hash: fixture.home.enrolment().unwrap().manifest,
+            schedule,
+            owner_consented: true,
+            self_removal: true,
+        };
+        let tick = || {
+            schedule::tick(
+                &fixture.home,
+                &fixture.home,
+                None,
+                &authorization,
+                checks::EventMarkerReads::default,
+            )
+        };
+        tick().await.unwrap();
+        for name in ["ca.pem", "vpn-cert.pem"] {
+            assert!(
+                std::fs::symlink_metadata(fixture.home.file(name)).is_err(),
+                "{name} was deleted and the denied claim installed no new one"
+            );
+        }
+        assert_eq!(
+            claim_posts(&fixture),
+            1,
+            "the claim went out in the same wake"
+        );
+        let log = job_log_text(&fixture);
+        assert_eq!(
+            log.matches("Removed the VPN certificate").count(),
+            1,
+            "{log}"
+        );
+        assert!(log.contains("password_set"), "{log}");
+        assert!(schedule_state(&fixture)["last_success"].is_number());
+        tick().await.unwrap();
+        assert_eq!(claim_posts(&fixture), 1, "nothing is due the next minute");
+        assert_eq!(
+            job_log_text(&fixture)
+                .matches("Removed the VPN certificate")
+                .count(),
+            1,
+            "the removal is logged once"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_accepted_claim_after_the_removal_installs_a_new_certificate() {
+        let (_probe, address) = open_probe();
+        let table = format!("{PASSWORD_SET_RULE}\n{}", vpn_table(&address));
+        let fixture = claim_fixture_replying(
+            None,
+            unchanged,
+            grown_checkpoint,
+            valid_pair,
+            Some(AGREED),
+            Some(&table),
+        )
+        .await;
+        let since = chrono::Utc::now().timestamp() - 30 * 86_400;
+        fixture
+            .home
+            .write(
+                "report-state.json",
+                json!({ "vpn_up": true, "last_success": null, "first_failed": { "password_set": since } })
+                    .to_string()
+                    .as_bytes(),
+            )
+            .unwrap();
+        let schedule = fixture
+            .home
+            .signed_manifest()
+            .unwrap()
+            .body()
+            .schedule
+            .clone()
+            .unwrap();
+        let authorization = schedule::ScheduleAuthorization {
+            manifest_hash: fixture.home.enrolment().unwrap().manifest,
+            schedule,
+            owner_consented: true,
+            self_removal: true,
+        };
+        schedule::tick(
+            &fixture.home,
+            &fixture.home,
+            None,
+            &authorization,
+            checks::EventMarkerReads::default,
+        )
+        .await
+        .unwrap();
+        let [ca, cert] = earlier_pair(&fixture);
+        assert_eq!(ca, fixture.pair.ca.as_bytes());
+        assert_eq!(cert, fixture.pair.cert.as_deref().unwrap().as_bytes());
+        assert!(job_log_text(&fixture).contains("Removed the VPN certificate"));
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_vpn_recovery_repairs_flat_files_and_removes_stale_generations() {
@@ -9240,6 +9540,11 @@ grace = "1d"
         assert!(parse(&["join", "--json", "--yes", "--auto-send", "maybe"]).is_err());
         assert!(parse(&["check", "--json"]).is_ok());
         assert!(parse(&["check", "--json", "--dry-run"]).is_err());
+        assert!(parse(&["check", "--dry-run", "--timings"]).is_ok());
+        assert!(
+            parse(&["check", "--timings"]).is_err(),
+            "timings belong to the dry run: a real check writes files and sends"
+        );
         assert!(parse(&["accept", "--preview"]).is_ok());
         assert!(parse(&["accept", "--preview", "--yes"]).is_err());
     }

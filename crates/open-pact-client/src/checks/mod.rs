@@ -92,10 +92,24 @@ const BUILTINS: &[(&str, u32)] = &[
     ("password_min_length", 1),
 ];
 
+/// Later versions of a builtin. The registry runs one check per id and picks the version from the
+/// control's `check`.
+const LATER_VERSIONS: &[(&str, u32)] = &[("screen_lock", 2)];
+
 fn implements(control: &Control) -> bool {
     BUILTINS
         .iter()
+        .chain(LATER_VERSIONS)
         .any(|(id, v)| control.id == *id && control.check == format!("builtin:{id}@{v}"))
+}
+
+/// `screen_lock@2` reports whole minutes. `screen_lock@1` keeps its buckets.
+fn screen_lock_version(input: &CheckInput<'_>) -> u32 {
+    if input.control.check == "builtin:screen_lock@2" {
+        2
+    } else {
+        1
+    }
 }
 
 /// Refuses a manifest with a control this client cannot run exactly as signed.
@@ -181,7 +195,10 @@ const MACOS: Registry = &[
         ignore_input!(|| macos::disk_encryption().into()),
     ),
     ("firewall", ignore_input!(|| macos::firewall().into())),
-    ("screen_lock", ignore_input!(|| macos::screen_lock().into())),
+    ("screen_lock", |input| match screen_lock_version(input) {
+        2 => macos::screen_lock_minutes(),
+        _ => macos::screen_lock().into(),
+    }),
     (
         "os_supported",
         ignore_input!(|| macos::os_supported().into()),
@@ -239,7 +256,10 @@ const LINUX: Registry = &[
         ignore_input!(|| linux::disk_encryption().into()),
     ),
     ("firewall", ignore_input!(|| linux::firewall().into())),
-    ("screen_lock", ignore_input!(|| linux::screen_lock().into())),
+    ("screen_lock", |input| match screen_lock_version(input) {
+        2 => linux::screen_lock_minutes(),
+        _ => linux::screen_lock().into(),
+    }),
     (
         "os_supported",
         ignore_input!(|| linux::os_supported().into()),
@@ -297,7 +317,10 @@ const WINDOWS: Registry = &[
     ("uptime_days", ignore_input!(windows::uptime_days)),
     ("disk_encryption", ignore_input!(windows::disk_encryption)),
     ("firewall", ignore_input!(windows::firewall)),
-    ("screen_lock", ignore_input!(windows::screen_lock)),
+    ("screen_lock", |input| match screen_lock_version(input) {
+        2 => windows::screen_lock_minutes(),
+        _ => windows::screen_lock(),
+    }),
     ("os_supported", ignore_input!(windows::os_supported)),
     (
         "os_patch_age_days",
@@ -628,6 +651,7 @@ mod tests {
         for (from, to) in [
             ("builtin:firewall@1", "builtin:firewall@2"),
             ("builtin:firewall@1", "builtin:screen_lock@1"),
+            ("builtin:firewall@1", "builtin:screen_lock@3"),
             ("builtin:firewall@1", "builtin:firewall@1 "),
             (r#"id = "firewall""#, r#"id = "installed_apps""#),
         ] {
@@ -637,6 +661,32 @@ mod tests {
                 "{to}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn screen_lock_at_version_two_is_a_supported_builtin_and_reports_its_own_value() {
+        let demo = include_str!("../../../../examples/manifest.toml");
+        let manifest = Manifest::parse(
+            demo.replace("builtin:screen_lock@1", "builtin:screen_lock@2")
+                .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(check_supported(&manifest), Ok(()));
+        let control = manifest.body().control("screen_lock").unwrap();
+        assert_eq!(control.check, "builtin:screen_lock@2");
+        // Off its own OS every check reads unknown; the value is the same for both versions there.
+        for os in Os::ALL {
+            let value = run(os, std::slice::from_ref(control), None, None);
+            assert!(value.contains_key("screen_lock"), "{os}");
+        }
+        assert_eq!(
+            screen_lock_version(&CheckInput {
+                control,
+                device_config: None,
+                repo_scan: None
+            }),
+            2
+        );
     }
 
     #[test]

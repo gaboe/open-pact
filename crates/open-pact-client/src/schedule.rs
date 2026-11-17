@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::Subcommand;
-use open_pact_core::{ManifestHash, Place, ProbeName, Schedule};
+use open_pact_core::{CheckPeriod, Manifest, ManifestHash, OnConnect, Place, ProbeName, Schedule};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -36,6 +36,12 @@ const HOME_REMOVE_FILES: &[&str] = &[
     JOB_LOG,
     "schedule.log.1",
 ];
+/// How often the OS wakes the job. Each wake costs one process start and one probe; the check and
+/// send periods come from the signed manifest, and a wake with nothing due exits at once.
+const WAKE_MINUTES: u32 = 1;
+const WAKE_SECS: u32 = WAKE_MINUTES * 60;
+/// The wake period as Task Scheduler reports a trigger's repeat interval.
+const WAKE_ISO: &str = "PT1M";
 const REPO_SCAN_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const LOCK: &str = "report-schedule.lock";
 
@@ -111,8 +117,9 @@ impl Trigger {
     }
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 struct State {
+    /// Whether the last wake found the VPN answering.
     vpn_up: bool,
     #[serde(default)]
     reconnect_pending: bool,
@@ -135,6 +142,12 @@ struct State {
     last_observed_compliance: Option<BTreeMap<String, bool>>,
     #[serde(default)]
     event_pending: bool,
+    /// When the last local check finished. A connect clears it, so the first wake on the VPN checks.
+    #[serde(default)]
+    last_check: Option<i64>,
+    /// When each control that fails now first failed on this device, for the local grace.
+    #[serde(default)]
+    first_failed: BTreeMap<String, i64>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -147,6 +160,7 @@ impl State {
     fn observe(&mut self, vpn_up: bool) {
         if vpn_up && !self.vpn_up {
             self.reconnect_pending = true;
+            self.last_check = None;
         }
         self.vpn_up = vpn_up;
     }
@@ -159,8 +173,29 @@ impl State {
             .is_none_or(|last| now < last || now.saturating_sub(last) >= interval)
     }
 
-    fn should_send(&self, now: i64, interval: i64) -> bool {
-        self.vpn_up && self.interval_elapsed(now, interval)
+    /// The gateway answered an attempt less than `within` seconds ago.
+    fn answered_within(&self, now: i64, within: i64) -> bool {
+        self.last_attempt
+            .max(self.last_success)
+            .is_some_and(|last| now >= last && now - last < within)
+    }
+
+    /// The last local check is older than `period`, or there is none, or the clock ran back.
+    fn check_older_than(&self, now: i64, period: i64) -> bool {
+        self.last_check
+            .is_none_or(|last| now < last || now - last >= period)
+    }
+
+    /// Notes when each control first failed on this device, and forgets a control that passes or
+    /// is no longer required.
+    fn observe_failures(&mut self, compliance: &BTreeMap<String, bool>, now: i64) {
+        self.first_failed
+            .retain(|id, _| compliance.get(id) == Some(&false));
+        for (id, compliant) in compliance {
+            if !compliant {
+                self.first_failed.entry(id.clone()).or_insert(now);
+            }
+        }
     }
 
     fn new_events(&self, current: checks::EventMarkerReads) -> bool {
@@ -189,22 +224,6 @@ impl State {
             self.event_pending = true;
         }
         self.last_observed_compliance = Some(current.clone());
-    }
-
-    fn due(&self, now: i64, interval: i64) -> Option<Trigger> {
-        if !self.vpn_up {
-            None
-        } else if self.event_pending {
-            Some(Trigger::Event)
-        } else if self.should_send(now, interval) {
-            Some(if self.reconnect_pending {
-                Trigger::Connect
-            } else {
-                Trigger::Periodic
-            })
-        } else {
-            None
-        }
     }
 
     fn acknowledged(&mut self, now: i64, events: checks::EventMarkerReads) {
@@ -312,6 +331,172 @@ fn newer(current: checks::EventMarkerRead, initialized: bool, previous: Option<i
     initialized
         && matches!(current, checks::EventMarkerRead::Read(Some(current))
             if previous.is_none_or(|previous| current > previous))
+}
+
+/// A connect claim comes at most this often (seconds). A VPN that flaps does not flood the gateway:
+/// the claim that went out within this window already proves the device, and any change in a
+/// result still sends at once.
+const CONNECT_REUSE_SECS: i64 = 5 * 60;
+/// How often a device that sends on any network, off the VPN, runs its checks.
+const ELSEWHERE_CHECK_SECS: i64 = 5 * 60;
+/// The shortest check period on Windows, where one check starts PowerShell. Lower it only after
+/// `check --dry-run --timings` shows a median cost the fleet accepts.
+const WINDOWS_CHECK_FLOOR_SECS: i64 = 5 * 60;
+
+fn check_floor_secs() -> i64 {
+    if cfg!(windows) {
+        WINDOWS_CHECK_FLOOR_SECS
+    } else {
+        0
+    }
+}
+
+/// What one wake does, decided before any check runs.
+#[derive(Debug, PartialEq, Eq)]
+struct Plan {
+    /// Run the checks now. A wake that runs none exits after its probe.
+    check: bool,
+    /// Send a claim after the checks, and why. A result that gets worse during the checks adds an
+    /// `Event` send; ask again after them.
+    send: Option<Trigger>,
+}
+
+impl Plan {
+    fn idle(&self) -> bool {
+        !self.check && self.send.is_none()
+    }
+}
+
+/// How far ahead `next_due` looks. A send interval is at most 24 hours.
+const HORIZON_SECS: i64 = 3 * 24 * 60 * 60;
+
+/// The first second at or after `now` where `due` holds, if it holds within the horizon. `due`
+/// only turns from false to true as time passes.
+fn first_time(now: i64, due: impl Fn(i64) -> bool) -> Option<i64> {
+    if due(now) {
+        return Some(now);
+    }
+    let end = now.saturating_add(HORIZON_SECS);
+    if !due(end) {
+        return None;
+    }
+    let (mut low, mut high) = (now, end);
+    while high - low > 1 {
+        let middle = low + (high - low) / 2;
+        if due(middle) {
+            high = middle;
+        } else {
+            low = middle;
+        }
+    }
+    Some(high)
+}
+
+/// When the next check and the next claim fall due if the device stays where the last wake found
+/// it. Derived from `plan`, so it says what the job will do.
+#[derive(Debug, PartialEq, Eq)]
+struct NextDue {
+    check: Option<i64>,
+    send: Option<i64>,
+}
+
+fn next_due(schedule: &Schedule, state: &State, now: i64) -> NextDue {
+    let place = if state.vpn_up {
+        Place::Vpn
+    } else {
+        Place::Elsewhere
+    };
+    let floor = check_floor_secs();
+    NextDue {
+        check: first_time(now, |at| plan(schedule, state, place, at, floor).check),
+        send: first_time(now, |at| {
+            plan(schedule, state, place, at, floor).send.is_some()
+        }),
+    }
+}
+
+fn time_text(time: i64) -> String {
+    chrono::DateTime::from_timestamp(time, 0).map_or_else(
+        || "an unknown time".to_owned(),
+        |time| time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    )
+}
+
+/// What `schedule status` and `accept` say about the job's next steps.
+fn next_due_lines(schedule: &Schedule, state: &State, now: i64) -> Vec<String> {
+    let next = next_due(schedule, state, now);
+    let off_vpn = !state.vpn_up && !schedule.may_send(Place::Elsewhere);
+    let line = |what: &str, due: Option<i64>| match due {
+        Some(time) if time <= now => format!("Next {what} due: at the next wake, within a minute."),
+        Some(time) => format!("Next {what} due: {}.", time_text(time)),
+        None if off_vpn => format!(
+            "Next {what} due: none while the VPN does not answer. The job only tests whether it does."
+        ),
+        None => format!("Next {what} due: none within three days."),
+    };
+    let mut lines = Vec::new();
+    if let Some(last) = state.last_check {
+        lines.push(format!("Last check: {}.", time_text(last)));
+    }
+    lines.push(line("check", next.check));
+    lines.push(line("claim", next.send));
+    lines
+}
+
+/// `next_due_lines` from the job's saved state, or from a fresh state when the job has not run.
+pub(crate) fn next_due_text(state_home: &Home, schedule: &Schedule) -> Vec<String> {
+    let state: State = state_home
+        .read_json(STATE)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    next_due_lines(schedule, &state, chrono::Utc::now().timestamp())
+}
+
+/// The decision of one wake. Pure: the caller probes for `place`, reads `state` and the clock,
+/// and then does only what the plan names.
+///
+/// - Checks: on the VPN every `check` of the schedule and on the first wake after a connect;
+///   elsewhere only where the schedule sends from any network, every five minutes. A claim that is
+///   due always runs fresh checks first. `check_floor` raises the VPN check period (Windows).
+/// - Sends: where the schedule allows a claim at this place, at once when a result got worse, at
+///   once on a connect (unless a claim was answered within the last five minutes; the flat 0.7 form
+///   waits for its interval), and when the interval has passed.
+fn plan(schedule: &Schedule, state: &State, place: Place, now: i64, check_floor: i64) -> Plan {
+    let connect = place == Place::Vpn && state.reconnect_pending;
+    let send = schedule.period(place).and_then(|period| {
+        if state.event_pending {
+            Some(Trigger::Event)
+        } else if connect
+            && schedule.on_connect() == Some(OnConnect::Send)
+            && !state.answered_within(now, CONNECT_REUSE_SECS)
+        {
+            Some(Trigger::Connect)
+        } else if state.interval_elapsed(now, period.as_secs()) {
+            Some(if connect {
+                Trigger::Connect
+            } else {
+                Trigger::Periodic
+            })
+        } else {
+            None
+        }
+    });
+    let check_period = match place {
+        Place::Vpn => schedule
+            .vpn_check_period()
+            .map_or(CheckPeriod::DEFAULT.as_secs(), |period| period.as_secs())
+            .max(check_floor),
+        Place::Elsewhere => ELSEWHERE_CHECK_SECS.max(check_floor),
+    };
+    let checks_here = match place {
+        Place::Vpn => true,
+        Place::Elsewhere => schedule.may_send(place),
+    };
+    Plan {
+        check: send.is_some() || (checks_here && state.check_older_than(now, check_period)),
+        send,
+    }
 }
 
 async fn probe_process(command: &mut tokio::process::Command, limit: Duration) -> bool {
@@ -640,7 +825,7 @@ impl Job {
 <plist version="1.0"><dict>
 <key>Label</key><string>{}</string>
 <key>ProgramArguments</key><array>{args}</array>
-<key>StartInterval</key><integer>300</integer>
+<key>StartInterval</key><integer>{WAKE_SECS}</integer>
 <key>RunAtLoad</key><true/>
 <key>StandardOutPath</key><string>{log}</string>
 <key>StandardErrorPath</key><string>{log}</string>
@@ -674,7 +859,7 @@ impl Job {
 
     fn timer(&self) -> String {
         format!(
-            "[Unit]\nDescription=Check VPN for open-pact claims every five minutes\n[Timer]\nOnStartupSec=1min\nOnUnitActiveSec=5min\nAccuracySec=1s\nUnit={}.service\n[Install]\nWantedBy=timers.target\n",
+            "[Unit]\nDescription=Wake open-pact every minute and send claims when the signed schedule says so\n[Timer]\nOnStartupSec=1min\nOnUnitActiveSec=1min\nAccuracySec=1s\nUnit={}.service\n[Install]\nWantedBy=timers.target\n",
             self.id
         )
     }
@@ -687,7 +872,7 @@ impl Job {
             "/SC".into(),
             "MINUTE".into(),
             "/MO".into(),
-            "5".into(),
+            WAKE_MINUTES.to_string(),
             "/TR".into(),
             self.argv
                 .iter()
@@ -1301,6 +1486,9 @@ pub(crate) struct ScheduleAuthorization {
     pub(crate) manifest_hash: ManifestHash,
     pub(crate) schedule: open_pact_core::Schedule,
     pub(crate) owner_consented: bool,
+    /// Whether a failing control whose grace ended deletes the VPN certificate. The job always
+    /// does; a test turns it off where the machine's real check results must not matter.
+    pub(crate) self_removal: bool,
 }
 
 pub(crate) async fn tick_with_scan(
@@ -1313,9 +1501,17 @@ pub(crate) async fn tick_with_scan(
 ) -> Result<()> {
     let schedule = &authorization.schedule;
     let mut state: State = state_home.read_json(STATE)?.unwrap_or_default();
+    let before = state.clone();
     let place = place(schedule).await;
-    state.observe(schedule.may_send(place));
-    save(state_home, STATE, &state)?;
+    state.observe(place == Place::Vpn);
+    if state != before || !state_home.file(STATE).exists() {
+        save(state_home, STATE, &state)?;
+    }
+    // A wake with nothing due ends here: no check, no scan, no gateway request.
+    let now = chrono::Utc::now().timestamp();
+    if plan(schedule, &state, place, now, check_floor_secs()).idle() {
+        return Ok(());
+    }
     // The scan can take long. It runs before the claim lock, which `check` and `accept` wait for.
     scan.await?;
     let Some(_claim_lock) = claim::try_lock(home)? else {
@@ -1339,12 +1535,18 @@ pub(crate) async fn tick_with_scan(
     .await?;
     let events = read_events();
     let compliance = prepared.compliance().clone();
-    state.observe_compliance(&compliance);
-    state.event_pending |= state.new_events(events);
     let now = chrono::Utc::now().timestamp();
-    let due = schedule
-        .period(place)
-        .and_then(|interval| state.due(now, interval.as_secs()));
+    state.last_check = Some(now);
+    state.observe_compliance(&compliance);
+    state.observe_failures(&compliance, now);
+    state.event_pending |= state.new_events(events);
+    if authorization.self_removal {
+        let lapsed = lapsed_controls(&manifest, &compliance, prepared.results(), &state, now);
+        if !lapsed.is_empty() {
+            retire_certificate(home, &mut state, &lapsed);
+        }
+    }
+    let due = plan(schedule, &state, place, now, check_floor_secs()).send;
     if let Some(trigger) = due {
         save(state_home, STATE, &state)?;
         let outcome = prepared
@@ -1357,6 +1559,70 @@ pub(crate) async fn tick_with_scan(
     }
     save(state_home, STATE, &state)?;
     Ok(())
+}
+
+/// The controls that fail now and whose grace has ended on this device, so the gateway would deny
+/// them too. Grace counts from the first check that saw the failure; `0d` ends at once, and a result
+/// that cannot be read counts against `unknown_grace`.
+fn lapsed_controls(
+    manifest: &Manifest,
+    compliance: &BTreeMap<String, bool>,
+    results: &BTreeMap<String, open_pact_core::ControlValue>,
+    state: &State,
+    now: i64,
+) -> Vec<String> {
+    let body = manifest.body();
+    compliance
+        .iter()
+        .filter(|(_, compliant)| !**compliant)
+        .filter_map(|(id, _)| {
+            let control = body.control(id)?;
+            let unknown = results.get(id).is_none_or(|value| value == "unknown");
+            let span = if unknown {
+                &body.unknown_grace
+            } else {
+                &control.grace
+            };
+            let since = state.first_failed.get(id).copied().unwrap_or(now);
+            let ended = span.is_zero()
+                || span.min_duration().is_some_and(|length| {
+                    chrono::TimeDelta::seconds(now.saturating_sub(since)) > length
+                });
+            ended.then(|| id.clone())
+        })
+        .collect()
+}
+
+/// A control failed and its grace ended: the device stops being a good VPN client by itself. It
+/// deletes the installed VPN certificate, writes one line to the job log, and asks for a claim at
+/// once. A claim that the gateway accepts later installs a new certificate as always.
+fn retire_certificate(home: &Home, state: &mut State, lapsed: &[String]) {
+    match home.remove_vpn_pair() {
+        Ok(false) => {}
+        Ok(true) => {
+            job_log(
+                home,
+                &format!(
+                    "Removed the VPN certificate: {} failed and its grace ended. A claim goes out at once.",
+                    lapsed.join(", ")
+                ),
+            );
+            state.event_pending = true;
+        }
+        Err(error) => {
+            let key = format!("removal failed {error:#}");
+            if state.last_note.as_deref() != Some(key.as_str()) {
+                job_log(
+                    home,
+                    &format!(
+                        "Could not remove the VPN certificate after {} failed: {error:#}",
+                        lapsed.join(", ")
+                    ),
+                );
+                state.last_note = Some(key);
+            }
+        }
+    }
 }
 
 /// Tells the owner what only the owner can fix: a changed manifest, a denial, an alarm. Each piece
@@ -1491,6 +1757,8 @@ struct Observed {
 struct WindowsTaskState {
     trigger_enabled: bool,
     trigger_type: Option<i32>,
+    /// The repeat interval of the trigger, as Task Scheduler writes it (such as `PT1M`).
+    repetition: Option<String>,
     protected_binary: Option<ProtectedBinaryState>,
 }
 
@@ -1504,6 +1772,7 @@ impl WindowsTaskState {
     fn matches_desired(&self, system: bool) -> bool {
         self.trigger_enabled
             && self.trigger_type == Some(1)
+            && self.repetition.as_deref() == Some(WAKE_ISO)
             && (!system
                 || self
                     .protected_binary
@@ -1564,6 +1833,7 @@ $triggers = @($task.Definition.Triggers)
 if ($triggers.Count -eq 1) {{
     Write-Output ("trigger_enabled=" + [int]$triggers[0].Enabled)
     Write-Output ("trigger_type=" + $triggers[0].Type)
+    Write-Output ("repetition=" + $triggers[0].Repetition.Interval)
 }}
 if (IsSystemTask $task) {{
     $protected = Join-Path (Join-Path (ProgramFilesPath) 'open-pact') 'open-pact-client.exe'
@@ -1572,7 +1842,7 @@ if (IsSystemTask $task) {{
     $protectedMatches = $protectedExists -and (Get-FileHash -LiteralPath $protected -Algorithm SHA256).Hash -eq (Get-FileHash -LiteralPath {source} -Algorithm SHA256).Hash
     Write-Output ("protected_matches=" + [int]$protectedMatches)
 }}
-if ($action.Count -eq 1 -and $action[0].Path -eq {binary} -and $action[0].Arguments -eq {args} -and $task.Enabled -and $triggers.Count -eq 1 -and $triggers[0].Enabled -and $triggers[0].Type -eq 1 -and $triggers[0].Repetition.Interval -eq 'PT5M') {{ Write-Output 'matches' }}
+if ($action.Count -eq 1 -and $action[0].Path -eq {binary} -and $action[0].Arguments -eq {args} -and $task.Enabled -and $triggers.Count -eq 1 -and $triggers[0].Enabled -and $triggers[0].Type -eq 1 -and $triggers[0].Repetition.Interval -eq '{WAKE_ISO}') {{ Write-Output 'matches' }}
 "#,
         binary = powershell_literal(text(executable)?),
         args = powershell_literal(expected_args),
@@ -1670,6 +1940,10 @@ fn observe(home: &Home, desired: Option<&Applied>, inspect_protected: bool) -> R
                 .then(|| WindowsTaskState {
                     trigger_enabled: field("trigger_enabled=") == Some(1),
                     trigger_type: field("trigger_type="),
+                    repetition: output
+                        .lines()
+                        .find_map(|line| line.strip_prefix("repetition="))
+                        .map(|value| value.trim().to_owned()),
                     protected_binary: system.then(|| ProtectedBinaryState {
                         exists: field("protected_exists=") == Some(1),
                         matches_source: field("protected_matches=") == Some(1),
@@ -1976,6 +2250,14 @@ async fn status(home: &Home) -> Result<()> {
             time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
         );
     }
+    if desired.is_some()
+        && let Ok(manifest) = home.signed_manifest()
+        && let Some(schedule) = &manifest.body().schedule
+    {
+        for line in next_due_text(&schedule_home, schedule) {
+            println!("{line}");
+        }
+    }
     Ok(())
 }
 
@@ -2027,6 +2309,7 @@ async fn run_tick(home: &Home, state_home: &Home, user_home: Option<&Path>) -> R
             manifest_hash: manifest.hash().clone(),
             schedule,
             owner_consented: config.auto_send,
+            self_removal: true,
         }
     };
     tick(
@@ -2143,7 +2426,7 @@ async fn operate(home: &Home, command: Operation, home_locked: bool) -> Result<(
             };
             register(&job, RegistrationAction::Install(run_as))?;
             println!(
-                "Installed {}. The OS runs it every five minutes. It sends the same claim as `check`, as the signed manifest allows. It writes what needs your attention to {}.",
+                "Installed {}. The OS runs it every minute and it does nothing until a check or a claim is due. It sends the same claim as `check`, as the signed manifest allows. It writes what needs your attention to {}.",
                 job.id, job.log
             );
         }
@@ -2462,6 +2745,579 @@ esac
         );
     }
 
+    const T: i64 = 1_000_000;
+
+    /// Controls of the example manifest: `disk_encryption` has no grace, `firewall` one day,
+    /// `unknown_grace` is seven days.
+    fn lapsed(rows: &[(&str, &str, Option<i64>)]) -> Vec<String> {
+        let manifest = Manifest::parse(include_bytes!("../../../examples/manifest.toml")).unwrap();
+        let compliance = rows
+            .iter()
+            .map(|(id, value, _)| ((*id).to_owned(), *value == "full" || *value == "on"))
+            .collect();
+        let results = rows
+            .iter()
+            .map(|(id, value, _)| ((*id).to_owned(), (*value).into()))
+            .collect();
+        let state = State {
+            first_failed: rows
+                .iter()
+                .filter_map(|(id, _, ago)| Some(((*id).to_owned(), T - (*ago)?)))
+                .collect(),
+            ..State::default()
+        };
+        lapsed_controls(&manifest, &compliance, &results, &state, T)
+    }
+
+    #[test]
+    fn a_control_lapses_when_its_grace_has_ended() {
+        const DAY: i64 = 86_400;
+        // No grace: at once, even on the first check that saw it.
+        assert_eq!(
+            lapsed(&[("disk_encryption", "none", None)]),
+            ["disk_encryption"]
+        );
+        assert_eq!(
+            lapsed(&[("disk_encryption", "none", Some(0))]),
+            ["disk_encryption"]
+        );
+        // One day of grace ends after the day, not at it.
+        assert!(lapsed(&[("firewall", "off", None)]).is_empty());
+        assert!(lapsed(&[("firewall", "off", Some(DAY - 1))]).is_empty());
+        assert!(lapsed(&[("firewall", "off", Some(DAY))]).is_empty());
+        assert_eq!(lapsed(&[("firewall", "off", Some(DAY + 1))]), ["firewall"]);
+        // A result that cannot be read counts against `unknown_grace`, also on a no-grace control.
+        assert!(lapsed(&[("firewall", "unknown", Some(7 * DAY))]).is_empty());
+        assert_eq!(
+            lapsed(&[("firewall", "unknown", Some(7 * DAY + 1))]),
+            ["firewall"]
+        );
+        assert!(lapsed(&[("disk_encryption", "unknown", Some(60))]).is_empty());
+        // A control that passes never lapses, and a control the manifest lacks is ignored.
+        assert!(lapsed(&[("firewall", "on", Some(30 * DAY))]).is_empty());
+        assert!(lapsed(&[("not_in_the_manifest", "off", Some(30 * DAY))]).is_empty());
+        assert_eq!(
+            lapsed(&[
+                ("firewall", "off", Some(2 * DAY)),
+                ("disk_encryption", "none", None),
+                ("os_supported", "no", Some(DAY)),
+            ]),
+            ["disk_encryption", "firewall"]
+        );
+    }
+
+    #[test]
+    fn the_local_grace_starts_at_the_first_failure_and_resets_when_the_control_passes() {
+        let mut state = State::default();
+        let failing = |firewall| {
+            BTreeMap::from([
+                ("firewall".to_owned(), firewall),
+                ("os_supported".to_owned(), false),
+            ])
+        };
+        state.observe_failures(&failing(false), 100);
+        state.observe_failures(&failing(false), 500);
+        assert_eq!(
+            state.first_failed["firewall"], 100,
+            "the first failure stands"
+        );
+        state.observe_failures(&failing(true), 600);
+        assert!(
+            !state.first_failed.contains_key("firewall"),
+            "a pass clears it"
+        );
+        state.observe_failures(&failing(false), 700);
+        assert_eq!(state.first_failed["firewall"], 700);
+        state.observe_failures(&BTreeMap::from([("firewall".to_owned(), false)]), 800);
+        assert!(
+            !state.first_failed.contains_key("os_supported"),
+            "a control the manifest no longer requires is forgotten"
+        );
+    }
+
+    fn probe() -> open_pact_core::Probe {
+        open_pact_core::Probe {
+            address: open_pact_core::ProbeAddress::try_from("10.0.0.1:443".to_owned()).unwrap(),
+            name: None,
+        }
+    }
+
+    fn interval(text: &str) -> open_pact_core::Interval {
+        open_pact_core::Interval::try_from(text.to_owned()).unwrap()
+    }
+
+    /// `[schedule.vpn]` with these periods, and `[schedule.always]` when given.
+    fn places(vpn: Option<(&str, &str)>, always: Option<&str>) -> Schedule {
+        let vpn = vpn.map(|(send, check)| {
+            let mut slot = open_pact_core::VpnSlot::new(probe(), interval(send));
+            slot.check = CheckPeriod::try_from(check.to_owned()).unwrap();
+            slot
+        });
+        Schedule::new(vpn, always.map(interval)).unwrap()
+    }
+
+    /// A state with the last answered attempt and the last check `ago` seconds before `T`.
+    fn state(reconnect: bool, attempt: Option<i64>, check: Option<i64>, event: bool) -> State {
+        State {
+            vpn_up: true,
+            reconnect_pending: reconnect,
+            last_attempt: attempt.map(|ago| T - ago),
+            last_check: check.map(|ago| T - ago),
+            event_pending: event,
+            ..State::default()
+        }
+    }
+
+    const MIN: i64 = 60;
+
+    #[test]
+    fn next_due_says_when_the_job_will_check_and_send() {
+        let vpn = places(Some(("10m", "5m")), None);
+        let on_vpn = State {
+            vpn_up: true,
+            ..state(false, Some(4 * MIN), Some(2 * MIN), false)
+        };
+        // Check at 5 minutes after the last one (3 minutes from now); claim 10 minutes after the answer.
+        assert_eq!(
+            next_due(&vpn, &on_vpn, T),
+            NextDue {
+                check: Some(T + 3 * MIN),
+                send: Some(T + 6 * MIN)
+            }
+        );
+        // Nothing ran yet: both at the next wake.
+        let fresh = State {
+            vpn_up: true,
+            ..State::default()
+        };
+        assert_eq!(
+            next_due(&vpn, &fresh, T),
+            NextDue {
+                check: Some(T),
+                send: Some(T)
+            }
+        );
+        // Off the VPN with only a VPN slot: nothing falls due.
+        let off = State::default();
+        assert_eq!(
+            next_due(&vpn, &off, T),
+            NextDue {
+                check: None,
+                send: None
+            }
+        );
+        let lines = next_due_lines(&vpn, &off, T);
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.contains("none while the VPN does not answer")),
+            "{lines:?}"
+        );
+        // A held event is due now.
+        let event = state(false, Some(MIN), Some(MIN), true);
+        assert_eq!(
+            next_due(
+                &vpn,
+                &State {
+                    vpn_up: true,
+                    ..event
+                },
+                T
+            )
+            .send,
+            Some(T)
+        );
+    }
+
+    #[test]
+    fn the_next_due_lines_name_the_last_check_and_both_times() {
+        let vpn = places(Some(("10m", "5m")), None);
+        let on_vpn = State {
+            vpn_up: true,
+            ..state(false, Some(4 * MIN), Some(2 * MIN), false)
+        };
+        assert_eq!(
+            next_due_lines(&vpn, &on_vpn, T),
+            [
+                format!("Last check: {}.", time_text(T - 2 * MIN)),
+                format!("Next check due: {}.", time_text(T + 3 * MIN)),
+                format!("Next claim due: {}.", time_text(T + 6 * MIN)),
+            ]
+        );
+        let due_now = State {
+            vpn_up: true,
+            ..State::default()
+        };
+        assert_eq!(
+            next_due_lines(&vpn, &due_now, T),
+            [
+                "Next check due: at the next wake, within a minute.".to_owned(),
+                "Next claim due: at the next wake, within a minute.".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_decides_checks_and_sends_from_the_schedule_place_and_state() {
+        use Place::{Elsewhere, Vpn};
+        let vpn = places(Some(("10m", "5m")), None);
+        let vpn_every_minute = places(Some(("10m", "1m")), None);
+        let both = places(Some(("10m", "5m")), Some("4h"));
+        let always = places(None, Some("4h"));
+        let flat_vpn = Schedule::legacy_vpn(probe(), interval("55m"));
+        let flat_always = Schedule::legacy_always(interval("55m"));
+        let go = |check, send| Plan { check, send };
+        let idle = go(false, None);
+        let rows: Vec<(&str, &Schedule, Place, State, i64, Plan)> = vec![
+            // Off the VPN with only a VPN slot: nothing runs, whatever the state says.
+            (
+                "off the VPN",
+                &vpn,
+                Elsewhere,
+                state(false, None, None, false),
+                0,
+                idle,
+            ),
+            (
+                "off the VPN, event held",
+                &vpn,
+                Elsewhere,
+                state(false, None, None, true),
+                0,
+                go(false, None),
+            ),
+            (
+                "off the VPN, reconnect held",
+                &vpn,
+                Elsewhere,
+                state(true, Some(99 * MIN), None, false),
+                0,
+                go(false, None),
+            ),
+            // A connect: check at once and send at once.
+            (
+                "connect, never sent",
+                &vpn,
+                Vpn,
+                state(true, None, None, false),
+                0,
+                go(true, Some(Trigger::Connect)),
+            ),
+            (
+                "connect, last answer 6 minutes ago",
+                &vpn,
+                Vpn,
+                state(true, Some(6 * MIN), Some(6 * MIN), false),
+                0,
+                go(true, Some(Trigger::Connect)),
+            ),
+            // The flapping guard: an answer within five minutes holds the connect claim back, but the
+            // first wake after the connect still checks.
+            (
+                "connect, last answer 3 minutes ago",
+                &vpn,
+                Vpn,
+                state(true, Some(3 * MIN), None, false),
+                0,
+                go(true, None),
+            ),
+            (
+                "connect, last answer 4m59s ago",
+                &vpn,
+                Vpn,
+                state(true, Some(5 * MIN - 1), None, false),
+                0,
+                go(true, None),
+            ),
+            (
+                "connect, last answer 5m ago",
+                &vpn,
+                Vpn,
+                state(true, Some(5 * MIN), None, false),
+                0,
+                go(true, Some(Trigger::Connect)),
+            ),
+            // Steady state on the VPN.
+            (
+                "steady, nothing due",
+                &vpn,
+                Vpn,
+                state(false, Some(4 * MIN), Some(4 * MIN), false),
+                0,
+                go(false, None),
+            ),
+            (
+                "steady, check due",
+                &vpn,
+                Vpn,
+                state(false, Some(4 * MIN), Some(5 * MIN), false),
+                0,
+                go(true, None),
+            ),
+            (
+                "steady, interval due",
+                &vpn,
+                Vpn,
+                state(false, Some(10 * MIN), Some(MIN), false),
+                0,
+                go(true, Some(Trigger::Periodic)),
+            ),
+            (
+                "steady, 9m59s since the answer",
+                &vpn,
+                Vpn,
+                state(false, Some(10 * MIN - 1), Some(MIN), false),
+                0,
+                go(false, None),
+            ),
+            // A result that got worse sends at once, and its checks run again.
+            (
+                "event",
+                &vpn,
+                Vpn,
+                state(false, Some(MIN), Some(MIN), true),
+                0,
+                go(true, Some(Trigger::Event)),
+            ),
+            (
+                "event beats connect",
+                &vpn,
+                Vpn,
+                state(true, None, None, true),
+                0,
+                go(true, Some(Trigger::Event)),
+            ),
+            // The check period comes from the manifest, and Windows raises it to five minutes.
+            (
+                "check every minute, 59 s",
+                &vpn_every_minute,
+                Vpn,
+                state(false, Some(MIN), Some(MIN - 1), false),
+                0,
+                go(false, None),
+            ),
+            (
+                "check every minute, 60 s",
+                &vpn_every_minute,
+                Vpn,
+                state(false, Some(MIN), Some(MIN), false),
+                0,
+                go(true, None),
+            ),
+            (
+                "check every minute, Windows floor",
+                &vpn_every_minute,
+                Vpn,
+                state(false, Some(MIN), Some(4 * MIN), false),
+                300,
+                go(false, None),
+            ),
+            (
+                "check every minute, Windows floor reached",
+                &vpn_every_minute,
+                Vpn,
+                state(false, Some(MIN), Some(5 * MIN), false),
+                300,
+                go(true, None),
+            ),
+            (
+                "a clock that ran back checks",
+                &vpn,
+                Vpn,
+                state(false, Some(MIN), Some(-5 * MIN), false),
+                0,
+                go(true, None),
+            ),
+            // Both slots: elsewhere checks every five minutes and sends on the always interval.
+            (
+                "both, elsewhere, nothing due",
+                &both,
+                Elsewhere,
+                state(false, Some(MIN), Some(4 * MIN), false),
+                0,
+                go(false, None),
+            ),
+            (
+                "both, elsewhere, check due",
+                &both,
+                Elsewhere,
+                state(false, Some(MIN), Some(5 * MIN), false),
+                0,
+                go(true, None),
+            ),
+            (
+                "both, elsewhere, interval due",
+                &both,
+                Elsewhere,
+                state(false, Some(4 * 60 * MIN), Some(MIN), false),
+                0,
+                go(true, Some(Trigger::Periodic)),
+            ),
+            (
+                "both, elsewhere, event",
+                &both,
+                Elsewhere,
+                state(false, Some(MIN), Some(MIN), true),
+                0,
+                go(true, Some(Trigger::Event)),
+            ),
+            (
+                "both, on the VPN, VPN interval",
+                &both,
+                Vpn,
+                state(false, Some(10 * MIN), Some(MIN), false),
+                0,
+                go(true, Some(Trigger::Periodic)),
+            ),
+            (
+                "both, on the VPN, connect",
+                &both,
+                Vpn,
+                state(true, Some(60 * MIN), None, false),
+                0,
+                go(true, Some(Trigger::Connect)),
+            ),
+            // Always only: no probe, the place is always elsewhere.
+            (
+                "always, never sent",
+                &always,
+                Elsewhere,
+                state(false, None, None, false),
+                0,
+                go(true, Some(Trigger::Periodic)),
+            ),
+            (
+                "always, nothing due",
+                &always,
+                Elsewhere,
+                state(false, Some(MIN), Some(MIN), false),
+                0,
+                go(false, None),
+            ),
+            // The flat 0.7 forms keep their interval gating: the connect claim waits for it.
+            (
+                "flat vpn, connect inside the interval",
+                &flat_vpn,
+                Vpn,
+                state(true, Some(10 * MIN), None, false),
+                0,
+                go(true, None),
+            ),
+            (
+                "flat vpn, connect after the interval",
+                &flat_vpn,
+                Vpn,
+                state(true, Some(55 * MIN), None, false),
+                0,
+                go(true, Some(Trigger::Connect)),
+            ),
+            (
+                "flat vpn, steady check",
+                &flat_vpn,
+                Vpn,
+                state(false, Some(10 * MIN), Some(5 * MIN), false),
+                0,
+                go(true, None),
+            ),
+            (
+                "flat vpn, off the VPN",
+                &flat_vpn,
+                Elsewhere,
+                state(false, None, None, false),
+                0,
+                go(false, None),
+            ),
+            (
+                "flat always, first wake",
+                &flat_always,
+                Elsewhere,
+                state(false, None, None, false),
+                0,
+                go(true, Some(Trigger::Periodic)),
+            ),
+            (
+                "flat always, between",
+                &flat_always,
+                Elsewhere,
+                state(false, Some(10 * MIN), Some(MIN), false),
+                0,
+                go(false, None),
+            ),
+            (
+                "flat always, at the interval",
+                &flat_always,
+                Elsewhere,
+                state(false, Some(55 * MIN), Some(MIN), false),
+                0,
+                go(true, Some(Trigger::Periodic)),
+            ),
+        ];
+        for (name, schedule, place, state, floor, expected) in rows {
+            assert_eq!(plan(schedule, &state, place, T, floor), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_wake_with_nothing_due_is_idle_and_a_due_claim_always_checks() {
+        let vpn = places(Some(("10m", "5m")), None);
+        let quiet = plan(
+            &vpn,
+            &state(false, Some(MIN), Some(MIN), false),
+            Place::Vpn,
+            T,
+            0,
+        );
+        assert!(quiet.idle());
+        for send_due in [
+            state(false, Some(10 * MIN), Some(MIN), false),
+            state(false, Some(MIN), Some(MIN), true),
+            state(true, None, Some(MIN), false),
+        ] {
+            let due = plan(&vpn, &send_due, Place::Vpn, T, 0);
+            assert!(due.send.is_some() && due.check && !due.idle());
+        }
+    }
+
+    #[test]
+    fn a_connect_clears_the_last_check_so_the_first_wake_checks() {
+        let mut state = State {
+            last_check: Some(T),
+            ..State::default()
+        };
+        state.observe(false);
+        assert_eq!(state.last_check, Some(T), "off the VPN changes nothing");
+        state.observe(true);
+        assert!(state.reconnect_pending);
+        assert_eq!(state.last_check, None);
+        state.last_check = Some(T);
+        state.observe(true);
+        assert_eq!(state.last_check, Some(T), "staying connected is no connect");
+    }
+
+    /// The decisions the flat 0.7 VPN form made before `plan`: the old tests still hold them.
+    impl State {
+        fn due(&self, now: i64, interval: i64) -> Option<Trigger> {
+            let schedule = open_pact_core::Schedule::legacy_vpn(
+                open_pact_core::Probe {
+                    address: open_pact_core::ProbeAddress::try_from("10.0.0.1:443".to_owned())
+                        .unwrap(),
+                    name: None,
+                },
+                open_pact_core::Interval::try_from(format!("{}m", interval / 60)).unwrap(),
+            );
+            let place = if self.vpn_up {
+                Place::Vpn
+            } else {
+                Place::Elsewhere
+            };
+            plan(&schedule, self, place, now, 0).send
+        }
+
+        fn should_send(&self, now: i64, interval: i64) -> bool {
+            self.vpn_up && self.interval_elapsed(now, interval)
+        }
+    }
+
     fn every_55_minutes_on_the_vpn(probe: &str) -> open_pact_core::Schedule {
         open_pact_core::Schedule::legacy_vpn(
             open_pact_core::Probe {
@@ -2549,6 +3405,7 @@ esac
             windows_task: Some(WindowsTaskState {
                 trigger_enabled: false,
                 trigger_type: Some(1),
+                repetition: Some(WAKE_ISO.into()),
                 protected_binary: None,
             }),
             ..Observed::default()
@@ -2561,6 +3418,7 @@ esac
             windows_task: Some(WindowsTaskState {
                 trigger_enabled: true,
                 trigger_type: Some(7),
+                repetition: Some(WAKE_ISO.into()),
                 protected_binary: None,
             }),
             ..disabled
@@ -2569,6 +3427,55 @@ esac
             reconcile(Some(&settings), applied, &wrong_type),
             Change::Update
         );
+    }
+
+    #[test]
+    fn a_five_minute_job_is_rewritten_for_the_one_minute_wake() {
+        let settings = Applied {
+            run_as: RunAs::User,
+            executable: PathBuf::from("C:\\Program Files\\open-pact\\open-pact-client.exe"),
+            user_home: None,
+        };
+        let task = |repetition: Option<&str>| Observed {
+            exists: true,
+            matches: true,
+            windows_task: Some(WindowsTaskState {
+                trigger_enabled: true,
+                trigger_type: Some(1),
+                repetition: repetition.map(str::to_owned),
+                protected_binary: None,
+            }),
+            ..Observed::default()
+        };
+        for stale in [Some("PT5M"), Some("PT10M"), None] {
+            assert_eq!(
+                reconcile(Some(&settings), Some(&settings), &task(stale)),
+                Change::Update,
+                "{stale:?}"
+            );
+        }
+        assert_eq!(
+            reconcile(Some(&settings), Some(&settings), &task(Some("PT1M"))),
+            Change::None
+        );
+    }
+
+    #[test]
+    fn the_windows_observation_asks_for_the_one_minute_repeat() {
+        let job = Job::new(Path::new("client.exe"), Path::new("fixture-home")).unwrap();
+        let script = windows_observation_script(
+            &job,
+            Path::new("client.exe"),
+            Path::new("client.exe"),
+            "--home",
+        )
+        .unwrap();
+        assert!(
+            script.contains("Repetition.Interval -eq 'PT1M'"),
+            "{script}"
+        );
+        assert!(!script.contains("PT5M"));
+        assert!(script.contains("repetition="));
     }
 
     #[test]
@@ -2596,6 +3503,7 @@ esac
                 windows_task: Some(WindowsTaskState {
                     trigger_enabled: true,
                     trigger_type: Some(1),
+                    repetition: Some(WAKE_ISO.into()),
                     protected_binary: Some(protected_binary),
                 }),
                 ..Observed::default()
@@ -3463,7 +4371,7 @@ Write-Output 'refused'
     fn launchd_arguments_and_interval_are_encoded() {
         let log = Path::new("/home/example/pact & data").join(JOB_LOG);
         let plist = job().plist();
-        assert!(plist.contains("<key>StartInterval</key><integer>300</integer>"));
+        assert!(plist.contains("<key>StartInterval</key><integer>60</integer>"));
         assert!(plist.contains("<string>/home/example/pact &amp; data</string>"));
         assert!(plist.contains("<string>schedule</string>\n<string>run</string>"));
         assert!(plist.contains("<key>RunAtLoad</key><true/>"));
@@ -3477,8 +4385,8 @@ Write-Output 'refused'
     }
 
     #[test]
-    fn systemd_has_a_five_minute_timer_and_quotes_arguments() {
-        assert!(job().timer().contains("OnUnitActiveSec=5min"));
+    fn systemd_has_a_one_minute_timer_and_quotes_arguments() {
+        assert!(job().timer().contains("OnUnitActiveSec=1min"));
         assert!(
             job()
                 .timer()
@@ -3497,7 +4405,7 @@ Write-Output 'refused'
     }
 
     #[test]
-    fn windows_task_runs_every_five_minutes_as_the_current_user() {
+    fn windows_task_runs_every_minute_as_the_current_user() {
         let job = Job::new(
             Path::new(r"C:\Example App\open-pact-client.exe"),
             Path::new(r"C:\Example User\pact"),
@@ -3512,7 +4420,7 @@ Write-Output 'refused'
                 "/SC",
                 "MINUTE",
                 "/MO",
-                "5",
+                "1",
                 "/TR",
                 r#""C:\Example App\open-pact-client.exe" "--home" "C:\Example User\pact" "schedule" "run""#,
                 "/RL",
@@ -3526,7 +4434,7 @@ Write-Output 'refused'
     }
 
     #[test]
-    fn windows_system_task_runs_every_five_minutes_with_explicit_user_home() {
+    fn windows_system_task_runs_every_minute_with_explicit_user_home() {
         let job = Job::new(
             Path::new(r"C:\Example App\open-pact-client.exe"),
             Path::new(r"C:\Example User\pact"),
@@ -3543,7 +4451,7 @@ Write-Output 'refused'
                 "/SC",
                 "MINUTE",
                 "/MO",
-                "5",
+                "1",
                 "/TR",
                 r#""C:\Example App\open-pact-client.exe" "--home" "C:\Example User\pact" "schedule" "run" "--system" "--user-home" "C:\Users\example user""#,
                 "/RU",
@@ -3717,6 +4625,7 @@ Write-Output 'refused'
             manifest_hash: home.enrolment().unwrap().manifest,
             schedule: policy.clone(),
             owner_consented: true,
+            self_removal: false,
         };
         tick(&home, &state_home, None, &authorization, || events(100))
             .await
@@ -3726,6 +4635,22 @@ Write-Output 'refused'
             baseline.last_events.unwrap().security_log_cleared,
             Some(100)
         );
+        // The next check is not due yet, so a wake in between reads no markers at all.
+        tick(&home, &state_home, None, &authorization, || events(101))
+            .await
+            .unwrap();
+        let unchanged: State = state_home.read_json(STATE).unwrap().unwrap();
+        assert_eq!(unchanged.last_events, baseline.last_events);
+        assert!(!unchanged.event_pending);
+        save(
+            &state_home,
+            STATE,
+            &State {
+                last_check: Some(baseline.last_check.unwrap() - 10 * 60),
+                ..baseline.clone()
+            },
+        )
+        .unwrap();
         let error = tick(&home, &state_home, None, &authorization, || events(101))
             .await
             .unwrap_err();
@@ -4190,6 +5115,7 @@ Write-Output 'refused'
             manifest_hash: home.enrolment().unwrap().manifest,
             schedule,
             owner_consented: true,
+            self_removal: false,
         };
 
         let held = claim::try_lock(&home).unwrap().unwrap();

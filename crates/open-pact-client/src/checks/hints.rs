@@ -84,13 +84,13 @@ pub fn fix_hint(check: &str, value: &str, os: Os) -> Option<&'static str> {
             "Enable a firewall: run 'sudo ufw enable' or 'sudo systemctl enable --now firewalld'.",
         ),
         ("screen_lock", Os::Macos) => Some(
-            "Set the lock delay: System Settings > Lock Screen > Require password after screen saver begins or display is turned off > Immediately or 5 minutes.",
+            "Shorten the time before the screen locks: System Settings > Lock Screen > Start Screen Saver when inactive, Turn display off when inactive, and Require password after screen saver begins or display is turned off. Ask IT for the longest time it allows.",
         ),
         ("screen_lock", Os::Windows) => Some(
-            "Set a lock timeout: Settings > Accounts > Sign-in options > If you've been away, when should Windows require you to sign in again.",
+            "Set a lock timeout: Settings > Accounts > Sign-in options > If you've been away, when should Windows require you to sign in again, and a screen saver that asks for a password on resume. Ask IT for the longest time it allows.",
         ),
         ("screen_lock", Os::Linux) => Some(
-            "Set automatic screen lock to 5 minutes or less: Settings > Privacy > Screen Lock (GNOME) or System Settings > Screen Locking (KDE).",
+            "Shorten the automatic screen lock: Settings > Privacy > Screen Lock (GNOME) or System Settings > Screen Locking (KDE). Ask IT for the longest time it allows.",
         ),
         ("os_supported", Os::Macos) => {
             Some("Upgrade macOS: System Settings > General > Software Update.")

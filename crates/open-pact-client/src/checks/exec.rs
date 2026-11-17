@@ -122,6 +122,8 @@ pub fn capture(program: &str, args: &[&str], timeout: Duration) -> std::io::Resu
             }
         }
     };
+    #[cfg(windows)]
+    crate::timings::note_child(&child);
     let grace = Instant::now() + Duration::from_millis(250);
     let mut streams = [String::new(), String::new()];
     for (stream, reader) in streams.iter_mut().zip(readers) {
