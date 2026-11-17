@@ -69,7 +69,7 @@ On macOS, make ad hoc signed bundles with the installed CLI.
 scripts/build-macos.sh "$(command -v open-pact-client)"
 ```
 
-The bundles appear in `dist`. The client bundle contains the CLI in `Contents/Helpers`. Each bundle carries its icon from `assets` (`CFBundleIconFile`). On Windows, `build.rs` embeds the `.ico` in each executable. The icon sources and their prompts are in `design/brand`.
+The bundles appear in `dist`. Both bundles contain the CLI in `Contents/Helpers`. The admin app checks manifests with that copy first. Each bundle carries its icon from `assets` (`CFBundleIconFile`). On Windows, `build.rs` embeds the `.ico` in each executable. The icon sources and their prompts are in `design/brand`.
 
 ## Set up the admin app
 

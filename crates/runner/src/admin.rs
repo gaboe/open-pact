@@ -249,7 +249,8 @@ pub struct Admin {
     pub kubectl: PathBuf,
     /// Tests point this at a temporary folder. The app always uses `Settings::backup_root()`.
     pub backup_root: PathBuf,
-    /// The open-pact-client that checks manifests. `None` looks for one the way the client app does.
+    /// The open-pact-client that checks manifests. `None` looks for the one bundled with this
+    /// app first, then the one the client app installs, then the one on PATH.
     pub client: Option<PathBuf>,
     /// How long one manifest check may run.
     pub check_limit: Duration,

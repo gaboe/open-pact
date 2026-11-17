@@ -34,10 +34,8 @@ for binary in open-pact open-pact-admin; do
 <key>NSHighResolutionCapable</key><true/>
 </dict></plist>
 EOF
-  if [ "$binary" = open-pact ]; then
-    cp -f "$cli" "$bundle/Contents/Helpers/open-pact-client"
-    codesign --force --sign - "$bundle/Contents/Helpers/open-pact-client"
-  fi
+  cp -f "$cli" "$bundle/Contents/Helpers/open-pact-client"
+  codesign --force --sign - "$bundle/Contents/Helpers/open-pact-client"
   codesign --force --sign - "$bundle"
   codesign --verify --deep --strict "$bundle"
 done

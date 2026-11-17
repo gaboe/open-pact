@@ -791,6 +791,29 @@ fn installed_cli_is_used_when_it_is_as_new_as_the_bundled_one() {
 }
 
 #[test]
+fn the_admin_app_tries_the_cli_bundled_with_it_first() {
+    use runner::client::{cli_candidates, cli_name};
+    let temp = tempfile::tempdir().unwrap();
+    let macos = temp.path().join("open-pact-admin.app/Contents/MacOS");
+    let helpers = temp.path().join("open-pact-admin.app/Contents/Helpers");
+    std::fs::create_dir_all(&macos).unwrap();
+    std::fs::create_dir_all(&helpers).unwrap();
+    let app = macos.join("open-pact-admin");
+    let bundled = helpers.join(cli_name());
+    std::fs::write(&app, "").unwrap();
+    std::fs::write(&bundled, "").unwrap();
+    assert_eq!(cli_candidates(Some(&app)).first(), Some(&bundled));
+
+    let zip = temp.path().join("zip");
+    std::fs::create_dir_all(&zip).unwrap();
+    let flat_app = zip.join("open-pact-admin");
+    let flat_cli = zip.join(cli_name());
+    std::fs::write(&flat_app, "").unwrap();
+    std::fs::write(&flat_cli, "").unwrap();
+    assert_eq!(cli_candidates(Some(&flat_app)).first(), Some(&flat_cli));
+}
+
+#[test]
 fn shown_commands_are_quoted_for_a_posix_shell() {
     use runner::{shell_line, shell_quote};
     assert_eq!(shell_quote("--note=plain"), "--note=plain");
