@@ -25,6 +25,10 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Check that the tag names both workspace versions
+        if: github.ref_type == 'tag'
+        run: python3 scripts/packaging/check-release-version.py "$GITHUB_REF_NAME"
+
       - id: epoch
         run: echo "value=$(git log -1 --format=%ct)" >> "$GITHUB_OUTPUT"
 
@@ -62,6 +66,10 @@ jobs:
       digest: ${{ steps.build.outputs.digest }}
     steps:
       - uses: actions/checkout@v6
+
+      - name: Check that the tag names both workspace versions
+        if: github.ref_type == 'tag'
+        run: python3 scripts/packaging/check-release-version.py "$GITHUB_REF_NAME"
 
       - id: epoch
         run: echo "value=$(git log -1 --format=%ct)" >> "$GITHUB_OUTPUT"
@@ -148,18 +156,9 @@ jobs:
       GATEWAY_DIGEST: ${{ needs.gateway.outputs.digest }}
       WITNESS_DIGEST: ${{ needs.witness.outputs.digest }}
     steps:
+      - uses: actions/checkout@v6
+
+      # client-release.yml alone creates, checks and publishes the release. This job
+      # waits for that release and adds the digests to its notes.
       - name: Add digests to the release note
-        run: |
-          note="Image digests (each rebuilt independently, identical):
-          - gateway: \`${GATEWAY_IMAGE}@${GATEWAY_DIGEST}\`
-          - witness: \`${WITNESS_IMAGE}@${WITNESS_DIGEST}\`
-          Verify with \`scripts/verify-release.sh ${TAG} ${GATEWAY_IMAGE}@${GATEWAY_DIGEST}\` and \`scripts/verify-release.sh --target witness ${TAG} ${WITNESS_IMAGE}@${WITNESS_DIGEST}\`."
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            body=$(gh release view "$TAG" --json body --jq .body)
-            gh release edit "$TAG" --notes "${body}"$'\n\n'"${note}"
-          else
-            # client-release.yml publishes the release after it uploads every asset.
-            flag=
-            if [[ "$TAG" == *-* ]]; then flag=--prerelease; fi
-            gh release create "$TAG" --verify-tag --draft --title "$TAG" --notes "$note" $flag
-          fi
+        run: bash scripts/packaging/add-image-notes.sh

@@ -5,7 +5,7 @@
 One annotated tag publishes the CLI, the gateway image, and both desktop apps from this repository.
 
 1. Set the same version in the root `Cargo.toml` and in `desktop/Cargo.toml` (`[workspace.package]`), refresh `desktop/Cargo.lock` (`cd desktop && cargo metadata --format-version 1 > /dev/null`), merge to `main`, and wait for green CI. The release stops at its first job when the tag and both versions differ.
-2. Push an annotated tag `vX.Y.Z` on that `main` commit. `client-release.yml` builds the CLI, packages it, builds both desktop apps from the same run, signs every asset, uploads them to a draft release, and then publishes it. `SHA256SUMS` and its Cosign bundle cover the desktop zips.
+2. Push an annotated tag `vX.Y.Z` on that `main` commit. `client-release.yml` builds the CLI, packages it, builds both desktop apps from the same run, signs every asset, uploads them to a draft release, checks every asset, and then publishes it. Only that workflow creates and publishes the release. `image.yml` checks the same version gate before it pushes a tag image, then waits for the release and adds the image digests to its notes. `SHA256SUMS` and its Cosign bundle cover the desktop zips.
 3. The repository has no `PACKAGING_TOKEN` secret on purpose: Actions holds no write token for other repositories. The release job prints a warning and attaches `open-pact.rb`, `open-pact.json`, and `open-pact-desktop.json` to the release. Do not add the secret unless the owner asks for it.
 4. Publish the package metadata by hand after the release job succeeds:
    1. Download `open-pact.rb`, `open-pact.json`, `open-pact-desktop.json`, `SHA256SUMS`, and `SHA256SUMS.sigstore.json` from the release.
