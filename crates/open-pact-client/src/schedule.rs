@@ -5,7 +5,6 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use clap::Subcommand;
 use open_pact_core::{CheckPeriod, Manifest, ManifestHash, OnConnect, Place, ProbeName, Schedule};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -45,42 +44,24 @@ const WAKE_ISO: &str = "PT1M";
 const REPO_SCAN_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const LOCK: &str = "report-schedule.lock";
 
-#[derive(Subcommand)]
-pub(crate) enum Command {
-    /// Install the job that sends claims by itself, as the signed manifest allows
+/// The `schedule` commands of the CLI, without the parser.
+#[derive(Clone, Debug)]
+pub enum Command {
     On {
-        /// Windows only: run the job as SYSTEM. Needs an elevated PowerShell prompt
-        #[arg(long, hide = !cfg!(windows), conflicts_with = "user")]
         system: bool,
-        /// Windows only: run the job as the current user
-        #[arg(long, hide = !cfg!(windows))]
         user: bool,
-        /// Show what would change and change nothing
-        #[arg(long)]
         dry_run: bool,
     },
-    /// Remove the job
     Off {
-        /// Show what would change and change nothing
-        #[arg(long)]
         dry_run: bool,
     },
-    /// Show whether the job is installed and what the signed manifest allows
     Status,
-    #[command(hide = true)]
     Run {
-        #[arg(long)]
         system: bool,
-        /// The profile whose repositories and `~` paths count, when the job does not run as that user
-        #[arg(long)]
         user_home: Option<PathBuf>,
     },
-    #[command(hide = true)]
     Probe {
-        #[arg(long)]
         address: String,
-        /// The DNS name that the probe's TLS certificate must carry
-        #[arg(long)]
         name: Option<String>,
     },
 }
@@ -1585,7 +1566,7 @@ pub(crate) async fn tick_with_scan(
     if let Some(trigger) = due {
         save(state_home, STATE, &state)?;
         let outcome = prepared
-            .send(home, async || may_send(schedule, executable).await)
+            .send(home, || may_send(schedule, executable))
             .await?;
         note_outcome(home, &mut state, trigger, &outcome);
         state.record(&outcome, chrono::Utc::now().timestamp(), events, compliance);
@@ -2243,7 +2224,7 @@ pub(crate) async fn turn_off(home: &Home, dry_run: bool, executable: &Path) -> R
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum JobStatus {
+pub enum JobStatus {
     Current,
     Missing,
     Outdated,
@@ -2821,44 +2802,6 @@ esac
         if let Some(output) = std::env::var_os("OPEN_PACT_CLI_TRANSCRIPT") {
             std::fs::write(output, transcript).unwrap();
         }
-    }
-
-    #[test]
-    fn imperative_setup_commands_are_removed() {
-        use clap::Parser;
-        for args in [
-            vec![
-                "client",
-                "schedule",
-                "install",
-                "--collector",
-                "https://example.org",
-            ],
-            vec!["client", "schedule", "uninstall"],
-            vec!["client", "report", "--collector", "https://example.org"],
-            vec!["client", "report", "--dry-run"],
-            vec!["client", "log", "reports"],
-            vec!["client", "apply"],
-            vec!["client", "finish"],
-            vec!["client", "config", "example"],
-        ] {
-            assert!(crate::Cli::try_parse_from(args).is_err());
-        }
-        assert!(crate::Cli::try_parse_from(["client", "check", "--dry-run"]).is_ok());
-        for args in [
-            vec!["client", "schedule", "on"],
-            vec!["client", "schedule", "on", "--dry-run"],
-            vec!["client", "schedule", "off"],
-            vec!["client", "schedule", "status"],
-            vec!["client", "folders", "list"],
-            vec!["client", "folders", "add", "~/work"],
-            vec!["client", "folders", "remove", "~/work"],
-        ] {
-            assert!(crate::Cli::try_parse_from(args).is_ok());
-        }
-        assert!(
-            crate::Cli::try_parse_from(["client", "schedule", "on", "--system", "--user"]).is_err()
-        );
     }
 
     const T: i64 = 1_000_000;
@@ -5108,14 +5051,16 @@ Write-Output 'refused'
         const ADDRESS: &str = "OPEN_PACT_TEST_PROBE_ADDRESS";
         if let Ok(address) = std::env::var(ADDRESS) {
             assert!(std::env::var_os("HOME").is_none());
-            let cli = <crate::Cli as clap::Parser>::try_parse_from([
-                "open-pact-client",
-                "schedule",
-                "probe",
-                "--address",
-                &address,
-            ])
-            .unwrap();
+            let cli = crate::Invocation {
+                home: None,
+                insecure_dev: false,
+                command: crate::Command::Schedule {
+                    command: Command::Probe {
+                        address,
+                        name: None,
+                    },
+                },
+            };
             assert_eq!(
                 crate::run(cli, &std::env::current_exe().unwrap())
                     .await

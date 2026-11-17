@@ -57,10 +57,13 @@ fn open(home: &Home) -> Result<Option<File>> {
 /// so once: the holder is usually the scheduled job.
 pub(crate) async fn lock(home: &Home) -> Result<ClaimLock> {
     lock_for(home, WAIT, || {
-        eprintln!(
-            "Waiting for the scheduled job, which holds {}. It releases the lock when its claim is done.",
-            home.file(LOCK).display()
-        );
+        // An app that follows the steps shows this itself; the CLI prints it.
+        if !crate::json_out::waiting_for_job() {
+            eprintln!(
+                "Waiting for the scheduled job, which holds {}. It releases the lock when its claim is done.",
+                home.file(LOCK).display()
+            );
+        }
     })
     .await
 }
@@ -512,7 +515,11 @@ impl Prepared {
     /// Verifies the log, signs the claim, posts it and installs the VPN pair the gateway answers
     /// with. `probe` runs before the first gateway request and again once the claim is ready,
     /// before the first POST; when it returns false, nothing more is sent.
-    pub(crate) async fn send(self, home: &Home, probe: impl AsyncFn() -> bool) -> Result<Outcome> {
+    pub(crate) async fn send<Probe, Probing>(self, home: &Home, probe: Probe) -> Result<Outcome>
+    where
+        Probe: Fn() -> Probing,
+        Probing: Future<Output = bool>,
+    {
         if !probe().await {
             println!("The VPN probe failed before the gateway was contacted. Nothing was sent.");
             return Ok(Outcome::NotSent(NotSent::OffVpn));

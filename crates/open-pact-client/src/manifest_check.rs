@@ -84,7 +84,7 @@ fn render(problems: Vec<Problem>, json: bool) -> String {
 
 pub(crate) fn run(json: bool) -> Result<ExitCode> {
     let mut bytes = Vec::new();
-    let problems = match std::io::stdin().lock().read_to_end(&mut bytes) {
+    let problems = match crate::host::input()().read_to_end(&mut bytes) {
         Ok(_) => problems(&bytes),
         Err(error) => vec![Problem {
             message: format!("read the manifest from stdin: {error}"),

@@ -29,7 +29,9 @@ macro_rules! eprintln {
         if $crate::json_out::active() {
             $crate::json_out::note_line(format!($($arg)*));
         }
-        let _ = ::std::writeln!(::std::io::stderr(), $($arg)*);
+        if $crate::json_out::stderr_allowed() {
+            let _ = ::std::writeln!(::std::io::stderr(), $($arg)*);
+        }
     }};
 }
 
@@ -49,12 +51,14 @@ mod device_config;
 mod device_key;
 #[cfg(test)]
 mod fake_gateway;
+mod host;
 mod json_out;
 mod locallog;
 mod manifest_check;
 mod schedule;
 #[cfg(target_os = "macos")]
 mod secure_enclave;
+mod session;
 mod status;
 mod timings;
 mod ui;
@@ -69,7 +73,6 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
 use device_key::DeviceKey;
 use open_pact_core::{
     AcceptRequest, DeviceAuthPurpose, DeviceStatus, MyEntries, MyEntriesRequest,
@@ -90,165 +93,102 @@ use serde_json::Value;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-#[derive(Parser)]
-#[command(
-    name = "open-pact-client",
-    version,
-    about = "Prove this device meets the company's signed manifest, nothing more"
-)]
-struct Cli {
+pub use host::{Host, InputSource, InterruptFuture, Interrupted, with_host};
+pub use json_out::{ClaimReport, ControlReport, JoinStep, StepState, WAITING_FOR_JOB};
+pub use schedule::Command as ScheduleCommand;
+pub use session::{Cancelled, JoinChoices, Session};
+pub use status::Options as StatusOptions;
+
+/// What a command line asks for, after a parser read it. The CLI maps its arguments to this and
+/// calls [`run`]; the library has no parser of its own.
+#[derive(Clone, Debug)]
+pub struct Invocation {
     /// Directory for keys, the signed manifest and logs [default: ~/.config/open-pact]
-    #[arg(long, global = true)]
-    home: Option<PathBuf>,
+    pub home: Option<PathBuf>,
     /// Allow a plain http:// gateway other than localhost. For development only
-    #[arg(long, global = true)]
-    insecure_dev: bool,
-    #[command(subcommand)]
-    command: Command,
+    pub insecure_dev: bool,
+    pub command: Command,
 }
 
-impl Cli {
-    /// The command prints JSON, so a failure before it starts is JSON too.
-    fn prints_json(&self) -> bool {
-        match &self.command {
-            Command::Status(options) => options.json(),
-            command => matches!(
-                command,
-                Command::Join { preview: true, .. }
-                    | Command::Join { json: true, .. }
-                    | Command::Check { json: true, .. }
-                    | Command::Accept { preview: true, .. }
-                    | Command::Manifest {
-                        command: ManifestCommand::Check { json: true }
-                    }
-            ),
-        }
+/// The command prints JSON, so a failure before it starts is JSON too.
+pub fn prints_json(command: &Command) -> bool {
+    match command {
+        Command::Status(options) => options.json,
+        command => matches!(
+            command,
+            Command::Join { preview: true, .. }
+                | Command::Join { json: true, .. }
+                | Command::Check { json: true, .. }
+                | Command::Accept { preview: true, .. }
+                | Command::Manifest {
+                    command: ManifestCommand::Check { json: true }
+                }
+        ),
     }
 }
 
-#[derive(Subcommand)]
-enum Command {
-    /// Show the device status without running checks or sending a claim
+#[derive(Clone, Debug)]
+pub enum Command {
     Status(status::Options),
-    /// Check the gateway against the invitation from IT, show the manifest, sign it and enrol
     Join {
-        /// The opi1: invitation string from IT
         invitation: Option<String>,
-        /// Sign without asking
-        #[arg(long)]
         yes: bool,
-        /// Keep a new device key in a file (trust level L0) even when a Secure Enclave is available
-        #[arg(long)]
         software_key: bool,
-        /// Print the device code and exit without waiting for IT
-        #[arg(long)]
         no_wait: bool,
-        /// Show what joining would sign, as JSON, and stop. Signs nothing, writes no file, sends no POST
-        #[arg(
-            long,
-            requires = "invitation",
-            conflicts_with_all = ["yes", "software_key", "no_wait", "json"]
-        )]
         preview: bool,
-        /// Print one JSON line per wizard step event. Needs --yes; nothing is asked
-        #[arg(long, requires = "yes")]
         json: bool,
-        /// With --json: a folder that holds your repositories, for the manifest's repository checks. Repeatable
-        #[arg(long = "folder", requires = "json")]
         folders: Vec<PathBuf>,
-        /// With --json: send claims automatically (on) or not (off) [default: off]
-        #[arg(long, requires = "json", value_enum)]
         auto_send: Option<Toggle>,
     },
-    /// Run the manifest's checks, send a signed claim and fetch a VPN certificate
     Check {
-        /// Print the claim that would be sent. Make GET requests only and write no file
-        #[arg(long)]
         dry_run: bool,
-        /// With --dry-run: also print the wall time of the run and the CPU time of this process
-        /// and its child processes
-        #[arg(long, requires = "dry_run")]
         timings: bool,
-        /// After sending, print the result as JSON
-        #[arg(long, conflicts_with = "dry_run")]
         json: bool,
     },
-    /// Review a changed manifest from the gateway, sign it and move this device to it
     Accept {
-        /// Sign without asking
-        #[arg(long)]
         yes: bool,
-        /// Print what accepting would change, as JSON, and stop. Signs nothing, writes no file
-        #[arg(long, conflicts_with = "yes")]
         preview: bool,
     },
-    /// Choose the folders that hold your repositories, for the manifest's repository checks
     Folders {
-        #[command(subcommand)]
         command: FoldersCommand,
     },
-    /// Show the manifest this device signed, or check a manifest draft
     Manifest {
-        #[command(subcommand)]
         command: ManifestCommand,
     },
-    /// Turn automatic sending of claims on or off, or show its state
     Schedule {
-        #[command(subcommand)]
         command: schedule::Command,
     },
-    /// Transparency log and local claim log
     Log {
-        #[command(subcommand)]
         command: LogCommand,
     },
-    /// Show how to stop the scheduled claims and remove the client
     Stop,
-    /// Destroy the device key before full uninstall or rotation
     DeleteDeviceKey,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
-enum Toggle {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Toggle {
     On,
     Off,
 }
 
-#[derive(Subcommand)]
-enum FoldersCommand {
-    /// Show the folders
+#[derive(Clone, Debug)]
+pub enum FoldersCommand {
     List,
-    /// Add a folder that holds repositories. `~` is your home folder
     Add { path: PathBuf },
-    /// Remove a folder
     Remove { path: PathBuf },
 }
 
-#[derive(Subcommand)]
-enum ManifestCommand {
-    /// Show the signed manifest stored on this device
+#[derive(Clone, Debug)]
+pub enum ManifestCommand {
     Show,
-    /// Check a manifest draft from stdin with the rules clients and the gateway apply. Needs no home or network
-    Check {
-        /// Print one JSON document: ok, and the errors with their line and key
-        #[arg(long)]
-        json: bool,
-    },
-    /// List the built-in checks this client runs, with their default text. Needs no home or network
-    Builtins {
-        /// Print one JSON array: each check, its id and its default text
-        #[arg(long)]
-        json: bool,
-    },
+    Check { json: bool },
+    Builtins { json: bool },
 }
 
-#[derive(Subcommand)]
-enum LogCommand {
-    /// Print the last verified, gateway-signed log checkpoint held on this device
+#[derive(Clone, Debug)]
+pub enum LogCommand {
     Head,
-    /// Fetch and verify the inclusion proof of one log entry [default: this device's enrolment]
     Prove { index: Option<u64> },
-    /// Print every claim this device sent and the gateway's response
     Show,
 }
 
@@ -439,6 +379,7 @@ enum Response {
     },
 }
 
+#[derive(Clone, Debug)]
 struct Home(PathBuf);
 
 tokio::task_local! {
@@ -480,20 +421,14 @@ where
     WIZARD_STEP
         .scope(Cell::new(initial_step), WIZARD_APPROVAL_WAIT.scope(Cell::new(false), async {
             tokio::select! {
-                signal = tokio::signal::ctrl_c(), if !WIZARD_APPROVAL_WAIT.try_with(Cell::get).unwrap_or(false) => match signal {
-                    Ok(()) => {
-                        print_stopped(home, invitation);
-                        if json_out::active() {
-                            json_out::exit_interrupted();
-                        }
-                        let _ = std::io::stdout().flush();
-                        std::process::exit(130);
-                    }
-                    Err(error) => Err(error.into()),
+                () = host::interrupted(), if !WIZARD_APPROVAL_WAIT.try_with(Cell::get).unwrap_or(false) => {
+                    print_stopped(home, invitation);
+                    Err(Interrupted.into())
                 },
                 result = operation => {
                     if !json_out::active()
                         && !matches!(&result, Ok(code) if *code == ExitCode::SUCCESS)
+                        && !result.as_ref().is_err_and(host::is_interrupt)
                     {
                         print_stopped(home, invitation);
                     }
@@ -1586,11 +1521,11 @@ fn manifest_show(home: &Home) -> Result<String> {
 
 async fn confirm_yes_by_default(question: &str) -> Result<bool> {
     let question = question.to_string();
+    let input = host::input();
     let (send, receive) = tokio::sync::oneshot::channel();
     std::thread::spawn(move || {
-        let input = std::io::stdin();
         let mut output = std::io::stdout();
-        let result = confirm_yes_by_default_from(&question, &mut input.lock(), &mut output);
+        let result = confirm_yes_by_default_from(&question, &mut input(), &mut output);
         let _ = send.send(result);
     });
     Ok(receive.await.context("confirmation input stopped")??)
@@ -1598,11 +1533,11 @@ async fn confirm_yes_by_default(question: &str) -> Result<bool> {
 
 async fn confirm(question: &str) -> Result<bool> {
     let question = question.to_string();
+    let input = host::input();
     let (send, receive) = tokio::sync::oneshot::channel();
     std::thread::spawn(move || {
-        let input = std::io::stdin();
         let mut output = std::io::stdout();
-        let result = confirm_from(question, &mut input.lock(), &mut output);
+        let result = confirm_from(question, &mut input(), &mut output);
         let _ = send.send(result);
     });
     Ok(receive.await.context("confirmation input stopped")??)
@@ -1895,14 +1830,13 @@ async fn apply_setup(home: &Home, choices: SetupChoices, executable: &Path) -> R
     Ok(())
 }
 
-/// Wizard step 5: the owner's few choices, then the first check.
-async fn setup_device(home: &Home, insecure_dev: bool, executable: &Path) -> Result<ExitCode> {
-    wizard_step(5, "Set up this device");
+/// What step 5 shows the owner and the choices it starts from.
+fn setup_context(home: &Home) -> Result<SetupContext> {
     let manifest = home.signed_manifest()?;
     let os = current_os()?;
     let user_home = user_profile();
     let scan = proposal_repo_scan(home)?;
-    let context = SetupContext {
+    Ok(SetupContext {
         os,
         current: device_config::DeviceConfig::load_or_migrate(home, user_home.as_deref(), true)?,
         overview: scan
@@ -1920,18 +1854,27 @@ async fn setup_device(home: &Home, insecure_dev: bool, executable: &Path) -> Res
         legacy: device_config::legacy_folders(home, user_home.as_deref()),
         manifest,
         user_home,
-    };
-    let choices = if let Some(answers) = json_out::answers() {
-        setup_answers(&context, &answers)
-    } else {
-        let (send, receive) = tokio::sync::oneshot::channel();
-        std::thread::spawn(move || {
-            let input = std::io::stdin();
-            let mut output = std::io::stdout();
-            let _ = send.send(setup_questions(&context, &mut input.lock(), &mut output));
-        });
-        receive.await.context("setup questions stopped")??
-    };
+    })
+}
+
+/// The owner's choices of step 5: the caller's answers, or the questions asked on the input.
+async fn setup_choices(context: SetupContext) -> Result<SetupChoices> {
+    if let Some(answers) = json_out::answers() {
+        return Ok(setup_answers(&context, &answers));
+    }
+    let input = host::input();
+    let (send, receive) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let mut output = std::io::stdout();
+        let _ = send.send(setup_questions(&context, &mut input(), &mut output));
+    });
+    receive.await.context("setup questions stopped")?
+}
+
+/// Wizard step 5: the owner's few choices, then the first check.
+async fn setup_device(home: &Home, insecure_dev: bool, executable: &Path) -> Result<ExitCode> {
+    wizard_step(5, "Set up this device");
+    let choices = setup_choices(setup_context(home)?).await?;
     let detail = serde_json::json!({ "auto_send": choices.auto_send, "folders": choices.folders });
     apply_setup(home, choices, executable).await?;
     json_out::step_done(5, Some(detail));
@@ -1959,34 +1902,63 @@ async fn first_claim(home: &Home, insecure_dev: bool, executable: &Path) -> Resu
     check_impl(home, insecure_dev, executable, false).await
 }
 
+/// The owner's repository folders.
+fn folders_list(home: &Home) -> Result<Vec<PathBuf>> {
+    Ok(
+        device_config::DeviceConfig::load_or_migrate(home, user_profile().as_deref(), false)?
+            .folders,
+    )
+}
+
+/// Adds a repository folder, under the claim lock. Gives the absolute folder and whether it is new.
+async fn folder_add(home: &Home, path: &Path) -> Result<(PathBuf, bool)> {
+    let user_home = user_profile();
+    let _claim_lock = claim::lock(home).await?;
+    let mut config =
+        device_config::DeviceConfig::load_or_migrate(home, user_home.as_deref(), true)?;
+    let folder = device_config::absolute_folder(path, user_home.as_deref())?;
+    let added = config.add_folder(folder.clone());
+    if added {
+        config.save(home)?;
+    }
+    Ok((folder, added))
+}
+
+/// Removes a repository folder, under the claim lock. Gives the absolute folder.
+async fn folder_remove(home: &Home, path: &Path) -> Result<PathBuf> {
+    let user_home = user_profile();
+    let _claim_lock = claim::lock(home).await?;
+    let mut config =
+        device_config::DeviceConfig::load_or_migrate(home, user_home.as_deref(), true)?;
+    let folder = device_config::absolute_folder(path, user_home.as_deref())?;
+    if !config.remove_folder(&folder) {
+        bail!("{} is not listed", folder.display());
+    }
+    config.save(home)?;
+    Ok(folder)
+}
+
 /// `folders list|add|remove`: the owner's repository folders.
 async fn folders(home: &Home, command: FoldersCommand) -> Result<ExitCode> {
-    let user_home = user_profile();
-    let mut config =
-        device_config::DeviceConfig::load_or_migrate(home, user_home.as_deref(), false)?;
-    if let FoldersCommand::List = command {
-        if config.folders.is_empty() {
-            println!(
-                "No folders. Add one with `{} folders add <path>`.",
-                client_command(&home.0)
-            );
-        }
-        for folder in &config.folders {
-            println!("{}", folder.display());
-        }
-        return Ok(ExitCode::SUCCESS);
-    }
-    let _claim_lock = claim::lock(home).await?;
-    config = device_config::DeviceConfig::load_or_migrate(home, user_home.as_deref(), true)?;
     match command {
-        FoldersCommand::List => unreachable!("handled above"),
+        FoldersCommand::List => {
+            let folders = folders_list(home)?;
+            if folders.is_empty() {
+                println!(
+                    "No folders. Add one with `{} folders add <path>`.",
+                    client_command(&home.0)
+                );
+            }
+            for folder in &folders {
+                println!("{}", folder.display());
+            }
+        }
         FoldersCommand::Add { path } => {
-            let folder = device_config::absolute_folder(&path, user_home.as_deref())?;
+            let (folder, added) = folder_add(home, &path).await?;
             if !folder.is_dir() {
                 println!("note: {} is not an existing folder yet.", folder.display());
             }
-            if config.add_folder(folder.clone()) {
-                config.save(home)?;
+            if added {
                 println!("Added {}.", folder.display());
             } else {
                 println!("{} is already listed.", folder.display());
@@ -2001,11 +1973,7 @@ async fn folders(home: &Home, command: FoldersCommand) -> Result<ExitCode> {
             }
         }
         FoldersCommand::Remove { path } => {
-            let folder = device_config::absolute_folder(&path, user_home.as_deref())?;
-            if !config.remove_folder(&folder) {
-                bail!("{} is not listed", folder.display());
-            }
-            config.save(home)?;
+            let folder = folder_remove(home, &path).await?;
             println!("Removed {}.", folder.display());
         }
     }
@@ -2862,8 +2830,8 @@ async fn wait_for_approval_with_status(
         if !first_poll {
             if interruptible {
                 tokio::select! {
-                    _ = tokio::signal::ctrl_c() => return Ok(Ok(ApprovalWait::Interrupted)),
-                    _ = tokio::time::sleep(poll_interval) => {}
+                    () = host::interrupted() => return Ok(Ok(ApprovalWait::Interrupted)),
+                _ = tokio::time::sleep(poll_interval) => {}
                 }
             } else {
                 tokio::time::sleep(poll_interval).await;
@@ -2875,7 +2843,7 @@ async fn wait_for_approval_with_status(
             initial
         } else if interruptible {
             tokio::select! {
-                _ = tokio::signal::ctrl_c() => return Ok(Ok(ApprovalWait::Interrupted)),
+                () = host::interrupted() => return Ok(Ok(ApprovalWait::Interrupted)),
                 result = poll_approval(http, home, enrolment, manifest) => result,
             }
         } else {
@@ -3027,13 +2995,9 @@ async fn wait_after_join(
     let scan = scan_repositories(home, manifest, config.as_ref());
     tokio::pin!(scan);
     let result = tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
+        () = host::interrupted() => {
             println!("\n{}", stopped_message(4, &format!("{command} join")));
-            if json_out::active() {
-                json_out::exit_interrupted();
-            }
-            let _ = std::io::stdout().flush();
-            std::process::exit(130);
+            return Err(Interrupted.into());
         }
         result = async {
             let mut completed_scan = None;
@@ -3144,8 +3108,7 @@ async fn wait_after_join(
         Ok(wait) => {
             let code = approval_exit(wait, &command);
             if wait == ApprovalWait::Interrupted && !wizard {
-                let _ = std::io::stdout().flush();
-                std::process::exit(130);
+                return Ok(code);
             }
             match wait {
                 ApprovalWait::Approved => {
@@ -3169,9 +3132,7 @@ async fn wait_after_join(
 }
 
 fn wizard_enabled(no_wait: bool) -> bool {
-    !no_wait
-        && (json_out::active()
-            || (std::io::stdin().is_terminal() && std::io::stdout().is_terminal()))
+    !no_wait && (json_out::active() || host::interactive())
 }
 
 async fn continue_saved_join(
@@ -3747,6 +3708,22 @@ async fn check_impl(
     }
 }
 
+/// What one `check` came to: the exit code of the CLI, and either the claim the gateway answered
+/// or the reason there is none.
+struct CheckRun {
+    code: ExitCode,
+    report: Result<json_out::ClaimReport, String>,
+}
+
+/// Sends the claim like `check`. It runs under [`json_out::scope`], which keeps the claim.
+async fn check_report(home: &Home, insecure_dev: bool, executable: &Path) -> Result<CheckRun> {
+    let outcome = check_run(home, insecure_dev, executable, false).await?;
+    Ok(CheckRun {
+        code: outcome.exit_code(),
+        report: json_out::claim().ok_or_else(|| outcome.failure_text()),
+    })
+}
+
 /// `check --json`: sends the claim like `check` and prints what happened as one JSON document.
 async fn check_json(
     home: &Home,
@@ -3755,13 +3732,13 @@ async fn check_json(
     json: std::sync::Arc<json_out::Json>,
 ) -> ExitCode {
     json_out::scope(json, async {
-        match check_run(home, insecure_dev, executable, false).await {
-            Ok(outcome) => {
-                match json_out::claim() {
-                    Some(report) => json_out::document(&report),
-                    None => json_out::error(&outcome.failure_text()),
+        match check_report(home, insecure_dev, executable).await {
+            Ok(run) => {
+                match &run.report {
+                    Ok(report) => json_out::document(report),
+                    Err(text) => json_out::error(text),
                 }
-                json_out::settle(outcome.exit_code())
+                json_out::settle(run.code)
             }
             Err(error) => json_out::settle(json_out::failed(&format!("{error:#}"))),
         }
@@ -3799,7 +3776,7 @@ async fn check_run(
             WizardResume::Complete => {}
         }
     }
-    prepared.send(home, async || true).await
+    prepared.send(home, || std::future::ready(true)).await
 }
 
 /// The hash of the manifest the gateway enforces now.
@@ -3856,10 +3833,10 @@ fn control_rule(c: &open_pact_core::Control) -> String {
 /// One difference between the manifest a device signed and the one the gateway enforces now.
 /// `before` or `after` is null for a control that was added or removed.
 #[derive(Debug, PartialEq, Serialize)]
-struct ManifestChange {
-    id: String,
-    before: Option<String>,
-    after: Option<String>,
+pub struct ManifestChange {
+    pub id: String,
+    pub before: Option<String>,
+    pub after: Option<String>,
     #[serde(skip)]
     line: String,
 }
@@ -4202,11 +4179,11 @@ async fn accept(home: &Home, yes: bool, insecure_dev: bool, executable: &Path) -
 
 /// What `accept --preview` prints.
 #[derive(Debug, Serialize)]
-struct AcceptPreview {
-    signed_hash: ManifestHash,
-    published_hash: ManifestHash,
-    changes: Vec<ManifestChange>,
-    schedule_widened: bool,
+pub struct AcceptPreview {
+    pub signed_hash: ManifestHash,
+    pub published_hash: ManifestHash,
+    pub changes: Vec<ManifestChange>,
+    pub schedule_widened: bool,
 }
 
 /// `accept --preview`: the changes of the manifest the gateway enforces against the one this
@@ -4286,31 +4263,31 @@ async fn accept_preview_json(
 }
 
 #[derive(Debug, Serialize)]
-struct PreviewCompany {
-    name: String,
-    key_fingerprint: String,
-    matches_invitation: bool,
+pub struct PreviewCompany {
+    pub name: String,
+    pub key_fingerprint: String,
+    pub matches_invitation: bool,
 }
 
 #[derive(Debug, Serialize)]
-struct PreviewControl {
-    id: String,
-    title: String,
-    requirement: String,
+pub struct PreviewControl {
+    pub id: String,
+    pub title: String,
+    pub requirement: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    rationale: Option<String>,
+    pub rationale: Option<String>,
 }
 
 /// What `join --preview` prints: the manifest as the owner would sign it.
 #[derive(Debug, Serialize)]
-struct JoinPreview {
-    company: PreviewCompany,
-    gateway: String,
-    manifest_hash: ManifestHash,
-    controls: Vec<PreviewControl>,
-    disclosed_metadata: Vec<String>,
-    schedule: Option<open_pact_core::Schedule>,
-    folders: Vec<PathBuf>,
+pub struct JoinPreview {
+    pub company: PreviewCompany,
+    pub gateway: String,
+    pub manifest_hash: ManifestHash,
+    pub controls: Vec<PreviewControl>,
+    pub disclosed_metadata: Vec<String>,
+    pub schedule: Option<open_pact_core::Schedule>,
+    pub folders: Vec<PathBuf>,
 }
 
 /// The id of a control in words: `password_min_length` is "Password min length".
@@ -4430,16 +4407,92 @@ async fn join_preview_json(
     .await
 }
 
-/// What a finished `join --json` reached: `done` when the device is approved and its first claim
-/// was accepted, `approved` when IT approved it, `enrolled` before that.
-fn join_result(home: &Home, enrolment: &Enrolment) -> &'static str {
+/// How far a finished join got: `done` when the device is approved and its first claim was
+/// accepted, `approved` when IT approved it, `enrolled` before that.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum JoinStage {
+    Enrolled,
+    Approved,
+    Done,
+}
+
+/// What a finished join reached. `join --json` prints the first three fields as its last line.
+#[derive(Clone, Debug, Serialize)]
+pub struct JoinResult {
+    pub result: JoinStage,
+    pub device: Pseudonym,
+    pub manifest_hash: ManifestHash,
+    /// The first claim, when the join sent one. It is not part of the last line.
+    #[serde(skip)]
+    pub claim: Option<json_out::ClaimReport>,
+}
+
+fn join_stage(home: &Home, enrolment: &Enrolment) -> JoinStage {
     if enrolment.last_status != Some(DeviceStatus::Approved) {
-        "enrolled"
+        JoinStage::Enrolled
     } else if matches!(wizard_resume(home), Ok(WizardResume::Complete)) {
-        "done"
+        JoinStage::Done
     } else {
-        "approved"
+        JoinStage::Approved
     }
+}
+
+/// What one join run came to: the exit code of the CLI, and either the result or the last thing
+/// the run said about why it did not finish.
+struct JoinRun {
+    code: ExitCode,
+    finished: Result<JoinResult, String>,
+}
+
+/// The wizard with its questions answered by the caller. It runs under [`json_out::scope`] and
+/// ends the step it left open: with the result line when it finished, with the error line when it
+/// did not.
+async fn join_run(
+    home: &Home,
+    invitation: Option<&str>,
+    software_key: bool,
+    options: JoinOptions<'_>,
+) -> Result<JoinRun> {
+    let JoinOptions {
+        insecure_dev,
+        executable,
+        no_wait,
+        poll_interval,
+    } = options;
+    let operation = async move {
+        match invitation {
+            Some(invitation) => join(home, invitation, true, software_key, options).await,
+            None => resume_join(home, insecure_dev, executable, no_wait, poll_interval).await,
+        }
+    };
+    let code = run_wizard(home, invitation, no_wait, operation).await?;
+    let enrolment = home.read_json::<Enrolment>("enrolment.json").ok().flatten();
+    let claim = json_out::claim();
+    let denied_claim = claim.as_ref().is_some_and(|report| !report.accepted);
+    Ok(match enrolment {
+        Some(enrolment) if code == ExitCode::SUCCESS || denied_claim => {
+            let result = JoinResult {
+                result: join_stage(home, &enrolment),
+                device: enrolment.device,
+                manifest_hash: enrolment.manifest,
+                claim,
+            };
+            json_out::finish(&result);
+            JoinRun {
+                code,
+                finished: Ok(result),
+            }
+        }
+        _ => {
+            let text = json_out::last_note().unwrap_or_else(|| "join did not finish".to_owned());
+            json_out::error(&text);
+            JoinRun {
+                code,
+                finished: Err(text),
+            }
+        }
+    })
 }
 
 /// `join --json`: the wizard with its questions answered by flags, one JSON line per step event
@@ -4451,56 +4504,15 @@ async fn join_json(
     options: JoinOptions<'_>,
     json: std::sync::Arc<json_out::Json>,
 ) -> ExitCode {
-    let JoinOptions {
-        insecure_dev,
-        executable,
-        no_wait,
-        poll_interval,
-    } = options;
     json_out::scope(json, async {
-        let operation = async {
-            match invitation {
-                Some(invitation) => {
-                    join(
-                        home,
-                        invitation,
-                        true,
-                        software_key,
-                        JoinOptions {
-                            insecure_dev,
-                            executable,
-                            no_wait,
-                            poll_interval,
-                        },
-                    )
-                    .await
-                }
-                None => resume_join(home, insecure_dev, executable, no_wait, poll_interval).await,
+        match join_run(home, invitation, software_key, options).await {
+            Ok(run) => json_out::settle(run.code),
+            Err(error) if host::is_interrupt(&error) => {
+                json_out::error("interrupted");
+                json_out::settle(ExitCode::from(130))
             }
-        };
-        let code = match run_wizard(home, invitation, no_wait, operation).await {
-            Ok(code) => code,
-            Err(error) => return json_out::settle(json_out::failed(&format!("{error:#}"))),
-        };
-        let enrolment = home.read_json::<Enrolment>("enrolment.json").ok().flatten();
-        let denied_claim = json_out::claim().is_some_and(|report| !report.accepted);
-        let code = match enrolment {
-            Some(enrolment) if code == ExitCode::SUCCESS || denied_claim => {
-                json_out::finish(
-                    join_result(home, &enrolment),
-                    &enrolment.device,
-                    &enrolment.manifest,
-                );
-                code
-            }
-            _ => {
-                json_out::error(
-                    &json_out::last_note().unwrap_or_else(|| "join did not finish".to_owned()),
-                );
-                code
-            }
-        };
-        json_out::settle(code)
+            Err(error) => json_out::settle(json_out::failed(&format!("{error:#}"))),
+        }
     })
     .await
 }
@@ -4656,7 +4668,9 @@ fn log_show(path: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn run(cli: Cli, executable: &Path) -> Result<ExitCode> {
+/// Runs one command of the CLI. A caller that wants Ctrl-C and the standard input wraps this in
+/// [`with_host`]. An interrupt ends the command with an [`Interrupted`] error.
+pub async fn run(cli: Invocation, executable: &Path) -> Result<ExitCode> {
     if let Command::Schedule {
         command: schedule::Command::Probe { address, name },
     } = &cli.command
@@ -4698,7 +4712,9 @@ async fn run(cli: Cli, executable: &Path) -> Result<ExitCode> {
             ..
         } => Ok(join_preview_json(
             &home,
-            invitation.as_deref().expect("clap requires the invitation"),
+            invitation
+                .as_deref()
+                .expect("a preview needs the invitation"),
             cli.insecure_dev,
             json_out::Json::new(std::io::stdout(), json_out::Answers::default()),
         )
@@ -4845,8 +4861,7 @@ async fn run(cli: Cli, executable: &Path) -> Result<ExitCode> {
 
 /// Whether the command repairs an interrupted VPN installation before it runs. A command that only
 /// reads, or that promises to write no file, does not.
-#[cfg_attr(not(windows), allow(dead_code))]
-fn recovers_vpn_first(command: &Command) -> bool {
+pub fn recovers_vpn_first(command: &Command) -> bool {
     !matches!(
         command,
         Command::Status(_)
@@ -4858,28 +4873,8 @@ fn recovers_vpn_first(command: &Command) -> bool {
     )
 }
 
-/// Whether the command line asked for JSON output, so a failure to parse it is JSON too.
-fn args_ask_for_json(args: &[std::ffi::OsString]) -> bool {
-    args.iter()
-        .skip(1)
-        .take_while(|arg| *arg != "--")
-        .any(|arg| arg == "--json" || arg == "--preview")
-}
-
-/// The error line for a command line that does not parse, when it asked for JSON. Help and version
-/// output, and the errors of a command line that did not ask for JSON, stay as clap prints them.
-fn usage_error_line(args: &[std::ffi::OsString], error: &clap::Error) -> Option<String> {
-    if !error.use_stderr() || !args_ask_for_json(args) {
-        return None;
-    }
-    let text = error.to_string();
-    let first = text.split("\n\n").next().unwrap_or_default().trim();
-    let first = first.strip_prefix("error: ").unwrap_or(first);
-    Some(serde_json::json!({ "error": first }).to_string())
-}
-
 /// Polls `future` so that a panic in it comes back as an error.
-async fn catch_panic(future: impl Future<Output = Result<ExitCode>>) -> Result<ExitCode> {
+pub async fn catch_panic(future: impl Future<Output = Result<ExitCode>>) -> Result<ExitCode> {
     let mut future = std::pin::pin!(future);
     std::future::poll_fn(|cx| {
         let polled =
@@ -4897,64 +4892,6 @@ async fn catch_panic(future: impl Future<Output = Result<ExitCode>>) -> Result<E
         }
     })
     .await
-}
-
-pub fn run_cli() -> ExitCode {
-    // Windows gives the main thread 1 MiB, which the debug CLI future can exceed.
-    std::thread::Builder::new()
-        .name("open-pact-client".into())
-        .stack_size(8 * 1024 * 1024)
-        .spawn(|| {
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .expect("build the CLI runtime")
-                .block_on(cli_main())
-        })
-        .expect("start the CLI thread")
-        .join()
-        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
-}
-
-async fn cli_main() -> ExitCode {
-    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
-    let cli = match Cli::try_parse_from(&args) {
-        Ok(cli) => cli,
-        Err(error) => match usage_error_line(&args, &error) {
-            Some(line) => {
-                let _ = writeln!(std::io::stdout(), "{line}");
-                return ExitCode::from(2);
-            }
-            None => error.exit(),
-        },
-    };
-    let json = cli.prints_json();
-    // Keep Rust's ignored SIGPIPE for JSON: a closed stderr must not kill usable stdout.
-    // Text commands still exit quietly when their stdout pipe closes, such as `log show | head`.
-    #[cfg(unix)]
-    if !json {
-        unsafe {
-            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-        }
-    }
-    let executable = std::env::current_exe().unwrap_or_default();
-    let result = if json {
-        catch_panic(run(cli, &executable)).await
-    } else {
-        run(cli, &executable).await
-    };
-    match result {
-        Ok(code) => code,
-        Err(e) if json => {
-            let line = serde_json::json!({ "error": format!("{e:#}") });
-            let _ = writeln!(std::io::stdout(), "{line}");
-            ExitCode::FAILURE
-        }
-        Err(e) => {
-            eprintln!("error: {e:#}");
-            ExitCode::FAILURE
-        }
-    }
 }
 
 #[cfg(test)]
@@ -6613,18 +6550,6 @@ mod tests {
                 .count(),
             1
         );
-    }
-
-    #[test]
-    fn join_invitation_argument_is_optional_for_a_saved_enrolment() {
-        let cli = Cli::try_parse_from(["open-pact-client", "join"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Command::Join {
-                invitation: None,
-                ..
-            }
-        ));
     }
 
     #[tokio::test]
@@ -9230,24 +9155,22 @@ grace = "1d"
             .unwrap();
         home.write(LOG_CHECKPOINT, b"fictional checkpoint").unwrap();
         home.write(VPN_FILES[0], b"interrupted flat copy").unwrap();
-        let executable = std::env::current_exe().unwrap();
         let home_path = dir.path().to_path_buf();
-        let cli = move || {
-            Cli::parse_from([
-                "open-pact-client",
-                "--home",
-                home_path.to_str().unwrap(),
-                "log",
-                "head",
-            ])
+        let cli = move || Invocation {
+            home: Some(home_path.clone()),
+            insecure_dev: false,
+            command: Command::Log {
+                command: LogCommand::Head,
+            },
         };
+        let executable = std::env::current_exe().unwrap();
         let lock = home.lock_vpn().unwrap();
         assert!(!home.recover_vpn_at_startup().unwrap());
         let handle = tokio::runtime::Handle::current();
         let cli_for_task = cli.clone();
-        let task_executable = executable.clone();
+        let executable_for_task = executable.clone();
         let run_while_locked = tokio::task::spawn_blocking(move || {
-            handle.block_on(run(cli_for_task(), &task_executable))
+            handle.block_on(run(cli_for_task(), &executable_for_task))
         });
         let timely =
             tokio::time::timeout(std::time::Duration::from_secs(1), run_while_locked).await;
@@ -9910,49 +9833,6 @@ grace = "1d"
         let capture = json_out::testing::Capture::default();
         let json = json_out::Json::new(capture.clone(), json_out::Answers::default());
         (capture, json)
-    }
-
-    #[test]
-    fn json_flags_need_the_flags_they_depend_on() {
-        let parse = |args: &[&str]| {
-            let mut all = vec!["open-pact-client"];
-            all.extend_from_slice(args);
-            Cli::try_parse_from(all).map(|_| ())
-        };
-        assert!(parse(&["join", "--preview", "opi1:x"]).is_ok());
-        assert!(
-            parse(&["join", "--preview"]).is_err(),
-            "preview needs the invitation"
-        );
-        assert!(parse(&["join", "--preview", "--yes", "opi1:x"]).is_err());
-        assert!(
-            parse(&[
-                "join",
-                "--json",
-                "--yes",
-                "--folder",
-                "/a",
-                "--auto-send",
-                "on"
-            ])
-            .is_ok()
-        );
-        assert!(
-            parse(&["join", "--json"]).is_err(),
-            "--json asks nothing, so it needs --yes"
-        );
-        assert!(parse(&["join", "--yes", "--folder", "/a"]).is_err());
-        assert!(parse(&["join", "--yes", "--auto-send", "on"]).is_err());
-        assert!(parse(&["join", "--json", "--yes", "--auto-send", "maybe"]).is_err());
-        assert!(parse(&["check", "--json"]).is_ok());
-        assert!(parse(&["check", "--json", "--dry-run"]).is_err());
-        assert!(parse(&["check", "--dry-run", "--timings"]).is_ok());
-        assert!(
-            parse(&["check", "--timings"]).is_err(),
-            "timings belong to the dry run: a real check writes files and sends"
-        );
-        assert!(parse(&["accept", "--preview"]).is_ok());
-        assert!(parse(&["accept", "--preview", "--yes"]).is_err());
     }
 
     #[tokio::test]
@@ -10721,56 +10601,253 @@ grace = "1d"
         assert!(after.is_some_and(|error| error.contains("fictional full disk")));
     }
 
-    #[test]
-    fn startup_vpn_recovery_skips_the_commands_that_write_no_file() {
-        let parse = |args: &[&str]| {
-            let mut all = vec!["open-pact-client"];
-            all.extend_from_slice(args);
-            Cli::try_parse_from(all).unwrap()
-        };
-        for skipped in [
-            &["status"][..],
-            &["manifest", "show"],
-            &["join", "--preview", "opi1:fictional"],
-            &["accept", "--preview"],
-        ] {
-            assert!(!recovers_vpn_first(&parse(skipped).command), "{skipped:?}");
-        }
-        for recovering in [
-            &["check"][..],
-            &["check", "--json"],
-            &["join", "opi1:fictional"],
-            &["accept"],
-        ] {
-            assert!(
-                recovers_vpn_first(&parse(recovering).command),
-                "{recovering:?}"
-            );
-        }
+    // ----- The typed API for apps -----
+
+    fn session_of(home: &Home) -> Session {
+        Session::open(Some(home.0.clone()), std::env::current_exe().unwrap()).unwrap()
     }
 
-    #[test]
-    fn a_command_line_that_does_not_parse_gets_a_json_error_when_it_asked_for_json() {
-        let line = |args: &[&str]| {
-            let mut all = vec!["open-pact-client"];
-            all.extend_from_slice(args);
-            let all: Vec<std::ffi::OsString> = all.into_iter().map(Into::into).collect();
-            let error = Cli::try_parse_from(&all).map(|_| ()).unwrap_err();
-            usage_error_line(&all, &error)
-        };
-        for args in [
-            &["join", "--json", "--yes", "--auto-send", "maybe"][..],
-            &["join", "--preview"],
-            &["check", "--json", "--bogus"],
-            &["status", "--json", "--bogus"],
-        ] {
-            let text = line(args).unwrap_or_else(|| panic!("{args:?} has no JSON error"));
-            let document: Value = serde_json::from_str(&text).unwrap();
-            assert_eq!(document.as_object().unwrap().len(), 1, "{text}");
-            assert!(!document["error"].as_str().unwrap().is_empty(), "{text}");
-            assert!(!text.contains('\n'), "{text}");
+    fn step_log() -> (
+        std::sync::Arc<std::sync::Mutex<Vec<JoinStep>>>,
+        impl FnMut(JoinStep) + Send + 'static,
+    ) {
+        let steps = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = steps.clone();
+        (steps, move |step| seen.lock().unwrap().push(step))
+    }
+
+    fn assert_send<T: Send>(_: &T) {}
+
+    #[tokio::test]
+    async fn a_session_joins_without_a_terminal_and_reports_each_step() {
+        let (gateway, invitation) = witnessed_join_fixture().await;
+        let dir = tempfile::tempdir().unwrap();
+        let session = session_of(&Home(dir.path().to_path_buf()));
+        let (steps, on_step) = step_log();
+
+        let call = session.join(
+            &invitation,
+            JoinChoices {
+                software_key: true,
+                no_wait: true,
+                ..JoinChoices::default()
+            },
+            std::future::pending(),
+            on_step,
+        );
+        assert_send(&call);
+        let result = call.await.unwrap();
+
+        assert_eq!(result.result, JoinStage::Enrolled);
+        let enrolment = Home(dir.path().to_path_buf()).enrolment().unwrap();
+        assert_eq!(result.device, enrolment.device);
+        assert_eq!(result.manifest_hash, enrolment.manifest);
+        assert_eq!(gateway.posts(), vec!["POST /v1/enroll"]);
+        let steps = steps.lock().unwrap();
+        let states: Vec<(u8, StepState)> = steps.iter().map(|s| (s.step, s.state)).collect();
+        assert_eq!(
+            states,
+            [
+                (1, StepState::Started),
+                (1, StepState::Done),
+                (2, StepState::Started),
+                (2, StepState::Done),
+                (3, StepState::Started),
+                (3, StepState::Done),
+                (4, StepState::Started),
+                (4, StepState::Waiting),
+            ],
+            "the open step waits for IT, so the run does not finish it: {steps:?}"
+        );
+        assert_eq!(steps[0].title, "Check the invitation");
+        assert_eq!(
+            steps[7].detail.as_ref().unwrap()["device_code"],
+            device_code(&enrolment.device)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_join_ends_with_cancelled_when_its_cancel_future_completes() {
+        let witness = Witness::new();
+        let toml = witnessed_manifest(&witness);
+        let company = Company::new();
+        let published = Company::published(&toml, &company.key);
+        let log = company.log.vkey();
+        let mut checkpoint = company.sign(&Checkpoint {
+            origin: company.log.origin().into(),
+            size: 1,
+            root: LogHash([3; 32]),
+        });
+        witness.cosign(
+            &mut checkpoint,
+            u64::try_from(chrono::Utc::now().timestamp()).unwrap(),
+        );
+        let checkpoint = checkpoint.to_string();
+        let gateway = FakeGateway::start(move |line, nth| match line {
+            "GET /v1/manifest" => (200, published.clone()),
+            "GET /v1/log/key" => (200, format!("{log}\n")),
+            "GET /v1/log/checkpoint" => (200, checkpoint.clone()),
+            "POST /v1/enroll" => (
+                200,
+                json!({"salt":"11".repeat(32),"state":"pending"}).to_string(),
+            ),
+            "POST /v1/nonce" => (200, json!({"nonce":format!("wait-{nth}")}).to_string()),
+            "POST /v1/device/status" => (200, r#"{"state":"pending"}"#.into()),
+            _ => not_found(),
+        })
+        .await;
+        let invitation = Invitation::new(
+            &gateway.url,
+            &PublicKey::from(&company.key),
+            &company.log,
+            open_pact_core::InvitationCode::from_bytes([7; 32]),
+        )
+        .encode();
+        let dir = tempfile::tempdir().unwrap();
+        let session = session_of(&Home(dir.path().to_path_buf()));
+        let (steps, on_step) = step_log();
+
+        let error = session
+            .join(
+                &invitation,
+                JoinChoices {
+                    software_key: true,
+                    ..JoinChoices::default()
+                },
+                tokio::time::sleep(Duration::from_millis(500)),
+                on_step,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.is::<Cancelled>(), "{error:#}");
+        assert!(
+            gateway
+                .requests()
+                .contains(&"POST /v1/device/status".to_string()),
+            "the join was waiting for IT when it was cancelled"
+        );
+        let steps = steps.lock().unwrap();
+        assert!(
+            steps
+                .iter()
+                .any(|step| step.step == 4 && step.state == StepState::Waiting),
+            "{steps:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_check_sends_the_claim_and_says_when_it_waits_for_the_job() {
+        let fixture = claim_fixture_replying(
+            None,
+            |signed| signed.to_string(),
+            grown_checkpoint,
+            valid_pair,
+            None,
+            None,
+        )
+        .await;
+        let session = session_of(&fixture.home);
+        let (steps, on_step) = step_log();
+        let job = claim::try_lock(&fixture.home).unwrap().unwrap();
+
+        let call = session.check_with(on_step);
+        assert_send(&call);
+        tokio::pin!(call);
+        tokio::select! {
+            _ = &mut call => panic!("check must wait while the job holds the lock"),
+            () = tokio::time::sleep(Duration::from_millis(600)) => {}
         }
-        assert_eq!(line(&["join", "--bogus"]), None);
-        assert_eq!(line(&["check", "--bogus"]), None);
+        assert!(steps.lock().unwrap().iter().any(
+            |step| step.title == json_out::WAITING_FOR_JOB && step.state == StepState::Waiting
+        ));
+        assert!(
+            !fixture
+                .gateway
+                .posts()
+                .contains(&"POST /v1/claim".to_string())
+        );
+        drop(job);
+
+        let report = call.await.unwrap();
+
+        assert!(report.accepted);
+        assert!(report.sent_at.ends_with('Z'));
+        assert_eq!(report.controls[0].id, "os_supported");
+        assert!(
+            fixture
+                .gateway
+                .posts()
+                .contains(&"POST /v1/claim".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_previews_and_accepts_the_manifest_the_gateway_enforces() {
+        let company = Company::new();
+        let witness = Witness::new();
+        let old = witnessed_manifest(&witness);
+        let new_toml = with_password_rule(&old);
+        let published = Company::published(&new_toml, &company.key);
+        let new = Manifest::parse(new_toml.as_bytes()).unwrap();
+        let log = company.log.vkey();
+        let checkpoint = cosigned_empty_checkpoint(&company, &witness);
+        let reply =
+            json!({"status":"accepted","state":"approved","manifest": new.hash()}).to_string();
+        let gateway = FakeGateway::start(move |line, _| match line {
+            "GET /v1/manifest" => (200, published.clone()),
+            "GET /v1/log/key" => (200, format!("{log}\n")),
+            "GET /v1/log/checkpoint" => (200, checkpoint.clone()),
+            "POST /v1/nonce" => (200, json!({"nonce":"accept-nonce"}).to_string()),
+            "POST /v1/device/accept" => (200, reply.clone()),
+            _ => not_found(),
+        })
+        .await;
+        let (dir, _) = accept_home(&gateway.url, &company, &old);
+        let home = Home(dir.path().to_path_buf());
+        let session = session_of(&home);
+
+        let preview = session.accept_preview().await.unwrap();
+        assert_eq!(preview.signed_hash, ManifestHash::of(old.as_bytes()));
+        assert_eq!(&preview.published_hash, new.hash());
+        assert!(!preview.changes.is_empty());
+        assert!(gateway.posts().is_empty(), "a preview sends nothing");
+
+        let call = session.accept();
+        assert_send(&call);
+        call.await.unwrap();
+
+        assert_eq!(
+            gateway.posts(),
+            ["POST /v1/nonce", "POST /v1/device/accept"]
+        );
+        assert_eq!(&home.enrolment().unwrap().manifest, new.hash());
+        session.accept().await.unwrap();
+        assert_eq!(gateway.posts().len(), 2, "nothing is left to accept");
+    }
+
+    #[tokio::test]
+    async fn a_session_previews_a_join_and_keeps_the_folder_list() {
+        let company = Company::new();
+        let (gateway, invitation) = preview_gateway(&company, DEMO_MANIFEST).await;
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().join("home"));
+        let session = session_of(&home);
+
+        let preview = session.join_preview(&invitation.encode()).await.unwrap();
+
+        assert!(preview.company.matches_invitation);
+        assert_eq!(preview.gateway, gateway.url);
+        assert!(gateway.posts().is_empty());
+
+        std::fs::create_dir_all(&home.0).unwrap();
+        let work = dir.path().join("work");
+        assert!(session.folders().unwrap().is_empty());
+        assert!(session.add_folder(&work).await.unwrap());
+        assert!(!session.add_folder(&work).await.unwrap(), "listed already");
+        assert_eq!(session.folders().unwrap(), std::slice::from_ref(&work));
+        session.remove_folder(&work).await.unwrap();
+        assert!(session.remove_folder(&work).await.is_err());
+        assert!(session.folders().unwrap().is_empty());
     }
 }

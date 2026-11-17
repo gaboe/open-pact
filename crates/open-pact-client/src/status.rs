@@ -4,7 +4,6 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
-use clap::Args;
 use open_pact_core::{DeviceStatus, Manifest, ManifestHash, verify_claim};
 use serde::{Deserialize, Serialize};
 
@@ -12,19 +11,18 @@ use crate::device_config::DeviceConfig;
 use crate::schedule::JobStatus;
 use crate::{Enrolment, Home, Pins, PublishedManifest, Response, locallog};
 
-#[derive(Args)]
-pub(crate) struct Options {
+/// The options of `status`, without the parser.
+#[derive(Clone, Debug)]
+pub struct Options {
     /// Refresh approval, manifest, log, VPN probe, and OS job state. Sends no claim
-    #[arg(long)]
-    online: bool,
+    pub online: bool,
     /// Print the same evidence and issues as JSON
-    #[arg(long)]
-    json: bool,
+    pub json: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum Verdict {
+pub enum Verdict {
     NoKnownProblem,
     ActionNeeded,
     Alarm,
@@ -33,65 +31,65 @@ enum Verdict {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum Urgency {
+pub enum Urgency {
     Alarm,
     Action,
     Warning,
 }
 
 #[derive(Debug, Serialize)]
-struct Issue {
-    urgency: Urgency,
-    message: String,
-    fix: Option<String>,
-    command: Option<String>,
-    stop_job_command: Option<String>,
-    deadline: String,
+pub struct Issue {
+    pub urgency: Urgency,
+    pub message: String,
+    pub fix: Option<String>,
+    pub command: Option<String>,
+    pub stop_job_command: Option<String>,
+    pub deadline: String,
 }
 
 #[derive(Debug, Serialize)]
-struct ApprovalEvidence {
-    state: Option<DeviceStatus>,
-    live: bool,
-    source: String,
+pub struct ApprovalEvidence {
+    pub state: Option<DeviceStatus>,
+    pub live: bool,
+    pub source: String,
 }
 
 #[derive(Debug, Serialize)]
-struct ClaimEvidence {
-    sent_at: Option<String>,
-    response_at: String,
-    response: String,
-    warnings: Vec<String>,
-    reasons: Vec<String>,
-    manifest: Option<ManifestHash>,
-    os: Option<open_pact_core::Os>,
-    results: std::collections::BTreeMap<String, open_pact_core::ControlValue>,
+pub struct ClaimEvidence {
+    pub sent_at: Option<String>,
+    pub response_at: String,
+    pub response: String,
+    pub warnings: Vec<String>,
+    pub reasons: Vec<String>,
+    pub manifest: Option<ManifestHash>,
+    pub os: Option<open_pact_core::Os>,
+    pub results: std::collections::BTreeMap<String, open_pact_core::ControlValue>,
 }
 
 #[derive(Debug, Serialize)]
-struct ManifestEvidence {
-    signed: ManifestHash,
-    enforced: Option<ManifestHash>,
-    agreement: String,
+pub struct ManifestEvidence {
+    pub signed: ManifestHash,
+    pub enforced: Option<ManifestHash>,
+    pub agreement: String,
 }
 
 #[derive(Debug, Serialize)]
-struct ScheduleEvidence {
-    owner_consented: Option<bool>,
-    policy: String,
-    policy_defined: bool,
-    job: String,
-    job_status: Option<JobStatus>,
-    vpn: String,
-    last_scheduled_claim: Option<ScheduledClaim>,
-    last_job_note: Option<String>,
-    last_job_log_line: Option<String>,
+pub struct ScheduleEvidence {
+    pub owner_consented: Option<bool>,
+    pub policy: String,
+    pub policy_defined: bool,
+    pub job: String,
+    pub job_status: Option<JobStatus>,
+    pub vpn: String,
+    pub last_scheduled_claim: Option<ScheduledClaim>,
+    pub last_job_note: Option<String>,
+    pub last_job_log_line: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
-struct ScheduledClaim {
-    answered_at: String,
-    response: Option<String>,
+pub struct ScheduledClaim {
+    pub answered_at: String,
+    pub response: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -102,29 +100,40 @@ struct TickEvidence {
 }
 
 #[derive(Debug, Serialize)]
-pub(crate) struct Report {
-    schema_version: u8,
-    observed_at: String,
-    mode: &'static str,
-    verdict: Verdict,
-    exit_code: u8,
-    online_command: Option<String>,
-    current_compliance: &'static str,
-    approval: ApprovalEvidence,
-    last_claim: Option<ClaimEvidence>,
-    manifest: Option<ManifestEvidence>,
-    schedule: ScheduleEvidence,
-    log: String,
-    issues: Vec<Issue>,
-    limitations: Vec<String>,
-    update: Option<crate::update::Notice>,
+pub struct Report {
+    pub schema_version: u8,
+    pub observed_at: String,
+    pub mode: &'static str,
+    pub verdict: Verdict,
+    pub exit_code: u8,
+    pub online_command: Option<String>,
+    pub current_compliance: &'static str,
+    pub approval: ApprovalEvidence,
+    pub last_claim: Option<ClaimEvidence>,
+    pub manifest: Option<ManifestEvidence>,
+    pub schedule: ScheduleEvidence,
+    pub log: String,
+    pub issues: Vec<Issue>,
+    pub limitations: Vec<String>,
+    pub update: Option<crate::update::Notice>,
 }
 
-impl Options {
-    /// The command prints JSON, so its failure is JSON too.
-    pub(crate) fn json(&self) -> bool {
-        self.json
+/// The status report. With `online` it also asks whether a newer release exists.
+pub(crate) async fn report(
+    home: &Home,
+    online: bool,
+    insecure_dev: bool,
+    executable: &Path,
+) -> Result<Report> {
+    let mut report = collect(home, online, insecure_dev, executable).await?;
+    if online && home.file("enrolment.json").exists() {
+        // The check waits on the network on a thread of its own, so it must not hold a worker.
+        report.update = tokio::task::spawn_blocking(crate::update::latest_notice)
+            .await
+            .ok()
+            .flatten();
     }
+    Ok(report)
 }
 
 pub(crate) async fn run(
@@ -133,10 +142,7 @@ pub(crate) async fn run(
     insecure_dev: bool,
     executable: &Path,
 ) -> Result<ExitCode> {
-    let mut report = collect(home, options.online, insecure_dev, executable).await?;
-    if options.online && home.file("enrolment.json").exists() {
-        report.update = crate::update::latest_notice();
-    }
+    let report = report(home, options.online, insecure_dev, executable).await?;
     let text = if options.json {
         serde_json::to_string_pretty(&report)? + "\n"
     } else {
