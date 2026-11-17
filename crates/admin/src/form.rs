@@ -163,6 +163,9 @@ pub struct FormState {
     pub panel: Option<Panel>,
     /// The id of the selected check.
     pub selected: Option<String>,
+    /// The Description edit that is open: the check id and the text in its editor. A panel
+    /// rebuilt for that check reopens the editor with this text.
+    pub description_edit: Option<(String, String)>,
     pub filter: Filter,
     pub add_open: bool,
     /// Input the form could not read yet, one message per field.
@@ -249,6 +252,7 @@ impl FormState {
             sends_seen: manifest::SeenSchedule::default(),
             panel: None,
             selected: None,
+            description_edit: None,
             filter: Filter::All,
             add_open: false,
             pending: Pending::default(),
@@ -1030,6 +1034,7 @@ impl AppView {
             PanelSwitch::Refuse => self.error = note,
             PanelSwitch::Replace => {
                 self.fv.selected = id;
+                self.fv.description_edit = None;
                 self.build_panel(window, cx);
             }
         }
@@ -1050,6 +1055,12 @@ impl AppView {
         Form::parse(&self.draft).ok()?.control(id).cloned()
     }
 
+    /// Opens the Description editor, as a snapshot scene needs it.
+    #[cfg(all(feature = "snapshot", target_os = "macos"))]
+    pub fn open_description_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.start_description_edit(window, cx);
+    }
+
     /// Opens the Description editor with the text the reader sees now.
     fn start_description_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self
@@ -1060,10 +1071,11 @@ impl AppView {
             return;
         };
         panel.description.update(cx, |state, cx| {
-            state.set_value(text, window, cx);
+            state.set_value(text.clone(), window, cx);
             state.focus(window, cx);
         });
         panel.editing = true;
+        self.fv.description_edit = self.fv.selected.clone().map(|id| (id, text));
         cx.notify();
     }
 
@@ -1105,10 +1117,12 @@ impl AppView {
                 .description
                 .update(cx, |state, cx| state.set_value(text, window, cx));
         }
+        self.fv.description_edit = self.fv.selected.clone().map(|id| (id, text.to_owned()));
         cx.notify();
     }
 
     fn close_description_editor(&mut self) {
+        self.fv.description_edit = None;
         if let Some(panel) = self.fv.panel.as_mut() {
             panel.editing = false;
         }
@@ -1218,6 +1232,10 @@ impl AppView {
                         Ok(text) => {
                             this.fv.pending.rename_control(&old, &value);
                             this.fv.selected = Some(value.clone());
+                            match this.fv.description_edit.as_mut() {
+                                Some((held, _)) if *held == old => *held = value.clone(),
+                                _ => {}
+                            }
                             this.edit_field(Field::Id(value), Ok(text), Rebuild::No, window, cx);
                         }
                         Err(message) => {
@@ -1253,11 +1271,28 @@ impl AppView {
             },
         );
         self.fv.panel_subs.push(reference_subscription);
-        let description = cx.new(|cx| {
-            TextareaState::new(window, cx)
-                .rows(6)
-                .default_value(description_or_default(&control))
-        });
+        let held = kept_description(
+            self.fv.description_edit.as_ref(),
+            self.fv.selected.as_deref(),
+        )
+        .map(str::to_owned);
+        let editing = held.is_some();
+        let text = held.unwrap_or_else(|| description_or_default(&control));
+        let description = cx.new(|cx| TextareaState::new(window, cx).rows(6).default_value(text));
+        let description_subscription = cx.subscribe_in(
+            &description,
+            window,
+            |this, state, event: &InputEvent, _, cx| {
+                if !matches!(event, InputEvent::Change) {
+                    return;
+                }
+                if let Some(id) = this.fv.selected.clone() {
+                    let text = state.read(cx).value().to_string();
+                    this.fv.description_edit = Some((id, text));
+                }
+            },
+        );
+        self.fv.panel_subs.push(description_subscription);
         let grace = self.duration_field(
             DurationSpec {
                 raw: control.grace.clone(),
@@ -1280,7 +1315,7 @@ impl AppView {
             id,
             reference,
             description,
-            editing: false,
+            editing,
             os,
             opened: [false; 3],
             grace,
@@ -2870,12 +2905,34 @@ fn stored_description<'a>(text: &'a str, default: Option<&'a str>) -> &'a str {
     if default == Some(text) { "" } else { text }
 }
 
+/// The Description text that an open edit keeps for the selected check. An edit of another
+/// check, or no selected check, keeps nothing.
+fn kept_description<'a>(
+    edit: Option<&'a (String, String)>,
+    selected: Option<&str>,
+) -> Option<&'a str> {
+    let (id, text) = edit?;
+    (selected == Some(id.as_str())).then_some(text.as_str())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        PanelSwitch, PopoverPlace, ViewSwitch, panel_switch, popover_place, stored_description,
-        view_switch,
+        PanelSwitch, PopoverPlace, ViewSwitch, kept_description, panel_switch, popover_place,
+        stored_description, view_switch,
     };
+
+    #[test]
+    fn an_open_description_edit_applies_only_to_its_check() {
+        let edit = ("screen_lock".to_owned(), "Typed text.".to_owned());
+        assert_eq!(
+            kept_description(Some(&edit), Some("screen_lock")),
+            Some("Typed text.")
+        );
+        assert_eq!(kept_description(Some(&edit), Some("firewall")), None);
+        assert_eq!(kept_description(Some(&edit), None), None);
+        assert_eq!(kept_description(None, Some("screen_lock")), None);
+    }
 
     fn place(above: bool, height: f32) -> PopoverPlace {
         PopoverPlace { above, height }

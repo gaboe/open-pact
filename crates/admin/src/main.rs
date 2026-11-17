@@ -1484,14 +1484,13 @@ fn main() {
         return;
     }
     runner::tool_path();
-    manifest::load_builtin_texts(&runner::client::cli_candidates(
-        std::env::current_exe().ok().as_deref(),
-    ));
+    let programs = runner::client::cli_candidates(std::env::current_exe().ok().as_deref());
     let settings = Settings::load();
     launch("open-pact admin", 1360., 860., move |window, cx| {
         cx.new(|cx| {
             let mut app = AppView::new(settings.clone().unwrap_or_default(), window, cx);
             app.load_contexts(window, cx);
+            load_builtin_texts_later(programs, cx);
             let runner = app.admin.runner.clone();
             watch_updates(cx, runner, |view: &mut AppView| &mut view.update);
             match settings {
@@ -1504,6 +1503,21 @@ fn main() {
             app
         })
     });
+}
+
+/// Loads the default texts after the window opens, so a slow CLI does not hold the window back.
+/// Until they arrive, the panel shows the plain description and hides Reset text. The panel reads
+/// the texts on each paint, so the view repaints when they arrive.
+fn load_builtin_texts_later(programs: Vec<std::path::PathBuf>, cx: &mut Context<AppView>) {
+    cx.spawn(async move |this, cx| {
+        cx.background_executor()
+            .spawn(async move {
+                manifest::load_builtin_texts(&programs);
+            })
+            .await;
+        this.update(cx, |_, cx| cx.notify()).ok();
+    })
+    .detach();
 }
 
 /// The default texts a snapshot scene uses when no CLI is installed. The text is a placeholder,
@@ -1536,6 +1550,7 @@ fn snapshots(output: PathBuf) {
         ("admin-a-overview", Screen::Overview, true, None),
         ("admin-b-form", Screen::Manifest, true, None),
         ("admin-w-sending-both", Screen::Manifest, true, None),
+        ("admin-x-description-edit", Screen::Manifest, true, None),
         ("admin-c-toml", Screen::Manifest, false, None),
         ("admin-m-number-check", Screen::Manifest, true, None),
         ("admin-n-add-check", Screen::Manifest, true, None),
@@ -1581,6 +1596,7 @@ fn snapshots(output: PathBuf) {
                 if matches!(
                     name,
                     "admin-b-form"
+                        | "admin-x-description-edit"
                         | "admin-w-sending-both"
                         | "admin-m-number-check"
                         | "admin-n-add-check"
@@ -1603,7 +1619,7 @@ fn snapshots(output: PathBuf) {
             if name == "admin-k-update" { app.update = UpdateState::Available("0.1.1".into()); }
                 app.active = include_str!("../../../tests/fixtures/manifest.toml").into();
                 app.draft = app.active.clone();
-            if matches!(name, "admin-d-apply" | "admin-b-form" | "admin-w-sending-both" | "admin-m-number-check" | "admin-n-add-check" | "admin-o-field-errors" | "admin-p-add-check-all" | "admin-q-add-check-scrolled" | "admin-r-old-cli" | "admin-s-check-line") { app.draft = include_str!("../../../tests/fixtures/manifest-v2.toml").into(); }
+            if matches!(name, "admin-d-apply" | "admin-b-form" | "admin-x-description-edit" | "admin-w-sending-both" | "admin-m-number-check" | "admin-n-add-check" | "admin-o-field-errors" | "admin-p-add-check-all" | "admin-q-add-check-scrolled" | "admin-r-old-cli" | "admin-s-check-line") { app.draft = include_str!("../../../tests/fixtures/manifest-v2.toml").into(); }
             if name == "admin-w-sending-both" {
                 app.draft = format!("{}
 [schedule.always]
@@ -1622,13 +1638,14 @@ interval = \"24h\"
                 }
             }
             if !form && name != "admin-s-check-line" { app.draft = include_str!("../../../tests/fixtures/manifest-v2.toml").replace("issuer = \"Example Company, IT security\"", "issuer = \"Example Company, IT security"); }
-            app.fv.selected = match name { "admin-m-number-check" | "admin-o-field-errors" => Some("os_patch_age_days".to_owned()), "admin-b-form" | "admin-n-add-check" => Some("screen_lock".to_owned()), _ => None };
+            app.fv.selected = match name { "admin-m-number-check" | "admin-o-field-errors" => Some("os_patch_age_days".to_owned()), "admin-b-form" | "admin-n-add-check" | "admin-x-description-edit" => Some("screen_lock".to_owned()), _ => None };
             app.fv.add_open = matches!(name, "admin-n-add-check" | "admin-p-add-check-all" | "admin-q-add-check-scrolled");
             app.fv.manual_check = true;
             app.show_draft(window, cx);
             app.build_form(window, cx);
             app.fv.set_check(&app.draft, snapshot_check(name, &app.draft));
             app.mark_lines(cx);
+            if name == "admin-x-description-edit" { app.open_description_edit(window, cx); }
             if name == "admin-o-field-errors" { app.type_valid_from("garbage", window, cx); }
             if matches!(name, "admin-p-add-check-all" | "admin-q-add-check-scrolled") { app.fv.scroll.set_offset(point(px(0.), px(-1000.))); }
             if name == "admin-q-add-check-scrolled" { app.fv.add_scroll.set_offset(point(px(0.), px(-5000.))); }

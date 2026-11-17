@@ -549,18 +549,23 @@ fn window_keys(cx: &mut App, name: &'static str) {
         KeyBinding::new("cmd-q", Quit, None),
     ]);
     cx.on_action(|_: &Quit, cx| cx.quit());
+    // GPUI holds the active window while it dispatches the key, so the window work runs after it.
     cx.on_action(|_: &CloseWindow, cx| {
-        if let Some(window) = cx.active_window() {
-            window
-                .update(cx, |_, window, _| window.remove_window())
-                .ok();
+        if let Some(handle) = cx.active_window() {
+            cx.defer(move |cx| {
+                if let Err(error) = handle.update(cx, |_, window, _| window.remove_window()) {
+                    eprintln!("Cannot close the window: {error}");
+                }
+            });
         }
     });
     cx.on_action(|_: &Minimize, cx| {
-        if let Some(window) = cx.active_window() {
-            window
-                .update(cx, |_, window, _| window.minimize_window())
-                .ok();
+        if let Some(handle) = cx.active_window() {
+            cx.defer(move |cx| {
+                if let Err(error) = handle.update(cx, |_, window, _| window.minimize_window()) {
+                    eprintln!("Cannot minimize the window: {error}");
+                }
+            });
         }
     });
     cx.set_menus(vec![
