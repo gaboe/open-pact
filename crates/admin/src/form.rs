@@ -3,8 +3,10 @@
 use super::*;
 use gpui_component::{
     date_picker::{DatePicker, DatePickerEvent, DatePickerState},
+    h_resizable,
     highlighter::{Diagnostic, DiagnosticSeverity},
     input::{Editor, Position, Textarea, TextareaState},
+    resizable_panel,
 };
 use runner::manifest::{
     self, Control, Field, FieldError, Filter, Form, ManifestCheck, Os, Output, Pending, Problems,
@@ -1501,12 +1503,21 @@ impl AppView {
             .child(self.sent(&form, cx))
             .child(self.sending(&form, inputs, &issues, cx))
             .child(self.checks(&form, before.as_ref(), &issues, cx));
-        div()
-            .flex()
-            .flex_1()
-            .min_h_0()
-            .child(scroll)
-            .child(self.panel(&form, before.as_ref(), &issues, cx))
+        div().flex().flex_1().min_h_0().child(
+            h_resizable("manifest-split")
+                .child(
+                    resizable_panel()
+                        .size_range(px(520.)..Pixels::MAX)
+                        .child(scroll),
+                )
+                .child(
+                    resizable_panel()
+                        .size(px(380.))
+                        .size_range(px(380.)..px(600.))
+                        .fixed()
+                        .child(self.panel(&form, before.as_ref(), &issues, cx)),
+                ),
+        )
     }
 
     fn agreement(
@@ -1780,6 +1791,7 @@ impl AppView {
                 "VPN answers at",
                 div()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap(px(8.))
                     .child(
@@ -1874,6 +1886,7 @@ impl AppView {
             });
         let tools = div()
             .flex()
+            .flex_wrap()
             .items_center()
             .gap(px(10.))
             .mb(px(10.))
@@ -1972,6 +1985,9 @@ impl AppView {
                         .child(
                             div()
                                 .id(("check-name", index))
+                                .min_w_0()
+                                .overflow_hidden()
+                                .text_ellipsis()
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .whitespace_nowrap()
                                 .when_some(
@@ -2153,8 +2169,8 @@ impl AppView {
                 .flex()
                 .flex_col()
                 .gap(px(16.))
-                .w(px(380.))
-                .flex_none()
+                .flex_1()
+                .min_w_0()
                 .h_full()
                 .p(px(22.))
                 .border_l_1()

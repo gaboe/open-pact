@@ -11,6 +11,7 @@ use gpui_component::{
     input::{EditorState, Input, InputEvent, InputState},
     select::{Select, SelectEvent, SelectState},
 };
+use gpui_kit_assets::IconName;
 use results::ResultsView;
 use runner::{
     Runner,
@@ -1367,17 +1368,17 @@ impl Render for AppView {
             .border_color(rgb(RULE))
             .children(
                 [
-                    (Screen::Overview, "Overview"),
-                    (Screen::Manifest, "Manifest"),
-                    (Screen::Devices, "Devices"),
-                    (Screen::Results, "Results"),
-                    (Screen::Setup, "Settings"),
+                    (Screen::Overview, "Overview", IconName::LayoutDashboard),
+                    (Screen::Manifest, "Manifest", IconName::FileText),
+                    (Screen::Devices, "Devices", IconName::HardDrive),
+                    (Screen::Results, "Results", IconName::CircleCheck),
+                    (Screen::Setup, "Settings", IconName::Settings),
                 ]
                 .into_iter()
                 .enumerate()
-                .map(|(i, (screen, name))| {
-                    nav_item(("nav", i), name, self.screen == screen).on_click(cx.listener(
-                        move |this, _, window, cx| {
+                .map(|(i, (screen, name, icon))| {
+                    nav_item_with_icon(("nav", i), Some(icon), name, self.screen == screen)
+                        .on_click(cx.listener(move |this, _, window, cx| {
                             if this.busy || (screen != Screen::Setup && this.overview.is_none()) {
                                 return;
                             }
@@ -1387,8 +1388,7 @@ impl Render for AppView {
                             }
                             this.screen = screen;
                             cx.notify();
-                        },
-                    ))
+                        }))
                 }),
             )
             .child(div().flex_1())

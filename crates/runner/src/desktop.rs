@@ -2,7 +2,7 @@ use crate::text::{Tone, short_hash};
 use crate::update::{self, Platform, UpdateState};
 use gpui::{prelude::*, *};
 use gpui_component::{
-    Disableable, Root, Sizable, Theme, ThemeMode,
+    Disableable, Icon, Root, Sizable, Theme, ThemeMode,
     button::{Button, ButtonVariants},
 };
 use std::time::Duration;
@@ -367,8 +367,21 @@ pub fn tabs(items: Vec<Stateful<Div>>) -> Div {
 }
 
 pub fn nav_item(id: impl Into<ElementId>, text: &'static str, selected: bool) -> Stateful<Div> {
+    nav_item_with_icon(id, None, text, selected)
+}
+
+/// A sidebar entry. The icon, when given, sits 16 px before the label in the entry's text colour.
+pub fn nav_item_with_icon(
+    id: impl Into<ElementId>,
+    icon: Option<gpui_kit_assets::IconName>,
+    text: &'static str,
+    selected: bool,
+) -> Stateful<Div> {
     div()
         .id(id)
+        .flex()
+        .items_center()
+        .gap(px(8.))
         .px(px(12.))
         .py(px(8.))
         .rounded(px(7.))
@@ -378,6 +391,9 @@ pub fn nav_item(id: impl Into<ElementId>, text: &'static str, selected: bool) ->
         .when(!selected, |item| {
             item.text_color(rgb(INK_2))
                 .hover(|hover| hover.bg(rgb(0xefece4)))
+        })
+        .when_some(icon, |item, icon| {
+            item.child(Icon::new(icon).flex_none().size_4())
         })
         .child(text)
 }
