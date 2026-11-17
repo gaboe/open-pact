@@ -5,6 +5,9 @@ use super::exec::run;
 
 const SOCKETFILTERFW: &str = "/usr/libexec/ApplicationFirewall/socketfilterfw";
 const INSTALL_HISTORY: &str = "/Library/Receipts/InstallHistory.plist";
+/// The screen saver idle time the installed macOS uses when the user and a profile set none.
+const SAVER_ENGINE_DEFAULTS: &str =
+    "/System/Library/Frameworks/ScreenSaver.framework/Versions/A/Resources/EngineDefaults.plist";
 const RELEASED_MAJORS: &[u32] = &[11, 12, 13, 14, 15, 26];
 
 pub fn disk_encryption() -> &'static str {
@@ -24,11 +27,25 @@ pub fn screen_lock() -> &'static str {
 /// `screen_lock@2`: the time from the last input to a locked screen, in whole minutes. That is
 /// the shorter of the screen saver idle time and the display sleep time, plus the password delay.
 pub fn screen_lock_minutes() -> open_pact_core::ControlValue {
-    let saver = run(
+    let configured = run(
         "defaults",
         &["-currentHost", "read", "com.apple.screensaver", "idleTime"],
     )
     .map_or(Lock::Unknown, |text| parse_saver_idle(&text));
+    let saver = saver_idle(configured, || {
+        run(
+            "plutil",
+            &[
+                "-extract",
+                "idleTime",
+                "raw",
+                "-o",
+                "-",
+                SAVER_ENGINE_DEFAULTS,
+            ],
+        )
+        .map_or(Lock::Unknown, |text| parse_saver_idle(&text))
+    });
     let display =
         run("pmset", &["-g", "custom"]).map_or(Lock::Unknown, |text| parse_display_sleep(&text));
     total_lock(password_delay(), first_idle_trigger(saver, display)).minutes()
@@ -118,12 +135,23 @@ pub fn parse_password_delay(out: &str) -> Lock {
 }
 
 /// The screen saver idle time in seconds, from `defaults read com.apple.screensaver idleTime`.
-/// Zero means the screen saver never starts. A key that is not set cannot be read.
+/// Zero means the screen saver never starts. A key that is not set cannot be read here; see
+/// `saver_idle`.
 pub fn parse_saver_idle(out: &str) -> Lock {
     match out.trim().parse::<u64>() {
         Ok(0) => Lock::None,
         Ok(seconds) => Lock::Seconds(seconds),
         Err(_) => Lock::Unknown,
+    }
+}
+
+/// The screen saver idle time that applies: the one the user or a profile set, else the default of
+/// the installed macOS. Unknown only when neither can be read. The default is read only when the
+/// setting is missing.
+pub fn saver_idle(configured: Lock, installed_default: impl FnOnce() -> Lock) -> Lock {
+    match configured {
+        Lock::Unknown => installed_default(),
+        set => set,
     }
 }
 
@@ -256,6 +284,32 @@ mod tests {
         ] {
             assert_eq!(parse_saver_idle(text), Lock::Unknown, "{text}");
         }
+    }
+
+    #[test]
+    fn an_unset_saver_idle_time_uses_the_default_of_the_installed_macos() {
+        let unset = parse_saver_idle(
+            "The domain/default pair of (com.apple.screensaver, idleTime) does not exist",
+        );
+        // `plutil -extract idleTime raw -o -` on the installed EngineDefaults.plist.
+        let engine_default = || parse_saver_idle("1200\n");
+        assert_eq!(saver_idle(unset, engine_default), Lock::Seconds(1200));
+        // A set value, even zero, is never replaced by the default.
+        assert_eq!(
+            saver_idle(Lock::Seconds(300), || panic!("not read")),
+            Lock::Seconds(300)
+        );
+        assert_eq!(saver_idle(Lock::None, || panic!("not read")), Lock::None);
+        // Neither can be read.
+        assert_eq!(saver_idle(unset, || Lock::Unknown), Lock::Unknown);
+        // With display sleep of 10 minutes and a password at once: 600 seconds, so 10 minutes.
+        let display = parse_display_sleep(" displaysleep 10\n");
+        let total = total_lock(
+            parse_password_delay("delay is immediate"),
+            first_idle_trigger(saver_idle(unset, engine_default), display),
+        );
+        assert_eq!(total, Lock::Seconds(600));
+        assert_eq!(total.minutes(), open_pact_core::ControlValue::from(10));
     }
 
     #[test]

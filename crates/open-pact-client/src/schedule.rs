@@ -148,6 +148,10 @@ struct State {
     /// When each control that fails now first failed on this device, for the local grace.
     #[serde(default)]
     first_failed: BTreeMap<String, i64>,
+    /// A removal at grace expiry failed and its claim was already forced, so the next check that
+    /// fails the same way does not force another.
+    #[serde(default)]
+    removal_failed: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -443,14 +447,36 @@ fn next_due_lines(schedule: &Schedule, state: &State, now: i64) -> Vec<String> {
     lines
 }
 
-/// `next_due_lines` from the job's saved state, or from a fresh state when the job has not run.
-pub(crate) fn next_due_text(state_home: &Home, schedule: &Schedule) -> Vec<String> {
-    let state: State = state_home
-        .read_json(STATE)
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-    next_due_lines(schedule, &state, chrono::Utc::now().timestamp())
+/// The home that holds the job's saved state: the client home for a user job, the protected
+/// directory of the SYSTEM job on Windows.
+fn job_state_home(home: &Home, run_as: RunAs) -> Result<Home> {
+    let absolute = Home(schedule_home(&home.0, true)?);
+    match run_as {
+        RunAs::User => Ok(absolute),
+        RunAs::System if crate::current_os()? == open_pact_core::Os::Windows => {
+            Ok(Home(windows_protected_paths(&absolute, false)?.1))
+        }
+        RunAs::System => bail!("a SYSTEM job exists only on Windows"),
+    }
+}
+
+/// `next_due_lines` from the saved state of the job that runs (`run_as`), or from a fresh state
+/// when the job has not run yet. A state that cannot be read is said so: it is not a new job.
+pub(crate) fn next_due_text(home: &Home, run_as: RunAs, schedule: &Schedule) -> Vec<String> {
+    due_text(job_state_home(home, run_as), schedule)
+}
+
+fn due_text(state_home: Result<Home>, schedule: &Schedule) -> Vec<String> {
+    match state_home.and_then(|state_home| state_home.read_json::<State>(STATE)) {
+        Ok(state) => next_due_lines(
+            schedule,
+            &state.unwrap_or_default(),
+            chrono::Utc::now().timestamp(),
+        ),
+        Err(error) => vec![format!(
+            "Next check and claim: unknown. The job's saved state cannot be read ({error:#})."
+        )],
+    }
 }
 
 /// The decision of one wake. Pure: the caller probes for `place`, reads `state` and the clock,
@@ -1542,7 +1568,9 @@ pub(crate) async fn tick_with_scan(
     state.event_pending |= state.new_events(events);
     if authorization.self_removal {
         let lapsed = lapsed_controls(&manifest, &compliance, prepared.results(), &state, now);
-        if !lapsed.is_empty() {
+        if lapsed.is_empty() {
+            state.removal_failed = false;
+        } else {
             retire_certificate(home, &mut state, &lapsed);
         }
     }
@@ -1597,7 +1625,11 @@ fn lapsed_controls(
 /// deletes the installed VPN certificate, writes one line to the job log, and asks for a claim at
 /// once. A claim that the gateway accepts later installs a new certificate as always.
 fn retire_certificate(home: &Home, state: &mut State, lapsed: &[String]) {
-    match home.remove_vpn_pair() {
+    let removal = home.remove_vpn_pair();
+    if removal.is_ok() {
+        state.removal_failed = false;
+    }
+    match removal {
         Ok(false) => {}
         Ok(true) => {
             job_log(
@@ -1610,6 +1642,12 @@ fn retire_certificate(home: &Home, state: &mut State, lapsed: &[String]) {
             state.event_pending = true;
         }
         Err(error) => {
+            // The certificate may still work, so the gateway must hear of the failure now. One
+            // forced claim per run of failures: a later check does not repeat it.
+            if !state.removal_failed {
+                state.event_pending = true;
+                state.removal_failed = true;
+            }
             let key = format!("removal failed {error:#}");
             if state.last_note.as_deref() != Some(key.as_str()) {
                 job_log(
@@ -2213,6 +2251,16 @@ async fn status(home: &Home) -> Result<()> {
         executable: std::env::current_exe().unwrap_or_default(),
         user_home: None,
     });
+    let print_next_due = || {
+        if desired.is_some()
+            && let Ok(manifest) = home.signed_manifest()
+            && let Some(schedule) = &manifest.body().schedule
+        {
+            for line in next_due_text(home, config.run_as, schedule) {
+                println!("{line}");
+            }
+        }
+    };
     if desired
         .as_ref()
         .is_some_and(|desired| desired.run_as == RunAs::System)
@@ -2220,6 +2268,7 @@ async fn status(home: &Home) -> Result<()> {
         println!(
             "The job runs as SYSTEM. Run `schedule on --system` from an elevated prompt to change it."
         );
+        print_next_due();
         return Ok(());
     }
     let schedule_home = Home(schedule_home(&home.0, true)?);
@@ -2250,14 +2299,7 @@ async fn status(home: &Home) -> Result<()> {
             time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
         );
     }
-    if desired.is_some()
-        && let Ok(manifest) = home.signed_manifest()
-        && let Some(schedule) = &manifest.body().schedule
-    {
-        for line in next_due_text(&schedule_home, schedule) {
-            println!("{line}");
-        }
-    }
+    print_next_due();
     Ok(())
 }
 
@@ -2769,6 +2811,42 @@ esac
         lapsed_controls(&manifest, &compliance, &results, &state, T)
     }
 
+    /// A removal that fails at grace expiry still asks for the claim, once per run of failures.
+    /// `ca.pem` is a non-empty directory, so deleting it fails on every OS.
+    #[test]
+    fn a_failed_removal_at_grace_expiry_still_forces_the_claim_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+        home.install_vpn_pair(b"CA", b"certificate").unwrap();
+        std::fs::remove_file(home.file("ca.pem")).unwrap();
+        std::fs::create_dir(home.file("ca.pem")).unwrap();
+        std::fs::write(home.file("ca.pem").join("held"), b"x").unwrap();
+        let vpn = places(Some(("1h", "5m")), None);
+        // A recent answered claim, a control that has failed since before: no event came from the
+        // compliance change itself.
+        let mut state = State {
+            last_observed_compliance: Some(BTreeMap::from([("firewall".to_owned(), false)])),
+            ..state(false, Some(10 * MIN), Some(10 * MIN), false)
+        };
+        assert_eq!(plan(&vpn, &state, Place::Vpn, T, 0).send, None);
+        retire_certificate(&home, &mut state, &["firewall".to_owned()]);
+        assert!(state.event_pending);
+        assert_eq!(
+            plan(&vpn, &state, Place::Vpn, T, 0).send,
+            Some(Trigger::Event)
+        );
+        let log = std::fs::read_to_string(home.file(JOB_LOG)).unwrap();
+        assert!(log.contains("Could not remove the VPN certificate"));
+        // The claim went out; the next check fails to remove it the same way: no second claim.
+        state.event_pending = false;
+        retire_certificate(&home, &mut state, &["firewall".to_owned()]);
+        assert!(!state.event_pending);
+        // The deletion works later and the failure run is over.
+        std::fs::remove_dir_all(home.file("ca.pem")).unwrap();
+        retire_certificate(&home, &mut state, &["firewall".to_owned()]);
+        assert!(!state.removal_failed);
+    }
+
     #[test]
     fn a_control_lapses_when_its_grace_has_ended() {
         const DAY: i64 = 86_400;
@@ -2869,6 +2947,59 @@ esac
     }
 
     const MIN: i64 = 60;
+
+    #[test]
+    fn next_due_text_reads_the_state_of_the_job_that_runs() {
+        let vpn = places(Some(("10m", "5m")), None);
+        let dir = tempfile::tempdir().unwrap();
+        let state_home = Home(dir.path().to_path_buf());
+        // No saved state: a new job. It checks at the next wake.
+        let fresh = due_text(Ok(Home(state_home.0.clone())), &vpn);
+        assert!(fresh.iter().any(|line| line.starts_with("Next check due")));
+        // A state the job saved, with a check a moment ago, is the one that counts.
+        let now = chrono::Utc::now().timestamp();
+        save(
+            &state_home,
+            STATE,
+            &State {
+                vpn_up: true,
+                last_check: Some(now - MIN),
+                last_attempt: Some(now - MIN),
+                ..State::default()
+            },
+        )
+        .unwrap();
+        let lines = due_text(Ok(Home(state_home.0.clone())), &vpn);
+        assert!(lines.iter().any(|line| line.starts_with("Last check:")));
+        assert_ne!(lines, fresh);
+        // A state that cannot be read is said so; it is not a new job.
+        std::fs::write(state_home.file(STATE), b"{ not json").unwrap();
+        let unreadable = due_text(Ok(Home(state_home.0.clone())), &vpn);
+        assert_eq!(unreadable.len(), 1);
+        assert!(unreadable[0].contains("cannot be read"), "{unreadable:?}");
+        let missing = due_text(Err(anyhow::anyhow!("access denied")), &vpn);
+        assert!(missing[0].contains("cannot be read"), "{missing:?}");
+        assert!(missing[0].contains("access denied"));
+    }
+
+    /// `schedule status` and `accept` ask for the job's own state: a user job keeps it in the
+    /// client home, and a SYSTEM job in the protected directory of Windows. The Windows lookup
+    /// itself runs PowerShell and has no unit test.
+    #[test]
+    fn the_job_state_home_follows_who_runs_the_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+        assert_eq!(
+            job_state_home(&home, RunAs::User).unwrap().0,
+            schedule_home(&home.0, true).unwrap()
+        );
+        if crate::current_os().unwrap() != open_pact_core::Os::Windows {
+            let vpn = places(Some(("10m", "5m")), None);
+            let lines = next_due_text(&home, RunAs::System, &vpn);
+            assert_eq!(lines.len(), 1);
+            assert!(lines[0].contains("only on Windows"), "{lines:?}");
+        }
+    }
 
     #[test]
     fn next_due_says_when_the_job_will_check_and_send() {

@@ -529,6 +529,10 @@ const VPN_CURRENT: &str = "current";
 #[cfg(windows)]
 const VPN_FLAT_STALE: &str = "flat-copies-stale";
 const VPN_FILES: [&str; 2] = ["ca.pem", "vpn-cert.pem"];
+/// Written (and synced) in the client home before a removal deletes anything. While it exists,
+/// recovery finishes the deletion and never restores the pair; only the install of a later
+/// accepted claim removes it.
+const VPN_REMOVAL_MARKER: &str = "vpn-removal-pending";
 
 #[cfg(test)]
 thread_local! {
@@ -649,6 +653,7 @@ impl Home {
         {
             let _lock = self.lock_vpn()?;
             self.recover_vpn_locked()?;
+            self.clear_vpn_removal_marker()?;
             let vpn = self.file(VPN_DIR);
             if self.vpn_generation(VPN_CURRENT)?.is_none()
                 && let (Ok(old_ca), Ok(old_cert)) = (
@@ -669,6 +674,7 @@ impl Home {
         #[cfg(unix)]
         {
             self.recover_vpn()?;
+            self.clear_vpn_removal_marker()?;
             if !self.file(VPN_DIR).join(VPN_CURRENT).exists()
                 && let (Ok(ca), Ok(cert)) = (
                     std::fs::read(self.file(VPN_FILES[0])),
@@ -714,8 +720,9 @@ impl Home {
     }
 
     /// Deletes the installed VPN generation: the documented files, `vpn/current` and every
-    /// generation. Returns whether a pair was installed. A later accepted claim installs a new
-    /// one. The caller holds the claim lock.
+    /// generation. Returns whether it deleted anything. A durable marker goes first, so an
+    /// interrupted deletion is finished by recovery and never undone. A later accepted claim
+    /// installs a new pair and clears the marker. The caller holds the claim lock.
     fn remove_vpn_pair(&self) -> Result<bool> {
         #[cfg(not(any(unix, windows)))]
         {
@@ -723,45 +730,102 @@ impl Home {
         }
         #[cfg(windows)]
         {
-            let vpn = self.file(VPN_DIR);
-            if !vpn.exists() && !VPN_FILES.iter().any(|name| self.file(name).exists()) {
+            if !self.vpn_removal_pending() && !self.vpn_pair_present() {
                 return Ok(false);
             }
             let _lock = self.lock_vpn()?;
-            let mut removed = false;
-            // The pointers go first, so that no recovery can copy the pair back.
-            for pointer in [VPN_CURRENT, "previous"] {
-                removed |= remove_file_if_exists(&vpn.join(pointer))?;
-            }
-            for name in VPN_FILES {
-                removed |= remove_file_if_exists(&self.file(name))?;
-            }
-            self.remove_vpn_leftovers(&vpn)?;
-            Ok(removed)
+            self.begin_vpn_removal()?;
+            self.finish_vpn_removal()
         }
         #[cfg(unix)]
         {
-            let mut removed = false;
-            // The documented files are links into `vpn/current`: they go first.
-            for name in VPN_FILES {
-                removed |= remove_file_if_exists(&self.file(name))?;
+            if !self.vpn_removal_pending() && !self.vpn_pair_present() {
+                return Ok(false);
             }
-            let vpn = self.file(VPN_DIR);
-            removed |= remove_file_if_exists(&vpn.join(VPN_CURRENT))?;
-            self.remove_vpn_leftovers(&vpn)?;
-            Ok(removed)
+            self.begin_vpn_removal()?;
+            self.finish_vpn_removal()
         }
+    }
+
+    fn vpn_removal_pending(&self) -> bool {
+        std::fs::symlink_metadata(self.file(VPN_REMOVAL_MARKER)).is_ok()
+    }
+
+    /// Whether any generation, temporary file or documented file exists.
+    #[cfg(any(unix, windows))]
+    fn vpn_pair_present(&self) -> bool {
+        VPN_FILES
+            .iter()
+            .any(|name| std::fs::symlink_metadata(self.file(name)).is_ok())
+            || std::fs::read_dir(self.file(VPN_DIR)).is_ok_and(|mut entries| {
+                entries.any(|entry| entry.is_ok_and(|entry| entry.file_name() != "write.lock"))
+            })
+    }
+
+    /// Records the intent to delete, durably: the file and then its directory entry reach disk
+    /// before anything is deleted.
+    #[cfg(any(unix, windows))]
+    fn begin_vpn_removal(&self) -> Result<()> {
+        if self.vpn_removal_pending() {
+            return Ok(());
+        }
+        let path = self.file(VPN_REMOVAL_MARKER);
+        let mut file = std::fs::File::create(&path).with_context(|| path.display().to_string())?;
+        file.write_all(b"removing\n")?;
+        file.sync_all()?;
+        drop(file);
+        #[cfg(unix)]
+        std::fs::File::open(&self.0)?.sync_all()?;
+        interruption_point();
+        Ok(())
+    }
+
+    /// Removes the marker once a new pair is about to be installed.
+    #[cfg(any(unix, windows))]
+    fn clear_vpn_removal_marker(&self) -> Result<()> {
+        if remove_file_if_exists(&self.file(VPN_REMOVAL_MARKER))? {
+            #[cfg(unix)]
+            std::fs::File::open(&self.0)?.sync_all()?;
+        }
+        Ok(())
+    }
+
+    /// Completes a marked deletion; safe to repeat after any interruption. Returns whether this
+    /// call deleted anything. On Windows the caller holds the VPN lock.
+    #[cfg(any(unix, windows))]
+    fn finish_vpn_removal(&self) -> Result<bool> {
+        let vpn = self.file(VPN_DIR);
+        let mut removed = false;
+        // Windows: the pointers go first, so that no recovery can copy the pair back. Unix: the
+        // documented files are links into `vpn/current`, so they go first.
+        #[cfg(windows)]
+        for pointer in [VPN_CURRENT, "previous"] {
+            removed |= remove_file_if_exists(&vpn.join(pointer))?;
+            interruption_point();
+        }
+        for name in VPN_FILES {
+            removed |= remove_file_if_exists(&self.file(name))?;
+            interruption_point();
+        }
+        #[cfg(unix)]
+        {
+            removed |= remove_file_if_exists(&vpn.join(VPN_CURRENT))?;
+            interruption_point();
+        }
+        removed |= self.remove_vpn_leftovers(&vpn)?;
+        Ok(removed)
     }
 
     /// Every generation, and every temporary file, below `vpn/`. Keeps the directory and the
     /// Windows write lock.
     #[cfg(any(unix, windows))]
-    fn remove_vpn_leftovers(&self, vpn: &Path) -> Result<()> {
+    fn remove_vpn_leftovers(&self, vpn: &Path) -> Result<bool> {
         let entries = match std::fs::read_dir(vpn) {
             Ok(entries) => entries,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(e) => return Err(e).with_context(|| vpn.display().to_string()),
         };
+        let mut removed = false;
         for entry in entries {
             let entry = entry?;
             if entry.file_name() == "write.lock" {
@@ -774,8 +838,10 @@ impl Home {
                 std::fs::remove_file(&path)
             }
             .with_context(|| path.display().to_string())?;
+            removed = true;
+            interruption_point();
         }
-        Ok(())
+        Ok(removed)
     }
 
     /// Makes each documented VPN file a link into `vpn/current/`, replacing a plain file.
@@ -802,6 +868,10 @@ impl Home {
     /// that has never installed a generation.
     #[cfg(unix)]
     fn recover_vpn(&self) -> Result<()> {
+        if self.vpn_removal_pending() {
+            self.finish_vpn_removal()?;
+            return Ok(());
+        }
         let vpn = self.file(VPN_DIR);
         let entries = match std::fs::read_dir(&vpn) {
             Ok(entries) => entries,
@@ -912,7 +982,7 @@ impl Home {
 
     #[cfg(windows)]
     fn recover_vpn_at_startup(&self) -> Result<bool> {
-        if !self.file(VPN_DIR).exists() {
+        if !self.file(VPN_DIR).exists() && !self.vpn_removal_pending() {
             return Ok(true);
         }
         let Some(_lock) = self.try_lock_vpn()? else {
@@ -925,7 +995,7 @@ impl Home {
     #[cfg(windows)]
     fn recover_vpn(&self) -> Result<()> {
         // A command such as uninstall must not recreate a missing home.
-        if !self.file(VPN_DIR).exists() {
+        if !self.file(VPN_DIR).exists() && !self.vpn_removal_pending() {
             return Ok(());
         }
         let _lock = self.lock_vpn()?;
@@ -949,6 +1019,10 @@ impl Home {
 
     #[cfg(windows)]
     fn recover_vpn_locked(&self) -> Result<()> {
+        if self.vpn_removal_pending() {
+            self.finish_vpn_removal()?;
+            return Ok(());
+        }
         let vpn = self.file(VPN_DIR);
         let current = self.vpn_generation(VPN_CURRENT)?;
         let previous = self.vpn_generation("previous")?;
@@ -4042,10 +4116,11 @@ async fn accept(home: &Home, yes: bool, insecure_dev: bool) -> Result<ExitCode> 
     }
     if turned_off.is_none()
         && let Some(schedule) = &new.body().schedule
-        && device_config::DeviceConfig::load(home).is_ok_and(|config| config.auto_send)
+        && let Ok(config) = device_config::DeviceConfig::load(home)
+        && config.auto_send
     {
         println!("{schedule}");
-        for line in schedule::next_due_text(home, schedule) {
+        for line in schedule::next_due_text(home, config.run_as, schedule) {
             println!("{line}");
         }
     }
@@ -8542,6 +8617,71 @@ grace = "1d"
             std::fs::read(home.file(VPN_FILES[1])).unwrap(),
             b"certificate three"
         );
+    }
+
+    /// Every interruption of a removal, then recovery: the pair never comes back, and the
+    /// marker stays until a later install clears it. Runs on every OS.
+    #[test]
+    fn an_interrupted_vpn_removal_is_finished_by_recovery_and_never_restored() {
+        let mut completed = false;
+        for layout in ["generations", "plain files"] {
+            completed = false;
+            for step in 1..=32 {
+                let dir = tempfile::tempdir().unwrap();
+                let home = Home(dir.path().join("fictional-home"));
+                if layout == "generations" {
+                    home.install_vpn_pair(b"CA one", b"certificate one")
+                        .unwrap();
+                    home.install_vpn_pair(b"CA two", b"certificate two")
+                        .unwrap();
+                } else {
+                    std::fs::create_dir_all(&home.0).unwrap();
+                    for name in VPN_FILES {
+                        std::fs::write(home.file(name), b"plain").unwrap();
+                    }
+                }
+                INTERRUPT_AFTER.with(|left| left.set(Some(step)));
+                let result = std::panic::catch_unwind(|| home.remove_vpn_pair());
+                INTERRUPT_AFTER.with(|left| left.set(None));
+                let finished = result.is_ok();
+                assert!(home.vpn_removal_pending(), "{layout} step {step}: marked");
+                // Recovery can be interrupted too.
+                for recovery_step in 1..=4 {
+                    INTERRUPT_AFTER.with(|left| left.set(Some(recovery_step)));
+                    let _ = std::panic::catch_unwind(|| home.recover_vpn());
+                    INTERRUPT_AFTER.with(|left| left.set(None));
+                }
+                home.recover_vpn().unwrap();
+                for name in VPN_FILES {
+                    assert!(
+                        std::fs::symlink_metadata(home.file(name)).is_err(),
+                        "{layout} step {step}: {name} is gone"
+                    );
+                }
+                assert!(
+                    std::fs::read_dir(home.file(VPN_DIR))
+                        .map(|mut entries| entries
+                            .all(|entry| entry.unwrap().file_name() == "write.lock"))
+                        .unwrap_or(true),
+                    "{layout} step {step}: no generation is left"
+                );
+                assert!(home.vpn_removal_pending());
+                // A later accepted claim installs again and clears the marker.
+                home.install_vpn_pair(b"CA three", b"certificate three")
+                    .unwrap();
+                assert!(!home.vpn_removal_pending());
+                assert_eq!(
+                    std::fs::read(home.file(VPN_FILES[1])).unwrap(),
+                    b"certificate three"
+                );
+                if finished {
+                    completed = true;
+                    break;
+                }
+            }
+            assert!(completed, "{layout}: removal never finished");
+        }
+        assert!(completed);
     }
 
     #[test]
