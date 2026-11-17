@@ -1116,22 +1116,25 @@ impl AppView {
         let description = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .rows(2)
-                .default_value(control.description.clone())
+                .default_value(description_or_default(&control))
         });
+        let default = control.builtin().map(|known| known.about);
         let description_subscription = cx.subscribe_in(
             &description,
             window,
-            |this, state, event: &InputEvent, window, cx| {
+            move |this, state, event: &InputEvent, window, cx| {
                 if matches!(event, InputEvent::Change) {
                     let Some(index) = this.selected_index() else {
                         return;
                     };
-                    let result = manifest::set_control_text(
-                        &this.draft,
-                        index,
-                        "description",
-                        state.read(cx).value().trim(),
-                    );
+                    let value = state.read(cx).value().trim().to_owned();
+                    let value = if default == Some(value.as_str()) {
+                        ""
+                    } else {
+                        value.as_str()
+                    };
+                    let result =
+                        manifest::set_control_text(&this.draft, index, "description", value);
                     this.edit_form(result, Rebuild::No, window, cx);
                 }
             },
@@ -1550,21 +1553,34 @@ impl AppView {
             .child(self.sent(&form, cx))
             .child(self.sending(inputs, &issues, cx))
             .child(self.checks(&form, before.as_ref(), &issues, cx));
-        div().flex().flex_1().min_h_0().child(
-            h_resizable("manifest-split")
-                .child(
-                    resizable_panel()
-                        .size_range(px(520.)..Pixels::MAX)
-                        .child(scroll),
-                )
-                .child(
-                    resizable_panel()
-                        .size(px(380.))
-                        .size_range(px(380.)..px(600.))
-                        .fixed()
-                        .child(self.panel(&form, before.as_ref(), &issues, cx)),
-                ),
-        )
+        let open = self
+            .fv
+            .selected
+            .as_ref()
+            .is_some_and(|id| form.control(id).is_some());
+        let split = h_resizable("manifest-split").child(
+            resizable_panel()
+                .size_range(px(520.)..Pixels::MAX)
+                .child(scroll),
+        );
+        let split = if open {
+            split.child(
+                resizable_panel()
+                    .size(px(380.))
+                    .size_range(px(380.)..px(600.))
+                    .fixed()
+                    .child(
+                        div()
+                            .id("check-panel-scroll")
+                            .size_full()
+                            .overflow_y_scroll()
+                            .child(self.panel(&form, before.as_ref(), &issues, cx)),
+                    ),
+            )
+        } else {
+            split
+        };
+        div().flex().flex_1().min_h_0().child(split)
     }
 
     fn agreement(
@@ -2229,7 +2245,7 @@ impl AppView {
                 .gap(px(16.))
                 .flex_1()
                 .min_w_0()
-                .h_full()
+                .min_h_full()
                 .p(px(22.))
                 .border_l_1()
                 .border_color(rgb(RULE))
@@ -2276,17 +2292,7 @@ impl AppView {
                             .font_family(mono())
                             .text_color(rgb(MUTED))
                             .child(control.check.clone()),
-                    )
-                    .when_some(control.builtin(), |header, known| {
-                        header.child(
-                            div()
-                                .mt(px(6.))
-                                .text_size(px(13.))
-                                .line_height(relative(1.45))
-                                .text_color(rgb(INK_2))
-                                .child(known.about),
-                        )
-                    }),
+                    ),
             )
             .child(
                 div()
@@ -2721,6 +2727,15 @@ fn panel_switch(selected: Option<&str>, requested: Option<&str>, blocked: bool) 
         PanelSwitch::Refuse
     } else {
         PanelSwitch::Replace
+    }
+}
+
+/// The check's description, or the open-pact text for a built-in check that has none, so the
+/// admin edits one text that the device user also reads.
+fn description_or_default(control: &manifest::Control) -> String {
+    match control.builtin() {
+        Some(known) if control.description.is_empty() => known.about.to_owned(),
+        _ => control.description.clone(),
     }
 }
 

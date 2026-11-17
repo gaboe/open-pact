@@ -539,6 +539,39 @@ pub fn toml_highlight_theme() -> std::sync::Arc<gpui_component::highlighter::Hig
 /// the Dock icon would not bring one back.
 pub const QUIT_MODE: QuitMode = QuitMode::LastWindowClosed;
 
+actions!(open_pact, [Quit, CloseWindow, Minimize]);
+
+/// Cmd+W, Cmd+M and Cmd+Q, with the app menu that shows them.
+fn window_keys(cx: &mut App, name: &'static str) {
+    cx.bind_keys([
+        KeyBinding::new("cmd-w", CloseWindow, None),
+        KeyBinding::new("cmd-m", Minimize, None),
+        KeyBinding::new("cmd-q", Quit, None),
+    ]);
+    cx.on_action(|_: &Quit, cx| cx.quit());
+    cx.on_action(|_: &CloseWindow, cx| {
+        if let Some(window) = cx.active_window() {
+            window
+                .update(cx, |_, window, _| window.remove_window())
+                .ok();
+        }
+    });
+    cx.on_action(|_: &Minimize, cx| {
+        if let Some(window) = cx.active_window() {
+            window
+                .update(cx, |_, window, _| window.minimize_window())
+                .ok();
+        }
+    });
+    cx.set_menus(vec![
+        Menu::new(name).items([MenuItem::action(format!("Quit {name}"), Quit)]),
+        Menu::new("Window").items([
+            MenuItem::action("Minimize", Minimize),
+            MenuItem::action("Close Window", CloseWindow),
+        ]),
+    ]);
+}
+
 pub fn launch<V: Render + 'static>(
     name: &'static str,
     width: f32,
@@ -550,6 +583,7 @@ pub fn launch<V: Render + 'static>(
         .with_quit_mode(QUIT_MODE)
         .run(move |cx| {
             init(cx);
+            window_keys(cx, name);
             cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(Bounds::centered(

@@ -1186,10 +1186,10 @@ fn result_header() -> Div {
         .text_size(px(12.))
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(rgb(MUTED))
-        .child(div().w(px(160.)).child("Time"))
-        .child(div().flex_1().child("Device"))
-        .child(div().w(px(170.)).child("Result"))
-        .child(div().flex_1().child("Reason"))
+        .child(div().w(px(160.)).flex_none().child("Time"))
+        .child(div().w(px(220.)).flex_none().child("Device"))
+        .child(div().w(px(190.)).flex_none().child("Result"))
+        .child(div().flex_1().min_w_0().child("Reason"))
 }
 
 fn result_row(time: String, device: Div, result: &str, reasons: String) -> Div {
@@ -1199,17 +1199,26 @@ fn result_row(time: String, device: Div, result: &str, reasons: String) -> Div {
         .py(px(10.))
         .border_b_1()
         .border_color(rgb(RULE_2))
-        .child(div().w(px(160.)).child(time))
-        .child(div().flex_1().child(device))
+        .child(div().w(px(160.)).flex_none().child(time))
         .child(
             div()
-                .w(px(170.))
+                .w(px(220.))
+                .flex_none()
+                .min_w_0()
+                .overflow_hidden()
+                .child(device),
+        )
+        .child(
+            div()
+                .w(px(190.))
+                .flex_none()
                 .text_color(rgb(tone_text(result_tone(result))))
                 .child(result.to_owned()),
         )
         .child(
             div()
                 .flex_1()
+                .min_w_0()
                 .text_size(px(13.))
                 .text_color(rgb(MUTED))
                 .child(reasons),
