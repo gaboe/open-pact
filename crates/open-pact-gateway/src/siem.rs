@@ -9,6 +9,7 @@ use std::{
     },
     time::Duration,
 };
+use time::OffsetDateTime;
 
 use anyhow::{Context, bail};
 use open_pact_core::{Claim, Manifest, verified_trust_level};
@@ -25,7 +26,7 @@ const IO_TIMEOUT: Duration = Duration::from_secs(5);
 pub fn event(manifest: &Manifest, claim: &Claim, reasons: &[String], warnings: &[String]) -> Value {
     let mut body = json!({
         "schema_version": 1,
-        "time": claim.time,
+        "time": open_pact_core::timestamp::rfc3339_auto(claim.time),
         "device_pseudonym": claim.device,
         "manifest_hash": claim.manifest,
         "client_version": claim.client,
@@ -367,9 +368,11 @@ fn configured(manifest: &Manifest) -> anyhow::Result<Option<Exporter>> {
         if days < 0 {
             bail!("SIEM retention must be nonnegative");
         }
-        let now = chrono::Utc::now();
-        let deadline = chrono::Duration::try_days(days)
-            .and_then(|d| now.checked_add_signed(d))
+        let now = OffsetDateTime::now_utc();
+        let deadline = days
+            .checked_mul(86400)
+            .and_then(open_pact_core::timestamp::seconds)
+            .and_then(|d| now.checked_add(d))
             .context("SIEM retention exceeds calendar range")?;
         if manifest
             .body()

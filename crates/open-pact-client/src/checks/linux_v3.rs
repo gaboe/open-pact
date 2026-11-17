@@ -1,9 +1,9 @@
 use std::fs::File;
 use std::io::Read;
 
-use chrono::{DateTime, Utc};
 use open_pact_core::ControlValue;
 use serde_json::Value;
+use time::OffsetDateTime;
 
 use super::common::bounded_age;
 use super::exec::run_status;
@@ -330,19 +330,19 @@ pub fn antimalware_signature_age_days() -> ControlValue {
             dates.push(date);
         }
         if let Some(last) = dates.into_iter().max() {
-            return super::buckets::elapsed_age_days(last, Utc::now(), 3650);
+            return super::buckets::elapsed_age_days(last, OffsetDateTime::now_utc(), 3650);
         }
     }
     "unknown".into()
 }
 
-fn parse_cvd_header(bytes: &[u8]) -> Option<DateTime<Utc>> {
+fn parse_cvd_header(bytes: &[u8]) -> Option<OffsetDateTime> {
     let text = std::str::from_utf8(bytes).ok()?;
     let fields: Vec<_> = text.trim().split(':').collect();
     if fields.first() != Some(&"ClamAV-VDB") || fields.len() != 9 {
         return None;
     }
-    DateTime::from_timestamp(fields[8].trim().parse().ok()?, 0)
+    OffsetDateTime::from_unix_timestamp(fields[8].trim().parse().ok()?).ok()
 }
 
 pub fn log_oldest_record_days() -> ControlValue {
@@ -359,10 +359,10 @@ pub fn log_oldest_record_days() -> ControlValue {
     .filter(|r| r.success) else {
         return "unknown".into();
     };
-    parse_journal_age(&output.text, Utc::now())
+    parse_journal_age(&output.text, OffsetDateTime::now_utc())
 }
 
-fn parse_journal_age(text: &str, now: DateTime<Utc>) -> ControlValue {
+fn parse_journal_age(text: &str, now: OffsetDateTime) -> ControlValue {
     // Do not suppress journalctl warnings: a permission warning means partial visibility.
     let Some(micros) = serde_json::from_str::<Value>(text)
         .ok()
@@ -370,13 +370,13 @@ fn parse_journal_age(text: &str, now: DateTime<Utc>) -> ControlValue {
     else {
         return "unknown".into();
     };
-    let Some(oldest) = DateTime::from_timestamp_micros(micros) else {
+    let Some(oldest) = open_pact_core::timestamp::from_unix_micros(micros) else {
         return "unknown".into();
     };
     if oldest > now {
         return "unknown".into();
     }
-    bounded_age((now - oldest).num_days(), i32::MAX)
+    bounded_age((now - oldest).whole_days(), i32::MAX)
 }
 
 pub(super) fn event_markers() -> super::EventMarkerReads {
@@ -398,7 +398,11 @@ pub(super) fn event_markers() -> super::EventMarkerReads {
     .ok()
     .filter(|r| !r.timed_out && r.stderr.is_empty())
     .map_or(super::EventMarkerRead::Unknown, |r| {
-        parse_detection_status(r.status.and_then(|s| s.code()), &r.stdout, Utc::now())
+        parse_detection_status(
+            r.status.and_then(|s| s.code()),
+            &r.stdout,
+            OffsetDateTime::now_utc(),
+        )
     });
     super::EventMarkerReads {
         security_log_cleared: super::EventMarkerRead::Unknown,
@@ -409,7 +413,7 @@ pub(super) fn event_markers() -> super::EventMarkerReads {
 fn parse_detection_status(
     code: Option<i32>,
     text: &str,
-    now: DateTime<Utc>,
+    now: OffsetDateTime,
 ) -> super::EventMarkerRead {
     match code {
         Some(0) => parse_detection_journal(text, now),
@@ -418,7 +422,7 @@ fn parse_detection_status(
     }
 }
 
-fn parse_detection_journal(text: &str, now: DateTime<Utc>) -> super::EventMarkerRead {
+fn parse_detection_journal(text: &str, now: OffsetDateTime) -> super::EventMarkerRead {
     use super::EventMarkerRead::{Read, Unknown};
     if text.trim().is_empty() {
         return Read(None);
@@ -439,7 +443,7 @@ fn parse_detection_journal(text: &str, now: DateTime<Utc>) -> super::EventMarker
     else {
         return Unknown;
     };
-    if micros < 0 || micros > now.timestamp_micros() {
+    if micros < 0 || micros > now.unix_timestamp() * 1_000_000 + i64::from(now.microsecond()) {
         return Unknown;
     }
     Read(Some(micros))
@@ -452,7 +456,7 @@ mod tests {
     fn daily_database_uses_embedded_timestamp_not_file_mtime() {
         let text = "ClamAV-VDB:14 Oct 2026 08-00 +0000:28000:3000000:90:00000000000000000000000000000000:fictional-signature:fictional-builder:1791964800";
         assert_eq!(
-            parse_cvd_header(text.as_bytes()).unwrap().timestamp(),
+            parse_cvd_header(text.as_bytes()).unwrap().unix_timestamp(),
             1791964800
         );
         assert!(parse_cvd_header(b"not a database").is_none());
@@ -460,10 +464,12 @@ mod tests {
     }
     #[test]
     fn oldest_readable_system_entry_and_permission_warnings() {
-        let now = DateTime::from_timestamp(1791964800, 0).unwrap();
+        let now = OffsetDateTime::from_unix_timestamp(1791964800)
+            .ok()
+            .unwrap();
         let text = format!(
             "{{\"__REALTIME_TIMESTAMP\":\"{}\"}}\n",
-            (now.timestamp() - 10 * 86400) * 1_000_000
+            (now.unix_timestamp() - 10 * 86400) * 1_000_000
         );
         assert_eq!(parse_journal_age(&text, now), ControlValue::Integer(10));
         assert_eq!(
@@ -475,7 +481,7 @@ mod tests {
         );
         assert_eq!(parse_journal_age("-- No entries --", now), "unknown");
         assert_eq!(
-            parse_journal_age(&text, now - chrono::Duration::days(11)),
+            parse_journal_age(&text, now - time::Duration::days(11)),
             "unknown"
         );
     }
@@ -613,7 +619,9 @@ mod detection_tests {
     use super::*;
     #[test]
     fn trusted_journal_detection_keeps_microseconds_and_rejects_partial_reads() {
-        let now = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000)
+            .ok()
+            .unwrap();
         let entry = r#"{"_COMM":"clamonacc","MESSAGE":"/fictional/sample: Fictional.Test FOUND","__REALTIME_TIMESTAMP":"1799999999123456"}"#;
         assert_eq!(
             parse_detection_journal(entry, now),
@@ -633,14 +641,14 @@ mod detection_tests {
             Unknown
         );
         assert_eq!(
-            parse_detection_journal(entry, now - chrono::Duration::days(1)),
+            parse_detection_journal(entry, now - time::Duration::days(1)),
             Unknown
         );
     }
 
     #[test]
     fn journal_grep_no_match_establishes_an_empty_baseline() {
-        let now = Utc::now();
+        let now = OffsetDateTime::now_utc();
         assert_eq!(parse_detection_status(Some(1), "", now), Read(None));
         assert_eq!(
             parse_detection_status(Some(1), "permission denied", now),

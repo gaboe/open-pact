@@ -207,7 +207,7 @@ pub(crate) async fn prepare(
                 .await?
             }
             ScanPolicy::OlderThan(age) => {
-                let now = chrono::Utc::now().timestamp();
+                let now = time::OffsetDateTime::now_utc().unix_timestamp();
                 let age = i64::try_from(age.as_secs()).unwrap_or(i64::MAX);
                 let due = crate::checks::repos::load_attempt(&home.0)?
                     .is_none_or(|last| now.saturating_sub(last.scanned_at) >= age);
@@ -281,7 +281,7 @@ pub(crate) async fn scan_if_due(
     if !crate::scans_repositories(&manifest) {
         return Ok(());
     }
-    let now = chrono::Utc::now().timestamp();
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
     let age = i64::try_from(age.as_secs()).unwrap_or(i64::MAX);
     let due = crate::checks::repos::load_attempt(&home.0)?
         .is_none_or(|last| now.saturating_sub(last.scanned_at) >= age);
@@ -427,7 +427,7 @@ impl Prepared {
     fn claim(
         &self,
         nonce: String,
-        time: chrono::DateTime<chrono::Utc>,
+        time: time::OffsetDateTime,
         csr_sha256: CsrHash,
         log_checkpoint: Option<LogCheckpoint>,
     ) -> Claim {
@@ -486,7 +486,7 @@ impl Prepared {
         let log_checkpoint = crate::disclosable_checkpoint(&self.manifest, Some(verified));
         let claim = self.claim(
             String::new(),
-            chrono::DateTime::UNIX_EPOCH,
+            time::OffsetDateTime::UNIX_EPOCH,
             CsrHash::of(b""),
             log_checkpoint,
         );
@@ -551,7 +551,11 @@ impl Prepared {
         let (csr_pem, csr_der) = crate::vpn_csr(home)?;
         let claim = self.claim(
             nonce.nonce,
-            chrono::DateTime::from_timestamp(chrono::Utc::now().timestamp(), 0).context("clock")?,
+            time::OffsetDateTime::from_unix_timestamp(
+                time::OffsetDateTime::now_utc().unix_timestamp(),
+            )
+            .ok()
+            .context("clock")?,
             CsrHash::of(&csr_der),
             log_checkpoint,
         );
@@ -583,9 +587,7 @@ impl Prepared {
         for (id, value) in &claim.results {
             println!("  {id} = {value}");
         }
-        let sent_at = claim
-            .time
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let sent_at = open_pact_core::timestamp::rfc3339_secs(claim.time);
         let (result, reasons, warnings) = match serde_json::from_slice::<Response>(&received)
             .with_context(|| String::from_utf8_lossy(&received).into_owned())?
         {

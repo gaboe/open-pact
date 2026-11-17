@@ -139,7 +139,7 @@ fn signed_null_claim_passes_but_a_clearing_time_does_not() {
         device: Pseudonym::of(&device_key),
         device_key,
         nonce: "fictional-nonce".into(),
-        time: "2026-10-22T12:00:00Z".parse().unwrap(),
+        time: open_pact_core::timestamp::parse_rfc3339("2026-10-22T12:00:00Z").unwrap(),
         client: "open-pact-client 0.2.0".into(),
         os: Os::Windows,
         trust_level: TrustLevel::L0,

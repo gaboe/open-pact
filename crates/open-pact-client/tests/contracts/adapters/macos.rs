@@ -12,7 +12,7 @@ pub(crate) fn run(id: &str, case: &Case) -> ControlValue {
         "auto_login" => parse_auto_login(text).into(),
         "os_patch_age_days" => parse_last_macos_update(text).map_or_else(
             || "unknown".into(),
-            |date| buckets::patch_age(date, case.now().date_naive()),
+            |date| buckets::patch_age(date, case.now().date()),
         ),
         _ => panic!("unsupported macOS contract {id}"),
     }

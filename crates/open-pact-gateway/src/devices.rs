@@ -1,10 +1,10 @@
 use anyhow::{Context, bail};
-use chrono::{DateTime, Utc};
 use open_pact_core::{EntryKind, Pseudonym};
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{PgConnection, PgPool};
+use time::OffsetDateTime;
 
 use crate::translog;
 
@@ -286,7 +286,7 @@ pub async fn record_claim(
     conn: &mut PgConnection,
     device: &Pseudonym,
     manifest: &str,
-    at: DateTime<Utc>,
+    at: OffsetDateTime,
     result: ClaimResult,
     reasons: &[String],
 ) -> anyhow::Result<()> {
