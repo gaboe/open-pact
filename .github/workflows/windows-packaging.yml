@@ -2,7 +2,9 @@ name: windows-packaging
 
 on:
   pull_request:
+    paths-ignore: ['desktop/**']
   push:
+    paths-ignore: ['desktop/**']
   workflow_dispatch:
 
 permissions:

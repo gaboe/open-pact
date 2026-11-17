@@ -3,6 +3,7 @@ name: image
 on:
   push:
     branches: [main]
+    paths-ignore: ['desktop/**']
     tags: ["v*"]
   workflow_dispatch:
 
