@@ -1270,6 +1270,72 @@ fn tone_text(tone: Tone) -> u32 {
     }
 }
 
+impl AppView {
+    /// The cluster and namespace this app reads, with the refresh button. The dot turns green once
+    /// the cluster answered.
+    fn connection(&self, cx: &Context<Self>) -> Div {
+        let settings = &self.admin.settings;
+        let tone = if self.overview.is_some() {
+            Tone::Good
+        } else {
+            Tone::Idle
+        };
+        let (_, dot, _) = tone_colors(tone);
+        let line = |text: String, color: u32, size: f32| {
+            div()
+                .min_w_0()
+                .overflow_hidden()
+                .text_ellipsis()
+                .whitespace_nowrap()
+                .text_size(px(size))
+                .text_color(rgb(color))
+                .child(text)
+        };
+        div()
+            .flex()
+            .items_start()
+            .gap(px(8.))
+            .pl(px(6.))
+            .pt(px(12.))
+            .border_t_1()
+            .border_color(rgb(RULE))
+            .child(
+                div()
+                    .flex_none()
+                    .mt(px(5.))
+                    .size(px(7.))
+                    .rounded_full()
+                    .bg(rgb(dot)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w_0()
+                    .gap(px(1.))
+                    .child(
+                        line(settings.context.clone(), INK, 12.5).font_weight(FontWeight::MEDIUM),
+                    )
+                    .child(line(settings.namespace.clone(), MUTED, 12.)),
+            )
+            .child(
+                Button::new("refresh")
+                    .icon(gpui_kit_assets::IconName::RefreshCw)
+                    .ghost()
+                    .xsmall()
+                    .tooltip(format!(
+                        "Refresh from {} / {}",
+                        settings.context, settings.namespace
+                    ))
+                    .disabled(self.busy || self.overview.is_none())
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.run(Operation::Refresh, window, cx)),
+                    ),
+            )
+    }
+}
+
 impl Render for AppView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let _ = (
@@ -1326,38 +1392,7 @@ impl Render for AppView {
                 }),
             )
             .child(div().flex_1())
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .px(px(12.))
-                    .pt(px(10.))
-                    .border_t_1()
-                    .border_color(rgb(RULE))
-                    .child(note("Cluster"))
-                    .child(
-                        div()
-                            .font_family(mono())
-                            .text_size(px(12.))
-                            .child(self.admin.settings.context.clone()),
-                    )
-                    .child(note("Namespace"))
-                    .child(
-                        div()
-                            .font_family(mono())
-                            .text_size(px(12.))
-                            .child(self.admin.settings.namespace.clone()),
-                    )
-                    .child(
-                        ghost("refresh", "Refresh")
-                            .disabled(self.busy || self.overview.is_none())
-                            .self_start()
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.run(Operation::Refresh, window, cx)
-                            })),
-                    ),
-            );
+            .child(self.connection(cx));
         let mut main = if wide {
             div()
                 .id("admin-main")
