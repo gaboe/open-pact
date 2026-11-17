@@ -14,8 +14,13 @@
 //! 3. The certificate chains to the pinned Fulcio intermediate and root, and each of the three is
 //!    valid at the integrated time.
 //! 4. The certificate names the identity
-//!    `https://github.com/<repository>/.github/workflows/client-release.yml@refs/tags/<tag>`,
-//!    the issuer `https://token.actions.githubusercontent.com` and the code signing purpose.
+//!    `https://github.com/<repository>/.github/workflows/client-release.yml@refs/tags/<tag>`
+//!    (the subject alternative name). Its source repository extension (1.3.6.1.4.1.57264.1.12)
+//!    is `https://github.com/<repository>`, and its source ref extension (1.3.6.1.4.1.57264.1.14)
+//!    is `refs/tags/<tag>`. It names the issuer `https://token.actions.githubusercontent.com`,
+//!    allows a digital signature, is issued for code signing, and has no critical extension that
+//!    this verifier does not understand. The source extensions name the repository whose code ran,
+//!    so a called workflow of another repository with the same path and tag fails.
 //! 5. The signature over the SHA256SUMS bytes verifies with the certificate key (ECDSA P-256).
 //!
 //! Left out on purpose: the signed certificate timestamp (the SET already proves that the log saw
@@ -43,6 +48,18 @@ pub const WORKFLOW: &str = ".github/workflows/client-release.yml";
 /// Fulcio v2 issuer extension (a DER UTF8String) and its deprecated v1 form (the raw string).
 const OID_ISSUER_V2: &[u64] = &[1, 3, 6, 1, 4, 1, 57264, 1, 8];
 const OID_ISSUER_V1: &[u64] = &[1, 3, 6, 1, 4, 1, 57264, 1, 1];
+/// Fulcio v2 source extensions (DER UTF8Strings): the repository and the ref whose code ran.
+const OID_SOURCE_REPOSITORY: &[u64] = &[1, 3, 6, 1, 4, 1, 57264, 1, 12];
+const OID_SOURCE_REF: &[u64] = &[1, 3, 6, 1, 4, 1, 57264, 1, 14];
+/// The critical extensions of a leaf that this verifier understands. Any other critical one fails.
+const UNDERSTOOD_CRITICAL: &[&[u64]] = &[
+    &[2, 5, 29, 14], // subject key identifier
+    &[2, 5, 29, 15], // key usage
+    &[2, 5, 29, 17], // subject alternative name
+    &[2, 5, 29, 19], // basic constraints
+    &[2, 5, 29, 35], // authority key identifier
+    &[2, 5, 29, 37], // extended key usage
+];
 
 // Pinned Sigstore public-good instance trust material.
 // Source: https://tuf-repo-cdn.sigstore.dev/targets/6494e21ea73fa7ee769f85f57d5a3e6a08725eae1e38c755fc3517c9e6bc0b66.trusted_root.json
@@ -180,6 +197,18 @@ pub enum ReleaseVerifyError {
     },
     /// The certificate is not issued for code signing.
     WrongPurpose,
+    /// The source extension `what` (repository or ref) is missing or is not the expected value.
+    WrongSource {
+        what: &'static str,
+        expected: String,
+        found: Vec<String>,
+    },
+    /// The certificate does not allow a digital signature.
+    WrongKeyUsage,
+    /// The leaf has a critical extension that this verifier does not understand (RFC 5280 6.1.3).
+    UnknownCriticalExtension {
+        oid: String,
+    },
     /// The signature over SHA256SUMS does not verify with the certificate key.
     SignatureInvalid,
 }
@@ -226,6 +255,19 @@ impl fmt::Display for ReleaseVerifyError {
             Self::WrongPurpose => {
                 write!(f, "the signing certificate is not issued for code signing")
             }
+            Self::WrongSource {
+                what,
+                expected,
+                found,
+            } => write!(f, "the signing source {what} is {found:?}, not {expected}"),
+            Self::WrongKeyUsage => write!(
+                f,
+                "the signing certificate does not allow a digital signature"
+            ),
+            Self::UnknownCriticalExtension { oid } => write!(
+                f,
+                "the signing certificate has a critical extension this client does not understand: {oid}"
+            ),
             Self::SignatureInvalid => write!(f, "the signature over SHA256SUMS is invalid"),
         }
     }
@@ -296,7 +338,7 @@ pub fn verify_release_with(
     // 3. The chain, at the time the log saw the certificate.
     verify_chain(root, &leaf, integrated_time)?;
 
-    // 4. Identity, issuer and purpose.
+    // 4. Identity, source, issuer, purpose, key usage and critical extensions.
     let expected_identity = format!("https://github.com/{repository}/{WORKFLOW}@refs/tags/{tag}");
     let identities = uri_names(&leaf)?;
     if !identities.contains(&expected_identity) {
@@ -305,6 +347,13 @@ pub fn verify_release_with(
             found: identities,
         });
     }
+    check_source(
+        &leaf,
+        OID_SOURCE_REPOSITORY,
+        "repository",
+        format!("https://github.com/{repository}"),
+    )?;
+    check_source(&leaf, OID_SOURCE_REF, "ref", format!("refs/tags/{tag}"))?;
     let issuers = issuers(&leaf)?;
     if issuers.is_empty() || issuers.iter().any(|issuer| issuer != ISSUER) {
         return Err(ReleaseVerifyError::WrongIssuer {
@@ -316,6 +365,14 @@ pub fn verify_release_with(
         Ok(Some(usage)) if usage.value.code_signing => {}
         _ => return Err(ReleaseVerifyError::WrongPurpose),
     }
+    match leaf
+        .key_usage()
+        .map_err(|error| ReleaseVerifyError::BadCertificate(error.to_string()))?
+    {
+        Some(usage) if usage.value.digital_signature() => {}
+        _ => return Err(ReleaseVerifyError::WrongKeyUsage),
+    }
+    reject_unknown_critical(&leaf)?;
 
     // 5. The signature of SHA256SUMS.
     verify_p256(&leaf.public_key().subject_public_key.data, sums, &signature)
@@ -597,6 +654,61 @@ fn issuers(leaf: &X509Certificate<'_>) -> Result<Vec<String>, ReleaseVerifyError
         found.push(text.unwrap_or_default());
     }
     Ok(found)
+}
+
+/// The text of the one Fulcio v2 extension with this OID. None when it is absent. An error when the
+/// certificate lists it twice. A value that is not a DER UTF8String reads as "".
+fn fulcio_text(
+    leaf: &X509Certificate<'_>,
+    oid: &[u64],
+) -> Result<Option<String>, ReleaseVerifyError> {
+    let oid = Oid::from(oid).expect("the Fulcio OID is valid");
+    let extension = leaf
+        .get_extension_unique(&oid)
+        .map_err(|error| ReleaseVerifyError::BadCertificate(error.to_string()))?;
+    Ok(
+        extension.map(|extension| match parse_der_utf8string(extension.value) {
+            Ok(([], object)) => object.as_str().map(str::to_owned).unwrap_or_default(),
+            _ => String::new(),
+        }),
+    )
+}
+
+/// A source extension must be present once and name exactly `expected`.
+fn check_source(
+    leaf: &X509Certificate<'_>,
+    oid: &[u64],
+    what: &'static str,
+    expected: String,
+) -> Result<(), ReleaseVerifyError> {
+    let found = fulcio_text(leaf, oid)?;
+    if found.as_deref() == Some(expected.as_str()) {
+        return Ok(());
+    }
+    Err(ReleaseVerifyError::WrongSource {
+        what,
+        expected,
+        found: found.into_iter().collect(),
+    })
+}
+
+/// Every critical extension of the leaf must be one that this verifier understands.
+fn reject_unknown_critical(leaf: &X509Certificate<'_>) -> Result<(), ReleaseVerifyError> {
+    for extension in leaf
+        .extensions()
+        .iter()
+        .filter(|extension| extension.critical)
+    {
+        let understood = UNDERSTOOD_CRITICAL
+            .iter()
+            .any(|oid| Oid::from(oid).expect("the extension OID is valid") == extension.oid);
+        if !understood {
+            return Err(ReleaseVerifyError::UnknownCriticalExtension {
+                oid: extension.oid.to_id_string(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// ECDSA P-256 over SHA-256, DER signature, key as the uncompressed point.
