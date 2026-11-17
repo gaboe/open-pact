@@ -1,9 +1,5 @@
 #[cfg(unix)]
-use runner::{
-    Runner,
-    admin::Admin,
-    client::{Client, JoinEvent},
-};
+use runner::{Runner, admin::Admin};
 use runner::{
     admin::Settings,
     manifest::{self, Filter, Form, Os, Output, Requirement, Span, date_text, parse_date},
@@ -16,52 +12,6 @@ fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures")
         .join(name)
-}
-
-#[cfg(unix)]
-fn client() -> Client {
-    Client {
-        runner: Runner::default(),
-        executable: fixture("bin/open-pact-client"),
-    }
-}
-
-#[test]
-#[cfg(unix)]
-fn client_screens_use_json_and_keep_actionable_status() {
-    let client = client();
-    let preview = client.preview("opi1:fictional").unwrap();
-    assert!(preview.company.matches_invitation);
-    assert_eq!(preview.folders, ["~/Documents"]);
-    assert!(
-        client
-            .preview("opi1:expired")
-            .unwrap_err()
-            .starts_with("This invitation expired")
-    );
-    let mut events = Vec::new();
-    client
-        .join("opi1:fictional", &preview.folders, true, |e| events.push(e))
-        .unwrap();
-    assert!(matches!(events.last(), Some(JoinEvent::Result { .. })));
-    assert_eq!(events.len(), 7);
-    let status = client.status().unwrap();
-    assert_eq!(status.verdict, "action_needed");
-    assert!(!status.approval.live);
-    assert_eq!(status.issues.len(), 2);
-    assert!(client.check().unwrap().accepted);
-    assert!(client.changes().unwrap().schedule_widened);
-    client.accept().unwrap();
-    client.schedule(false).unwrap();
-    client.schedule(true).unwrap();
-    let logs = client.runner.logs();
-    assert!(logs.iter().any(|log| log.exit == Some(2)));
-    assert!(logs.iter().any(|log| {
-        log.args
-            .windows(2)
-            .any(|w| w == ["--folder", "~/Documents"])
-    }));
-    assert!(logs.iter().all(|log| log.exit.is_some()));
 }
 
 #[test]
@@ -674,122 +624,6 @@ fn timeout_reports_an_unconfirmed_write_instead_of_success() {
     assert!(error.contains("Refresh status"));
 }
 
-#[cfg(unix)]
-fn isolated_fixtures() -> (tempfile::TempDir, PathBuf) {
-    let temp = tempfile::tempdir().unwrap();
-    let fixtures = temp.path().join("fixtures");
-    std::fs::create_dir_all(fixtures.join("bin")).unwrap();
-    for entry in std::fs::read_dir(fixture("")).unwrap() {
-        let entry = entry.unwrap();
-        if entry.file_type().unwrap().is_file() {
-            std::fs::copy(entry.path(), fixtures.join(entry.file_name())).unwrap();
-        }
-    }
-    for name in ["kubectl", "open-pact-client"] {
-        std::fs::copy(
-            fixture(&format!("bin/{name}")),
-            fixtures.join("bin").join(name),
-        )
-        .unwrap();
-    }
-    (temp, fixtures)
-}
-
-#[cfg(unix)]
-fn isolated_client() -> (tempfile::TempDir, PathBuf, Client) {
-    let (temp, fixtures) = isolated_fixtures();
-    let client = Client {
-        runner: Runner::default(),
-        executable: fixtures.join("bin/open-pact-client"),
-    };
-    (temp, fixtures, client)
-}
-
-#[test]
-#[cfg(unix)]
-fn status_asks_the_gateway_and_a_denied_check_is_a_report() {
-    let (_temp, fixtures, client) = isolated_client();
-    client.status().unwrap();
-    assert!(
-        client
-            .runner
-            .logs()
-            .iter()
-            .any(|log| log.args == ["status", "--online", "--json"])
-    );
-    std::fs::write(fixtures.join("denied"), "").unwrap();
-    let check = client.check().unwrap();
-    assert!(!check.accepted);
-    assert_eq!(check.reasons, ["Password is 4 characters, 10 needed"]);
-    assert_eq!(client.runner.logs().last().unwrap().exit, Some(1));
-}
-
-#[test]
-#[cfg(unix)]
-fn a_preview_with_a_wrong_company_key_is_shown_not_failed() {
-    let (_temp, _fixtures, client) = isolated_client();
-    let preview = client.preview("opi1:mismatch").unwrap();
-    assert!(!preview.company.matches_invitation);
-    assert!(
-        client
-            .preview("opi1:expired")
-            .unwrap_err()
-            .starts_with("This invitation expired")
-    );
-    let log = &client.runner.logs()[0];
-    assert_eq!(log.args, ["join", "--preview", "--", "opi1:mismatch"]);
-}
-
-#[test]
-#[cfg(unix)]
-fn join_reads_a_denied_result_and_the_last_error_line() {
-    let (_temp, _fixtures, client) = isolated_client();
-    let mut events = Vec::new();
-    client
-        .join("opi1:denied", &[], false, |event| events.push(event))
-        .unwrap();
-    assert!(matches!(
-        events.last(),
-        Some(JoinEvent::Result { result, .. }) if result == "denied"
-    ));
-    let mut steps = 0;
-    let error = client
-        .join("opi1:broken", &[], false, |_| steps += 1)
-        .unwrap_err();
-    assert_eq!(
-        error,
-        "The VPN probe failed, so the first check was not sent."
-    );
-    assert_eq!(steps, 2);
-    let words = &client.runner.logs()[1].args;
-    assert_eq!(words[words.len() - 2..], ["--", "opi1:broken"]);
-}
-
-#[test]
-fn installed_cli_is_used_when_it_is_as_new_as_the_bundled_one() {
-    use runner::client::at_least;
-    assert!(at_least("open-pact-client 0.6.0", "open-pact-client 0.6.0"));
-    assert!(at_least("open-pact-client 0.7.1", "open-pact-client 0.6.0"));
-    assert!(at_least(
-        "open-pact-client 0.10.0",
-        "open-pact-client 0.9.9"
-    ));
-    assert!(!at_least(
-        "open-pact-client 0.5.9",
-        "open-pact-client 0.6.0"
-    ));
-    assert!(!at_least(
-        "open-pact-client 0.7.0-rc.1",
-        "open-pact-client 0.7.0"
-    ));
-    assert!(at_least(
-        "open-pact-client 0.7.0",
-        "open-pact-client 0.7.0-rc.1"
-    ));
-    assert!(at_least("garbage", "garbage"));
-    assert!(!at_least("garbage", "open-pact-client 0.6.0"));
-}
-
 #[test]
 fn the_admin_app_tries_the_cli_bundled_with_it_first() {
     use runner::client::{cli_candidates, cli_name};
@@ -1210,34 +1044,6 @@ fn a_namespace_list_that_fails_gives_one_short_kubectl_line() {
 
 #[test]
 #[cfg(unix)]
-fn an_approval_that_came_while_the_app_was_closed_resumes_the_join() {
-    use runner::client::resume_join;
-    let (_temp, fixtures, client) = isolated_client();
-    // The saved state is approved and a claim exists: nothing to resume.
-    assert_eq!(resume_join(&client.status().unwrap()), None);
-    // IT approved while the app was closed: the live state is approved and there is no claim yet.
-    std::fs::write(fixtures.join("approved-no-claim"), "").unwrap();
-    let status = client.status().unwrap();
-    assert_eq!(status.approval.state.as_deref(), Some("approved"));
-    assert!(status.approval.live && status.last_claim.is_none());
-    assert_eq!(resume_join(&status), Some(true));
-    let mut pending = status.clone();
-    pending.approval.state = Some("pending".into());
-    pending.last_claim = Some(serde_json::json!({}));
-    assert_eq!(resume_join(&pending), Some(true));
-    let mut revoked = status;
-    revoked.approval.state = Some("revoked".into());
-    assert_eq!(resume_join(&revoked), None);
-    // The resumed join has no invitation.
-    client.join("", &[], true, |_| {}).unwrap();
-    assert_eq!(
-        client.runner.logs().last().unwrap().args,
-        ["join", "--yes", "--json", "--auto-send", "on"]
-    );
-}
-
-#[test]
-#[cfg(unix)]
 fn a_write_timeout_still_names_the_manifest_that_was_replaced() {
     use runner::admin::hash;
     let (temp, admin) = isolated_admin();
@@ -1265,43 +1071,6 @@ fn a_write_timeout_still_names_the_manifest_that_was_replaced() {
 fn closing_the_last_window_quits_both_apps() {
     use gpui::QuitMode;
     assert_eq!(runner::desktop::QUIT_MODE, QuitMode::LastWindowClosed);
-}
-
-#[test]
-fn status_reports_a_newer_command_line_tool_only_when_the_field_has_its_shape() {
-    use runner::client::Status;
-    let parse = |text: &str| serde_json::from_str::<Status>(text).unwrap();
-    assert!(
-        parse(include_str!("../../../tests/fixtures/status.json"))
-            .update
-            .is_none()
-    );
-    let with = parse(include_str!(
-        "../../../tests/fixtures/status-cli-update.json"
-    ))
-    .update
-    .unwrap();
-    assert_eq!(
-        (with.current.as_str(), with.latest.as_str()),
-        ("0.6.0", "0.6.1")
-    );
-    assert_eq!(
-        with.command.as_deref(),
-        Some("brew upgrade open-pact-client")
-    );
-    let bundled = parse(include_str!(
-        "../../../tests/fixtures/status-cli-update-bundled.json"
-    ))
-    .update
-    .unwrap();
-    assert_eq!(bundled.command, None);
-    assert!(
-        parse(include_str!(
-            "../../../tests/fixtures/status-cli-update-unknown.json"
-        ))
-        .update
-        .is_none()
-    );
 }
 
 mod results {

@@ -2233,6 +2233,12 @@ pub enum JobStatus {
     SystemUnconfirmed,
 }
 
+/// The executable that the recorded OS job runs. `None` when no job is recorded.
+pub(crate) fn recorded_executable(home: &Home) -> Result<Option<PathBuf>> {
+    let home = Home(schedule_home(&home.0, true)?);
+    Ok(read_applied(&home)?.map(|applied| applied.executable))
+}
+
 pub(crate) fn inspect_job(
     home: &Home,
     config: &DeviceConfig,

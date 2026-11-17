@@ -2,7 +2,18 @@
 
 Optional desktop apps for [open-pact](https://github.com/gaboe/open-pact). `open-pact` joins a company, reviews manifests, and sends device checks. `open-pact-admin` edits deployment manifests and manages devices.
 
-The apps only run `open-pact-client`, `kubectl`, and the OS folder opener (`open` or `explorer`, for the admin backup folder). They never call the gateway or Kubernetes APIs directly. The Terminal strip at the bottom of each window opens to show each command, its input, output, and exit code.
+The client app `open-pact` calls the client library (`open_pact_client::Session`, in `crates/open-pact-client`) in its own process. It does not run the command line tool for status, check, join, accept or the job. The admin app `open-pact-admin` runs `kubectl`, the bundled `open-pact-client` (to check a manifest draft) and the OS folder opener (`open` or `explorer`, for the admin backup folder). Neither app calls the Kubernetes API directly.
+
+The Terminal strip at the bottom of the admin window opens to show each command, its input, output, and exit code. The strip of the client app shows the operation log instead: each call of the library with its time and result, such as a status, a check or a move of the scheduled job. It lists the few processes the client app still starts (the update check, the removal of another copy) below the operations.
+
+## The client app owns the device
+
+The OS job (launchd, systemd or Task Scheduler) runs `open-pact-client`. The client app installs its bundled copy to a fixed place, `~/.local/bin/open-pact-client` on macOS and Linux and `%LOCALAPPDATA%\open-pact\open-pact-client.exe` on Windows, and passes that path to the library as the job executable. A copy on PATH never wins, however new it is, so the job and the library are always the same release.
+
+- **Start.** When the installed copy has another version than the bundled one, the app replaces it. When no copy is installed, the first screen asks before it installs one.
+- **The scheduled job.** When the job exists and names another executable, and automatic sending is on, the app rewrites the job to the installed copy (`Session::schedule(true)`) and writes the move to the operation log. The job changes only its executable; the owner agreed to it before. A SYSTEM job on Windows needs an elevated process, so the app starts the installed copy with `runas` (`schedule on --system`) when the owner presses **Install job (administrator)**.
+- **Other copies.** The app looks on PATH for an `open-pact-client` that is not the installed copy. It shows one notice with the exact command that removes it, and a **Remove** button that runs the command and shows what it printed: `brew uninstall open-pact` for a Homebrew copy (a path in the Cellar of `open-pact`, or under `brew --prefix open-pact`), `scoop uninstall open-pact` for a Scoop copy (a path under `scoop/apps/open-pact`, or the Scoop shims), and `rm <file>` (`Remove-Item` on Windows) for any other file. The app never deletes package manager files by itself; it runs the command only when you click.
+- **Runtime.** The app calls the library in one tokio runtime that it creates at start, with an 8 MiB stack for each thread, because the debug futures of the library overflow the 1 MiB main stack of Windows. One call runs at a time. A call never runs on the GPUI thread, so the claim lock that a check holds never blocks the window. When a check waits for the scheduled job, the window says "Waiting for the scheduled job".
 
 ## Install
 
@@ -39,7 +50,7 @@ Run the same install line again, or `scoop update open-pact-desktop`. Both apps 
 
 **What the update check sends.** At start, then every 24 hours, each app runs `curl -fsSL -m 5 https://api.github.com/repos/gaboe/open-pact-desktop/releases/latest` (`curl.exe` on Windows). That is a plain GET to GitHub. GitHub sees your IP address and the curl user agent. The apps send nothing about you, your company, or your device. A failed check shows nothing and stays in the Terminal strip. Set `OPEN_PACT_NO_UPDATE_CHECK=1` to turn the check off.
 
-When the command line tool reports a newer `open-pact-client` (`update` in `status --online --json`), the `open-pact` status screen shows "Command line tool 0.6.1 is available". The tool's `command` runs from the **Update** button. With no command, the app update brings the new tool.
+When the command line tool reports a newer `open-pact-client` (`update` in the online status report), the `open-pact` status screen shows "Command line tool 0.6.1 is available". The tool's `command` runs from the **Update** button. With no command, the app update brings the new tool.
 
 ## Release
 
@@ -61,7 +72,7 @@ cargo run -p open-pact-app
 cargo run -p open-pact-admin
 ```
 
-For an unbundled client build, put `open-pact-client` next to the app executable. At start, each app reads the login shell PATH once (`$SHELL -lc`, 5 second limit; `/opt/homebrew/bin` and `/usr/local/bin` are always added after it when missing), because an app started from Finder has only the short system PATH. Every child process gets that PATH. The client then compares CLI versions. A CLI on that PATH, or in the install folder, that is as new as the bundled one skips installation. With none, or only an older one, the app installs the bundled CLI to `~/.local/bin` on macOS or `%LOCALAPPDATA%\open-pact` on Windows.
+For an unbundled client build, put `open-pact-client` next to the app executable. At start, each app reads the login shell PATH once (`$SHELL -lc`, 5 second limit; `/opt/homebrew/bin` and `/usr/local/bin` are always added after it when missing), because an app started from Finder has only the short system PATH. Every child process gets that PATH, and the client app looks for other copies of the command line tool on it. The client app installs the bundled CLI to `~/.local/bin` on macOS or `%LOCALAPPDATA%\open-pact` on Windows.
 
 On macOS, make ad hoc signed bundles with the installed CLI.
 
@@ -92,6 +103,6 @@ cargo test --workspace
 cargo build --workspace --features snapshot
 ```
 
-Tests use fictional JSON and command fixtures. They need no cluster or network. Shell command fixtures run on Unix. Manifest tests also run on Windows. On macOS, set `OPEN_PACT_SHOTS` to an existing directory when running either snapshot binary through the approved GPUI snapshot runner.
+Tests use fictional reports built as values of the library types (`crates/runner/src/samples.rs`), fictional JSON, and command fixtures. They need no cluster or network. Shell command fixtures run on Unix. Manifest tests also run on Windows. On macOS, set `OPEN_PACT_SHOTS` to an existing directory when running either snapshot binary through the approved GPUI snapshot runner.
 
 Ubuntu CI is not enabled. It needs Linux graphics development packages and a separate successful build receipt.

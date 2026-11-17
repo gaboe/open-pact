@@ -3843,6 +3843,19 @@ pub struct ManifestChange {
     line: String,
 }
 
+impl ManifestChange {
+    /// A change of one id from `before` to `after`, for an app that shows a sample.
+    pub fn new(id: impl Into<String>, before: Option<String>, after: Option<String>) -> Self {
+        let id = id.into();
+        ManifestChange {
+            line: format!("changed control {id}"),
+            id,
+            before,
+            after,
+        }
+    }
+}
+
 /// A control as the owner reads it in a change: its rule and its check.
 fn control_state(c: &open_pact_core::Control) -> String {
     format!("{}; check {}", control_rule(c), c.check)
@@ -10665,6 +10678,41 @@ grace = "1d"
         assert_eq!(
             steps[7].detail.as_ref().unwrap()["device_code"],
             device_code(&enrolment.device)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_resumes_an_enrolled_join_without_an_invitation() {
+        let (gateway, invitation) = witnessed_join_fixture().await;
+        let dir = tempfile::tempdir().unwrap();
+        let session = session_of(&Home(dir.path().to_path_buf()));
+        let choices = || JoinChoices {
+            software_key: true,
+            no_wait: true,
+            ..JoinChoices::default()
+        };
+        session
+            .join(&invitation, choices(), std::future::pending(), |_| {})
+            .await
+            .unwrap();
+
+        let (steps, on_step) = step_log();
+        let call = session.resume_join(choices(), std::future::pending(), on_step);
+        assert_send(&call);
+        let result = call.await.unwrap();
+
+        assert_eq!(result.result, JoinStage::Enrolled);
+        assert_eq!(
+            gateway.posts(),
+            vec!["POST /v1/enroll"],
+            "the resume enrols nothing again"
+        );
+        let steps = steps.lock().unwrap();
+        assert!(
+            steps
+                .iter()
+                .any(|s| s.step == 4 && s.state == StepState::Waiting),
+            "the resume waits for IT again: {steps:?}"
         );
     }
 

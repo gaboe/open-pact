@@ -437,10 +437,67 @@ pub fn terminal(runner: &crate::Runner) -> Div {
     panel
 }
 
+/// What the client app asked its library to do: one line per operation with its time and result.
+/// The commands that the app still runs as processes (the update check, the removal of another
+/// copy) follow, because they leave evidence too.
+#[cfg(feature = "client")]
+pub fn operations(log: &crate::engine::OperationLog, runner: &crate::Runner) -> Div {
+    let entries = log.entries();
+    let mut panel = div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .text_size(px(12.5))
+        .font_family(mono())
+        .text_color(rgb(TERM_INK));
+    if entries.is_empty() {
+        panel = panel.child(div().text_color(rgb(TERM_DIM)).child("No operations yet."));
+    }
+    for entry in entries {
+        let (color, text) = match entry.result {
+            None => (TERM_DIM, "running…".to_owned()),
+            Some(Ok(text)) => (TERM_DIM, text),
+            Some(Err(text)) => (0xe3b776, format!("failed: {text}")),
+        };
+        panel = panel.child(
+            div()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(div().flex_none().text_color(rgb(TERM_DIM)).child(entry.at))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .text_color(rgb(0x8fb4f0))
+                                .child(entry.operation),
+                        ),
+                )
+                .child(div().pl_6().text_color(rgb(color)).child(text)),
+        );
+    }
+    if runner.logs().is_empty() {
+        panel
+    } else {
+        panel.child(div().h(px(8.))).child(terminal(runner))
+    }
+}
+
 /// A quiet dark strip at the bottom of the window. Its header opens and closes the command log.
 pub fn terminal_drawer(
     open: bool,
     runner: &crate::Runner,
+    toggle: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Div {
+    terminal_drawer_with(open, || terminal(runner), toggle)
+}
+
+/// The same strip around any panel.
+pub fn terminal_drawer_with(
+    open: bool,
+    panel: impl FnOnce() -> Div,
     toggle: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> Div {
     div()
@@ -473,7 +530,7 @@ pub fn terminal_drawer(
                     .overflow_y_scroll()
                     .px_4()
                     .pb_3()
-                    .child(terminal(runner)),
+                    .child(panel()),
             )
         })
 }

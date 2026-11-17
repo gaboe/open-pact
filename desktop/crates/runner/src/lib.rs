@@ -2,8 +2,15 @@ pub mod admin;
 pub mod client;
 #[cfg(feature = "desktop")]
 pub mod desktop;
+#[cfg(feature = "client")]
+pub mod engine;
 pub mod manifest;
+pub mod ownership;
 pub mod results;
+#[cfg(all(feature = "client", any(test, feature = "snapshot")))]
+pub mod samples;
+#[cfg(feature = "client")]
+pub mod status_text;
 pub mod text;
 pub mod update;
 

@@ -101,6 +101,28 @@ impl Session {
         cancel: impl Future<Output = ()>,
         on_step: impl FnMut(JoinStep) + Send + 'static,
     ) -> Result<JoinResult> {
+        self.join_with(Some(invitation), choices, cancel, on_step)
+            .await
+    }
+
+    /// Finishes a join that waits for IT, or that IT approved while the app was closed. It needs no
+    /// invitation: the enrolment on this device says what to resume.
+    pub async fn resume_join(
+        &self,
+        choices: JoinChoices,
+        cancel: impl Future<Output = ()>,
+        on_step: impl FnMut(JoinStep) + Send + 'static,
+    ) -> Result<JoinResult> {
+        self.join_with(None, choices, cancel, on_step).await
+    }
+
+    async fn join_with(
+        &self,
+        invitation: Option<&str>,
+        choices: JoinChoices,
+        cancel: impl Future<Output = ()>,
+        on_step: impl FnMut(JoinStep) + Send + 'static,
+    ) -> Result<JoinResult> {
         let JoinChoices {
             software_key,
             no_wait,
@@ -120,7 +142,7 @@ impl Session {
         // The join future is large: it lives on the heap, not on the caller's stack.
         let flow = Box::pin(json_out::scope(
             json,
-            crate::join_run(&self.home, Some(invitation), software_key, options),
+            crate::join_run(&self.home, invitation, software_key, options),
         ));
         let run = Self::until(cancel, flow).await?;
         run.finished.map_err(|text| anyhow!(text))
@@ -187,6 +209,12 @@ impl Session {
         .await
     }
 
+    /// The executable that the recorded OS job runs, or `None` when no job is recorded. An app
+    /// compares it with the installed client, which `schedule(true)` writes into the job.
+    pub fn job_executable(&self) -> Result<Option<PathBuf>> {
+        crate::schedule::recorded_executable(&self.home)
+    }
+
     /// The folders that hold the owner's repositories.
     pub fn folders(&self) -> Result<Vec<PathBuf>> {
         crate::folders_list(&self.home)
@@ -239,6 +267,26 @@ fn join_folders(folders: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_job_executable_is_the_one_the_applied_record_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = Session::open(
+            Some(dir.path().to_path_buf()),
+            PathBuf::from("/fictional/installed/open-pact-client"),
+        )
+        .unwrap();
+        assert_eq!(session.job_executable().unwrap(), None);
+        std::fs::write(
+            dir.path().join(crate::schedule::APPLIED),
+            r#"{"run_as":"user","executable":"/fictional/brew/bin/open-pact-client"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            session.job_executable().unwrap(),
+            Some(PathBuf::from("/fictional/brew/bin/open-pact-client"))
+        );
+    }
 
     #[test]
     fn join_folders_are_absolute_like_the_cli_saves_them() {

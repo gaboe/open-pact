@@ -17,7 +17,9 @@ snapshot = ["runner/snapshot", "gpui/test-support", "gpui-platform/test-support"
 winresource = "0.1"
 
 [dependencies]
-runner = { workspace = true, features = ["desktop"] }
+runner = { workspace = true, features = ["desktop", "client"] }
+open-pact-client.workspace = true
+open-pact-core.workspace = true
 serde_json.workspace = true
 gpui.workspace = true
 gpui-component.workspace = true

@@ -1,7 +1,7 @@
 //! The check for a newer desktop release and the command that installs it. Everything here is
 //! pure or runs through the `Runner`, so the Terminal strip shows each command.
 
-use crate::{Runner, args, client::CliUpdate, client::version_key};
+use crate::{Runner, args, client::version_key};
 use serde_json::Value;
 use std::time::Duration;
 
@@ -248,9 +248,9 @@ pub fn run(runner: &Runner, call: &Invocation) -> Result<(), String> {
 
 /// The row for a newer command line tool. The second part is the command that updates it, or
 /// `None` when the app update brings the tool.
-pub fn cli_notice(update: &CliUpdate) -> (String, Option<&str>) {
-    let command = update.command.as_deref().filter(|c| !c.trim().is_empty());
-    let mut text = format!("Command line tool {} is available", update.latest);
+pub fn cli_notice<'a>(latest: &str, command: Option<&'a str>) -> (String, Option<&'a str>) {
+    let command = command.filter(|c| !c.trim().is_empty());
+    let mut text = format!("Command line tool {latest} is available");
     if command.is_none() {
         text.push_str(". The app update brings it.");
     }
@@ -398,34 +398,21 @@ mod tests {
 
     #[test]
     fn the_command_line_tool_row_names_its_command_or_the_app_update() {
-        let with = CliUpdate {
-            current: "0.6.0".into(),
-            latest: "0.6.1".into(),
-            command: Some("brew upgrade open-pact-client".into()),
-        };
         assert_eq!(
-            cli_notice(&with),
+            cli_notice("0.6.1", Some("brew upgrade open-pact-client")),
             (
                 "Command line tool 0.6.1 is available".to_owned(),
                 Some("brew upgrade open-pact-client")
             )
         );
-        let without = CliUpdate {
-            command: None,
-            ..with.clone()
-        };
         assert_eq!(
-            cli_notice(&without),
+            cli_notice("0.6.1", None),
             (
                 "Command line tool 0.6.1 is available. The app update brings it.".to_owned(),
                 None
             )
         );
-        let blank = CliUpdate {
-            command: Some("  ".into()),
-            ..with
-        };
-        assert_eq!(cli_notice(&blank).1, None);
+        assert_eq!(cli_notice("0.6.1", Some("  ")).1, None);
     }
 
     #[test]

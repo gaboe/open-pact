@@ -7,11 +7,15 @@ license.workspace = true
 publish = false
 
 [features]
+# The typed client library, for the client app. The admin app does not link it.
+client = ["dep:open-pact-client", "dep:tokio"]
 desktop = ["dep:gpui", "dep:gpui-component", "dep:gpui-platform", "dep:gpui-kit-assets", "dep:gpui-apple"]
 snapshot = ["desktop", "gpui/test-support", "gpui-platform/test-support"]
 
 [dependencies]
 open-pact-core.workspace = true
+open-pact-client = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 toml_edit.workspace = true
