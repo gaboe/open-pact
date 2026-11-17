@@ -1571,7 +1571,7 @@ pub(crate) async fn tick_with_scan(
         if lapsed.is_empty() {
             state.removal_failed = false;
         } else {
-            retire_certificate(home, &mut state, &lapsed);
+            retire_certificate(home, state_home, &mut state, &lapsed)?;
         }
     }
     let due = plan(schedule, &state, place, now, check_floor_secs()).send;
@@ -1624,7 +1624,20 @@ fn lapsed_controls(
 /// A control failed and its grace ended: the device stops being a good VPN client by itself. It
 /// deletes the installed VPN certificate, writes one line to the job log, and asks for a claim at
 /// once. A claim that the gateway accepts later installs a new certificate as always.
-fn retire_certificate(home: &Home, state: &mut State, lapsed: &[String]) {
+///
+/// The claim is owed from the moment the deletion starts, so the pending claim is saved before the
+/// first file goes: a crash after the deletion still leaves it for the next run, which sends it.
+/// The save is skipped inside a run of failed removals, whose one claim was forced already.
+fn retire_certificate(
+    home: &Home,
+    state_home: &Home,
+    state: &mut State,
+    lapsed: &[String],
+) -> Result<()> {
+    if home.vpn_removal_owed() && !state.removal_failed {
+        state.event_pending = true;
+        save(state_home, STATE, state)?;
+    }
     let removal = home.remove_vpn_pair();
     if removal.is_ok() {
         state.removal_failed = false;
@@ -1661,6 +1674,7 @@ fn retire_certificate(home: &Home, state: &mut State, lapsed: &[String]) {
             }
         }
     }
+    Ok(())
 }
 
 /// Tells the owner what only the owner can fix: a changed manifest, a denial, an alarm. Each piece
@@ -1723,7 +1737,7 @@ fn note_outcome(home: &Home, state: &mut State, trigger: Trigger, outcome: &Outc
 
 /// Appends a dated line to the job log. The log keeps the last two files of at most
 /// `JOB_LOG_LIMIT` bytes each. A failed write is only reported: it must not stop the job.
-fn job_log(home: &Home, line: &str) {
+pub(crate) fn job_log(home: &Home, line: &str) {
     if let Err(error) = append_job_log(home, line) {
         eprintln!(
             "warning: could not write {}: {error}",
@@ -2824,12 +2838,14 @@ esac
         let vpn = places(Some(("1h", "5m")), None);
         // A recent answered claim, a control that has failed since before: no event came from the
         // compliance change itself.
+        let state_dir = tempfile::tempdir().unwrap();
+        let state_home = Home(state_dir.path().to_path_buf());
         let mut state = State {
             last_observed_compliance: Some(BTreeMap::from([("firewall".to_owned(), false)])),
             ..state(false, Some(10 * MIN), Some(10 * MIN), false)
         };
         assert_eq!(plan(&vpn, &state, Place::Vpn, T, 0).send, None);
-        retire_certificate(&home, &mut state, &["firewall".to_owned()]);
+        retire_certificate(&home, &state_home, &mut state, &["firewall".to_owned()]).unwrap();
         assert!(state.event_pending);
         assert_eq!(
             plan(&vpn, &state, Place::Vpn, T, 0).send,
@@ -2839,12 +2855,60 @@ esac
         assert!(log.contains("Could not remove the VPN certificate"));
         // The claim went out; the next check fails to remove it the same way: no second claim.
         state.event_pending = false;
-        retire_certificate(&home, &mut state, &["firewall".to_owned()]);
+        retire_certificate(&home, &state_home, &mut state, &["firewall".to_owned()]).unwrap();
         assert!(!state.event_pending);
         // The deletion works later and the failure run is over.
         std::fs::remove_dir_all(home.file("ca.pem")).unwrap();
-        retire_certificate(&home, &mut state, &["firewall".to_owned()]);
+        retire_certificate(&home, &state_home, &mut state, &["firewall".to_owned()]).unwrap();
         assert!(!state.removal_failed);
+    }
+
+    /// The forced claim is saved before the deletion starts. A crash at any step of the
+    /// deletion leaves it pending for the next run, which plans a claim at once.
+    #[test]
+    fn a_crash_during_the_removal_leaves_the_forced_claim_pending() {
+        let vpn = places(Some(("1h", "5m")), None);
+        let mut completed = false;
+        for step in 1..=32 {
+            let dir = tempfile::tempdir().unwrap();
+            let home = Home(dir.path().join("fictional-home"));
+            home.install_vpn_pair(b"CA one", b"certificate one")
+                .unwrap();
+            let state_dir = tempfile::tempdir().unwrap();
+            let state_home = Home(state_dir.path().to_path_buf());
+            // A recent answered claim and a control that has failed since before: no event came
+            // from the compliance change itself.
+            let mut state = State {
+                last_observed_compliance: Some(BTreeMap::from([("firewall".to_owned(), false)])),
+                ..state(false, Some(10 * MIN), Some(10 * MIN), false)
+            };
+            crate::INTERRUPT_AFTER.with(|left| left.set(Some(step)));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                retire_certificate(&home, &state_home, &mut state, &["firewall".to_owned()])
+            }));
+            crate::INTERRUPT_AFTER.with(|left| left.set(None));
+            // Only the saved state survives the crash. Recovery then finishes the deletion.
+            let saved: State = state_home
+                .read_json(STATE)
+                .unwrap()
+                .unwrap_or_else(|| panic!("step {step}: no state was saved"));
+            assert!(saved.event_pending, "step {step}: the claim is pending");
+            home.recover_vpn().unwrap();
+            assert!(
+                !home.vpn_removal_owed(),
+                "step {step}: nothing left to delete"
+            );
+            assert_eq!(
+                plan(&vpn, &saved, Place::Vpn, T, 0).send,
+                Some(Trigger::Event),
+                "step {step}: the next run sends the claim"
+            );
+            if result.is_ok() {
+                completed = true;
+                break;
+            }
+        }
+        assert!(completed, "the removal never finished");
     }
 
     #[test]

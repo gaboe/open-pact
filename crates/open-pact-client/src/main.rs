@@ -747,6 +747,18 @@ impl Home {
         }
     }
 
+    /// Whether a removal would delete something: any file of the pair is still there.
+    fn vpn_removal_owed(&self) -> bool {
+        #[cfg(any(unix, windows))]
+        {
+            self.vpn_pair_present()
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            false
+        }
+    }
+
     fn vpn_removal_pending(&self) -> bool {
         std::fs::symlink_metadata(self.file(VPN_REMOVAL_MARKER)).is_ok()
     }
@@ -8783,6 +8795,38 @@ grace = "1d"
                 .count(),
             1,
             "the removal is logged once"
+        );
+    }
+
+    /// A removal that cannot finish (`ca.pem` is a non-empty directory, so deleting it fails on
+    /// every OS) does not keep the claim from the gateway.
+    #[tokio::test]
+    async fn a_blocked_removal_does_not_stop_the_claim_from_reaching_the_gateway() {
+        let (_probe, address) = open_probe();
+        let denied = r#"{"status":"denied","reasons":["fictional denial"]}"#;
+        let fixture = claim_fixture_replying(
+            Some(denied),
+            unchanged,
+            grown_checkpoint,
+            valid_pair,
+            Some(AGREED),
+            None,
+        )
+        .await;
+        std::fs::remove_file(fixture.home.file(VPN_FILES[0])).unwrap();
+        std::fs::create_dir(fixture.home.file(VPN_FILES[0])).unwrap();
+        std::fs::write(fixture.home.file(VPN_FILES[0]).join("held"), b"x").unwrap();
+        fixture.home.begin_vpn_removal().unwrap();
+        assert!(
+            fixture.home.recover_vpn().is_err(),
+            "the removal is blocked"
+        );
+        tick_once(&fixture, &address).await.unwrap();
+        assert_eq!(claim_posts(&fixture), 1, "the claim reached the gateway");
+        let log = job_log_text(&fixture);
+        assert!(
+            log.contains("Could not finish the VPN certificate removal"),
+            "{log}"
         );
     }
 

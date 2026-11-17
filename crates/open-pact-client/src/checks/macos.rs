@@ -1,7 +1,7 @@
 use chrono::{NaiveDate, Utc};
 
 use super::buckets::{self, Lock};
-use super::exec::run;
+use super::exec::{Ran, run, run_status};
 
 const SOCKETFILTERFW: &str = "/usr/libexec/ApplicationFirewall/socketfilterfw";
 const INSTALL_HISTORY: &str = "/Library/Receipts/InstallHistory.plist";
@@ -27,13 +27,12 @@ pub fn screen_lock() -> &'static str {
 /// `screen_lock@2`: the time from the last input to a locked screen, in whole minutes. That is
 /// the shorter of the screen saver idle time and the display sleep time, plus the password delay.
 pub fn screen_lock_minutes() -> open_pact_core::ControlValue {
-    let configured = run(
+    let configured = saver_setting(run_status(
         "defaults",
         &["-currentHost", "read", "com.apple.screensaver", "idleTime"],
-    )
-    .map_or(Lock::Unknown, |text| parse_saver_idle(&text));
+    ));
     let saver = saver_idle(configured, || {
-        run(
+        run_status(
             "plutil",
             &[
                 "-extract",
@@ -44,7 +43,8 @@ pub fn screen_lock_minutes() -> open_pact_core::ControlValue {
                 SAVER_ENGINE_DEFAULTS,
             ],
         )
-        .map_or(Lock::Unknown, |text| parse_saver_idle(&text))
+        .filter(|ran| ran.success)
+        .map_or(Lock::Unknown, |ran| parse_saver_idle(&ran.text))
     });
     let display =
         run("pmset", &["-g", "custom"]).map_or(Lock::Unknown, |text| parse_display_sleep(&text));
@@ -145,14 +145,29 @@ pub fn parse_saver_idle(out: &str) -> Lock {
     }
 }
 
-/// The screen saver idle time that applies: the one the user or a profile set, else the default of
-/// the installed macOS. Unknown only when neither can be read. The default is read only when the
-/// setting is missing.
-pub fn saver_idle(configured: Lock, installed_default: impl FnOnce() -> Lock) -> Lock {
-    match configured {
-        Lock::Unknown => installed_default(),
-        set => set,
+/// What `defaults read com.apple.screensaver idleTime` says. `None` only when the key is truly
+/// unset: the command ran and reported that the pair does not exist. A command that cannot start,
+/// times out, fails for another reason, or prints something else is `Some(Lock::Unknown)`,
+/// because the user's setting may exist and must not be replaced by a default.
+pub fn saver_setting(ran: Option<Ran>) -> Option<Lock> {
+    match ran {
+        Some(Ran {
+            success: false,
+            text,
+        }) if text.contains("does not exist") => None,
+        Some(Ran {
+            success: true,
+            text,
+        }) => Some(parse_saver_idle(&text)),
+        Some(_) | None => Some(Lock::Unknown),
     }
+}
+
+/// The screen saver idle time that applies: the one the user or a profile set, else the default of
+/// the installed macOS when the key is unset (`None`). A setting that could not be read stays
+/// unknown. The default is read only when the key is unset.
+pub fn saver_idle(setting: Option<Lock>, installed_default: impl FnOnce() -> Lock) -> Lock {
+    setting.unwrap_or_else(installed_default)
 }
 
 /// The display sleep time from `pmset -g custom`, which lists minutes for each power source.
@@ -286,21 +301,29 @@ mod tests {
         }
     }
 
+    fn ran(success: bool, text: &str) -> Option<Ran> {
+        Some(Ran {
+            success,
+            text: text.to_owned(),
+        })
+    }
+
     #[test]
     fn an_unset_saver_idle_time_uses_the_default_of_the_installed_macos() {
-        let unset = parse_saver_idle(
+        let unset = saver_setting(ran(
+            false,
             "The domain/default pair of (com.apple.screensaver, idleTime) does not exist",
-        );
+        ));
+        assert_eq!(unset, None);
         // `plutil -extract idleTime raw -o -` on the installed EngineDefaults.plist.
         let engine_default = || parse_saver_idle("1200\n");
         assert_eq!(saver_idle(unset, engine_default), Lock::Seconds(1200));
         // A set value, even zero, is never replaced by the default.
-        assert_eq!(
-            saver_idle(Lock::Seconds(300), || panic!("not read")),
-            Lock::Seconds(300)
-        );
-        assert_eq!(saver_idle(Lock::None, || panic!("not read")), Lock::None);
-        // Neither can be read.
+        let set = saver_setting(ran(true, "300\n"));
+        assert_eq!(saver_idle(set, || panic!("not read")), Lock::Seconds(300));
+        let never = saver_setting(ran(true, "0\n"));
+        assert_eq!(saver_idle(never, || panic!("not read")), Lock::None);
+        // The key is unset and the default cannot be read.
         assert_eq!(saver_idle(unset, || Lock::Unknown), Lock::Unknown);
         // With display sleep of 10 minutes and a password at once: 600 seconds, so 10 minutes.
         let display = parse_display_sleep(" displaysleep 10\n");
@@ -310,6 +333,31 @@ mod tests {
         );
         assert_eq!(total, Lock::Seconds(600));
         assert_eq!(total.minutes(), open_pact_core::ControlValue::from(10));
+    }
+
+    /// A read that fails is not an unset key: the user's setting may be 60 minutes, so the
+    /// installed default (20 minutes) must not stand in for it.
+    #[test]
+    fn a_failed_saver_idle_read_is_unknown_and_never_the_default() {
+        for failed in [
+            None,
+            ran(false, "defaults: command failed"),
+            ran(false, ""),
+            ran(true, "not a number"),
+            ran(true, ""),
+        ] {
+            let setting = saver_setting(failed);
+            assert_eq!(setting, Some(Lock::Unknown));
+            assert_eq!(
+                saver_idle(setting, || panic!("the default is not read")),
+                Lock::Unknown
+            );
+            let total = total_lock(
+                parse_password_delay("delay is immediate"),
+                first_idle_trigger(saver_idle(setting, || Lock::Seconds(1200)), Lock::None),
+            );
+            assert_eq!(total, Lock::Unknown);
+        }
     }
 
     #[test]

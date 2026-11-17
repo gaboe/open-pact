@@ -520,7 +520,16 @@ impl Prepared {
         let mut enrolment = self.enrolment.clone();
         let manifest = &self.manifest;
         let os = self.os;
-        home.recover_vpn()?;
+        // A removal that cannot finish must not keep the gateway from hearing of this device:
+        // the claim goes out while the certificate stays blocked.
+        if let Err(error) = home.recover_vpn() {
+            crate::schedule::job_log(
+                home,
+                &format!(
+                    "Could not finish the VPN certificate removal: {error:#}. The claim goes on."
+                ),
+            );
+        }
         let command = crate::client_command(&home.0);
         let http = crate::http_client()?;
         let enforced = crate::enforced_manifest(&http, &enrolment.gateway).await?;
