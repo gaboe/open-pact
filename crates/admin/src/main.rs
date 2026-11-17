@@ -491,7 +491,9 @@ impl AppView {
                     Ok(Outcome::Refresh(overview, active)) => {
                         match refresh_step(this.unread_field(), this.draft == this.active, this.active != active) {
                             RefreshStep::Rebuild => {
+                                let edit = (this.active == active).then(|| this.fv.description_edit.take()).flatten();
                                 this.replace_draft(active.clone());
+                                this.fv.description_edit = edit;
                                 this.show_draft(window, cx);
                                 this.build_form(window, cx);
                             }

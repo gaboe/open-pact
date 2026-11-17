@@ -454,9 +454,10 @@ fn plural(count: usize, one: &str, many: &str) -> String {
 
 impl AppView {
     /// Replaces the whole draft, as Setup, Refresh, Apply, Restore and Discard do. The sending
-    /// values that the session remembered belong to the draft before, so they go too.
+    /// values and an open description edit belong to the draft before, so they go too.
     pub fn replace_draft(&mut self, text: String) {
         self.draft = text;
+        self.fv.description_edit = None;
         self.fv.sends_kept.forget();
         self.fv.sends_seen.forget();
     }
