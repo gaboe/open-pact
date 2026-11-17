@@ -16,7 +16,7 @@ use open_pact_core::{DeviceStatus, Schedule};
 use runner::{
     Runner, client,
     desktop::*,
-    engine::{self, Engine, Opened, Reply},
+    engine::{self, Engine, Opened, Reply, owns_progress},
     ownership::{self, OtherCopy},
     status_text::*,
     text::*,
@@ -108,6 +108,10 @@ struct AppView {
     automatic: bool,
     also_terminal: bool,
     busy: bool,
+    /// The number of the operation in flight, or the last one. Each operation's progress loop
+    /// belongs to its own number, because `busy` alone is false and true again within one update
+    /// when a finished operation starts its successor.
+    operation: u64,
     error: Option<String>,
     terminal: bool,
     all_controls: bool,
@@ -145,6 +149,7 @@ impl AppView {
             automatic: false,
             also_terminal: true,
             busy: false,
+            operation: 0,
             error: None,
             terminal: false,
             all_controls: false,
@@ -261,8 +266,9 @@ impl AppView {
                     let session = engine::session(&installed)?;
                     if enabled && cfg!(windows) && system_job {
                         let (runner, log, installed) = (runner, log, installed.clone());
+                        let home = session.home().to_path_buf();
                         engine::blocking(move || {
-                            engine::install_system_job(&runner, &log, &installed)
+                            engine::install_system_job(&runner, &log, &installed, &home)
                         })
                         .await?;
                     } else {
@@ -306,6 +312,8 @@ impl AppView {
             return;
         }
         self.busy = true;
+        self.operation += 1;
+        let mine = self.operation;
         self.error = None;
         self.removal_output = None;
         self.steps.clear();
@@ -320,6 +328,9 @@ impl AppView {
                     .timer(Duration::from_millis(100))
                     .await;
                 let Ok(keep_running) = this.update(cx, |this, cx| {
+                    if !owns_progress(this.operation, mine, this.busy) {
+                        return false;
+                    }
                     let steps = incoming.lock().unwrap_or_else(|e| e.into_inner()).clone();
                     if steps != this.steps {
                         if let Screen::Joining(events) = &mut this.screen {
@@ -328,7 +339,7 @@ impl AppView {
                         this.steps = steps;
                         cx.notify();
                     }
-                    this.busy
+                    true
                 }) else {
                     break;
                 };
@@ -354,14 +365,17 @@ impl AppView {
     fn finish(&mut self, result: Result<Outcome, String>, cx: &mut Context<Self>) {
         match result {
             Ok(Outcome::Opened(None)) => self.screen = Screen::Install,
-            Ok(Outcome::Opened(Some(opened))) => {
-                let resume = resume_join(&opened.status);
+            // An install goes on like an open: a device with join steps still open resumes them.
+            Ok(Outcome::Opened(Some(opened))) | Ok(Outcome::Installed(opened)) => {
+                let resume = opened.resume_join();
+                let warning = opened.warning.clone();
                 self.adopt(opened);
                 if let Some(automatic) = resume {
                     self.run(Operation::Join(String::new(), Vec::new(), automatic), cx);
+                    // Starting an operation clears the error; the warning of the open stays.
+                    self.error = self.error.take().or(warning);
                 }
             }
-            Ok(Outcome::Installed(opened)) => self.adopt(opened),
             Ok(Outcome::Preview(preview)) => {
                 self.automatic = false;
                 self.folders.clear();
@@ -815,10 +829,10 @@ fn snapshots(output: PathBuf) {
     let mut revoked = samples::report(open_pact_client::status::Verdict::ActionNeeded, 2);
     revoked.approval.state = Some(DeviceStatus::Revoked);
     let status = || samples::report(open_pact_client::status::Verdict::ActionNeeded, 2);
-    let copy = OtherCopy {
-        path: "/opt/fictional/bin/open-pact-client".into(),
-        source: ownership::Source::Homebrew,
-    };
+    let copy = OtherCopy::new(
+        "/opt/fictional/bin/open-pact-client".into(),
+        ownership::Source::Homebrew,
+    );
     for (name, screen) in [
         ("client-0-install", Screen::Install),
         ("client-1-invitation", Screen::Invitation),

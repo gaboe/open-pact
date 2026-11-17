@@ -2,8 +2,8 @@
 //! installed. These rules find every other copy and name the command that removes it. Nothing
 //! here removes a file or runs a package manager; the app runs the command when its user clicks.
 
-use crate::shell_quote;
 use crate::update::{Invocation, Platform, shell_invocation};
+use crate::{shell_line, shell_quote};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
@@ -24,6 +24,22 @@ pub enum Source {
 pub struct OtherCopy {
     pub path: PathBuf,
     pub source: Source,
+    /// Homebrew: the `brew` program of the prefix that owns this copy. `None` when no prefix
+    /// was found, and the removal then uses the first `brew` on PATH.
+    pub brew: Option<PathBuf>,
+    /// Scoop: the package that owns this copy. `None` means the standalone package.
+    pub package: Option<String>,
+}
+
+impl OtherCopy {
+    pub fn new(path: PathBuf, source: Source) -> Self {
+        Self {
+            path,
+            source,
+            brew: None,
+            package: None,
+        }
+    }
 }
 
 /// The command that removes an other copy: the line to show, and the process to run.
@@ -69,20 +85,66 @@ pub fn classify(path: &Path, resolved: &Path, brew_roots: &[PathBuf]) -> Source 
     }
 }
 
+/// The `brew` program of the Homebrew prefix that owns the copy at `path` (`resolved` is the
+/// same file after symlinks, inside the Cellar). Every folder above the copy that holds
+/// `bin/brew` is a prefix; the nearest one wins. Two Homebrew installations on one computer
+/// each remove their own package this way, whichever `brew` comes first on PATH.
+pub fn brew_owner(path: &Path, resolved: &Path) -> Option<PathBuf> {
+    [resolved, path].into_iter().find_map(|file| {
+        file.ancestors()
+            .skip(1)
+            .map(|folder| folder.join("bin").join("brew"))
+            .find(|brew| brew.is_file())
+    })
+}
+
+/// The Scoop package that owns a file below `scoop/apps/<package>`.
+pub fn scoop_package(path: &Path) -> Option<String> {
+    let parts = words(path);
+    let at = parts
+        .windows(2)
+        .position(|pair| pair == ["scoop", "apps"])?;
+    parts
+        .get(at + 2)
+        .filter(|name| {
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+        })
+        .cloned()
+}
+
+/// The target of a Scoop shim. Scoop copies a shim program next to a `.shim` text file that names
+/// the real executable, so the shim itself is a file that no link points through.
+pub fn shim_target(contents: &str) -> Option<PathBuf> {
+    contents.lines().find_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        (key.trim() == "path").then(|| PathBuf::from(value.trim().trim_matches('"')))
+    })
+}
+
 /// The command that removes `copy`. A package manager removes its own package, so the app never
 /// deletes a file that a package manager owns.
 pub fn removal(copy: &OtherCopy, platform: Platform) -> Removal {
     match copy.source {
-        Source::Homebrew => Removal {
-            shown: format!("brew uninstall {PACKAGE}"),
-            call: Invocation {
-                program: "brew".into(),
-                args: vec!["uninstall".into(), PACKAGE.into()],
-                env: Vec::new(),
-            },
-        },
+        Source::Homebrew => {
+            let program = copy.brew.as_ref().map_or_else(
+                || "brew".to_owned(),
+                |brew| brew.to_string_lossy().into_owned(),
+            );
+            Removal {
+                shown: shell_line(&[program.as_str(), "uninstall", PACKAGE]),
+                call: Invocation {
+                    program,
+                    args: vec!["uninstall".into(), PACKAGE.into()],
+                    env: Vec::new(),
+                },
+            }
+        }
         Source::Scoop => {
-            let line = format!("scoop uninstall {PACKAGE}");
+            let package = copy.package.as_deref().unwrap_or(PACKAGE);
+            let line = format!("scoop uninstall {package}");
             Removal {
                 call: shell_invocation(platform, &line),
                 shown: line,
@@ -104,7 +166,8 @@ pub fn removal(copy: &OtherCopy, platform: Platform) -> Removal {
 }
 
 /// Every `name` on `path_var` except the files in `own` (the installed copy and the copy
-/// bundled with the app). A file that two PATH entries reach counts once.
+/// bundled with the app). A file that two PATH entries reach counts once. A Scoop shim counts as
+/// the file it names, so the shim of the bundled copy is not another copy.
 pub fn other_copies(
     path_var: &OsStr,
     name: &str,
@@ -112,10 +175,7 @@ pub fn other_copies(
     brew_roots: &[PathBuf],
 ) -> Vec<OtherCopy> {
     let resolve = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let own: Vec<PathBuf> = own
-        .iter()
-        .flat_map(|path| [path.clone(), resolve(path)])
-        .collect();
+    let is_own = |path: &Path| own.iter().any(|own| same_path(own, path));
     let mut seen: Vec<PathBuf> = Vec::new();
     let mut found = Vec::new();
     for directory in std::env::split_paths(path_var) {
@@ -123,13 +183,24 @@ pub fn other_copies(
         if !path.is_file() {
             continue;
         }
-        let resolved = resolve(&path);
-        if own.contains(&path) || own.contains(&resolved) || seen.contains(&resolved) {
+        let shim = std::fs::read_to_string(path.with_extension("shim"))
+            .ok()
+            .and_then(|contents| shim_target(&contents));
+        let target = shim.unwrap_or_else(|| path.clone());
+        let resolved = resolve(&target);
+        if is_own(&path) || is_own(&target) || seen.contains(&resolved) {
             continue;
         }
         seen.push(resolved.clone());
+        let source = classify(&path, &resolved, brew_roots);
         found.push(OtherCopy {
-            source: classify(&path, &resolved, brew_roots),
+            brew: (source == Source::Homebrew)
+                .then(|| brew_owner(&path, &resolved))
+                .flatten(),
+            package: (source == Source::Scoop)
+                .then(|| scoop_package(&resolved).or_else(|| scoop_package(&target)))
+                .flatten(),
+            source,
             path,
         });
     }
@@ -162,13 +233,75 @@ pub fn job_needs_rewrite(
     consented && !system_job && job_executable.is_some_and(|job| !same_path(job, installed))
 }
 
+/// A PowerShell single-quoted string. PowerShell reads the typographic single quotes as quotes
+/// too, so each of them doubles like the plain one.
+fn powershell_literal(text: &str) -> String {
+    let mut quoted = String::from("'");
+    for letter in text.chars() {
+        quoted.push(letter);
+        if matches!(
+            letter,
+            '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}'
+        ) {
+            quoted.push(letter);
+        }
+    }
+    quoted.push('\'');
+    quoted
+}
+
+/// What the elevated PowerShell runs. A process that starts with the `runas` verb gets no
+/// environment from its parent, and a UAC prompt can run it as another administrator. So the
+/// script sets the scan profile itself, and the CLI gets the device home as `--home`. It ends
+/// with the CLI's exit code, and with 1 when the CLI did not run at all.
+fn elevated_script(installed: &Path, home: &Path, profile: &Path) -> String {
+    format!(
+        "$ErrorActionPreference = 'Stop'\n\
+         $env:USERPROFILE = {profile}\n\
+         try {{ & {exe} --home {home} schedule on --system }} catch {{ [Console]::Error.WriteLine($_.Exception.Message); exit 1 }}\n\
+         if ($null -eq $LASTEXITCODE) {{ exit 1 }}\n\
+         exit $LASTEXITCODE",
+        profile = powershell_literal(&profile.to_string_lossy()),
+        exe = powershell_literal(&installed.to_string_lossy()),
+        home = powershell_literal(&home.to_string_lossy()),
+    )
+}
+
+/// The text that `powershell -EncodedCommand` takes: base64 of the script as UTF-16 little endian.
+fn encoded_command(script: &str) -> String {
+    const DIGITS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let mut encoded = String::new();
+    for chunk in bytes.chunks(3) {
+        let word = (u32::from(chunk[0]) << 16)
+            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*chunk.get(2).unwrap_or(&0));
+        for place in 0..4 {
+            if place <= chunk.len() {
+                encoded.push(char::from(
+                    DIGITS[((word >> (18 - 6 * place)) & 63) as usize],
+                ));
+            } else {
+                encoded.push('=');
+            }
+        }
+    }
+    encoded
+}
+
 /// `schedule on --system` in an elevated process, which the user's UAC prompt allows. A library
 /// call cannot elevate, so the app starts the installed copy through PowerShell's `runas` verb
-/// and waits for its exit code.
-pub fn elevated_system_schedule(installed: &Path) -> Invocation {
-    let file = installed.to_string_lossy().replace('\'', "''");
+/// and waits for its exit code. `home` is the device home of the app's session and `profile`
+/// the profile whose repositories the job scans. A cancelled prompt, a launch that fails and a
+/// child without an exit code all end the wrapper with a nonzero exit code.
+pub fn elevated_system_schedule(installed: &Path, home: &Path, profile: &Path) -> Invocation {
+    let child = encoded_command(&elevated_script(installed, home, profile));
     let line = format!(
-        "$run = Start-Process -FilePath '{file}' -ArgumentList 'schedule','on','--system' -Verb RunAs -Wait -PassThru; exit $run.ExitCode"
+        "$ErrorActionPreference = 'Stop'; \
+         try {{ $run = Start-Process -FilePath 'powershell.exe' -ArgumentList '-NoProfile','-NonInteractive','-EncodedCommand','{child}' -Verb RunAs -Wait -PassThru }} \
+         catch {{ [Console]::Error.WriteLine('The administrator process did not start: ' + $_.Exception.Message); exit 1 }}; \
+         if ($null -eq $run -or $null -eq $run.ExitCode) {{ [Console]::Error.WriteLine('The administrator process gave no exit code.'); exit 1 }}; \
+         exit $run.ExitCode"
     );
     shell_invocation(Platform::Windows, &line)
 }
@@ -178,10 +311,7 @@ mod tests {
     use super::*;
 
     fn copy(path: &str, source: Source) -> OtherCopy {
-        OtherCopy {
-            path: PathBuf::from(path),
-            source,
-        }
+        OtherCopy::new(PathBuf::from(path), source)
     }
 
     #[test]
@@ -267,14 +397,198 @@ mod tests {
         assert!(!job_needs_rewrite(Some(brew), installed, true, true));
     }
 
+    const HOME: &str = r"C:\Users\Fictional\.config\open-pact";
+    const PROFILE: &str = r"C:\Users\Fictional";
+
     #[test]
-    fn the_elevated_command_quotes_the_path_and_passes_the_exit_code_on() {
-        let call =
-            elevated_system_schedule(Path::new(r"C:\Users\O'Fictional\open-pact-client.exe"));
+    fn the_elevated_child_gets_the_device_home_and_the_scan_profile() {
+        let script = elevated_script(
+            Path::new(r"C:\Users\O'Fictional\open-pact-client.exe"),
+            Path::new(HOME),
+            Path::new(PROFILE),
+        );
+        assert!(script.contains(r"$env:USERPROFILE = 'C:\Users\Fictional'"));
+        assert!(script.contains(
+            r"& 'C:\Users\O''Fictional\open-pact-client.exe' --home 'C:\Users\Fictional\.config\open-pact' schedule on --system"
+        ));
+        // A typographic quote in a path cannot end the literal early.
+        assert_eq!(powershell_literal("a\u{2019}b"), "'a\u{2019}\u{2019}b'");
+    }
+
+    #[test]
+    fn the_child_script_ends_with_the_cli_exit_code_and_fails_without_one() {
+        let script = elevated_script(Path::new("a.exe"), Path::new(HOME), Path::new(PROFILE));
+        assert!(script.contains("$ErrorActionPreference = 'Stop'"));
+        assert!(
+            script.contains("catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }")
+        );
+        assert!(script.contains("if ($null -eq $LASTEXITCODE) { exit 1 }"));
+        assert!(script.ends_with("exit $LASTEXITCODE"));
+    }
+
+    #[test]
+    fn a_cancelled_or_failed_elevation_ends_the_wrapper_with_a_failure() {
+        let call = elevated_system_schedule(
+            Path::new(r"C:\Users\Fictional\open-pact-client.exe"),
+            Path::new(HOME),
+            Path::new(PROFILE),
+        );
         let line = call.args.last().unwrap();
-        assert!(line.contains(r"'C:\Users\O''Fictional\open-pact-client.exe'"));
-        assert!(line.contains("'schedule','on','--system' -Verb RunAs -Wait -PassThru"));
+        let child = encoded_command(&elevated_script(
+            Path::new(r"C:\Users\Fictional\open-pact-client.exe"),
+            Path::new(HOME),
+            Path::new(PROFILE),
+        ));
+        assert!(line.starts_with("$ErrorActionPreference = 'Stop'"));
+        assert!(line.contains(&format!(
+            "'-EncodedCommand','{child}' -Verb RunAs -Wait -PassThru"
+        )));
+        // A cancelled UAC prompt throws: the wrapper reports it and exits with 1, not 0.
+        assert!(line.contains(
+            "catch { [Console]::Error.WriteLine('The administrator process did not start: '"
+        ));
+        assert!(line.contains("exit 1 }"));
+        // No process or no exit code is a failure too, never a silent `exit $null`.
+        assert!(line.contains("if ($null -eq $run -or $null -eq $run.ExitCode)"));
         assert!(line.ends_with("exit $run.ExitCode"));
+        assert!(!line.contains('"'));
+    }
+
+    #[test]
+    fn the_encoded_command_is_base64_of_utf16() {
+        assert_eq!(encoded_command("dir"), "ZABpAHIA");
+        assert_eq!(encoded_command("Hi"), "SABpAA==");
+        assert_eq!(encoded_command("A"), "QQA=");
+        assert_eq!(encoded_command(""), "");
+    }
+
+    #[test]
+    fn a_shim_names_its_target_and_a_package_owns_its_apps_folder() {
+        let contents = "path = \"C:\\Users\\Fictional\\scoop\\apps\\open-pact-desktop\\current\\open-pact-client.exe\"\r\nargs = --x\r\n";
+        assert_eq!(
+            shim_target(contents),
+            Some(PathBuf::from(
+                r"C:\Users\Fictional\scoop\apps\open-pact-desktop\current\open-pact-client.exe"
+            ))
+        );
+        assert_eq!(shim_target("args = nothing"), None);
+        assert_eq!(
+            scoop_package(Path::new(
+                r"C:\Users\Fictional\Scoop\apps\open-pact\current\x.exe"
+            )),
+            Some("open-pact".to_owned())
+        );
+        assert_eq!(
+            scoop_package(Path::new(r"C:\Users\Fictional\scoop\shims\x.exe")),
+            None
+        );
+    }
+
+    #[test]
+    fn a_scoop_copy_is_removed_by_the_package_that_owns_it() {
+        let mut copy = copy(
+            r"C:\fictional\scoop\shims\open-pact-client.exe",
+            Source::Scoop,
+        );
+        copy.package = Some("open-pact-other".into());
+        assert_eq!(
+            removal(&copy, Platform::Windows).shown,
+            "scoop uninstall open-pact-other"
+        );
+    }
+
+    #[test]
+    fn the_scoop_shim_of_the_bundled_copy_is_not_another_copy() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let make = |relative: &str, text: &str| {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, text).unwrap();
+            path
+        };
+        let bundled = make(
+            "scoop/apps/open-pact-desktop/current/open-pact-client",
+            "fictional",
+        );
+        make("scoop/shims/open-pact-client", "shim program");
+        make(
+            "scoop/shims/open-pact-client.shim",
+            &format!("path = \"{}\"\n", bundled.display()),
+        );
+        let path = std::env::join_paths([root.join("scoop/shims")]).unwrap();
+        assert_eq!(
+            other_copies(
+                &path,
+                "open-pact-client",
+                std::slice::from_ref(&bundled),
+                &[]
+            ),
+            vec![]
+        );
+
+        // A shim of the standalone package is another copy, owned by that package.
+        let standalone = make("scoop/apps/open-pact/current/open-pact-client", "fictional");
+        make(
+            "scoop/shims/open-pact-client.shim",
+            &format!("path = \"{}\"\n", standalone.display()),
+        );
+        let found = other_copies(&path, "open-pact-client", &[bundled], &[]);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].source, Source::Scoop);
+        assert_eq!(found[0].package.as_deref(), Some("open-pact"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn each_homebrew_copy_is_removed_by_the_brew_of_its_own_prefix() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let canonical_root = std::fs::canonicalize(temp.path()).unwrap();
+        let root = canonical_root.as_path();
+        let make = |relative: &str| {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "fictional").unwrap();
+            path
+        };
+        for prefix in ["brew-a", "brew-b"] {
+            make(&format!("{prefix}/bin/brew"));
+            let cellar = make(&format!(
+                "{prefix}/Cellar/open-pact/0.7.1/bin/open-pact-client"
+            ));
+            symlink(&cellar, root.join(prefix).join("bin/open-pact-client")).unwrap();
+        }
+        let installed = make("home/.local/bin/open-pact-client");
+        let path =
+            std::env::join_paths([root.join("brew-a/bin"), root.join("brew-b/bin")]).unwrap();
+        // The first brew on PATH owns only prefix A; `brew --prefix` names that one root.
+        let roots = [std::fs::canonicalize(root.join("brew-a/Cellar/open-pact")).unwrap()];
+        let found = other_copies(
+            &path,
+            "open-pact-client",
+            std::slice::from_ref(&installed),
+            &roots,
+        );
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].brew, Some(root.join("brew-a/bin/brew")));
+        assert_eq!(found[1].brew, Some(root.join("brew-b/bin/brew")));
+        let second = removal(&found[1], Platform::Mac);
+        assert_eq!(
+            second.call.program,
+            root.join("brew-b/bin/brew").to_string_lossy()
+        );
+        assert_eq!(second.call.args, ["uninstall", "open-pact"]);
+        assert!(
+            second
+                .shown
+                .ends_with("brew-b/bin/brew uninstall open-pact")
+        );
+        // After prefix A lost its package, the rescan reports B, and the command names B's brew.
+        std::fs::remove_file(root.join("brew-a/bin/open-pact-client")).unwrap();
+        let rescan = other_copies(&path, "open-pact-client", &[installed], &[]);
+        assert_eq!(rescan.len(), 1);
+        assert_eq!(rescan[0].brew, Some(root.join("brew-b/bin/brew")));
     }
 
     #[cfg(unix)]
@@ -306,14 +620,8 @@ mod tests {
         assert_eq!(
             found,
             vec![
-                OtherCopy {
-                    path: root.join("brew/bin/open-pact-client"),
-                    source: Source::Homebrew
-                },
-                OtherCopy {
-                    path: loose,
-                    source: Source::Other
-                },
+                OtherCopy::new(root.join("brew/bin/open-pact-client"), Source::Homebrew),
+                OtherCopy::new(loose, Source::Other),
             ]
         );
     }

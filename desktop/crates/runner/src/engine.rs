@@ -16,6 +16,15 @@ use tokio::sync::oneshot;
 /// overflow the 1 MiB main stack of Windows. Every thread of the app's runtime gets the same.
 pub const STACK_BYTES: usize = 8 * 1024 * 1024;
 
+/// The progress loop of operation `mine` may write while that operation is the current one and
+/// still runs. An older loop that finds a newer operation stops without writing.
+pub fn owns_progress(current: u64, mine: u64, busy: bool) -> bool {
+    busy && current == mine
+}
+
+/// How long a process that the app starts at launch may run before the app stops it.
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// One call of the library, as the Terminal strip shows it. `result` is `None` while it runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OperationEntry {
@@ -78,9 +87,32 @@ impl<T> Future for Reply<T> {
     }
 }
 
+/// The runtime, which stops without waiting. A runtime that is dropped waits for every blocking
+/// call, such as a process, and the last engine is dropped on the GPUI thread when the window
+/// closes. This one hands its threads off instead, and the process exit ends what still runs.
+struct Background(Option<tokio::runtime::Runtime>);
+
+impl std::ops::Deref for Background {
+    type Target = tokio::runtime::Runtime;
+
+    fn deref(&self) -> &Self::Target {
+        self.0
+            .as_ref()
+            .expect("the runtime lives until it is dropped")
+    }
+}
+
+impl Drop for Background {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.0.take() {
+            runtime.shutdown_background();
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Engine {
-    runtime: Arc<tokio::runtime::Runtime>,
+    runtime: Arc<Background>,
     pub log: OperationLog,
 }
 
@@ -93,7 +125,7 @@ impl Engine {
             .build()
             .map_err(|error| format!("Cannot start the background runtime: {error}"))?;
         Ok(Self {
-            runtime: Arc::new(runtime),
+            runtime: Arc::new(Background(Some(runtime))),
             log: OperationLog::default(),
         })
     }
@@ -153,6 +185,15 @@ pub struct Opened {
     pub warning: Option<String>,
 }
 
+impl Opened {
+    /// The join continues when this device still has steps open, whether the app found the device
+    /// on start or installed its command line tool first. Gives the automatic-sending choice to
+    /// continue with.
+    pub fn resume_join(&self) -> Option<bool> {
+        crate::status_text::resume_join(&self.status)
+    }
+}
+
 /// Whether the installed copy exists and matches the bundled one.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Installed {
@@ -174,6 +215,8 @@ pub fn refresh_installed(
     if !installed.is_file() {
         return Ok(Installed::Missing);
     }
+    // A version check that hangs must not keep the app from ever showing its first screen.
+    let runner = &runner.with_timeout(STARTUP_TIMEOUT);
     let wanted = client::version(runner, bundled)?;
     if client::version(runner, installed).is_ok_and(|found| found == wanted) {
         return Ok(Installed::Current);
@@ -194,7 +237,9 @@ pub fn refresh_installed(
 pub fn find_other_copies(runner: &Runner, installed: &Path, bundled: &Path) -> Vec<OtherCopy> {
     let mut roots = Vec::new();
     if find_on_path("brew").is_some()
-        && let Ok(log) = runner.run(Path::new("brew"), &args(&["--prefix", "open-pact"]))
+        && let Ok(log) = runner
+            .with_timeout(STARTUP_TIMEOUT)
+            .run(Path::new("brew"), &args(&["--prefix", "open-pact"]))
     {
         let prefix = PathBuf::from(log.stdout.trim());
         if !prefix.as_os_str().is_empty() {
@@ -231,20 +276,35 @@ pub fn install_system_job(
     runner: &Runner,
     log: &OperationLog,
     installed: &Path,
+    home: &Path,
 ) -> Result<(), String> {
-    let call = ownership::elevated_system_schedule(installed);
     let place = log.begin("Schedule on --system (administrator)");
-    let result = runner
-        .with_timeout(Duration::from_secs(300))
-        .run(Path::new(&call.program), &call.args)
-        .map(|_| ());
+    let result = system_profile(std::env::var_os("USERPROFILE")).and_then(|profile| {
+        let call = ownership::elevated_system_schedule(installed, home, &profile);
+        runner
+            .with_timeout(Duration::from_secs(300))
+            .run(Path::new(&call.program), &call.args)
+            .map(|_| ())
+    });
     log.finish(
         place,
-        result
-            .clone()
-            .map(|()| "The SYSTEM job runs the installed command line tool".to_owned()),
+        result.clone().map(|()| {
+            "The administrator process finished. The status shows whether the SYSTEM job is confirmed."
+                .to_owned()
+        }),
     );
     result
+}
+
+/// The profile whose repositories the SYSTEM job scans: the one of the user who runs the app.
+fn system_profile(variable: Option<std::ffi::OsString>) -> Result<PathBuf, String> {
+    variable
+        .filter(|profile| !profile.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            "USERPROFILE is not set, so the SYSTEM job cannot know whose repositories it scans."
+                .to_owned()
+        })
 }
 
 /// The status of a device, and the two things the app does for the device it owns: it moves the
@@ -409,6 +469,69 @@ mod tests {
         let engine = Engine::start().unwrap();
         let reply = engine.call("Deep", |_: &u8| String::new(), async { Ok(deep()) });
         assert_eq!(engine.runtime.block_on(reply), Ok(7));
+    }
+
+    /// Closing the window drops the last engine on the GPUI thread. A process that still runs
+    /// on the runtime must not hold that thread.
+    #[test]
+    fn dropping_the_engine_does_not_wait_for_a_running_blocking_call() {
+        let engine = Engine::start().unwrap();
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let (started, running) = std::sync::mpsc::channel::<()>();
+        engine.runtime.spawn_blocking(move || {
+            let _ = started.send(());
+            let _ = wait.recv_timeout(Duration::from_secs(10));
+        });
+        running.recv_timeout(Duration::from_secs(5)).unwrap();
+        let before = std::time::Instant::now();
+        drop(engine);
+        let waited = before.elapsed();
+        let _ = release.send(());
+        assert!(
+            waited < Duration::from_secs(3),
+            "the drop waited {waited:?}"
+        );
+    }
+
+    /// Open finishes and starts Resume join in one update, so `busy` is never false between
+    /// them. Only the operation number tells the old progress loop that it is over.
+    #[test]
+    fn a_progress_loop_stops_when_its_operation_has_a_successor() {
+        assert!(owns_progress(1, 1, true));
+        assert!(!owns_progress(2, 1, true));
+        assert!(owns_progress(2, 2, true));
+        assert!(!owns_progress(2, 2, false));
+    }
+
+    #[test]
+    fn the_system_profile_is_the_profile_of_the_app_user_and_never_a_guess() {
+        assert_eq!(
+            system_profile(Some(r"C:\Users\Fictional".into())),
+            Ok(PathBuf::from(r"C:\Users\Fictional"))
+        );
+        assert!(system_profile(None).is_err());
+        assert!(system_profile(Some("".into())).is_err());
+    }
+
+    /// An install of the command line tool continues the join of a device that is still open,
+    /// as an open of the app does.
+    #[test]
+    fn an_opened_device_with_a_pending_approval_resumes_its_join() {
+        use crate::samples;
+        let mut status = samples::report(open_pact_client::status::Verdict::ActionNeeded, 0);
+        status.approval.state = Some(open_pact_core::DeviceStatus::Pending);
+        let opened = Opened {
+            status,
+            others: Vec::new(),
+            warning: None,
+        };
+        assert_eq!(opened.resume_join(), Some(true));
+        let settled = Opened {
+            status: samples::report_good(),
+            others: Vec::new(),
+            warning: None,
+        };
+        assert_eq!(settled.resume_join(), None);
     }
 
     #[test]
