@@ -176,6 +176,7 @@ Each JSON event has exactly one top-level key, `open_pact`. Its fields are flat.
 | `verdict` | `allow` or `deny`, including enrolment state and certificate-request checks. |
 | `reasons` | Array, empty for allow. |
 | `warnings` | Array, including failures still within grace on an allow verdict. |
+| `access_until` | RFC 3339 UTC time, the end of the VPN certificate that the claim got, or `null` when it got none. |
 | `result_<control id>` | The result exactly as disclosed, with no derived values. For example `result_os_patch_age_days: 31`. |
 
 TLS sends RFC 5424 messages with facility `local0`, severity `informational`, app name `open-pact`, and message ID `status`. The timestamp and hostname in the syslog header are NILVALUE. The JSON body contains the signed claim time. RFC 5425 octet counting prefixes the UTF-8 byte length of the complete syslog message and one space. File output contains only JSON and a newline, without a syslog header or length prefix.

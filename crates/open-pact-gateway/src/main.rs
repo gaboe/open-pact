@@ -12,6 +12,7 @@ mod ratelimit;
 mod results;
 mod seal;
 mod siem;
+mod standing;
 #[cfg(test)]
 mod testdb;
 mod translog;
@@ -29,6 +30,7 @@ use axum::{
     response::{Html, IntoResponse},
     routing::{get, post},
 };
+use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use open_pact_core::{
     Checkpoint, Claim, CsrHash, Decision, Endorsement, EnrolRequest, Entry, EntryKind, Evaluation,
@@ -884,6 +886,7 @@ async fn claim(
                     manifest_hash,
                     chrono::Utc::now(),
                     devices::ClaimResult::Denied,
+                    None,
                     &reasons,
                 )
                 .await
@@ -910,6 +913,7 @@ async fn claim(
     } = evaluate_under(&consented, &app.manifest, claim, now, &first_failures);
     let oversharing = matches!(&decision, Decision::Deny { reasons } if reasons.iter().any(Reason::breaks_disclosure_contract));
     let strings = |rs: &[Reason]| rs.iter().map(ToString::to_string).collect::<Vec<_>>();
+    let nearest_deadline = nearest_grace_deadline(&decision, now);
     let (warnings, decision_reasons) = match &decision {
         Decision::Allow { warnings } => (strings(warnings), vec![]),
         Decision::Deny { reasons } => (vec![], strings(reasons)),
@@ -939,33 +943,41 @@ async fn claim(
         }
     };
     let mut certificate_pem = None;
+    let mut access_until = None;
     if let (true, Some(csr)) = (reasons.is_empty(), csr) {
-        let validity = app
-            .manifest
-            .body()
-            .claim_max_age
-            .min_duration()
-            .map_or(time::Duration::DAY, |max| {
-                time::Duration::seconds(max.num_seconds()).min(time::Duration::DAY)
-            });
-        let cn = claim.device.as_str().trim_start_matches("pseudonym:");
-        match app.keys.ca.issue(csr, cn, validity) {
-            Ok(pem) => certificate_pem = Some(pem),
-            Err(e) => reasons.push(e),
+        let lease = certificate_lease(&consented, &app.manifest, nearest_deadline, now);
+        if lease > chrono::TimeDelta::zero() {
+            let validity = time::Duration::seconds(lease.num_seconds());
+            let cn = claim.device.as_str().trim_start_matches("pseudonym:");
+            match app.keys.ca.issue(csr, cn, validity) {
+                Ok(pem) => {
+                    access_until = Some(keys::certificate_not_after(&pem).map_err(internal)?);
+                    certificate_pem = Some(pem);
+                }
+                Err(e) => reasons.push(e),
+            }
         }
     }
-
     if enrolled {
         grace::save(&mut tx, &claim.device, manifest_hash, &first_failures)
             .await
             .map_err(internal)?;
         let (result, listed) = devices::claim_outcome(&warnings, &reasons, oversharing);
-        devices::record_claim(&mut tx, &claim.device, manifest_hash, now, result, &listed)
-            .await
-            .map_err(internal)?;
+        devices::record_claim(
+            &mut tx,
+            &claim.device,
+            manifest_hash,
+            now,
+            result,
+            access_until,
+            &listed,
+        )
+        .await
+        .map_err(internal)?;
     }
     if enrolled && !oversharing {
-        let payload = stored_claim(claim, certificate_pem.as_deref()).map_err(internal)?;
+        let payload =
+            stored_claim(claim, certificate_pem.as_deref(), access_until).map_err(internal)?;
         claims::store(
             &mut tx,
             &app.kek,
@@ -984,7 +996,13 @@ async fn claim(
         && !oversharing
         && let Some(exporter) = &app.siem
     {
-        exporter.submit(siem::event(&consented, claim, &reasons, &warnings));
+        exporter.submit(siem::event(
+            &consented,
+            claim,
+            &reasons,
+            &warnings,
+            access_until,
+        ));
     }
     if !reasons.is_empty() {
         return Err(denied(reasons));
@@ -1028,7 +1046,11 @@ fn consented_manifest(
 
 /// The claim as the company keeps it, with the fingerprint of the certificate issued for it. The
 /// client's `trust_level` is kept as `asserted_trust_level`, next to the level the gateway verified.
-fn stored_claim(claim: &Claim, certificate_pem: Option<&str>) -> anyhow::Result<Value> {
+fn stored_claim(
+    claim: &Claim,
+    certificate_pem: Option<&str>,
+    access_until: Option<DateTime<Utc>>,
+) -> anyhow::Result<Value> {
     let mut payload = serde_json::to_value(claim)?;
     let fields = payload.as_object_mut().expect("a claim is a JSON object");
     let asserted = fields.remove("trust_level");
@@ -1040,7 +1062,51 @@ fn stored_claim(claim: &Claim, certificate_pem: Option<&str>) -> anyhow::Result<
     if let Some(pem) = certificate_pem {
         payload["certificate_sha256"] = keys::certificate_sha256(pem)?.into();
     }
+    if let Some(until) = access_until {
+        payload["certificate_not_after"] = results::stamp(until).into();
+    }
     Ok(payload)
+}
+
+/// The VPN certificate lifetime of a claim accepted now. The schedule is the one the device signed,
+/// which the device runs. `claim_max_age` is the enforced manifest's, as before.
+fn certificate_lease(
+    consented: &Manifest,
+    enforced: &Manifest,
+    nearest_deadline: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> chrono::TimeDelta {
+    open_pact_core::vpn_lease(
+        consented.body().schedule.as_ref(),
+        &enforced.body().claim_max_age,
+        nearest_deadline,
+        now,
+    )
+}
+
+/// When the first warning of an accepted claim turns into a denial. None when no warning has a
+/// grace that ends.
+fn nearest_grace_deadline(
+    decision: &open_pact_core::Decision,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let open_pact_core::Decision::Allow { warnings } = decision else {
+        return None;
+    };
+    warnings
+        .iter()
+        .filter_map(|reason| match reason {
+            open_pact_core::Reason::NotAccepted { grace, .. }
+            | open_pact_core::Reason::Failed { grace, .. }
+            | open_pact_core::Reason::Unknown { grace, .. } => match grace {
+                open_pact_core::Grace::Left(left) if *left != chrono::TimeDelta::MAX => {
+                    Some(now + *left)
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .min()
 }
 
 async fn index(Extension(app): Extension<App>) -> Result<Html<String>, Reply> {
@@ -2459,6 +2525,181 @@ grace = "1d"
             .fetch_one(db)
             .await
             .unwrap()
+    }
+
+    fn demo_with(replacements: &[(&str, &str)]) -> Manifest {
+        let mut toml = DEMO.to_string();
+        for (from, to) in replacements {
+            assert!(toml.contains(from), "{from} is not in the demo");
+            toml = toml.replacen(from, to, 1);
+        }
+        Manifest::parse(toml.as_bytes()).unwrap()
+    }
+
+    fn at(text: &str) -> DateTime<Utc> {
+        text.parse().unwrap()
+    }
+
+    /// The demo sends every 55 minutes on the VPN, so its certificate lasts 110 minutes.
+    #[test]
+    fn the_certificate_lasts_twice_the_vpn_interval() {
+        let now = at("2026-11-17T09:00:00Z");
+        let demo = demo_with(&[]);
+        assert_eq!(
+            certificate_lease(&demo, &demo, None, now),
+            chrono::TimeDelta::minutes(110)
+        );
+    }
+
+    #[test]
+    fn claim_max_age_bounds_the_certificate() {
+        let now = at("2026-11-17T09:00:00Z");
+        let short = demo_with(&[("claim_max_age = \"24h\"", "claim_max_age = \"1h\"")]);
+        assert_eq!(
+            certificate_lease(&short, &short, None, now),
+            chrono::TimeDelta::hours(1)
+        );
+    }
+
+    #[test]
+    fn a_day_bounds_the_certificate() {
+        let now = at("2026-11-17T09:00:00Z");
+        let long = demo_with(&[
+            ("claim_max_age = \"24h\"", "claim_max_age = \"7d\""),
+            ("interval = \"55m\"", "interval = \"24h\""),
+        ]);
+        assert_eq!(
+            certificate_lease(&long, &long, None, now),
+            chrono::TimeDelta::hours(24)
+        );
+    }
+
+    #[test]
+    fn the_nearest_grace_deadline_bounds_the_certificate() {
+        let now = at("2026-11-17T09:00:00Z");
+        let demo = demo_with(&[]);
+        let deadline = now + chrono::TimeDelta::minutes(25);
+        assert_eq!(
+            certificate_lease(&demo, &demo, Some(deadline), now),
+            chrono::TimeDelta::minutes(25)
+        );
+        assert_eq!(
+            certificate_lease(&demo, &demo, Some(now), now),
+            chrono::TimeDelta::zero(),
+            "a deadline that has come gives no certificate"
+        );
+    }
+
+    #[test]
+    fn a_manifest_without_a_schedule_gives_claim_max_age_up_to_a_day() {
+        let now = at("2026-11-17T09:00:00Z");
+        let head = DEMO.split("\n[schedule]").next().unwrap();
+        let without = Manifest::parse(head.as_bytes()).unwrap();
+        assert_eq!(
+            certificate_lease(&without, &without, None, now),
+            chrono::TimeDelta::hours(24)
+        );
+    }
+
+    #[test]
+    fn the_warning_that_runs_out_first_sets_the_deadline() {
+        let now = at("2026-11-17T09:00:00Z");
+        let warning = |grace: open_pact_core::Grace| open_pact_core::Reason::NotAccepted {
+            id: "firewall".into(),
+            grace,
+        };
+        let left = |length: chrono::TimeDelta| open_pact_core::Grace::Left(length);
+        let allowed = open_pact_core::Decision::Allow {
+            warnings: vec![
+                warning(left(chrono::TimeDelta::hours(3))),
+                warning(left(chrono::TimeDelta::minutes(40))),
+            ],
+        };
+        assert_eq!(
+            nearest_grace_deadline(&allowed, now),
+            Some(now + chrono::TimeDelta::minutes(40))
+        );
+        let endless = open_pact_core::Decision::Allow {
+            warnings: vec![warning(left(chrono::TimeDelta::MAX))],
+        };
+        assert_eq!(nearest_grace_deadline(&endless, now), None);
+        let clean = open_pact_core::Decision::Allow { warnings: vec![] };
+        assert_eq!(nearest_grace_deadline(&clean, now), None);
+        let denied = open_pact_core::Decision::Deny {
+            reasons: vec![warning(left(chrono::TimeDelta::minutes(1)))],
+        };
+        assert_eq!(nearest_grace_deadline(&denied, now), None);
+    }
+
+    /// Sends a claim under DEMO with a certificate request, after it sets `results`.
+    async fn send_with_csr(
+        app: &Router,
+        owned: &Owned,
+        results: &[(&str, &str)],
+    ) -> (StatusCode, Value) {
+        let mut claim = claim_under(app, &owned.device, DEMO).await;
+        for (id, value) in results {
+            claim.results.insert(id.to_string(), (*value).into());
+        }
+        let (pem, der) = bare_csr();
+        claim.csr_sha256 = Some(CsrHash::of(&der));
+        let jws = open_pact_core::sign_claim(&claim, &owned.device).unwrap();
+        post_json(app, "/v1/claim", &json!({"jws": jws, "csr_pem": pem})).await
+    }
+
+    fn certificate_end(body: &Value) -> DateTime<Utc> {
+        keys::certificate_not_after(body["certificate_pem"].as_str().expect("a certificate"))
+            .unwrap()
+    }
+
+    /// A clean claim gets a certificate for twice the VPN interval. A failing control inside its
+    /// grace gets one that ends at the grace deadline, and the device row keeps that end.
+    #[tokio::test]
+    #[ignore = "needs TEST_DATABASE_URL"]
+    async fn a_certificate_ends_at_twice_the_vpn_interval_or_at_the_grace_deadline() {
+        let (app, db) = test_app_with(DEMO, 10, 100).await;
+        let owned = device_on(&db, DEMO).await;
+
+        let (status, body) = send_with_csr(&app, &owned, &[]).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let left = certificate_end(&body) - chrono::Utc::now();
+        assert!(
+            left > chrono::TimeDelta::minutes(109) && left <= chrono::TimeDelta::minutes(110),
+            "a clean claim: {left}"
+        );
+
+        let (status, body) = send_with_csr(&app, &owned, &[("firewall", "off")]).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            body["warnings"].to_string().contains("access ends in"),
+            "{body}"
+        );
+        let left = certificate_end(&body) - chrono::Utc::now();
+        assert!(
+            left > chrono::TimeDelta::minutes(109) && left <= chrono::TimeDelta::minutes(110),
+            "a warning with a day of grace left still gets the interval: {left}"
+        );
+
+        sqlx::query(
+            "UPDATE control_failures SET first_failed_at = now() - interval '23 hours 30 minutes'",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let (status, body) = send_with_csr(&app, &owned, &[("firewall", "off")]).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let left = certificate_end(&body) - chrono::Utc::now();
+        assert!(
+            left > chrono::TimeDelta::minutes(29) && left <= chrono::TimeDelta::minutes(30),
+            "the grace deadline is 30 minutes away: {left}"
+        );
+        let stored: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT last_access_until FROM devices WHERE pseudonym = $1")
+                .bind(owned.pseudonym.as_str())
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(stored, Some(certificate_end(&body)));
     }
 
     /// The gateway runs B, which adds a required control with grace 1d, and holds no copy of A.

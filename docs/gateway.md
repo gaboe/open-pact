@@ -101,7 +101,7 @@ kubectl exec deploy/pact-gateway -- open-pact-gateway status --json
   "last_reasons": ["os_patch_age_days = 40, <= 30 required, access ends in 24h"]}]
 ```
 
-`code` is the first 12 hex digits of the pseudonym, which `devices approve` takes. `note` is the invitation note, empty when there is none. `last_claim_at`, `last_result` and `last_reasons` are the gateway's decision on the last claim of this enrolment. `last_result` is `accepted`, `accepted_with_warnings` or `denied`. `last_reasons` holds the warnings of an accepted claim or the reasons of a denied one, and is empty for a clean accepted claim. A device that never sent a claim has `null` in `last_claim_at` and `last_result` and `[]` in `last_reasons`. The gateway writes them in the transaction that decides the claim, as plain columns of the `devices` table. A claim that carries data the manifest does not allow is not stored, and its reasons can quote that data, so its `last_reasons` is the one line "the claim disclosed more than the manifest allows".
+`code` is the first 12 hex digits of the pseudonym, which `devices approve` takes. `note` is the invitation note, empty when there is none. `last_claim_at`, `last_result` and `last_reasons` are the gateway's decision on the last claim of this enrolment. `last_result` is `accepted`, `accepted_with_warnings` or `denied`. `last_reasons` holds the warnings of an accepted claim or the reasons of a denied one, and is empty for a clean accepted claim. A device that never sent a claim has `null` in `last_claim_at` and `last_result` and `[]` in `last_reasons`. The gateway writes them in the transaction that decides the claim, as plain columns of the `devices` table. A claim that carries data the manifest does not allow is not stored, and its reasons can quote that data, so its `last_reasons` is the one line "the claim disclosed more than the manifest allows". The gateway also writes `last_access_until`, the end of the certificate that the last claim got, in the same transaction. It is null after a denial. `claims list` and `claims show` read it to derive a standing.
 
 `invite --json` prints `{"invitation": "opi1:…", "expires_at": "2026-11-05T10:00:00Z", "company_key_fingerprint": "sha256:…", "note": "Example laptop"}` and nothing on stderr.
 
@@ -113,6 +113,19 @@ kubectl exec deploy/pact-gateway -- open-pact-gateway status --json
 ```
 
 `manifest_source` is `database`, `file` for `MANIFEST_PATH`, or `builtin` for the image's example manifest. `manifest_version` is the active database version, or `null` for either file source. `devices` counts distinct pseudonyms per state. Without `--json`, `status` prints the same facts as text.
+
+## VPN certificate lifetime
+
+An accepted claim gets a VPN client certificate. Its end is the earliest of these limits:
+
+- Twice the send interval on the VPN. With both `[schedule.vpn]` and `[schedule.always]`, the shorter interval counts. The gateway uses the schedule that the device signed, because the device runs that one.
+- `claim_max_age` of the enforced manifest.
+- 24 hours.
+- The nearest grace deadline of a failing control. A claim accepted with a warning gets a certificate that ends when the warned grace runs out.
+
+A manifest without a schedule has no interval limit. A claim with no time left under these limits gets no certificate. The gateway writes the end into the certificate, and it keeps the same end with the claim as `certificate_not_after`.
+
+The gateway does not revoke a certificate before its end. A device that stops being compliant keeps VPN access until the certificate ends, and it gets no new certificate. A shorter `claim_max_age` shortens every certificate. How long a live tunnel stays up after its certificate ends depends on the VPN product, so check its re-authentication setting.
 
 ## Read results
 
@@ -133,17 +146,29 @@ kubectl exec deploy/pact-gateway -- open-pact-gateway claims show 4812 --json
 ```json
 {"claims": [{"id": 4812, "received_at": "2026-11-03T08:15:00Z", "device": "pseudonym:0123…",
              "device_note": "Example laptop", "manifest_hash": "sha256:…", "result": "warnings",
-             "failed_controls": ["os_patch_age_days"]}],
+             "failed_controls": ["os_patch_age_days"], "access_until": "2026-11-03T10:05:00Z", "standing": "lapsed"}],
  "unreadable": 0}
 ```
 
-`device_note` is the invitation note of the device, empty when it has none. `failed_controls` lists the required controls that do not pass, inside their grace or not. `unreadable` counts the claims the command met that it cannot open, because retention deleted the key of their month. No filter applies to them.
+`device_note` is the invitation note of the device, empty when it has none.
+
+`access_until` is the end of the VPN certificate that this claim got, in RFC 3339. It is `null` for a denied claim, for a claim without a certificate, and for a claim stored before this version. It stays the claim's own end even after the device has a newer claim.
+
+`standing` describes the device when the command runs, so every claim of one device shows the same value. It is one of these values:
+
+- `current`: the last claim was accepted, and its certificate has not ended.
+- `lapsed`: the last claim was accepted, its certificate has ended, and no newer claim renewed it.
+- `denied`: the last claim was denied.
+- `silent`: the last claim is older than twice the send interval, or the device never claimed. Without a schedule in the manifest, a device with a claim is never silent.
+
+The command derives the standing from the device's last decision and the clock. No job stores it, and no certificate is revoked for it. `failed_controls` lists the required controls that do not pass, inside their grace or not. `unreadable` counts the claims the command met that it cannot open, because retention deleted the key of their month. No filter applies to them.
 
 `claims show <id>` prints one claim with every control of the manifest it was made under:
 
 ```json
 {"id": 4812, "received_at": "2026-11-03T08:15:00Z", "device": "pseudonym:0123…", "device_note": "Example laptop",
  "manifest_hash": "sha256:…", "os": "linux", "client_version": "0.6.0", "trust_level": "L0", "result": "warnings",
+ "access_until": "2026-11-03T10:05:00Z", "standing": "lapsed",
  "controls": [{"id": "os_patch_age_days", "value": 40, "required": "<= 30", "status": "fail", "grace": "1d",
                "first_failed_at": "2026-11-02T08:15:00Z", "deadline": "2026-11-03T08:15:00Z"}]}
 ```
@@ -189,7 +214,7 @@ New Unix files use mode `0600` by default. The `GATEWAY_SIEM_FILE_MODE` setting 
 
 For Helm, set `siem.enabled=true`, `siem.syslogUrl`, `siem.caSecret.name`, and `siem.retentionDays`. The Secret key defaults to `ca.pem`. The chart mounts the CA read-only. Restart the gateway after you change the CA Secret. The chart exposes `siem.fileMode`, but its built-in sink uses TLS. `fileMode` applies only to a separately configured file sink.
 
-The gateway exports one event after each committed claim evaluation from an enrolled device. Events include allow and deny verdicts, including pending, approved, and revoked devices. Invalid claims and failed database commits produce no event. Events contain the pseudonym, manifest hash, OS, verdict, reasons, warnings, trust levels, and declared results. They do not contain raw logs, keys, nonces, JWS values, certificate requests, certificates, or source addresses.
+The gateway exports one event after each committed claim evaluation from an enrolled device. Events include allow and deny verdicts, including pending, approved, and revoked devices. Invalid claims and failed database commits produce no event. Events contain the pseudonym, manifest hash, OS, verdict, reasons, warnings, trust levels, and declared results. Each event also carries `access_until`, the end of the VPN certificate that the claim got, or `null` when the claim got none. They do not contain raw logs, keys, nonces, JWS values, certificate requests, certificates, or source addresses.
 
 TLS output uses RFC 5424 syslog with RFC 5425 octet counting. File output is one JSON object per line. The queue holds at most 1024 events. It drops the oldest event on overflow and logs a change in the drop count once per minute. Check gateway logs for drop warnings. No metrics endpoint exposes the drop count. The queue is in memory, so a restart loses queued events. Retries can create duplicate events. A successful TLS write does not confirm SIEM ingestion.
 

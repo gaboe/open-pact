@@ -1,4 +1,5 @@
 use anyhow::Context;
+use chrono::{DateTime, Utc};
 use open_pact_core::{SigningKey, dev_key};
 use rcgen::{
     BasicConstraints, CertificateParams, CertificateSigningRequestParams, DistinguishedName,
@@ -88,6 +89,17 @@ impl Keys {
             ca: Ca::new(ca_cert, KeyPair::from_pem(&ca_key)?)?,
         })
     }
+}
+
+/// The end of a certificate, as the certificate itself states it.
+pub fn certificate_not_after(pem: &str) -> anyhow::Result<DateTime<Utc>> {
+    use x509_parser::prelude::{FromDer, X509Certificate};
+    let (_, pem) = x509_parser::pem::parse_x509_pem(pem.as_bytes())
+        .map_err(|e| anyhow::anyhow!("certificate is not PEM: {e}"))?;
+    let (_, cert) = X509Certificate::from_der(&pem.contents)
+        .map_err(|e| anyhow::anyhow!("certificate is not X.509: {e}"))?;
+    DateTime::from_timestamp(cert.validity().not_after.timestamp(), 0)
+        .context("certificate end is out of range")
 }
 
 fn common_name(cn: &str) -> DistinguishedName {
@@ -349,6 +361,26 @@ mod tests {
             "a wrong KEK must not load or replace the keys"
         );
         assert_eq!(stored(&db).await, resealed);
+    }
+
+    #[test]
+    fn the_stored_end_is_the_end_the_certificate_states() {
+        let ca = ca();
+        let before = chrono::Utc::now();
+        let issued = ca
+            .issue(
+                &csr(&KeyPair::generate().unwrap()),
+                "abc",
+                Duration::minutes(20),
+            )
+            .unwrap();
+        let lifetime = certificate_not_after(&issued).unwrap() - before;
+        // Certificate times have whole seconds, so the end can fall up to one second early.
+        assert!(
+            lifetime >= chrono::TimeDelta::seconds(1199)
+                && lifetime <= chrono::TimeDelta::minutes(21),
+            "{lifetime}"
+        );
     }
 
     #[test]

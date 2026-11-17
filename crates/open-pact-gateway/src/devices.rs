@@ -281,24 +281,27 @@ pub fn claim_outcome(
 }
 
 /// Records the last claim decision of the enrolment `device` holds under `manifest`, in the
-/// transaction that decides the claim.
+/// transaction that decides the claim. `access_until` is the end of the certificate the claim got,
+/// None when it got none.
 pub async fn record_claim(
     conn: &mut PgConnection,
     device: &Pseudonym,
     manifest: &str,
     at: DateTime<Utc>,
     result: ClaimResult,
+    access_until: Option<DateTime<Utc>>,
     reasons: &[String],
 ) -> anyhow::Result<()> {
     sqlx::query(
-        "UPDATE devices SET last_claim_at = $3, last_result = $4, last_reasons = $5 \
-         WHERE pseudonym = $1 AND manifest_hash = $2",
+        "UPDATE devices SET last_claim_at = $3, last_result = $4, last_reasons = $5, \
+         last_access_until = $6 WHERE pseudonym = $1 AND manifest_hash = $2",
     )
     .bind(device.as_str())
     .bind(manifest)
     .bind(at)
     .bind(result.as_str())
     .bind(reasons)
+    .bind(access_until)
     .execute(conn)
     .await?;
     Ok(())
