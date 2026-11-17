@@ -1,4 +1,5 @@
 mod accept;
+mod builtins;
 mod claim;
 mod crypto;
 pub mod dev_key;
@@ -14,6 +15,7 @@ mod own_entries;
 mod witness;
 
 pub use accept::{AcceptRequest, accept_statement};
+pub use builtins::{BUILTINS, LATER_VERSIONS, builtin_about, builtin_defaults, check_supported};
 pub use claim::{
     Claim, LogCheckpoint, VerifiedClaim, Virtualized, sign_claim, sign_claim_with, verify_claim,
 };

@@ -1488,7 +1488,7 @@ fn write_summary(
             if let Some(why) = c
                 .description
                 .as_deref()
-                .or_else(|| checks::builtin_about(&c.check))
+                .or_else(|| open_pact_core::builtin_about(&c.check))
             {
                 writeln!(output, "    {:<width$}  why: {why}", "")?;
             }
@@ -1539,7 +1539,7 @@ struct BuiltinEntry<'a> {
 /// The built-in checks this client runs with their default text, in BUILTINS order: one line per
 /// check, or with `json` one array.
 fn manifest_builtins(json: bool) -> Result<String> {
-    let entries: Vec<BuiltinEntry> = checks::builtin_defaults()
+    let entries: Vec<BuiltinEntry> = open_pact_core::builtin_defaults()
         .map(|(id, version, about)| BuiltinEntry {
             check: format!("builtin:{id}@{version}"),
             id,
@@ -3310,7 +3310,7 @@ async fn join(
             mismatch.replace(" changed: pinned ", " differs: the invitation names ")
         );
     }
-    checks::check_supported(&manifest).map_err(|e| {
+    open_pact_core::check_supported(&manifest).map_err(|e| {
         anyhow::anyhow!("{e}; refusing to show or sign this manifest. Nothing was sent")
     })?;
     let saved_enrolment_matches = saved_enrolment
@@ -4062,7 +4062,7 @@ async fn accept(home: &Home, yes: bool, insecure_dev: bool) -> Result<ExitCode> 
     if old.hash() != &enrolment.manifest && !resumed {
         bail!("manifest.toml no longer matches the hash you signed");
     }
-    checks::check_supported(&new).map_err(|e| {
+    open_pact_core::check_supported(&new).map_err(|e| {
         anyhow::anyhow!("{e}; refusing to show or sign this manifest. Nothing was sent")
     })?;
     let checkpoint =
@@ -4219,7 +4219,7 @@ async fn accept_preview(home: &Home, insecure_dev: bool) -> Result<AcceptPreview
     if old.hash() != &enrolment.manifest {
         bail!("manifest.toml no longer matches the hash you signed");
     }
-    checks::check_supported(&new).map_err(|e| {
+    open_pact_core::check_supported(&new).map_err(|e| {
         anyhow::anyhow!("{e}; refusing to show or sign this manifest. Nothing was sent")
     })?;
     if let Err(error) = sync_checkpoint_with(
@@ -4337,7 +4337,7 @@ async fn join_preview(
     let log = get_text(&http, format!("{}/v1/log/key", base(gateway))).await?;
     let fingerprint = published.company.key.fingerprint();
     let matches = wanted.differs(&fingerprint, &log).is_none();
-    checks::check_supported(&manifest).map_err(|e| {
+    open_pact_core::check_supported(&manifest).map_err(|e| {
         anyhow::anyhow!("{e}; refusing to show or sign this manifest. Nothing was sent")
     })?;
     let os = current_os()?;
@@ -9455,8 +9455,8 @@ grace = "1d"
     fn manifest_builtins_json_is_one_entry_per_builtin_in_order() {
         let text = manifest_builtins(true).unwrap();
         let entries: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
-        assert_eq!(entries.len(), checks::builtin_defaults().count());
-        let (id, version, about) = checks::builtin_defaults().next().unwrap();
+        assert_eq!(entries.len(), open_pact_core::builtin_defaults().count());
+        let (id, version, about) = open_pact_core::builtin_defaults().next().unwrap();
         assert!(text.starts_with(&format!(
             r#"[{{"check":"builtin:{id}@{version}","id":"{id}","about":"#
         )));
@@ -9475,8 +9475,8 @@ grace = "1d"
     fn manifest_builtins_text_prints_the_check_then_its_text_on_one_line() {
         let text = manifest_builtins(false).unwrap();
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), checks::builtin_defaults().count());
-        let (id, version, about) = checks::builtin_defaults().next().unwrap();
+        assert_eq!(lines.len(), open_pact_core::builtin_defaults().count());
+        let (id, version, about) = open_pact_core::builtin_defaults().next().unwrap();
         assert_eq!(lines[0], format!("builtin:{id}@{version}  {about}"));
     }
 
@@ -9488,7 +9488,7 @@ grace = "1d"
             write_summary(&mut output, &manifest, "sha256:fictional", Os::Macos).unwrap();
             String::from_utf8(output).unwrap()
         };
-        let firewall = checks::builtin_about("builtin:firewall@1").unwrap();
+        let firewall = open_pact_core::builtin_about("builtin:firewall@1").unwrap();
         assert!(summary(&demo_manifest()).contains(&format!("why: {firewall}\n")));
         let owner_words = demo_manifest().replace(
             "check = \"builtin:firewall@1\"",

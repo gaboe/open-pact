@@ -27,7 +27,7 @@ fn problems(bytes: &[u8]) -> Vec<Problem> {
         Ok(manifest) => manifest,
         Err(error) => return vec![core_problem(bytes, &error)],
     };
-    match crate::checks::check_supported(&manifest) {
+    match open_pact_core::check_supported(&manifest) {
         Ok(()) => Vec::new(),
         Err(message) => vec![Problem {
             message,

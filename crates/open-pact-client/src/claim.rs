@@ -180,7 +180,7 @@ pub(crate) async fn prepare(
             &enrolment.manifest,
         ));
     }
-    crate::checks::check_supported(&manifest)
+    open_pact_core::check_supported(&manifest)
         .map_err(|e| anyhow::anyhow!("{e}; nothing was run or sent"))?;
     let scan = if !can_scan_repositories {
         None

@@ -1,6 +1,6 @@
 # Platform support
 
-This page lists the built-in controls in `crates/open-pact-client/src/checks/mod.rs`. Each row gives the result type or the source that the client reads. A failed read returns `unknown` unless the table says `n/a`.
+This page lists the built-in controls. The catalog is in `crates/open-pact-core/src/builtins.rs`, and the checks that run them are in `crates/open-pact-client/src/checks/mod.rs`. Each row gives the result type or the source that the client reads. A failed read returns `unknown` unless the table says `n/a`.
 
 | Control | macOS | Windows | Linux | Required privilege |
 | --- | --- | --- | --- | --- |
