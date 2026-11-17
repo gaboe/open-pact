@@ -234,6 +234,12 @@ enum ManifestCommand {
         #[arg(long)]
         json: bool,
     },
+    /// List the built-in checks this client runs, with their default text. Needs no home or network
+    Builtins {
+        /// Print one JSON array: each check, its id and its default text
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1479,7 +1485,11 @@ fn write_summary(
                     ""
                 )?;
             }
-            if let Some(why) = &c.description {
+            if let Some(why) = c
+                .description
+                .as_deref()
+                .or_else(|| checks::builtin_about(&c.check))
+            {
                 writeln!(output, "    {:<width$}  why: {why}", "")?;
             }
             writeln!(output, "    {:<width$}  reports: {}", "", c.output)?;
@@ -1516,6 +1526,33 @@ fn print_summary(manifest: &Manifest, company_fingerprint: &str, os: Os) -> Resu
     write_summary(&mut text, manifest, company_fingerprint, os)?;
     print!("{}", String::from_utf8(text)?);
     Ok(())
+}
+
+/// One built-in check in `manifest builtins --json`. The fields print in this order.
+#[derive(Serialize)]
+struct BuiltinEntry<'a> {
+    check: String,
+    id: &'a str,
+    about: &'a str,
+}
+
+/// The built-in checks this client runs with their default text, in BUILTINS order: one line per
+/// check, or with `json` one array.
+fn manifest_builtins(json: bool) -> Result<String> {
+    let entries: Vec<BuiltinEntry> = checks::builtin_defaults()
+        .map(|(id, version, about)| BuiltinEntry {
+            check: format!("builtin:{id}@{version}"),
+            id,
+            about,
+        })
+        .collect();
+    if json {
+        return Ok(format!("{}\n", serde_json::to_string(&entries)?));
+    }
+    Ok(entries
+        .iter()
+        .map(|entry| format!("{}  {}\n", entry.check, entry.about))
+        .collect())
 }
 
 fn manifest_show(home: &Home) -> Result<String> {
@@ -4603,6 +4640,13 @@ async fn run(cli: Cli) -> Result<ExitCode> {
     {
         return manifest_check::run(*json);
     }
+    if let Command::Manifest {
+        command: ManifestCommand::Builtins { json },
+    } = &cli.command
+    {
+        std::io::stdout().write_all(manifest_builtins(*json)?.as_bytes())?;
+        return Ok(ExitCode::SUCCESS);
+    }
     let home = Home::new(cli.home)?;
     #[cfg(windows)]
     if recovers_vpn_first(&cli.command) {
@@ -4726,7 +4770,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Manifest {
-            command: ManifestCommand::Check { .. },
+            command: ManifestCommand::Check { .. } | ManifestCommand::Builtins { .. },
         } => unreachable!("handled before the home is read"),
         Command::Schedule { command } => {
             schedule::run(&home, command).await?;
@@ -9405,6 +9449,54 @@ grace = "1d"
             ]
         );
         assert!(manifest_changes(&old, &old).is_empty());
+    }
+
+    #[test]
+    fn manifest_builtins_json_is_one_entry_per_builtin_in_order() {
+        let text = manifest_builtins(true).unwrap();
+        let entries: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
+        assert_eq!(entries.len(), checks::builtin_defaults().count());
+        let (id, version, about) = checks::builtin_defaults().next().unwrap();
+        assert!(text.starts_with(&format!(
+            r#"[{{"check":"builtin:{id}@{version}","id":"{id}","about":"#
+        )));
+        assert_eq!(
+            entries[0],
+            serde_json::json!({"check": format!("builtin:{id}@{version}"), "id": id, "about": about})
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.as_object().unwrap().len() == 3)
+        );
+    }
+
+    #[test]
+    fn manifest_builtins_text_prints_the_check_then_its_text_on_one_line() {
+        let text = manifest_builtins(false).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), checks::builtin_defaults().count());
+        let (id, version, about) = checks::builtin_defaults().next().unwrap();
+        assert_eq!(lines[0], format!("builtin:{id}@{version}  {about}"));
+    }
+
+    #[test]
+    fn the_review_summary_shows_the_default_text_of_a_builtin_without_a_description() {
+        let summary = |toml: &str| {
+            let manifest = Manifest::parse(toml.as_bytes()).unwrap();
+            let mut output = Vec::new();
+            write_summary(&mut output, &manifest, "sha256:fictional", Os::Macos).unwrap();
+            String::from_utf8(output).unwrap()
+        };
+        let firewall = checks::builtin_about("builtin:firewall@1").unwrap();
+        assert!(summary(&demo_manifest()).contains(&format!("why: {firewall}\n")));
+        let owner_words = demo_manifest().replace(
+            "check = \"builtin:firewall@1\"",
+            "check = \"builtin:firewall@1\"\ndescription = \"Our own words.\"",
+        );
+        let with_description = summary(&owner_words);
+        assert!(with_description.contains("why: Our own words.\n"));
+        assert!(!with_description.contains(firewall));
     }
 
     #[test]

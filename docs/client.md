@@ -133,6 +133,8 @@ open-pact-client manifest check --json < manifest.toml
 
 It prints `Manifest is valid.` and exits 0, or prints one line per error and exits 1. Wrong arguments exit 2. With `--json`, stdout holds one document: `{"ok":true,"errors":[]}`, or `{"ok":false,"errors":[{"message":"...","line":12,"key":"log.witness_quorum"}]}`. `line` is the 1-based line of a TOML error, and `key` is the manifest key a rule error names. Each is `null` when the error has none. A draft that passes can still need a newer client if it uses a builtin that the client in your hand does not have.
 
+`open-pact-client manifest builtins` lists each built-in check that this client runs, with its default text: one line per check, the check name such as `builtin:firewall@1`, two spaces, then the text. With `--json` it prints one array of objects with `check`, `id` and `about`. The default text lives only in the client. A control's `description` in the manifest replaces it in the manifest summary, and the apps read the default from this command.
+
 ### Accept a changed manifest
 
 When the company changes the manifest, `check` prints a line that names the new hash and asks you to run `accept`. The device keeps its approval and VPN access meanwhile. Controls that the new manifest adds or tightens fail now. The gateway accepts claims for the length of each control's grace and warns you. When the grace runs out, access ends.
