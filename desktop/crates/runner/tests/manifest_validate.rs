@@ -1,5 +1,5 @@
-//! What the form keeps of the manifest rules: it shows the CLI's errors per field, holds the text
-//! it cannot read, and summarizes edits. The rules themselves run in the open-pact CLI.
+//! What the form keeps of the manifest rules: it shows the check errors per field, holds the text
+//! it cannot read, and summarizes edits. The rules themselves run in open-pact-core.
 use runner::admin::CheckError;
 use runner::manifest::{self, Field, Form, ManifestCheck, Os, Pending};
 
@@ -213,7 +213,7 @@ fn a_text_that_does_not_parse_is_one_change() {
 }
 
 #[test]
-fn a_cli_key_names_the_form_field_it_belongs_to() {
+fn a_check_key_names_the_form_field_it_belongs_to() {
     for (key, field) in [
         ("issuer", Field::Issuer),
         ("valid_from", Field::ValidFrom),
@@ -288,9 +288,9 @@ fn a_reply_to_an_older_draft_is_dropped() {
     let first = check.begin();
     let second = check.begin();
     let slow = vec![error("old", None, None)];
-    assert!(!check.finish(first, "a", Ok(slow)), "stale reply");
+    assert!(!check.finish(first, "a", slow), "stale reply");
     assert_eq!(check.result("a"), None);
-    assert!(check.finish(second, "b", Ok(Vec::new())));
+    assert!(check.finish(second, "b", Vec::new()));
     assert_eq!(check.result("b"), Some(Vec::new()));
     assert_eq!(
         check.result("a"),
@@ -301,24 +301,6 @@ fn a_reply_to_an_older_draft_is_dropped() {
         check.result("b "),
         None,
         "a draft edited since has no answer"
-    );
-}
-
-#[test]
-fn a_cli_that_did_not_answer_stops_the_review_with_one_error() {
-    let mut check = ManifestCheck::default();
-    let generation = check.begin();
-    check.finish(
-        generation,
-        "a",
-        Err("open-pact-client was not found.".into()),
-    );
-    let errors = check.result("a").unwrap();
-    assert_eq!(errors.len(), 1);
-    assert!(
-        errors[0]
-            .message
-            .contains("open-pact-client was not found.")
     );
 }
 
@@ -362,11 +344,11 @@ fn text_the_panel_cannot_read_blocks_a_switch_and_text_of_the_form_does_not() {
 fn a_new_question_hides_the_answer_to_the_older_one() {
     let mut check = ManifestCheck::default();
     let first = check.begin();
-    assert!(check.finish(first, "A", Ok(Vec::new())));
+    assert!(check.finish(first, "A", Vec::new()));
     assert_eq!(check.result("A"), Some(Vec::new()));
     let second = check.begin();
     assert_eq!(check.result("A"), None, "the question about A is pending");
-    assert!(check.finish(second, "A", Err("refused".into())));
+    assert!(check.finish(second, "A", vec![error("refused", None, None)]));
     assert_eq!(check.result("A").map(|errors| errors.len()), Some(1));
 }
 

@@ -13,6 +13,7 @@ snapshot = ["runner/snapshot", "gpui/test-support", "gpui-platform/test-support"
 winresource = "0.1"
 
 [dependencies]
+open-pact-core.workspace = true
 runner = { workspace = true, features = ["desktop"] }
 serde_json.workspace = true
 toml_edit.workspace = true

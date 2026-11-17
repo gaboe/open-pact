@@ -1486,13 +1486,11 @@ fn main() {
         return;
     }
     runner::tool_path();
-    let programs = runner::client::cli_candidates(std::env::current_exe().ok().as_deref());
     let settings = Settings::load();
     launch("open-pact admin", 1360., 860., move |window, cx| {
         cx.new(|cx| {
             let mut app = AppView::new(settings.clone().unwrap_or_default(), window, cx);
             app.load_contexts(window, cx);
-            load_builtin_texts_later(programs, cx);
             let runner = app.admin.runner.clone();
             watch_updates(cx, runner, |view: &mut AppView| &mut view.update);
             match settings {
@@ -1507,38 +1505,8 @@ fn main() {
     });
 }
 
-/// Loads the default texts after the window opens, so a slow CLI does not hold the window back.
-/// Until they arrive, the panel shows the plain description and hides Reset text. The panel reads
-/// the texts on each paint, so the view repaints when they arrive.
-fn load_builtin_texts_later(programs: Vec<std::path::PathBuf>, cx: &mut Context<AppView>) {
-    cx.spawn(async move |this, cx| {
-        cx.background_executor()
-            .spawn(async move {
-                manifest::load_builtin_texts(&programs);
-            })
-            .await;
-        this.update(cx, |_, cx| cx.notify()).ok();
-    })
-    .detach();
-}
-
-/// The default texts a snapshot scene uses when no CLI is installed. The text is a placeholder,
-/// so the scenes do not carry the real text of the checks.
-#[cfg(all(feature = "snapshot", target_os = "macos"))]
-const SNAPSHOT_BUILTIN_TEXTS: &str = r#"[
-  {"check": "builtin:disk_encryption@1", "id": "disk_encryption", "about": "Snapshot placeholder text."},
-  {"check": "builtin:firewall@1", "id": "firewall", "about": "Snapshot placeholder text."},
-  {"check": "builtin:screen_lock@1", "id": "screen_lock", "about": "Snapshot placeholder text."}
-]"#;
-
 #[cfg(all(feature = "snapshot", target_os = "macos"))]
 fn snapshots(output: PathBuf) {
-    let programs = runner::client::cli_candidates(std::env::current_exe().ok().as_deref());
-    if !manifest::load_builtin_texts(&programs) {
-        let texts = manifest::parse_builtin_texts(SNAPSHOT_BUILTIN_TEXTS)
-            .expect("the snapshot placeholder texts are valid JSON");
-        manifest::set_builtin_texts(texts);
-    }
     for (name, screen, form, dialog) in [
         ("admin-setup", Screen::Setup, true, None),
         ("admin-h-settings", Screen::Setup, true, None),
@@ -1559,7 +1527,6 @@ fn snapshots(output: PathBuf) {
         ("admin-o-field-errors", Screen::Manifest, true, None),
         ("admin-p-add-check-all", Screen::Manifest, true, None),
         ("admin-q-add-check-scrolled", Screen::Manifest, true, None),
-        ("admin-r-old-cli", Screen::Manifest, true, None),
         ("admin-s-check-line", Screen::Manifest, false, None),
         ("admin-d-apply", Screen::Manifest, true, Some(Dialog::Apply)),
         (
@@ -1707,22 +1674,17 @@ interval = \"24h\"
     }
 }
 
-/// What the open-pact CLI would say about the draft of a snapshot scene.
+/// What the checks would say about the draft of a snapshot scene.
 #[cfg(all(feature = "snapshot", target_os = "macos"))]
-fn snapshot_check(name: &str, draft: &str) -> Result<Vec<runner::admin::CheckError>, String> {
-    use runner::admin::{CLI_TOO_OLD, CheckError};
-    Ok(match name {
+fn snapshot_check(name: &str, draft: &str) -> Vec<runner::admin::CheckError> {
+    use runner::admin::CheckError;
+    match name {
         "admin-o-field-errors" => vec![CheckError {
             message:
                 "os_patch_age_days: required.windows 3651 is above the output range 0 to 3650."
                     .into(),
             line: None,
             key: Some("controls.os_patch_age_days.required.windows".into()),
-        }],
-        "admin-r-old-cli" => vec![CheckError {
-            message: CLI_TOO_OLD.into(),
-            line: None,
-            key: None,
         }],
         "admin-s-check-line" => vec![CheckError {
             message: "invalid date, expected YYYY-MM-DD".into(),
@@ -1733,7 +1695,7 @@ fn snapshot_check(name: &str, draft: &str) -> Result<Vec<runner::admin::CheckErr
             key: None,
         }],
         _ => Vec::new(),
-    })
+    }
 }
 
 #[cfg(test)]

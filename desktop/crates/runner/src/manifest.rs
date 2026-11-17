@@ -2,13 +2,9 @@
 //! changes one value and prints the document again, so comments and order stay as written.
 use crate::admin::CheckError;
 use crate::text::humanize;
-use crate::{Runner, args};
 use chrono::{Datelike, NaiveDate};
-use serde::Deserialize;
+use open_pact_core::{Metadata, TrustLevel};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
-use std::sync::OnceLock;
-use std::time::Duration;
 use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, TableLike, Value};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -113,57 +109,53 @@ pub fn date_text(text: &str) -> String {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Os {
-    Macos,
-    Windows,
-    Linux,
-}
+pub use open_pact_core::Os;
 
-impl Os {
-    pub const ALL: [Os; 3] = [Os::Macos, Os::Windows, Os::Linux];
-
-    pub fn key(self) -> &'static str {
-        match self {
-            Self::Macos => "macos",
-            Self::Windows => "windows",
-            Self::Linux => "linux",
-        }
-    }
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Macos => "macOS",
-            Self::Windows => "Windows",
-            Self::Linux => "Linux",
-        }
+/// The name of an OS in the panel, such as "macOS". The manifest key is the `Display` of `Os`.
+pub fn os_name(os: Os) -> &'static str {
+    match os {
+        Os::Macos => "macOS",
+        Os::Windows => "Windows",
+        Os::Linux => "Linux",
     }
 }
 
-pub const TRUST_LEVELS: [(&str, &str); 3] = [
-    ("L0", "L0 software"),
-    ("L1", "L1 hardware"),
-    ("L2", "L2 attested"),
+/// The trust levels in panel order, with their panel names.
+pub const TRUST_LEVELS: [(TrustLevel, &str); 3] = [
+    (TrustLevel::L0, "L0 software"),
+    (TrustLevel::L1, "L1 hardware"),
+    (TrustLevel::L2, "L2 attested"),
 ];
 
-/// Every field a claim can carry besides the check values, with its plain name. The first nine
-/// are mandatory: the core refuses a manifest that does not list them.
-pub const METADATA: [(&str, &str); 11] = [
-    ("manifest_hash", "Manifest hash"),
-    ("device_pseudonym", "Device pseudonym"),
-    ("device_key", "Device key"),
-    ("nonce", "Nonce"),
-    ("time", "Time"),
-    ("client_version", "Client version"),
-    ("os", "Operating system"),
-    ("trust_level", "Trust level"),
-    ("vpn_certificate_request", "VPN certificate request"),
-    ("virtualized", "Runs in a virtual machine"),
-    ("log_checkpoint", "Log checkpoint"),
+/// The spelling of a trust level in the manifest, such as "L1".
+pub fn trust_code(level: TrustLevel) -> &'static str {
+    match level {
+        TrustLevel::L0 => "L0",
+        TrustLevel::L1 => "L1",
+        TrustLevel::L2 => "L2",
+    }
+}
+
+/// The claim fields in panel order, with their plain names.
+pub const METADATA: [(Metadata, &str); 11] = [
+    (Metadata::ManifestHash, "Manifest hash"),
+    (Metadata::DevicePseudonym, "Device pseudonym"),
+    (Metadata::DeviceKey, "Device key"),
+    (Metadata::Nonce, "Nonce"),
+    (Metadata::Time, "Time"),
+    (Metadata::ClientVersion, "Client version"),
+    (Metadata::Os, "Operating system"),
+    (Metadata::TrustLevel, "Trust level"),
+    (Metadata::VpnCertificateRequest, "VPN certificate request"),
+    (Metadata::Virtualized, "Runs in a virtual machine"),
+    (Metadata::LogCheckpoint, "Log checkpoint"),
 ];
 
+/// Whether the core requires a claim field, by its manifest key.
 pub fn metadata_mandatory(key: &str) -> bool {
-    METADATA.iter().take(9).any(|(known, _)| *known == key)
+    Metadata::MANDATORY
+        .iter()
+        .any(|known| known.to_string() == key)
 }
 
 /// The possible results of a check.
@@ -554,7 +546,7 @@ impl Form {
                             read_requirement(
                                 required
                                     .and_then(Item::as_table_like)
-                                    .and_then(|t| t.get(os.key())),
+                                    .and_then(|t| t.get(&os.to_string())),
                             )
                         };
                         Control {
@@ -708,60 +700,6 @@ pub fn by_group<T>(
     }
     sections.retain(|(_, items)| !items.is_empty());
     sections
-}
-
-/// The default text of each built-in check, keyed by its check name, `builtin:<id>@<version>`.
-/// The CLI gives these texts, so the app keeps no copy.
-pub type BuiltinTexts = BTreeMap<String, String>;
-
-/// The default texts of this run. Empty until `load_builtin_texts` or `set_builtin_texts` sets them.
-static BUILTIN_TEXTS: OnceLock<BuiltinTexts> = OnceLock::new();
-
-#[derive(Deserialize)]
-struct BuiltinText {
-    check: String,
-    about: String,
-}
-
-/// Reads what `manifest builtins --json` printed: one `{"check", "id", "about"}` per built-in check.
-/// A check whose text is empty has no default.
-pub fn parse_builtin_texts(text: &str) -> Result<BuiltinTexts, String> {
-    let texts: Vec<BuiltinText> = serde_json::from_str(text)
-        .map_err(|error| format!("Invalid JSON from open-pact-client: {error}"))?;
-    Ok(texts
-        .into_iter()
-        .filter(|text| !text.about.is_empty())
-        .map(|text| (text.check, text.about))
-        .collect())
-}
-
-/// Asks the CLIs in order for the default texts and keeps them from the first one that answers.
-/// A CLI that fails, or is too old to know the command, is skipped. Returns false when none
-/// answers, and then no check has a default text.
-pub fn load_builtin_texts(programs: &[PathBuf]) -> bool {
-    let runner = Runner::default().with_timeout(Duration::from_secs(5));
-    let words = args(&["manifest", "builtins", "--json"]);
-    let texts = programs.iter().find_map(|program| {
-        let log = runner.run(program, &words).ok()?;
-        parse_builtin_texts(&log.stdout).ok()
-    });
-    match texts {
-        Some(texts) => {
-            let _ = BUILTIN_TEXTS.set(texts);
-            true
-        }
-        None => false,
-    }
-}
-
-/// Sets the default texts without a CLI, for snapshot scenes. Only the first set counts.
-pub fn set_builtin_texts(texts: BuiltinTexts) {
-    let _ = BUILTIN_TEXTS.set(texts);
-}
-
-/// The default text of a built-in check, or None when the CLI gave none.
-pub fn default_about(check: &str) -> Option<&'static str> {
-    BUILTIN_TEXTS.get()?.get(check).map(String::as_str)
 }
 
 /// A built-in check the client can run.
@@ -1195,7 +1133,7 @@ pub fn changes(before: &Form, after: &Form) -> Vec<String> {
     let trust = |raw: &str| {
         TRUST_LEVELS
             .iter()
-            .find(|(key, _)| *key == raw)
+            .find(|(level, _)| trust_code(*level) == raw)
             .map_or_else(|| raw.to_owned(), |(_, name)| (*name).to_owned())
     };
     text(
@@ -1224,7 +1162,7 @@ pub fn changes(before: &Form, after: &Form) -> Vec<String> {
         &|key| {
             METADATA
                 .iter()
-                .find(|(known, _)| *known == key)
+                .find(|(known, _)| known.to_string() == key)
                 .map_or_else(|| key.to_owned(), |(_, name)| (*name).to_owned())
         },
     );
@@ -1270,7 +1208,7 @@ pub fn changes(before: &Form, after: &Form) -> Vec<String> {
                     requirement_text(new, b)
                 ),
             };
-            list.push(format!("{name}: {} {words}", os.name()));
+            list.push(format!("{name}: {} {words}", os_name(os)));
         }
         if old.grace != new.grace {
             let span =
@@ -1452,7 +1390,8 @@ pub fn other_edits(before: &str, after: &str) -> Vec<String> {
             &prefix,
             &mut keys,
         );
-        let os_keys = Os::ALL.map(Os::key);
+        let os_names: Vec<String> = Os::ALL.iter().map(ToString::to_string).collect();
+        let os_keys: Vec<&str> = os_names.iter().map(String::as_str).collect();
         differing(
             was.get("required"),
             control.get("required"),
@@ -1581,7 +1520,7 @@ impl Field {
             Self::AlwaysInterval => "Any network: send every".into(),
             Self::Id(id) => format!("{}: ID", name(id)),
             Self::Grace(id) => format!("{}: time to fix", name(id)),
-            Self::Requirement(id, os) => format!("{}: {}", name(id), os.name()),
+            Self::Requirement(id, os) => format!("{}: {}", name(id), os_name(*os)),
         }
     }
 }
@@ -1695,12 +1634,12 @@ impl Pending {
 }
 
 /// Everything that stops a review. Unparsed input is the form's own business. Every rule of the
-/// manifest comes from the open-pact CLI, which runs the same code as a client and the gateway.
+/// manifest comes from open-pact-core, which runs the same code as a client and the gateway.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Problems {
-    /// Shown under their field: unparsed input first, then the CLI errors whose key names one.
+    /// Shown under their field: unparsed input first, then the check errors whose key names one.
     pub fields: Vec<FieldError>,
-    /// The CLI errors that name no field of the form.
+    /// The check errors that name no field of the form.
     pub listed: Vec<CheckError>,
 }
 
@@ -1732,7 +1671,7 @@ impl CheckError {
     }
 }
 
-/// The form field that a CLI error key names, or `None` when the key names none. A key is a
+/// The form field that a check error key names, or `None` when the key names none. A key is a
 /// top-level name (`issuer`), `schedule.interval`, or `controls.<id>[.check|.required.<os>]`.
 pub fn field_of(key: &str) -> Option<Field> {
     let key = key.trim();
@@ -1747,7 +1686,7 @@ pub fn field_of(key: &str) -> Option<Field> {
             (Some("grace"), None, _) => Some(Field::Grace(id)),
             (Some("required"), Some(os), None) => Os::ALL
                 .into_iter()
-                .find(|known| known.key() == os)
+                .find(|known| known.to_string() == os)
                 .map(|os| Field::Requirement(id, os)),
             _ => None,
         };
@@ -1770,7 +1709,7 @@ pub fn field_of(key: &str) -> Option<Field> {
     }
 }
 
-/// Unparsed input first, then what the CLI refused, each error under its field when its key
+/// Unparsed input first, then what the checks refused, each error under its field when its key
 /// names one.
 pub fn problems(pending: &Pending, refused: &[CheckError]) -> Problems {
     let mut all = Problems {
@@ -1789,13 +1728,13 @@ pub fn problems(pending: &Pending, refused: &[CheckError]) -> Problems {
     all
 }
 
-/// The answer of the CLI for one draft. A draft edited after the question was sent has no
+/// The answer of the checks for one draft. A draft edited after the question was sent has no
 /// answer yet, and a reply to an older question is dropped.
 #[derive(Clone, Debug, Default)]
 pub struct ManifestCheck {
     generation: u64,
     checked: String,
-    outcome: Option<Result<Vec<CheckError>, String>>,
+    outcome: Option<Vec<CheckError>>,
 }
 
 impl ManifestCheck {
@@ -1814,34 +1753,21 @@ impl ManifestCheck {
 
     /// Keeps the reply to the question `generation` about `draft`. A stale reply is dropped and
     /// the result is `false`.
-    pub fn finish(
-        &mut self,
-        generation: u64,
-        draft: &str,
-        outcome: Result<Vec<CheckError>, String>,
-    ) -> bool {
+    pub fn finish(&mut self, generation: u64, draft: &str, errors: Vec<CheckError>) -> bool {
         if !self.is_current(generation) {
             return false;
         }
         self.checked = draft.to_owned();
-        self.outcome = Some(outcome);
+        self.outcome = Some(errors);
         true
     }
 
-    /// The errors of the CLI for exactly this draft. `None` while the answer is not here. A CLI
-    /// that did not answer is one error, so it stops a review like any other.
+    /// The errors for exactly this draft. `None` while the answer is not here.
     pub fn result(&self, draft: &str) -> Option<Vec<CheckError>> {
         if self.checked != draft {
             return None;
         }
-        Some(match self.outcome.as_ref()? {
-            Ok(errors) => errors.clone(),
-            Err(message) => vec![CheckError {
-                message: format!("The manifest could not be checked. {message}"),
-                line: None,
-                key: None,
-            }],
-        })
+        self.outcome.clone()
     }
 }
 fn document(text: &str) -> Result<DocumentMut, String> {
@@ -2222,7 +2148,7 @@ pub fn set_requirement(
         .ok_or("required is not a table")?;
     let value = match requirement {
         Requirement::Reported => {
-            required.remove(os.key());
+            required.remove(&os.to_string());
             return Ok(document.to_string());
         }
         Requirement::Values(values) if values.len() == 1 => Value::from(values[0].as_str()),
@@ -2239,7 +2165,7 @@ pub fn set_requirement(
             Value::InlineTable(limit)
         }
     };
-    put(required, os.key(), value);
+    put(required, &os.to_string(), value);
     if let Some(inline) = document
         .get_mut("control")
         .and_then(Item::as_array_of_tables_mut)
@@ -2314,32 +2240,4 @@ pub fn error_line(text: &str, error: &toml_edit::TomlError) -> usize {
     error.span().map_or(1, |span| {
         text[..span.start.min(text.len())].matches('\n').count() + 1
     })
-}
-
-#[cfg(test)]
-mod builtin_text_tests {
-    use super::parse_builtin_texts;
-
-    const FIXTURE: &str = r#"[
-  {"check": "builtin:firewall@1", "id": "firewall", "about": "A device without a firewall accepts connections."},
-  {"check": "builtin:screen_lock@2", "id": "screen_lock", "about": "A device that stays unlocked gives access to anyone nearby."},
-  {"check": "builtin:firewall@2", "id": "firewall", "about": ""}
-]"#;
-
-    #[test]
-    fn the_texts_are_keyed_by_check_and_an_empty_text_is_no_default() {
-        let texts = parse_builtin_texts(FIXTURE).unwrap();
-        assert_eq!(
-            texts.get("builtin:firewall@1").map(String::as_str),
-            Some("A device without a firewall accepts connections.")
-        );
-        assert_eq!(texts.len(), 2);
-        assert!(!texts.contains_key("builtin:firewall@2"));
-    }
-
-    #[test]
-    fn a_reply_that_is_not_the_list_is_an_error() {
-        assert!(parse_builtin_texts("{\"error\": \"unknown command\"}").is_err());
-        assert!(parse_builtin_texts("not json").is_err());
-    }
 }

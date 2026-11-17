@@ -1,5 +1,6 @@
-use crate::{Runner, args, client, command_error};
+use crate::{Runner, args};
 use chrono::{DateTime, Utc};
+use open_pact_core::{Error as CoreError, Manifest, check_supported};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -249,22 +250,13 @@ pub struct Admin {
     pub kubectl: PathBuf,
     /// Tests point this at a temporary folder. The app always uses `Settings::backup_root()`.
     pub backup_root: PathBuf,
-    /// The open-pact-client that checks manifests. `None` looks for the one bundled with this
-    /// app first, then the one the client app installs, then the one on PATH.
-    pub client: Option<PathBuf>,
-    /// How long one manifest check may run.
-    pub check_limit: Duration,
 }
 
-/// What an open-pact-client older than the manifest check answers with.
-pub const CLI_TOO_OLD: &str =
-    "This open-pact-client is too old to check manifests; update it to 0.7.1 or later.";
-
-/// One reason the open-pact CLI refuses a manifest draft.
+/// One reason a manifest draft is refused.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct CheckError {
     pub message: String,
-    /// The 1-based line in the draft, when the CLI knows it.
+    /// The 1-based line in the draft, when the check knows it.
     #[serde(default)]
     pub line: Option<usize>,
     /// The dotted TOML path the message names, when it names one.
@@ -272,45 +264,46 @@ pub struct CheckError {
     pub key: Option<String>,
 }
 
-#[derive(Deserialize)]
-struct CheckReport {
-    ok: bool,
-    errors: Vec<CheckError>,
-}
-
-enum Answer {
-    Errors(Vec<CheckError>),
-    TooOld,
-}
-
-/// Reads what `manifest check --json` printed. The draft is valid only when the exit code, `ok`
-/// and the error list all say so.
-fn read_answer(log: &crate::CommandLog) -> Result<Answer, String> {
-    if log.exit == Some(2)
-        || log
-            .stderr
-            .to_lowercase()
-            .contains("unrecognized subcommand")
-    {
-        return Ok(Answer::TooOld);
-    }
-    let report: CheckReport = match (log.exit, serde_json::from_str(&log.stdout)) {
-        (Some(0 | 1), Ok(report)) => report,
-        (Some(0), Err(error)) => {
-            return Err(format!("Invalid JSON from open-pact-client: {error}"));
-        }
-        _ => return Err(command_error(log)),
+/// Runs the rules a client and the gateway apply to a manifest draft: the core parse, then the
+/// builtins the core can run. No error means the draft is valid.
+pub fn check_draft(toml: &str) -> Vec<CheckError> {
+    let bytes = toml.as_bytes();
+    let manifest = match Manifest::parse(bytes) {
+        Ok(manifest) => manifest,
+        Err(error) => return vec![core_error(bytes, &error)],
     };
-    if log.exit == Some(0) && report.ok && report.errors.is_empty() {
-        return Ok(Answer::Errors(Vec::new()));
+    match check_supported(&manifest) {
+        Ok(()) => Vec::new(),
+        Err(message) => vec![CheckError {
+            message,
+            line: None,
+            key: None,
+        }],
     }
-    if report.errors.is_empty() {
-        return Err(format!(
-            "open-pact-client gave no reason with exit code {:?}.",
-            log.exit
-        ));
+}
+
+fn core_error(bytes: &[u8], error: &CoreError) -> CheckError {
+    let (message, line) = match error {
+        CoreError::ManifestToml(toml_error) => (
+            toml_error.message().to_string(),
+            toml_error.span().map(|span| line_at(bytes, span.start)),
+        ),
+        CoreError::InvalidManifest(message) => (message.clone(), None),
+        other => (other.to_string(), None),
+    };
+    CheckError {
+        message,
+        line,
+        key: error.manifest_key(),
     }
-    Ok(Answer::Errors(report.errors))
+}
+
+/// The 1-based line that holds byte `offset`.
+fn line_at(bytes: &[u8], offset: usize) -> usize {
+    1 + bytes[..offset.min(bytes.len())]
+        .iter()
+        .filter(|byte| **byte == b'\n')
+        .count()
 }
 
 /// Cluster names from `kubectl config get-contexts -o name`.
@@ -480,53 +473,7 @@ impl Admin {
             kubectl: settings.kubectl_program(),
             settings,
             backup_root: Settings::backup_root(),
-            client: None,
-            check_limit: Duration::from_secs(5),
         }
-    }
-
-    fn client_candidates(&self) -> Vec<PathBuf> {
-        match &self.client {
-            Some(client) => vec![client.clone()],
-            None => client::cli_candidates(std::env::current_exe().ok().as_deref()),
-        }
-    }
-
-    /// Runs the rules of a client and the gateway on a manifest draft, by asking the CLI. No
-    /// error list means the draft is valid. A CLI too old to know the command is one error. A CLI
-    /// that cannot be run, or that answers in a way this app cannot read, is an `Err`.
-    pub fn check_manifest(&self, toml: &str) -> Result<Vec<CheckError>, String> {
-        self.check_manifest_with(&self.client_candidates(), toml)
-    }
-
-    /// Like `check_manifest`, with the CLIs to try in order. The next one is tried when one is
-    /// too old.
-    pub fn check_manifest_with(
-        &self,
-        programs: &[PathBuf],
-        toml: &str,
-    ) -> Result<Vec<CheckError>, String> {
-        if programs.is_empty() {
-            return Err(
-                "open-pact-client was not found. Install the open-pact app, or put open-pact-client on your PATH."
-                    .into(),
-            );
-        }
-        // A separate runner keeps the draft out of the command log and gives the check its own limit.
-        let runner = Runner::default().with_timeout(self.check_limit);
-        let words = args(&["manifest", "check", "--json"]);
-        for program in programs {
-            let log = runner.input_any(program, &words, toml)?;
-            match read_answer(&log)? {
-                Answer::Errors(errors) => return Ok(errors),
-                Answer::TooOld => (),
-            }
-        }
-        Ok(vec![CheckError {
-            message: CLI_TOO_OLD.into(),
-            line: None,
-            key: None,
-        }])
     }
 
     pub fn use_settings(&mut self, settings: Settings) {

@@ -15,7 +15,7 @@ use runner::manifest::{
 };
 use std::{cell::Cell, rc::Rc, time::Duration};
 
-/// How long the draft stays unchanged before the CLI is asked about it.
+/// How long the draft stays unchanged before it is checked.
 const CHECK_AFTER: Duration = Duration::from_millis(300);
 
 type Units = Entity<SelectState<Vec<SharedString>>>;
@@ -170,9 +170,9 @@ pub struct FormState {
     pub add_open: bool,
     /// Input the form could not read yet, one message per field.
     pub pending: Pending,
-    /// What the open-pact CLI said about the draft.
+    /// What the checks said about the draft.
     pub check: ManifestCheck,
-    /// Tests and snapshots set the answer themselves, so no CLI runs.
+    /// Tests and snapshots set the answer themselves, so no check runs.
     pub manual_check: bool,
     /// Where the Add check button was in the last paint: its top and the window height.
     add_anchor: Rc<Cell<(f32, f32)>>,
@@ -196,15 +196,11 @@ pub struct FormState {
 }
 
 impl FormState {
-    /// Sets the answer of the CLI for `draft`, as a snapshot scene needs it.
+    /// Sets the answer of the checks for `draft`, as a snapshot scene needs it.
     #[cfg(all(feature = "snapshot", target_os = "macos"))]
-    pub fn set_check(
-        &mut self,
-        draft: &str,
-        outcome: Result<Vec<runner::admin::CheckError>, String>,
-    ) {
+    pub fn set_check(&mut self, draft: &str, errors: Vec<runner::admin::CheckError>) {
         let generation = self.check.begin();
-        self.check.finish(generation, draft, outcome);
+        self.check.finish(generation, draft, errors);
     }
 
     pub fn new(window: &mut Window, cx: &mut Context<AppView>) -> Self {
@@ -326,7 +322,7 @@ fn error_line(message: impl Into<SharedString>) -> Div {
 }
 
 /// The draft after the Valid from picker changes. A picked day is written as YYYY-MM-DD. A
-/// cleared picker writes an empty date, so the old date leaves the draft and the CLI refuses the
+/// cleared picker writes an empty date, so the old date leaves the draft and the checks refuse the
 /// field.
 fn valid_from_draft(draft: &str, picked: Option<String>) -> Result<String, String> {
     manifest::set_top_text(draft, "valid_from", &picked.unwrap_or_default())
@@ -509,8 +505,8 @@ impl AppView {
         }
     }
 
-    /// Puts the draft into the TOML editor, marks the lines the parser and the CLI refuse in it,
-    /// and asks the CLI about the draft.
+    /// Puts the draft into the TOML editor, marks the lines the parser and the checks refuse in it,
+    /// and checks the draft.
     pub fn show_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let draft = self.draft.clone();
         self.editor.update(cx, |state, cx| {
@@ -522,7 +518,7 @@ impl AppView {
         self.check_draft(window, cx);
     }
 
-    /// Marks the line of a parse error and the line of each CLI error that has one.
+    /// Marks the line of a parse error and the line of each error that has one.
     pub fn mark_lines(&mut self, cx: &mut Context<Self>) {
         let draft = self.draft.clone();
         let mut marks: Vec<(usize, String)> = Vec::new();
@@ -562,7 +558,7 @@ impl AppView {
         });
     }
 
-    /// Asks the CLI about the draft once it has stayed the same for a moment. An answer that
+    /// Checks the draft once it has stayed the same for a moment. An answer that
     /// arrives after the draft changed again is dropped.
     fn check_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.fv.manual_check {
@@ -573,7 +569,6 @@ impl AppView {
         if draft.parse::<toml_edit::DocumentMut>().is_err() {
             return;
         }
-        let admin = self.admin.clone();
         cx.spawn_in(window, async move |this, cx| {
             cx.background_executor().timer(CHECK_AFTER).await;
             let current = this
@@ -585,7 +580,7 @@ impl AppView {
             let asked = draft.clone();
             let outcome = cx
                 .background_executor()
-                .spawn(async move { admin.check_manifest(&asked) })
+                .spawn(async move { runner::admin::check_draft(&asked) })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 if this.fv.check.finish(generation, &draft, outcome) {
@@ -1090,7 +1085,7 @@ impl AppView {
             return;
         };
         let typed = panel.description.read(cx).value().trim().to_owned();
-        let value = stored_description(&typed, manifest::default_about(&control.check));
+        let value = stored_description(&typed, open_pact_core::builtin_about(&control.check));
         let result = manifest::set_control_text(&self.draft, index, "description", value);
         let saved = result.is_ok();
         self.edit_form(result, Rebuild::No, window, cx);
@@ -1109,7 +1104,7 @@ impl AppView {
     fn reset_description(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(text) = self
             .selected_control()
-            .and_then(|control| manifest::default_about(&control.check))
+            .and_then(|control| open_pact_core::builtin_about(&control.check))
         else {
             return;
         };
@@ -1152,7 +1147,7 @@ impl AppView {
                 ),
             );
         }
-        let default = manifest::default_about(&control.check);
+        let default = open_pact_core::builtin_about(&control.check);
         let holds_default =
             default.is_some_and(|text| panel.description.read(cx).value().trim() == text);
         column()
@@ -1487,7 +1482,7 @@ impl AppView {
     }
 
     /// Whether Review and apply may open: a draft that differs from the active one, confirmed by
-    /// the CLI for these exact bytes, with no check running, no error and no unread input.
+    /// the checks for these exact bytes, with no check running, no error and no unread input.
     pub fn review_open(&self) -> bool {
         !(self.busy
             || self.change_list().is_empty()
@@ -1868,8 +1863,9 @@ impl AppView {
             TRUST_LEVELS
                 .iter()
                 .enumerate()
-                .map(|(i, (key, name))| {
-                    seg2_item(("trust", i), *name, form.trust == *key).on_click(cx.listener(
+                .map(|(i, (level, name))| {
+                    let key = manifest::trust_code(*level);
+                    seg2_item(("trust", i), *name, form.trust == key).on_click(cx.listener(
                         move |this, _, window, cx| {
                             let result =
                                 manifest::set_top_text(&this.draft, "min_trust_level", key);
@@ -1910,7 +1906,7 @@ impl AppView {
     fn sent(&self, form: &Form, cx: &Context<Self>) -> Div {
         let mut entries: Vec<(String, String)> = manifest::METADATA
             .iter()
-            .map(|(key, name)| ((*key).to_owned(), (*name).to_owned()))
+            .map(|(key, name)| (key.to_string(), (*name).to_owned()))
             .collect();
         for key in &form.metadata {
             if !entries.iter().any(|(known, _)| known == key) {
@@ -2643,7 +2639,7 @@ impl AppView {
                             .flex_none()
                             .text_size(px(13.))
                             .text_color(rgb(INK_2))
-                            .child(os.name()),
+                            .child(manifest::os_name(os)),
                     )
                     .child(
                         column()
@@ -2894,14 +2890,14 @@ fn panel_switch(selected: Option<&str>, requested: Option<&str>, blocked: bool) 
 /// The check's description, or the open-pact text for a built-in check that has none, so the
 /// admin edits one text that the device user also reads.
 fn description_or_default(control: &manifest::Control) -> String {
-    match manifest::default_about(&control.check) {
+    match open_pact_core::builtin_about(&control.check) {
         Some(default) if control.description.is_empty() => default.to_owned(),
         _ => control.description.clone(),
     }
 }
 
 /// The description to write for a typed text. The default text writes an empty description, so
-/// the manifest keeps no copy of the text that the CLI gives.
+/// the manifest keeps no copy of the text that the core gives.
 fn stored_description<'a>(text: &'a str, default: Option<&'a str>) -> &'a str {
     if default == Some(text) { "" } else { text }
 }
