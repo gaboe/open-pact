@@ -101,7 +101,7 @@ kubectl exec deploy/pact-gateway -- open-pact-gateway status --json
   "last_reasons": ["os_patch_age_days = 40, <= 30 required, access ends in 24h"]}]
 ```
 
-`code` is the first 12 hex digits of the pseudonym, which `devices approve` takes. `note` is the invitation note, empty when there is none. `last_claim_at`, `last_result` and `last_reasons` are the gateway's decision on the last claim of this enrolment. `last_result` is `accepted`, `accepted_with_warnings` or `denied`. `last_reasons` holds the warnings of an accepted claim or the reasons of a denied one, and is empty for a clean accepted claim. A device that never sent a claim has `null` in `last_claim_at` and `last_result` and `[]` in `last_reasons`. The gateway writes them in the transaction that decides the claim, as plain columns of the `devices` table. A claim that carries data the manifest does not allow is not stored, and its reasons can quote that data, so its `last_reasons` is the one line "the claim disclosed more than the manifest allows". The gateway also writes `last_access_until`, the end of the certificate that the last claim got, in the same transaction. It is null after a denial. `claims list` and `claims show` read it to derive a standing.
+`code` is the first 12 hex digits of the pseudonym, which `devices approve` takes. `note` is the invitation note, empty when there is none. `last_claim_at`, `last_result` and `last_reasons` are the gateway's decision on the last claim of this enrolment. `last_result` is `accepted`, `accepted_with_warnings` or `denied`. `last_reasons` holds the warnings of an accepted claim or the reasons of a denied one, and is empty for a clean accepted claim. A device that never sent a claim has `null` in `last_claim_at` and `last_result` and `[]` in `last_reasons`. The gateway writes them in the transaction that decides the claim, as plain columns of the `devices` table. A claim that carries data the manifest does not allow is not stored, and its reasons can quote that data, so its `last_reasons` is the one line "the claim disclosed more than the manifest allows". The gateway also writes `last_access_until`, the end of the certificate that the last claim got, in the same transaction. An accepted claim that got no certificate stores its own decision time, because its access ended at once. The column is null after a denial, and for an enrolment whose last claim the gateway decided before it kept this column; the next claim replaces that null. `claims list` and `claims show` read it to derive a standing.
 
 `invite --json` prints `{"invitation": "opi1:…", "expires_at": "2026-11-05T10:00:00Z", "company_key_fingerprint": "sha256:…", "note": "Example laptop"}` and nothing on stderr.
 
@@ -118,12 +118,12 @@ kubectl exec deploy/pact-gateway -- open-pact-gateway status --json
 
 An accepted claim gets a VPN client certificate. Its end is the earliest of these limits:
 
-- Twice the send interval on the VPN. With both `[schedule.vpn]` and `[schedule.always]`, the shorter interval counts. The gateway uses the schedule that the device signed, because the device runs that one.
+- Twice the send interval on the VPN. With both `[schedule.vpn]` and `[schedule.always]`, the shorter interval counts. The gateway uses the schedule of the manifest it enforces, never the one the device signed, so a shorter interval takes effect before the owner accepts the new manifest.
 - `claim_max_age` of the enforced manifest.
 - 24 hours.
 - The nearest grace deadline of a failing control. A claim accepted with a warning gets a certificate that ends when the warned grace runs out.
 
-A manifest without a schedule has no interval limit. A claim with no time left under these limits gets no certificate. The gateway writes the end into the certificate, and it keeps the same end with the claim as `certificate_not_after`.
+A manifest without a schedule has no interval limit. A claim with no time left under these limits gets no certificate. The gateway fixes the end as one time from one clock reading, in whole seconds, so a certificate never ends after the grace deadline. It writes the end into the certificate, and it keeps the same end with the claim as `certificate_not_after`.
 
 The gateway does not revoke a certificate before its end. A device that stops being compliant keeps VPN access until the certificate ends, and it gets no new certificate. A shorter `claim_max_age` shortens every certificate. How long a live tunnel stays up after its certificate ends depends on the VPN product, so check its re-authentication setting.
 
@@ -158,6 +158,7 @@ kubectl exec deploy/pact-gateway -- open-pact-gateway claims show 4812 --json
 
 - `current`: the last claim was accepted, and its certificate has not ended.
 - `lapsed`: the last claim was accepted, its certificate has ended, and no newer claim renewed it.
+- `unknown`: the last claim was accepted before the gateway kept the end of its certificate, so the gateway cannot tell whether that certificate still runs. The device's next claim replaces it with another value.
 - `denied`: the last claim was denied.
 - `silent`: the last claim is older than twice the send interval, or the device never claimed. Without a schedule in the manifest, a device with a claim is never silent.
 

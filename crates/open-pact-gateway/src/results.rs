@@ -892,6 +892,63 @@ grace = "1d"
         assert_eq!(detail.standing, Standing::Lapsed);
     }
 
+    /// A device row from before the gateway kept the certificate end has a null end. Its standing is
+    /// unknown until the device claims again, and the new claim ends the doubt.
+    #[tokio::test]
+    #[ignore = "needs TEST_DATABASE_URL"]
+    async fn a_device_with_no_recorded_certificate_end_is_unknown_until_its_next_claim() {
+        let w = world().await;
+        let now = Utc::now();
+        let ok = [("disk_encryption", "full"), ("firewall", "on")];
+        let id = put_with(
+            &w.db,
+            "12mo",
+            &claim(
+                &w.a,
+                w.manifest.hash(),
+                Os::Linux,
+                now - TimeDelta::minutes(1),
+                &ok,
+            ),
+            true,
+            None,
+        )
+        .await;
+        let hash = w.manifest.hash().as_str().to_owned();
+        sqlx::query(
+            "UPDATE devices SET last_claim_at = $3, last_result = 'accepted', last_reasons = '{}', \
+             last_access_until = NULL WHERE pseudonym = $1 AND manifest_hash = $2",
+        )
+        .bind(w.a.as_str())
+        .bind(&hash)
+        .bind(now - TimeDelta::minutes(1))
+        .execute(&w.db)
+        .await
+        .unwrap();
+        let detail = show(&w.db, &w.kek, None, id).await.unwrap();
+        assert_eq!(detail.standing, Standing::Unknown);
+        assert_eq!(detail.access_until, None);
+
+        let mut conn = w.db.acquire().await.unwrap();
+        devices::record_claim(
+            &mut conn,
+            &w.a,
+            &hash,
+            now,
+            devices::ClaimResult::Accepted,
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
+        let detail = show(&w.db, &w.kek, None, id).await.unwrap();
+        assert_eq!(
+            detail.standing,
+            Standing::Lapsed,
+            "a new claim without a certificate ended its access when it was decided"
+        );
+    }
+
     fn ids(listing: &Listing) -> Vec<i64> {
         listing.claims.iter().map(|c| c.id).collect()
     }

@@ -14,6 +14,9 @@ pub enum Standing {
     Current,
     /// The certificate ended, and no newer claim renewed it.
     Lapsed,
+    /// The last claim was accepted before the gateway kept the end of its certificate, so the
+    /// gateway cannot tell whether it still runs. The next claim ends the doubt.
+    Unknown,
     /// The last claim was denied.
     Denied,
     /// No claim within twice the send interval, or no claim at all.
@@ -38,8 +41,9 @@ pub fn send_interval(manifest: Option<&Manifest>) -> Option<TimeDelta> {
 }
 
 /// The standing at `now`. A denial stands until a newer claim. A certificate that has not ended
-/// keeps the device current. Otherwise the device is silent when its last claim is older than twice
-/// the send interval, and lapsed when it is not. Without a schedule, no silence is judged.
+/// keeps the device current, and an accepted claim with no recorded end leaves it unknown.
+/// Otherwise the device is silent when its last claim is older than twice the send interval, and
+/// lapsed when it is not. Without a schedule, no silence is judged.
 pub fn standing(
     last: Option<&LastDecision>,
     send_interval: Option<TimeDelta>,
@@ -51,7 +55,10 @@ pub fn standing(
     if last.denied {
         return Standing::Denied;
     }
-    if last.access_until.is_some_and(|until| now < until) {
+    let Some(until) = last.access_until else {
+        return Standing::Unknown;
+    };
+    if now < until {
         return Standing::Current;
     }
     match send_interval {
@@ -148,18 +155,29 @@ mod tests {
 
     #[test]
     fn without_a_schedule_no_silence_is_judged() {
-        let last = decision(false, None);
+        let last = decision(false, Some("2026-11-17T09:00:00Z"));
         let long_after = at("2027-01-01T00:00:00Z");
         assert_eq!(standing(Some(&last), None, long_after), Standing::Lapsed);
     }
 
+    /// A row from before the gateway kept the certificate end holds no end. Its certificate may
+    /// still run, so the standing is unknown at any time, never lapsed or silent.
     #[test]
-    fn a_claim_without_a_certificate_is_lapsed() {
+    fn an_accepted_claim_with_no_recorded_end_is_unknown() {
         let last = decision(false, None);
-        let now = at("2026-11-17T09:05:00Z");
+        for now in ["2026-11-17T09:05:00Z", "2026-11-18T09:05:00Z"] {
+            for interval in [None, Some(TimeDelta::minutes(55))] {
+                assert_eq!(
+                    standing(Some(&last), interval, at(now)),
+                    Standing::Unknown,
+                    "{now} {interval:?}"
+                );
+            }
+        }
+        let denied = decision(true, None);
         assert_eq!(
-            standing(Some(&last), Some(TimeDelta::minutes(55)), now),
-            Standing::Lapsed
+            standing(Some(&denied), None, at("2026-11-17T09:05:00Z")),
+            Standing::Denied
         );
     }
 

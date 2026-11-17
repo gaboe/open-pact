@@ -281,8 +281,10 @@ pub fn claim_outcome(
 }
 
 /// Records the last claim decision of the enrolment `device` holds under `manifest`, in the
-/// transaction that decides the claim. `access_until` is the end of the certificate the claim got,
-/// None when it got none.
+/// transaction that decides the claim. `access_until` is the end of the certificate the claim got.
+/// An accepted claim that got none ended its access at `at`, so it stores `at`. The column stays
+/// null after a denial and for a row the gateway wrote before it kept the end, which reads as an
+/// unknown standing until the next claim.
 pub async fn record_claim(
     conn: &mut PgConnection,
     device: &Pseudonym,
@@ -301,7 +303,10 @@ pub async fn record_claim(
     .bind(at)
     .bind(result.as_str())
     .bind(reasons)
-    .bind(access_until)
+    .bind(match result {
+        ClaimResult::Denied => None,
+        _ => Some(access_until.unwrap_or(at)),
+    })
     .execute(conn)
     .await?;
     Ok(())
