@@ -175,6 +175,9 @@ pub struct FormState {
     /// The values of the sending parts that are off. The session keeps them, so that a part that
     /// is turned on again gets its old values back.
     pub sends_kept: manifest::KeptSends,
+    /// The schedule of the last raw text that parsed. A syntax error in the middle of typing is
+    /// not a schedule change.
+    pub sends_seen: manifest::SeenSchedule,
     pub jump: usize,
     pub scroll: ScrollHandle,
     /// The scroll position of the Add check options.
@@ -241,6 +244,7 @@ impl FormState {
         Self {
             inputs: None,
             sends_kept: manifest::KeptSends::default(),
+            sends_seen: manifest::SeenSchedule::default(),
             panel: None,
             selected: None,
             filter: Filter::All,
@@ -448,6 +452,7 @@ impl AppView {
     pub fn replace_draft(&mut self, text: String) {
         self.draft = text;
         self.fv.sends_kept.forget();
+        self.fv.sends_seen.forget();
     }
 
     /// Applies an edit of the form to the draft. `rebuild` says which inputs the new text makes
@@ -813,6 +818,7 @@ impl AppView {
             self.fv.panel_subs.clear();
             return;
         };
+        self.fv.pending.drop_absent_sends(form.schedule.as_ref());
         let held = self.fv.pending.clone();
         let reuse = |field: Field| -> Option<DurationField> {
             kept.as_ref()
@@ -2046,16 +2052,13 @@ impl AppView {
                                 .text_ellipsis()
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .whitespace_nowrap()
-                                .when_some(
-                                    manifest::builtin(control.builtin_id()),
-                                    |name, known| {
-                                        name.tooltip(move |window, cx| {
-                                            gpui_component::tooltip::Tooltip::new(known.about)
-                                                .w(px(340.))
-                                                .build(window, cx)
-                                        })
-                                    },
-                                )
+                                .when_some(control.builtin(), |name, known| {
+                                    name.tooltip(move |window, cx| {
+                                        gpui_component::tooltip::Tooltip::new(known.about)
+                                            .w(px(340.))
+                                            .build(window, cx)
+                                    })
+                                })
                                 .child(control.name()),
                         ),
                 );
@@ -2274,7 +2277,7 @@ impl AppView {
                             .text_color(rgb(MUTED))
                             .child(control.check.clone()),
                     )
-                    .when_some(manifest::builtin(control.builtin_id()), |header, known| {
+                    .when_some(control.builtin(), |header, known| {
                         header.child(
                             div()
                                 .mt(px(6.))
@@ -2313,7 +2316,7 @@ impl AppView {
                         .text_color(rgb(INK_2))
                         .child(value)
                 }));
-        let heading = match (&control.output, manifest::builtin(control.builtin_id())) {
+        let heading = match (&control.output, control.builtin()) {
             (Output::Integer { .. }, Some(known)) if !known.noun.is_empty() => {
                 let direction = match (control.mixed_limits(), control.limit_is_max()) {
                     (true, _) => "",

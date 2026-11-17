@@ -220,6 +220,7 @@ impl AppView {
                             &before,
                             &this.draft,
                             &mut this.fv.sends_kept,
+                            &mut this.fv.sends_seen,
                         );
                         this.show_draft(window, cx);
                         cx.notify();

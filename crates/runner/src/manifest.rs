@@ -244,6 +244,12 @@ pub struct Control {
 }
 
 impl Control {
+    /// The entry of the version this check names. Name, group and limit kind come from the newest
+    /// entry, but what the check reads and reports differs by version.
+    pub fn builtin(&self) -> Option<&'static Builtin> {
+        builtin_of_check(&self.check)
+    }
+
     /// "screen_lock" from "builtin:screen_lock@1".
     pub fn builtin_id(&self) -> &str {
         self.check
@@ -719,8 +725,9 @@ pub struct Builtin {
 
 const INTEGER_3650: &str = "{ integer = { min = 0, max = 3650 } }";
 const INTEGER_MAX: &str = "{ integer = { min = 0, max = 2147483647 } }";
-const LOCK_MINUTES: &str =
-    r#"{ integer = { min = 0, max = 2147483647 }, values = ["none", "unknown"] }"#;
+/// Core takes only `n/a` and `none` as explicit words of an integer output; `unknown` is always
+/// allowed without being listed. A day (1440 minutes) is the longest lock time a person sets.
+const LOCK_MINUTES: &str = r#"{ integer = { min = 0, max = 1440 }, values = ["none"] }"#;
 
 pub const BUILTINS: [Builtin; 27] = [
     Builtin {
@@ -788,12 +795,12 @@ pub const BUILTINS: [Builtin; 27] = [
         noun: "time before the lock",
         group: Group::SignIn,
         about: "A device that stays unlocked gives access to anyone nearby. The client \
-            reads the same setting as the older screen lock check and reports whole \
-            minutes: the time before the screen asks for a password, or none when the \
-            screen never locks. On macOS it runs sysadminctl -screenLock status; on \
-            Windows it reads the machine inactivity limit, else the secure screen saver \
-            of each signed-in user; on Linux it reads the GNOME settings with gsettings \
-            or the KDE kscreenlockerrc file.",
+            reports whole minutes, or none when the screen never locks. On macOS it \
+            runs sysadminctl -screenLock status and reads only the password delay that \
+            applies after the screen saver starts or the display turns off, not the idle \
+            time that starts them; on Windows it reads the machine inactivity limit, \
+            else the secure screen saver of each signed-in user; on Linux it reads the \
+            GNOME settings with gsettings or the KDE kscreenlockerrc file.",
     },
     Builtin {
         id: "os_patch_age_days",
@@ -1170,6 +1177,18 @@ pub fn builtin(id: &str) -> Option<&'static Builtin> {
         .iter()
         .filter(|known| known.id == id)
         .max_by_key(|known| known.version)
+}
+
+/// The built-in check that a `check` value such as `builtin:screen_lock@1` names, with that
+/// exact version. A version this editor does not know falls back to the newest entry.
+pub fn builtin_of_check(check: &str) -> Option<&'static Builtin> {
+    let rest = check.strip_prefix("builtin:")?;
+    let (id, version) = rest.split_once('@').unwrap_or((rest, ""));
+    let version = version.parse::<u8>().ok();
+    BUILTINS
+        .iter()
+        .find(|known| known.id == id && Some(known.version) == version)
+        .or_else(|| builtin(id))
 }
 
 /// The built-in checks the manifest does not use yet. The two repository checks need remote
@@ -1727,6 +1746,17 @@ impl Pending {
         ))
     }
 
+    /// A part of sending that is off has no inputs, so it holds no unread text either.
+    pub fn drop_absent_sends(&mut self, schedule: Option<&Schedule>) {
+        let vpn = schedule.is_some_and(|schedule| schedule.vpn.is_some());
+        let always = schedule.is_some_and(|schedule| schedule.always.is_some());
+        self.0.retain(|field, _| match field {
+            Field::VpnProbe | Field::VpnProbeName | Field::VpnCheck | Field::VpnInterval => vpn,
+            Field::AlwaysInterval => always,
+            _ => true,
+        });
+    }
+
     /// The first input that holds text the form could not read.
     pub fn first_unread(&self) -> Option<&Field> {
         self.0.keys().next()
@@ -2052,7 +2082,7 @@ fn put_part(document: &mut DocumentMut, part: SendPart, table: Table) -> Result<
     }
     let schedule = document
         .get_mut("schedule")
-        .and_then(Item::as_table_mut)
+        .and_then(Item::as_table_like_mut)
         .ok_or("schedule is not a table")?;
     schedule.insert(part.table(), Item::Table(table));
     Ok(())
@@ -2060,7 +2090,10 @@ fn put_part(document: &mut DocumentMut, part: SendPart, table: Table) -> Result<
 
 /// Removes one part table. Without any part left, the manifest has no [schedule].
 fn remove_part(document: &mut DocumentMut, part: SendPart) {
-    let empty = match document.get_mut("schedule").and_then(Item::as_table_mut) {
+    let empty = match document
+        .get_mut("schedule")
+        .and_then(Item::as_table_like_mut)
+    {
         Some(schedule) => {
             schedule.remove(part.table());
             schedule.is_empty()
@@ -2072,12 +2105,17 @@ fn remove_part(document: &mut DocumentMut, part: SendPart) {
     }
 }
 
-fn send_table_mut(document: &mut DocumentMut, part: SendPart) -> Result<&mut Table, String> {
+/// The table of one part. A part written as an inline table, or inside an inline `schedule`, is
+/// a table to core too.
+fn send_table_mut(
+    document: &mut DocumentMut,
+    part: SendPart,
+) -> Result<&mut dyn TableLike, String> {
     document
         .get_mut("schedule")
-        .and_then(Item::as_table_mut)
+        .and_then(Item::as_table_like_mut)
         .and_then(|schedule| schedule.get_mut(part.table()))
-        .and_then(Item::as_table_mut)
+        .and_then(Item::as_table_like_mut)
         .ok_or_else(|| "This part of sending is off".to_owned())
 }
 
@@ -2149,10 +2187,38 @@ impl KeptSends {
 
 /// Forgets the remembered sending values when a TOML edit changes the schedule. A form edit does
 /// not come here: the form switches parts through \`switch_send\`.
-pub fn sends_after_edit(before: &str, after: &str, kept: &mut KeptSends) {
-    let schedule = |text: &str| Form::parse(text).ok().and_then(|form| form.schedule);
-    if schedule(before) != schedule(after) {
+///
+/// A text with a syntax error has no schedule to compare, and it does not count as a schedule
+/// that is gone. `seen` holds the schedule of the last text that parsed, so a schedule change
+/// across a broken intermediate text still forgets the values.
+pub fn sends_after_edit(before: &str, after: &str, kept: &mut KeptSends, seen: &mut SeenSchedule) {
+    if let Some(schedule) = parsed_schedule(before) {
+        seen.0 = Some(schedule);
+    }
+    let Some(now) = parsed_schedule(after) else {
+        return;
+    };
+    if seen.0.as_ref().is_some_and(|was| *was != now) {
         kept.forget();
+    }
+    seen.0 = Some(now);
+}
+
+/// The schedule of a text, or `None` when the text does not parse as TOML.
+fn parsed_schedule(text: &str) -> Option<Option<Schedule>> {
+    text.parse::<DocumentMut>()
+        .ok()
+        .map(|document| read_schedule(&document))
+}
+
+/// The schedule of the last raw text that parsed, for `sends_after_edit`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SeenSchedule(Option<Option<Schedule>>);
+
+impl SeenSchedule {
+    /// A draft replaced as a whole has no baseline from the old text.
+    pub fn forget(&mut self) {
+        self.0 = None;
     }
 }
 
