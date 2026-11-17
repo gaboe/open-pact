@@ -163,10 +163,11 @@ fn requirements_read_as_words() {
     );
     assert_eq!(control("screen_lock").name(), "Screen lock");
     assert_eq!(control("screen_lock").grace_text(), "1 d");
-    let tags: Vec<_> = ["disk_encryption", "firewall", "os_supported"]
-        .map(|id| manifest::source_tag(&control(id).source))
-        .into();
-    assert_eq!(tags, ["Contract", "Policy", "Standard"]);
+    assert_eq!(
+        control("disk_encryption").reference,
+        "Client contract, security annex, 4.2"
+    );
+    assert!(control("firewall").reference.is_empty());
     let multiple = Requirement::Values(vec!["le_5min".into(), "le_15min".into()]);
     assert_eq!(
         manifest::requirement_text(control("screen_lock"), &multiple),
@@ -192,11 +193,10 @@ fn the_form_reads_every_section() {
     );
     assert!(!form.metadata.contains(&"virtualized".to_owned()));
     let schedule = form.schedule.as_ref().unwrap();
-    assert_eq!(
-        (schedule.mode.as_str(), schedule.interval.as_str()),
-        ("vpn", "55m")
-    );
-    assert_eq!(schedule.probe, "10.0.0.1:443");
+    let vpn = schedule.vpn.as_ref().unwrap();
+    assert_eq!((vpn.interval.as_str(), vpn.check.as_str()), ("55m", "5m"));
+    assert_eq!(vpn.probe, "10.0.0.1:443");
+    assert!(schedule.always.is_none());
     assert_eq!(form.controls.len(), 21);
     let (all, required, reported) = form.counts();
     assert_eq!(all, required + reported);
@@ -219,7 +219,7 @@ fn edits_keep_comments_and_order() {
     text = manifest::set_top_text(&text, "issuer", "Example Company, Security").unwrap();
     text = manifest::set_top_text(&text, "min_trust_level", "L1").unwrap();
     text = manifest::set_top_list(&text, "claim_recipients", &["One".to_owned()]).unwrap();
-    text = manifest::set_schedule(&text, "interval", "2h").unwrap();
+    text = manifest::set_send_text(&text, manifest::SendPart::Vpn, "interval", "2h").unwrap();
     text = manifest::set_control_text(&text, 0, "grace", "2d").unwrap();
     text = manifest::set_requirement(&text, 3, Os::Windows, &Requirement::Max(21)).unwrap();
     text = manifest::set_requirement(
@@ -270,10 +270,24 @@ fn edits_keep_comments_and_order() {
     let order =
         |text: &str| -> Vec<String> { form(text).controls.into_iter().map(|c| c.id).collect() };
     assert_eq!(order(&text), order(MANIFEST));
+    // A written control takes the current key names and drops source, and the sending section
+    // takes its parts, so those keys are compared apart. Every other key keeps its place.
     let keys = |text: &str| -> Vec<String> {
-        text.lines()
-            .filter_map(|line| line.split_once(" = ").map(|(key, _)| key.to_owned()))
-            .collect()
+        text.split(
+            "
+[schedule",
+        )
+        .next()
+        .unwrap_or(text)
+        .lines()
+        .filter_map(|line| line.split_once(" = ").map(|(key, _)| key.to_owned()))
+        .filter(|key| {
+            !matches!(
+                key.as_str(),
+                "source" | "source_ref" | "rationale" | "description" | "reference"
+            )
+        })
+        .collect()
     };
     assert_eq!(keys(&text), keys(MANIFEST));
     assert!(manifest::set_control_text(&text, 0, "id", "firewall").is_err());
@@ -282,11 +296,11 @@ fn edits_keep_comments_and_order() {
 
 #[test]
 fn optional_text_is_removed_when_cleared() {
-    let text = manifest::set_control_text(MANIFEST, 0, "source_ref", "").unwrap();
-    assert!(!form(&text).controls[0].source_ref.contains("Client"));
+    let text = manifest::set_control_text(MANIFEST, 0, "reference", "").unwrap();
+    assert!(form(&text).controls[0].reference.is_empty());
     assert!(!text.contains("security annex"));
-    let text = manifest::set_control_text(&text, 1, "rationale", "Keep it on.").unwrap();
-    assert_eq!(form(&text).controls[1].rationale, "Keep it on.");
+    let text = manifest::set_control_text(&text, 1, "description", "Keep it on.").unwrap();
+    assert_eq!(form(&text).controls[1].description, "Keep it on.");
 }
 
 #[test]
@@ -315,7 +329,7 @@ fn a_check_is_added_as_reported_and_removed_again() {
         Output::Choices(["on", "off", "n/a", "unknown"].map(String::from).into())
     );
     assert!(!added.is_required());
-    assert_eq!(added.source, "company_policy");
+    assert!(added.reference.is_empty());
     assert!(text.contains("required = {}"), "{text}");
     assert!(text.contains("# Demo only: this witness key"));
     assert!(manifest::add_control(&text, "remote_wipe").is_err());
@@ -350,7 +364,7 @@ fn changed_rows_and_the_change_list_are_in_words() {
     assert!(manifest::changes(&before, &before).is_empty());
     let mut text = manifest::set_top_text(MANIFEST, "claim_max_age", "12h").unwrap();
     text = manifest::set_top_text(&text, "valid_from", "2026-11-02").unwrap();
-    text = manifest::set_control_text(&text, 2, "source", "standard").unwrap();
+    text = manifest::set_control_text(&text, 2, "description", "Lock at once.").unwrap();
     text = manifest::set_control_text(&text, 2, "grace", "2w").unwrap();
     text = manifest::set_requirement(&text, 2, Os::Windows, &Requirement::Reported).unwrap();
     text = manifest::set_top_list(
@@ -371,25 +385,11 @@ fn changed_rows_and_the_change_list_are_in_words() {
             "A result is valid for: 24 hours → 12 hours",
             "Sent with each result: added Runs in a virtual machine",
             "Sent with each result: removed Log checkpoint",
-            "Screen lock: asked for by Customer contract → Standard",
+            "Screen lock: description changed",
             "Screen lock: Windows ≤ 5 min → reported",
             "Screen lock: time to fix 1 day → 2 weeks",
         ]
     );
-}
-
-#[test]
-fn sending_mode_follows_the_core_rules() {
-    let always = manifest::set_send_mode(MANIFEST, "always").unwrap();
-    assert!(!always.contains("vpn_probe"));
-    assert_eq!(form(&always).schedule.unwrap().mode, "always");
-    let back = manifest::set_send_mode(&always, "vpn").unwrap();
-    assert!(back.contains("vpn_probe = \"\""));
-    let probe = manifest::set_schedule(&back, "vpn_probe", "10.0.0.2:443").unwrap();
-    assert_eq!(form(&probe).schedule.unwrap().probe, "10.0.0.2:443");
-    let none = "manifest_version = 1\n";
-    let created = manifest::set_send_mode(none, "always").unwrap();
-    assert_eq!(form(&created).schedule.unwrap().interval, "1h");
 }
 
 #[test]

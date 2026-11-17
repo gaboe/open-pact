@@ -135,27 +135,6 @@ impl Os {
     }
 }
 
-pub const SOURCES: [(&str, &str, &str); 4] = [
-    ("customer_contract", "Customer contract", "Contract"),
-    ("company_policy", "Company policy", "Policy"),
-    ("standard", "Standard", "Standard"),
-    ("law", "Law", "Law"),
-];
-
-pub fn source_name(key: &str) -> String {
-    SOURCES
-        .iter()
-        .find(|(known, _, _)| *known == key)
-        .map_or_else(|| key.to_owned(), |(_, name, _)| (*name).to_owned())
-}
-
-pub fn source_tag(key: &str) -> String {
-    SOURCES
-        .iter()
-        .find(|(known, _, _)| *known == key)
-        .map_or_else(|| key.to_owned(), |(_, _, tag)| (*tag).to_owned())
-}
-
 pub const TRUST_LEVELS: [(&str, &str); 3] = [
     ("L0", "L0 software"),
     ("L1", "L1 hardware"),
@@ -254,9 +233,10 @@ pub enum Requirement {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Control {
     pub id: String,
-    pub source: String,
-    pub source_ref: String,
-    pub rationale: String,
+    /// What the owner writes about the check. Optional.
+    pub description: String,
+    /// A link or text that names where the check comes from. Optional.
+    pub reference: String,
     pub check: String,
     pub output: Output,
     pub required: [Requirement; 3],
@@ -301,6 +281,7 @@ impl Control {
             "password_min_length" => "characters",
             "managed_repos_outside" | "managed_repos_total" => "repositories",
             "antimalware_active_threats" => "threats",
+            "screen_lock" => "minutes",
             _ => "",
         }
     }
@@ -355,12 +336,70 @@ impl Control {
     }
 }
 
+/// How devices send. At least one part is on. With both parts off the manifest has no [schedule].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Schedule {
-    pub mode: String,
+    pub vpn: Option<VpnSend>,
+    pub always: Option<AlwaysSend>,
+}
+
+/// Sending on the company VPN: the probe that answers when the VPN is up, how often a device
+/// checks it, and how often it sends.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VpnSend {
     pub probe: String,
     pub name: String,
+    pub check: String,
     pub interval: String,
+}
+
+/// Sending on any network.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AlwaysSend {
+    pub interval: String,
+}
+
+/// One part of the sending section.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SendPart {
+    Vpn,
+    Always,
+}
+
+impl SendPart {
+    fn table(self) -> &'static str {
+        match self {
+            Self::Vpn => "vpn",
+            Self::Always => "always",
+        }
+    }
+}
+
+/// The values of the parts that are off. The session keeps them, so that turning a part on
+/// again restores what it had.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct KeptSends {
+    pub vpn: Option<VpnSend>,
+    pub always: Option<AlwaysSend>,
+}
+
+const CHECK_DEFAULT: &str = "5m";
+const VPN_INTERVAL_DEFAULT: &str = "1h";
+const ALWAYS_INTERVAL_DEFAULT: &str = "24h";
+
+fn default_vpn() -> VpnSend {
+    VpnSend {
+        probe: String::new(),
+        name: String::new(),
+        check: CHECK_DEFAULT.to_owned(),
+        interval: VPN_INTERVAL_DEFAULT.to_owned(),
+    }
+}
+
+fn default_always() -> AlwaysSend {
+    AlwaysSend {
+        interval: ALWAYS_INTERVAL_DEFAULT.to_owned(),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -448,18 +487,51 @@ fn read_requirement(item: Option<&Item>) -> Requirement {
     Requirement::Reported
 }
 
+/// The sending parts of a manifest. An older flat [schedule] with `mode` reads as the VPN part
+/// when its mode is "vpn", and as the any-network part otherwise.
+fn read_schedule(document: &DocumentMut) -> Option<Schedule> {
+    let table = document.get("schedule").and_then(Item::as_table_like)?;
+    if table.get("mode").is_some() {
+        let interval = text_of(table.get("interval"));
+        let vpn = (text_of(table.get("mode")) == "vpn").then(|| VpnSend {
+            probe: text_of(table.get("vpn_probe")),
+            name: text_of(table.get("vpn_probe_name")),
+            check: CHECK_DEFAULT.to_owned(),
+            interval: interval.clone(),
+        });
+        let always = vpn.is_none().then_some(AlwaysSend { interval });
+        return Some(Schedule { vpn, always });
+    }
+    let vpn = table
+        .get(SendPart::Vpn.table())
+        .and_then(Item::as_table_like)
+        .map(|part| VpnSend {
+            probe: text_of(part.get("probe")),
+            name: text_of(part.get("probe_name")),
+            check: or_default(part.get("check"), CHECK_DEFAULT),
+            interval: text_of(part.get("interval")),
+        });
+    let always = table
+        .get(SendPart::Always.table())
+        .and_then(Item::as_table_like)
+        .map(|part| AlwaysSend {
+            interval: text_of(part.get("interval")),
+        });
+    (vpn.is_some() || always.is_some()).then_some(Schedule { vpn, always })
+}
+
+fn or_default(item: Option<&Item>, default: &str) -> String {
+    match text_of(item) {
+        text if text.is_empty() => default.to_owned(),
+        text => text,
+    }
+}
+
 impl Form {
     pub fn parse(text: &str) -> Result<Self, String> {
         let document = text.parse::<DocumentMut>().map_err(|e| e.to_string())?;
         let get = |key: &str| document.get(key);
-        let schedule = get("schedule")
-            .and_then(Item::as_table_like)
-            .map(|table| Schedule {
-                mode: text_of(table.get("mode")),
-                probe: text_of(table.get("vpn_probe")),
-                name: text_of(table.get("vpn_probe_name")),
-                interval: text_of(table.get("interval")),
-            });
+        let schedule = read_schedule(&document);
         let controls = get("control")
             .and_then(Item::as_array_of_tables)
             .map(|tables| {
@@ -476,9 +548,12 @@ impl Form {
                         };
                         Control {
                             id: text_of(table.get("id")),
-                            source: text_of(table.get("source")),
-                            source_ref: text_of(table.get("source_ref")),
-                            rationale: text_of(table.get("rationale")),
+                            description: text_of(
+                                table.get("description").or_else(|| table.get("rationale")),
+                            ),
+                            reference: text_of(
+                                table.get("reference").or_else(|| table.get("source_ref")),
+                            ),
                             check: text_of(table.get("check")),
                             output: read_output(table.get("output")),
                             required: Os::ALL.map(per_os),
@@ -631,6 +706,8 @@ pub struct Builtin {
     pub line: &'static str,
     pub scope: &'static str,
     pub output: &'static str,
+    /// The version of the check the client runs, as in `builtin:<id>@<version>`.
+    pub version: u8,
     /// For a number check, whether the limit is a maximum.
     pub max: bool,
     /// What a number limit counts, as a noun, for the panel heading.
@@ -642,10 +719,13 @@ pub struct Builtin {
 
 const INTEGER_3650: &str = "{ integer = { min = 0, max = 3650 } }";
 const INTEGER_MAX: &str = "{ integer = { min = 0, max = 2147483647 } }";
+const LOCK_MINUTES: &str =
+    r#"{ integer = { min = 0, max = 2147483647 }, values = ["none", "unknown"] }"#;
 
-pub const BUILTINS: [Builtin; 26] = [
+pub const BUILTINS: [Builtin; 27] = [
     Builtin {
         id: "disk_encryption",
+        version: 1,
         name: "Disk encryption",
         line: "The disk is encrypted",
         scope: "",
@@ -665,6 +745,7 @@ pub const BUILTINS: [Builtin; 26] = [
     },
     Builtin {
         id: "firewall",
+        version: 1,
         name: "Firewall",
         line: "The firewall is on",
         scope: "",
@@ -680,6 +761,7 @@ pub const BUILTINS: [Builtin; 26] = [
     },
     Builtin {
         id: "screen_lock",
+        version: 1,
         name: "Screen lock",
         line: "The screen locks after a short idle time",
         scope: "",
@@ -696,7 +778,26 @@ pub const BUILTINS: [Builtin; 26] = [
             the idle time that starts the screen saver or turns off the display.",
     },
     Builtin {
+        id: "screen_lock",
+        version: 2,
+        name: "Screen lock",
+        line: "The screen locks after a short idle time",
+        scope: "",
+        output: LOCK_MINUTES,
+        max: true,
+        noun: "time before the lock",
+        group: Group::SignIn,
+        about: "A device that stays unlocked gives access to anyone nearby. The client \
+            reads the same setting as the older screen lock check and reports whole \
+            minutes: the time before the screen asks for a password, or none when the \
+            screen never locks. On macOS it runs sysadminctl -screenLock status; on \
+            Windows it reads the machine inactivity limit, else the secure screen saver \
+            of each signed-in user; on Linux it reads the GNOME settings with gsettings \
+            or the KDE kscreenlockerrc file.",
+    },
+    Builtin {
         id: "os_patch_age_days",
+        version: 1,
         name: "OS updates",
         line: "How old the last system update is",
         scope: "",
@@ -713,6 +814,7 @@ pub const BUILTINS: [Builtin; 26] = [
     },
     Builtin {
         id: "os_supported",
+        version: 1,
         name: "Supported OS",
         line: "The OS version still gets vendor updates",
         scope: "",
@@ -729,6 +831,7 @@ pub const BUILTINS: [Builtin; 26] = [
     },
     Builtin {
         id: "os_auto_updates",
+        version: 1,
         name: "Automatic OS updates",
         line: "The OS installs updates by itself",
         scope: "",
@@ -745,6 +848,7 @@ pub const BUILTINS: [Builtin; 26] = [
     },
     Builtin {
         id: "antimalware_active",
+        version: 1,
         name: "Antimalware active",
         line: "An antimalware program is installed and on",
         scope: "",
@@ -761,6 +865,7 @@ pub const BUILTINS: [Builtin; 26] = [
     },
     Builtin {
         id: "antimalware_realtime",
+        version: 1,
         name: "Antimalware real-time",
         line: "The antimalware program scans files as they open",
         scope: "",
@@ -776,6 +881,7 @@ pub const BUILTINS: [Builtin; 26] = [
     },
     Builtin {
         id: "antimalware_signature_age_days",
+        version: 1,
         name: "Antimalware signatures",
         line: "How old the antimalware signatures are",
         scope: "",
@@ -791,6 +897,7 @@ pub const BUILTINS: [Builtin; 26] = [
     },
     Builtin {
         id: "antimalware_full_scan_age_days",
+        version: 1,
         name: "Full scan age",
         line: "How long ago the last full scan ran",
         scope: "Windows",
@@ -805,6 +912,7 @@ pub const BUILTINS: [Builtin; 26] = [
     },
     Builtin {
         id: "antimalware_active_threats",
+        version: 1,
         name: "Active threats",
         line: "Threats the antimalware program has not cleaned",
         scope: "Windows",
@@ -819,6 +927,7 @@ pub const BUILTINS: [Builtin; 26] = [
     },
     Builtin {
         id: "preboot_auth",
+        version: 1,
         name: "Pre-boot login",
         line: "A secret is needed before the disk unlocks",
         scope: "",
@@ -835,6 +944,7 @@ pub const BUILTINS: [Builtin; 26] = [
     },
     Builtin {
         id: "password_min_length",
+        version: 1,
         name: "Password policy",
         line: "The shortest password the device accepts",
         scope: "",
@@ -850,6 +960,7 @@ pub const BUILTINS: [Builtin; 26] = [
     },
     Builtin {
         id: "password_set",
+        version: 1,
         name: "Password set",
         line: "The account has a password",
         scope: "",
@@ -864,6 +975,7 @@ pub const BUILTINS: [Builtin; 26] = [
     },
     Builtin {
         id: "auto_login",
+        version: 1,
         name: "Automatic login",
         line: "The device signs in without a password",
         scope: "",
@@ -879,6 +991,7 @@ pub const BUILTINS: [Builtin; 26] = [
     },
     Builtin {
         id: "secure_boot",
+        version: 1,
         name: "Secure boot",
         line: "Only trusted software starts the device",
         scope: "Windows and Linux",
@@ -893,6 +1006,7 @@ pub const BUILTINS: [Builtin; 26] = [
     },
     Builtin {
         id: "work_account",
+        version: 1,
         name: "Work account",
         line: "Whether the work account is an administrator",
         scope: "",
@@ -907,6 +1021,7 @@ pub const BUILTINS: [Builtin; 26] = [
     },
     Builtin {
         id: "uptime_days",
+        version: 1,
         name: "Uptime",
         line: "Days since the device last restarted",
         scope: "",
@@ -921,6 +1036,7 @@ pub const BUILTINS: [Builtin; 26] = [
     },
     Builtin {
         id: "web_protection",
+        version: 1,
         name: "Web protection",
         line: "Browser blocks known bad sites",
         scope: "",
@@ -936,6 +1052,7 @@ pub const BUILTINS: [Builtin; 26] = [
     },
     Builtin {
         id: "log_oldest_record_days",
+        version: 1,
         name: "Oldest log record",
         line: "How far back the system log reaches",
         scope: "Windows and Linux",
@@ -951,6 +1068,7 @@ pub const BUILTINS: [Builtin; 26] = [
     },
     Builtin {
         id: "log_cleared",
+        version: 1,
         name: "Log cleared",
         line: "When someone last cleared the security log",
         scope: "Windows",
@@ -966,6 +1084,7 @@ pub const BUILTINS: [Builtin; 26] = [
     },
     Builtin {
         id: "process_audit",
+        version: 1,
         name: "Process audit",
         line: "Windows logs which programs start",
         scope: "Windows",
@@ -981,6 +1100,7 @@ pub const BUILTINS: [Builtin; 26] = [
     },
     Builtin {
         id: "remote_wipe",
+        version: 1,
         name: "Remote wipe",
         line: "Can the device be erased from a distance",
         scope: "macOS",
@@ -995,6 +1115,7 @@ pub const BUILTINS: [Builtin; 26] = [
     },
     Builtin {
         id: "powershell_logging",
+        version: 1,
         name: "PowerShell logging",
         line: "Scripts are logged",
         scope: "Windows",
@@ -1009,6 +1130,7 @@ pub const BUILTINS: [Builtin; 26] = [
     },
     Builtin {
         id: "managed_repos_outside",
+        version: 1,
         name: "Repositories outside folders",
         line: "Work repositories outside the declared folders",
         scope: "",
@@ -1025,6 +1147,7 @@ pub const BUILTINS: [Builtin; 26] = [
     },
     Builtin {
         id: "managed_repos_total",
+        version: 1,
         name: "Managed repositories",
         line: "All work repositories on the device",
         scope: "",
@@ -1040,8 +1163,13 @@ pub const BUILTINS: [Builtin; 26] = [
     },
 ];
 
+/// The newest version of a built-in check. A control that uses an older version keeps its name,
+/// group and limit kind from this entry.
 pub fn builtin(id: &str) -> Option<&'static Builtin> {
-    BUILTINS.iter().find(|known| known.id == id)
+    BUILTINS
+        .iter()
+        .filter(|known| known.id == id)
+        .max_by_key(|known| known.version)
 }
 
 /// The built-in checks the manifest does not use yet. The two repository checks need remote
@@ -1050,6 +1178,7 @@ pub fn addable(form: &Form) -> Vec<&'static Builtin> {
     BUILTINS
         .iter()
         .filter(|known| !known.id.starts_with("managed_repos"))
+        .filter(|known| builtin(known.id).is_some_and(|newest| newest.version == known.version))
         .filter(|known| !form.controls.iter().any(|c| c.builtin_id() == known.id))
         .collect()
 }
@@ -1163,31 +1292,7 @@ pub fn changes(before: &Form, after: &Form) -> Vec<String> {
                 .map_or_else(|| key.to_owned(), |(_, name)| (*name).to_owned())
         },
     );
-    match (&before.schedule, &after.schedule) {
-        (Some(old), Some(new)) => {
-            let mode = |raw: &str| {
-                if raw == "vpn" {
-                    "only on the company VPN".to_owned()
-                } else {
-                    "always".to_owned()
-                }
-            };
-            let mut text = |label: &str, old: &str, new: &str| {
-                if old != new {
-                    list.push(format!("{label}: {old} → {new}"));
-                }
-            };
-            text("Send", &mode(&old.mode), &mode(&new.mode));
-            text("VPN answers at", &old.probe, &new.probe);
-            text("VPN shown as", &old.name, &new.name);
-            let interval =
-                |raw: &str| Span::parse(raw).map_or_else(|| raw.to_owned(), |span| span.words());
-            text("Every", &interval(&old.interval), &interval(&new.interval));
-        }
-        (None, Some(_)) => list.push("Sending: automatic sending turned on".into()),
-        (Some(_), None) => list.push("Sending: automatic sending turned off".into()),
-        (None, None) => (),
-    }
+    send_changes(&mut list, before.schedule.as_ref(), after.schedule.as_ref());
     for old in &before.controls {
         if after.control(&old.id).is_none() {
             list.push(format!("Removed check: {}", old.name()));
@@ -1199,18 +1304,11 @@ pub fn changes(before: &Form, after: &Form) -> Vec<String> {
             continue;
         };
         let name = new.name();
-        if old.source != new.source {
-            list.push(format!(
-                "{name}: asked for by {} → {}",
-                source_name(&old.source),
-                source_name(&new.source)
-            ));
-        }
-        if old.source_ref != new.source_ref {
+        if old.reference != new.reference {
             list.push(format!("{name}: reference changed"));
         }
-        if old.rationale != new.rationale {
-            list.push(format!("{name}: reason changed"));
+        if old.description != new.description {
+            list.push(format!("{name}: description changed"));
         }
         for os in Os::ALL {
             let (a, b) = (old.requirement(os), new.requirement(os));
@@ -1251,6 +1349,54 @@ pub fn changes(before: &Form, after: &Form) -> Vec<String> {
     list
 }
 
+/// The sending changes in words: each part turned on or off, then the values that changed.
+fn send_changes(list: &mut Vec<String>, before: Option<&Schedule>, after: Option<&Schedule>) {
+    let span = |raw: &str| Span::parse(raw).map_or_else(|| raw.to_owned(), |span| span.words());
+    match (
+        before.and_then(|s| s.vpn.as_ref()),
+        after.and_then(|s| s.vpn.as_ref()),
+    ) {
+        (None, Some(_)) => list.push("On the company VPN: turned on".into()),
+        (Some(_), None) => list.push("On the company VPN: turned off".into()),
+        (Some(old), Some(new)) => {
+            if old.probe != new.probe {
+                list.push(format!("VPN answers at: {} → {}", old.probe, new.probe));
+            }
+            if old.name != new.name {
+                list.push(format!("VPN shown as: {} → {}", old.name, new.name));
+            }
+            if old.check != new.check {
+                list.push(format!(
+                    "VPN: check every {} → {}",
+                    span(&old.check),
+                    span(&new.check)
+                ));
+            }
+            if old.interval != new.interval {
+                list.push(format!(
+                    "VPN: send every {} → {}",
+                    span(&old.interval),
+                    span(&new.interval)
+                ));
+            }
+        }
+        (None, None) => (),
+    }
+    match (
+        before.and_then(|s| s.always.as_ref()),
+        after.and_then(|s| s.always.as_ref()),
+    ) {
+        (None, Some(_)) => list.push("On any network: turned on".into()),
+        (Some(_), None) => list.push("On any network: turned off".into()),
+        (Some(old), Some(new)) if old.interval != new.interval => list.push(format!(
+            "On any network: send every {} → {}",
+            span(&old.interval),
+            span(&new.interval)
+        )),
+        _ => (),
+    }
+}
+
 /// Ids of the controls that differ from the active manifest, or that it does not have.
 pub fn changed_controls(before: &Form, after: &Form) -> Vec<String> {
     after
@@ -1273,12 +1419,23 @@ const MODELLED_TOP: [&str; 9] = [
     "min_trust_level",
     "disclosed_metadata",
 ];
-const MODELLED_SCHEDULE: [&str; 4] = ["mode", "vpn_probe", "vpn_probe_name", "interval"];
-const MODELLED_CONTROL: [&str; 6] = [
+/// The keys of [schedule] that the form edits: the two parts, and the flat keys of older manifests.
+const MODELLED_SCHEDULE: [&str; 6] = [
+    "mode",
+    "vpn_probe",
+    "vpn_probe_name",
+    "interval",
+    "vpn",
+    "always",
+];
+const MODELLED_SEND: [&str; 4] = ["probe", "probe_name", "check", "interval"];
+const MODELLED_CONTROL: [&str; 8] = [
     "id",
     "source",
     "source_ref",
     "rationale",
+    "description",
+    "reference",
     "required",
     "grace",
 ];
@@ -1324,6 +1481,15 @@ pub fn other_edits(before: &str, after: &str) -> Vec<String> {
         "schedule.",
         &mut keys,
     );
+    for part in ["vpn", "always"] {
+        differing(
+            old.get("schedule").and_then(|s| s.get(part)),
+            new.get("schedule").and_then(|s| s.get(part)),
+            &MODELLED_SEND,
+            &format!("schedule.{part}."),
+            &mut keys,
+        );
+    }
     let controls = |value: &serde_json::Value| {
         value
             .get("control")
@@ -1433,10 +1599,11 @@ pub enum Field {
     MaxAge,
     Retention,
     UnknownGrace,
-    Send,
-    Interval,
     VpnProbe,
     VpnProbeName,
+    VpnCheck,
+    VpnInterval,
+    AlwaysInterval,
     /// The check with this ID.
     Id(String),
     Grace(String),
@@ -1471,10 +1638,11 @@ impl Field {
             Self::MaxAge => "A result is valid for".into(),
             Self::Retention => "Results are kept for".into(),
             Self::UnknownGrace => "Unknown is allowed for".into(),
-            Self::Send => "Send".into(),
-            Self::Interval => "Every".into(),
             Self::VpnProbe => "VPN answers at".into(),
             Self::VpnProbeName => "VPN shown as".into(),
+            Self::VpnCheck => "VPN: check every".into(),
+            Self::VpnInterval => "VPN: send every".into(),
+            Self::AlwaysInterval => "Any network: send every".into(),
             Self::Id(id) => format!("{}: ID", name(id)),
             Self::Grace(id) => format!("{}: time to fix", name(id)),
             Self::Requirement(id, os) => format!("{}: {}", name(id), os.name()),
@@ -1646,10 +1814,11 @@ pub fn field_of(key: &str) -> Option<Field> {
         "claim_max_age" => Some(Field::MaxAge),
         "claim_retention" => Some(Field::Retention),
         "unknown_grace" => Some(Field::UnknownGrace),
-        "interval" => Some(Field::Interval),
-        "vpn_probe" => Some(Field::VpnProbe),
-        "vpn_probe_name" => Some(Field::VpnProbeName),
-        "mode" => Some(Field::Send),
+        "vpn.probe" | "vpn_probe" => Some(Field::VpnProbe),
+        "vpn.probe_name" | "vpn_probe_name" => Some(Field::VpnProbeName),
+        "vpn.check" => Some(Field::VpnCheck),
+        "vpn.interval" => Some(Field::VpnInterval),
+        "always.interval" => Some(Field::AlwaysInterval),
         _ => None,
     }
 }
@@ -1830,11 +1999,93 @@ pub fn set_top_list(text: &str, key: &str, items: &[String]) -> Result<String, S
     Ok(document.to_string())
 }
 
-/// Sets a value of the [schedule] table. Empty text removes the key.
-pub fn set_schedule(text: &str, key: &str, value: &str) -> Result<String, String> {
+/// The document of a draft, with an older flat [schedule] turned into the sending parts.
+fn converted(text: &str) -> Result<DocumentMut, String> {
     let mut document = document(text)?;
-    let table = schedule_table(&mut document)?;
-    if value.is_empty() && key != "mode" && key != "interval" {
+    let legacy = document
+        .get("schedule")
+        .and_then(Item::as_table_like)
+        .is_some_and(|table| table.get("mode").is_some());
+    if legacy {
+        let schedule = read_schedule(&document);
+        document.remove("schedule");
+        if let Some(schedule) = schedule {
+            if let Some(vpn) = &schedule.vpn {
+                put_part(&mut document, SendPart::Vpn, vpn_table(vpn))?;
+            }
+            if let Some(always) = &schedule.always {
+                put_part(&mut document, SendPart::Always, always_table(always))?;
+            }
+        }
+    }
+    Ok(document)
+}
+
+fn vpn_table(vpn: &VpnSend) -> Table {
+    let mut table = Table::new();
+    table.insert("probe", Item::Value(Value::from(vpn.probe.as_str())));
+    if !vpn.name.is_empty() {
+        table.insert("probe_name", Item::Value(Value::from(vpn.name.as_str())));
+    }
+    if vpn.check != CHECK_DEFAULT {
+        table.insert("check", Item::Value(Value::from(vpn.check.as_str())));
+    }
+    table.insert("interval", Item::Value(Value::from(vpn.interval.as_str())));
+    table
+}
+
+fn always_table(always: &AlwaysSend) -> Table {
+    let mut table = Table::new();
+    table.insert(
+        "interval",
+        Item::Value(Value::from(always.interval.as_str())),
+    );
+    table
+}
+
+/// Writes one part table of [schedule], creating [schedule] when the draft has none.
+fn put_part(document: &mut DocumentMut, part: SendPart, table: Table) -> Result<(), String> {
+    if document.get("schedule").is_none() {
+        let mut schedule = Table::new();
+        schedule.set_implicit(true);
+        document.insert("schedule", Item::Table(schedule));
+    }
+    let schedule = document
+        .get_mut("schedule")
+        .and_then(Item::as_table_mut)
+        .ok_or("schedule is not a table")?;
+    schedule.insert(part.table(), Item::Table(table));
+    Ok(())
+}
+
+/// Removes one part table. Without any part left, the manifest has no [schedule].
+fn remove_part(document: &mut DocumentMut, part: SendPart) {
+    let empty = match document.get_mut("schedule").and_then(Item::as_table_mut) {
+        Some(schedule) => {
+            schedule.remove(part.table());
+            schedule.is_empty()
+        }
+        None => return,
+    };
+    if empty {
+        document.remove("schedule");
+    }
+}
+
+fn send_table_mut(document: &mut DocumentMut, part: SendPart) -> Result<&mut Table, String> {
+    document
+        .get_mut("schedule")
+        .and_then(Item::as_table_mut)
+        .and_then(|schedule| schedule.get_mut(part.table()))
+        .and_then(Item::as_table_mut)
+        .ok_or_else(|| "This part of sending is off".to_owned())
+}
+
+/// Sets one value of a sending part. Empty text removes \`probe_name\` and \`check\`.
+pub fn set_send_text(text: &str, part: SendPart, key: &str, value: &str) -> Result<String, String> {
+    let mut document = converted(text)?;
+    let table = send_table_mut(&mut document, part)?;
+    if value.is_empty() && matches!(key, "probe_name" | "check") {
         table.remove(key);
     } else {
         put(table, key, Value::from(value));
@@ -1842,84 +2093,90 @@ pub fn set_schedule(text: &str, key: &str, value: &str) -> Result<String, String
     Ok(document.to_string())
 }
 
-fn schedule_table(document: &mut DocumentMut) -> Result<&mut dyn TableLike, String> {
-    if document.get("schedule").is_none() {
-        let mut table = Table::new();
-        table.insert("mode", Item::Value("always".into()));
-        table.insert("interval", Item::Value("1h".into()));
-        document.insert("schedule", Item::Table(table));
+/// Turns one sending part on or off. Turning it off keeps its values in \`kept\`. Turning it on
+/// writes the kept values back, or the defaults when the session has none.
+pub fn switch_send(
+    text: &str,
+    part: SendPart,
+    on: bool,
+    kept: &mut KeptSends,
+) -> Result<String, String> {
+    let mut document = converted(text)?;
+    let schedule = read_schedule(&document);
+    let is_on = match part {
+        SendPart::Vpn => schedule.as_ref().is_some_and(|s| s.vpn.is_some()),
+        SendPart::Always => schedule.as_ref().is_some_and(|s| s.always.is_some()),
+    };
+    if on == is_on {
+        return Ok(document.to_string());
     }
-    document
-        .get_mut("schedule")
-        .and_then(Item::as_table_like_mut)
-        .ok_or_else(|| "schedule is not a table".to_owned())
-}
-
-/// Chooses how devices send. "always" takes no probe, as the core demands.
-pub fn set_send_mode(text: &str, mode: &str) -> Result<String, String> {
-    let mut document = document(text)?;
-    let table = schedule_table(&mut document)?;
-    put(table, "mode", Value::from(mode));
-    if mode == "always" {
-        table.remove("vpn_probe");
-        table.remove("vpn_probe_name");
-    } else if table.get("vpn_probe").is_none() {
-        table.insert("vpn_probe", Item::Value("".into()));
+    if on {
+        let table = match part {
+            SendPart::Vpn => vpn_table(&kept.vpn.clone().unwrap_or_else(default_vpn)),
+            SendPart::Always => always_table(&kept.always.clone().unwrap_or_else(default_always)),
+        };
+        put_part(&mut document, part, table)?;
+    } else {
+        match (part, schedule) {
+            (
+                SendPart::Vpn,
+                Some(Schedule {
+                    vpn: Some(value), ..
+                }),
+            ) => kept.vpn = Some(value),
+            (
+                SendPart::Always,
+                Some(Schedule {
+                    always: Some(value),
+                    ..
+                }),
+            ) => {
+                kept.always = Some(value);
+            }
+            _ => (),
+        }
+        remove_part(&mut document, part);
     }
     Ok(document.to_string())
 }
 
-/// The VPN probe and probe name of a draft.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct KeptProbe {
-    pub probe: String,
-    pub name: String,
+impl KeptSends {
+    /// Forgets every remembered value. A draft that is replaced as a whole has no use for them.
+    pub fn forget(&mut self) {
+        *self = Self::default();
+    }
 }
 
-/// Switches how devices send, as `set_send_mode` does. Leaving "vpn" keeps its probe and name in
-/// `kept`. Entering "vpn" from another mode writes the kept pair back.
-pub fn switch_send_mode(
-    text: &str,
-    mode: &str,
-    kept: &mut Option<KeptProbe>,
-) -> Result<String, String> {
-    let before = Form::parse(text)?.schedule;
-    let was_vpn = before.as_ref().is_some_and(|s| s.mode == "vpn");
-    let mut result = set_send_mode(text, mode)?;
-    let mut remembered = kept.clone();
-    if was_vpn
-        && mode != "vpn"
-        && let Some(schedule) = before
-    {
-        remembered = Some(KeptProbe {
-            probe: schedule.probe,
-            name: schedule.name,
-        });
+/// Forgets the remembered sending values when a TOML edit changes the schedule. A form edit does
+/// not come here: the form switches parts through \`switch_send\`.
+pub fn sends_after_edit(before: &str, after: &str, kept: &mut KeptSends) {
+    let schedule = |text: &str| Form::parse(text).ok().and_then(|form| form.schedule);
+    if schedule(before) != schedule(after) {
+        kept.forget();
     }
-    if mode == "vpn"
-        && !was_vpn
-        && let Some(pair) = &remembered
-    {
-        let mut document = document(&result)?;
-        let table = schedule_table(&mut document)?;
-        put(table, "vpn_probe", Value::from(pair.probe.as_str()));
-        if pair.name.is_empty() {
-            table.remove("vpn_probe_name");
-        } else {
-            put(table, "vpn_probe_name", Value::from(pair.name.as_str()));
-        }
-        result = document.to_string();
-    }
-    *kept = remembered;
-    Ok(result)
 }
 
 fn control_table(document: &mut DocumentMut, index: usize) -> Result<&mut Table, String> {
-    document
+    let table = document
         .get_mut("control")
         .and_then(Item::as_array_of_tables_mut)
         .and_then(|tables| tables.get_mut(index))
-        .ok_or_else(|| "This check is no longer in the manifest".to_owned())
+        .ok_or_else(|| "This check is no longer in the manifest".to_owned())?;
+    current_names(table);
+    Ok(table)
+}
+
+/// Writes a check with the current key names: `description` for `rationale`, `reference` for
+/// `source_ref`, and no `source`. A value under the new name wins over the old one.
+fn current_names(table: &mut Table) {
+    for (old, new) in [("rationale", "description"), ("source_ref", "reference")] {
+        if let Some(item) = table.remove(old)
+            && table.get(new).is_none()
+        {
+            table.insert(new, item);
+        }
+    }
+    table.remove("source");
 }
 
 /// Sets a text key of one check. Empty text removes an optional key.
@@ -1954,7 +2211,7 @@ pub fn set_control_text(
         }
     }
     let table = control_table(&mut document, index)?;
-    if value.is_empty() && matches!(key, "source_ref" | "rationale") {
+    if value.is_empty() && matches!(key, "reference" | "description") {
         table.remove(key);
     } else {
         put(table, key, Value::from(value));
@@ -2019,8 +2276,10 @@ pub fn add_control(text: &str, id: &str) -> Result<(String, usize), String> {
     let output = known.output.parse::<Value>().map_err(|e| e.to_string())?;
     let mut table = Table::new();
     table.insert("id", Item::Value(id.into()));
-    table.insert("source", Item::Value("company_policy".into()));
-    table.insert("check", Item::Value(format!("builtin:{id}@1").into()));
+    table.insert(
+        "check",
+        Item::Value(format!("builtin:{id}@{}", known.version).into()),
+    );
     table.insert("output", Item::Value(output));
     table.insert(
         "required",

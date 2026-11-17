@@ -41,7 +41,7 @@ fn a_time_check_offers_no_time_and_no_unknown() {
 #[test]
 fn a_field_names_its_place_in_words() {
     let form = Form::parse(MANIFEST).unwrap();
-    assert_eq!(Field::Interval.label(&form), "Every");
+    assert_eq!(Field::VpnInterval.label(&form), "VPN: send every");
     assert_eq!(
         requirement("screen_lock", Os::Windows).label(&form),
         "Screen lock: Windows"
@@ -72,9 +72,9 @@ fn an_error_in_one_field_survives_an_edit_of_another() {
 #[test]
 fn one_field_keeps_one_error_that_the_newest_input_replaces() {
     let mut pending = Pending::default();
-    pending.record(Field::Interval, Err("first".into()));
-    pending.record(Field::Interval, Err("second".into()));
-    assert_eq!(pending.get(&Field::Interval), Some("second"));
+    pending.record(Field::VpnInterval, Err("first".into()));
+    pending.record(Field::VpnInterval, Err("second".into()));
+    assert_eq!(pending.get(&Field::VpnInterval), Some("second"));
     assert_eq!(pending.errors().len(), 1);
 }
 
@@ -220,10 +220,13 @@ fn a_cli_key_names_the_form_field_it_belongs_to() {
         ("min_trust_level", Field::Trust),
         ("unknown_grace", Field::UnknownGrace),
         ("claim_max_age", Field::MaxAge),
-        ("schedule.interval", Field::Interval),
+        ("schedule.vpn.interval", Field::VpnInterval),
+        ("schedule.vpn.probe", Field::VpnProbe),
+        ("schedule.vpn.probe_name", Field::VpnProbeName),
+        ("schedule.vpn.check", Field::VpnCheck),
+        ("schedule.always.interval", Field::AlwaysInterval),
         ("schedule.vpn_probe", Field::VpnProbe),
         ("schedule.vpn_probe_name", Field::VpnProbeName),
-        ("schedule.mode", Field::Send),
         ("controls.firewall.check", Field::Id("firewall".into())),
         (
             "controls.os_patch_age_days.required.windows",
@@ -249,7 +252,7 @@ fn a_cli_key_names_the_form_field_it_belongs_to() {
 fn an_error_with_a_key_sits_under_its_field_and_one_without_is_listed() {
     let mut pending = Pending::default();
     pending.record(Field::ValidFrom, Err("Type the date.".into()));
-    let keyed = error("interval is too short", Some("schedule.interval"), None);
+    let keyed = error("interval is too short", Some("schedule.vpn.interval"), None);
     let loose = error("duplicate id", None, Some(4));
     let all = manifest::problems(&pending, &[keyed.clone(), loose.clone()]);
     assert_eq!(
@@ -259,7 +262,7 @@ fn an_error_with_a_key_sits_under_its_field_and_one_without_is_listed() {
             .collect::<Vec<_>>(),
         [
             (Field::ValidFrom, "Type the date."),
-            (Field::Interval, "interval is too short")
+            (Field::VpnInterval, "interval is too short")
         ]
     );
     assert_eq!(all.listed, [loose]);

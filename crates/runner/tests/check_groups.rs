@@ -79,7 +79,12 @@ fn the_groups_hold_the_checks_the_task_names() {
             named += 1;
         }
     }
-    assert_eq!(named, BUILTINS.len());
+    // Each ID is named once. An older version of a check shares its ID and its group.
+    let newest = BUILTINS
+        .iter()
+        .filter(|known| manifest::builtin(known.id).is_some_and(|top| top.version == known.version))
+        .count();
+    assert_eq!(named, newest);
 }
 
 #[test]

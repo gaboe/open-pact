@@ -7,10 +7,11 @@ use gpui_component::{
     highlighter::{Diagnostic, DiagnosticSeverity},
     input::{Editor, Position, Textarea, TextareaState},
     resizable_panel,
+    switch::Switch,
 };
 use runner::manifest::{
     self, Control, Field, FieldError, Filter, Form, ManifestCheck, Os, Output, Pending, Problems,
-    Requirement, SOURCES, Span, TRUST_LEVELS, Unit,
+    Requirement, Span, TRUST_LEVELS, Unit,
 };
 use std::{cell::Cell, rc::Rc, time::Duration};
 
@@ -23,6 +24,16 @@ type Apply = Rc<dyn Fn(&AppView, &str) -> Result<String, String>>;
 
 const SPANS: &[Unit] = &Unit::SPANS;
 const INTERVALS: &[Unit] = &Unit::INTERVALS;
+const HOURS: &[Unit] = &[Unit::Hour];
+
+/// The units of an any-network interval: hours, or the units its stored value needs.
+fn always_units(raw: &str) -> &'static [Unit] {
+    match Span::parse(raw) {
+        Some(span) if span.unit == Unit::Minute => INTERVALS,
+        Some(span) if span.unit != Unit::Hour => SPANS,
+        _ => HOURS,
+    }
+}
 /// How far from the Add check button its options open, the gap kept to the window edge, and the
 /// least height the options get.
 const POPOVER_TOP: f32 = 40.;
@@ -91,9 +102,36 @@ pub struct FormInputs {
     max_age: DurationField,
     retention: DurationField,
     unknown_grace: DurationField,
+    /// The inputs of the VPN part, while it is on.
+    vpn: Option<VpnInputs>,
+    /// The inputs of the any-network part, while it is on.
+    always: Option<AlwaysInputs>,
+}
+
+pub struct VpnInputs {
     probe: Entity<InputState>,
     probe_name: Entity<InputState>,
+    check: DurationField,
     interval: DurationField,
+}
+
+pub struct AlwaysInputs {
+    interval: DurationField,
+}
+
+impl FormInputs {
+    /// The duration input of a field, when the form has one for it.
+    fn duration(&self, field: &Field) -> Option<&DurationField> {
+        match field {
+            Field::MaxAge => Some(&self.max_age),
+            Field::Retention => Some(&self.retention),
+            Field::UnknownGrace => Some(&self.unknown_grace),
+            Field::VpnCheck => self.vpn.as_ref().map(|vpn| &vpn.check),
+            Field::VpnInterval => self.vpn.as_ref().map(|vpn| &vpn.interval),
+            Field::AlwaysInterval => self.always.as_ref().map(|always| &always.interval),
+            _ => None,
+        }
+    }
 }
 
 enum Pick {
@@ -110,9 +148,8 @@ enum OsInput {
 pub struct Panel {
     /// None for a built-in check: its ID is fixed.
     id: Option<Entity<InputState>>,
-    source: Units,
-    source_ref: Entity<TextareaState>,
-    rationale: Entity<TextareaState>,
+    reference: Entity<InputState>,
+    description: Entity<TextareaState>,
     os: [OsInput; 3],
     /// A number field is open for this OS before any number is typed.
     opened: [bool; 3],
@@ -135,8 +172,9 @@ pub struct FormState {
     /// Where the Add check button was in the last paint: its top and the window height.
     add_anchor: Rc<Cell<(f32, f32)>>,
     pub adding_recipient: bool,
-    /// The VPN probe and probe name the draft had when it last left the VPN mode.
-    pub vpn_kept: Option<manifest::KeptProbe>,
+    /// The values of the sending parts that are off. The session keeps them, so that a part that
+    /// is turned on again gets its old values back.
+    pub sends_kept: manifest::KeptSends,
     pub jump: usize,
     pub scroll: ScrollHandle,
     /// The scroll position of the Add check options.
@@ -202,7 +240,7 @@ impl FormState {
         ];
         Self {
             inputs: None,
-            vpn_kept: None,
+            sends_kept: manifest::KeptSends::default(),
             panel: None,
             selected: None,
             filter: Filter::All,
@@ -318,6 +356,24 @@ fn kv_row_error(key: &'static str, control: impl IntoElement, error: Option<Stri
         })
 }
 
+/// One part of the sending section: its heading with the on or off switch, then its rows.
+fn send_part(title: &'static str, switch: impl IntoElement) -> Div {
+    div().flex().flex_col().gap(px(12.)).child(
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .child(
+                div()
+                    .text_size(px(13.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(INK_2))
+                    .child(title),
+            )
+            .child(switch),
+    )
+}
+
 fn rows(items: Vec<Div>) -> Div {
     div().flex().flex_col().gap(px(10.)).children(items)
 }
@@ -382,31 +438,18 @@ fn small(text: impl Into<SharedString>) -> Div {
         .child(text.into())
 }
 
-fn tag(source: &str) -> Div {
-    let (wash, ink) = match source {
-        "customer_contract" => (0xeae4f3, 0x5b3e86),
-        "standard" => (0xe3eef0, 0x2d5e66),
-        "law" => (0xfbeedc, 0x7a4708),
-        _ => (0xeceae5, INK_2),
-    };
-    div().w(px(92.)).flex_none().child(
-        div()
-            .px(px(8.))
-            .py(px(2.))
-            .rounded_full()
-            .bg(rgb(wash))
-            .text_color(rgb(ink))
-            .text_size(px(11.5))
-            .font_weight(FontWeight::SEMIBOLD)
-            .child(manifest::source_tag(source)),
-    )
-}
-
 fn plural(count: usize, one: &str, many: &str) -> String {
     format!("{count} {}", if count == 1 { one } else { many })
 }
 
 impl AppView {
+    /// Replaces the whole draft, as Setup, Refresh, Apply, Restore and Discard do. The sending
+    /// values that the session remembered belong to the draft before, so they go too.
+    pub fn replace_draft(&mut self, text: String) {
+        self.draft = text;
+        self.fv.sends_kept.forget();
+    }
+
     /// Applies an edit of the form to the draft. `rebuild` says which inputs the new text makes
     /// again, for edits that change which inputs exist.
     pub fn edit_form(
@@ -771,27 +814,28 @@ impl AppView {
             return;
         };
         let held = self.fv.pending.clone();
-        let reuse_duration = |field: Field, pick: fn(&FormInputs) -> &DurationField| {
+        let reuse = |field: Field| -> Option<DurationField> {
             kept.as_ref()
                 .filter(|_| held.get(&field).is_some())
-                .map(|inputs| {
-                    let duration = pick(inputs);
-                    DurationField {
-                        amount: duration.amount.clone(),
-                        unit: duration.unit.clone(),
-                    }
+                .and_then(|inputs| inputs.duration(&field))
+                .map(|duration| DurationField {
+                    amount: duration.amount.clone(),
+                    unit: duration.unit.clone(),
                 })
         };
-        let kept_max_age = reuse_duration(Field::MaxAge, |inputs| &inputs.max_age);
-        let kept_retention = reuse_duration(Field::Retention, |inputs| &inputs.retention);
-        let kept_unknown_grace =
-            reuse_duration(Field::UnknownGrace, |inputs| &inputs.unknown_grace);
-        let kept_interval = reuse_duration(Field::Interval, |inputs| &inputs.interval);
+        let kept_max_age = reuse(Field::MaxAge);
+        let kept_retention = reuse(Field::Retention);
+        let kept_unknown_grace = reuse(Field::UnknownGrace);
+        let kept_check = reuse(Field::VpnCheck);
+        let kept_vpn_interval = reuse(Field::VpnInterval);
+        let kept_always_interval = reuse(Field::AlwaysInterval);
         for (field, stays) in [
             (Field::MaxAge, kept_max_age.is_some()),
             (Field::Retention, kept_retention.is_some()),
             (Field::UnknownGrace, kept_unknown_grace.is_some()),
-            (Field::Interval, kept_interval.is_some()),
+            (Field::VpnCheck, kept_check.is_some()),
+            (Field::VpnInterval, kept_vpn_interval.is_some()),
+            (Field::AlwaysInterval, kept_always_interval.is_some()),
         ] {
             if !stays {
                 self.fv.pending.record(field, Ok(()));
@@ -845,43 +889,79 @@ impl AppView {
             window,
             cx,
         );
-        let schedule = form.schedule.clone().unwrap_or(manifest::Schedule {
-            mode: String::new(),
-            probe: String::new(),
-            name: String::new(),
-            interval: String::new(),
-        });
-        let schedule_key = |key: &'static str| -> Apply {
-            Rc::new(move |this, value| manifest::set_schedule(&this.draft, key, value))
+        let send = |part: manifest::SendPart, key: &'static str| -> Apply {
+            Rc::new(move |this, value| manifest::set_send_text(&this.draft, part, key, value))
         };
-        let probe = self.text_input(
-            &schedule.probe,
-            None,
-            schedule_key("vpn_probe"),
-            None,
-            window,
-            cx,
-        );
-        let probe_name = self.text_input(
-            &schedule.name,
-            None,
-            schedule_key("vpn_probe_name"),
-            None,
-            window,
-            cx,
-        );
-        let interval = self.duration_field(
-            DurationSpec {
-                raw: schedule.interval.clone(),
-                units: INTERVALS,
-                panel: false,
-                field: Rc::new(|_| Some(Field::Interval)),
-                reuse: kept_interval,
-            },
-            schedule_key("interval"),
-            window,
-            cx,
-        );
+        let vpn = match form.schedule.as_ref().and_then(|s| s.vpn.clone()) {
+            Some(vpn) => {
+                let probe = self.text_input(
+                    &vpn.probe,
+                    None,
+                    send(manifest::SendPart::Vpn, "probe"),
+                    None,
+                    window,
+                    cx,
+                );
+                let probe_name = self.text_input(
+                    &vpn.name,
+                    None,
+                    send(manifest::SendPart::Vpn, "probe_name"),
+                    None,
+                    window,
+                    cx,
+                );
+                let check = self.duration_field(
+                    DurationSpec {
+                        raw: vpn.check.clone(),
+                        units: INTERVALS,
+                        panel: false,
+                        field: Rc::new(|_| Some(Field::VpnCheck)),
+                        reuse: kept_check,
+                    },
+                    send(manifest::SendPart::Vpn, "check"),
+                    window,
+                    cx,
+                );
+                let interval = self.duration_field(
+                    DurationSpec {
+                        raw: vpn.interval.clone(),
+                        units: INTERVALS,
+                        panel: false,
+                        field: Rc::new(|_| Some(Field::VpnInterval)),
+                        reuse: kept_vpn_interval,
+                    },
+                    send(manifest::SendPart::Vpn, "interval"),
+                    window,
+                    cx,
+                );
+                Some(VpnInputs {
+                    probe,
+                    probe_name,
+                    check,
+                    interval,
+                })
+            }
+            None => None,
+        };
+        let always = form
+            .schedule
+            .as_ref()
+            .and_then(|s| s.always.clone())
+            .map(|always| {
+                let interval = self.duration_field(
+                    DurationSpec {
+                        raw: always.interval.clone(),
+                        units: always_units(&always.interval),
+                        panel: false,
+                        field: Rc::new(|_| Some(Field::AlwaysInterval)),
+                        reuse: kept_always_interval,
+                    },
+                    send(manifest::SendPart::Always, "interval"),
+                    window,
+                    cx,
+                );
+                AlwaysInputs { interval }
+            });
         self.fv.inputs = Some(FormInputs {
             issuer,
             valid_from,
@@ -889,9 +969,8 @@ impl AppView {
             max_age,
             retention,
             unknown_grace,
-            probe,
-            probe_name,
-            interval,
+            vpn,
+            always,
         });
         if self
             .fv
@@ -1004,59 +1083,37 @@ impl AppView {
             self.fv.panel_subs.push(renamed);
             id
         });
-        let mut keys: Vec<String> = SOURCES
-            .iter()
-            .map(|(key, _, _)| (*key).to_owned())
-            .collect();
-        if !keys.contains(&control.source) {
-            keys.push(control.source.clone());
-        }
-        let source_labels: Vec<SharedString> = keys
-            .iter()
-            .map(|key| manifest::source_name(key).into())
-            .collect();
-        let source = cx.new(|cx| SelectState::new(source_labels.clone(), None, window, cx));
-        source.update(cx, |state, cx| {
-            state.set_selected_value(
-                &SharedString::from(manifest::source_name(&control.source)),
-                window,
-                cx,
-            )
+        let reference = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Link or text")
+                .default_value(control.reference.clone())
         });
-        let source_subscription = cx.subscribe_in(
-            &source,
+        let reference_subscription = cx.subscribe_in(
+            &reference,
             window,
-            move |this, _, event: &SelectEvent<Vec<SharedString>>, window, cx| {
-                let SelectEvent::Confirm(Some(label)) = event else {
-                    return;
-                };
-                let Some(key) = keys
-                    .iter()
-                    .find(|key| manifest::source_name(key) == label.as_ref())
-                else {
-                    return;
-                };
-                let Some(index) = this.selected_index() else {
-                    return;
-                };
-                let result = manifest::set_control_text(&this.draft, index, "source", key);
-                this.edit_form(result, Rebuild::No, window, cx);
+            |this, state, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::Change) {
+                    let Some(index) = this.selected_index() else {
+                        return;
+                    };
+                    let result = manifest::set_control_text(
+                        &this.draft,
+                        index,
+                        "reference",
+                        state.read(cx).value().trim(),
+                    );
+                    this.edit_form(result, Rebuild::No, window, cx);
+                }
             },
         );
-        self.fv.panel_subs.push(source_subscription);
-        let source_ref = cx.new(|cx| {
-            TextareaState::new(window, cx)
-                .auto_grow(1, 6)
-                .placeholder("Reference")
-                .default_value(control.source_ref.clone())
-        });
-        let rationale = cx.new(|cx| {
+        self.fv.panel_subs.push(reference_subscription);
+        let description = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .rows(2)
-                .default_value(control.rationale.clone())
+                .default_value(control.description.clone())
         });
-        let reference = cx.subscribe_in(
-            &source_ref,
+        let description_subscription = cx.subscribe_in(
+            &description,
             window,
             |this, state, event: &InputEvent, window, cx| {
                 if matches!(event, InputEvent::Change) {
@@ -1066,33 +1123,14 @@ impl AppView {
                     let result = manifest::set_control_text(
                         &this.draft,
                         index,
-                        "source_ref",
+                        "description",
                         state.read(cx).value().trim(),
                     );
                     this.edit_form(result, Rebuild::No, window, cx);
                 }
             },
         );
-        self.fv.panel_subs.push(reference);
-        let reason = cx.subscribe_in(
-            &rationale,
-            window,
-            |this, state, event: &InputEvent, window, cx| {
-                if matches!(event, InputEvent::Change) {
-                    let Some(index) = this.selected_index() else {
-                        return;
-                    };
-                    let result = manifest::set_control_text(
-                        &this.draft,
-                        index,
-                        "rationale",
-                        state.read(cx).value().trim(),
-                    );
-                    this.edit_form(result, Rebuild::No, window, cx);
-                }
-            },
-        );
-        self.fv.panel_subs.push(reason);
+        self.fv.panel_subs.push(description_subscription);
         let grace = self.duration_field(
             DurationSpec {
                 raw: control.grace.clone(),
@@ -1113,9 +1151,8 @@ impl AppView {
         let os = Os::ALL.map(|os| self.os_input(&control, os, window, cx));
         self.fv.panel = Some(Panel {
             id,
-            source,
-            source_ref,
-            rationale,
+            reference,
+            description,
             os,
             opened: [false; 3],
             grace,
@@ -1505,7 +1542,7 @@ impl AppView {
             .child(self.agreement(&form, inputs, disabled, &issues, cx))
             .child(self.results(&form, inputs, &issues, cx))
             .child(self.sent(&form, cx))
-            .child(self.sending(&form, inputs, &issues, cx))
+            .child(self.sending(inputs, &issues, cx))
             .child(self.checks(&form, before.as_ref(), &issues, cx));
         div().flex().flex_1().min_h_0().child(
             h_resizable("manifest-split")
@@ -1757,69 +1794,85 @@ impl AppView {
         )
     }
 
-    fn sending(
-        &self,
-        form: &Form,
-        inputs: &FormInputs,
-        issues: &[FieldError],
-        cx: &Context<Self>,
-    ) -> Div {
-        let mode = form
-            .schedule
-            .as_ref()
-            .map(|s| s.mode.as_str())
-            .unwrap_or_default();
-        let send = seg2(
-            [("always", "Always"), ("vpn", "Only on the company VPN")]
-                .into_iter()
-                .enumerate()
-                .map(|(i, (key, name))| {
-                    seg2_item(("send", i), name, mode == key).on_click(cx.listener(
-                        move |this, _, window, cx| {
-                            let result =
-                                manifest::switch_send_mode(&this.draft, key, &mut this.fv.vpn_kept);
-                            this.edit_form(result, Rebuild::Inputs, window, cx);
-                        },
-                    ))
-                })
-                .collect(),
-        );
-        let mut list = vec![kv_row_error("Send", send, error_of(issues, &Field::Send))];
-        if form.schedule.is_none() {
-            list.push(div().child(small(
+    fn sending(&self, inputs: &FormInputs, issues: &[FieldError], cx: &Context<Self>) -> Div {
+        let switch = |id: &'static str, part: manifest::SendPart, on: bool| {
+            Switch::new(id)
+                .checked(on)
+                .disabled(self.busy)
+                .on_click(cx.listener(move |this, checked: &bool, window, cx| {
+                    let result =
+                        manifest::switch_send(&this.draft, part, *checked, &mut this.fv.sends_kept);
+                    this.edit_form(result, Rebuild::Inputs, window, cx);
+                }))
+        };
+        let vpn = send_part(
+            "On the company VPN",
+            switch("send-vpn", manifest::SendPart::Vpn, inputs.vpn.is_some()),
+        )
+        .when_some(inputs.vpn.as_ref(), |part, vpn| {
+            part.child(rows(vec![
+                kv_row_error(
+                    "VPN answers at",
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(
+                            div()
+                                .w(px(150.))
+                                .font_family(mono())
+                                .child(Input::new(&vpn.probe).disabled(self.busy)),
+                        )
+                        .child(small("shown as"))
+                        .child(
+                            div()
+                                .w(px(180.))
+                                .font_family(mono())
+                                .child(Input::new(&vpn.probe_name).disabled(self.busy)),
+                        ),
+                    error_of(issues, &Field::VpnProbe)
+                        .or_else(|| error_of(issues, &Field::VpnProbeName)),
+                ),
+                kv_row_error(
+                    "Check every",
+                    column()
+                        .gap(px(4.))
+                        .child(self.duration(&vpn.check, None))
+                        .child(small(
+                            "Windows checks at most every 5 minutes until measured.",
+                        )),
+                    error_of(issues, &Field::VpnCheck),
+                ),
+                kv_row_error(
+                    "Send every",
+                    column()
+                        .gap(px(4.))
+                        .child(self.duration(&vpn.interval, None))
+                        .child(small("and at once on connect or when a result gets worse")),
+                    error_of(issues, &Field::VpnInterval),
+                ),
+            ]))
+        });
+        let always = send_part(
+            "On any network",
+            switch(
+                "send-always",
+                manifest::SendPart::Always,
+                inputs.always.is_some(),
+            ),
+        )
+        .when_some(inputs.always.as_ref(), |part, always| {
+            part.child(rows(vec![kv_row_error(
+                "Send every",
+                self.duration(&always.interval, None),
+                error_of(issues, &Field::AlwaysInterval),
+            )]))
+        });
+        let mut list = vec![vpn, always];
+        if inputs.vpn.is_none() && inputs.always.is_none() {
+            list.push(small(
                 "Devices send nothing by themselves. The owner sends by hand.",
-            )));
-        }
-        if mode == "vpn" {
-            list.push(kv_row_error(
-                "VPN answers at",
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .gap(px(8.))
-                    .child(
-                        div()
-                            .w(px(150.))
-                            .font_family(mono())
-                            .child(Input::new(&inputs.probe).disabled(self.busy)),
-                    )
-                    .child(small("shown as"))
-                    .child(
-                        div()
-                            .w(px(180.))
-                            .font_family(mono())
-                            .child(Input::new(&inputs.probe_name).disabled(self.busy)),
-                    ),
-                error_of(issues, &Field::VpnProbe)
-                    .or_else(|| error_of(issues, &Field::VpnProbeName)),
-            ));
-        }
-        if form.schedule.is_some() {
-            list.push(kv_row_error(
-                "Every",
-                self.duration(&inputs.interval, Some("and at once on a change")),
-                error_of(issues, &Field::Interval),
             ));
         }
         section(
@@ -1930,7 +1983,6 @@ impl AppView {
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(rgb(MUTED))
                     .child(div().flex_1().min_w_0().child("Check"))
-                    .child(head("From", 92.))
                     .child(head("macOS", 92.))
                     .child(head("Windows", 92.))
                     .child(head("Linux", 92.))
@@ -2006,8 +2058,7 @@ impl AppView {
                                 )
                                 .child(control.name()),
                         ),
-                )
-                .child(tag(&control.source));
+                );
             for os in Os::ALL {
                 let text = control.requirement_text(os);
                 row = row.child(
@@ -2468,27 +2519,13 @@ impl AppView {
                 error_of(issues, &Field::Id(control.id.clone())),
             ))
             .child(field(
-                "Asked for by",
-                div()
-                    .flex()
-                    .gap(px(8.))
-                    .child(
-                        div()
-                            .w(px(170.))
-                            .flex_none()
-                            .child(Select::new(&panel.source).disabled(self.busy)),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(Textarea::new(&panel.source_ref).disabled(self.busy)),
-                    ),
+                "Description",
+                div().child(Textarea::new(&panel.description).disabled(self.busy)),
                 None,
             ))
             .child(field(
-                "Why the contractor should care",
-                div().child(Textarea::new(&panel.rationale).disabled(self.busy)),
+                "Reference",
+                div().child(Input::new(&panel.reference).disabled(self.busy)),
                 None,
             ))
             .child(field(
@@ -2579,7 +2616,7 @@ impl AppView {
                     .label("Discard")
                     .disabled(self.busy || changes == 0)
                     .on_click(cx.listener(|this, _, window, cx| {
-                        this.draft = this.active.clone();
+                        this.replace_draft(this.active.clone());
                         this.error = None;
                         this.show_draft(window, cx);
                         this.build_form(window, cx);

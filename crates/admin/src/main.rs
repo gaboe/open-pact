@@ -215,7 +215,12 @@ impl AppView {
                 if matches!(event, InputEvent::Change) {
                     let value = state.read(cx).value().to_string();
                     if value != this.draft {
-                        this.draft = value;
+                        let before = std::mem::replace(&mut this.draft, value);
+                        runner::manifest::sends_after_edit(
+                            &before,
+                            &this.draft,
+                            &mut this.fv.sends_kept,
+                        );
                         this.show_draft(window, cx);
                         cx.notify();
                     }
@@ -473,7 +478,7 @@ impl AppView {
                 this.busy = false;
                 match result {
                     Ok(Outcome::Setup(settings, active, overview, history)) => {
-                        this.admin.use_settings(settings); this.active = active.clone(); this.draft = active;
+                        this.admin.use_settings(settings); this.active = active.clone(); this.replace_draft(active);
                         this.overview = Some(overview);
                         this.forget_results_gateway(window, cx);
                         let skipped = history.warnings.len();
@@ -485,7 +490,7 @@ impl AppView {
                     Ok(Outcome::Refresh(overview, active)) => {
                         match refresh_step(this.unread_field(), this.draft == this.active, this.active != active) {
                             RefreshStep::Rebuild => {
-                                this.draft = active.clone();
+                                this.replace_draft(active.clone());
                                 this.show_draft(window, cx);
                                 this.build_form(window, cx);
                             }
@@ -511,7 +516,7 @@ impl AppView {
                     }
                     Ok(Outcome::Applied(written, active, history, notice)) => {
                         let hash = written.hash;
-                        this.active = active.clone(); this.draft = active; this.dialog = None;
+                        this.active = active.clone(); this.replace_draft(active); this.dialog = None;
                         if history.is_some() { this.history = history; }
                         this.error = notice;
                         this.show_draft(window, cx);
@@ -1502,6 +1507,7 @@ fn snapshots(output: PathBuf) {
         ("admin-v-results-empty", Screen::Results, true, None),
         ("admin-a-overview", Screen::Overview, true, None),
         ("admin-b-form", Screen::Manifest, true, None),
+        ("admin-w-sending-both", Screen::Manifest, true, None),
         ("admin-c-toml", Screen::Manifest, false, None),
         ("admin-m-number-check", Screen::Manifest, true, None),
         ("admin-n-add-check", Screen::Manifest, true, None),
@@ -1547,6 +1553,7 @@ fn snapshots(output: PathBuf) {
                 if matches!(
                     name,
                     "admin-b-form"
+                        | "admin-w-sending-both"
                         | "admin-m-number-check"
                         | "admin-n-add-check"
                         | "admin-o-field-errors"
@@ -1568,7 +1575,13 @@ fn snapshots(output: PathBuf) {
             if name == "admin-k-update" { app.update = UpdateState::Available("0.1.1".into()); }
                 app.active = include_str!("../../../tests/fixtures/manifest.toml").into();
                 app.draft = app.active.clone();
-            if matches!(name, "admin-d-apply" | "admin-b-form" | "admin-m-number-check" | "admin-n-add-check" | "admin-o-field-errors" | "admin-p-add-check-all" | "admin-q-add-check-scrolled" | "admin-r-old-cli" | "admin-s-check-line") { app.draft = include_str!("../../../tests/fixtures/manifest-v2.toml").into(); }
+            if matches!(name, "admin-d-apply" | "admin-b-form" | "admin-w-sending-both" | "admin-m-number-check" | "admin-n-add-check" | "admin-o-field-errors" | "admin-p-add-check-all" | "admin-q-add-check-scrolled" | "admin-r-old-cli" | "admin-s-check-line") { app.draft = include_str!("../../../tests/fixtures/manifest-v2.toml").into(); }
+            if name == "admin-w-sending-both" {
+                app.draft = format!("{}
+[schedule.always]
+interval = \"24h\"
+", app.draft.trim_end());
+            }
             if name == "admin-o-field-errors" {
                 app.draft = app.draft
                     .replace("windows = { max = 30 }, linux = { max = 30 } }\ngrace = \"1d\"\n\n[[control]]\nid = \"os_supported\"", "windows = { max = 3651 }, linux = { max = 30 } }\ngrace = \"1d\"\n\n[[control]]\nid = \"os_supported\"");

@@ -12,9 +12,8 @@ unknown_grace = "7d"
 
 [[control]]
 id = "disk_encryption"
-source = "customer_contract"
-source_ref = "Client contract, security annex, 4.2"
-rationale = "A lost laptop must not expose client data."
+reference = "Client contract, security annex, 4.2"
+description = "A lost laptop must not expose client data."
 check = "builtin:disk_encryption@1"
 output = ["full", "partial", "none", "unknown"]
 required = { macos = "full", windows = "full", linux = "full" }
@@ -22,7 +21,6 @@ grace = "0d"
 
 [[control]]
 id = "firewall"
-source = "company_policy"
 check = "builtin:firewall@1"
 output = ["on", "off", "unknown"]
 required = { macos = "on", windows = "on", linux = "on" }
@@ -30,9 +28,8 @@ grace = "1d"
 
 [[control]]
 id = "screen_lock"
-source = "customer_contract"
-source_ref = "Flow-down of RTS 2024/1774 Art. 13(l)"
-rationale = "Lock the screen when you walk away, so nobody can read client data on an open laptop."
+reference = "Flow-down of RTS 2024/1774 Art. 13(l)"
+description = "Lock the screen when you walk away, so nobody can read client data on an open laptop."
 check = "builtin:screen_lock@1"
 output = ["le_5min", "le_15min", "gt_15min", "none", "unknown"]
 required = { macos = "le_5min", windows = "le_5min", linux = "le_5min" }
@@ -40,8 +37,7 @@ grace = "1d"
 
 [[control]]
 id = "os_patch_age_days"
-source = "company_policy"
-rationale = "Limit the age of the last whole-system OS update."
+description = "Limit the age of the last whole-system OS update."
 check = "builtin:os_patch_age_days@1"
 output = { integer = { min = 0, max = 3650 } }
 required = { macos = { max = 14 }, windows = { max = 30 }, linux = { max = 30 } }
@@ -49,7 +45,6 @@ grace = "1d"
 
 [[control]]
 id = "os_supported"
-source = "standard"
 check = "builtin:os_supported@1"
 output = ["yes", "no", "unknown"]
 required = { macos = "yes", windows = "yes", linux = "yes" }
@@ -59,7 +54,6 @@ grace = "14d"
 
 [[control]]
 id = "antimalware_active"
-source = "company_policy"
 check = "builtin:antimalware_active@1"
 output = ["yes", "no", "unknown"]
 required = { macos = "yes", windows = "yes", linux = "yes" }
@@ -67,7 +61,6 @@ grace = "1d"
 
 [[control]]
 id = "preboot_auth"
-source = "company_policy"
 check = "builtin:preboot_auth@1"
 output = ["user_secret", "hardware_only", "none", "unknown"]
 required = { macos = "user_secret", windows = "user_secret", linux = "user_secret" }
@@ -75,7 +68,6 @@ grace = "1d"
 
 [[control]]
 id = "antimalware_signature_age_days"
-source = "company_policy"
 check = "builtin:antimalware_signature_age_days@1"
 output = { integer = { min = 0, max = 3650 } }
 required = { macos = { max = 3 }, windows = { max = 3 }, linux = { max = 3 } }
@@ -83,7 +75,6 @@ grace = "1d"
 
 [[control]]
 id = "antimalware_full_scan_age_days"
-source = "company_policy"
 check = "builtin:antimalware_full_scan_age_days@1"
 output = { integer = { min = 0, max = 3650 }, values = ["n/a"] }
 required = {}
@@ -91,7 +82,6 @@ grace = "1d"
 
 [[control]]
 id = "log_oldest_record_days"
-source = "company_policy"
 check = "builtin:log_oldest_record_days@1"
 output = { integer = { min = 0, max = 2147483647 }, values = ["n/a"] }
 required = { windows = { min = 90 }, macos = "n/a" }
@@ -99,8 +89,7 @@ grace = "1d"
 
 [[control]]
 id = "managed_repos_outside"
-source = "company_policy"
-rationale = "Keep managed repositories inside the folders declared on this device."
+description = "Keep managed repositories inside the folders declared on this device."
 check = "builtin:managed_repos_outside@1"
 remotes = ["github.com/example-org/"]
 output = { integer = { min = 0, max = 2147483647 } }
@@ -109,8 +98,7 @@ grace = "0d"
 
 [[control]]
 id = "managed_repos_total"
-source = "company_policy"
-rationale = "Count all managed repositories with a matching remote."
+description = "Count all managed repositories with a matching remote."
 check = "builtin:managed_repos_total@1"
 remotes = ["github.com/example-org/"]
 output = { integer = { min = 0, max = 2147483647 } }
@@ -119,7 +107,6 @@ grace = "1d"
 
 [[control]]
 id = "log_cleared"
-source = "company_policy"
 check = "builtin:log_cleared@1"
 output = { timestamp = true, nullable = true, values = ["n/a"] }
 required = { windows = "null", macos = "n/a", linux = "n/a" }
@@ -127,7 +114,6 @@ grace = "1d"
 
 [[control]]
 id = "os_auto_updates"
-source = "company_policy"
 check = "builtin:os_auto_updates@1"
 output = ["on", "off", "unknown"]
 required = { macos = "on", windows = "on", linux = "on" }
@@ -135,7 +121,6 @@ grace = "1d"
 
 [[control]]
 id = "antimalware_realtime"
-source = "company_policy"
 check = "builtin:antimalware_realtime@1"
 output = ["on", "off", "unknown"]
 required = { macos = "on", windows = "on", linux = "on" }
@@ -143,7 +128,6 @@ grace = "1d"
 
 [[control]]
 id = "antimalware_active_threats"
-source = "company_policy"
 check = "builtin:antimalware_active_threats@1"
 output = { integer = { min = 0, max = 2147483647 }, values = ["n/a"] }
 required = { windows = { max = 0 }, macos = "n/a" }
@@ -151,7 +135,6 @@ grace = "1d"
 
 [[control]]
 id = "work_account"
-source = "company_policy"
 check = "builtin:work_account@1"
 output = ["standard", "admin", "unknown"]
 required = {}
@@ -159,7 +142,6 @@ grace = "1d"
 
 [[control]]
 id = "uptime_days"
-source = "company_policy"
 check = "builtin:uptime_days@1"
 output = { integer = { min = 0, max = 2147483647 } }
 required = {}
@@ -167,7 +149,6 @@ grace = "1d"
 
 [[control]]
 id = "password_min_length"
-source = "company_policy"
 check = "builtin:password_min_length@1"
 output = { integer = { min = 0, max = 2147483647 }, values = ["none"] }
 required = { macos = { min = 10 }, windows = { min = 10 }, linux = { min = 10 } }
@@ -175,7 +156,6 @@ grace = "1d"
 
 [[control]]
 id = "secure_boot"
-source = "customer_contract"
 check = "builtin:secure_boot@1"
 output = ["on", "off", "unknown"]
 required = { macos = "on", windows = "on", linux = "on" }
@@ -183,7 +163,6 @@ grace = "3d"
 
 [[control]]
 id = "auto_login"
-source = "customer_contract"
 check = "builtin:auto_login@1"
 output = ["off", "on", "unknown"]
 required = { macos = "off", windows = "off", linux = "off" }
@@ -196,8 +175,7 @@ witnesses = [{ name = "witness.example.org/demo", key = "witness.example.org/dem
 witness_quorum = 1
 checkpoint_max_age = "1h"
 
-[schedule]
-mode = "vpn"
-vpn_probe = "10.0.0.1:443"
-vpn_probe_name = "vpn.example.org"
+[schedule.vpn]
+probe = "10.0.0.1:443"
+probe_name = "vpn.example.org"
 interval = "55m"
