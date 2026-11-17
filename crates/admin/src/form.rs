@@ -2,6 +2,7 @@
 //! Both edit the same text, `AppView::draft`. Every form edit rewrites it with toml_edit.
 use super::*;
 use gpui_component::{
+    date_picker::{DatePicker, DatePickerEvent, DatePickerState},
     highlighter::{Diagnostic, DiagnosticSeverity},
     input::{Editor, Position, Textarea, TextareaState},
 };
@@ -83,7 +84,7 @@ struct DurationSpec {
 
 pub struct FormInputs {
     issuer: Entity<InputState>,
-    valid_from: Entity<InputState>,
+    valid_from: Entity<DatePickerState>,
     controller: Entity<InputState>,
     max_age: DurationField,
     retention: DurationField,
@@ -132,6 +133,8 @@ pub struct FormState {
     /// Where the Add check button was in the last paint: its top and the window height.
     add_anchor: Rc<Cell<(f32, f32)>>,
     pub adding_recipient: bool,
+    /// The VPN probe and probe name the draft had when it last left the VPN mode.
+    pub vpn_kept: Option<manifest::KeptProbe>,
     pub jump: usize,
     pub scroll: ScrollHandle,
     /// The scroll position of the Add check options.
@@ -197,6 +200,7 @@ impl FormState {
         ];
         Self {
             inputs: None,
+            vpn_kept: None,
             panel: None,
             selected: None,
             filter: Filter::All,
@@ -564,6 +568,35 @@ impl AppView {
         self.fv.subs.push(subscription);
     }
 
+    /// A date picker for Valid from, set to the date of `value` when it has one. Picking a date
+    /// writes it to the draft as YYYY-MM-DD.
+    fn date_picker(
+        &mut self,
+        value: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<DatePickerState> {
+        let picker = cx.new(|cx| DatePickerState::new(window, cx).date_format("%-d %b %Y"));
+        if let Some(day) = manifest::parse_date(value).and_then(|date| date.and_hms_opt(0, 0, 0)) {
+            picker.update(cx, |state, cx| state.set_date_time(day, window, cx));
+        }
+        let subscription = cx.subscribe_in(
+            &picker,
+            window,
+            |this, _, event: &DatePickerEvent, window, cx| {
+                let DatePickerEvent::Change(value) = event;
+                let Some(day) = value.start() else {
+                    return;
+                };
+                let text = day.format("%Y-%m-%d").to_string();
+                let result = manifest::set_top_text(&this.draft, "valid_from", &text);
+                this.edit_field(Field::ValidFrom, result, Rebuild::No, window, cx);
+            },
+        );
+        self.fv.subs.push(subscription);
+        picker
+    }
+
     fn text_input(
         &mut self,
         value: &str,
@@ -732,11 +765,6 @@ impl AppView {
             return;
         };
         let held = self.fv.pending.clone();
-        let reuse_input = |field: Field, pick: fn(&FormInputs) -> &Entity<InputState>| {
-            kept.as_ref()
-                .filter(|_| held.get(&field).is_some())
-                .map(|inputs| pick(inputs).clone())
-        };
         let reuse_duration = |field: Field, pick: fn(&FormInputs) -> &DurationField| {
             kept.as_ref()
                 .filter(|_| held.get(&field).is_some())
@@ -748,14 +776,12 @@ impl AppView {
                     }
                 })
         };
-        let kept_valid_from = reuse_input(Field::ValidFrom, |inputs| &inputs.valid_from);
         let kept_max_age = reuse_duration(Field::MaxAge, |inputs| &inputs.max_age);
         let kept_retention = reuse_duration(Field::Retention, |inputs| &inputs.retention);
         let kept_unknown_grace =
             reuse_duration(Field::UnknownGrace, |inputs| &inputs.unknown_grace);
         let kept_interval = reuse_duration(Field::Interval, |inputs| &inputs.interval);
         for (field, stays) in [
-            (Field::ValidFrom, kept_valid_from.is_some()),
             (Field::MaxAge, kept_max_age.is_some()),
             (Field::Retention, kept_retention.is_some()),
             (Field::UnknownGrace, kept_unknown_grace.is_some()),
@@ -777,22 +803,18 @@ impl AppView {
             window,
             cx,
         );
-        let date: Apply = Rc::new(|this, value| match manifest::parse_date(value) {
-            Some(date) => manifest::set_top_text(
-                &this.draft,
-                "valid_from",
-                &date.format("%Y-%m-%d").to_string(),
+        match manifest::parse_date(&form.valid_from) {
+            Some(_) => self.fv.pending.record(Field::ValidFrom, Ok(())),
+            None if form.valid_from.is_empty() => self.fv.pending.record(Field::ValidFrom, Ok(())),
+            None => self.fv.pending.record(
+                Field::ValidFrom,
+                Err(format!(
+                    "Pick a date. The draft has \"{}\" here.",
+                    form.valid_from
+                )),
             ),
-            None => Err("Type the date as 1 Oct 2026 or 2026-10-01.".into()),
-        });
-        let valid_from = self.text_input(
-            &manifest::date_text(&form.valid_from),
-            Some(Field::ValidFrom),
-            date,
-            kept_valid_from,
-            window,
-            cx,
-        );
+        }
+        let valid_from = self.date_picker(&form.valid_from, window, cx);
         let max_age = self.top_span(
             &form.max_age,
             "claim_max_age",
@@ -875,19 +897,12 @@ impl AppView {
         }
     }
 
-    /// Puts text the form cannot read into the Valid from input and marks the field, as typing
-    /// it does. The snapshot of a refused date uses it.
+    /// Writes text the form cannot read as the draft's Valid from and rebuilds the form, as a
+    /// draft with such a date has it. The snapshot of a refused date uses it.
     #[cfg(all(feature = "snapshot", target_os = "macos"))]
     pub fn type_valid_from(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(inputs) = &self.fv.inputs {
-            inputs
-                .valid_from
-                .update(cx, |state, cx| state.set_value(text.to_owned(), window, cx));
-            self.fv.pending.record(
-                Field::ValidFrom,
-                Err("Type the date as 1 Oct 2026 or 2026-10-01.".into()),
-            );
-        }
+        let result = manifest::set_top_text(&self.draft, "valid_from", text);
+        self.edit_form(result, Rebuild::Inputs, window, cx);
     }
 
     /// Moves between the Form and TOML views. Leaving the Form waits while an input holds text
@@ -1580,7 +1595,7 @@ impl AppView {
                     "Valid from",
                     div()
                         .w(px(150.))
-                        .child(Input::new(&inputs.valid_from).disabled(disabled)),
+                        .child(DatePicker::new(&inputs.valid_from).disabled(disabled)),
                     error_of(issues, &Field::ValidFrom),
                 ),
                 kv_row_error(
@@ -1746,7 +1761,8 @@ impl AppView {
                 .map(|(i, (key, name))| {
                     seg2_item(("send", i), name, mode == key).on_click(cx.listener(
                         move |this, _, window, cx| {
-                            let result = manifest::set_send_mode(&this.draft, key);
+                            let result =
+                                manifest::switch_send_mode(&this.draft, key, &mut this.fv.vpn_kept);
                             this.edit_form(result, Rebuild::Inputs, window, cx);
                         },
                     ))

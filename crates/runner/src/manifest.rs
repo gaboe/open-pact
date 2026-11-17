@@ -1864,6 +1864,51 @@ pub fn set_send_mode(text: &str, mode: &str) -> Result<String, String> {
     Ok(document.to_string())
 }
 
+/// The VPN probe and probe name of a draft.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct KeptProbe {
+    pub probe: String,
+    pub name: String,
+}
+
+/// Switches how devices send, as `set_send_mode` does. Leaving "vpn" keeps its probe and name in
+/// `kept`. Entering "vpn" from another mode writes the kept pair back.
+pub fn switch_send_mode(
+    text: &str,
+    mode: &str,
+    kept: &mut Option<KeptProbe>,
+) -> Result<String, String> {
+    let before = Form::parse(text)?.schedule;
+    let was_vpn = before.as_ref().is_some_and(|s| s.mode == "vpn");
+    let mut result = set_send_mode(text, mode)?;
+    let mut remembered = kept.clone();
+    if was_vpn
+        && mode != "vpn"
+        && let Some(schedule) = before
+    {
+        remembered = Some(KeptProbe {
+            probe: schedule.probe,
+            name: schedule.name,
+        });
+    }
+    if mode == "vpn"
+        && !was_vpn
+        && let Some(pair) = &remembered
+    {
+        let mut document = document(&result)?;
+        let table = schedule_table(&mut document)?;
+        put(table, "vpn_probe", Value::from(pair.probe.as_str()));
+        if pair.name.is_empty() {
+            table.remove("vpn_probe_name");
+        } else {
+            put(table, "vpn_probe_name", Value::from(pair.name.as_str()));
+        }
+        result = document.to_string();
+    }
+    *kept = remembered;
+    Ok(result)
+}
+
 fn control_table(document: &mut DocumentMut, index: usize) -> Result<&mut Table, String> {
     document
         .get_mut("control")
