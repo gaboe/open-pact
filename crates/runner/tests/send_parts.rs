@@ -196,7 +196,7 @@ fn a_screen_lock_check_offers_minutes_as_its_newest_version() {
         added.output,
         manifest::Output::Integer {
             min: 0,
-            max: 1440,
+            max: 2147483647,
             values: vec!["none".to_owned()],
         }
     );
@@ -217,10 +217,9 @@ fn a_screen_lock_check_offers_minutes_as_its_newest_version() {
 fn a_new_screen_lock_check_is_written_as_core_accepts_it() {
     let (text, index) = manifest::add_control(NONE, "screen_lock").unwrap();
     assert!(
-        text.contains("output = { integer = { min = 0, max = 1440 }, values = [\"none\"] }"),
+        text.contains("output = { integer = { min = 0, max = 2147483647 }, values = [\"none\"] }"),
         "{text}"
     );
-    assert!(!text.contains("2147483647"), "{text}");
     assert_eq!(index, 0);
 }
 
@@ -412,9 +411,10 @@ fn an_existing_screen_lock_check_explains_its_own_version() {
     assert_eq!(new.version, 2);
     assert!(new.about.contains("whole minutes"), "{}", new.about);
     assert!(
-        new.about.contains("reads only the password delay"),
+        new.about
+            .contains("shorter of the screen saver idle time and the display sleep"),
         "{}",
         new.about
     );
-    assert!(new.about.contains("not the idle time"), "{}", new.about);
+    assert!(!new.about.contains("not the idle time"), "{}", new.about);
 }

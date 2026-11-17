@@ -726,8 +726,9 @@ pub struct Builtin {
 const INTEGER_3650: &str = "{ integer = { min = 0, max = 3650 } }";
 const INTEGER_MAX: &str = "{ integer = { min = 0, max = 2147483647 } }";
 /// Core takes only `n/a` and `none` as explicit words of an integer output; `unknown` is always
-/// allowed without being listed. A day (1440 minutes) is the longest lock time a person sets.
-const LOCK_MINUTES: &str = r#"{ integer = { min = 0, max = 1440 }, values = ["none"] }"#;
+/// allowed without being listed. The bound matches the client, which reports any whole number of
+/// minutes that fits an i32.
+const LOCK_MINUTES: &str = r#"{ integer = { min = 0, max = 2147483647 }, values = ["none"] }"#;
 
 pub const BUILTINS: [Builtin; 27] = [
     Builtin {
@@ -796,9 +797,9 @@ pub const BUILTINS: [Builtin; 27] = [
         group: Group::SignIn,
         about: "A device that stays unlocked gives access to anyone nearby. The client \
             reports whole minutes, or none when the screen never locks. On macOS it \
-            runs sysadminctl -screenLock status and reads only the password delay that \
-            applies after the screen saver starts or the display turns off, not the idle \
-            time that starts them; on Windows it reads the machine inactivity limit, \
+            adds the password delay from sysadminctl -screenLock status to the shorter of \
+            the screen saver idle time and the display sleep time from pmset, rounded up \
+            to whole minutes; on Windows it reads the machine inactivity limit, \
             else the secure screen saver of each signed-in user; on Linux it reads the \
             GNOME settings with gsettings or the KDE kscreenlockerrc file.",
     },
