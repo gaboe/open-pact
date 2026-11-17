@@ -59,7 +59,7 @@ mod schedule;
 #[cfg(target_os = "macos")]
 mod secure_enclave;
 mod session;
-mod status;
+pub mod status;
 mod timings;
 mod ui;
 mod update;
@@ -96,8 +96,10 @@ use sha2::{Digest, Sha256};
 pub use host::{Host, InputSource, InterruptFuture, Interrupted, with_host};
 pub use json_out::{ClaimReport, ControlReport, JoinStep, StepState, WAITING_FOR_JOB};
 pub use schedule::Command as ScheduleCommand;
+pub use schedule::JobStatus;
 pub use session::{Cancelled, JoinChoices, Session};
 pub use status::Options as StatusOptions;
+pub use update::Notice;
 
 /// What a command line asks for, after a parser read it. The CLI maps its arguments to this and
 /// calls [`run`]; the library has no parser of its own.
@@ -10734,6 +10736,109 @@ grace = "1d"
                 .any(|step| step.step == 4 && step.state == StepState::Waiting),
             "{steps:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_session_join_is_cancelled_at_once_when_its_cancel_future_is_ready_without_a_terminal()
+     {
+        let (gateway, invitation) = witnessed_join_fixture().await;
+        let dir = tempfile::tempdir().unwrap();
+        let session = session_of(&Home(dir.path().to_path_buf()));
+
+        let error = session
+            .join(
+                &invitation,
+                JoinChoices {
+                    software_key: true,
+                    no_wait: true,
+                    ..JoinChoices::default()
+                },
+                std::future::ready(()),
+                |_| {},
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.is::<Cancelled>(), "{error:#}");
+        assert!(gateway.posts().is_empty(), "{:?}", gateway.posts());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_session_join_is_cancelled_while_its_manifest_request_is_pending() {
+        let company = Company::new();
+        let toml = witnessed_manifest(&Witness::new());
+        let published = Company::published(&toml, &company.key);
+        let started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let held = std::sync::Mutex::new(held);
+        let seen = started.clone();
+        let gateway = FakeGateway::start(move |line, _| match line {
+            "GET /v1/manifest" => {
+                seen.notify_one();
+                // The reply waits for the test, or gives up after ten seconds.
+                let _ = held.lock().unwrap().recv_timeout(Duration::from_secs(10));
+                (200, published.clone())
+            }
+            _ => not_found(),
+        })
+        .await;
+        let invitation = Invitation::new(
+            &gateway.url,
+            &PublicKey::from(&company.key),
+            &company.log,
+            open_pact_core::InvitationCode::from_bytes([7; 32]),
+        )
+        .encode();
+        let dir = tempfile::tempdir().unwrap();
+        let session = session_of(&Home(dir.path().to_path_buf()));
+        let cancel_after = started.clone();
+
+        let call = session.join(
+            &invitation,
+            JoinChoices {
+                software_key: true,
+                no_wait: true,
+                ..JoinChoices::default()
+            },
+            async move { cancel_after.notified().await },
+            |_| {},
+        );
+        let outcome = tokio::time::timeout(Duration::from_secs(5), call).await;
+        // Release the gateway whatever the outcome, so that no thread waits on it after this test.
+        let _ = release.send(());
+
+        let error = outcome
+            .expect("the cancelled join returns while the manifest reply is still held")
+            .unwrap_err();
+        assert!(error.is::<Cancelled>(), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn a_session_join_rejects_an_empty_folder_before_it_contacts_the_gateway() {
+        let (gateway, invitation) = witnessed_join_fixture().await;
+        let dir = tempfile::tempdir().unwrap();
+        let session = session_of(&Home(dir.path().to_path_buf()));
+
+        let error = session
+            .join(
+                &invitation,
+                JoinChoices {
+                    software_key: true,
+                    no_wait: true,
+                    folders: vec![PathBuf::new()],
+                    ..JoinChoices::default()
+                },
+                std::future::pending(),
+                |_| {},
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("must not be empty"),
+            "{error:#}"
+        );
+        assert!(gateway.requests().is_empty(), "{:?}", gateway.requests());
     }
 
     #[tokio::test]

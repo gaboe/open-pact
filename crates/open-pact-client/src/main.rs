@@ -340,11 +340,15 @@ fn main() -> ExitCode {
         .name("open-pact-client".into())
         .stack_size(8 * 1024 * 1024)
         .spawn(|| {
-            tokio::runtime::Builder::new_multi_thread()
+            let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
-                .expect("build the CLI runtime")
-                .block_on(cli_main())
+                .expect("build the CLI runtime");
+            let code = runtime.block_on(cli_main());
+            // A blocking task, such as a repository scan that waits on a FIFO, cannot be stopped.
+            // Dropping the runtime would wait for it, so the command ends without waiting.
+            runtime.shutdown_background();
+            code
         })
         .expect("start the CLI thread")
         .join()

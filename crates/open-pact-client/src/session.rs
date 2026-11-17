@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow};
 
+use crate::device_config;
 use crate::json_out::{self, Answers, Json};
 use crate::{
     APPROVAL_POLL_INTERVAL, AcceptPreview, ClaimReport, Home, Host, JoinOptions, JoinPreview,
@@ -90,7 +91,9 @@ impl Session {
     }
 
     /// Joins with the owner's answers given up front. `on_step` hears each wizard step. When
-    /// `cancel` completes, the join stops where it waits and gives [`Cancelled`].
+    /// `cancel` completes, the join ends at once with [`Cancelled`], with or without `no_wait`.
+    /// A repository scan that already runs on a blocking thread keeps that thread until its read
+    /// returns.
     pub async fn join(
         &self,
         invitation: &str,
@@ -98,23 +101,26 @@ impl Session {
         cancel: impl Future<Output = ()>,
         on_step: impl FnMut(JoinStep) + Send + 'static,
     ) -> Result<JoinResult> {
-        let json = Json::observed(
-            Answers {
-                auto_send: choices.auto_send,
-                folders: choices.folders,
-            },
-            on_step,
-        );
+        let JoinChoices {
+            software_key,
+            no_wait,
+            auto_send,
+            folders,
+        } = choices;
+        // The CLI normalizes its folders before the join starts. So does a session, so that the
+        // folder API finds the same paths again.
+        let folders = join_folders(folders)?;
+        let json = Json::observed(Answers { auto_send, folders }, on_step);
         let options = JoinOptions {
             insecure_dev: self.insecure_dev,
             executable: &self.cli,
-            no_wait: choices.no_wait,
+            no_wait,
             poll_interval: APPROVAL_POLL_INTERVAL,
         };
         // The join future is large: it lives on the heap, not on the caller's stack.
         let flow = Box::pin(json_out::scope(
             json,
-            crate::join_run(&self.home, Some(invitation), choices.software_key, options),
+            crate::join_run(&self.home, Some(invitation), software_key, options),
         ));
         let run = Self::until(cancel, flow).await?;
         run.finished.map_err(|text| anyhow!(text))
@@ -197,34 +203,18 @@ impl Session {
         Ok(())
     }
 
-    /// Runs `flow` until it ends. When `cancel` completes first, the flow hears an interrupt at
-    /// its next wait and ends with [`Cancelled`].
+    /// Runs `flow` until it ends. When `cancel` completes first, the flow is dropped where it
+    /// waits, and the call ends with [`Cancelled`]. The flow gets no interrupt of its own, so this
+    /// holds for a join with `no_wait` too.
     async fn until<T>(
         cancel: impl Future<Output = ()>,
         flow: impl Future<Output = Result<T>>,
     ) -> Result<T> {
-        let (stop, stopped) = tokio::sync::watch::channel(false);
-        let host = Host::new(
-            || Box::new(std::io::empty()),
-            false,
-            move || {
-                let mut stopped = stopped.clone();
-                Box::pin(async move {
-                    let _ = stopped.wait_for(|stop| *stop).await;
-                })
-            },
-        );
-        let flow = host::with_host(host, flow);
+        let flow = host::with_host(Host::closed(), flow);
         tokio::pin!(flow, cancel);
-        let mut cancelled = false;
-        let result = loop {
-            tokio::select! {
-                result = &mut flow => break result,
-                () = &mut cancel, if !cancelled => {
-                    cancelled = true;
-                    let _ = stop.send(true);
-                }
-            }
+        let result = tokio::select! {
+            result = &mut flow => result,
+            () = &mut cancel => return Err(Cancelled.into()),
         };
         result.map_err(|error| {
             if host::is_interrupt(&error) {
@@ -233,5 +223,31 @@ impl Session {
                 error
             }
         })
+    }
+}
+
+/// The folders of a join, normalized as the CLI normalizes its `--folder` choices: a `~` path
+/// expands to the owner's home, a relative path becomes absolute, and an empty path fails.
+fn join_folders(folders: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
+    let user_home = crate::user_profile();
+    folders
+        .iter()
+        .map(|folder| device_config::absolute_folder(folder, user_home.as_deref()))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn join_folders_are_absolute_like_the_cli_saves_them() {
+        let folders = join_folders(vec![PathBuf::from("work")]).unwrap();
+        assert_eq!(folders, vec![std::path::absolute("work").unwrap()]);
+        let home = crate::user_profile().expect("the test runs with a home");
+        assert_eq!(
+            join_folders(vec![PathBuf::from("~/work")]).unwrap(),
+            vec![home.join("work")]
+        );
     }
 }
