@@ -276,9 +276,16 @@ impl Fixture {
 
     async fn report(&self, online: bool) -> Report {
         let before = snapshot(&self.home.0);
-        let report = collect_with(&self.home, online, false, self.now, |_, _| Ok(self.job))
-            .await
-            .unwrap();
+        let report = collect_with(
+            &self.home,
+            online,
+            false,
+            &std::env::current_exe().unwrap(),
+            self.now,
+            |_, _| Ok(self.job),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             snapshot(&self.home.0),
             before,
@@ -478,9 +485,16 @@ async fn a_relative_deadline_becomes_an_absolute_time() {
 async fn a_deadline_in_the_past_is_reported_as_passed() {
     let fixture = Fixture::new("grace_warning").await;
     let later = fixture.now + chrono::TimeDelta::hours(30);
-    let report = collect_with(&fixture.home, false, false, later, |_, _| Ok(fixture.job))
-        .await
-        .unwrap();
+    let report = collect_with(
+        &fixture.home,
+        false,
+        false,
+        &std::env::current_exe().unwrap(),
+        later,
+        |_, _| Ok(fixture.job),
+    )
+    .await
+    .unwrap();
     assert!(report.render().contains(
         "   Deadline passed at about 2026-11-17T08:50:00Z (gateway said 'access ends in 23h' at 2026-11-16T09:50:00Z)\n"
     ));
@@ -817,7 +831,14 @@ async fn accept_restores_missing_or_damaged_signed_manifest() {
         }
         let enrolment = std::fs::read(fixture.home.file("enrolment.json")).unwrap();
         assert_eq!(
-            crate::accept(&fixture.home, true, false).await.unwrap(),
+            crate::accept(
+                &fixture.home,
+                true,
+                false,
+                &std::env::current_exe().unwrap()
+            )
+            .await
+            .unwrap(),
             ExitCode::SUCCESS
         );
         assert_eq!(
@@ -844,7 +865,16 @@ async fn accept_refuses_a_manifest_the_company_did_not_sign() {
     let fixture = Fixture::new("bad_company_signature").await;
     std::fs::remove_file(fixture.home.file("manifest.toml")).unwrap();
     let enrolment = std::fs::read(fixture.home.file("enrolment.json")).unwrap();
-    assert!(crate::accept(&fixture.home, true, false).await.is_err());
+    assert!(
+        crate::accept(
+            &fixture.home,
+            true,
+            false,
+            &std::env::current_exe().unwrap()
+        )
+        .await
+        .is_err()
+    );
     assert!(!fixture.home.file("manifest.toml").exists());
     assert_eq!(
         std::fs::read(fixture.home.file("enrolment.json")).unwrap(),
@@ -939,9 +969,14 @@ async fn send_time_and_response_time_are_distinct_evidence() {
 #[tokio::test]
 async fn a_system_job_without_inspection_cannot_produce_ok() {
     let fixture = Fixture::new("approved_ok").await;
-    let report = collect_with(&fixture.home, true, false, fixture.now, |_, _| {
-        Ok(JobStatus::SystemUnconfirmed)
-    })
+    let report = collect_with(
+        &fixture.home,
+        true,
+        false,
+        &std::env::current_exe().unwrap(),
+        fixture.now,
+        |_, _| Ok(JobStatus::SystemUnconfirmed),
+    )
     .await
     .unwrap();
     assert_eq!(report.exit_code, 3);

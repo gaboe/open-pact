@@ -332,8 +332,10 @@ enum ClaimResult {
 }
 
 #[derive(Clone, Copy)]
-struct JoinOptions {
+struct JoinOptions<'a> {
     insecure_dev: bool,
+    /// The installed program the OS job runs.
+    executable: &'a Path,
     no_wait: bool,
     poll_interval: Duration,
 }
@@ -1868,7 +1870,7 @@ fn setup_answers(context: &SetupContext, answers: &json_out::Answers) -> SetupCh
 }
 
 /// Saves the choices and installs or removes the job to match.
-async fn apply_setup(home: &Home, choices: SetupChoices) -> Result<()> {
+async fn apply_setup(home: &Home, choices: SetupChoices, executable: &Path) -> Result<()> {
     let was_on = {
         let _claim_lock = claim::lock(home).await?;
         let mut config =
@@ -1881,20 +1883,20 @@ async fn apply_setup(home: &Home, choices: SetupChoices) -> Result<()> {
         was_on
     };
     if choices.auto_send {
-        if let Err(error) = schedule::turn_on(home, Some(choices.run_as), false).await {
+        if let Err(error) = schedule::turn_on(home, Some(choices.run_as), false, executable).await {
             println!(
                 "The job was not installed: {error:#}\nRun `{} schedule on` when you can.",
                 client_command(&home.0)
             );
         }
     } else if was_on {
-        schedule::turn_off(home, false).await?;
+        schedule::turn_off(home, false, executable).await?;
     }
     Ok(())
 }
 
 /// Wizard step 5: the owner's few choices, then the first check.
-async fn setup_device(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
+async fn setup_device(home: &Home, insecure_dev: bool, executable: &Path) -> Result<ExitCode> {
     wizard_step(5, "Set up this device");
     let manifest = home.signed_manifest()?;
     let os = current_os()?;
@@ -1931,17 +1933,17 @@ async fn setup_device(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
         receive.await.context("setup questions stopped")??
     };
     let detail = serde_json::json!({ "auto_send": choices.auto_send, "folders": choices.folders });
-    apply_setup(home, choices).await?;
+    apply_setup(home, choices, executable).await?;
     json_out::step_done(5, Some(detail));
-    first_claim(home, insecure_dev).await
+    first_claim(home, insecure_dev, executable).await
 }
 
 /// Wizard step 6: ask once more, then run the first check.
-async fn first_claim(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
+async fn first_claim(home: &Home, insecure_dev: bool, executable: &Path) -> Result<ExitCode> {
     set_wizard_step(6);
     if json_out::active() {
         wizard_step(6, "First check and claim");
-        let outcome = check_run(home, insecure_dev, false).await?;
+        let outcome = check_run(home, insecure_dev, executable, false).await?;
         let detail = match json_out::claim() {
             Some(report) => serde_json::to_value(report)?,
             None => json_out::not_sent_detail(&outcome.failure_text()),
@@ -1954,7 +1956,7 @@ async fn first_claim(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
     wizard_step(6, "First check and claim");
-    check_impl(home, insecure_dev, false).await
+    check_impl(home, insecure_dev, executable, false).await
 }
 
 /// `folders list|add|remove`: the owner's repository folders.
@@ -2010,13 +2012,18 @@ async fn folders(home: &Home, command: FoldersCommand) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-async fn after_approval(home: &Home, insecure_dev: bool, wizard: bool) -> Result<ExitCode> {
+async fn after_approval(
+    home: &Home,
+    insecure_dev: bool,
+    executable: &Path,
+    wizard: bool,
+) -> Result<ExitCode> {
     if !wizard {
         print_approved_next_step(&client_command(&home.0));
         return Ok(ExitCode::SUCCESS);
     }
     match wizard_resume(home)? {
-        WizardResume::Setup => return setup_device(home, insecure_dev).await,
+        WizardResume::Setup => return setup_device(home, insecure_dev, executable).await,
         WizardResume::Complete => {
             println!("This device setup is complete.");
             json_out::steps_skipped(&[5, 6]);
@@ -2024,7 +2031,7 @@ async fn after_approval(home: &Home, insecure_dev: bool, wizard: bool) -> Result
         }
         WizardResume::FirstCheck => json_out::steps_skipped(&[5]),
     }
-    first_claim(home, insecure_dev).await
+    first_claim(home, insecure_dev, executable).await
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2969,7 +2976,7 @@ async fn wait_after_join(
     home: &Home,
     enrolment: &Enrolment,
     manifest: &Manifest,
-    options: JoinOptions,
+    options: JoinOptions<'_>,
     wizard: bool,
     origin: JoinOrigin,
 ) -> Result<ExitCode> {
@@ -3132,7 +3139,7 @@ async fn wait_after_join(
         Ok(ApprovalWait::Approved) if wizard => {
             println!("\n  {}", ui::bold(approval_confirmation(), ui::styled()));
             json_out::step_done(4, Some(serde_json::json!({ "state": "approved" })));
-            after_approval(home, options.insecure_dev, true).await
+            after_approval(home, options.insecure_dev, options.executable, true).await
         }
         Ok(wait) => {
             let code = approval_exit(wait, &command);
@@ -3172,7 +3179,7 @@ async fn continue_saved_join(
     home: &Home,
     enrolment: &Enrolment,
     manifest: &Manifest,
-    options: JoinOptions,
+    options: JoinOptions<'_>,
     origin: JoinOrigin,
 ) -> Result<ExitCode> {
     let wizard = wizard_enabled(options.no_wait);
@@ -3182,6 +3189,7 @@ async fn continue_saved_join(
 async fn resume_join(
     home: &Home,
     insecure_dev: bool,
+    executable: &Path,
     no_wait: bool,
     poll_interval: Duration,
 ) -> Result<ExitCode> {
@@ -3232,6 +3240,7 @@ async fn resume_join(
         &manifest,
         JoinOptions {
             insecure_dev,
+            executable,
             no_wait,
             poll_interval,
         },
@@ -3245,10 +3254,14 @@ async fn join(
     invitation: &str,
     yes: bool,
     software_key: bool,
-    insecure_dev: bool,
-    no_wait: bool,
-    poll_interval: Duration,
+    options: JoinOptions<'_>,
 ) -> Result<ExitCode> {
+    let JoinOptions {
+        insecure_dev,
+        executable,
+        no_wait,
+        poll_interval,
+    } = options;
     let invitation = Invitation::decode(invitation)?;
     let gateway = invitation.gateway.as_str();
     check_scheme(gateway, insecure_dev)?;
@@ -3360,6 +3373,7 @@ async fn join(
                     &manifest,
                     JoinOptions {
                         insecure_dev,
+                        executable,
                         no_wait,
                         poll_interval,
                     },
@@ -3488,6 +3502,7 @@ async fn join(
             &manifest,
             JoinOptions {
                 insecure_dev,
+                executable,
                 no_wait,
                 poll_interval,
             },
@@ -3504,11 +3519,11 @@ fn device_code(device: &Pseudonym) -> String {
 
 /// How to stop the scheduled claims. On Windows the command carries the full path of this
 /// program, because the elevated prompt a SYSTEM job needs may not find it by name.
-fn stop_instructions(home: &Path, windows: bool) -> String {
+fn stop_instructions(home: &Path, windows: bool, executable: &Path) -> String {
     if windows {
         format!(
             "Run this from PowerShell to stop the scheduled claims:\n  {}\nA job that runs as SYSTEM needs an elevated PowerShell prompt.",
-            schedule::apply_command(home, "schedule off")
+            schedule::apply_command(home, "schedule off", executable)
         )
     } else {
         format!(
@@ -3668,8 +3683,8 @@ fn print_hints(
     }
 }
 
-async fn check(home: &Home, insecure_dev: bool) -> Result<ExitCode> {
-    check_impl(home, insecure_dev, true).await
+async fn check(home: &Home, insecure_dev: bool, executable: &Path) -> Result<ExitCode> {
+    check_impl(home, insecure_dev, executable, true).await
 }
 
 /// Shows the request `check` would send now. It makes GET requests only and writes no file.
@@ -3716,8 +3731,13 @@ async fn check_preview(home: &Home, insecure_dev: bool) -> Result<claim::Preview
         .await
 }
 
-async fn check_impl(home: &Home, insecure_dev: bool, show_resume_hint: bool) -> Result<ExitCode> {
-    match check_run(home, insecure_dev, show_resume_hint).await {
+async fn check_impl(
+    home: &Home,
+    insecure_dev: bool,
+    executable: &Path,
+    show_resume_hint: bool,
+) -> Result<ExitCode> {
+    match check_run(home, insecure_dev, executable, show_resume_hint).await {
         Ok(outcome) => Ok(outcome.exit_code()),
         Err(error) if error.is::<claim::LegacyLogHead>() => {
             print_log_upgrade(home);
@@ -3731,10 +3751,11 @@ async fn check_impl(home: &Home, insecure_dev: bool, show_resume_hint: bool) -> 
 async fn check_json(
     home: &Home,
     insecure_dev: bool,
+    executable: &Path,
     json: std::sync::Arc<json_out::Json>,
 ) -> ExitCode {
     json_out::scope(json, async {
-        match check_run(home, insecure_dev, false).await {
+        match check_run(home, insecure_dev, executable, false).await {
             Ok(outcome) => {
                 match json_out::claim() {
                     Some(report) => json_out::document(&report),
@@ -3751,6 +3772,7 @@ async fn check_json(
 async fn check_run(
     home: &Home,
     insecure_dev: bool,
+    executable: &Path,
     show_resume_hint: bool,
 ) -> Result<claim::Outcome> {
     let _claim_lock = claim::lock(home).await?;
@@ -3760,6 +3782,7 @@ async fn check_run(
         device_config::Surface::Check,
         &client_command(&home.0),
         &device_config::DeviceConfig::load(home).unwrap_or_default(),
+        executable,
     ) {
         println!("{notice}\n");
     }
@@ -4024,7 +4047,7 @@ fn manifest_change_list(old: &Manifest, new: &Manifest) -> Vec<ManifestChange> {
 
 /// Shows the manifest the gateway enforces and what it changes, asks the owner, and sends the
 /// owner's and the device's signatures. The device keeps its approval; no invitation is needed.
-async fn accept(home: &Home, yes: bool, insecure_dev: bool) -> Result<ExitCode> {
+async fn accept(home: &Home, yes: bool, insecure_dev: bool, executable: &Path) -> Result<ExitCode> {
     let _claim_lock = claim::lock(home).await?;
     let mut enrolment = home.enrolment()?;
     check_scheme(&enrolment.gateway, insecure_dev)?;
@@ -4169,7 +4192,7 @@ async fn accept(home: &Home, yes: bool, insecure_dev: bool) -> Result<ExitCode> 
         && config.auto_send
     {
         println!("{schedule}");
-        for line in schedule::next_due_text(home, config.run_as, schedule) {
+        for line in schedule::next_due_text(home, config.run_as, schedule, executable) {
             println!("{line}");
         }
     }
@@ -4425,11 +4448,15 @@ async fn join_json(
     home: &Home,
     invitation: Option<&str>,
     software_key: bool,
-    no_wait: bool,
-    insecure_dev: bool,
-    poll_interval: Duration,
+    options: JoinOptions<'_>,
     json: std::sync::Arc<json_out::Json>,
 ) -> ExitCode {
+    let JoinOptions {
+        insecure_dev,
+        executable,
+        no_wait,
+        poll_interval,
+    } = options;
     json_out::scope(json, async {
         let operation = async {
             match invitation {
@@ -4439,13 +4466,16 @@ async fn join_json(
                         invitation,
                         true,
                         software_key,
-                        insecure_dev,
-                        no_wait,
-                        poll_interval,
+                        JoinOptions {
+                            insecure_dev,
+                            executable,
+                            no_wait,
+                            poll_interval,
+                        },
                     )
                     .await
                 }
-                None => resume_join(home, insecure_dev, no_wait, poll_interval).await,
+                None => resume_join(home, insecure_dev, executable, no_wait, poll_interval).await,
             }
         };
         let code = match run_wizard(home, invitation, no_wait, operation).await {
@@ -4626,7 +4656,7 @@ fn log_show(path: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn run(cli: Cli) -> Result<ExitCode> {
+async fn run(cli: Cli, executable: &Path) -> Result<ExitCode> {
     if let Command::Schedule {
         command: schedule::Command::Probe { address, name },
     } = &cli.command
@@ -4661,7 +4691,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         }
     }
     match cli.command {
-        Command::Status(options) => status::run(&home, options, cli.insecure_dev).await,
+        Command::Status(options) => status::run(&home, options, cli.insecure_dev, executable).await,
         Command::Join {
             invitation,
             preview: true,
@@ -4685,9 +4715,12 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             &home,
             invitation.as_deref(),
             software_key,
-            no_wait,
-            cli.insecure_dev,
-            APPROVAL_POLL_INTERVAL,
+            JoinOptions {
+                insecure_dev: cli.insecure_dev,
+                executable,
+                no_wait,
+                poll_interval: APPROVAL_POLL_INTERVAL,
+            },
             json_out::Json::new(
                 std::io::stdout(),
                 json_out::Answers {
@@ -4719,9 +4752,12 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                         &invitation,
                         yes,
                         software_key,
-                        cli.insecure_dev,
-                        no_wait,
-                        APPROVAL_POLL_INTERVAL,
+                        JoinOptions {
+                            insecure_dev: cli.insecure_dev,
+                            executable,
+                            no_wait,
+                            poll_interval: APPROVAL_POLL_INTERVAL,
+                        },
                     ),
                 )
                 .await
@@ -4731,7 +4767,13 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     &home,
                     None,
                     no_wait,
-                    resume_join(&home, cli.insecure_dev, no_wait, APPROVAL_POLL_INTERVAL),
+                    resume_join(
+                        &home,
+                        cli.insecure_dev,
+                        executable,
+                        no_wait,
+                        APPROVAL_POLL_INTERVAL,
+                    ),
                 )
                 .await
             }
@@ -4739,10 +4781,11 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Command::Check { json: true, .. } => Ok(check_json(
             &home,
             cli.insecure_dev,
+            executable,
             json_out::Json::new(std::io::stdout(), json_out::Answers::default()),
         )
         .await),
-        Command::Check { dry_run: false, .. } => check(&home, cli.insecure_dev).await,
+        Command::Check { dry_run: false, .. } => check(&home, cli.insecure_dev, executable).await,
         Command::Check {
             dry_run: true,
             timings,
@@ -4761,7 +4804,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             json_out::Json::new(std::io::stdout(), json_out::Answers::default()),
         )
         .await),
-        Command::Accept { yes, .. } => accept(&home, yes, cli.insecure_dev).await,
+        Command::Accept { yes, .. } => accept(&home, yes, cli.insecure_dev, executable).await,
         Command::Folders { command } => folders(&home, command).await,
         Command::Manifest {
             command: ManifestCommand::Show,
@@ -4773,7 +4816,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             command: ManifestCommand::Check { .. } | ManifestCommand::Builtins { .. },
         } => unreachable!("handled before the home is read"),
         Command::Schedule { command } => {
-            schedule::run(&home, command).await?;
+            schedule::run(&home, command, executable).await?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Log {
@@ -4791,7 +4834,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Stop => {
-            println!("{}", stop_instructions(&home.0, cfg!(windows)));
+            println!("{}", stop_instructions(&home.0, cfg!(windows), executable));
             println!(
                 "Before deleting the home or binary, run `open-pact-client delete-device-key` with the same --home."
             );
@@ -4894,10 +4937,11 @@ async fn cli_main() -> ExitCode {
             libc::signal(libc::SIGPIPE, libc::SIG_DFL);
         }
     }
+    let executable = std::env::current_exe().unwrap_or_default();
     let result = if json {
-        catch_panic(run(cli)).await
+        catch_panic(run(cli, &executable)).await
     } else {
-        run(cli).await
+        run(cli, &executable).await
     };
     match result {
         Ok(code) => code,
@@ -5652,7 +5696,9 @@ mod tests {
             let home = enrolled_home_with(dir.path(), &gateway_url, &company, &toml);
             fs::write(home.file("claims.jsonl"), b"{\"time\":\n").unwrap();
             assert_eq!(
-                check(&home, true).await.unwrap(),
+                check(&home, true, &std::env::current_exe().unwrap())
+                    .await
+                    .unwrap(),
                 ExitCode::FAILURE,
                 "{state}"
             );
@@ -5989,9 +6035,12 @@ mod tests {
             &invitation,
             true,
             true,
-            false,
-            true,
-            APPROVAL_POLL_INTERVAL,
+            JoinOptions {
+                insecure_dev: false,
+                executable: &std::env::current_exe().unwrap(),
+                no_wait: true,
+                poll_interval: APPROVAL_POLL_INTERVAL,
+            },
         )
         .await
         .unwrap_err()
@@ -6055,9 +6104,12 @@ mod tests {
             &old_invitation,
             true,
             true,
-            false,
-            true,
-            APPROVAL_POLL_INTERVAL,
+            JoinOptions {
+                insecure_dev: false,
+                executable: &std::env::current_exe().unwrap(),
+                no_wait: true,
+                poll_interval: APPROVAL_POLL_INTERVAL,
+            },
         )
         .await
         .unwrap_err()
@@ -6078,9 +6130,12 @@ mod tests {
             &new_invitation,
             true,
             true,
-            false,
-            true,
-            APPROVAL_POLL_INTERVAL,
+            JoinOptions {
+                insecure_dev: false,
+                executable: &std::env::current_exe().unwrap(),
+                no_wait: true,
+                poll_interval: APPROVAL_POLL_INTERVAL,
+            },
         )
         .await
         .unwrap();
@@ -6187,9 +6242,12 @@ mod tests {
             &invitation,
             true,
             true,
-            false,
-            false,
-            Duration::from_millis(1),
+            JoinOptions {
+                insecure_dev: false,
+                executable: &std::env::current_exe().unwrap(),
+                no_wait: false,
+                poll_interval: Duration::from_millis(1),
+            },
         )
         .await
         .unwrap();
@@ -6232,9 +6290,15 @@ mod tests {
             !requests.iter().any(|request| request == "POST /v1/claim"),
             "a non-terminal join stops before finish and check"
         );
-        let resumed = resume_join(&home, false, false, Duration::from_millis(1))
-            .await
-            .unwrap();
+        let resumed = resume_join(
+            &home,
+            false,
+            &std::env::current_exe().unwrap(),
+            false,
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap();
         assert_eq!(resumed, ExitCode::SUCCESS);
         let resumed_requests = gateway.requests();
         assert!(
@@ -6341,6 +6405,7 @@ mod tests {
             &manifest,
             JoinOptions {
                 insecure_dev: true,
+                executable: &std::env::current_exe().unwrap(),
                 no_wait: false,
                 poll_interval: APPROVAL_POLL_INTERVAL,
             },
@@ -6431,6 +6496,7 @@ mod tests {
             &manifest,
             JoinOptions {
                 insecure_dev: true,
+                executable: &std::env::current_exe().unwrap(),
                 no_wait: false,
                 poll_interval: Duration::from_millis(1),
             },
@@ -6518,6 +6584,7 @@ mod tests {
             &manifest,
             JoinOptions {
                 insecure_dev: true,
+                executable: &std::env::current_exe().unwrap(),
                 no_wait: false,
                 poll_interval: APPROVAL_POLL_INTERVAL,
             },
@@ -6662,6 +6729,7 @@ mod tests {
             &manifest,
             JoinOptions {
                 insecure_dev: true,
+                executable: &std::env::current_exe().unwrap(),
                 no_wait: true,
                 poll_interval: APPROVAL_POLL_INTERVAL,
             },
@@ -6750,7 +6818,7 @@ mod tests {
         let home = enrolled_home(dir.path(), &gateway.url, &company);
         let before = snapshot(dir.path());
 
-        let code = check(&home, false).await;
+        let code = check(&home, false, &std::env::current_exe().unwrap()).await;
 
         assert_eq!(gateway.posts(), Vec::<String>::new(), "no nonce, no claim");
         let mut after = snapshot(dir.path());
@@ -6990,7 +7058,7 @@ mod tests {
         };
         let before = snapshot(dir.path());
 
-        let code = check(&home, false).await;
+        let code = check(&home, false, &std::env::current_exe().unwrap()).await;
         #[cfg(windows)]
         if code.as_ref().is_err() || code.as_ref().is_ok_and(|code| *code != ExitCode::SUCCESS) {
             assert!(
@@ -7135,6 +7203,7 @@ mod tests {
             &Home(fixture.dir.path().to_path_buf()),
             None,
             &authorization,
+            &std::env::current_exe().unwrap(),
             checks::EventMarkerReads::default,
         )
         .await
@@ -7235,6 +7304,7 @@ mod tests {
                 home,
                 None,
                 &authorization,
+                &std::env::current_exe().unwrap(),
                 checks::EventMarkerReads::default,
                 async move {
                     home.write("manifest.toml", text.as_bytes())?;
@@ -7360,12 +7430,14 @@ mod tests {
             owner_consented: true,
             self_removal: false,
         };
+        let executable = std::env::current_exe().unwrap();
         let tick = || {
             schedule::tick(
                 &home,
                 &home,
                 None,
                 &authorization,
+                &executable,
                 checks::EventMarkerReads::default,
             )
         };
@@ -7396,6 +7468,7 @@ mod tests {
             Some(&vpn_table(&address)),
         )
         .await;
+        let executable = std::env::current_exe().unwrap();
         let run = || {
             schedule::run(
                 &fixture.home,
@@ -7403,6 +7476,7 @@ mod tests {
                     system: false,
                     user_home: None,
                 },
+                &executable,
             )
         };
         let held = claim::try_lock(&fixture.home).unwrap().unwrap();
@@ -7492,6 +7566,7 @@ mod tests {
                 system: false,
                 user_home: None,
             },
+            &std::env::current_exe().unwrap(),
         )
         .await
         .unwrap_err();
@@ -7598,7 +7673,12 @@ grace = "1d"
         .await;
         let dir = tempfile::tempdir().unwrap();
         let home = enrolled_home_with(dir.path(), &gateway.url, &company, &toml);
-        assert_eq!(check(&home, true).await.unwrap(), ExitCode::FAILURE);
+        assert_eq!(
+            check(&home, true, &std::env::current_exe().unwrap())
+                .await
+                .unwrap(),
+            ExitCode::FAILURE
+        );
         assert_eq!(
             gateway.posts(),
             [
@@ -7661,7 +7741,7 @@ grace = "1d"
         config.auto_send = auto_send;
         config.save(&home).unwrap();
 
-        let result = accept(&home, true, false).await;
+        let result = accept(&home, true, false, &std::env::current_exe().unwrap()).await;
         (dir, result)
     }
 
@@ -7752,7 +7832,12 @@ grace = "1d"
         let home = Home(dir.path().to_path_buf());
         let device = DeviceKey::load(&home.0).unwrap();
 
-        assert_eq!(accept(&home, true, false).await.unwrap(), ExitCode::SUCCESS);
+        assert_eq!(
+            accept(&home, true, false, &std::env::current_exe().unwrap())
+                .await
+                .unwrap(),
+            ExitCode::SUCCESS
+        );
         assert_eq!(
             gateway.posts(),
             ["POST /v1/nonce", "POST /v1/device/accept"]
@@ -7773,7 +7858,12 @@ grace = "1d"
         assert_eq!(&enrolment.manifest, new.hash());
         assert!(enrolment.log_entries.is_none());
 
-        assert_eq!(accept(&home, true, false).await.unwrap(), ExitCode::SUCCESS);
+        assert_eq!(
+            accept(&home, true, false, &std::env::current_exe().unwrap())
+                .await
+                .unwrap(),
+            ExitCode::SUCCESS
+        );
         assert_eq!(gateway.posts().len(), 2, "nothing is left to accept");
     }
 
@@ -7797,7 +7887,12 @@ grace = "1d"
         let (dir, _) = accept_home(&gateway.url, &company, &old);
         let before = snapshot(dir.path());
         let home = Home(dir.path().to_path_buf());
-        assert_eq!(accept(&home, true, false).await.unwrap(), ExitCode::FAILURE);
+        assert_eq!(
+            accept(&home, true, false, &std::env::current_exe().unwrap())
+                .await
+                .unwrap(),
+            ExitCode::FAILURE
+        );
         // The checkpoint the gateway signed is verified and kept whatever the owner decides.
         let mut after = snapshot(dir.path());
         after.remove("log-checkpoint.txt");
@@ -7877,7 +7972,12 @@ grace = "1d"
         )
         .unwrap();
 
-        assert_eq!(check(&home, true).await.unwrap(), ExitCode::FAILURE);
+        assert_eq!(
+            check(&home, true, &std::env::current_exe().unwrap())
+                .await
+                .unwrap(),
+            ExitCode::FAILURE
+        );
         assert_eq!(
             gateway.posts(),
             ["POST /v1/nonce", "POST /v1/log/mine"],
@@ -7956,7 +8056,12 @@ grace = "1d"
         )
         .unwrap();
 
-        assert_eq!(check(&home, true).await.unwrap(), ExitCode::from(2));
+        assert_eq!(
+            check(&home, true, &std::env::current_exe().unwrap())
+                .await
+                .unwrap(),
+            ExitCode::from(2)
+        );
         assert_eq!(
             gateway.posts(),
             ["POST /v1/nonce", "POST /v1/log/mine"],
@@ -7981,7 +8086,12 @@ grace = "1d"
         let home = enrolled_home_with(dir.path(), "http://127.0.0.1:9", &company, &old);
         home.write("manifest.toml", new_toml.as_bytes()).unwrap();
 
-        let error = format!("{:#}", check(&home, true).await.unwrap_err());
+        let error = format!(
+            "{:#}",
+            check(&home, true, &std::env::current_exe().unwrap())
+                .await
+                .unwrap_err()
+        );
         assert!(
             error.contains("disagree") && error.contains("accept` to finish it"),
             "{error}"
@@ -8409,9 +8519,12 @@ grace = "1d"
             &invitation,
             true,
             true,
-            false,
-            true,
-            APPROVAL_POLL_INTERVAL,
+            JoinOptions {
+                insecure_dev: false,
+                executable: &std::env::current_exe().unwrap(),
+                no_wait: true,
+                poll_interval: APPROVAL_POLL_INTERVAL,
+            },
         )
         .await;
 
@@ -8445,9 +8558,12 @@ grace = "1d"
             &invitation,
             true,
             true,
-            false,
-            true,
-            APPROVAL_POLL_INTERVAL,
+            JoinOptions {
+                insecure_dev: false,
+                executable: &std::env::current_exe().unwrap(),
+                no_wait: true,
+                poll_interval: APPROVAL_POLL_INTERVAL,
+            },
         )
         .await;
         (gateway, joined)
@@ -8802,12 +8918,14 @@ grace = "1d"
             owner_consented: true,
             self_removal: true,
         };
+        let executable = std::env::current_exe().unwrap();
         let tick = || {
             schedule::tick(
                 &fixture.home,
                 &fixture.home,
                 None,
                 &authorization,
+                &executable,
                 checks::EventMarkerReads::default,
             )
         };
@@ -8916,6 +9034,7 @@ grace = "1d"
             &fixture.home,
             None,
             &authorization,
+            &std::env::current_exe().unwrap(),
             checks::EventMarkerReads::default,
         )
         .await
@@ -9111,6 +9230,7 @@ grace = "1d"
             .unwrap();
         home.write(LOG_CHECKPOINT, b"fictional checkpoint").unwrap();
         home.write(VPN_FILES[0], b"interrupted flat copy").unwrap();
+        let executable = std::env::current_exe().unwrap();
         let home_path = dir.path().to_path_buf();
         let cli = move || {
             Cli::parse_from([
@@ -9125,8 +9245,10 @@ grace = "1d"
         assert!(!home.recover_vpn_at_startup().unwrap());
         let handle = tokio::runtime::Handle::current();
         let cli_for_task = cli.clone();
-        let run_while_locked =
-            tokio::task::spawn_blocking(move || handle.block_on(run(cli_for_task())));
+        let task_executable = executable.clone();
+        let run_while_locked = tokio::task::spawn_blocking(move || {
+            handle.block_on(run(cli_for_task(), &task_executable))
+        });
         let timely =
             tokio::time::timeout(std::time::Duration::from_secs(1), run_while_locked).await;
         drop(lock);
@@ -9136,10 +9258,10 @@ grace = "1d"
             std::fs::read(home.file(VPN_FILES[0])).unwrap(),
             b"interrupted flat copy"
         );
-        assert_eq!(run(cli()).await.unwrap(), ExitCode::SUCCESS);
+        assert_eq!(run(cli(), &executable).await.unwrap(), ExitCode::SUCCESS);
         assert_eq!(std::fs::read(home.file(VPN_FILES[0])).unwrap(), b"CA one");
         std::fs::write(home.file(VPN_DIR).join(VPN_CURRENT), b"../invalid").unwrap();
-        assert_eq!(run(cli()).await.unwrap(), ExitCode::SUCCESS);
+        assert_eq!(run(cli(), &executable).await.unwrap(), ExitCode::SUCCESS);
     }
 
     #[cfg(windows)]
@@ -9375,6 +9497,7 @@ grace = "1d"
                 run_as: device_config::RunAs::User,
                 folders: vec![PathBuf::from("/srv/code")],
             },
+            &std::env::current_exe().unwrap(),
         )
         .await
         .unwrap();
@@ -9555,6 +9678,7 @@ grace = "1d"
                 system: false,
                 user_home: None,
             },
+            &std::env::current_exe().unwrap(),
         )
         .await
         .unwrap();
@@ -9606,6 +9730,7 @@ grace = "1d"
                 system: false,
                 user_home: None,
             },
+            &std::env::current_exe().unwrap(),
         )
         .await
         .unwrap();
@@ -9714,6 +9839,7 @@ grace = "1d"
             )
             .unwrap();
             let expected = vec![std::path::absolute("/srv/code").unwrap()];
+            let executable = std::env::current_exe().unwrap();
             let job = || {
                 schedule::run(
                     home,
@@ -9721,12 +9847,16 @@ grace = "1d"
                         system: false,
                         user_home: None,
                     },
+                    &executable,
                 )
             };
             if job_first {
                 job().await.unwrap();
             }
-            assert_eq!(check(home, false).await.unwrap(), ExitCode::SUCCESS);
+            assert_eq!(
+                check(home, false, &executable).await.unwrap(),
+                ExitCode::SUCCESS
+            );
             if !job_first {
                 job().await.unwrap();
             }
@@ -9751,7 +9881,7 @@ grace = "1d"
     #[test]
     fn stop_names_the_elevated_prompt_on_windows_and_a_plain_command_elsewhere() {
         let home = Path::new("/home/example/pact");
-        let windows = stop_instructions(home, true);
+        let windows = stop_instructions(home, true, &std::env::current_exe().unwrap());
         assert!(
             windows.contains("schedule off") && windows.contains("elevated PowerShell prompt"),
             "{windows}"
@@ -9766,7 +9896,7 @@ grace = "1d"
             ),
             "the full path of this program: {windows}"
         );
-        let elsewhere = stop_instructions(home, false);
+        let elsewhere = stop_instructions(home, false, &std::env::current_exe().unwrap());
         assert!(
             elsewhere.contains("open-pact-client") && elsewhere.contains("schedule off"),
             "{elsewhere}"
@@ -9855,7 +9985,13 @@ grace = "1d"
         .await;
         let (capture, json) = json_capture();
 
-        let code = check_json(&fixture.home, false, json).await;
+        let code = check_json(
+            &fixture.home,
+            false,
+            &std::env::current_exe().unwrap(),
+            json,
+        )
+        .await;
 
         assert_eq!(code, ExitCode::SUCCESS);
         let report: Value = serde_json::from_str(&capture.text()).expect("one JSON document");
@@ -9890,7 +10026,13 @@ grace = "1d"
         .await;
         let (capture, json) = json_capture();
 
-        let code = check_json(&fixture.home, false, json).await;
+        let code = check_json(
+            &fixture.home,
+            false,
+            &std::env::current_exe().unwrap(),
+            json,
+        )
+        .await;
 
         assert_eq!(code, ExitCode::FAILURE);
         let report: Value = serde_json::from_str(&capture.text()).unwrap();
@@ -9904,7 +10046,13 @@ grace = "1d"
         let dir = tempfile::tempdir().unwrap();
         let (capture, json) = json_capture();
 
-        let code = check_json(&Home(dir.path().to_path_buf()), false, json).await;
+        let code = check_json(
+            &Home(dir.path().to_path_buf()),
+            false,
+            &std::env::current_exe().unwrap(),
+            json,
+        )
+        .await;
 
         assert_eq!(code, ExitCode::FAILURE);
         let report: Value = serde_json::from_str(&capture.text()).unwrap();
@@ -10105,9 +10253,12 @@ grace = "1d"
             &home,
             Some(&invitation),
             true,
-            true,
-            false,
-            Duration::from_millis(1),
+            JoinOptions {
+                insecure_dev: false,
+                executable: &std::env::current_exe().unwrap(),
+                no_wait: true,
+                poll_interval: Duration::from_millis(1),
+            },
             json,
         )
         .await;
@@ -10186,9 +10337,12 @@ grace = "1d"
             &Home(dir.path().to_path_buf()),
             Some(&invitation),
             true,
-            false,
-            false,
-            Duration::from_millis(1),
+            JoinOptions {
+                insecure_dev: false,
+                executable: &std::env::current_exe().unwrap(),
+                no_wait: false,
+                poll_interval: Duration::from_millis(1),
+            },
             json,
         )
         .await;
@@ -10227,7 +10381,14 @@ grace = "1d"
         );
 
         let code = json_out::scope(json, async {
-            after_approval(&fixture.home, false, true).await.unwrap()
+            after_approval(
+                &fixture.home,
+                false,
+                &std::env::current_exe().unwrap(),
+                true,
+            )
+            .await
+            .unwrap()
         })
         .await;
 
@@ -10449,9 +10610,12 @@ grace = "1d"
             &home,
             Some(&invitation),
             true,
-            true,
-            false,
-            Duration::from_millis(1),
+            JoinOptions {
+                insecure_dev: false,
+                executable: &std::env::current_exe().unwrap(),
+                no_wait: true,
+                poll_interval: Duration::from_millis(1),
+            },
             json_out::Json::new(std::io::stdout(), json_out::Answers::default()),
         )
         .await;

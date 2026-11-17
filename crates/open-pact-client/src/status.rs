@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -126,8 +127,13 @@ impl Options {
     }
 }
 
-pub(crate) async fn run(home: &Home, options: Options, insecure_dev: bool) -> Result<ExitCode> {
-    let mut report = collect(home, options.online, insecure_dev).await?;
+pub(crate) async fn run(
+    home: &Home,
+    options: Options,
+    insecure_dev: bool,
+    executable: &Path,
+) -> Result<ExitCode> {
+    let mut report = collect(home, options.online, insecure_dev, executable).await?;
     if options.online && home.file("enrolment.json").exists() {
         report.update = crate::update::latest_notice();
     }
@@ -140,13 +146,19 @@ pub(crate) async fn run(home: &Home, options: Options, insecure_dev: bool) -> Re
     Ok(ExitCode::from(report.exit_code))
 }
 
-async fn collect(home: &Home, online: bool, insecure_dev: bool) -> Result<Report> {
+async fn collect(
+    home: &Home,
+    online: bool,
+    insecure_dev: bool,
+    executable: &Path,
+) -> Result<Report> {
     collect_with(
         home,
         online,
         insecure_dev,
+        executable,
         Utc::now(),
-        crate::schedule::inspect_job,
+        |home, config| crate::schedule::inspect_job(home, config, executable),
     )
     .await
 }
@@ -155,6 +167,7 @@ async fn collect_with(
     home: &Home,
     online: bool,
     insecure_dev: bool,
+    executable: &Path,
     now: DateTime<Utc>,
     inspect_job: impl FnOnce(&Home, &DeviceConfig) -> Result<JobStatus>,
 ) -> Result<Report> {
@@ -374,7 +387,7 @@ async fn collect_with(
             }
         }
         if let Some(manifest) = &manifest {
-            match refresh(home, &enrolment, manifest, insecure_dev).await {
+            match refresh(home, &enrolment, manifest, insecure_dev, executable).await {
                 Ok(live) => {
                     if let Some(approval) = live.approval {
                         report.approval = ApprovalEvidence {
@@ -591,6 +604,7 @@ async fn refresh(
     enrolment: &Enrolment,
     manifest: &Manifest,
     insecure_dev: bool,
+    executable: &Path,
 ) -> Result<Live> {
     crate::check_scheme(&enrolment.gateway, insecure_dev)?;
     let device = crate::DeviceKey::load(&home.0)?;
@@ -654,6 +668,7 @@ async fn refresh(
             crate::schedule::vpn_up(
                 probe.address.as_str(),
                 probe.name.as_ref().map(|name| name.as_str()),
+                executable,
             )
             .await,
         )
