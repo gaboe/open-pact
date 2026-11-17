@@ -1597,7 +1597,7 @@ mod tests {
                 ("2026-10-12T09:00:00z", false),
                 ("2026-10-12t09:00:00Z", true),
                 ("2026-10-12 09:00:00Z", true),
-                // chrono read a leap second; the time crate has none, so it is refused.
+                // chrono read a leap second, and the validity check still does.
                 ("2026-10-12T23:59:60Z", true),
                 ("2026-02-30T00:00:00Z", false),
                 ("2026-10-12T09:00Z", false),
@@ -1614,8 +1614,25 @@ mod tests {
                 serde_json::to_value(m.body()).unwrap()["valid_from"],
                 "2026-10-01"
             );
+            // chrono's NaiveDate serde read white space around the numbers and the dashes.
+            for text in [
+                "2026-10-01 ",
+                " 2026-10-01",
+                "2026- 10- 01",
+                "2026 -10 -01",
+                "2026-10-01\t",
+                "2026-10-1 ",
+            ] {
+                let m = with_valid_from(&format!("\"{text}\"")).expect(text);
+                assert_eq!(
+                    serde_json::to_value(m.body()).unwrap()["valid_from"],
+                    "2026-10-01",
+                    "{text:?}"
+                );
+            }
             for (value, accepted) in [
                 ("\"2026-1-5\"", true),
+                ("\"2026-10-01x\"", false),
                 ("\"2026-02-30\"", false),
                 ("\"2026-10-01T00:00:00Z\"", false),
                 ("2026-10-01", false),

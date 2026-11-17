@@ -155,7 +155,7 @@ fn stamp(t: OffsetDateTime) -> String {
 }
 
 fn parse_since(text: &str) -> Result<OffsetDateTime, String> {
-    open_pact_core::timestamp::parse_rfc3339(text)
+    open_pact_core::timestamp::parse_relaxed(text)
         .ok_or_else(|| format!("not an RFC 3339 time: {text}"))
 }
 
@@ -1241,10 +1241,24 @@ mod timestamp_pins {
             ("2026-10-05T08:00:00", false),
             ("2026-10-05", false),
         ] {
+            assert_eq!(parse_since(text).is_ok(), ok, "{text}");
+        }
+    }
+
+    #[test]
+    fn since_keeps_a_leap_second_as_the_first_second_of_the_next_minute() {
+        assert_eq!(
+            stamp(parse_since("2016-12-31T23:59:60Z").unwrap()),
+            "2017-01-01T00:00:00Z"
+        );
+    }
+
+    #[test]
+    fn since_out_of_range_is_an_error_not_a_panic() {
+        for text in ["9999-12-31T23:59:59-23:59", "+10000-01-01T00:00:00Z"] {
             assert_eq!(
-                open_pact_core::timestamp::parse_rfc3339(text).is_some(),
-                ok,
-                "{text}"
+                parse_since(text),
+                Err(format!("not an RFC 3339 time: {text}"))
             );
         }
     }

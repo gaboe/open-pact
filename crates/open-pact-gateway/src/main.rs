@@ -3511,6 +3511,73 @@ grace = "1d"
         assert!(!parse(&[]).prints_json());
     }
 
+    /// `claims list --since` read these spellings while clap used chrono's `FromStr`.
+    fn since_reads(text: &str, expected: &str) {
+        let cli = Cli::try_parse_from(["open-pact-gateway", "claims", "list", "--since", text])
+            .unwrap_or_else(|error| panic!("{text:?}: {error}"));
+        let Some(Command::Claims {
+            command: results::Command::List {
+                since: Some(since), ..
+            },
+        }) = cli.command
+        else {
+            panic!("claims list command")
+        };
+        assert_eq!(
+            open_pact_core::timestamp::rfc3339_auto(since),
+            expected,
+            "{text:?}"
+        );
+    }
+
+    macro_rules! since_spellings {
+        ($($name:ident: $text:expr => $expected:expr;)*) => {
+            $(
+                #[test]
+                fn $name() {
+                    since_reads($text, $expected);
+                }
+            )*
+        };
+    }
+
+    since_spellings! {
+        since_reads_rfc3339_with_z: "2026-10-12T09:00:00Z" => "2026-10-12T09:00:00Z";
+        since_reads_an_offset_without_a_colon: "2026-10-12T09:00:00+0000" => "2026-10-12T09:00:00Z";
+        since_reads_an_offset_with_a_space: "2026-10-12T09:00:00 +00 00" => "2026-10-12T09:00:00Z";
+        since_reads_a_utc_suffix_after_a_space: "2026-10-12 09:00:00 UTC" => "2026-10-12T09:00:00Z";
+        since_reads_a_lowercase_utc_suffix: "2026-10-12 09:00:00 utc" => "2026-10-12T09:00:00Z";
+        since_reads_one_digit_fields: "2026-1-2T3:4:5Z" => "2026-01-02T03:04:05Z";
+        since_reads_trailing_white_space: "2026-10-12T09:00:00Z " => "2026-10-12T09:00:00Z";
+        since_reads_white_space_between_the_parts: "2026 - 10 - 12T 09 : 00 : 00 Z" => "2026-10-12T09:00:00Z";
+        since_reads_a_signed_year: "+2026-10-12T09:00:00Z" => "2026-10-12T09:00:00Z";
+        since_reads_a_unicode_minus_in_the_offset: "2026-10-12T09:00:00\u{2212}02:00" => "2026-10-12T11:00:00Z";
+        since_reads_a_space_before_the_time: "2026-10-12 09:00:00+02:00" => "2026-10-12T07:00:00Z";
+        since_reads_a_lowercase_t_and_z: "2026-10-12t09:00:00z" => "2026-10-12T09:00:00Z";
+        since_reads_a_fraction: "2026-10-12T09:00:00.5+02:00" => "2026-10-12T07:00:00.500Z";
+        since_reads_a_leap_second: "2016-12-31T23:59:60Z" => "2017-01-01T00:00:00Z";
+    }
+
+    #[test]
+    fn since_refuses_text_chrono_refused_and_instants_past_the_range_of_time() {
+        for text in [
+            "2026-10-12",
+            "2026-10-12T09:00:00",
+            "2026-10-12T09:00:00+24:00",
+            "9999-12-31T23:59:59-23:59",
+            "+10000-01-01T00:00:00Z",
+        ] {
+            let error =
+                Cli::try_parse_from(["open-pact-gateway", "claims", "list", "--since", text])
+                    .map(|_| ())
+                    .unwrap_err();
+            assert!(
+                error.to_string().contains("not an RFC 3339 time"),
+                "{text}: {error}"
+            );
+        }
+    }
+
     #[tokio::test]
     #[ignore = "needs TEST_DATABASE_URL and LOG_ORIGIN"]
     async fn invite_json_prints_one_document_and_nothing_else() {
