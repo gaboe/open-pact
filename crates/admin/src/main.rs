@@ -1484,6 +1484,9 @@ fn main() {
         return;
     }
     runner::tool_path();
+    manifest::load_builtin_texts(&runner::client::cli_candidates(
+        std::env::current_exe().ok().as_deref(),
+    ));
     let settings = Settings::load();
     launch("open-pact admin", 1360., 860., move |window, cx| {
         cx.new(|cx| {
@@ -1503,8 +1506,23 @@ fn main() {
     });
 }
 
+/// The default texts a snapshot scene uses when no CLI is installed. The text is a placeholder,
+/// so the scenes do not carry the real text of the checks.
+#[cfg(all(feature = "snapshot", target_os = "macos"))]
+const SNAPSHOT_BUILTIN_TEXTS: &str = r#"[
+  {"check": "builtin:disk_encryption@1", "id": "disk_encryption", "about": "Snapshot placeholder text."},
+  {"check": "builtin:firewall@1", "id": "firewall", "about": "Snapshot placeholder text."},
+  {"check": "builtin:screen_lock@1", "id": "screen_lock", "about": "Snapshot placeholder text."}
+]"#;
+
 #[cfg(all(feature = "snapshot", target_os = "macos"))]
 fn snapshots(output: PathBuf) {
+    let programs = runner::client::cli_candidates(std::env::current_exe().ok().as_deref());
+    if !manifest::load_builtin_texts(&programs) {
+        let texts = manifest::parse_builtin_texts(SNAPSHOT_BUILTIN_TEXTS)
+            .expect("the snapshot placeholder texts are valid JSON");
+        manifest::set_builtin_texts(texts);
+    }
     for (name, screen, form, dialog) in [
         ("admin-setup", Screen::Setup, true, None),
         ("admin-h-settings", Screen::Setup, true, None),

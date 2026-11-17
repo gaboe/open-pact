@@ -2,8 +2,13 @@
 //! changes one value and prints the document again, so comments and order stay as written.
 use crate::admin::CheckError;
 use crate::text::humanize;
+use crate::{Runner, args};
 use chrono::{Datelike, NaiveDate};
+use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
+use std::sync::OnceLock;
+use std::time::Duration;
 use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, TableLike, Value};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -705,6 +710,60 @@ pub fn by_group<T>(
     sections
 }
 
+/// The default text of each built-in check, keyed by its check name, `builtin:<id>@<version>`.
+/// The CLI gives these texts, so the app keeps no copy.
+pub type BuiltinTexts = BTreeMap<String, String>;
+
+/// The default texts of this run. Empty until `load_builtin_texts` or `set_builtin_texts` sets them.
+static BUILTIN_TEXTS: OnceLock<BuiltinTexts> = OnceLock::new();
+
+#[derive(Deserialize)]
+struct BuiltinText {
+    check: String,
+    about: String,
+}
+
+/// Reads what `manifest builtins --json` printed: one `{"check", "id", "about"}` per built-in check.
+/// A check whose text is empty has no default.
+pub fn parse_builtin_texts(text: &str) -> Result<BuiltinTexts, String> {
+    let texts: Vec<BuiltinText> = serde_json::from_str(text)
+        .map_err(|error| format!("Invalid JSON from open-pact-client: {error}"))?;
+    Ok(texts
+        .into_iter()
+        .filter(|text| !text.about.is_empty())
+        .map(|text| (text.check, text.about))
+        .collect())
+}
+
+/// Asks the CLIs in order for the default texts and keeps them from the first one that answers.
+/// A CLI that fails, or is too old to know the command, is skipped. Returns false when none
+/// answers, and then no check has a default text.
+pub fn load_builtin_texts(programs: &[PathBuf]) -> bool {
+    let runner = Runner::default().with_timeout(Duration::from_secs(5));
+    let words = args(&["manifest", "builtins", "--json"]);
+    let texts = programs.iter().find_map(|program| {
+        let log = runner.run(program, &words).ok()?;
+        parse_builtin_texts(&log.stdout).ok()
+    });
+    match texts {
+        Some(texts) => {
+            let _ = BUILTIN_TEXTS.set(texts);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Sets the default texts without a CLI, for snapshot scenes. Only the first set counts.
+pub fn set_builtin_texts(texts: BuiltinTexts) {
+    let _ = BUILTIN_TEXTS.set(texts);
+}
+
+/// The default text of a built-in check, or None when the CLI gave none.
+pub fn default_about(check: &str) -> Option<&'static str> {
+    BUILTIN_TEXTS.get()?.get(check).map(String::as_str)
+}
+
 /// A built-in check the client can run.
 pub struct Builtin {
     pub id: &'static str,
@@ -719,8 +778,6 @@ pub struct Builtin {
     /// What a number limit counts, as a noun, for the panel heading.
     pub noun: &'static str,
     pub group: Group,
-    /// The risk the check covers, then what the client reads on each OS where it runs.
-    pub about: &'static str,
 }
 
 const INTEGER_3650: &str = "{ integer = { min = 0, max = 3650 } }";
@@ -741,15 +798,6 @@ pub const BUILTINS: [Builtin; 27] = [
         max: true,
         noun: "",
         group: Group::DiskAndStartup,
-        about: "A lost or stolen device gives away its files when the disk is not \
-            encrypted. On macOS the client runs fdesetup status to see whether \
-            FileVault is on, and on Windows it reads the BitLocker protection state \
-            of the system drive. On Linux it runs lsblk -s and counts a disk as \
-            encrypted only when every path from it to its physical devices crosses \
-            an active encryption layer; it checks each writable, non-removable disk \
-            that is mounted or used as swap, and skips the boot mounts /boot, \
-            /boot/efi and /efi, loop, optical and RAM-backed devices, and \
-            non-persistent filesystems such as tmpfs and overlay.",
     },
     Builtin {
         id: "firewall",
@@ -761,11 +809,6 @@ pub const BUILTINS: [Builtin; 27] = [
         max: true,
         noun: "",
         group: Group::MalwareAndNetwork,
-        about: "A device without a firewall accepts network connections that it should \
-            refuse. On macOS the client runs socketfilterfw --getglobalstate. On \
-            Windows it reads the Domain, Private and Public profiles with \
-            Get-NetFirewallProfile (all three must be on), and on Linux it asks \
-            firewalld (firewall-cmd --state) and reads the UFW configuration.",
     },
     Builtin {
         id: "screen_lock",
@@ -777,13 +820,6 @@ pub const BUILTINS: [Builtin; 27] = [
         max: true,
         noun: "",
         group: Group::SignIn,
-        about: "A device that stays unlocked gives access to anyone nearby. On macOS \
-            the client runs sysadminctl -screenLock status and reads only the password \
-            delay that applies after the screen saver starts or the display turns off; \
-            on Windows it reads the machine inactivity limit, else the secure screen \
-            saver of each signed-in user; on Linux it reads the GNOME settings with \
-            gsettings or the KDE kscreenlockerrc file. The macOS result does not show \
-            the idle time that starts the screen saver or turns off the display.",
     },
     Builtin {
         id: "screen_lock",
@@ -795,13 +831,6 @@ pub const BUILTINS: [Builtin; 27] = [
         max: true,
         noun: "time before the lock",
         group: Group::SignIn,
-        about: "A device that stays unlocked gives access to anyone nearby. The client \
-            reports whole minutes, or none when the screen never locks. On macOS it \
-            adds the password delay from sysadminctl -screenLock status to the shorter of \
-            the screen saver idle time and the display sleep time from pmset, rounded up \
-            to whole minutes; on Windows it reads the machine inactivity limit, \
-            else the secure screen saver of each signed-in user; on Linux it reads the \
-            GNOME settings with gsettings or the KDE kscreenlockerrc file.",
     },
     Builtin {
         id: "os_patch_age_days",
@@ -813,12 +842,6 @@ pub const BUILTINS: [Builtin; 27] = [
         max: true,
         noun: "last OS update",
         group: Group::Updates,
-        about: "A device that has not been updated for a long time lacks recent security \
-            fixes. On macOS the client reads the newest macOS entry in \
-            /Library/Receipts/InstallHistory.plist. On Windows it reads the install \
-            date of the newest cumulative update package, and on Linux the last full \
-            upgrade in the apt history or dnf history, counted only when no security \
-            update is waiting.",
     },
     Builtin {
         id: "os_supported",
@@ -830,12 +853,6 @@ pub const BUILTINS: [Builtin; 27] = [
         max: true,
         noun: "",
         group: Group::Updates,
-        about: "An OS that no longer gets vendor updates collects security holes that \
-            nobody fixes. The client compares the OS version with end-of-support \
-            dates built into it. On macOS it runs sw_vers (the latest three major \
-            versions count as supported), on Windows it reads the build, edition and \
-            version from the registry, and on Linux it reads /etc/os-release (only \
-            Ubuntu and Fedora are known, other distributions report unknown).",
     },
     Builtin {
         id: "os_auto_updates",
@@ -847,12 +864,6 @@ pub const BUILTINS: [Builtin; 27] = [
         max: true,
         noun: "",
         group: Group::Updates,
-        about: "Updates that need a manual click often wait for weeks. On macOS the \
-            client reads ConfigDataInstall and CriticalUpdateInstall in the \
-            SoftwareUpdate preferences. On Windows it reads the Windows Update mode, \
-            the pause state and the NoAutoUpdate policy, and on Linux the apt \
-            unattended-upgrade settings and the apt-daily-upgrade or dnf-automatic \
-            timer.",
     },
     Builtin {
         id: "antimalware_active",
@@ -864,12 +875,6 @@ pub const BUILTINS: [Builtin; 27] = [
         max: true,
         noun: "",
         group: Group::MalwareAndNetwork,
-        about: "A device with no working antimalware program has no defence against \
-            known malware. On macOS the client checks that the XProtect files exist \
-            and that its scan service is registered and not disabled in launchctl. \
-            On Windows it asks Windows Security Center for an antivirus product that \
-            is on (else it reads the Defender status), and on Linux it checks \
-            whether the ClamAV service clamav-daemon or clamd@scan is active.",
     },
     Builtin {
         id: "antimalware_realtime",
@@ -881,11 +886,6 @@ pub const BUILTINS: [Builtin; 27] = [
         max: true,
         noun: "",
         group: Group::MalwareAndNetwork,
-        about: "Without real-time scanning, malware is found only when someone starts a \
-            scan. On macOS the client gives the same result as Antimalware active \
-            (the XProtect check). On Windows it reads RealTimeProtectionEnabled from \
-            Microsoft Defender, and on Linux it checks whether the ClamAV on-access \
-            scanner clamonacc is running.",
     },
     Builtin {
         id: "antimalware_signature_age_days",
@@ -897,11 +897,6 @@ pub const BUILTINS: [Builtin; 27] = [
         max: true,
         noun: "signature age",
         group: Group::MalwareAndNetwork,
-        about: "Old signatures cannot spot new malware. On macOS the client takes the \
-            age of the installed XProtect version from the install history. On \
-            Windows it reads AntivirusSignatureLastUpdated from Microsoft Defender, \
-            and on Linux the date in the header of the ClamAV daily.cvd or daily.cld \
-            database.",
     },
     Builtin {
         id: "antimalware_full_scan_age_days",
@@ -913,10 +908,6 @@ pub const BUILTINS: [Builtin; 27] = [
         max: true,
         noun: "last full scan",
         group: Group::MalwareAndNetwork,
-        about: "A full scan can find malware that real-time protection missed. On \
-            Windows the client reads FullScanEndTime from Microsoft Defender. On \
-            macOS it reports n/a and on Linux it reports unknown, because the client \
-            has no scan history to read there.",
     },
     Builtin {
         id: "antimalware_active_threats",
@@ -928,10 +919,6 @@ pub const BUILTINS: [Builtin; 27] = [
         max: true,
         noun: "active threats",
         group: Group::MalwareAndNetwork,
-        about: "A threat that the antimalware program found and did not remove is still \
-            a risk. On Windows the client counts the Microsoft Defender threats \
-            marked active (Get-MpThreat). On macOS it reports n/a and on Linux it \
-            reports unknown, because the client has no threat list to read there.",
     },
     Builtin {
         id: "preboot_auth",
@@ -943,12 +930,6 @@ pub const BUILTINS: [Builtin; 27] = [
         max: true,
         noun: "",
         group: Group::DiskAndStartup,
-        about: "A disk that unlocks by itself protects nothing when someone else holds \
-            the device, so a secret should be needed before the disk unlocks. On \
-            macOS the client reads the FileVault state with fdesetup. On Windows it \
-            lists the BitLocker key protectors of the system drive (a PIN or \
-            passphrase counts, TPM alone does not), and on Linux it reads \
-            /etc/crypttab and the LUKS key slots with cryptsetup.",
     },
     Builtin {
         id: "password_min_length",
@@ -960,11 +941,6 @@ pub const BUILTINS: [Builtin; 27] = [
         max: false,
         noun: "password length",
         group: Group::SignIn,
-        about: "Short passwords are easy to guess. On macOS the client runs pwpolicy \
-            getaccountpolicies and takes the longest length rule. On Windows it \
-            reads the minimum password length of the local account database (a \
-            domain policy is not read), and on Linux it reads minlen from \
-            /etc/security/pwquality.conf and the files in pwquality.conf.d.",
     },
     Builtin {
         id: "password_set",
@@ -976,10 +952,6 @@ pub const BUILTINS: [Builtin; 27] = [
         max: true,
         noun: "",
         group: Group::SignIn,
-        about: "An account with no password lets anyone who holds the device sign in. \
-            The client has no reader for this setting yet, so it reports unknown on \
-            macOS, Windows and Linux. Use Password policy to ask for a minimum \
-            length instead.",
     },
     Builtin {
         id: "auto_login",
@@ -991,11 +963,6 @@ pub const BUILTINS: [Builtin; 27] = [
         max: true,
         noun: "",
         group: Group::SignIn,
-        about: "Automatic login lets anyone who starts the device reach the user's files \
-            without a password. On macOS the client reads autoLoginUser in the login \
-            window preferences. On Windows it reads AutoAdminLogon in the Winlogon \
-            registry key, and on Linux it reads the GDM, SDDM and LightDM \
-            configuration files.",
     },
     Builtin {
         id: "secure_boot",
@@ -1007,10 +974,6 @@ pub const BUILTINS: [Builtin; 27] = [
         max: true,
         noun: "",
         group: Group::DiskAndStartup,
-        about: "Without Secure Boot, malware can replace the start-up software before \
-            the system loads. On Windows the client reads the UEFISecureBootEnabled \
-            value in the registry, and on Linux it runs mokutil --sb-state and falls \
-            back to the SecureBoot EFI variable. On macOS it always reports unknown.",
     },
     Builtin {
         id: "work_account",
@@ -1022,10 +985,6 @@ pub const BUILTINS: [Builtin; 27] = [
         max: true,
         noun: "",
         group: Group::Account,
-        about: "A work account with administrator rights lets malware change the system. \
-            On macOS the client checks whether the user is in the admin group. On \
-            Windows it checks the Administrators group in the user's token, and on \
-            Linux it checks the sudo, wheel and root groups.",
     },
     Builtin {
         id: "uptime_days",
@@ -1037,10 +996,6 @@ pub const BUILTINS: [Builtin; 27] = [
         max: true,
         noun: "uptime",
         group: Group::Uptime,
-        about: "A device that never restarts misses the updates that need a restart. On \
-            macOS the client reads kern.boottime with sysctl. On Windows it reads \
-            LastBootUpTime from Win32_OperatingSystem, and on Linux the first value \
-            in /proc/uptime.",
     },
     Builtin {
         id: "web_protection",
@@ -1052,11 +1007,6 @@ pub const BUILTINS: [Builtin; 27] = [
         max: true,
         noun: "",
         group: Group::MalwareAndNetwork,
-        about: "A browser that does not block known bad sites lets phishing and malware \
-            pages load. The client reads the safe browsing setting of Chrome, Edge, \
-            Brave and Firefox on macOS and Windows, and of Chrome, Chromium and \
-            Firefox on Linux, policy first and then the user's profile. On Windows \
-            it also reads the Windows SmartScreen setting; Safari is not read.",
     },
     Builtin {
         id: "log_oldest_record_days",
@@ -1068,11 +1018,6 @@ pub const BUILTINS: [Builtin; 27] = [
         max: false,
         noun: "oldest log record",
         group: Group::LogsAndAudit,
-        about: "A short log history hides what happened before an incident. On Windows \
-            the client reads the age of the oldest event in the Security and the \
-            System log and keeps the smaller one (this needs administrator rights), \
-            and on Linux it reads the oldest entry of the system journal with \
-            journalctl --system. macOS reports n/a.",
     },
     Builtin {
         id: "log_cleared",
@@ -1084,11 +1029,6 @@ pub const BUILTINS: [Builtin; 27] = [
         max: true,
         noun: "",
         group: Group::LogsAndAudit,
-        about: "An attacker who clears the event log hides what was done. On Windows the \
-            client reads the newest clear event (event 1102 in the Security log, \
-            event 104 in the System log) and reports its time, or none when no such \
-            event exists; this needs administrator rights. macOS and Linux report \
-            n/a.",
     },
     Builtin {
         id: "process_audit",
@@ -1100,11 +1040,6 @@ pub const BUILTINS: [Builtin; 27] = [
         max: true,
         noun: "",
         group: Group::LogsAndAudit,
-        about: "Windows writes a log entry each time a program starts, so after an \
-            incident you can see what ran. The client reads the Process Creation \
-            audit policy. The check is on only when the entry also includes the \
-            command line; it needs administrator rights, and macOS and Linux report \
-            n/a.",
     },
     Builtin {
         id: "remote_wipe",
@@ -1116,10 +1051,6 @@ pub const BUILTINS: [Builtin; 27] = [
         max: true,
         noun: "",
         group: Group::LostDevice,
-        about: "A lost device can be erased from a distance only when remote management \
-            is set up. On macOS the client runs system_profiler to see whether \
-            Activation Lock (Find My Mac) is on. Windows and Linux report n/a, \
-            because the client reads no remote erase setting there.",
     },
     Builtin {
         id: "powershell_logging",
@@ -1131,10 +1062,6 @@ pub const BUILTINS: [Builtin; 27] = [
         max: true,
         noun: "",
         group: Group::LogsAndAudit,
-        about: "PowerShell scripts are a common way to run malware, so a record of them \
-            helps after an incident. On Windows the client reads the Script Block \
-            Logging policy (EnableScriptBlockLogging), the machine policy first and \
-            then the policy of each signed-in user. macOS and Linux report n/a.",
     },
     Builtin {
         id: "managed_repos_outside",
@@ -1146,12 +1073,6 @@ pub const BUILTINS: [Builtin; 27] = [
         max: true,
         noun: "repositories",
         group: Group::Repositories,
-        about: "Work code outside the agreed folders is harder to find and to protect. \
-            The client scans the user's home folder, down to 8 levels, for Git \
-            repositories whose remote matches the manifest patterns, and counts \
-            those outside the listed folders. It reads the Git configuration files \
-            and does not run git; a missing or old scan (over 48 hours) gives \
-            unknown.",
     },
     Builtin {
         id: "managed_repos_total",
@@ -1163,11 +1084,6 @@ pub const BUILTINS: [Builtin; 27] = [
         max: true,
         noun: "repositories",
         group: Group::Repositories,
-        about: "The count shows how much company code sits on the device. The client \
-            scans the user's home folder, down to 8 levels, for Git repositories \
-            whose remote matches the manifest patterns, and counts all of them. It \
-            reads the Git configuration files and does not run git; a missing or old \
-            scan (over 48 hours) gives unknown.",
     },
 ];
 
@@ -2398,4 +2314,32 @@ pub fn error_line(text: &str, error: &toml_edit::TomlError) -> usize {
     error.span().map_or(1, |span| {
         text[..span.start.min(text.len())].matches('\n').count() + 1
     })
+}
+
+#[cfg(test)]
+mod builtin_text_tests {
+    use super::parse_builtin_texts;
+
+    const FIXTURE: &str = r#"[
+  {"check": "builtin:firewall@1", "id": "firewall", "about": "A device without a firewall accepts connections."},
+  {"check": "builtin:screen_lock@2", "id": "screen_lock", "about": "A device that stays unlocked gives access to anyone nearby."},
+  {"check": "builtin:firewall@2", "id": "firewall", "about": ""}
+]"#;
+
+    #[test]
+    fn the_texts_are_keyed_by_check_and_an_empty_text_is_no_default() {
+        let texts = parse_builtin_texts(FIXTURE).unwrap();
+        assert_eq!(
+            texts.get("builtin:firewall@1").map(String::as_str),
+            Some("A device without a firewall accepts connections.")
+        );
+        assert_eq!(texts.len(), 2);
+        assert!(!texts.contains_key("builtin:firewall@2"));
+    }
+
+    #[test]
+    fn a_reply_that_is_not_the_list_is_an_error() {
+        assert!(parse_builtin_texts("{\"error\": \"unknown command\"}").is_err());
+        assert!(parse_builtin_texts("not json").is_err());
+    }
 }

@@ -391,30 +391,10 @@ fn a_schedule_change_across_a_syntax_error_still_forgets_the_pair() {
 }
 
 #[test]
-fn an_existing_screen_lock_check_explains_its_own_version() {
+fn an_existing_screen_lock_check_keeps_its_version() {
     let old = form(include_str!("../../../tests/fixtures/manifest.toml"));
-    let about = old.control("screen_lock").unwrap().builtin().unwrap();
-    assert_eq!(about.version, 1);
-    assert!(
-        about.about.contains("reads only the password delay"),
-        "{}",
-        about.about
-    );
-    assert!(
-        about.about.contains("does not show the idle time"),
-        "{}",
-        about.about
-    );
-    assert!(!about.about.contains("whole minutes"), "{}", about.about);
+    let check = old.control("screen_lock").unwrap().builtin().unwrap();
+    assert_eq!(check.version, 1);
     let (text, index) = manifest::add_control(NONE, "screen_lock").unwrap();
-    let new = form(&text).controls[index].builtin().unwrap();
-    assert_eq!(new.version, 2);
-    assert!(new.about.contains("whole minutes"), "{}", new.about);
-    assert!(
-        new.about
-            .contains("shorter of the screen saver idle time and the display sleep"),
-        "{}",
-        new.about
-    );
-    assert!(!new.about.contains("not the idle time"), "{}", new.about);
+    assert_eq!(form(&text).controls[index].builtin().unwrap().version, 2);
 }

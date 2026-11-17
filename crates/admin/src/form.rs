@@ -150,6 +150,8 @@ pub struct Panel {
     id: Option<Entity<InputState>>,
     reference: Entity<InputState>,
     description: Entity<TextareaState>,
+    /// The Description shows the editor. Otherwise it shows the text as read-only.
+    editing: bool,
     os: [OsInput; 3],
     /// A number field is open for this OS before any number is typed.
     opened: [bool; 3],
@@ -1043,6 +1045,144 @@ impl AppView {
             .position(|control| &control.id == id)
     }
 
+    fn selected_control(&self) -> Option<Control> {
+        let id = self.fv.selected.as_ref()?;
+        Form::parse(&self.draft).ok()?.control(id).cloned()
+    }
+
+    /// Opens the Description editor with the text the reader sees now.
+    fn start_description_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self
+            .selected_control()
+            .map(|control| description_or_default(&control))
+            .unwrap_or_default();
+        let Some(panel) = self.fv.panel.as_mut() else {
+            return;
+        };
+        panel.description.update(cx, |state, cx| {
+            state.set_value(text, window, cx);
+            state.focus(window, cx);
+        });
+        panel.editing = true;
+        cx.notify();
+    }
+
+    /// Writes the typed text to the draft. The default text writes an empty description. The
+    /// editor closes only when the draft took the text.
+    fn save_description(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(control), Some(index)) = (self.selected_control(), self.selected_index()) else {
+            return;
+        };
+        let Some(panel) = self.fv.panel.as_ref() else {
+            return;
+        };
+        let typed = panel.description.read(cx).value().trim().to_owned();
+        let value = stored_description(&typed, manifest::default_about(&control.check));
+        let result = manifest::set_control_text(&self.draft, index, "description", value);
+        let saved = result.is_ok();
+        self.edit_form(result, Rebuild::No, window, cx);
+        if saved {
+            self.close_description_editor();
+        }
+        cx.notify();
+    }
+
+    fn cancel_description(&mut self, cx: &mut Context<Self>) {
+        self.close_description_editor();
+        cx.notify();
+    }
+
+    /// Puts the default text in the editor. Save writes it.
+    fn reset_description(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(text) = self
+            .selected_control()
+            .and_then(|control| manifest::default_about(&control.check))
+        else {
+            return;
+        };
+        if let Some(panel) = self.fv.panel.as_ref() {
+            panel
+                .description
+                .update(cx, |state, cx| state.set_value(text, window, cx));
+        }
+        cx.notify();
+    }
+
+    fn close_description_editor(&mut self) {
+        if let Some(panel) = self.fv.panel.as_mut() {
+            panel.editing = false;
+        }
+    }
+
+    /// The Description field: the text as read, with Edit, or the editor with Save, Cancel and,
+    /// for a built-in check with a default, Reset text.
+    fn description_field(&self, panel: &Panel, control: &Control, cx: &Context<Self>) -> Div {
+        if !panel.editing {
+            let text = description_or_default(control);
+            let shown = if text.is_empty() {
+                small("No description yet.")
+            } else {
+                div().text_size(px(14.)).text_color(rgb(INK_2)).child(text)
+            };
+            return column().gap(px(8.)).child(shown).child(
+                div().flex().child(
+                    Button::new("edit-description")
+                        .label("Edit")
+                        .ghost()
+                        .small()
+                        .disabled(self.busy)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.start_description_edit(window, cx)
+                        })),
+                ),
+            );
+        }
+        let default = manifest::default_about(&control.check);
+        let holds_default =
+            default.is_some_and(|text| panel.description.read(cx).value().trim() == text);
+        column()
+            .gap(px(8.))
+            .child(Textarea::new(&panel.description).disabled(self.busy))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap(px(8.))
+                    .child(
+                        Button::new("save-description")
+                            .label("Save")
+                            .primary()
+                            .small()
+                            .disabled(self.busy)
+                            .on_click(
+                                cx.listener(|this, _, window, cx| {
+                                    this.save_description(window, cx)
+                                }),
+                            ),
+                    )
+                    .child(
+                        Button::new("cancel-description")
+                            .label("Cancel")
+                            .ghost()
+                            .small()
+                            .disabled(self.busy)
+                            .on_click(cx.listener(|this, _, _, cx| this.cancel_description(cx))),
+                    )
+                    .children(default.map(|_| {
+                        Button::new("reset-description")
+                            .label("Reset text")
+                            .ghost()
+                            .small()
+                            .disabled(self.busy || holds_default)
+                            .on_click(
+                                cx.listener(|this, _, window, cx| {
+                                    this.reset_description(window, cx)
+                                }),
+                            )
+                    })),
+            )
+    }
+
     fn build_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.fv.panel_subs.clear();
         self.fv.panel = None;
@@ -1115,31 +1255,9 @@ impl AppView {
         self.fv.panel_subs.push(reference_subscription);
         let description = cx.new(|cx| {
             TextareaState::new(window, cx)
-                .rows(2)
+                .rows(6)
                 .default_value(description_or_default(&control))
         });
-        let default = control.builtin().map(|known| known.about);
-        let description_subscription = cx.subscribe_in(
-            &description,
-            window,
-            move |this, state, event: &InputEvent, window, cx| {
-                if matches!(event, InputEvent::Change) {
-                    let Some(index) = this.selected_index() else {
-                        return;
-                    };
-                    let value = state.read(cx).value().trim().to_owned();
-                    let value = if default == Some(value.as_str()) {
-                        ""
-                    } else {
-                        value.as_str()
-                    };
-                    let result =
-                        manifest::set_control_text(&this.draft, index, "description", value);
-                    this.edit_form(result, Rebuild::No, window, cx);
-                }
-            },
-        );
-        self.fv.panel_subs.push(description_subscription);
         let grace = self.duration_field(
             DurationSpec {
                 raw: control.grace.clone(),
@@ -1162,6 +1280,7 @@ impl AppView {
             id,
             reference,
             description,
+            editing: false,
             os,
             opened: [false; 3],
             grace,
@@ -2068,13 +2187,19 @@ impl AppView {
                                 .text_ellipsis()
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .whitespace_nowrap()
-                                .when_some(control.builtin(), |name, known| {
-                                    name.tooltip(move |window, cx| {
-                                        gpui_component::tooltip::Tooltip::new(known.about)
-                                            .w(px(340.))
-                                            .build(window, cx)
-                                    })
-                                })
+                                .when_some(
+                                    control
+                                        .builtin()
+                                        .map(|_| description_or_default(control))
+                                        .filter(|text| !text.is_empty()),
+                                    |name, text| {
+                                        name.tooltip(move |window, cx| {
+                                            gpui_component::tooltip::Tooltip::new(text.clone())
+                                                .w(px(340.))
+                                                .build(window, cx)
+                                        })
+                                    },
+                                )
                                 .child(control.name()),
                         ),
                 );
@@ -2529,7 +2654,7 @@ impl AppView {
             ))
             .child(field(
                 "Description",
-                div().child(Textarea::new(&panel.description).disabled(self.busy)),
+                self.description_field(panel, control, cx),
                 None,
             ))
             .child(field(
@@ -2733,15 +2858,24 @@ fn panel_switch(selected: Option<&str>, requested: Option<&str>, blocked: bool) 
 /// The check's description, or the open-pact text for a built-in check that has none, so the
 /// admin edits one text that the device user also reads.
 fn description_or_default(control: &manifest::Control) -> String {
-    match control.builtin() {
-        Some(known) if control.description.is_empty() => known.about.to_owned(),
+    match manifest::default_about(&control.check) {
+        Some(default) if control.description.is_empty() => default.to_owned(),
         _ => control.description.clone(),
     }
 }
 
+/// The description to write for a typed text. The default text writes an empty description, so
+/// the manifest keeps no copy of the text that the CLI gives.
+fn stored_description<'a>(text: &'a str, default: Option<&'a str>) -> &'a str {
+    if default == Some(text) { "" } else { text }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{PanelSwitch, PopoverPlace, ViewSwitch, panel_switch, popover_place, view_switch};
+    use super::{
+        PanelSwitch, PopoverPlace, ViewSwitch, panel_switch, popover_place, stored_description,
+        view_switch,
+    };
 
     fn place(above: bool, height: f32) -> PopoverPlace {
         PopoverPlace { above, height }
@@ -2757,6 +2891,17 @@ mod tests {
     fn the_add_check_options_open_above_when_the_window_ends_just_below_the_button() {
         assert_eq!(popover_place(860., 650.), place(true, 630.));
         assert_eq!(popover_place(860., 700.), place(true, 680.));
+    }
+
+    #[test]
+    fn saving_the_default_text_writes_an_empty_description() {
+        let default = Some("The default text.");
+        assert_eq!(stored_description("The default text.", default), "");
+        assert_eq!(
+            stored_description("Our own text.", default),
+            "Our own text."
+        );
+        assert_eq!(stored_description("Our own text.", None), "Our own text.");
     }
 
     #[test]

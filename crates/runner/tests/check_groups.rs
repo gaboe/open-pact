@@ -1,4 +1,4 @@
-//! The groups and descriptions of the built-in checks. A group is display only: the manifest keeps
+//! The groups of the built-in checks. A group is display only: the manifest keeps
 //! its own order.
 use runner::manifest::{self, BUILTINS, Filter, Form, Group};
 
@@ -9,17 +9,9 @@ fn group_of(id: &str) -> Group {
 }
 
 #[test]
-fn every_built_in_check_has_a_group_and_a_short_description() {
+fn every_built_in_check_has_a_group() {
     for known in &BUILTINS {
         assert_ne!(known.group, Group::Other, "{} is built in", known.id);
-        let sentences = known.about.split(". ").count();
-        assert!(
-            (2..=3).contains(&sentences),
-            "{} has {sentences} sentences",
-            known.id
-        );
-        assert!(known.about.ends_with('.'), "{}", known.id);
-        assert!(!known.about.contains("  "), "{}", known.id);
     }
 }
 
