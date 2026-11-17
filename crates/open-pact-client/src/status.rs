@@ -4,7 +4,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use clap::Args;
-use open_pact_core::{DeviceStatus, Manifest, ManifestHash, SendPolicy, verify_claim};
+use open_pact_core::{DeviceStatus, Manifest, ManifestHash, verify_claim};
 use serde::{Deserialize, Serialize};
 
 use crate::device_config::DeviceConfig;
@@ -321,7 +321,7 @@ async fn collect_with(
             .body()
             .schedule
             .as_ref()
-            .is_some_and(|schedule| matches!(schedule.policy, SendPolicy::Vpn { .. }))
+            .is_some_and(|schedule| schedule.probe().is_some())
         {
             report.schedule.vpn = if tick_damaged {
                 "unknown; report-state.json is damaged".into()
@@ -644,12 +644,19 @@ async fn refresh(
     } else {
         None
     };
-    let vpn = if let Some(open_pact_core::Schedule {
-        policy: SendPolicy::Vpn { probe, name },
-        ..
-    }) = &manifest.body().schedule
+    let vpn = if let Some(probe) = manifest
+        .body()
+        .schedule
+        .as_ref()
+        .and_then(open_pact_core::Schedule::probe)
     {
-        Some(crate::schedule::vpn_up(probe.as_str(), name.as_ref().map(|name| name.as_str())).await)
+        Some(
+            crate::schedule::vpn_up(
+                probe.address.as_str(),
+                probe.name.as_ref().map(|name| name.as_str()),
+            )
+            .await,
+        )
     } else {
         None
     };

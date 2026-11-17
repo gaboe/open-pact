@@ -1314,7 +1314,7 @@ fn write_summary(
                     ""
                 )?;
             }
-            if let Some(why) = &c.rationale {
+            if let Some(why) = &c.description {
                 writeln!(output, "    {:<width$}  why: {why}", "")?;
             }
             writeln!(output, "    {:<width$}  reports: {}", "", c.output)?;
@@ -1549,11 +1549,10 @@ fn setup_questions(
     let mut run_as = context.current.run_as;
     if let Some(schedule) = &context.manifest.body().schedule {
         writeln!(output, "  {schedule}")?;
-        let question = match schedule.policy {
-            open_pact_core::SendPolicy::Vpn { .. } => {
-                "Send claims automatically while on the company VPN?"
-            }
-            open_pact_core::SendPolicy::Always => "Send claims automatically as the manifest says?",
+        let question = if schedule.probe().is_some() {
+            "Send claims automatically while on the company VPN?"
+        } else {
+            "Send claims automatically as the manifest says?"
         };
         auto_send = confirm_yes_by_default_from(question, input, output)?;
         if auto_send && context.os == Os::Windows {
@@ -4160,7 +4159,7 @@ async fn join_preview(
                 id: control.id.clone(),
                 title: control_title(&control.id),
                 requirement: requirement_text(control, os),
-                rationale: control.rationale.clone(),
+                rationale: control.description.clone(),
             })
             .collect(),
         disclosed_metadata: body
@@ -6847,18 +6846,22 @@ mod tests {
         format!("{}\n{table}\n", &toml[..toml.find("\n[schedule]").unwrap()])
     }
 
-    fn every_55_minutes(policy: open_pact_core::SendPolicy) -> open_pact_core::Schedule {
-        open_pact_core::Schedule {
-            policy,
-            interval: open_pact_core::Interval::try_from("55m".to_owned()).unwrap(),
-        }
+    fn every_55_minutes() -> open_pact_core::Interval {
+        open_pact_core::Interval::try_from("55m".to_owned()).unwrap()
+    }
+
+    fn always_every_55_minutes() -> open_pact_core::Schedule {
+        open_pact_core::Schedule::legacy_always(every_55_minutes())
     }
 
     fn vpn_schedule(probe: &str) -> open_pact_core::Schedule {
-        every_55_minutes(open_pact_core::SendPolicy::Vpn {
-            probe: open_pact_core::ProbeAddress::try_from(probe.to_owned()).unwrap(),
-            name: None,
-        })
+        open_pact_core::Schedule::legacy_vpn(
+            open_pact_core::Probe {
+                address: open_pact_core::ProbeAddress::try_from(probe.to_owned()).unwrap(),
+                name: None,
+            },
+            every_55_minutes(),
+        )
     }
 
     /// An address that accepts connections while the listener lives.
@@ -8999,20 +9002,14 @@ grace = "1d"
     #[tokio::test]
     async fn a_scheduled_tick_under_always_sends_without_a_probe() {
         let fixture = scheduled_fixture(None, unchanged, grown_checkpoint).await;
-        tick_under(
-            &fixture,
-            &every_55_minutes(open_pact_core::SendPolicy::Always),
-        )
-        .await
-        .unwrap();
+        tick_under(&fixture, &always_every_55_minutes())
+            .await
+            .unwrap();
         assert_eq!(claim_posts(&fixture), 1);
         assert!(schedule_state(&fixture)["last_success"].is_number());
-        tick_under(
-            &fixture,
-            &every_55_minutes(open_pact_core::SendPolicy::Always),
-        )
-        .await
-        .unwrap();
+        tick_under(&fixture, &always_every_55_minutes())
+            .await
+            .unwrap();
         assert_eq!(claim_posts(&fixture), 1, "the interval has not passed");
     }
 

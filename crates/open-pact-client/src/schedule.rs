@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::Subcommand;
-use open_pact_core::{ManifestHash, ProbeName, SendPolicy};
+use open_pact_core::{ManifestHash, Place, ProbeName, Schedule};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -1254,14 +1254,25 @@ fn validate_system_install(system: bool, os: open_pact_core::Os) -> Result<()> {
     Ok(())
 }
 
-/// Whether the policy lets the job send now. A policy without a VPN needs no probe.
-async fn may_send(policy: &SendPolicy) -> bool {
-    match policy {
-        SendPolicy::Vpn { probe, name } => {
-            vpn_up(probe.as_str(), name.as_ref().map(ProbeName::as_str)).await
+/// Where the device is now: on the VPN when the schedule has a probe and it answers.
+async fn place(schedule: &Schedule) -> Place {
+    match schedule.probe() {
+        Some(probe)
+            if vpn_up(
+                probe.address.as_str(),
+                probe.name.as_ref().map(ProbeName::as_str),
+            )
+            .await =>
+        {
+            Place::Vpn
         }
-        SendPolicy::Always => true,
+        _ => Place::Elsewhere,
     }
+}
+
+/// Whether the schedule lets the job send now. A schedule without a VPN part needs no probe.
+async fn may_send(schedule: &Schedule) -> bool {
+    schedule.may_send(place(schedule).await)
 }
 
 /// One scheduled run: note whether the policy lets the job send, collect the results, and send a
@@ -1300,9 +1311,10 @@ pub(crate) async fn tick_with_scan(
     read_events: impl FnOnce() -> checks::EventMarkerReads,
     scan: impl Future<Output = Result<()>>,
 ) -> Result<()> {
-    let policy = &authorization.schedule.policy;
+    let schedule = &authorization.schedule;
     let mut state: State = state_home.read_json(STATE)?.unwrap_or_default();
-    state.observe(may_send(policy).await);
+    let place = place(schedule).await;
+    state.observe(schedule.may_send(place));
     save(state_home, STATE, &state)?;
     // The scan can take long. It runs before the claim lock, which `check` and `accept` wait for.
     scan.await?;
@@ -1330,9 +1342,14 @@ pub(crate) async fn tick_with_scan(
     state.observe_compliance(&compliance);
     state.event_pending |= state.new_events(events);
     let now = chrono::Utc::now().timestamp();
-    if let Some(trigger) = state.due(now, authorization.schedule.interval.as_secs()) {
+    let due = schedule
+        .period(place)
+        .and_then(|interval| state.due(now, interval.as_secs()));
+    if let Some(trigger) = due {
         save(state_home, STATE, &state)?;
-        let outcome = prepared.send(home, async || may_send(policy).await).await?;
+        let outcome = prepared
+            .send(home, async || may_send(schedule).await)
+            .await?;
         note_outcome(home, &mut state, trigger, &outcome);
         state.record(&outcome, chrono::Utc::now().timestamp(), events, compliance);
     } else if !state.baseline().security_log_cleared || !state.baseline().antimalware_detection {
@@ -2445,18 +2462,14 @@ esac
         );
     }
 
-    fn vpn(probe: &str) -> SendPolicy {
-        SendPolicy::Vpn {
-            probe: open_pact_core::ProbeAddress::try_from(probe.to_owned()).unwrap(),
-            name: None,
-        }
-    }
-
-    fn every_55_minutes(policy: SendPolicy) -> open_pact_core::Schedule {
-        open_pact_core::Schedule {
-            policy,
-            interval: open_pact_core::Interval::try_from("55m".to_owned()).unwrap(),
-        }
+    fn every_55_minutes_on_the_vpn(probe: &str) -> open_pact_core::Schedule {
+        open_pact_core::Schedule::legacy_vpn(
+            open_pact_core::Probe {
+                address: open_pact_core::ProbeAddress::try_from(probe.to_owned()).unwrap(),
+                name: None,
+            },
+            open_pact_core::Interval::try_from("55m".to_owned()).unwrap(),
+        )
     }
 
     #[test]
@@ -3685,7 +3698,7 @@ Write-Output 'refused'
         enrolment.gateway = format!("http://{}", refused.local_addr().unwrap());
         home.write("enrolment.json", &serde_json::to_vec(&enrolment).unwrap())
             .unwrap();
-        let policy = every_55_minutes(vpn(&listener.local_addr().unwrap().to_string()));
+        let policy = every_55_minutes_on_the_vpn(&listener.local_addr().unwrap().to_string());
         save(
             &state_home,
             STATE,
