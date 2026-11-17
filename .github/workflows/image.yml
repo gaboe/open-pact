@@ -147,6 +147,7 @@ jobs:
     if: github.ref_type == 'tag'
     needs: [gateway, witness, rebuild]
     runs-on: ubuntu-latest
+    timeout-minutes: 75
     permissions:
       contents: write
     env:

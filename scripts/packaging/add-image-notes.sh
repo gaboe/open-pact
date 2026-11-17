@@ -5,8 +5,9 @@
 # publishes it.
 #
 # Needs GH_TOKEN, GH_REPO, TAG, GATEWAY_IMAGE, WITNESS_IMAGE, GATEWAY_DIGEST and
-# WITNESS_DIGEST. WAIT_ATTEMPTS (default 30) and WAIT_SECONDS (default 20) bound
-# the wait for the release.
+# WITNESS_DIGEST. WAIT_ATTEMPTS (default 180) and WAIT_SECONDS (default 20) bound
+# the wait for the release to one hour: client-release.yml creates it only after
+# every build, which took 12 minutes before the desktop jobs existed.
 set -euo pipefail
 
 : "${TAG:?TAG is required}"
@@ -14,7 +15,7 @@ set -euo pipefail
 : "${WITNESS_IMAGE:?WITNESS_IMAGE is required}"
 : "${GATEWAY_DIGEST:?GATEWAY_DIGEST is required}"
 : "${WITNESS_DIGEST:?WITNESS_DIGEST is required}"
-attempts=${WAIT_ATTEMPTS:-30}
+attempts=${WAIT_ATTEMPTS:-180}
 pause=${WAIT_SECONDS:-20}
 
 found=
