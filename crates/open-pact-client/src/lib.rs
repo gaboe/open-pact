@@ -55,6 +55,7 @@ mod host;
 mod json_out;
 mod locallog;
 mod manifest_check;
+pub mod release_verify;
 mod schedule;
 #[cfg(target_os = "macos")]
 mod secure_enclave;

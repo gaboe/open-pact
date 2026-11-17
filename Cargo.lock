@@ -1555,6 +1555,7 @@ dependencies = [
  "p256",
  "rcgen",
  "reqwest",
+ "ring",
  "rustls",
  "security-framework",
  "security-framework-sys",
