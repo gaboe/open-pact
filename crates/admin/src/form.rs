@@ -1904,7 +1904,15 @@ impl AppView {
                     .child(head("Grace", 52.))
                     .child(div().w(px(18.)).flex_none()),
             );
-        for index in visible {
+        let rows = listed(visible, |index| form.controls[*index].group());
+        for row in rows {
+            let index = match row {
+                Listed::Heading(group) => {
+                    table = table.child(group_heading(group, 0.));
+                    continue;
+                }
+                Listed::Item(index) => index,
+            };
             let control = &form.controls[index];
             let selected = self.fv.selected.as_deref() == Some(control.id.as_str());
             let id = control.id.clone();
@@ -1947,8 +1955,19 @@ impl AppView {
                         )
                         .child(
                             div()
+                                .id(("check-name", index))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .whitespace_nowrap()
+                                .when_some(
+                                    manifest::builtin(control.builtin_id()),
+                                    |name, known| {
+                                        name.tooltip(move |window, cx| {
+                                            gpui_component::tooltip::Tooltip::new(known.about)
+                                                .w(px(340.))
+                                                .build(window, cx)
+                                        })
+                                    },
+                                )
                                 .child(control.name()),
                         ),
                 )
@@ -2060,7 +2079,19 @@ impl AppView {
                     .child(small("Every built-in check is in the manifest.")),
             );
         }
-        for (i, known) in options.into_iter().enumerate() {
+        let rows = listed(options, |known| known.group);
+        let first = rows.iter().find_map(|row| match row {
+            Listed::Item(known) => Some(known.id),
+            Listed::Heading(_) => None,
+        });
+        for (i, row) in rows.into_iter().enumerate() {
+            let known = match row {
+                Listed::Heading(group) => {
+                    options_list = options_list.child(group_heading(group, 10.));
+                    continue;
+                }
+                Listed::Item(known) => known,
+            };
             let id = known.id;
             options_list = options_list.child(
                 div()
@@ -2071,7 +2102,7 @@ impl AppView {
                     .py(px(7.))
                     .rounded(px(7.))
                     .cursor_pointer()
-                    .when(i == 0, |option| option.bg(rgb(BLUE_WASH)))
+                    .when(Some(known.id) == first, |option| option.bg(rgb(BLUE_WASH)))
                     .hover(|hover| hover.bg(rgb(BLUE_WASH)))
                     .child(
                         div()
@@ -2155,7 +2186,17 @@ impl AppView {
                             .font_family(mono())
                             .text_color(rgb(MUTED))
                             .child(control.check.clone()),
-                    ),
+                    )
+                    .when_some(manifest::builtin(control.builtin_id()), |header, known| {
+                        header.child(
+                            div()
+                                .mt(px(6.))
+                                .text_size(px(13.))
+                                .line_height(relative(1.45))
+                                .text_color(rgb(INK_2))
+                                .child(known.about),
+                        )
+                    }),
             )
             .child(
                 div()
@@ -2565,6 +2606,36 @@ fn view_switch(form_now: bool, to_form: bool, unread: bool) -> ViewSwitch {
     } else {
         ViewSwitch::Switch
     }
+}
+
+/// A heading, or an item under it, in a list that shows its items by group.
+enum Listed<T> {
+    Heading(manifest::Group),
+    Item(T),
+}
+
+/// The items under their group headings, in the order of the headings.
+fn listed<T>(
+    items: impl IntoIterator<Item = T>,
+    group: impl Fn(&T) -> manifest::Group,
+) -> Vec<Listed<T>> {
+    manifest::by_group(items, group)
+        .into_iter()
+        .flat_map(|(group, items)| {
+            std::iter::once(Listed::Heading(group)).chain(items.into_iter().map(Listed::Item))
+        })
+        .collect()
+}
+
+fn group_heading(group: manifest::Group, inset: f32) -> Div {
+    div()
+        .px(px(inset))
+        .pt(px(16.))
+        .pb(px(6.))
+        .text_size(px(11.5))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(rgb(MUTED))
+        .child(group.label())
 }
 
 fn panel_switch(selected: Option<&str>, requested: Option<&str>, blocked: bool) -> PanelSwitch {
