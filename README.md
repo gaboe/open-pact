@@ -368,7 +368,7 @@ All checks are read-only. macOS and Linux checks run as the device owner. Window
 
 | Control | macOS | Linux |
 | --- | --- | --- |
-| `os_auto_updates` | `ConfigDataInstall` and `CriticalUpdateInstall` both enabled | Enabled and active apt or dnf timer with automatic installation configured |
+| `os_auto_updates` | `AutomaticCheckEnabled`, `ConfigDataInstall` and `CriticalUpdateInstall` all enabled | Enabled and active apt or dnf timer with automatic installation configured |
 | `antimalware_realtime` | XProtect present, registered and enabled | Running `clamonacc` process |
 | `antimalware_active_threats` | `n/a` | `unknown` |
 | `work_account` | Current account membership in `admin` | Current account membership in `sudo` or `wheel` |

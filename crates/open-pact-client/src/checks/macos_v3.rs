@@ -58,8 +58,13 @@ fn parse_activation_lock(text: &str) -> ControlValue {
 }
 
 pub fn os_auto_updates() -> ControlValue {
-    let values = ["ConfigDataInstall", "CriticalUpdateInstall"].map(update_setting);
-    parse_update_flags(values[0], values[1])
+    let values = [
+        "AutomaticCheckEnabled",
+        "ConfigDataInstall",
+        "CriticalUpdateInstall",
+    ]
+    .map(update_setting);
+    parse_update_flags(values[0], values[1], values[2])
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -98,10 +103,16 @@ fn parse_update_value(value: &str) -> UpdateSetting {
     }
 }
 
-fn parse_update_flags(data: UpdateSetting, critical: UpdateSetting) -> ControlValue {
-    match (data, critical) {
-        (UpdateSetting::Off, _) | (_, UpdateSetting::Off) => "off".into(),
-        (UpdateSetting::On, UpdateSetting::On) => "on".into(),
+fn parse_update_flags(
+    check: UpdateSetting,
+    data: UpdateSetting,
+    critical: UpdateSetting,
+) -> ControlValue {
+    match (check, data, critical) {
+        (UpdateSetting::Off, _, _) | (_, UpdateSetting::Off, _) | (_, _, UpdateSetting::Off) => {
+            "off".into()
+        }
+        (UpdateSetting::On, UpdateSetting::On, UpdateSetting::On) => "on".into(),
         _ => "unknown".into(),
     }
 }
@@ -442,15 +453,72 @@ mod v31_tests {
     use super::*;
     #[test]
     fn update_flags_treat_absent_settings_as_enabled() {
-        for (data, critical, expected) in [
-            (UpdateSetting::On, UpdateSetting::On, "on"),
-            (UpdateSetting::Off, UpdateSetting::On, "off"),
-            (UpdateSetting::On, UpdateSetting::Off, "off"),
-            (UpdateSetting::Unknown, UpdateSetting::On, "unknown"),
-            (UpdateSetting::On, UpdateSetting::Unknown, "unknown"),
+        for (check, data, critical, expected) in [
+            (
+                UpdateSetting::On,
+                UpdateSetting::On,
+                UpdateSetting::On,
+                "on",
+            ),
+            (
+                UpdateSetting::Off,
+                UpdateSetting::On,
+                UpdateSetting::On,
+                "off",
+            ),
+            (
+                UpdateSetting::On,
+                UpdateSetting::On,
+                UpdateSetting::Off,
+                "off",
+            ),
+            (
+                UpdateSetting::On,
+                UpdateSetting::Off,
+                UpdateSetting::On,
+                "off",
+            ),
+            (
+                UpdateSetting::Unknown,
+                UpdateSetting::On,
+                UpdateSetting::On,
+                "unknown",
+            ),
+            (
+                UpdateSetting::On,
+                UpdateSetting::Unknown,
+                UpdateSetting::On,
+                "unknown",
+            ),
+            (
+                UpdateSetting::On,
+                UpdateSetting::On,
+                UpdateSetting::Unknown,
+                "unknown",
+            ),
         ] {
-            assert_eq!(parse_update_flags(data, critical), expected);
+            assert_eq!(parse_update_flags(check, data, critical), expected);
         }
+    }
+
+    #[test]
+    fn automatic_check_key_absent_means_enabled() {
+        assert_eq!(
+            parse_update_flags(
+                classify_update_result(false, "Could not find key AutomaticCheckEnabled"),
+                classify_update_result(true, "1"),
+                classify_update_result(true, "1"),
+            ),
+            "on"
+        );
+        assert_eq!(
+            parse_update_flags(
+                classify_update_result(true, "0"),
+                classify_update_result(true, "1"),
+                classify_update_result(true, "1"),
+            ),
+            "off"
+        );
     }
 
     #[test]
@@ -472,6 +540,7 @@ mod v31_tests {
         );
         assert_eq!(
             parse_update_flags(
+                classify_update_result(false, "Could not find key AutomaticCheckEnabled"),
                 classify_update_result(false, "Could not find key ConfigDataInstall"),
                 classify_update_result(true, "1"),
             ),

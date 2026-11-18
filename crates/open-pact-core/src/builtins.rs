@@ -42,8 +42,8 @@ const BUILTIN_ABOUT: &[(&str, u32, &str)] = &[
         "os_auto_updates",
         1,
         "Updates that need a manual click often wait for weeks. On macOS the \
-            client reads ConfigDataInstall and CriticalUpdateInstall in the \
-            SoftwareUpdate preferences. On Windows it reads the Windows Update mode, \
+            client reads AutomaticCheckEnabled, ConfigDataInstall and \
+            CriticalUpdateInstall in the SoftwareUpdate preferences. On Windows it reads the Windows Update mode, \
             the pause state and the NoAutoUpdate policy, and on Linux the apt \
             unattended-upgrade settings and the apt-daily-upgrade or dnf-automatic \
             timer.",
