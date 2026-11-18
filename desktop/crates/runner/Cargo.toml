@@ -21,7 +21,7 @@ serde_json.workspace = true
 toml_edit.workspace = true
 dirs.workspace = true
 sha2 = "0.10"
-chrono = { version = "0.4", features = ["serde"] }
+time = { version = "0.3", features = ["formatting", "local-offset", "macros", "parsing"] }
 similar = "2"
 gpui = { workspace = true, optional = true }
 gpui-component = { workspace = true, optional = true }

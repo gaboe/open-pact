@@ -1,5 +1,6 @@
 use super::*;
 use std::io::{Read, Write};
+use time::OffsetDateTime;
 
 #[derive(Subcommand)]
 pub enum Command {
@@ -35,7 +36,8 @@ pub struct Version {
     pub toml: String,
     #[serde(rename = "manifest_hash")]
     pub hash: String,
-    created_at: chrono::DateTime<chrono::Utc>,
+    #[serde(with = "open_pact_core::timestamp::serde_rfc3339")]
+    created_at: OffsetDateTime,
     note: String,
     active: bool,
 }
@@ -212,5 +214,33 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(active_count, 1);
+    }
+}
+
+#[cfg(test)]
+mod timestamp_pins {
+    use super::*;
+
+    #[test]
+    fn created_at_serializes_with_the_fraction_chrono_chose() {
+        for (input, wire) in [
+            ("2026-10-05T08:00:00Z", "2026-10-05T08:00:00Z"),
+            ("2026-10-05T08:00:00.5Z", "2026-10-05T08:00:00.500Z"),
+            (
+                "2026-10-05T10:00:00.123456+02:00",
+                "2026-10-05T08:00:00.123456Z",
+            ),
+        ] {
+            let version = Version {
+                version: 1,
+                toml: String::new(),
+                hash: "h".into(),
+                created_at: open_pact_core::timestamp::parse_rfc3339(input).unwrap(),
+                note: String::new(),
+                active: true,
+            };
+            let json = serde_json::to_value(&version).unwrap();
+            assert_eq!(json["created_at"], wire, "{input}");
+        }
     }
 }

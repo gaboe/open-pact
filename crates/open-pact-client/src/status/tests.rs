@@ -34,7 +34,7 @@ struct Fixture {
     job: JobStatus,
     _closed: tokio::net::TcpSocket,
     probe: String,
-    now: DateTime<Utc>,
+    now: time::OffsetDateTime,
 }
 
 fn fixture_manifest(witness: &Witness, vpn: Option<&str>) -> String {
@@ -67,9 +67,9 @@ interval = "55m"
 
 impl Fixture {
     async fn new(state: &str) -> Self {
-        let now = DateTime::parse_from_rfc3339("2026-11-16T10:00:00Z")
+        let now = open_pact_core::timestamp::parse_rfc3339("2026-11-16T10:00:00Z")
             .unwrap()
-            .with_timezone(&Utc);
+            .to_offset(time::UtcOffset::UTC);
         let company = Company::new();
         let witness = Witness::new();
         let closed = tokio::net::TcpSocket::new_v4().unwrap();
@@ -104,7 +104,7 @@ impl Fixture {
         ));
         witness.cosign(
             &mut checkpoint,
-            u64::try_from(Utc::now().timestamp()).unwrap(),
+            u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp()).unwrap(),
         );
         let stored_checkpoint = checkpoint.to_string();
         let checkpoint = if state == "proof_unavailable" {
@@ -124,7 +124,10 @@ impl Fixture {
                 ],
                 2,
             ));
-            witness.cosign(&mut newer, u64::try_from(Utc::now().timestamp()).unwrap());
+            witness.cosign(
+                &mut newer,
+                u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp()).unwrap(),
+            );
             newer.to_string()
         } else if state == "log_alarm" {
             "not a checkpoint".into()
@@ -200,9 +203,9 @@ impl Fixture {
         if !matches!(state, "no_claim" | "not_enrolled") {
             let time = now
                 - if state == "stale_claim" {
-                    chrono::TimeDelta::days(2)
+                    time::Duration::days(2)
                 } else {
-                    chrono::TimeDelta::minutes(10)
+                    time::Duration::minutes(10)
                 };
             let value = if matches!(state, "grace_warning" | "denied") {
                 "off"
@@ -255,7 +258,7 @@ impl Fixture {
                 } else {
                     None
                 };
-                home.write("report-state.json", &serde_json::to_vec(&json!({"vpn_up":state != "off_vpn", "last_success":time.timestamp(), "last_note":note})).unwrap()).unwrap();
+                home.write("report-state.json", &serde_json::to_vec(&json!({"vpn_up":state != "off_vpn", "last_success":time.unix_timestamp(), "last_note":note})).unwrap()).unwrap();
                 if state == "log_alarm" {
                     home.write("schedule.log", b"2026-11-16T09:50:00Z TRANSPARENCY LOG ALARM: the saved checkpoint did not verify\n").unwrap();
                 }
@@ -484,7 +487,7 @@ async fn a_relative_deadline_becomes_an_absolute_time() {
 #[tokio::test]
 async fn a_deadline_in_the_past_is_reported_as_passed() {
     let fixture = Fixture::new("grace_warning").await;
-    let later = fixture.now + chrono::TimeDelta::hours(30);
+    let later = fixture.now + time::Duration::hours(30);
     let report = collect_with(
         &fixture.home,
         false,
@@ -502,7 +505,7 @@ async fn a_deadline_in_the_past_is_reported_as_passed() {
 
 #[test]
 fn access_spans_cover_the_gateway_formats() {
-    let at = |text| access_span(text).map(|(_, span)| span.num_minutes());
+    let at = |text| access_span(text).map(|(_, span)| span.whole_minutes());
     assert_eq!(at("firewall = off, access ends in 30m"), Some(30));
     assert_eq!(at("firewall = off, access ends in 23h"), Some(23 * 60));
     assert_eq!(at("firewall = off, access ends in 7d"), Some(7 * 24 * 60));
@@ -513,8 +516,12 @@ fn access_spans_cover_the_gateway_formats() {
     assert_eq!(at("firewall = off, on required"), None);
     assert_eq!(at("firewall = off, access ends in soon"), None);
     assert!(
-        warning_deadline("firewall = off", "2026-11-16T09:50:00Z", Utc::now())
-            .starts_with("Exact deadline unknown")
+        warning_deadline(
+            "firewall = off",
+            "2026-11-16T09:50:00Z",
+            time::OffsetDateTime::now_utc()
+        )
+        .starts_with("Exact deadline unknown")
     );
 }
 

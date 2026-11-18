@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read;
 
-use chrono::{DateTime, Duration, NaiveDate, Utc};
+use time::{Date, Duration, OffsetDateTime};
 
 use super::buckets::{self, Lock};
 use super::exec::{Ran, run, run_status};
@@ -99,7 +99,7 @@ fn lock() -> Lock {
 
 pub fn os_supported() -> &'static str {
     fs::read_to_string("/etc/os-release").map_or("unknown", |t| {
-        parse_os_supported(&t, Utc::now().date_naive())
+        parse_os_supported(&t, OffsetDateTime::now_utc().date())
     })
 }
 
@@ -248,7 +248,7 @@ fn hash_with<D: sha2::Digest>(mut input: impl Read) -> Option<IndexDigest> {
 }
 
 pub fn os_patch_age_days() -> open_pact_core::ControlValue {
-    patch_age(&System, Utc::now())
+    patch_age(&System, OffsetDateTime::now_utc())
 }
 
 /// What the package manager says about outstanding security updates. Only `Clear` lets the date
@@ -262,7 +262,10 @@ enum SecurityUpdates {
 
 /// The age of the last whole-system upgrade, or `unknown` unless the security query ran, exited
 /// zero and showed nothing outstanding.
-fn patch_age(host: &(impl PackageHost + Sync), now: DateTime<Utc>) -> open_pact_core::ControlValue {
+fn patch_age(
+    host: &(impl PackageHost + Sync),
+    now: OffsetDateTime,
+) -> open_pact_core::ControlValue {
     let (last, updates) = match host.read(APT_HISTORY) {
         Some(text) => (
             first_upgrade_date(
@@ -279,7 +282,7 @@ fn patch_age(host: &(impl PackageHost + Sync), now: DateTime<Utc>) -> open_pact_
         ),
     };
     match (updates, last) {
-        (SecurityUpdates::Clear, Some(date)) => buckets::patch_age(date, now.date_naive()),
+        (SecurityUpdates::Clear, Some(date)) => buckets::patch_age(date, now.date()),
         _ => "unknown".into(),
     }
 }
@@ -295,7 +298,7 @@ fn succeeded(ran: Option<Ran>) -> Option<String> {
 /// verified to stay within the check budget. Both must describe one cache generation (R7-M1):
 /// the lists are stamped before the simulation starts and again after both finish, and any
 /// change, such as an `apt update` landing in between, makes the result unknown.
-fn apt_security_updates(host: &(impl PackageHost + Sync), now: DateTime<Utc>) -> SecurityUpdates {
+fn apt_security_updates(host: &(impl PackageHost + Sync), now: OffsetDateTime) -> SecurityUpdates {
     let Some(config) = AptConfig::read(host) else {
         return SecurityUpdates::Unknown;
     };
@@ -490,7 +493,7 @@ fn release_names(release: &str) -> BTreeSet<&str> {
 fn apt_security_lists_current(
     host: &impl PackageHost,
     config: &AptConfig,
-    now: DateTime<Utc>,
+    now: OffsetDateTime,
 ) -> bool {
     let AptConfig {
         architectures,
@@ -601,7 +604,7 @@ fn index_matches(
 }
 
 /// Whether a Release was published within the last week and has not passed its `Valid-Until`.
-fn release_current(release: &str, now: DateTime<Utc>) -> bool {
+fn release_current(release: &str, now: OffsetDateTime) -> bool {
     let published = release_field(release, "Date").and_then(parse_release_date);
     let expired = release_field(release, "Valid-Until")
         .map(|until| parse_release_date(until).is_none_or(|until| until <= now));
@@ -616,7 +619,7 @@ fn release_field<'a>(text: &'a str, name: &str) -> Option<&'a str> {
 
 /// Reads a Release date such as `Mon, 12 Oct 2026  1:43:41 UTC`: APT pads a one-digit hour
 /// with a space and writes the zone as `UTC`, `GMT` or a numeric offset.
-fn parse_release_date(text: &str) -> Option<DateTime<Utc>> {
+fn parse_release_date(text: &str) -> Option<OffsetDateTime> {
     let words: Vec<&str> = text.split_whitespace().collect();
     let [.., day, month, year, time, zone] = words[..] else {
         return None;
@@ -625,12 +628,9 @@ fn parse_release_date(text: &str) -> Option<DateTime<Utc>> {
         "UTC" | "GMT" | "UT" | "Z" => "+0000",
         offset => offset,
     };
-    DateTime::parse_from_str(
-        &format!("{day} {month} {year} {time} {zone}"),
-        "%d %b %Y %H:%M:%S %z",
-    )
-    .ok()
-    .map(|t| t.with_timezone(&Utc))
+    open_pact_core::timestamp::parse_day_month_year_with_offset(&format!(
+        "{day} {month} {year} {time} {zone}"
+    ))
 }
 
 /// Reads `apt-get -s upgrade`. Any `Inst` line or kept-back package is an outstanding update:
@@ -988,7 +988,7 @@ fn version_key(v: &str) -> Option<(u32, u32)> {
     Some((major, minor))
 }
 
-pub fn parse_os_supported(os_release: &str, today: NaiveDate) -> &'static str {
+pub fn parse_os_supported(os_release: &str, today: Date) -> &'static str {
     let table = match os_release_field(os_release, "ID") {
         Some("ubuntu") => UBUNTU_EOL,
         Some("fedora") => FEDORA_EOL,
@@ -1001,10 +1001,10 @@ pub fn parse_os_supported(os_release: &str, today: NaiveDate) -> &'static str {
         return "unknown";
     };
     if let Some((_, eol)) = table.iter().find(|(v, _)| version_key(v) == Some(key)) {
-        return match NaiveDate::parse_from_str(eol, "%Y-%m-%d") {
-            Ok(eol) if today <= eol => "yes",
-            Ok(_) => "no",
-            Err(_) => "unknown",
+        return match open_pact_core::timestamp::parse_date(eol) {
+            Some(eol) if today <= eol => "yes",
+            Some(_) => "no",
+            None => "unknown",
         };
     }
     let newest = table.iter().filter_map(|(v, _)| version_key(v)).max();
@@ -1015,9 +1015,9 @@ pub fn parse_os_supported(os_release: &str, today: NaiveDate) -> &'static str {
     }
 }
 
-fn first_date(line: &str) -> Option<NaiveDate> {
+fn first_date(line: &str) -> Option<Date> {
     line.split_whitespace()
-        .find_map(|t| NaiveDate::parse_from_str(t, "%Y-%m-%d").ok())
+        .find_map(open_pact_core::timestamp::parse_date)
 }
 
 /// Patch-age heuristic. Package history records neither the archive pocket nor
@@ -1047,7 +1047,7 @@ fn is_apt_full_upgrade(commandline: &str) -> bool {
     matches!(args.as_slice(), [verb] if APT_FULL_UPGRADE_VERBS.contains(verb))
 }
 
-pub fn parse_apt_history(text: &str) -> Option<NaiveDate> {
+pub fn parse_apt_history(text: &str) -> Option<Date> {
     let mut full_upgrade = false;
     let mut upgraded = false;
     let mut failed = false;
@@ -1068,7 +1068,7 @@ pub fn parse_apt_history(text: &str) -> Option<NaiveDate> {
     latest
 }
 
-pub fn first_upgrade_date(logs: impl Iterator<Item = String>) -> Option<NaiveDate> {
+pub fn first_upgrade_date(logs: impl Iterator<Item = String>) -> Option<Date> {
     logs.into_iter().find_map(|log| parse_apt_history(&log))
 }
 
@@ -1125,15 +1125,12 @@ fn is_dnf_program(name: &str) -> bool {
     matches!(name, "dnf" | "dnf5" | "yum" | "microdnf")
 }
 
-pub fn parse_dnf_history(text: &str) -> Option<NaiveDate> {
+pub fn parse_dnf_history(text: &str) -> Option<Date> {
     text.lines()
         .filter_map(|line| {
-            let (at, date) = line.split_whitespace().find_map(|t| {
-                Some((
-                    line.find(t)?,
-                    NaiveDate::parse_from_str(t, "%Y-%m-%d").ok()?,
-                ))
-            })?;
+            let (at, date) = line
+                .split_whitespace()
+                .find_map(|t| Some((line.find(t)?, open_pact_core::timestamp::parse_date(t)?)))?;
             is_dnf_upgrade(&line[..at]).then_some(date)
         })
         .max()
@@ -1204,8 +1201,8 @@ pub fn parse_antimalware_units(out: &str) -> &'static str {
 mod tests {
     use super::*;
 
-    fn d(y: i32, m: u32, day: u32) -> NaiveDate {
-        NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    fn d(y: i32, m: u32, day: u32) -> Date {
+        open_pact_core::timestamp::ymd(y, m, day).unwrap()
     }
 
     #[test]
@@ -1773,8 +1770,8 @@ ID Command line                         Date and time       Action(s) Altered
     const RELEASE_POCKET: &str = "Origin: Fictional\nSuite: fictional\nCodename: fictional\n\
         Date: Thu, 25 Apr 2024 15:10:33 UTC\n";
 
-    fn now() -> DateTime<Utc> {
-        d(2026, 10, 12).and_hms_opt(12, 0, 0).unwrap().and_utc()
+    fn now() -> OffsetDateTime {
+        d(2026, 10, 12).with_hms(12, 0, 0).unwrap().assume_utc()
     }
 
     /// The file-name prefix APT gives to everything it downloads for a fictional `suite`.
@@ -2819,3 +2816,54 @@ vda2         part  0 0 ext4 /boot
 #[cfg(test)]
 #[path = "../../tests/contracts/adapters/linux.rs"]
 pub(super) mod contract_adapter;
+
+#[cfg(test)]
+mod timestamp_pins {
+    use super::*;
+
+    fn secs(t: Option<OffsetDateTime>) -> Option<String> {
+        t.map(open_pact_core::timestamp::rfc3339_secs)
+    }
+
+    #[test]
+    fn release_dates_read_apt_spellings_and_numeric_offsets() {
+        assert_eq!(
+            secs(parse_release_date("Mon, 12 Oct 2026  1:43:41 UTC")),
+            Some("2026-10-12T01:43:41Z".into())
+        );
+        assert_eq!(
+            secs(parse_release_date("Mon, 12 Oct 2026 01:43:41 GMT")),
+            Some("2026-10-12T01:43:41Z".into())
+        );
+        assert_eq!(
+            secs(parse_release_date("Mon, 12 Oct 2026 01:43:41 +0200")),
+            Some("2026-10-11T23:43:41Z".into())
+        );
+        assert_eq!(
+            secs(parse_release_date("Mon, 12 Oct 2026 01:43:41 -0130")),
+            Some("2026-10-12T03:13:41Z".into())
+        );
+        assert_eq!(
+            secs(parse_release_date("12 Oct 2026 01:43:41 Z")),
+            Some("2026-10-12T01:43:41Z".into())
+        );
+        assert_eq!(
+            secs(parse_release_date("Mon, 12 Oct 2026 01:43:41 +02:00")),
+            Some("2026-10-11T23:43:41Z".into())
+        );
+        assert_eq!(
+            secs(parse_release_date("Mon, 12 October 2026 01:43:41 UTC")),
+            None
+        );
+        assert_eq!(secs(parse_release_date("Mon, 12 Oct 2026 01:43 UTC")), None);
+    }
+
+    #[test]
+    fn first_date_reads_unpadded_iso_days() {
+        assert_eq!(
+            first_date("upgraded 2026-1-5 at noon").map(|d| d.to_string()),
+            Some("2026-01-05".into())
+        );
+        assert_eq!(first_date("2026-02-30"), None);
+    }
+}

@@ -784,6 +784,7 @@ impl Render for AppView {
 }
 
 fn main() {
+    runner::zone::read_start_offset();
     #[cfg(all(feature = "snapshot", target_os = "macos"))]
     if let Some(output) = std::env::var_os("OPEN_PACT_SHOTS") {
         snapshots(PathBuf::from(output));

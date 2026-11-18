@@ -1,10 +1,13 @@
 //! Plain-words wording for the typed reports of the client library. No UI code lives here.
 
 use crate::text::{Headline, Tone, humanize, readable_local};
-use chrono::{DateTime, Local, TimeDelta, TimeZone, Utc};
+use crate::zone;
 use open_pact_client::ControlReport;
 use open_pact_client::status::{Issue, Report, Verdict};
+use open_pact_core::timestamp::{parse_rfc3339, seconds};
 use open_pact_core::{ControlValue, DeviceStatus};
+use time::macros::format_description;
+use time::{Duration, OffsetDateTime};
 
 pub fn headline(status: &Report) -> Headline {
     let last = status.last_claim.as_ref().map(|claim| {
@@ -157,16 +160,16 @@ fn parse_finding(message: &str) -> Option<Finding<'_>> {
 }
 
 /// "19h", "30m", "3d" or "2d 5h" as the gateway prints the time left.
-fn span_delta(span: &str) -> Option<TimeDelta> {
-    let mut total = TimeDelta::zero();
+fn span_delta(span: &str) -> Option<Duration> {
+    let mut total = Duration::ZERO;
     let mut parts = 0;
     for part in span.split(' ') {
         let (number, unit) = part.split_at(part.len().checked_sub(1)?);
         let number: i64 = number.parse().ok()?;
         total += match unit {
-            "m" => TimeDelta::try_minutes(number)?,
-            "h" => TimeDelta::try_hours(number)?,
-            "d" => TimeDelta::try_days(number)?,
+            "m" => seconds(number.checked_mul(60)?)?,
+            "h" => seconds(number.checked_mul(3600)?)?,
+            "d" => seconds(number.checked_mul(86_400)?)?,
             _ => return None,
         };
         parts += 1;
@@ -244,10 +247,11 @@ fn finding_title(finding: &Finding) -> String {
 }
 
 /// The words for one action item. The raw CLI text stays in the command log.
-pub fn issue_view<Z: TimeZone>(issue: &Issue, now: DateTime<Utc>, zone: &Z) -> IssueView
-where
-    Z::Offset: std::fmt::Display,
-{
+pub fn issue_view(
+    issue: &Issue,
+    now: OffsetDateTime,
+    zone: impl Fn(OffsetDateTime) -> OffsetDateTime,
+) -> IssueView {
     let action = issue_action(issue);
     let Some(finding) = parse_finding(&issue.message) else {
         let message = issue.message.as_str();
@@ -262,19 +266,26 @@ where
             action,
         };
     };
-    let at = DateTime::parse_from_rfc3339(finding.at)
-        .ok()
-        .map(|time| time.to_utc());
-    let when = |time: DateTime<Utc>| time.with_timezone(zone).format("%-d %b, %H:%M").to_string();
+    let at = parse_rfc3339(finding.at);
+    let when = |time: OffsetDateTime| {
+        zone(time)
+            .format(format_description!(
+                "[day padding:none] [month repr:short], [hour]:[minute]"
+            ))
+            .unwrap_or_default()
+    };
     let note = match (finding.span, at) {
-        (Some(span), Some(at)) => span_delta(span).map(|left| {
-            let deadline = at + left;
-            if deadline < now {
-                format!("Access ended {}", when(deadline))
-            } else {
-                format!("Access ends {} unless fixed", when(deadline))
-            }
-        }),
+        (Some(span), Some(at)) => {
+            span_delta(span)
+                .and_then(|left| at.checked_add(left))
+                .map(|deadline| {
+                    if deadline < now {
+                        format!("Access ended {}", when(deadline))
+                    } else {
+                        format!("Access ends {} unless fixed", when(deadline))
+                    }
+                })
+        }
         (None, Some(at)) => Some(format!("Refused by the gateway on {}", when(at))),
         _ => None,
     };
@@ -290,9 +301,9 @@ where
 /// so that a picture does not change with the day; the app passes `None`.
 pub fn issue_view_local(issue: &Issue, now: Option<&str>) -> IssueView {
     let now = now
-        .and_then(|text| DateTime::parse_from_rfc3339(text).ok())
-        .map_or_else(Utc::now, |time| time.to_utc());
-    issue_view(issue, now, &Local)
+        .and_then(parse_rfc3339)
+        .unwrap_or_else(OffsetDateTime::now_utc);
+    issue_view(issue, now, zone::to_local)
 }
 
 /// The title, value and verdict of one control of a claim. A control the manifest does not require
@@ -340,8 +351,8 @@ pub fn resume_join(status: &Report) -> Option<bool> {
 mod tests {
     use super::*;
     use crate::samples::{self, report};
-    use chrono::FixedOffset;
     use open_pact_client::status::Urgency;
+    use time::UtcOffset;
 
     #[test]
     fn headlines_keep_uncertainty_in_plain_words() {
@@ -419,13 +430,16 @@ mod tests {
         }
     }
 
-    fn at(text: &str) -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339(text).unwrap().to_utc()
+    fn at(text: &str) -> OffsetDateTime {
+        parse_rfc3339(text).unwrap()
+    }
+
+    fn prague() -> impl Fn(OffsetDateTime) -> OffsetDateTime {
+        |time| time.to_offset(UtcOffset::from_hms(1, 0, 0).unwrap())
     }
 
     #[test]
     fn gateway_findings_read_in_plain_words_with_local_dates() {
-        let prague = FixedOffset::east_opt(3600).unwrap();
         let now = at("2026-11-16T15:00:00Z");
         let view = issue_view(
             &issue(
@@ -433,7 +447,7 @@ mod tests {
                 Some("open-pact-client check"),
             ),
             now,
-            &prague,
+            prague(),
         );
         assert_eq!(
             view.title,
@@ -450,7 +464,7 @@ mod tests {
                 None,
             ),
             now,
-            &prague,
+            prague(),
         );
         assert_eq!(
             view.title,
@@ -462,7 +476,7 @@ mod tests {
                 None,
             ),
             now,
-            &prague,
+            prague(),
         );
         assert_eq!(view.title, "Firewall is off, it must be on");
         assert_eq!(view.note.as_deref(), Some("Access ended 16 Nov, 12:00"));
@@ -472,7 +486,7 @@ mod tests {
                 None,
             ),
             now,
-            &prague,
+            prague(),
         );
         assert_eq!(view.title, "Disk encryption could not be read");
         assert_eq!(
@@ -483,13 +497,12 @@ mod tests {
 
     #[test]
     fn other_items_keep_their_message_and_get_a_button_by_command() {
-        let prague = FixedOffset::east_opt(3600).unwrap();
         let now = at("2026-11-16T15:00:00Z");
         let job = issue(
             "Automatic sending is on, but its job needs installation or update.",
             Some("open-pact-client schedule on"),
         );
-        let view = issue_view(&job, now, &prague);
+        let view = issue_view(&job, now, prague());
         assert_eq!(view.title, job.message);
         assert_eq!(view.action, Some(IssueAction::InstallJob));
         assert_eq!(

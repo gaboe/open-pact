@@ -2,9 +2,11 @@
 //! changes one value and prints the document again, so comments and order stay as written.
 use crate::admin::CheckError;
 use crate::text::humanize;
-use chrono::{Datelike, NaiveDate};
+use open_pact_core::timestamp::parse_date as parse_iso_date;
 use open_pact_core::{Metadata, TrustLevel};
 use std::collections::{BTreeMap, BTreeSet};
+use time::macros::format_description;
+use time::{Date, format_description::BorrowedFormatItem};
 use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, TableLike, Value};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,19 +96,36 @@ impl Span {
     }
 }
 
-pub fn parse_date(text: &str) -> Option<NaiveDate> {
+/// "1 Oct 2026" and "1 October 2026", in any case.
+const WORD_DATES: [&[BorrowedFormatItem<'static>]; 2] = [
+    format_description!(
+        "[day padding:none] [month repr:short case_sensitive:false] [year padding:none]"
+    ),
+    format_description!(
+        "[day padding:none] [month repr:long case_sensitive:false] [year padding:none]"
+    ),
+];
+
+/// "2026-10-01", "1 Oct 2026" or "1 October 2026".
+pub fn parse_date(text: &str) -> Option<Date> {
     let text = text.trim();
-    ["%Y-%m-%d", "%d %b %Y", "%d %B %Y"]
-        .iter()
-        .find_map(|format| NaiveDate::parse_from_str(text, format).ok())
+    parse_iso_date(text).or_else(|| {
+        WORD_DATES
+            .iter()
+            .find_map(|format| Date::parse(text, format).ok())
+    })
 }
 
 /// "2026-10-01" reads as "1 Oct 2026". Text that is not a date stays as it is.
 pub fn date_text(text: &str) -> String {
-    match parse_date(text) {
-        Some(date) => format!("{} {}", date.day(), date.format("%b %Y")),
-        None => text.to_owned(),
-    }
+    parse_date(text)
+        .and_then(|date| {
+            date.format(format_description!(
+                "[day padding:none] [month repr:short] [year]"
+            ))
+            .ok()
+        })
+        .unwrap_or_else(|| text.to_owned())
 }
 
 pub use open_pact_core::Os;

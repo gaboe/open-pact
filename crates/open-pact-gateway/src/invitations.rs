@@ -1,7 +1,7 @@
 use anyhow::bail;
-use chrono::{DateTime, Duration, Utc};
 use open_pact_core::{InvitationCode, InvitationHash, Pseudonym};
 use sqlx::{PgConnection, PgPool};
+use time::{Duration, OffsetDateTime};
 
 pub const MAX_TTL: Duration = Duration::days(30);
 const MAX_NOTE: usize = 200;
@@ -15,7 +15,7 @@ pub fn parse_ttl(text: &str) -> anyhow::Result<Duration> {
         _ => bail!("TTL must end in m, h or d, as in 30m, 72h or 7d: {text:?}"),
     };
     let number = &text[..text.len() - 1];
-    let max = MAX_TTL.num_minutes() / minutes_per_unit;
+    let max = MAX_TTL.whole_minutes() / minutes_per_unit;
     match number.parse::<i64>() {
         Ok(n) if (1..=max).contains(&n) => Ok(Duration::minutes(n * minutes_per_unit)),
         Ok(n) if n > max => bail!("TTL {text} is longer than 30 days"),
@@ -27,12 +27,12 @@ pub async fn create(
     db: &PgPool,
     ttl: Duration,
     note: &str,
-) -> anyhow::Result<(InvitationCode, DateTime<Utc>)> {
+) -> anyhow::Result<(InvitationCode, OffsetDateTime)> {
     if note.chars().count() > MAX_NOTE {
         bail!("note is longer than {MAX_NOTE} characters");
     }
     let code = InvitationCode::from_bytes(rand::random());
-    let expires: DateTime<Utc> = sqlx::query_scalar(
+    let expires: OffsetDateTime = sqlx::query_scalar(
         "INSERT INTO invitations (hash, note, expires_at) VALUES ($1, $2, now() + $3) RETURNING expires_at",
     )
     .bind(code.hash().as_str())

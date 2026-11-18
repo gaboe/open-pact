@@ -358,7 +358,7 @@ impl Default for Release {
             leaf_valid: ((2026, 5, 31), (2026, 6, 2)),
             extra: Vec::new(),
             forged_intermediate: false,
-            integrated_time: chrono_time(2026, 6, 1),
+            integrated_time: noon_utc(2026, 6, 1),
             signed: SUMS.as_bytes().to_vec(),
             body_digest: None,
             body_certificate_from_other_leaf: false,
@@ -367,13 +367,13 @@ impl Default for Release {
     }
 }
 
-fn chrono_time(year: i32, month: u32, day: u32) -> i64 {
-    chrono::NaiveDate::from_ymd_opt(year, month, day)
+fn noon_utc(year: i32, month: u8, day: u8) -> i64 {
+    time::Date::from_calendar_date(year, time::Month::try_from(month).unwrap(), day)
         .unwrap()
-        .and_hms_opt(12, 0, 0)
+        .with_hms(12, 0, 0)
         .unwrap()
-        .and_utc()
-        .timestamp()
+        .assume_utc()
+        .unix_timestamp()
 }
 
 /// A DER UTF8String, the form of the v2 Fulcio extensions. Short form: the text is under 128 bytes.

@@ -13,6 +13,7 @@ pub mod samples;
 pub mod status_text;
 pub mod text;
 pub mod update;
+pub mod zone;
 
 use serde::de::DeserializeOwned;
 use std::ffi::{OsStr, OsString};

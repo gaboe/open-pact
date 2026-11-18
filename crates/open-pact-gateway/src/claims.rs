@@ -8,30 +8,33 @@
 use std::collections::HashMap;
 
 use anyhow::Context;
-use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use open_pact_core::{EntryKind, ManifestHash, Pseudonym, Span};
 use serde_json::{Value, json};
 use sqlx::{PgConnection, PgPool};
+use time::{Date, OffsetDateTime};
 
 use crate::seal::SealingKey;
 use crate::translog;
 
-fn period_of(t: DateTime<Utc>) -> NaiveDate {
-    t.date_naive().with_day(1).expect("day 1 exists")
+fn period_of(t: OffsetDateTime) -> Date {
+    t.date().replace_day(1).expect("day 1 exists")
 }
 
-fn key_name(period: NaiveDate) -> String {
-    format!("claim_key:{}", period.format("%Y-%m"))
+fn key_name(period: Date) -> String {
+    format!(
+        "claim_key:{}",
+        open_pact_core::timestamp::year_month(period)
+    )
 }
 
-fn row_name(period: NaiveDate) -> String {
-    format!("claim:{}", period.format("%Y-%m"))
+fn row_name(period: Date) -> String {
+    format!("claim:{}", open_pact_core::timestamp::year_month(period))
 }
 
 async fn period_key(
     conn: &mut PgConnection,
     kek: &SealingKey,
-    period: NaiveDate,
+    period: Date,
 ) -> anyhow::Result<SealingKey> {
     sqlx::query(
         "INSERT INTO claim_keys (period, wrapped_key) VALUES ($1, $2) ON CONFLICT (period) DO NOTHING",
@@ -46,7 +49,7 @@ async fn period_key(
 async fn open_period_key(
     conn: &mut PgConnection,
     kek: &SealingKey,
-    period: NaiveDate,
+    period: Date,
 ) -> anyhow::Result<SealingKey> {
     let name = key_name(period);
     let wrapped: String =
@@ -66,7 +69,7 @@ fn sealed_body(device: &str, claim: &Value, jws: Option<&str>) -> Vec<u8> {
         .expect("JSON values serialize")
 }
 
-fn deadline(retention: &Span, received_at: DateTime<Utc>) -> anyhow::Result<DateTime<Utc>> {
+fn deadline(retention: &Span, received_at: OffsetDateTime) -> anyhow::Result<OffsetDateTime> {
     retention
         .after(received_at)
         .context("claim_retention reaches past the calendar")
@@ -81,8 +84,8 @@ fn legacy_deadline(
     current: &ManifestHash,
     retention: &Span,
     claim: &Value,
-    received_at: DateTime<Utc>,
-) -> anyhow::Result<DateTime<Utc>> {
+    received_at: OffsetDateTime,
+) -> anyhow::Result<OffsetDateTime> {
     if claim.get("manifest").and_then(Value::as_str) == Some(current.as_str()) {
         deadline(retention, received_at)
     } else {
@@ -97,7 +100,7 @@ pub async fn store(
     conn: &mut PgConnection,
     kek: &SealingKey,
     retention: &Span,
-    now: DateTime<Utc>,
+    now: OffsetDateTime,
     device: &Pseudonym,
     claim: &Value,
     jws: &str,
@@ -130,7 +133,7 @@ pub async fn seal_plaintext(
     current: &ManifestHash,
     retention: &Span,
 ) -> anyhow::Result<u64> {
-    type Plain = (i64, String, Value, Option<String>, DateTime<Utc>);
+    type Plain = (i64, String, Value, Option<String>, OffsetDateTime);
     let rows: Vec<Plain> = sqlx::query_as(
         "SELECT id, device, claim, jws, received_at FROM claims WHERE sealed IS NULL ORDER BY id",
     )
@@ -168,7 +171,7 @@ pub async fn set_missing_deadlines(
     current: &ManifestHash,
     retention: &Span,
 ) -> anyhow::Result<u64> {
-    let rows: Vec<(i64, DateTime<Utc>, NaiveDate, String)> = sqlx::query_as(
+    let rows: Vec<(i64, OffsetDateTime, Date, String)> = sqlx::query_as(
         "SELECT id, received_at, period, sealed FROM claims WHERE delete_after IS NULL",
     )
     .fetch_all(db)
@@ -201,7 +204,7 @@ pub async fn set_missing_deadlines(
 /// them. The JWS stays sealed; reading results never needs it.
 pub struct Stored {
     pub id: i64,
-    pub received_at: DateTime<Utc>,
+    pub received_at: OffsetDateTime,
     pub allowed: Option<bool>,
     pub device: String,
     pub claim: Value,
@@ -210,9 +213,9 @@ pub struct Stored {
 /// The columns `SELECT_STORED` returns.
 pub type StoredRow = (
     i64,
-    DateTime<Utc>,
+    OffsetDateTime,
     Option<bool>,
-    Option<NaiveDate>,
+    Option<Date>,
     Option<String>,
     Option<String>,
     Option<Value>,
@@ -226,7 +229,7 @@ pub const SELECT_STORED: &str =
 pub struct Opener<'a> {
     db: &'a PgPool,
     kek: &'a SealingKey,
-    keys: HashMap<NaiveDate, Option<SealingKey>>,
+    keys: HashMap<Date, Option<SealingKey>>,
 }
 
 impl<'a> Opener<'a> {
@@ -301,7 +304,7 @@ pub struct Purged {
 /// remaining claim uses. Store never creates the key of an ended month, so a claim in flight keeps
 /// its key. One transaction with a `retention_purge` log entry that holds only the counts; appends
 /// nothing when nothing was deleted.
-pub async fn purge(db: &PgPool, retention: &Span, now: DateTime<Utc>) -> anyhow::Result<Purged> {
+pub async fn purge(db: &PgPool, retention: &Span, now: OffsetDateTime) -> anyhow::Result<Purged> {
     let cutoff = retention
         .before(now)
         .context("claim_retention reaches before the calendar")?;
@@ -339,10 +342,9 @@ pub async fn purge(db: &PgPool, retention: &Span, now: DateTime<Utc>) -> anyhow:
 
 #[cfg(test)]
 pub async fn open_all(db: &PgPool, kek: &SealingKey) -> anyhow::Result<Vec<Value>> {
-    let rows: Vec<(NaiveDate, String)> =
-        sqlx::query_as("SELECT period, sealed FROM claims ORDER BY id")
-            .fetch_all(db)
-            .await?;
+    let rows: Vec<(Date, String)> = sqlx::query_as("SELECT period, sealed FROM claims ORDER BY id")
+        .fetch_all(db)
+        .await?;
     let mut out = vec![];
     for (period, sealed) in rows {
         let key = period_key(&mut *db.acquire().await?, kek, period).await?;
@@ -360,8 +362,8 @@ mod tests {
     use super::*;
     use crate::testdb;
 
-    fn at(s: &str) -> DateTime<Utc> {
-        s.parse().unwrap()
+    fn at(s: &str) -> OffsetDateTime {
+        open_pact_core::timestamp::parse_rfc3339(s).unwrap()
     }
 
     async fn count(db: &PgPool, sql: &str) -> i64 {
@@ -420,11 +422,11 @@ mod tests {
                 period_keys: 1
             }
         );
-        let left: Vec<NaiveDate> = sqlx::query_scalar("SELECT period FROM claim_keys")
+        let left: Vec<Date> = sqlx::query_scalar("SELECT period FROM claim_keys")
             .fetch_all(&db)
             .await
             .unwrap();
-        assert_eq!(left, [NaiveDate::from_ymd_opt(2026, 10, 1).unwrap()]);
+        assert_eq!(left, [open_pact_core::timestamp::ymd(2026, 10, 1).unwrap()]);
         assert_eq!(count(&db, "SELECT count(*) FROM claims").await, 1);
         let entries = translog::since(&mut conn, 0).await.unwrap();
         assert_eq!(entries.len(), 1);
@@ -563,7 +565,7 @@ mod tests {
             2,
             "neither legacy claim may outlive the unknown policy it was accepted under"
         );
-        let kept: Vec<DateTime<Utc>> =
+        let kept: Vec<OffsetDateTime> =
             sqlx::query_scalar("SELECT delete_after FROM claims ORDER BY id")
                 .fetch_all(&db)
                 .await
@@ -611,18 +613,18 @@ mod tests {
             json!({"device": "pseudonym:aa", "claim": first, "jws": "jws-a"})
         );
         assert_eq!(opened[1]["jws"], Value::Null);
-        let periods: Vec<NaiveDate> = sqlx::query_scalar("SELECT period FROM claims ORDER BY id")
+        let periods: Vec<Date> = sqlx::query_scalar("SELECT period FROM claims ORDER BY id")
             .fetch_all(&db)
             .await
             .unwrap();
         assert_eq!(
             periods,
             [
-                NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
-                NaiveDate::from_ymd_opt(2026, 10, 1).unwrap()
+                open_pact_core::timestamp::ymd(2026, 8, 1).unwrap(),
+                open_pact_core::timestamp::ymd(2026, 10, 1).unwrap()
             ]
         );
-        let deadlines: Vec<DateTime<Utc>> =
+        let deadlines: Vec<OffsetDateTime> =
             sqlx::query_scalar("SELECT delete_after FROM claims ORDER BY id")
                 .fetch_all(&db)
                 .await
@@ -657,7 +659,7 @@ mod tests {
         assert_eq!(dated.await.unwrap(), 1);
         let again = set_missing_deadlines(&db, &kek, &current, &month);
         assert_eq!(again.await.unwrap(), 0);
-        let deadline: DateTime<Utc> = sqlx::query_scalar("SELECT delete_after FROM claims")
+        let deadline: OffsetDateTime = sqlx::query_scalar("SELECT delete_after FROM claims")
             .fetch_one(&db)
             .await
             .unwrap();
@@ -682,6 +684,41 @@ mod tests {
                 claims: 1,
                 period_keys: 1
             }
+        );
+    }
+}
+
+#[cfg(test)]
+mod timestamp_pins {
+    use super::*;
+
+    fn at(s: &str) -> OffsetDateTime {
+        open_pact_core::timestamp::parse_rfc3339(s).unwrap()
+    }
+
+    #[test]
+    fn period_names_use_the_utc_month() {
+        let period = period_of(at("2026-10-12T23:59:59.9Z"));
+        assert_eq!(key_name(period), "claim_key:2026-10");
+        assert_eq!(row_name(period), "claim:2026-10");
+        assert_eq!(
+            key_name(period_of(at("2026-10-01T00:00:00Z"))),
+            "claim_key:2026-10"
+        );
+        assert_eq!(
+            key_name(period_of(at("2026-09-30T23:30:00-02:00"))),
+            "claim_key:2026-10"
+        );
+    }
+
+    #[test]
+    fn deadlines_clamp_the_month_and_keep_fractions() {
+        let span = Span::try_from("1mo".to_string()).unwrap();
+        assert_eq!(
+            open_pact_core::timestamp::rfc3339_auto(
+                deadline(&span, at("2026-01-31T10:00:00.5Z")).unwrap()
+            ),
+            "2026-02-28T10:00:00.500Z"
         );
     }
 }

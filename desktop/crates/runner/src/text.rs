@@ -1,7 +1,10 @@
 //! Plain-words wording for CLI and gateway JSON. No UI code lives here.
 
-use chrono::{DateTime, Local, TimeZone};
+use crate::zone;
+use open_pact_core::timestamp::parse_rfc3339;
 use serde_json::Value;
+use time::OffsetDateTime;
+use time::macros::format_description;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tone {
@@ -27,22 +30,22 @@ pub fn short_hash(hash: &str) -> String {
         .collect()
 }
 
-pub fn readable_time<Z: TimeZone>(text: &str, zone: &Z) -> String
-where
-    Z::Offset: std::fmt::Display,
-{
-    DateTime::parse_from_rfc3339(text).map_or_else(
-        |_| text.to_owned(),
-        |time| {
-            time.with_timezone(zone)
-                .format("%-d %b %Y, %H:%M")
-                .to_string()
-        },
-    )
+/// "19 Nov 2026, 13:00": `text` as an RFC 3339 time, moved into the zone `zone` gives. Other text
+/// stays as it is.
+pub fn readable_time(text: &str, zone: impl Fn(OffsetDateTime) -> OffsetDateTime) -> String {
+    parse_rfc3339(text)
+        .and_then(|time| {
+            zone(time)
+                .format(format_description!(
+                    "[day padding:none] [month repr:short] [year], [hour]:[minute]"
+                ))
+                .ok()
+        })
+        .unwrap_or_else(|| text.to_owned())
 }
 
 pub fn readable_local(text: &str) -> String {
-    readable_time(text, &Local)
+    readable_time(text, zone::to_local)
 }
 
 pub fn humanize(id: &str) -> String {
@@ -196,8 +199,8 @@ pub fn step_detail(detail: Option<&Value>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::FixedOffset;
     use serde_json::json;
+    use time::UtcOffset;
 
     #[test]
     fn hashes_show_twelve_hex_digits_and_keep_short_ones() {
@@ -210,12 +213,12 @@ mod tests {
 
     #[test]
     fn times_are_readable_in_the_given_zone_and_other_text_is_kept() {
-        let prague = FixedOffset::east_opt(3600).unwrap();
+        let prague = |time: OffsetDateTime| time.to_offset(UtcOffset::from_hms(1, 0, 0).unwrap());
         assert_eq!(
-            readable_time("2026-11-19T12:00:00Z", &prague),
+            readable_time("2026-11-19T12:00:00Z", prague),
             "19 Nov 2026, 13:00"
         );
-        assert_eq!(readable_time("10:53", &prague), "10:53");
+        assert_eq!(readable_time("10:53", prague), "10:53");
     }
 
     #[test]

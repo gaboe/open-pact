@@ -1,5 +1,5 @@
 use crate::{Runner, args};
-use chrono::{DateTime, Utc};
+use open_pact_core::timestamp::{parse_rfc3339, rfc3339_auto};
 use open_pact_core::{Error as CoreError, Manifest, check_supported};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -7,6 +7,16 @@ use sha2::{Digest, Sha256};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+use time::OffsetDateTime;
+use time::macros::format_description;
+
+/// The time in a backup file name: `20261116T120000.123Z`.
+fn backup_time(time: OffsetDateTime) -> String {
+    time.format(format_description!(
+        "[year][month][day]T[hour][minute][second].[subsecond digits:3]Z"
+    ))
+    .expect("a UTC time in the years 0 to 9999 has this form")
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Settings {
@@ -122,13 +132,7 @@ pub struct Device {
 /// The devices the Overview lists: revoked ones left out, the newest result first, and devices
 /// without a result last.
 pub fn latest_results(devices: &[Device]) -> Vec<&Device> {
-    let claimed = |device: &Device| {
-        device
-            .last_claim_at
-            .as_deref()
-            .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
-            .map(|at| at.with_timezone(&Utc))
-    };
+    let claimed = |device: &Device| device.last_claim_at.as_deref().and_then(parse_rfc3339);
     let mut shown: Vec<&Device> = devices
         .iter()
         .filter(|device| device.state != "revoked")
@@ -601,11 +605,9 @@ impl Admin {
         let versions = self.history()?;
         let mut warnings = Vec::new();
         for version in &versions {
-            let time = DateTime::parse_from_rfc3339(&version.created_at)
-                .map_err(|e| format!("Invalid server version time: {e}"))?
-                .with_timezone(&Utc)
-                .format("%Y%m%dT%H%M%S%.3fZ")
-                .to_string();
+            let time = parse_rfc3339(&version.created_at)
+                .map(backup_time)
+                .ok_or_else(|| format!("Invalid server version time: {}", version.created_at))?;
             let filename = format!(
                 "{time}-v{}-{}.toml",
                 version.version,
@@ -635,7 +637,7 @@ impl Admin {
         Ok(History {
             versions,
             backups,
-            synced_at: Utc::now().to_rfc3339(),
+            synced_at: rfc3339_auto(OffsetDateTime::now_utc()),
             warnings,
         })
     }
@@ -679,7 +681,7 @@ impl Admin {
         }
         let filename = format!(
             "{}-{}.toml",
-            Utc::now().format("%Y%m%dT%H%M%S%.3fZ"),
+            backup_time(OffsetDateTime::now_utc()),
             hash12(&current_hash)?
         );
         save_backup(&self.backup_dir(), &filename, &current)?;

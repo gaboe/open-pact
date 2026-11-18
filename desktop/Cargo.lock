@@ -4465,6 +4465,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "num_threads"
+version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cabcc654086861f9e1bc5115258de62ef92c79b20f4615a1b0cc57c4e82027d4"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "objc"
 version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4907,7 +4916,6 @@ version = "0.8.1-rc.2"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
- "chrono",
  "clap",
  "core-foundation 0.10.1",
  "hex",
@@ -4922,6 +4930,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.1",
+ "time",
  "tokio",
  "toml 1.2.1+spec-1.1.0",
  "uuid",
@@ -4934,7 +4943,6 @@ name = "open-pact-core"
 version = "0.8.1-rc.2"
 dependencies = [
  "base64 0.23.1",
- "chrono",
  "ed25519-dalek",
  "hex",
  "p256",
@@ -4943,6 +4951,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.1",
  "thiserror 2.0.21",
+ "time",
  "toml 1.2.1+spec-1.1.0",
 ]
 
@@ -6020,7 +6029,6 @@ dependencies = [
 name = "runner"
 version = "0.8.1-rc.2"
 dependencies = [
- "chrono",
  "dirs 6.0.0",
  "gpui-component",
  "gpui-kit-assets",
@@ -6034,6 +6042,7 @@ dependencies = [
  "sha2 0.10.9",
  "similar",
  "tempfile",
+ "time",
  "tokio",
  "toml_edit 0.23.10+spec-1.0.0",
  "winreg",
@@ -7162,7 +7171,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cdb87b95ec50ddfa440816d227a17b2ccbdda963a316a727fda0fc4334f7d134"
 dependencies = [
  "deranged",
+ "libc",
  "num-conv",
+ "num_threads",
  "powerfmt",
  "serde_core",
  "time-core",

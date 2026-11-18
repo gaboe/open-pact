@@ -11,7 +11,6 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use anyhow::{Context, bail};
-use chrono::{DateTime, SecondsFormat, Utc};
 use clap::{Subcommand, ValueEnum};
 use open_pact_core::{
     Claim, ControlValue, Manifest, Os, Pseudonym, TrustLevel, control_compliance,
@@ -19,6 +18,7 @@ use open_pact_core::{
 use serde::Serialize;
 use serde_json::Value;
 use sqlx::PgPool;
+use time::OffsetDateTime;
 
 use crate::claims::{Opener, SELECT_STORED, Stored, StoredRow};
 use crate::seal::SealingKey;
@@ -42,8 +42,8 @@ pub enum Command {
         #[arg(long)]
         result: Option<Outcome>,
         /// Only claims received at or after this time (RFC 3339)
-        #[arg(long)]
-        since: Option<DateTime<Utc>>,
+        #[arg(long, value_parser = parse_since)]
+        since: Option<OffsetDateTime>,
         /// Stop after this many matches
         #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u32).range(1..=1000))]
         limit: u32,
@@ -88,7 +88,7 @@ impl Outcome {
 pub struct Filter {
     pub device: Option<String>,
     pub result: Option<Outcome>,
-    pub since: Option<DateTime<Utc>>,
+    pub since: Option<OffsetDateTime>,
     pub limit: usize,
 }
 
@@ -159,8 +159,13 @@ pub struct Detail {
     pub standing: Standing,
 }
 
-pub fn stamp(t: DateTime<Utc>) -> String {
-    t.to_rfc3339_opts(SecondsFormat::Secs, true)
+pub fn stamp(t: OffsetDateTime) -> String {
+    open_pact_core::timestamp::rfc3339_secs(t)
+}
+
+fn parse_since(text: &str) -> Result<OffsetDateTime, String> {
+    open_pact_core::timestamp::parse_relaxed(text)
+        .ok_or_else(|| format!("not an RFC 3339 time: {text}"))
 }
 
 /// The claim as the client signed it. `stored_claim` renamed `trust_level` and added two fields.
@@ -247,7 +252,7 @@ async fn device_standing(
     db: &PgPool,
     manifests: &mut Manifests<'_>,
     device: &str,
-    now: DateTime<Utc>,
+    now: OffsetDateTime,
 ) -> anyhow::Result<Standing> {
     let last = standing::last_decision(db, device).await?;
     let interval = match &last {
@@ -281,12 +286,12 @@ pub async fn list(
     let mut manifests = Manifests::new(db, startup);
     let mut notes: HashMap<String, String> = HashMap::new();
     let mut standings: HashMap<String, Standing> = HashMap::new();
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     let mut listing = Listing {
         claims: vec![],
         unreadable: 0,
     };
-    let mut after: Option<(DateTime<Utc>, i64)> = None;
+    let mut after: Option<(OffsetDateTime, i64)> = None;
     loop {
         let rows: Vec<StoredRow> = sqlx::query_as(&format!(
             "{SELECT_STORED} WHERE ($1::timestamptz IS NULL OR received_at >= $1) \
@@ -430,7 +435,7 @@ pub async fn show(
                     first_failed_at: first_failed_at.copied().map(stamp),
                     deadline: span
                         .zip(first_failed_at)
-                        .and_then(|(span, first)| first.checked_add_signed(span.min_duration()?))
+                        .and_then(|(span, first)| first.checked_add(span.min_duration()?))
                         .map(stamp),
                 });
             }
@@ -453,7 +458,7 @@ pub async fn show(
             None,
         ),
     };
-    let standing = device_standing(db, &mut manifests, &device, Utc::now()).await?;
+    let standing = device_standing(db, &mut manifests, &device, OffsetDateTime::now_utc()).await?;
     Ok(Detail {
         id,
         received_at: stamp(received_at),
@@ -582,17 +587,17 @@ pub async fn run(
 mod tests {
     use std::collections::BTreeMap;
 
-    use chrono::TimeDelta;
     use open_pact_core::{ManifestHash, PublicKey, Span, Virtualized, dev_key};
     use serde_json::json;
+    use time::Duration;
 
     use super::*;
     use crate::{claims, testdb};
 
     const KEK: [u8; 32] = [9; 32];
 
-    fn at(s: &str) -> DateTime<Utc> {
-        s.parse().unwrap()
+    fn at(s: &str) -> OffsetDateTime {
+        open_pact_core::timestamp::parse_rfc3339(s).unwrap()
     }
 
     /// The demo manifest's header and `[log]` section around two controls.
@@ -630,7 +635,7 @@ grace = "1d"
         device: &Pseudonym,
         manifest: &ManifestHash,
         os: Os,
-        time: DateTime<Utc>,
+        time: OffsetDateTime,
         results: &[(&str, &str)],
     ) -> Claim {
         Claim {
@@ -662,7 +667,7 @@ grace = "1d"
         retention: &str,
         claim: &Claim,
         allowed: bool,
-        access_until: Option<DateTime<Utc>>,
+        access_until: Option<OffsetDateTime>,
     ) -> i64 {
         let retention: Span = retention.to_string().try_into().unwrap();
         let payload = crate::stored_claim(claim, None, access_until).unwrap();
@@ -806,8 +811,8 @@ grace = "1d"
     #[ignore = "needs TEST_DATABASE_URL"]
     async fn access_until_and_standing_follow_the_last_decision() {
         let w = world().await;
-        let now = Utc::now();
-        let until = now + TimeDelta::hours(1);
+        let now = OffsetDateTime::now_utc();
+        let until = now + Duration::hours(1);
         let ok = [("disk_encryption", "full"), ("firewall", "on")];
         let id = put_with(
             &w.db,
@@ -816,7 +821,7 @@ grace = "1d"
                 &w.a,
                 w.manifest.hash(),
                 Os::Linux,
-                now - TimeDelta::minutes(1),
+                now - Duration::minutes(1),
                 &ok,
             ),
             true,
@@ -881,9 +886,9 @@ grace = "1d"
             &mut conn,
             &w.a,
             &hash,
-            now - TimeDelta::minutes(5),
+            now - Duration::minutes(5),
             devices::ClaimResult::Accepted,
-            Some(now - TimeDelta::minutes(1)),
+            Some(now - Duration::minutes(1)),
             &[],
         )
         .await
@@ -898,7 +903,7 @@ grace = "1d"
     #[ignore = "needs TEST_DATABASE_URL"]
     async fn a_device_with_no_recorded_certificate_end_is_unknown_until_its_next_claim() {
         let w = world().await;
-        let now = Utc::now();
+        let now = OffsetDateTime::now_utc();
         let ok = [("disk_encryption", "full"), ("firewall", "on")];
         let id = put_with(
             &w.db,
@@ -907,7 +912,7 @@ grace = "1d"
                 &w.a,
                 w.manifest.hash(),
                 Os::Linux,
-                now - TimeDelta::minutes(1),
+                now - Duration::minutes(1),
                 &ok,
             ),
             true,
@@ -921,7 +926,7 @@ grace = "1d"
         )
         .bind(w.a.as_str())
         .bind(&hash)
-        .bind(now - TimeDelta::minutes(1))
+        .bind(now - Duration::minutes(1))
         .execute(&w.db)
         .await
         .unwrap();
@@ -1054,7 +1059,7 @@ grace = "1d"
         let hash = w.manifest.hash();
         let ok = [("disk_encryption", "full"), ("firewall", "on")];
         for i in 0..(BATCH + 5) {
-            let time = at("2026-10-06T00:00:00Z") + TimeDelta::minutes(i);
+            let time = at("2026-10-06T00:00:00Z") + Duration::minutes(i);
             put(
                 &w.db,
                 "12mo",
@@ -1414,5 +1419,53 @@ grace = "1d"
             "{text}"
         );
         assert!(text.contains("2 claims cannot be read"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod timestamp_pins {
+    use super::*;
+
+    #[test]
+    fn stamps_are_whole_seconds_in_utc() {
+        assert_eq!(
+            stamp(open_pact_core::timestamp::parse_rfc3339("2026-10-05T08:00:00.9Z").unwrap()),
+            "2026-10-05T08:00:00Z"
+        );
+        assert_eq!(
+            stamp(open_pact_core::timestamp::parse_rfc3339("2026-10-05T10:00:00.5+02:00").unwrap()),
+            "2026-10-05T08:00:00Z"
+        );
+    }
+
+    #[test]
+    fn since_accepts_the_rfc3339_spellings_clap_reads() {
+        for (text, ok) in [
+            ("2026-10-05T08:00:00Z", true),
+            ("2026-10-05T10:00:00.5+02:00", true),
+            ("2026-10-05 08:00:00Z", true),
+            ("2026-10-05T08:00:00", false),
+            ("2026-10-05", false),
+        ] {
+            assert_eq!(parse_since(text).is_ok(), ok, "{text}");
+        }
+    }
+
+    #[test]
+    fn since_keeps_a_leap_second_as_the_first_second_of_the_next_minute() {
+        assert_eq!(
+            stamp(parse_since("2016-12-31T23:59:60Z").unwrap()),
+            "2017-01-01T00:00:00Z"
+        );
+    }
+
+    #[test]
+    fn since_out_of_range_is_an_error_not_a_panic() {
+        for text in ["9999-12-31T23:59:59-23:59", "+10000-01-01T00:00:00Z"] {
+            assert_eq!(
+                parse_since(text),
+                Err(format!("not an RFC 3339 time: {text}"))
+            );
+        }
     }
 }

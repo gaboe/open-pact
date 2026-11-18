@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use chrono::{DateTime, NaiveDate, TimeDelta, Utc};
+use time::{Date, Duration, OffsetDateTime};
+
+use crate::timestamp;
 
 use crate::{
     Accepted, Claim, ControlValue, Manifest, ManifestHash, Metadata, Os, Span, TrustLevel,
@@ -15,7 +17,7 @@ pub enum Decision {
 
 /// When each required control of one device under one manifest started to fail or report
 /// `unknown`, as the gateway observed it. Keyed by control id.
-pub type FirstFailures = BTreeMap<String, DateTime<Utc>>;
+pub type FirstFailures = BTreeMap<String, OffsetDateTime>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Evaluation {
@@ -30,20 +32,20 @@ pub enum Grace {
     /// The grace is `0d`: the failure denies at once.
     None,
     /// Access continues for this long.
-    Left(TimeDelta),
+    Left(Duration),
     /// The grace ran out.
     Ended(Span),
 }
 
 impl Grace {
-    fn of(span: &Span, first_failure: DateTime<Utc>, now: DateTime<Utc>) -> Grace {
+    fn of(span: &Span, first_failure: OffsetDateTime, now: OffsetDateTime) -> Grace {
         if span.is_zero() {
             return Grace::None;
         }
         let Some(length) = span.min_duration() else {
-            return Grace::Left(TimeDelta::MAX);
+            return Grace::Left(timestamp::MAX);
         };
-        let elapsed = (now - first_failure).max(TimeDelta::zero());
+        let elapsed = (now - first_failure).max(Duration::ZERO);
         if elapsed > length {
             Grace::Ended(span.clone())
         } else {
@@ -65,13 +67,13 @@ impl Grace {
 }
 
 /// Minutes under an hour, hours under two days, then days and hours. Rounded down.
-struct Remaining(TimeDelta);
+struct Remaining(Duration);
 
 impl fmt::Display for Remaining {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let (hours, days) = (self.0.num_hours(), self.0.num_days());
+        let (hours, days) = (self.0.whole_hours(), self.0.whole_days());
         match (days, hours % 24) {
-            _ if hours < 1 => write!(f, "{}m", self.0.num_minutes()),
+            _ if hours < 1 => write!(f, "{}m", self.0.whole_minutes()),
             _ if hours < 48 => write!(f, "{hours}h"),
             (d, 0) => write!(f, "{d}d"),
             (d, h) => write!(f, "{d}d {h}h"),
@@ -86,14 +88,14 @@ pub enum Reason {
         claimed: ManifestHash,
         enforced: ManifestHash,
     },
-    #[error("claim time {time} is older than claim_max_age {max_age}")]
-    Stale { time: DateTime<Utc>, max_age: Span },
+    #[error("claim time {} is older than claim_max_age {}", timestamp::display(.time), .max_age)]
+    Stale { time: OffsetDateTime, max_age: Span },
     #[error("client must be \"open-pact-client <major>.<minor>.<patch>\"")]
     BadClient,
-    #[error("claim time {0} is more than 5 minutes in the future")]
-    FromFuture(DateTime<Utc>),
-    #[error("manifest is valid from {0}")]
-    NotYetValid(NaiveDate),
+    #[error("claim time {} is more than 5 minutes in the future", timestamp::display(.0))]
+    FromFuture(OffsetDateTime),
+    #[error("manifest is valid from {}", timestamp::date_text(.0))]
+    NotYetValid(Date),
     #[error(
         "min_trust_level {min:?} needs attestation, which is not available: \
          every claim counts as {verified:?} (this one asserts {asserted:?})"
@@ -191,7 +193,7 @@ pub fn control_compliance(
 pub fn evaluate(
     manifest: &Manifest,
     claim: &Claim,
-    now: DateTime<Utc>,
+    now: OffsetDateTime,
     first_failures: &FirstFailures,
 ) -> Evaluation {
     evaluate_under(manifest, manifest, claim, now, first_failures)
@@ -205,7 +207,7 @@ pub fn evaluate_under(
     consented: &Manifest,
     enforced: &Manifest,
     claim: &Claim,
-    now: DateTime<Utc>,
+    now: OffsetDateTime,
     first_failures: &FirstFailures,
 ) -> Evaluation {
     let signed = consented.body();
@@ -230,7 +232,7 @@ pub fn evaluate_under(
             enforced: consented.hash().clone(),
         });
     }
-    if claim.time > now + TimeDelta::minutes(5) {
+    if claim.time > now + Duration::minutes(5) {
         deny.push(Reason::FromFuture(claim.time));
     }
     if body
@@ -243,7 +245,7 @@ pub fn evaluate_under(
             max_age: body.claim_max_age.clone(),
         });
     }
-    if now.date_naive() < body.valid_from {
+    if now.date() < body.valid_from {
         deny.push(Reason::NotYetValid(body.valid_from));
     }
     let verified = verified_trust_level(claim);
@@ -351,8 +353,8 @@ mod tests {
 
     const DEMO: &str = include_str!("../../../examples/manifest.toml");
 
-    fn now() -> DateTime<Utc> {
-        "2026-10-12T09:00:00Z".parse().unwrap()
+    fn now() -> OffsetDateTime {
+        timestamp::parse_rfc3339("2026-10-12T09:00:00Z").unwrap()
     }
 
     fn manifest() -> Manifest {
@@ -410,7 +412,7 @@ mod tests {
         c
     }
 
-    fn decide(m: &Manifest, c: &Claim, now: DateTime<Utc>) -> Decision {
+    fn decide(m: &Manifest, c: &Claim, now: OffsetDateTime) -> Decision {
         evaluate(m, c, now, &FirstFailures::new()).decision
     }
 
@@ -451,7 +453,7 @@ mod tests {
         ] {
             let mut c = claim(&[]);
             c.client = bad.into();
-            let Decision::Deny { reasons } = decide(&m, &c, Utc::now()) else {
+            let Decision::Deny { reasons } = decide(&m, &c, OffsetDateTime::now_utc()) else {
                 panic!("{bad} was allowed");
             };
             assert!(reasons.contains(&Reason::BadClient), "{bad}");
@@ -580,7 +582,7 @@ mod tests {
     }
 
     fn since(hours: i64) -> FirstFailures {
-        FirstFailures::from([("firewall".to_string(), now() - TimeDelta::hours(hours))])
+        FirstFailures::from([("firewall".to_string(), now() - Duration::hours(hours))])
     }
 
     #[test]
@@ -616,7 +618,7 @@ mod tests {
         );
 
         let mut late = since(24);
-        *late.get_mut("firewall").unwrap() -= TimeDelta::seconds(1);
+        *late.get_mut("firewall").unwrap() -= Duration::seconds(1);
         let e = evaluate(&m, &off, now(), &late);
         assert_eq!(
             reasons(e.decision),
@@ -642,7 +644,7 @@ mod tests {
     #[test]
     fn unknown_uses_unknown_grace_even_on_a_zero_grace_control_and_then_denies() {
         let m = manifest();
-        let at = |t: DateTime<Utc>| {
+        let at = |t: OffsetDateTime| {
             let mut c = with(&[("disk_encryption", "unknown")]);
             c.time = t;
             c
@@ -653,12 +655,12 @@ mod tests {
             ["disk_encryption = unknown, full required, access ends in 7d"]
         );
         let started = e.first_failures;
-        let t = now() + TimeDelta::hours(25);
+        let t = now() + Duration::hours(25);
         assert_eq!(
             warnings(evaluate(&m, &at(t), t, &started).decision),
             ["disk_encryption = unknown, full required, access ends in 5d 23h"]
         );
-        let t = now() + TimeDelta::days(7) + TimeDelta::seconds(1);
+        let t = now() + Duration::days(7) + Duration::seconds(1);
         assert_eq!(
             reasons(evaluate(&m, &at(t), t, &started).decision),
             ["disk_encryption = unknown, full required, unknown_grace 7d ended"]
@@ -711,7 +713,7 @@ mod tests {
             with(&[("screen_lock", "never, set by admin")]),
             {
                 let mut c = with(&[]);
-                c.time = now() - TimeDelta::days(2);
+                c.time = now() - Duration::days(2);
                 c
             },
         ] {
@@ -734,12 +736,12 @@ mod tests {
 
     #[test]
     fn remaining_time_is_rounded_down() {
-        let r = |d: TimeDelta| Remaining(d).to_string();
-        assert_eq!(r(TimeDelta::minutes(59)), "59m");
-        assert_eq!(r(TimeDelta::minutes(61)), "1h");
-        assert_eq!(r(TimeDelta::hours(47) + TimeDelta::minutes(59)), "47h");
-        assert_eq!(r(TimeDelta::hours(48)), "2d");
-        assert_eq!(r(TimeDelta::hours(14 * 24 - 1)), "13d 23h");
+        let r = |d: Duration| Remaining(d).to_string();
+        assert_eq!(r(Duration::minutes(59)), "59m");
+        assert_eq!(r(Duration::minutes(61)), "1h");
+        assert_eq!(r(Duration::hours(47) + Duration::minutes(59)), "47h");
+        assert_eq!(r(Duration::hours(48)), "2d");
+        assert_eq!(r(Duration::hours(14 * 24 - 1)), "13d 23h");
     }
 
     #[test]
@@ -751,7 +753,7 @@ mod tests {
 
     #[test]
     fn denies_before_valid_from() {
-        let early = "2026-09-30T23:59:59Z".parse().unwrap();
+        let early = timestamp::parse_rfc3339("2026-09-30T23:59:59Z").unwrap();
         let mut c = claim(&PASSING);
         c.time = early;
         assert_eq!(
@@ -802,12 +804,12 @@ mod tests {
     #[test]
     fn denies_claim_older_than_claim_max_age() {
         let mut c = claim(&PASSING);
-        c.time = now() - TimeDelta::hours(24);
+        c.time = now() - Duration::hours(24);
         assert_eq!(
             decide(&manifest(), &c, now()),
             Decision::Allow { warnings: vec![] }
         );
-        c.time = now() - TimeDelta::hours(24) - TimeDelta::seconds(1);
+        c.time = now() - Duration::hours(24) - Duration::seconds(1);
         assert_eq!(
             reasons(decide(&manifest(), &c, now())),
             ["claim time 2026-10-11 08:59:59 UTC is older than claim_max_age 24h"]
@@ -817,12 +819,12 @@ mod tests {
     #[test]
     fn denies_claim_from_the_future() {
         let mut c = claim(&PASSING);
-        c.time = now() + TimeDelta::minutes(5);
+        c.time = now() + Duration::minutes(5);
         assert_eq!(
             decide(&manifest(), &c, now()),
             Decision::Allow { warnings: vec![] }
         );
-        c.time = now() + TimeDelta::minutes(6);
+        c.time = now() + Duration::minutes(6);
         assert_eq!(
             reasons(decide(&manifest(), &c, now())),
             ["claim time 2026-10-12 09:06:00 UTC is more than 5 minutes in the future"]
@@ -872,7 +874,7 @@ grace = "1d"
             FirstFailures::from([("password_min_length".into(), now())])
         );
 
-        let later = now() + TimeDelta::hours(25);
+        let later = now() + Duration::hours(25);
         let mut late = c.clone();
         late.time = later;
         let ended = evaluate_under(&old, &new, &late, later, &first.first_failures);
@@ -940,5 +942,119 @@ grace = "1d"
                 .any(|r| r.starts_with("claim is for manifest")),
             "the claim must name the manifest the owner signed"
         );
+    }
+
+    mod timestamp_pins {
+        use super::*;
+
+        fn at(s: &str) -> OffsetDateTime {
+            timestamp::parse_rfc3339(s).unwrap()
+        }
+
+        #[test]
+        fn claim_time_wire_format_keeps_chrono_auto_precision() {
+            let mut c = claim(&[]);
+            for (input, wire) in [
+                ("2026-10-12T09:00:00Z", "2026-10-12T09:00:00Z"),
+                ("2026-10-12T09:00:00.5Z", "2026-10-12T09:00:00.500Z"),
+                ("2026-10-12T09:00:00.123456Z", "2026-10-12T09:00:00.123456Z"),
+                (
+                    "2026-10-12T09:00:00.123456789Z",
+                    "2026-10-12T09:00:00.123456789Z",
+                ),
+                ("2026-10-12T09:00:00.000Z", "2026-10-12T09:00:00Z"),
+                ("2026-10-12T11:00:00+02:00", "2026-10-12T09:00:00Z"),
+            ] {
+                c.time = at(input);
+                let json = serde_json::to_value(&c).unwrap();
+                assert_eq!(json["time"], wire, "{input}");
+                assert_eq!(
+                    serde_json::from_value::<Claim>(json).unwrap().time,
+                    at(wire),
+                    "{input}"
+                );
+            }
+        }
+
+        #[test]
+        fn claim_time_reads_which_rfc3339_spellings() {
+            let base = serde_json::to_value(claim(&[])).unwrap();
+            for (text, accepted) in [
+                ("2026-10-12T09:00:00Z", true),
+                ("2026-10-12T09:00:00+00:00", true),
+                ("2026-10-12T09:00:00.5-01:30", true),
+                ("2026-10-12t09:00:00z", true),
+                ("2026-10-12 09:00:00Z", true),
+                // chrono read a leap second; the time crate has none, so it is refused.
+                ("2026-10-12T23:59:60Z", false),
+                ("2026-10-12T09:00:00", false),
+                ("2026-10-12", false),
+                ("2026-10-12T09:00Z", false),
+                ("2026-02-30T00:00:00Z", false),
+            ] {
+                let mut json = base.clone();
+                json["time"] = text.into();
+                assert_eq!(
+                    serde_json::from_value::<Claim>(json).is_ok(),
+                    accepted,
+                    "{text}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_leap_second_claim_time_round_trips_as_chrono_wrote_it() {
+            let base = serde_json::to_value(claim(&[])).unwrap();
+            let mut json = base.clone();
+            json["time"] = "2016-12-31T23:59:60Z".into();
+            // chrono kept a leap second and wrote it back as `23:59:60Z`. The time crate has no
+            // leap second, so the claim is refused. No client writes one.
+            assert!(serde_json::from_value::<Claim>(json).is_err());
+        }
+
+        #[test]
+        fn reason_texts_print_chrono_display_times() {
+            assert_eq!(
+                Reason::Stale {
+                    time: at("2026-10-10T09:00:00.5Z"),
+                    max_age: Span::try_from("24h".to_string()).unwrap(),
+                }
+                .to_string(),
+                "claim time 2026-10-10 09:00:00.500 UTC is older than claim_max_age 24h"
+            );
+            assert_eq!(
+                Reason::FromFuture(at("2026-10-12T09:06:00Z")).to_string(),
+                "claim time 2026-10-12 09:06:00 UTC is more than 5 minutes in the future"
+            );
+            assert_eq!(
+                Reason::NotYetValid(timestamp::ymd(2026, 10, 13).unwrap()).to_string(),
+                "manifest is valid from 2026-10-13"
+            );
+        }
+
+        #[test]
+        fn remaining_time_rounds_down_and_keeps_chrono_limits() {
+            let r = |d: Duration| Remaining(d).to_string();
+            assert_eq!(r(Duration::seconds(-90)), "-1m");
+            assert_eq!(r(Duration::minutes(59)), "59m");
+            assert_eq!(r(Duration::hours(47) + Duration::minutes(59)), "47h");
+            assert_eq!(r(Duration::days(100_000_000_000)), "100000000000d");
+            assert_eq!(r(timestamp::MAX), "106751991167d 7h");
+        }
+
+        #[test]
+        fn a_span_past_chrono_range_reads_as_the_longest_grace() {
+            let t = at("2026-10-12T09:00:00Z");
+            let span = Span::try_from("100000000000d".to_string()).unwrap();
+            assert_eq!(
+                Grace::of(&span, t, t).describe("firewall"),
+                ", access ends in 100000000000d"
+            );
+            let span = Span::try_from("200000000000d".to_string()).unwrap();
+            assert_eq!(
+                Grace::of(&span, t, t).describe("firewall"),
+                ", access ends in 106751991167d 7h"
+            );
+        }
     }
 }

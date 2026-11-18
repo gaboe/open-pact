@@ -12,6 +12,7 @@ mod manifest;
 mod narrowing;
 mod note;
 mod own_entries;
+pub mod timestamp;
 mod witness;
 
 pub use accept::{AcceptRequest, accept_statement};

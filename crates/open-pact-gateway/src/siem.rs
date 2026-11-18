@@ -9,6 +9,7 @@ use std::{
     },
     time::Duration,
 };
+use time::OffsetDateTime;
 
 use anyhow::{Context, bail};
 use open_pact_core::{Claim, Manifest, verified_trust_level};
@@ -27,11 +28,11 @@ pub fn event(
     claim: &Claim,
     reasons: &[String],
     warnings: &[String],
-    access_until: Option<chrono::DateTime<chrono::Utc>>,
+    access_until: Option<OffsetDateTime>,
 ) -> Value {
     let mut body = json!({
         "schema_version": 1,
-        "time": claim.time,
+        "time": open_pact_core::timestamp::rfc3339_auto(claim.time),
         "device_pseudonym": claim.device,
         "manifest_hash": claim.manifest,
         "client_version": claim.client,
@@ -41,7 +42,7 @@ pub fn event(
         "verdict": if reasons.is_empty() { "allow" } else { "deny" },
         "reasons": reasons,
         "warnings": warnings,
-        "access_until": access_until.map(|until| until.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+        "access_until": access_until.map(open_pact_core::timestamp::rfc3339_secs),
     });
     for control in &manifest.body().controls {
         if let Some(value) = claim.results.get(&control.id) {
@@ -374,9 +375,11 @@ fn configured(manifest: &Manifest) -> anyhow::Result<Option<Exporter>> {
         if days < 0 {
             bail!("SIEM retention must be nonnegative");
         }
-        let now = chrono::Utc::now();
-        let deadline = chrono::Duration::try_days(days)
-            .and_then(|d| now.checked_add_signed(d))
+        let now = OffsetDateTime::now_utc();
+        let deadline = days
+            .checked_mul(86400)
+            .and_then(open_pact_core::timestamp::seconds)
+            .and_then(|d| now.checked_add(d))
             .context("SIEM retention exceeds calendar range")?;
         if manifest
             .body()
@@ -479,7 +482,14 @@ mod tests {
         assert!(body.get("result_firewall").is_none());
         assert_eq!(body["verdict"], "deny");
         assert!(body["access_until"].is_null());
-        let until = "2026-11-17T10:20:00Z".parse().unwrap();
+        let until = open_pact_core::timestamp::parse_rfc3339("2026-11-17T10:20:00Z").unwrap();
+        assert_eq!(
+            super::event(&manifest, &claim, &[], &[], Some(until))["open_pact"]["access_until"],
+            "2026-11-17T10:20:00Z"
+        );
+        // The end is written in whole seconds and in UTC, whatever fraction or offset it had.
+        let until =
+            open_pact_core::timestamp::parse_rfc3339("2026-11-17T12:20:00.9+02:00").unwrap();
         assert_eq!(
             super::event(&manifest, &claim, &[], &[], Some(until))["open_pact"]["access_until"],
             "2026-11-17T10:20:00Z"

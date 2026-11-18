@@ -2,7 +2,7 @@
 //! Both edit the same text, `AppView::draft`. Every form edit rewrites it with toml_edit.
 use super::*;
 use gpui_component::{
-    date_picker::{DatePicker, DatePickerEvent, DatePickerState},
+    date_picker::{DatePicker, DatePickerEvent, DatePickerState, DateTime},
     h_resizable,
     highlighter::{Diagnostic, DiagnosticSeverity},
     input::{Editor, Position, Textarea, TextareaState},
@@ -636,7 +636,11 @@ impl AppView {
         cx: &mut Context<Self>,
     ) -> Entity<DatePickerState> {
         let picker = cx.new(|cx| DatePickerState::new(window, cx).date_format("%-d %b %Y"));
-        if let Some(day) = manifest::parse_date(value).and_then(|date| date.and_hms_opt(0, 0, 0)) {
+        if let Some(day) = manifest::parse_date(value) {
+            // The picker takes chrono values, and the apps link `time` only. The text gives the
+            // picker's own midnight type, which the variant fixes.
+            let midnight = format!("{}T00:00:00", open_pact_core::timestamp::date_text(&day));
+            let day = DateTime::Single(midnight.parse().ok());
             picker.update(cx, |state, cx| state.set_date_time(day, window, cx));
         }
         let subscription = cx.subscribe_in(

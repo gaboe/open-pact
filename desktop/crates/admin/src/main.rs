@@ -1495,6 +1495,7 @@ impl Render for AppView {
 }
 
 fn main() {
+    runner::zone::read_start_offset();
     #[cfg(all(feature = "snapshot", target_os = "macos"))]
     if let Some(output) = std::env::var_os("OPEN_PACT_SHOTS") {
         snapshots(PathBuf::from(output));
@@ -1641,7 +1642,7 @@ interval = \"24h\"
             app.history = Some(History { versions: serde_json::from_str(include_str!("../../../tests/fixtures/history.json")).unwrap(), backups: vec![admin::Backup { path: "/fictional/backups/20261116T100000Z-v1-example.toml".into(), manifest_hash: admin::hash(&app.active) }], synced_at: "2026-11-16T12:30:00Z".into(), warnings: if name == "admin-f-history" { vec!["Skipped backup 20261116T101500.000Z-0123456789ab.toml: its content does not match the hash in its name. Move it out of the folder and sync again.".into()] } else { Vec::new() } });
             if screen == Screen::Results {
                 use runner::results::{ClaimDetail, ClaimList, Filters, Period, ResultFilter};
-                let now = "2026-11-16T12:00:00Z".parse().unwrap();
+                let now = open_pact_core::timestamp::parse_rfc3339("2026-11-16T12:00:00Z").unwrap();
                 let mut list: ClaimList = serde_json::from_str(include_str!("../../../tests/fixtures/claims.json")).unwrap();
                 let test_a = Some("7c09e1f4a2b8".to_owned());
                 let filters = match name {

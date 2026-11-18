@@ -1,9 +1,9 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use chrono::{DateTime, Utc};
 use open_pact_core::{BUILTINS, ControlValue, Manifest, Os};
 use serde::Deserialize;
+use time::OffsetDateTime;
 
 use super::*;
 
@@ -53,8 +53,8 @@ impl Case {
         self.input.get(index).and_then(Option::as_deref)
     }
 
-    pub fn now(&self) -> DateTime<Utc> {
-        self.now.parse().expect("case has RFC3339 now")
+    pub fn now(&self) -> OffsetDateTime {
+        open_pact_core::timestamp::parse_rfc3339(&self.now).expect("case has RFC3339 now")
     }
 }
 
@@ -82,7 +82,7 @@ fn kind(value: &ControlValue) -> String {
         ControlValue::Integer(_) => "number".into(),
         ControlValue::Null => "null".into(),
         ControlValue::Text(text) => {
-            if DateTime::parse_from_rfc3339(text).is_ok() {
+            if open_pact_core::timestamp::is_rfc3339(text) {
                 "timestamp".into()
             } else {
                 text.into()
@@ -496,5 +496,24 @@ mod coverage_tests {
             validate_coverage(&expected, &actual, &[&first, &second]),
             Err("duplicate uncovered result \"off\"".into())
         );
+    }
+}
+
+#[cfg(test)]
+mod timestamp_pins {
+    use super::*;
+
+    #[test]
+    fn timestamp_text_is_any_rfc3339_spelling_with_an_offset() {
+        for (text, shown) in [
+            ("2026-10-12T09:00:00Z", "timestamp"),
+            ("2026-10-12T11:00:00.5+02:00", "timestamp"),
+            ("2026-10-12 09:00:00Z", "timestamp"),
+            ("2026-10-12T23:59:60Z", "timestamp"),
+            ("2026-10-12", "2026-10-12"),
+            ("2026-10-12T09:00:00", "2026-10-12T09:00:00"),
+        ] {
+            assert_eq!(kind(&ControlValue::Text(text.into())), shown, "{text}");
+        }
     }
 }

@@ -14,7 +14,7 @@ pub(crate) fn run(id: &str, case: &Case) -> ControlValue {
         "antimalware_realtime" => parse_realtime(text),
         "work_account" => parse_groups(text, &[80]),
         "password_min_length" => parse_pwpolicy_min_length(text),
-        "uptime_days" => parse_boot_time(text, case.now().timestamp()),
+        "uptime_days" => parse_boot_time(text, case.now().unix_timestamp()),
         "preboot_auth" => parse_preboot(text).into(),
         "antimalware_active" => parse_xprotect(text, case.optional(1)).into(),
         "antimalware_signature_age_days" => parse_signature_age(text, case.text(1), case.now()),

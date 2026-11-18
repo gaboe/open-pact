@@ -5,15 +5,16 @@
 use crate::admin::Admin;
 use crate::manifest::{self, Span};
 use crate::text::{Tone, humanize, readable_local, short_hash};
-use chrono::{Duration, SecondsFormat};
+use open_pact_core::timestamp::rfc3339_secs;
 use serde::Deserialize;
 use serde_json::Value;
+use time::Duration;
 
-pub use chrono::{DateTime, Utc};
+pub use time::OffsetDateTime;
 
 /// The time every list and its `--since` flag count from.
-pub fn now() -> DateTime<Utc> {
-    Utc::now()
+pub fn now() -> OffsetDateTime {
+    OffsetDateTime::now_utc()
 }
 
 /// The quiet note under the table when the gateway cannot read some old results.
@@ -85,14 +86,14 @@ impl Period {
     }
 
     /// The start of the period as `--since` takes it, or none for all results.
-    pub fn since(self, now: DateTime<Utc>) -> Option<String> {
+    pub fn since(self, now: OffsetDateTime) -> Option<String> {
         let length = match self {
             Self::Day => Duration::hours(24),
             Self::Week => Duration::days(7),
             Self::Month => Duration::days(30),
             Self::All => return None,
         };
-        Some((now - length).to_rfc3339_opts(SecondsFormat::Secs, true))
+        Some(rfc3339_secs(now - length))
     }
 }
 
@@ -110,7 +111,7 @@ impl Filters {
     }
 
     /// The words after `open-pact-gateway` that list the matching results.
-    pub fn list_words(&self, now: DateTime<Utc>) -> Vec<String> {
+    pub fn list_words(&self, now: OffsetDateTime) -> Vec<String> {
         let mut words: Vec<String> = ["claims", "list", "--json"].map(String::from).into();
         if let Some(device) = &self.device {
             words.extend(["--device".to_owned(), device.clone()]);
@@ -346,7 +347,7 @@ pub fn explain_error(error: &str) -> String {
 
 impl Admin {
     /// `claims list --json` with the flags the filters need. `now` fixes what "24 hours" means.
-    pub fn claims(&self, filters: &Filters, now: DateTime<Utc>) -> Result<ClaimList, String> {
+    pub fn claims(&self, filters: &Filters, now: OffsetDateTime) -> Result<ClaimList, String> {
         let words = filters.list_words(now);
         let words: Vec<&str> = words.iter().map(String::as_str).collect();
         self.runner
@@ -365,7 +366,7 @@ impl Admin {
     }
 
     /// The command `claims list` runs, for the quiet line under the table.
-    pub fn claims_command(filters: &Filters, now: DateTime<Utc>) -> String {
+    pub fn claims_command(filters: &Filters, now: OffsetDateTime) -> String {
         format!(
             "kubectl exec deploy/open-pact-gateway -- open-pact-gateway {}",
             crate::shell_line(&filters.list_words(now))

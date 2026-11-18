@@ -642,7 +642,8 @@ impl Home {
         let vpn = self.file(VPN_DIR);
         let generation = format!(
             "{}-{}",
-            chrono::Utc::now().timestamp_nanos_opt().context("clock")?,
+            i64::try_from(time::OffsetDateTime::now_utc().unix_timestamp_nanos())
+                .context("clock")?,
             std::process::id()
         );
         let dir = vpn.join(&generation);
@@ -862,7 +863,8 @@ impl Home {
         let vpn = self.file(VPN_DIR);
         let generation = format!(
             "{}-{}",
-            chrono::Utc::now().timestamp_nanos_opt().context("clock")?,
+            i64::try_from(time::OffsetDateTime::now_utc().unix_timestamp_nanos())
+                .context("clock")?,
             std::process::id()
         );
         let dir = vpn.join(&generation);
@@ -885,7 +887,8 @@ impl Home {
             ".{}.{}-{}.tmp",
             path.file_name().context("VPN file name")?.to_string_lossy(),
             std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().context("clock")?
+            i64::try_from(time::OffsetDateTime::now_utc().unix_timestamp_nanos())
+                .context("clock")?
         ));
         let mut file = std::fs::OpenOptions::new()
             .write(true)
@@ -1224,11 +1227,11 @@ fn repository_scan_root(_home: &Home) -> Result<PathBuf> {
 }
 
 fn stored_repo_scan(home: &Home) -> Result<Option<checks::repos::RepoScan>> {
-    checks::repos::load(&home.0, chrono::Utc::now().timestamp())
+    checks::repos::load(&home.0, time::OffsetDateTime::now_utc().unix_timestamp())
 }
 
 fn proposal_repo_scan(home: &Home) -> Result<Option<checks::repos::RepoScan>> {
-    let now = chrono::Utc::now().timestamp();
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
     Ok(checks::repos::load_attempt(&home.0)?
         .filter(|scan| scan.partial || checks::repos::fresh(scan, now)))
 }
@@ -2193,7 +2196,7 @@ async fn verify_checkpoint_unstored(
     prev: Option<&Checkpoint>,
     text: &str,
 ) -> Result<Result<Checkpoint, CheckpointVerifyError>> {
-    let now = u64::try_from(chrono::Utc::now().timestamp()).context("clock")?;
+    let now = u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp()).context("clock")?;
     let new = match Note::parse(text).and_then(|note| {
         let checkpoint = key.verify(&note)?;
         verify_cosignatures(policy, &checkpoint, &note, now)?;
@@ -5003,7 +5006,7 @@ mod tests {
     fn step_four_prints_scan_summary_before_the_waiting_message() {
         let home = Path::new("/home/example");
         let scan = checks::repos::RepoScan {
-            scanned_at: chrono::Utc::now().timestamp(),
+            scanned_at: time::OffsetDateTime::now_utc().unix_timestamp(),
             managed_repos_outside: 2,
             managed_repos_total: 2,
             outside_paths: Vec::new(),
@@ -5311,7 +5314,7 @@ mod tests {
         assert_eq!(sent["web_protection"], "unknown");
 
         let key = PublicKey::from(&dev_key::generate());
-        let time = "2026-10-20T12:00:00Z".parse().unwrap();
+        let time = open_pact_core::timestamp::parse_rfc3339("2026-10-20T12:00:00Z").unwrap();
         let claim = Claim {
             manifest: manifest.hash().clone(),
             device: Pseudonym::of(&key),
@@ -5445,7 +5448,7 @@ mod tests {
             },
         ];
         let mut before_approval = company.sign(&checkpoint_of(company.log.origin(), &entries, 2));
-        let now = u64::try_from(chrono::Utc::now().timestamp()).unwrap();
+        let now = u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp()).unwrap();
         witness.cosign(&mut before_approval, now);
         let before_approval = before_approval.to_string();
         home.write(LOG_CHECKPOINT, before_approval.as_bytes())
@@ -5631,7 +5634,7 @@ mod tests {
             let mut checkpoint = Note::parse(&company.empty_checkpoint()).unwrap();
             witness.cosign(
                 &mut checkpoint,
-                u64::try_from(chrono::Utc::now().timestamp()).unwrap(),
+                u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp()).unwrap(),
             );
             let checkpoint = checkpoint.to_string();
             let gateway = FakeGateway::start(move |line, _| match line {
@@ -5691,7 +5694,7 @@ mod tests {
             } else {
                 company.sign(&cp)
             };
-            let now = u64::try_from(chrono::Utc::now().timestamp()).unwrap();
+            let now = u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp()).unwrap();
             if case != "missing witness" {
                 witness.cosign(&mut note, now);
             }
@@ -5767,7 +5770,7 @@ mod tests {
             let mut note = company.sign(&cp);
             witness.cosign(
                 &mut note,
-                u64::try_from(chrono::Utc::now().timestamp()).unwrap(),
+                u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp()).unwrap(),
             );
             let mut response = MyEntries {
                 checkpoint: note.to_string(),
@@ -5961,7 +5964,7 @@ mod tests {
         let mut checkpoint = Note::parse(&company.empty_checkpoint()).unwrap();
         witness.cosign(
             &mut checkpoint,
-            u64::try_from(chrono::Utc::now().timestamp()).unwrap(),
+            u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp()).unwrap(),
         );
         let checkpoint = checkpoint.to_string();
         let gateway = FakeGateway::start(move |line, _| match line {
@@ -6023,7 +6026,7 @@ mod tests {
         });
         witness.cosign(
             &mut checkpoint,
-            u64::try_from(chrono::Utc::now().timestamp()).unwrap(),
+            u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp()).unwrap(),
         );
         let checkpoint = checkpoint.to_string();
         let checkpoint_for_gateway = checkpoint.clone();
@@ -6888,7 +6891,7 @@ mod tests {
                 data: json!({ "device": "another" }),
             },
         ];
-        let now = u64::try_from(chrono::Utc::now().timestamp()).unwrap();
+        let now = u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp()).unwrap();
         let mut before_claim = company.sign(&checkpoint_of(company.log.origin(), &entries, 2));
         witness.cosign(&mut before_claim, now);
         let before_claim = before_claim.to_string();
@@ -7598,7 +7601,7 @@ grace = "1d"
         let mut checkpoint = Note::parse(&company.empty_checkpoint()).unwrap();
         witness.cosign(
             &mut checkpoint,
-            u64::try_from(chrono::Utc::now().timestamp()).unwrap(),
+            u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp()).unwrap(),
         );
         let checkpoint = checkpoint.to_string();
         let gateway = FakeGateway::start(move |line, _| match line {
@@ -7742,7 +7745,7 @@ grace = "1d"
         let mut checkpoint = Note::parse(&company.empty_checkpoint()).unwrap();
         witness.cosign(
             &mut checkpoint,
-            u64::try_from(chrono::Utc::now().timestamp()).unwrap(),
+            u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp()).unwrap(),
         );
         checkpoint.to_string()
     }
@@ -7877,7 +7880,7 @@ grace = "1d"
         let mut note = company.sign(&checkpoint_of(company.log.origin(), &entries, 3));
         witness.cosign(
             &mut note,
-            u64::try_from(chrono::Utc::now().timestamp()).unwrap(),
+            u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp()).unwrap(),
         );
         let checkpoint = note.to_string();
         let response = serde_json::to_string(&MyEntries {
@@ -7961,7 +7964,7 @@ grace = "1d"
         let mut note = company.sign(&checkpoint_of(company.log.origin(), &entries, 2));
         witness.cosign(
             &mut note,
-            u64::try_from(chrono::Utc::now().timestamp()).unwrap(),
+            u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp()).unwrap(),
         );
         let checkpoint = note.to_string();
         let response = serde_json::to_string(&MyEntries {
@@ -8835,7 +8838,7 @@ grace = "1d"
         .await;
         assert_eq!(earlier_pair(&fixture), EARLIER_PAIR);
         // The device has failed `password_set` for thirty days, longer than `unknown_grace`.
-        let since = chrono::Utc::now().timestamp() - 30 * 86_400;
+        let since = time::OffsetDateTime::now_utc().unix_timestamp() - 30 * 86_400;
         fixture
             .home
             .write(
@@ -8946,7 +8949,7 @@ grace = "1d"
             Some(&table),
         )
         .await;
-        let since = chrono::Utc::now().timestamp() - 30 * 86_400;
+        let since = time::OffsetDateTime::now_utc().unix_timestamp() - 30 * 86_400;
         fixture
             .home
             .write(
@@ -10114,7 +10117,7 @@ grace = "1d"
         });
         witness.cosign(
             &mut checkpoint,
-            u64::try_from(chrono::Utc::now().timestamp()).unwrap(),
+            u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp()).unwrap(),
         );
         let checkpoint = checkpoint.to_string();
         let gateway = FakeGateway::start(move |line, _| match line {
@@ -10208,7 +10211,7 @@ grace = "1d"
         });
         witness.cosign(
             &mut checkpoint,
-            u64::try_from(chrono::Utc::now().timestamp()).unwrap(),
+            u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp()).unwrap(),
         );
         let checkpoint = checkpoint.to_string();
         let gateway = FakeGateway::start(move |line, _| match line {
@@ -10731,7 +10734,7 @@ grace = "1d"
         });
         witness.cosign(
             &mut checkpoint,
-            u64::try_from(chrono::Utc::now().timestamp()).unwrap(),
+            u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp()).unwrap(),
         );
         let checkpoint = checkpoint.to_string();
         let gateway = FakeGateway::start(move |line, nth| match line {

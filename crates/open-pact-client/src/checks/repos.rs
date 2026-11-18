@@ -229,7 +229,7 @@ pub(crate) fn scan(root: &Path, folders: &[PathBuf], patterns: &[String]) -> Res
     outside_paths.sort();
     managed_paths.sort();
     let scan = RepoScan {
-        scanned_at: chrono::Utc::now().timestamp(),
+        scanned_at: time::OffsetDateTime::now_utc().unix_timestamp(),
         managed_repos_outside: counts.0,
         managed_repos_total: counts.1,
         outside_paths,
@@ -1346,7 +1346,7 @@ mod tests {
             .cloned()
             .collect::<Vec<_>>();
         let scan = RepoScan {
-            scanned_at: chrono::Utc::now().timestamp(),
+            scanned_at: time::OffsetDateTime::now_utc().unix_timestamp(),
             managed_repos_outside: 1,
             managed_repos_total: 2,
             outside_paths: vec![PathBuf::from("/device/private/repo")],

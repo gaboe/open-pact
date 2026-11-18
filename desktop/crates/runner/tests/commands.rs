@@ -1074,7 +1074,6 @@ fn closing_the_last_window_quits_both_apps() {
 }
 
 mod results {
-    use chrono::{TimeZone, Utc};
     use runner::results::{
         ClaimDetail, ClaimList, ControlStatus, Filters, OLD_GATEWAY, Period, ResultFilter,
         check_name, explain_error, failed_checks_text, result_tag, unreadable_text,
@@ -1084,8 +1083,8 @@ mod results {
     const LIST: &str = include_str!("../../../tests/fixtures/claims.json");
     const SHOW: &str = include_str!("../../../tests/fixtures/claim.json");
 
-    fn now() -> chrono::DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 11, 16, 12, 0, 0).unwrap()
+    fn now() -> time::OffsetDateTime {
+        time::macros::datetime!(2026-11-16 12:00 UTC)
     }
 
     fn words(filters: &Filters) -> Vec<String> {

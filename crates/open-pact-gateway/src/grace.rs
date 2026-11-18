@@ -1,13 +1,13 @@
-use chrono::{DateTime, Utc};
 use open_pact_core::{FirstFailures, Pseudonym};
 use sqlx::PgConnection;
+use time::OffsetDateTime;
 
 pub async fn load(
     conn: &mut PgConnection,
     device: &Pseudonym,
     manifest: &str,
 ) -> sqlx::Result<FirstFailures> {
-    let rows: Vec<(String, DateTime<Utc>)> = sqlx::query_as(
+    let rows: Vec<(String, OffsetDateTime)> = sqlx::query_as(
         "SELECT control, first_failed_at FROM control_failures WHERE pseudonym = $1 AND manifest_hash = $2",
     )
     .bind(device.as_str())
@@ -24,7 +24,7 @@ pub async fn save(
     manifest: &str,
     failures: &FirstFailures,
 ) -> sqlx::Result<()> {
-    let (controls, starts): (Vec<String>, Vec<DateTime<Utc>>) =
+    let (controls, starts): (Vec<String>, Vec<OffsetDateTime>) =
         failures.iter().map(|(c, t)| (c.clone(), *t)).unzip();
     sqlx::query(
         "DELETE FROM control_failures WHERE pseudonym = $1 AND manifest_hash = $2 AND NOT (control = ANY($3))",
@@ -49,8 +49,8 @@ pub async fn save(
 
 #[cfg(test)]
 mod tests {
-    use chrono::TimeDelta;
     use open_pact_core::{PublicKey, dev_key};
+    use time::Duration;
 
     use super::*;
     use crate::testdb;
@@ -62,14 +62,15 @@ mod tests {
         let device = Pseudonym::of(&PublicKey::from(&dev_key::generate()));
         testdb::enrolled_device(&db, device.as_str(), "m").await;
         let mut conn = db.acquire().await.unwrap();
-        let t0: DateTime<Utc> = "2026-10-12T09:00:00Z".parse().unwrap();
+        let t0: OffsetDateTime =
+            open_pact_core::timestamp::parse_rfc3339("2026-10-12T09:00:00Z").unwrap();
 
         let both = FirstFailures::from([("firewall".into(), t0), ("screen_lock".into(), t0)]);
         save(&mut conn, &device, "m", &both).await.unwrap();
         assert_eq!(load(&mut conn, &device, "m").await.unwrap(), both);
         assert!(load(&mut conn, &device, "other").await.unwrap().is_empty());
 
-        let later = FirstFailures::from([("firewall".into(), t0 + TimeDelta::hours(1))]);
+        let later = FirstFailures::from([("firewall".into(), t0 + Duration::hours(1))]);
         save(&mut conn, &device, "m", &later).await.unwrap();
         assert_eq!(
             load(&mut conn, &device, "m").await.unwrap(),
@@ -91,7 +92,8 @@ mod tests {
         let db = testdb::fresh().await;
         let device = Pseudonym::of(&PublicKey::from(&dev_key::generate()));
         testdb::enrolled_device(&db, device.as_str(), "m").await;
-        let t0: DateTime<Utc> = "2026-10-12T09:00:00Z".parse().unwrap();
+        let t0: OffsetDateTime =
+            open_pact_core::timestamp::parse_rfc3339("2026-10-12T09:00:00Z").unwrap();
 
         let mut a = db.begin().await.unwrap();
         crate::devices::lock(&mut a, &device, "m").await.unwrap();

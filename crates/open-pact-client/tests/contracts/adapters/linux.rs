@@ -20,7 +20,7 @@ pub(crate) fn run(id: &str, case: &Case) -> ControlValue {
             parse_gnome_lock(text, case.text(1), case.text(2))
         }
         .into(),
-        "os_supported" => parse_os_supported(text, case.now().date_naive()).into(),
+        "os_supported" => parse_os_supported(text, case.now().date()).into(),
         "auto_login" => {
             aggregate_autologin(&case.input.iter().flatten().cloned().collect::<Vec<_>>()).into()
         }

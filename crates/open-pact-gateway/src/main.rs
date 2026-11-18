@@ -2,6 +2,7 @@ mod claims;
 use open_pact_core::{
     AcceptRequest, DeviceAuthPurpose, EntryWithProof, MyEntries, MyEntriesRequest, evaluate_under,
 };
+use time::OffsetDateTime;
 mod devices;
 mod grace;
 mod invitations;
@@ -30,7 +31,6 @@ use axum::{
     response::{Html, IntoResponse},
     routing::{get, post},
 };
-use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use open_pact_core::{
     Checkpoint, Claim, CsrHash, Decision, Endorsement, EnrolRequest, Entry, EntryKind, Evaluation,
@@ -70,7 +70,7 @@ enum Command {
         json: bool,
         /// How long the invitation stays valid: 30m, 72h, 7d (at most 30d)
         #[arg(long, default_value = "72h", value_parser = invitations::parse_ttl)]
-        ttl: chrono::Duration,
+        ttl: time::Duration,
         /// Who the invitation is for. Stays in the gateway database, never in the log
         #[arg(long, default_value = "")]
         note: String,
@@ -485,7 +485,7 @@ async fn enforce_retention(app: App) {
         match claims::purge(
             &app.db,
             &enforced.manifest.body().claim_retention,
-            chrono::Utc::now(),
+            OffsetDateTime::now_utc(),
         )
         .await
         {
@@ -884,7 +884,7 @@ async fn claim(
                     &mut tx,
                     &claim.device,
                     manifest_hash,
-                    chrono::Utc::now(),
+                    OffsetDateTime::now_utc(),
                     devices::ClaimResult::Denied,
                     None,
                     &reasons,
@@ -898,7 +898,7 @@ async fn claim(
     } else {
         app.manifest.clone()
     };
-    let now = chrono::Utc::now();
+    let now = OffsetDateTime::now_utc();
     let first_failures = if enrolled {
         grace::load(&mut tx, &claim.device, manifest_hash)
             .await
@@ -1047,7 +1047,7 @@ fn consented_manifest(
 fn stored_claim(
     claim: &Claim,
     certificate_pem: Option<&str>,
-    access_until: Option<DateTime<Utc>>,
+    access_until: Option<OffsetDateTime>,
 ) -> anyhow::Result<Value> {
     let mut payload = serde_json::to_value(claim)?;
     let fields = payload.as_object_mut().expect("a claim is a JSON object");
@@ -1073,16 +1073,16 @@ fn stored_claim(
 /// signer runs.
 fn certificate_expiry(
     enforced: &Manifest,
-    nearest_deadline: Option<DateTime<Utc>>,
-    now: DateTime<Utc>,
-) -> Option<DateTime<Utc>> {
+    nearest_deadline: Option<OffsetDateTime>,
+    now: OffsetDateTime,
+) -> Option<OffsetDateTime> {
     let lease = open_pact_core::vpn_lease(
         enforced.body().schedule.as_ref(),
         &enforced.body().claim_max_age,
         nearest_deadline,
         now,
     );
-    let end = DateTime::from_timestamp((now + lease).timestamp(), 0)?;
+    let end = OffsetDateTime::from_unix_timestamp((now + lease).unix_timestamp()).ok()?;
     (end > now).then_some(end)
 }
 
@@ -1090,8 +1090,8 @@ fn certificate_expiry(
 /// grace that ends.
 fn nearest_grace_deadline(
     decision: &open_pact_core::Decision,
-    now: DateTime<Utc>,
-) -> Option<DateTime<Utc>> {
+    now: OffsetDateTime,
+) -> Option<OffsetDateTime> {
     let open_pact_core::Decision::Allow { warnings } = decision else {
         return None;
     };
@@ -1101,8 +1101,8 @@ fn nearest_grace_deadline(
             open_pact_core::Reason::NotAccepted { grace, .. }
             | open_pact_core::Reason::Failed { grace, .. }
             | open_pact_core::Reason::Unknown { grace, .. } => match grace {
-                open_pact_core::Grace::Left(left) if *left != chrono::TimeDelta::MAX => {
-                    Some(now + *left)
+                open_pact_core::Grace::Left(left) if *left != open_pact_core::timestamp::MAX => {
+                    now.checked_add(*left)
                 }
                 _ => None,
             },
@@ -1194,7 +1194,7 @@ fn witness_refresh(manifest: &Manifest, witnesses: &Witnesses) -> anyhow::Result
         .and_then(|p| p.checkpoint_max_age.min_duration())
     {
         Some(age) if !witnesses.urls().is_empty() => {
-            let quarter = u64::try_from(age.num_seconds() / 4).unwrap_or(600);
+            let quarter = u64::try_from(age.whole_seconds() / 4).unwrap_or(600);
             Ok(Some(Duration::from_secs(env_number(
                 "WITNESS_REFRESH_SECS",
                 quarter.clamp(10, 600),
@@ -1289,7 +1289,7 @@ async fn invite(
     db: &PgPool,
     kek: &SealingKey,
     url: &str,
-    ttl: chrono::Duration,
+    ttl: time::Duration,
     note: &str,
     json: bool,
     out: &mut impl std::io::Write,
@@ -1302,7 +1302,7 @@ async fn invite(
     let (code, expires) = invitations::create(db, ttl, note).await?;
     let company = PublicKey::from(&keys.manifest);
     let invitation = Invitation::new(url, &company, &log_key(&keys)?, code);
-    let expires_at = expires.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let expires_at = open_pact_core::timestamp::rfc3339_secs(expires);
     if json {
         let document = InviteDocument {
             invitation: invitation.encode(),
@@ -2160,7 +2160,8 @@ mod tests {
             device,
             device_key,
             nonce: nonce["nonce"].as_str().unwrap().into(),
-            time: chrono::DateTime::from_timestamp(chrono::Utc::now().timestamp(), 0).unwrap(),
+            time: OffsetDateTime::from_unix_timestamp(OffsetDateTime::now_utc().unix_timestamp())
+                .unwrap(),
             client: "open-pact-client 0.0.1".into(),
             os: open_pact_core::Os::Linux,
             trust_level: open_pact_core::TrustLevel::L0,
@@ -2297,7 +2298,7 @@ mod tests {
         for key in [&first, &second] {
             let owner = open_pact_core::dev_key::generate();
             let note = "private owner at example.org";
-            let (code, _) = invitations::create(&db, chrono::Duration::hours(1), note)
+            let (code, _) = invitations::create(&db, time::Duration::hours(1), note)
                 .await
                 .unwrap();
             private_values.extend([
@@ -2538,8 +2539,8 @@ grace = "1d"
         Manifest::parse(toml.as_bytes()).unwrap()
     }
 
-    fn at(text: &str) -> DateTime<Utc> {
-        text.parse().unwrap()
+    fn at(text: &str) -> OffsetDateTime {
+        open_pact_core::timestamp::parse_rfc3339(text).unwrap()
     }
 
     /// The demo sends every 55 minutes on the VPN, so its certificate lasts 110 minutes.
@@ -2548,7 +2549,7 @@ grace = "1d"
         let now = at("2026-11-17T09:00:00Z");
         assert_eq!(
             certificate_expiry(&demo_with(&[]), None, now),
-            Some(now + chrono::TimeDelta::minutes(110))
+            Some(now + time::Duration::minutes(110))
         );
     }
 
@@ -2558,7 +2559,7 @@ grace = "1d"
         let short = demo_with(&[("claim_max_age = \"24h\"", "claim_max_age = \"1h\"")]);
         assert_eq!(
             certificate_expiry(&short, None, now),
-            Some(now + chrono::TimeDelta::hours(1))
+            Some(now + time::Duration::hours(1))
         );
     }
 
@@ -2571,7 +2572,7 @@ grace = "1d"
         ]);
         assert_eq!(
             certificate_expiry(&long, None, now),
-            Some(now + chrono::TimeDelta::hours(24))
+            Some(now + time::Duration::hours(24))
         );
     }
 
@@ -2579,7 +2580,7 @@ grace = "1d"
     fn the_nearest_grace_deadline_bounds_the_certificate() {
         let now = at("2026-11-17T09:00:00Z");
         let demo = demo_with(&[]);
-        let deadline = now + chrono::TimeDelta::minutes(25);
+        let deadline = now + time::Duration::minutes(25);
         assert_eq!(
             certificate_expiry(&demo, Some(deadline), now),
             Some(deadline)
@@ -2602,7 +2603,7 @@ grace = "1d"
         assert_eq!(end, at("2026-11-17T09:00:30Z"));
         assert!(end <= deadline);
         assert_eq!(
-            certificate_expiry(&demo, Some(now + chrono::TimeDelta::milliseconds(50)), now),
+            certificate_expiry(&demo, Some(now + time::Duration::milliseconds(50)), now),
             None,
             "less than a second of grace left gives no certificate"
         );
@@ -2615,7 +2616,7 @@ grace = "1d"
         let without = Manifest::parse(head.as_bytes()).unwrap();
         assert_eq!(
             certificate_expiry(&without, None, now),
-            Some(now + chrono::TimeDelta::hours(24))
+            Some(now + time::Duration::hours(24))
         );
     }
 
@@ -2626,25 +2627,25 @@ grace = "1d"
             id: "firewall".into(),
             grace,
         };
-        let left = |length: chrono::TimeDelta| open_pact_core::Grace::Left(length);
+        let left = |length: time::Duration| open_pact_core::Grace::Left(length);
         let allowed = open_pact_core::Decision::Allow {
             warnings: vec![
-                warning(left(chrono::TimeDelta::hours(3))),
-                warning(left(chrono::TimeDelta::minutes(40))),
+                warning(left(time::Duration::hours(3))),
+                warning(left(time::Duration::minutes(40))),
             ],
         };
         assert_eq!(
             nearest_grace_deadline(&allowed, now),
-            Some(now + chrono::TimeDelta::minutes(40))
+            Some(now + time::Duration::minutes(40))
         );
         let endless = open_pact_core::Decision::Allow {
-            warnings: vec![warning(left(chrono::TimeDelta::MAX))],
+            warnings: vec![warning(left(open_pact_core::timestamp::MAX))],
         };
         assert_eq!(nearest_grace_deadline(&endless, now), None);
         let clean = open_pact_core::Decision::Allow { warnings: vec![] };
         assert_eq!(nearest_grace_deadline(&clean, now), None);
         let denied = open_pact_core::Decision::Deny {
-            reasons: vec![warning(left(chrono::TimeDelta::minutes(1)))],
+            reasons: vec![warning(left(time::Duration::minutes(1)))],
         };
         assert_eq!(nearest_grace_deadline(&denied, now), None);
     }
@@ -2665,7 +2666,7 @@ grace = "1d"
         post_json(app, "/v1/claim", &json!({"jws": jws, "csr_pem": pem})).await
     }
 
-    fn certificate_end(body: &Value) -> DateTime<Utc> {
+    fn certificate_end(body: &Value) -> OffsetDateTime {
         keys::certificate_not_after(body["certificate_pem"].as_str().expect("a certificate"))
             .unwrap()
     }
@@ -2680,9 +2681,9 @@ grace = "1d"
 
         let (status, body) = send_with_csr(&app, &owned, &[]).await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        let left = certificate_end(&body) - chrono::Utc::now();
+        let left = certificate_end(&body) - OffsetDateTime::now_utc();
         assert!(
-            left > chrono::TimeDelta::minutes(109) && left <= chrono::TimeDelta::minutes(110),
+            left > time::Duration::minutes(109) && left <= time::Duration::minutes(110),
             "a clean claim: {left}"
         );
 
@@ -2692,9 +2693,9 @@ grace = "1d"
             body["warnings"].to_string().contains("access ends in"),
             "{body}"
         );
-        let left = certificate_end(&body) - chrono::Utc::now();
+        let left = certificate_end(&body) - OffsetDateTime::now_utc();
         assert!(
-            left > chrono::TimeDelta::minutes(109) && left <= chrono::TimeDelta::minutes(110),
+            left > time::Duration::minutes(109) && left <= time::Duration::minutes(110),
             "a warning with a day of grace left still gets the interval: {left}"
         );
 
@@ -2706,12 +2707,12 @@ grace = "1d"
         .unwrap();
         let (status, body) = send_with_csr(&app, &owned, &[("firewall", "off")]).await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        let left = certificate_end(&body) - chrono::Utc::now();
+        let left = certificate_end(&body) - OffsetDateTime::now_utc();
         assert!(
-            left > chrono::TimeDelta::minutes(29) && left <= chrono::TimeDelta::minutes(30),
+            left > time::Duration::minutes(29) && left <= time::Duration::minutes(30),
             "the grace deadline is 30 minutes away: {left}"
         );
-        let stored: Option<DateTime<Utc>> =
+        let stored: Option<OffsetDateTime> =
             sqlx::query_scalar("SELECT last_access_until FROM devices WHERE pseudonym = $1")
                 .bind(owned.pseudonym.as_str())
                 .fetch_one(&db)
@@ -2746,9 +2747,9 @@ grace = "1d"
             )
             .await;
             assert_eq!(status, StatusCode::OK, "{case}: {body}");
-            let left = certificate_end(&body) - chrono::Utc::now();
+            let left = certificate_end(&body) - OffsetDateTime::now_utc();
             assert!(
-                left > chrono::TimeDelta::minutes(9) && left <= chrono::TimeDelta::minutes(10),
+                left > time::Duration::minutes(9) && left <= time::Duration::minutes(10),
                 "{case}: the enforced 5m interval gives 10 minutes: {left}"
             );
         }
@@ -2764,7 +2765,7 @@ grace = "1d"
         let claim = claim_under(&app, &owned.device, DEMO).await;
         let (status, body) = send_claim(&app, &owned.device, &claim, None).await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        let (at, until): (Option<DateTime<Utc>>, Option<DateTime<Utc>>) = sqlx::query_as(
+        let (at, until): (Option<OffsetDateTime>, Option<OffsetDateTime>) = sqlx::query_as(
             "SELECT last_claim_at, last_access_until FROM devices WHERE pseudonym = $1",
         )
         .bind(owned.pseudonym.as_str())
@@ -2808,14 +2809,12 @@ grace = "1d"
         ] {
             assert!(warnings.contains(part), "{part} missing from {warnings}");
         }
-        let (received, delete_after): (
-            chrono::DateTime<chrono::Utc>,
-            chrono::DateTime<chrono::Utc>,
-        ) = sqlx::query_as("SELECT received_at, delete_after FROM claims")
-            .fetch_one(&db)
-            .await
-            .unwrap();
-        let kept = (delete_after - received).num_days();
+        let (received, delete_after): (OffsetDateTime, OffsetDateTime) =
+            sqlx::query_as("SELECT received_at, delete_after FROM claims")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        let kept = (delete_after - received).whole_days();
         assert!(
             (180..=185).contains(&kept),
             "a claim under A keeps A's 6mo retention, not B's 12mo: {kept} days"
@@ -3737,7 +3736,7 @@ grace = "1d"
             &db,
             &SealingKey::new(&TEST_KEK),
             "ftp://fictional.example/path",
-            chrono::Duration::hours(1),
+            time::Duration::hours(1),
             "FICTIONAL",
             false,
             &mut Vec::new(),
@@ -3825,6 +3824,73 @@ grace = "1d"
         assert!(!parse(&[]).prints_json());
     }
 
+    /// `claims list --since` read these spellings while clap used chrono's `FromStr`.
+    fn since_reads(text: &str, expected: &str) {
+        let cli = Cli::try_parse_from(["open-pact-gateway", "claims", "list", "--since", text])
+            .unwrap_or_else(|error| panic!("{text:?}: {error}"));
+        let Some(Command::Claims {
+            command: results::Command::List {
+                since: Some(since), ..
+            },
+        }) = cli.command
+        else {
+            panic!("claims list command")
+        };
+        assert_eq!(
+            open_pact_core::timestamp::rfc3339_auto(since),
+            expected,
+            "{text:?}"
+        );
+    }
+
+    macro_rules! since_spellings {
+        ($($name:ident: $text:expr => $expected:expr;)*) => {
+            $(
+                #[test]
+                fn $name() {
+                    since_reads($text, $expected);
+                }
+            )*
+        };
+    }
+
+    since_spellings! {
+        since_reads_rfc3339_with_z: "2026-10-12T09:00:00Z" => "2026-10-12T09:00:00Z";
+        since_reads_an_offset_without_a_colon: "2026-10-12T09:00:00+0000" => "2026-10-12T09:00:00Z";
+        since_reads_an_offset_with_a_space: "2026-10-12T09:00:00 +00 00" => "2026-10-12T09:00:00Z";
+        since_reads_a_utc_suffix_after_a_space: "2026-10-12 09:00:00 UTC" => "2026-10-12T09:00:00Z";
+        since_reads_a_lowercase_utc_suffix: "2026-10-12 09:00:00 utc" => "2026-10-12T09:00:00Z";
+        since_reads_one_digit_fields: "2026-1-2T3:4:5Z" => "2026-01-02T03:04:05Z";
+        since_reads_trailing_white_space: "2026-10-12T09:00:00Z " => "2026-10-12T09:00:00Z";
+        since_reads_white_space_between_the_parts: "2026 - 10 - 12T 09 : 00 : 00 Z" => "2026-10-12T09:00:00Z";
+        since_reads_a_signed_year: "+2026-10-12T09:00:00Z" => "2026-10-12T09:00:00Z";
+        since_reads_a_unicode_minus_in_the_offset: "2026-10-12T09:00:00\u{2212}02:00" => "2026-10-12T11:00:00Z";
+        since_reads_a_space_before_the_time: "2026-10-12 09:00:00+02:00" => "2026-10-12T07:00:00Z";
+        since_reads_a_lowercase_t_and_z: "2026-10-12t09:00:00z" => "2026-10-12T09:00:00Z";
+        since_reads_a_fraction: "2026-10-12T09:00:00.5+02:00" => "2026-10-12T07:00:00.500Z";
+        since_reads_a_leap_second: "2016-12-31T23:59:60Z" => "2017-01-01T00:00:00Z";
+    }
+
+    #[test]
+    fn since_refuses_text_chrono_refused_and_instants_past_the_range_of_time() {
+        for text in [
+            "2026-10-12",
+            "2026-10-12T09:00:00",
+            "2026-10-12T09:00:00+24:00",
+            "9999-12-31T23:59:59-23:59",
+            "+10000-01-01T00:00:00Z",
+        ] {
+            let error =
+                Cli::try_parse_from(["open-pact-gateway", "claims", "list", "--since", text])
+                    .map(|_| ())
+                    .unwrap_err();
+            assert!(
+                error.to_string().contains("not an RFC 3339 time"),
+                "{text}: {error}"
+            );
+        }
+    }
+
     #[tokio::test]
     #[ignore = "needs TEST_DATABASE_URL and LOG_ORIGIN"]
     async fn invite_json_prints_one_document_and_nothing_else() {
@@ -3836,7 +3902,7 @@ grace = "1d"
             &db,
             &kek,
             "https://pact.example.com",
-            chrono::Duration::hours(72),
+            time::Duration::hours(72),
             "MacBook, K. Example",
             true,
             &mut out,
@@ -3850,8 +3916,8 @@ grace = "1d"
         assert_eq!(document["note"], "MacBook, K. Example");
         assert_eq!(document["company_key_fingerprint"], invitation.company);
         let expires = document["expires_at"].as_str().unwrap();
-        let expires: chrono::DateTime<chrono::Utc> = expires.parse().unwrap();
-        let hours = (expires - chrono::Utc::now()).num_hours();
+        let expires = open_pact_core::timestamp::parse_rfc3339(expires).unwrap();
+        let hours = (expires - OffsetDateTime::now_utc()).whole_hours();
         assert!((70..=72).contains(&hours), "{hours}");
 
         let mut plain = Vec::new();
@@ -3859,7 +3925,7 @@ grace = "1d"
             &db,
             &kek,
             "https://pact.example.com",
-            chrono::Duration::hours(1),
+            time::Duration::hours(1),
             "",
             false,
             &mut plain,

@@ -51,7 +51,11 @@ impl OperationLog {
         let mut entries = self.lock();
         entries.push(OperationEntry {
             operation: operation.to_owned(),
-            at: chrono::Local::now().format("%H:%M:%S").to_string(),
+            at: crate::zone::to_local(time::OffsetDateTime::now_utc())
+                .format(time::macros::format_description!(
+                    "[hour]:[minute]:[second]"
+                ))
+                .expect("a time of day has this form"),
             result: None,
         });
         entries.len() - 1

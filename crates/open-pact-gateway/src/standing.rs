@@ -2,10 +2,10 @@
 //! when it runs, from the device's last claim decision and the clock. No job writes it, and the
 //! gateway revokes no certificate.
 
-use chrono::{DateTime, TimeDelta, Utc};
 use open_pact_core::{Manifest, Place};
 use serde::Serialize;
 use sqlx::PgPool;
+use time::{Duration, OffsetDateTime};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -26,18 +26,18 @@ pub enum Standing {
 /// The last claim decision of a device: the newest one over its enrolments.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LastDecision {
-    pub at: DateTime<Utc>,
+    pub at: OffsetDateTime,
     pub denied: bool,
     /// The end of the certificate that claim got. None for a denial and for a claim without one.
-    pub access_until: Option<DateTime<Utc>>,
+    pub access_until: Option<OffsetDateTime>,
     /// The manifest the claim was made under.
     pub manifest: String,
 }
 
 /// The send interval on the VPN, which is the one `vpn_lease` doubles. None without a schedule.
-pub fn send_interval(manifest: Option<&Manifest>) -> Option<TimeDelta> {
+pub fn send_interval(manifest: Option<&Manifest>) -> Option<Duration> {
     let interval = manifest?.body().schedule.as_ref()?.period(Place::Vpn)?;
-    TimeDelta::try_seconds(interval.as_secs())
+    open_pact_core::timestamp::seconds(interval.as_secs())
 }
 
 /// The standing at `now`. A denial stands until a newer claim. A certificate that has not ended
@@ -46,8 +46,8 @@ pub fn send_interval(manifest: Option<&Manifest>) -> Option<TimeDelta> {
 /// lapsed when it is not. Without a schedule, no silence is judged.
 pub fn standing(
     last: Option<&LastDecision>,
-    send_interval: Option<TimeDelta>,
-    now: DateTime<Utc>,
+    send_interval: Option<Duration>,
+    now: OffsetDateTime,
 ) -> Standing {
     let Some(last) = last else {
         return Standing::Silent;
@@ -69,7 +69,7 @@ pub fn standing(
 
 /// The newest decision of the device over its enrolments, or None when it never claimed.
 pub async fn last_decision(db: &PgPool, device: &str) -> anyhow::Result<Option<LastDecision>> {
-    type Row = (DateTime<Utc>, String, Option<DateTime<Utc>>, String);
+    type Row = (OffsetDateTime, String, Option<OffsetDateTime>, String);
     let row: Option<Row> = sqlx::query_as(
         "SELECT last_claim_at, last_result, last_access_until, manifest_hash FROM devices \
          WHERE pseudonym = $1 AND last_claim_at IS NOT NULL ORDER BY last_claim_at DESC LIMIT 1",
@@ -91,8 +91,8 @@ pub async fn last_decision(db: &PgPool, device: &str) -> anyhow::Result<Option<L
 mod tests {
     use super::*;
 
-    fn at(text: &str) -> DateTime<Utc> {
-        text.parse().unwrap()
+    fn at(text: &str) -> OffsetDateTime {
+        open_pact_core::timestamp::parse_rfc3339(text).unwrap()
     }
 
     fn decision(denied: bool, access_until: Option<&str>) -> LastDecision {
@@ -122,7 +122,7 @@ mod tests {
         let last = decision(false, Some("2026-11-17T10:00:00Z"));
         let before = at("2026-11-17T09:59:59Z");
         assert_eq!(
-            standing(Some(&last), Some(TimeDelta::minutes(55)), before),
+            standing(Some(&last), Some(Duration::minutes(55)), before),
             Standing::Current
         );
     }
@@ -132,7 +132,7 @@ mod tests {
         let last = decision(false, Some("2026-11-17T09:30:00Z"));
         let now = at("2026-11-17T10:00:00Z");
         assert_eq!(
-            standing(Some(&last), Some(TimeDelta::minutes(55)), now),
+            standing(Some(&last), Some(Duration::minutes(55)), now),
             Standing::Lapsed
         );
     }
@@ -142,13 +142,13 @@ mod tests {
         let last = decision(false, Some("2026-11-17T09:30:00Z"));
         let at_the_limit = at("2026-11-17T10:50:00Z");
         assert_eq!(
-            standing(Some(&last), Some(TimeDelta::minutes(55)), at_the_limit),
+            standing(Some(&last), Some(Duration::minutes(55)), at_the_limit),
             Standing::Lapsed,
             "exactly twice the interval is still in time"
         );
         let past = at("2026-11-17T10:50:01Z");
         assert_eq!(
-            standing(Some(&last), Some(TimeDelta::minutes(55)), past),
+            standing(Some(&last), Some(Duration::minutes(55)), past),
             Standing::Silent
         );
     }
@@ -166,7 +166,7 @@ mod tests {
     fn an_accepted_claim_with_no_recorded_end_is_unknown() {
         let last = decision(false, None);
         for now in ["2026-11-17T09:05:00Z", "2026-11-18T09:05:00Z"] {
-            for interval in [None, Some(TimeDelta::minutes(55))] {
+            for interval in [None, Some(Duration::minutes(55))] {
                 assert_eq!(
                     standing(Some(&last), interval, at(now)),
                     Standing::Unknown,
@@ -184,7 +184,7 @@ mod tests {
     #[test]
     fn the_send_interval_is_the_vpn_period_of_the_manifest() {
         let demo = Manifest::parse(include_bytes!("../../../examples/manifest.toml")).unwrap();
-        assert_eq!(send_interval(Some(&demo)), Some(TimeDelta::minutes(55)));
+        assert_eq!(send_interval(Some(&demo)), Some(Duration::minutes(55)));
         assert_eq!(send_interval(None), None);
     }
 }
