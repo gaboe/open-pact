@@ -377,6 +377,16 @@ pub fn evaluate_under(
         }
     }
 
+    if !envelope_clean {
+        // A denied envelope keeps the stored first failures, so a failure first seen now has no
+        // saved start and its deadline is not binding.
+        for (id, control) in standing.iter_mut() {
+            if matches!(control, ControlStanding::Warn { .. }) && !first_failures.contains_key(id) {
+                *control = ControlStanding::Warn { deadline: None };
+            }
+        }
+    }
+
     let decision = if deny.is_empty() {
         Decision::Allow { warnings: warn }
     } else {
@@ -913,6 +923,31 @@ mod tests {
                 )]
             );
         }
+    }
+
+    #[test]
+    fn a_denied_envelope_gives_no_deadline_to_a_failure_first_seen_now() {
+        let m = manifest();
+        let mut c = with(&[("firewall", "off"), ("screen_lock", "none")]);
+        c.time = now() - Duration::hours(25);
+        let stored = FirstFailures::from([("screen_lock".to_string(), now() - Duration::hours(2))]);
+        let e = evaluate(&m, &c, now(), &stored);
+        assert_eq!(
+            e.first_failures, stored,
+            "a stale claim saves no first failure"
+        );
+        assert_eq!(
+            e.controls["firewall"],
+            ControlStanding::Warn { deadline: None },
+            "first seen in a denied claim"
+        );
+        assert_eq!(
+            e.controls["screen_lock"],
+            ControlStanding::Warn {
+                deadline: Some(now() + Duration::hours(22))
+            },
+            "the stored start still binds"
+        );
     }
 
     #[test]
