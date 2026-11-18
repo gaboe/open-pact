@@ -102,7 +102,8 @@ fn is_id(text: &str) -> bool {
 }
 
 fn body_row(body: &str) -> Option<(String, String)> {
-    if body == "client must be \"open-pact-client <major>.<minor>.<patch>\"" {
+    // Older gateways end the text after <patch>; newer ones also name the prerelease forms.
+    if body.starts_with("client must be \"open-pact-client ") {
         return Some((
             "App version".into(),
             "The company cannot read the version this app sent".into(),
@@ -201,6 +202,15 @@ mod tests {
             detail: Some(detail.into()),
             grace,
         }
+    }
+
+    #[test]
+    fn the_newer_client_version_text_reads_as_the_same_row() {
+        let old = row("client must be \"open-pact-client <major>.<minor>.<patch>\"");
+        let new = row(
+            "client must be \"open-pact-client <major>.<minor>.<patch>\", optionally with -alpha.<n>, -beta.<n> or -rc.<n>",
+        );
+        assert_eq!(old, new);
     }
 
     #[test]
