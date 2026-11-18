@@ -26,6 +26,7 @@ const IO_TIMEOUT: Duration = Duration::from_secs(5);
 pub fn event(
     manifest: &Manifest,
     claim: &Claim,
+    device_note: &str,
     reasons: &[String],
     warnings: &[String],
     access_until: Option<OffsetDateTime>,
@@ -34,6 +35,7 @@ pub fn event(
         "schema_version": 1,
         "time": open_pact_core::timestamp::rfc3339_auto(claim.time),
         "device_pseudonym": claim.device,
+        "device_note": (!device_note.is_empty()).then_some(device_note),
         "manifest_hash": claim.manifest,
         "client_version": claim.client,
         "os": claim.os,
@@ -471,10 +473,20 @@ mod tests {
     }
 
     #[test]
+    fn event_names_the_device_with_its_invitation_note() {
+        let manifest = Manifest::parse(include_bytes!("../../../examples/manifest.toml")).unwrap();
+        let claim = claim(&manifest);
+        let named = event(&manifest, &claim, "Laptop, Example Person", &[], &[], None);
+        assert_eq!(named["open_pact"]["device_note"], "Laptop, Example Person");
+        let unnamed = event(&manifest, &claim, "", &[], &[], None);
+        assert_eq!(unnamed["open_pact"]["device_note"], Value::Null);
+    }
+
+    #[test]
     fn event_contains_only_declared_results_and_selected_metadata() {
         let manifest = Manifest::parse(include_bytes!("../../../examples/manifest.toml")).unwrap();
         let claim = claim(&manifest);
-        let event = event(&manifest, &claim, &["device revoked".into()], &[], None);
+        let event = event(&manifest, &claim, "", &["device revoked".into()], &[], None);
         let body = &event["open_pact"];
         assert_eq!(event.as_object().unwrap().len(), 1);
         assert_eq!(body["result_disk_encryption"], "full");
@@ -484,14 +496,14 @@ mod tests {
         assert!(body["access_until"].is_null());
         let until = open_pact_core::timestamp::parse_rfc3339("2026-11-17T10:20:00Z").unwrap();
         assert_eq!(
-            super::event(&manifest, &claim, &[], &[], Some(until))["open_pact"]["access_until"],
+            super::event(&manifest, &claim, "", &[], &[], Some(until))["open_pact"]["access_until"],
             "2026-11-17T10:20:00Z"
         );
         // The end is written in whole seconds and in UTC, whatever fraction or offset it had.
         let until =
             open_pact_core::timestamp::parse_rfc3339("2026-11-17T12:20:00.9+02:00").unwrap();
         assert_eq!(
-            super::event(&manifest, &claim, &[], &[], Some(until))["open_pact"]["access_until"],
+            super::event(&manifest, &claim, "", &[], &[], Some(until))["open_pact"]["access_until"],
             "2026-11-17T10:20:00Z"
         );
         assert_eq!(body["asserted_trust_level"], "L1");
@@ -501,7 +513,7 @@ mod tests {
         assert!(!event.to_string().contains("private_extra"));
         assert!(!event.to_string().contains("must not leave"));
         assert_eq!(
-            super::event(&manifest, &claim, &[], &[], None)["open_pact"]["verdict"],
+            super::event(&manifest, &claim, "", &[], &[], None)["open_pact"]["verdict"],
             "allow"
         );
     }
