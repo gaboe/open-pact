@@ -32,9 +32,11 @@ impl std::fmt::Display for NeedsElevation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(
             "Join on Windows needs an elevated PowerShell, so that the device key goes into the \
-             TPM and the scheduled job runs as SYSTEM. Open PowerShell with Run as administrator \
-             and run the same join command again. Nothing was sent. To join without that, for \
-             testing only, add --software-key.",
+             TPM and the scheduled job runs as SYSTEM. Open PowerShell with Run as administrator, \
+             using the account you sign in with every day, and run the same join command again. \
+             The join enrols the account that runs it. If Windows asks for another person's \
+             password, stop and ask IT. Nothing was sent. To join without that, for testing \
+             only, add --software-key.",
         )
     }
 }
@@ -165,6 +167,25 @@ impl DeviceKey {
             software,
             holds_key(home),
         ))
+    }
+
+    /// Whether a join with these choices must stop for lack of an elevated process. Only Windows
+    /// stops.
+    #[cfg(not(windows))]
+    pub fn join_needs_elevation(_home: &Path, _software: bool) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Whether this process runs elevated on Windows. False when Windows does not say.
+    #[cfg(windows)]
+    pub fn process_is_elevated() -> bool {
+        windows_key::is_elevated().unwrap_or(false)
+    }
+
+    /// Whether this process runs elevated on Windows. False everywhere else.
+    #[cfg(not(windows))]
+    pub fn process_is_elevated() -> bool {
+        false
     }
 
     /// Reuses the existing key. Tries platform hardware for a new key unless `software`.
@@ -367,6 +388,10 @@ mod tests {
         for part in [
             "elevated PowerShell",
             "Run as administrator",
+            "account you sign in with every day",
+            "enrols the account that runs it",
+            "another person's password",
+            "ask IT",
             "same join command again",
             "TPM",
             "SYSTEM",

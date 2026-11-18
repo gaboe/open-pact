@@ -48,7 +48,7 @@ On macOS, `join` uses an existing software key if one is present. Otherwise, it 
 
 On Linux, and on Windows or macOS with `--software-key`, the device key is a software key protected by operating-system file permissions. These keys report protection `os_permissions` and trust level `L0`. The owner signing key and VPN certificate key are software keys on every platform.
 
-On Windows, a new join needs an elevated administrator process. A non-elevated join of a home with no device key stops before any request. `--software-key` skips this check, for testing, and reports `key_protection = os_permissions`. Existing keys stay in use.
+On Windows, a new join needs an elevated administrator process. A non-elevated join of a home with no device key stops before any request. `--software-key` skips this check, for testing, and reports `key_protection = os_permissions`. Existing keys stay in use. An elevated join enrols the account that runs it, so use Run as administrator with the account you sign in with every day. A new elevated join defaults the scheduled job to SYSTEM; an owner who already chose keeps the choice.
 
 On Windows, a new join tries the Microsoft Platform Crypto Provider for a persisted,
 non-exportable ECDSA P-256 TPM key. Only its public key leaves the provider.

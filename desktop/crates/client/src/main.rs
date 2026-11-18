@@ -202,6 +202,13 @@ impl AppView {
             Operation::Preview(invitation) => {
                 engine.call("Join preview", Outcome::summary, async move {
                     let session = engine::session(&installed)?;
+                    // Ask before the review, so that the owner does not paste the invitation twice.
+                    if session
+                        .join_needs_elevation()
+                        .map_err(|e| format!("{e:#}"))?
+                    {
+                        return Ok(Outcome::NeedsElevation);
+                    }
                     session
                         .join_preview(&invitation)
                         .await
@@ -232,10 +239,7 @@ impl AppView {
                     };
                     let joined = match joined {
                         Ok(joined) => joined,
-                        Err(error) if error.is::<open_pact_client::NeedsElevation>() => {
-                            return Ok(Outcome::NeedsElevation);
-                        }
-                        Err(error) => return Err(format!("{error:#}")),
+                        Err(error) => return join_failure(&error),
                     };
                     let status = status_of(&session).await?;
                     Ok(Outcome::Joined(status, joined.claim))
@@ -589,7 +593,7 @@ impl AppView {
             }
             Screen::NeedsAdmin => column().gap(px(14.))
                 .child(title("Administrator rights are needed"))
-                .child(div().text_color(rgb(INK_2)).child("Joining a Windows computer needs administrator rights, so that the device key goes into the TPM and the scheduled job runs as SYSTEM. Nothing was sent. Restart the app as administrator, then paste the invitation again."))
+                .child(div().text_color(rgb(INK_2)).child("Joining a Windows computer needs administrator rights, so that the device key goes into the TPM and the scheduled job runs as SYSTEM. Nothing was sent. Restart the app as administrator with the account you sign in with every day: the join enrols the account that runs the app. If Windows asks for another person's password, ask IT. Then paste the invitation again."))
                 .child(actions()
                     .child(Button::new("back").label("Cancel").disabled(self.busy).on_click(cx.listener(|this, _, _, cx| { this.error = None; this.screen = Screen::Invitation; cx.notify(); })))
                     .child(self.action("restart-admin", "Restart as administrator", |_, _| Operation::Restart, cx))),
@@ -850,6 +854,16 @@ fn schedule_text(schedule: &Schedule) -> String {
 }
 
 /// The device status with the online parts, as the status screen shows it.
+/// A join that stopped for lack of administrator rights, before it sent anything, is a screen with
+/// a restart button. Any other failure is a text.
+fn join_failure(error: &anyhow::Error) -> Result<Outcome, String> {
+    if error.is::<open_pact_client::NeedsElevation>() {
+        Ok(Outcome::NeedsElevation)
+    } else {
+        Err(format!("{error:#}"))
+    }
+}
+
 async fn status_of(session: &Session) -> Result<Report, String> {
     session.status(true).await.map_err(|e| format!("{e:#}"))
 }
@@ -1063,5 +1077,34 @@ fn snapshots(output: PathBuf) {
                     app
                 })
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Named imports: a glob would bring in the `#[gpui::test]` macro in place of `#[test]`.
+    use super::{Outcome, join_failure};
+
+    #[test]
+    fn a_refusal_for_lack_of_elevation_maps_to_the_administrator_step() {
+        let refusal = anyhow::Error::new(open_pact_client::NeedsElevation);
+        assert!(matches!(
+            join_failure(&refusal),
+            Ok(Outcome::NeedsElevation)
+        ));
+        let wrapped = refusal.context("join");
+        assert!(
+            matches!(join_failure(&wrapped), Ok(Outcome::NeedsElevation)),
+            "a context layer keeps the refusal"
+        );
+    }
+
+    #[test]
+    fn any_other_failure_stays_a_text() {
+        let other = anyhow::anyhow!("fictional failure");
+        match join_failure(&other) {
+            Err(text) => assert_eq!(text, "fictional failure"),
+            Ok(_) => panic!("a plain failure must not open the administrator step"),
+        }
     }
 }

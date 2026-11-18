@@ -21,6 +21,7 @@ runner = { workspace = true, features = ["desktop", "client"] }
 open-pact-client.workspace = true
 open-pact-core.workspace = true
 serde_json.workspace = true
+anyhow.workspace = true
 gpui.workspace = true
 gpui-component.workspace = true
 gpui-platform.workspace = true

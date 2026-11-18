@@ -4898,6 +4898,7 @@ dependencies = [
 name = "open-pact-app"
 version = "0.8.1"
 dependencies = [
+ "anyhow",
  "gpui-component",
  "gpui-kit-assets",
  "gpui-pre",

@@ -19,6 +19,17 @@ pub(crate) enum RunAs {
     System,
 }
 
+/// Who runs the job of a device whose owner has not chosen yet. A new Windows device joined from an
+/// elevated process runs it as SYSTEM, because only an elevated process can install that job. Every
+/// other case keeps `saved`: the default, or what the owner chose.
+pub(crate) fn default_run_as(windows: bool, elevated: bool, answered: bool, saved: RunAs) -> RunAs {
+    if windows && elevated && !answered {
+        RunAs::System
+    } else {
+        saved
+    }
+}
+
 /// Where the notice about the ignored `open-pact.toml` was already shown. It has its own file, so a
 /// notice never writes the owner's choices.
 const NOTICE_FILE: &str = "legacy-notice.json";
@@ -342,6 +353,28 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let home = Home(dir.path().to_owned());
         (dir, home)
+    }
+
+    #[test]
+    fn only_an_elevated_new_windows_device_defaults_to_a_system_job() {
+        for windows in [false, true] {
+            for elevated in [false, true] {
+                for answered in [false, true] {
+                    for saved in [RunAs::User, RunAs::System] {
+                        let expected = if windows && elevated && !answered {
+                            RunAs::System
+                        } else {
+                            saved
+                        };
+                        assert_eq!(
+                            default_run_as(windows, elevated, answered, saved),
+                            expected,
+                            "windows {windows}, elevated {elevated}, answered {answered}, saved {saved:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
