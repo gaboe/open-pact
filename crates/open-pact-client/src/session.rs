@@ -21,6 +21,8 @@ use crate::{
 #[derive(Clone, Debug, Default)]
 pub struct JoinChoices {
     /// Keep a new device key in a file (trust level L0) even when a Secure Enclave is available.
+    /// On Windows a new join without it needs an elevated process: the call ends with
+    /// [`crate::NeedsElevation`] before it sends anything.
     pub software_key: bool,
     /// Stop after the enrolment instead of waiting for IT to approve the device.
     pub no_wait: bool,

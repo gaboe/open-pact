@@ -33,6 +33,8 @@ enum Screen {
     Install,
     Invitation,
     Review(Arc<JoinPreview>),
+    /// A new join on Windows needs an elevated process; the app offers to restart as administrator.
+    NeedsAdmin,
     Joining(Vec<JoinStep>),
     Status(Arc<Report>),
     Changed(Arc<AcceptPreview>),
@@ -43,6 +45,8 @@ enum Operation {
     Install(bool),
     Preview(String),
     Join(String, Vec<String>, bool),
+    /// Starts this app again through the UAC prompt, then quits this instance.
+    Restart,
     Status,
     Check,
     Changes,
@@ -59,6 +63,10 @@ enum Outcome {
     Preview(JoinPreview),
     Status(Report),
     Joined(Report, Option<ClaimReport>),
+    /// The join stopped before it sent anything: it needs an elevated process.
+    NeedsElevation,
+    /// The administrator copy of the app started.
+    Restarted,
     Check(ClaimReport, Report),
     Changes(AcceptPreview),
     Removed(String, Vec<OtherCopy>),
@@ -87,6 +95,8 @@ impl Outcome {
                 }
             ),
             Self::Status(status) | Self::Joined(status, _) => verdict_word(status.verdict).into(),
+            Self::NeedsElevation => "needs an administrator; nothing was sent".into(),
+            Self::Restarted => "the administrator copy of the app started".into(),
             Self::Check(check, _) if check.accepted => "accepted".into(),
             Self::Check(check, _) => format!("denied: {}", check.reasons.join("; ")),
             Self::Changes(changes) => format!("{} changes", changes.changes.len()),
@@ -219,12 +229,25 @@ impl AppView {
                         session.resume_join(choices, cancel, on_step()).await
                     } else {
                         session.join(&invitation, choices, cancel, on_step()).await
-                    }
-                    .map_err(|e| format!("{e:#}"))?;
+                    };
+                    let joined = match joined {
+                        Ok(joined) => joined,
+                        Err(error) if error.is::<open_pact_client::NeedsElevation>() => {
+                            return Ok(Outcome::NeedsElevation);
+                        }
+                        Err(error) => return Err(format!("{error:#}")),
+                    };
                     let status = status_of(&session).await?;
                     Ok(Outcome::Joined(status, joined.claim))
                 },
             ),
+            Operation::Restart => {
+                engine.call("Restart as administrator", Outcome::summary, async move {
+                    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+                    engine::blocking(move || engine::restart_elevated(&runner, &exe)).await?;
+                    Ok(Outcome::Restarted)
+                })
+            }
             Operation::Status => engine.call("Status", Outcome::summary, async move {
                 status_of(&engine::session(&installed)?)
                     .await
@@ -390,6 +413,9 @@ impl AppView {
                 }
                 self.show_status(status);
             }
+            Ok(Outcome::NeedsElevation) => self.screen = Screen::NeedsAdmin,
+            // The administrator copy runs now: this instance has nothing left to do.
+            Ok(Outcome::Restarted) => cx.quit(),
             Ok(Outcome::Check(check, status)) => {
                 // A denied claim is a result, not a failure: show which checks failed.
                 if !check.accepted {
@@ -561,6 +587,12 @@ impl AppView {
                         .child(Button::new("cancel").label("Cancel").disabled(self.busy).on_click(cx.listener(|this, _, _, cx| { this.screen = Screen::Invitation; cx.notify(); })))
                         .child(self.action("join", "Sign and join", |this, cx| Operation::Join(this.invitation.read(cx).value().to_string(), this.folders.iter().map(|p| p.read(cx).value().to_string()).collect(), this.automatic), cx).disabled(self.busy || !matches)))
             }
+            Screen::NeedsAdmin => column().gap(px(14.))
+                .child(title("Administrator rights are needed"))
+                .child(div().text_color(rgb(INK_2)).child("Joining a Windows computer needs administrator rights, so that the device key goes into the TPM and the scheduled job runs as SYSTEM. Nothing was sent. Restart the app as administrator, then paste the invitation again."))
+                .child(actions()
+                    .child(Button::new("back").label("Cancel").disabled(self.busy).on_click(cx.listener(|this, _, _, cx| { this.error = None; this.screen = Screen::Invitation; cx.notify(); })))
+                    .child(self.action("restart-admin", "Restart as administrator", |_, _| Operation::Restart, cx))),
             Screen::Joining(events) => column().gap(px(14.)).child(title("Joining your company"))
                 .child(column().gap_4().children(events.iter().map(step_view)))
                 .child(note("Closing the window is safe. Reopen it to check saved status."))
@@ -945,6 +977,7 @@ fn snapshots(output: PathBuf) {
                 step(6, "Running the first check", StepState::Started),
             ]),
         ),
+        ("client-3-needs-admin", Screen::NeedsAdmin),
         ("client-4-action", Screen::Status(Arc::new(status()))),
         (
             "client-5-good",

@@ -57,6 +57,9 @@ pub const WAITING_FOR_JOB: &str = "Waiting for the scheduled job";
 #[derive(Serialize)]
 struct ErrorDocument<'a> {
     error: &'a str,
+    /// A fixed word for a failure that an app acts on, such as [`NEEDS_ELEVATION_CODE`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<&'a str>,
 }
 
 /// One control of a sent claim: what the device reported and whether the manifest requires and
@@ -282,7 +285,15 @@ pub(crate) fn document(value: &impl Serialize) {
 
 /// Prints `{"error": ...}`.
 pub(crate) fn error(text: &str) {
-    with(|json| json.line(&ErrorDocument { error: text }, false));
+    with(|json| {
+        json.line(
+            &ErrorDocument {
+                error: text,
+                code: None,
+            },
+            false,
+        )
+    });
 }
 
 /// Step `step` starts. The step that is still open ends first.
@@ -362,6 +373,17 @@ pub(crate) fn finish(result: &crate::JoinResult) {
 /// The error of a command that failed: the line, and a failure exit code.
 pub(crate) fn failed(error_text: &str) -> ExitCode {
     error(error_text);
+    ExitCode::FAILURE
+}
+
+/// The error of a command that failed with `error`: the line, and a failure exit code. A refusal
+/// that an app acts on carries its fixed `code` next to the text.
+pub(crate) fn failed_error(error: &anyhow::Error) -> ExitCode {
+    let text = format!("{error:#}");
+    let code = error
+        .is::<crate::NeedsElevation>()
+        .then_some(crate::NEEDS_ELEVATION_CODE);
+    with(|json| json.line(&ErrorDocument { error: &text, code }, false));
     ExitCode::FAILURE
 }
 

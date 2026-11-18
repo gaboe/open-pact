@@ -75,6 +75,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use device_key::DeviceKey;
+pub use device_key::{NEEDS_ELEVATION_CODE, NeedsElevation};
 use open_pact_core::{
     AcceptRequest, DeviceAuthPurpose, DeviceStatus, MyEntries, MyEntriesRequest,
     device_auth_statement,
@@ -3239,6 +3240,12 @@ async fn join(
     let invitation = Invitation::decode(invitation)?;
     let gateway = invitation.gateway.as_str();
     check_scheme(gateway, insecure_dev)?;
+    // A new device on Windows needs the TPM key and the SYSTEM job: both need an elevated process.
+    // Stop before any request, so that the refusal leaves nothing on the gateway.
+    #[cfg(windows)]
+    if DeviceKey::join_needs_elevation(&home.0, software_key)? {
+        return Err(NeedsElevation.into());
+    }
     #[cfg(unix)]
     if unsafe { libc::geteuid() } == 0 {
         println!(
@@ -4537,7 +4544,7 @@ async fn join_json(
                 json_out::error("interrupted");
                 json_out::settle(ExitCode::from(130))
             }
-            Err(error) => json_out::settle(json_out::failed(&format!("{error:#}"))),
+            Err(error) => json_out::settle(json_out::failed_error(&error)),
         }
     })
     .await
@@ -10307,6 +10314,39 @@ grace = "1d"
             "{lines:?}"
         );
         assert!(lines.iter().all(|line| line.get("result").is_none()));
+    }
+
+    #[tokio::test]
+    async fn a_refusal_for_lack_of_elevation_is_an_error_line_with_a_fixed_code() {
+        let (capture, json) = json_capture();
+        let code = json_out::scope(json, async {
+            json_out::failed_error(&anyhow::Error::new(NeedsElevation))
+        })
+        .await;
+
+        assert_eq!(code, ExitCode::FAILURE);
+        let lines = capture.lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0]["code"], NEEDS_ELEVATION_CODE);
+        assert_eq!(lines[0]["code"], "needs_elevation");
+        assert!(
+            lines[0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("Run as administrator"),
+            "{lines:?}"
+        );
+
+        let (capture, json) = json_capture();
+        let other = json_out::scope(json, async {
+            json_out::failed_error(&anyhow::anyhow!("fictional failure"))
+        })
+        .await;
+        assert_eq!(other, ExitCode::FAILURE);
+        assert_eq!(
+            capture.lines(),
+            vec![serde_json::json!({"error": "fictional failure"})]
+        );
     }
 
     #[tokio::test]

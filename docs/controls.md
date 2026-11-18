@@ -119,7 +119,7 @@ The portable [contract runner](../crates/open-pact-client/src/checks/contracts.r
 
 ## Windows device key
 
-An elevated administrator join tries a persisted, non-exportable ECDSA P-256 key through the Microsoft Platform Crypto Provider. The home stores only the key name in `device-tpm.key`. The report labels the key `tpm` and requests trust level `L1`; the gateway verifies it as `L0` because the client does not provide hardware attestation. A non-elevated join, `--software-key`, or an unavailable provider uses a software key. Existing keys stay in use. Key-marker or ACL errors stop the join.
+An elevated administrator join tries a persisted, non-exportable ECDSA P-256 key through the Microsoft Platform Crypto Provider. The home stores only the key name in `device-tpm.key`. The report labels the key `tpm` and requests trust level `L1`; the gateway verifies it as `L0` because the client does not provide hardware attestation. A non-elevated join of a home with no device key stops before it sends anything. `--software-key` or an unavailable provider uses a software key. Existing keys stay in use. Key-marker or ACL errors stop the join.
 
 The machine-key ACL is configured for the joining account and SYSTEM. Hosted Windows CI did not verify signing under a standard-user or SYSTEM task token. Real TPM signing and deletion remain unverified on hosted runners. See [platform support](platform-support.md#key-protection) for the test limits. This device key is separate from the `preboot_auth` result, which describes OS-volume unlock protection.
 
