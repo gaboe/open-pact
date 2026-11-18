@@ -88,6 +88,29 @@ sudo apt install "$verified_dir/open-pact-client_0.8.1_amd64.deb"
 sudo dnf install "$verified_dir/open-pact-client-0.8.1-1.x86_64.rpm"
 ```
 
+## Run the Windows client under app control
+
+The Windows binaries in a release are not Authenticode-signed. Windows checks them in three ways:
+
+- **SmartScreen.** A downloaded file can show "Windows protected your PC". Select **More info**, then **Run anyway**.
+- **Smart App Control.** When it is on, Windows blocks an unsigned file and gives no way to run it. It runs a file that is signed with a certificate from a certificate authority in the Microsoft Trusted Root Program.
+- **App Control for Business.** A managed device runs only what the organization's policy allows.
+
+An organization that uses Smart App Control or App Control for Business signs the release itself:
+
+1. Verify the release with `scripts/verify-client-release.sh`, as in [Verify a release](#verify-a-release).
+2. Sign each Windows executable with the organization's code-signing certificate. Use the timestamp URL of the certificate authority:
+
+   ```powershell
+   signtool sign /fd sha256 /td sha256 /tr <timestamp-url> /a open-pact-client-x86_64-pc-windows-msvc.exe
+   ```
+
+   Sign the executables in the desktop app zip in the same way.
+3. Give the signed files to users through the organization's own channel, such as Intune, a file share, or its own Scoop bucket.
+4. For App Control for Business, allow the organization's signing certificate as a publisher, or allow each file by its hash.
+
+The signature changes each file, so its SHA-256 value no longer matches `SHA256SUMS`. Verify the release before you sign it, and publish the new hashes in your own channel. The desktop installer checks the release zip against `SHA256SUMS`, so install signed desktop apps through your own channel. A new certificate gets SmartScreen reputation only over time; until then, users can still see the SmartScreen prompt.
+
 ## Join and check the gateway
 
 On Windows, set `HOME` before you run the client. The client does not use `USERPROFILE` or `APPDATA` as a fallback. In PowerShell, set an absolute path with `$env:HOME = Join-Path $env:USERPROFILE 'pact'`.

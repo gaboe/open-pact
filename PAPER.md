@@ -349,7 +349,7 @@ claim_retention = "12mo"
 claim_recipients = ["Company IT security", "auditor on request"]
 disclosed_metadata = ["manifest_hash", "device_pseudonym", "device_key", "nonce", "time", "client_version", "os", "trust_level", "vpn_certificate_request", "virtualized", "log_checkpoint"]
 data_controller = "Company Ltd., dpo@company.example"
-min_trust_level = "L1"
+min_trust_level = "L0"               # L1 needs key attestation, which the gateway does not verify yet
 unknown_grace = "7d"                 # default for all checks, never zero
 # The minimum client version is set by a company-signed entry in the transparency log, not here.
 
