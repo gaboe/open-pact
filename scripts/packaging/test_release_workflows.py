@@ -78,8 +78,11 @@ class SigningJobTest(unittest.TestCase):
         self.jobs = jobs("client-release.yml")
 
     def test_only_the_sign_job_can_request_an_identity_token(self):
-        self.assertNotIn("id-token", self.text.split("\njobs:\n", 1)[0])
+        top = self.text.split("\njobs:\n", 1)[0]
+        self.assertNotIn("id-token", top)
+        self.assertNotIn("write-all", top)
         for name, job in self.jobs.items():
+            self.assertNotIn("write-all", job, name)
             if name == "sign":
                 self.assertEqual(re.findall(r"id-token: (\w+)", job), ["write"])
             else:
@@ -91,7 +94,7 @@ class SigningJobTest(unittest.TestCase):
         self.assertEqual(self.text.count("cosign sign-blob"), 2)
 
     def test_every_action_of_the_sign_job_is_pinned_by_commit_sha(self):
-        uses = re.findall(r"^\s+- uses: (\S+)", self.jobs["sign"], flags=re.M)
+        uses = re.findall(r"^\s+(?:- )?uses: (\S+)", self.jobs["sign"], flags=re.M)
         self.assertTrue(uses)
         for action in uses:
             self.assertRegex(action, r"^[\w.-]+/[\w.-]+@[0-9a-f]{40}$")
@@ -109,6 +112,11 @@ class SigningJobTest(unittest.TestCase):
         self.assertRegex(sign, r"cosign-release: v\d+\.\d+\.\d+\n")
         self.assertNotIn("actions/checkout", sign)
         self.assertEqual(needs(sign), ["package"])
+
+    def test_the_sign_job_checks_every_sum_strictly_before_it_signs(self):
+        sign = self.jobs["sign"]
+        self.assertIn("sha256sum --check --strict SHA256SUMS", sign)
+        self.assertLess(sign.index("sha256sum --check --strict"), sign.index("cosign sign-blob"))
 
     def test_the_release_job_waits_for_the_signatures_and_holds_no_signing_right(self):
         release = self.jobs["release"]

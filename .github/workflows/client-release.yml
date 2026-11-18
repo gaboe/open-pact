@@ -207,7 +207,7 @@ jobs:
         working-directory: dist
         run: |
           set -euo pipefail
-          sha256sum --check SHA256SUMS
+          sha256sum --check --strict SHA256SUMS
           cosign sign-blob --yes --bundle SHA256SUMS.sigstore.json SHA256SUMS
           while read -r _ name; do
             name="${name#\*}"
