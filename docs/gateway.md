@@ -64,7 +64,7 @@ Review retention before each rollout. PostgreSQL stores encrypted claims until t
 
 ## Create invitations and approve devices
 
-Create a one-time invitation on the gateway. Use a short lifetime and a fictional note that identifies the device without personal data.
+Create a one-time invitation on the gateway. Use a short lifetime and a fictional note that identifies the device without personal data. The note stays in the gateway database and is sent in SIEM events when a SIEM sink is configured. It is never in the transparency log.
 
 ```sh
 kubectl exec deploy/pact-gateway -- open-pact-gateway invite \

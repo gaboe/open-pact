@@ -193,7 +193,7 @@ Each JSON event has exactly one top-level key, `open_pact`. Its fields are flat.
 | `schema_version` | Integer, currently `1`. |
 | `time` | RFC 3339 UTC time from the signed claim. |
 | `device_pseudonym` | String, the enrolled device's pseudonym. |
-| `device_note` | String, the note IT wrote on the invitation the device enrolled with, for example `Laptop, Example Person`, or `null` when the invitation had none. |
+| `device_note` | String, the note IT wrote on the invitation the device enrolled with, for example `Laptop, Example Person`. The field is absent when the invitation has no note, not null. |
 | `manifest_hash` | String, the hash in the signed claim. |
 | `client_version` | String, for example `open-pact-client 0.5.0`. |
 | `os` | `macos`, `windows`, or `linux`. |
@@ -227,7 +227,7 @@ IT creates a one-time invitation on the gateway. In Kubernetes, run it with `kub
 open-pact-gateway invite --ttl 72h --note "laptop for the new contractor"
 ```
 
-It prints the `opi1:` string on stdout and a readable form on stderr. The string is base64url JSON with the gateway URL (`--url`, default `PUBLIC_URL`), the company key fingerprint, the log key, and a code of 256 random bits. The gateway stores only the SHA-256 of the code, its expiry (at most 30 days) and the note. The note never reaches the log.
+It prints the `opi1:` string on stdout and a readable form on stderr. The string is base64url JSON with the gateway URL (`--url`, default `PUBLIC_URL`), the company key fingerprint, the log key, and a code of 256 random bits. The gateway stores only the SHA-256 of the code, its expiry (at most 30 days) and the note. The note stays in the gateway database and is sent in SIEM events when a SIEM sink is configured. It is never in the transparency log.
 
 The owner runs `open-pact-client join 'opi1:...'`. Before it shows the manifest or sends anything, the client checks that the gateway serves the company key and the log key that the invitation names, and verifies the signed checkpoint. Then it pins both keys. The owner key and the device key both sign one statement over the manifest hash, the invitation hash and both public keys. The gateway checks both signatures, its own company key and the enforced manifest. Then it consumes the invitation and stores the device as `pending`, in one transaction. Running `join` again with the same invitation from the same device changes nothing. A device enrolled before invitations existed stays approved, but the client has no pinned keys; the owner joins again with a new invitation, which binds to the device and keeps its state.
 
