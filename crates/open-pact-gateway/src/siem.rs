@@ -12,7 +12,7 @@ use std::{
 use time::OffsetDateTime;
 
 use anyhow::{Context, bail};
-use open_pact_core::{Claim, ControlStanding, Manifest, verified_trust_level};
+use open_pact_core::{Claim, ControlStanding, Manifest, Pseudonym, verified_trust_level};
 use rustls::{
     ClientConfig, ClientConnection, RootCertStore, StreamOwned,
     pki_types::{CertificateDer, ServerName, pem::PemObject},
@@ -21,6 +21,8 @@ use serde_json::{Value, json};
 
 const CAPACITY: usize = 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long `devices approve` and `devices revoke` wait for one event before they give up.
+const ONE_SHOT_TIMEOUT: Duration = Duration::from_secs(15);
 
 // Control values keep their original JSON type. Prefixing avoids collisions with event metadata.
 // `standings` is the gateway's own evaluation of the claim, so the status of a control cannot
@@ -77,6 +79,25 @@ pub fn event(
             json!(deadline.map(open_pact_core::timestamp::rfc3339_secs));
     }
     json!({"open_pact": body})
+}
+
+/// The event IT's approval or revocation of a device produces. It shares the `open_pact` key and
+/// `schema_version` with the claim event, so rule 100500 matches it too. Unlike a claim event it has
+/// an `event` field, `device_state`; a claim event has no `event` field.
+pub fn state_event(
+    device: &Pseudonym,
+    device_note: &str,
+    state: &str,
+    at: OffsetDateTime,
+) -> Value {
+    json!({"open_pact": {
+        "schema_version": 1,
+        "event": "device_state",
+        "time": open_pact_core::timestamp::rfc3339_auto(at),
+        "device_pseudonym": device,
+        "device_note": (!device_note.is_empty()).then_some(device_note),
+        "state": state,
+    }})
 }
 
 // RFC 5425 counts the UTF-8 bytes of the entire RFC 5424 message, excluding the prefix.
@@ -372,14 +393,50 @@ fn report_drops(shared: Weak<Shared>, interval: Duration) {
     }
 }
 
-fn configured(manifest: &Manifest) -> anyhow::Result<Option<Exporter>> {
+/// One sink for one event, from the `GATEWAY_SIEM_*` variables the server reads. The CLI uses it:
+/// its process ends right after the event, so it cannot queue.
+pub struct OneShot(Sink);
+
+impl OneShot {
+    pub fn from_env() -> anyhow::Result<Option<Self>> {
+        Ok(sink_from_env()?.map(Self))
+    }
+
+    #[cfg(test)]
+    pub fn file_for_test(path: std::path::PathBuf) -> Self {
+        Self(Sink::File {
+            path,
+            mode: FileMode::OwnerOnly,
+        })
+    }
+
+    /// Delivers `event` once and waits at most `ONE_SHOT_TIMEOUT`. No retry.
+    pub fn send(self, event: &Value) -> anyhow::Result<()> {
+        let bytes = serde_json::to_vec(event).expect("JSON value serializes");
+        let (done, result) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("siem-one-shot".into())
+            .spawn(move || {
+                let _ = done.send(self.0.deliver(&bytes));
+            })?;
+        match result.recv_timeout(ONE_SHOT_TIMEOUT) {
+            Ok(delivered) => delivered,
+            Err(_) => bail!(
+                "no answer from the SIEM within {}s",
+                ONE_SHOT_TIMEOUT.as_secs()
+            ),
+        }
+    }
+}
+
+fn sink_from_env() -> anyhow::Result<Option<Sink>> {
     let url = std::env::var("GATEWAY_SIEM_SYSLOG_URL")
         .ok()
         .filter(|s| !s.is_empty());
     let file = std::env::var("GATEWAY_SIEM_FILE")
         .ok()
         .filter(|s| !s.is_empty());
-    let sink = match (url, file) {
+    Ok(Some(match (url, file) {
         (None, None) => return Ok(None),
         (Some(_), Some(_)) => bail!("configure only one SIEM sink"),
         (Some(url), None) => Sink::tls(&url, &std::env::var("GATEWAY_SIEM_CA")?)?,
@@ -394,6 +451,12 @@ fn configured(manifest: &Manifest) -> anyhow::Result<Option<Exporter>> {
                 mode,
             }
         }
+    }))
+}
+
+fn configured(manifest: &Manifest) -> anyhow::Result<Option<Exporter>> {
+    let Some(sink) = sink_from_env()? else {
+        return Ok(None);
     };
     if let Ok(days) = std::env::var("GATEWAY_SIEM_RETENTION_DAYS") {
         let days: i64 = days
@@ -513,6 +576,39 @@ mod tests {
         assert_eq!(named["open_pact"]["device_note"], "Laptop, Example Person");
         let unnamed = event(&manifest, &claim, "", &[], &[], None, &BTreeMap::new());
         assert!(unnamed["open_pact"].get("device_note").is_none());
+    }
+
+    #[test]
+    fn state_event_names_the_device_its_note_and_the_new_state() {
+        let device = Pseudonym::of(&PublicKey::from(&dev_key::generate()));
+        let at = OffsetDateTime::from_unix_timestamp(1_792_000_000).unwrap();
+        let named = state_event(&device, "Laptop, Example Person", "revoked", at);
+        assert_eq!(
+            named,
+            json!({"open_pact": {
+                "schema_version": 1,
+                "event": "device_state",
+                "time": "2026-10-14T17:46:40Z",
+                "device_pseudonym": device,
+                "device_note": "Laptop, Example Person",
+                "state": "revoked",
+            }})
+        );
+        let unnamed = state_event(&device, "", "approved", at);
+        assert_eq!(unnamed["open_pact"]["device_note"], Value::Null);
+        assert_eq!(unnamed["open_pact"]["state"], "approved");
+    }
+
+    #[test]
+    fn one_shot_writes_one_line_to_a_file_sink() {
+        let path = temporary();
+        let device = Pseudonym::of(&PublicKey::from(&dev_key::generate()));
+        let event = state_event(&device, "", "revoked", OffsetDateTime::UNIX_EPOCH);
+        OneShot::file_for_test(path.clone()).send(&event).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(text.lines().count(), 1);
+        assert_eq!(serde_json::from_str::<Value>(text.trim()).unwrap(), event);
     }
 
     #[test]

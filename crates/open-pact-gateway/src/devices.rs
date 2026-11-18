@@ -156,12 +156,16 @@ pub async fn revoked_anywhere(conn: &mut PgConnection, device: &Pseudonym) -> an
     .await?)
 }
 
-/// Applies `action` to every enrolment of `device` and logs each change. Returns the new states.
-pub async fn apply(
-    db: &PgPool,
-    device: &str,
-    action: Action,
-) -> anyhow::Result<Vec<(String, State)>> {
+/// What `apply` left: the state of each enrolment, and the state the device moved to when at
+/// least one enrolment changed. `None` means the action changed nothing.
+#[derive(Debug)]
+pub struct Applied {
+    pub states: Vec<(String, State)>,
+    pub changed_to: Option<State>,
+}
+
+/// Applies `action` to every enrolment of `device` and logs each change.
+pub async fn apply(db: &PgPool, device: &str, action: Action) -> anyhow::Result<Applied> {
     let mut tx = db.begin().await?;
     translog::lock(&mut tx).await?;
     let rows: Vec<(String, String, String)> = sqlx::query_as(
@@ -174,12 +178,14 @@ pub async fn apply(
         bail!("no device {device}");
     }
     let mut result = vec![];
+    let mut changed_to = None;
     for (manifest, state, salt) in rows {
         let state = State::parse(&state)?;
         let Some(next) = state.after(action).map_err(anyhow::Error::msg)? else {
             result.push((manifest, state));
             continue;
         };
+        changed_to = Some(next);
         sqlx::query("UPDATE devices SET state = $1 WHERE pseudonym = $2 AND manifest_hash = $3")
             .bind(next.as_str())
             .bind(device)
@@ -196,7 +202,10 @@ pub async fn apply(
         result.push((manifest, next));
     }
     tx.commit().await?;
-    Ok(result)
+    Ok(Applied {
+        states: result,
+        changed_to,
+    })
 }
 
 /// The start of a pseudonym the owner or IT reads out: at least 8 lowercase hex digits, with or

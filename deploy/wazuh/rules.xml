@@ -35,4 +35,9 @@
     <field name="open_pact.result_log_cleared" type="pcre2">^[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt ][0-9]{2}:[0-9]{2}:[0-9]{2}</field>
     <description>open-pact reports cleared logs</description>
   </rule>
+  <rule id="100507" level="8">
+    <if_sid>100500</if_sid>
+    <field name="open_pact.state">^revoked$</field>
+    <description>open-pact device revoked</description>
+  </rule>
 </group>

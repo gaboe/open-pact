@@ -1420,10 +1420,31 @@ async fn admin_devices(db: &PgPool, command: DevicesCommand) -> anyhow::Result<(
             (devices::full_pseudonym(&pseudonym)?, Action::Revoke)
         }
     };
-    for (manifest, state) in devices::apply(db, &device, action).await? {
+    let applied = devices::apply(db, &device, action).await?;
+    for (manifest, state) in &applied.states {
         println!("{} {device} for {manifest}", state.as_str());
     }
+    if let Some(state) = applied.changed_to {
+        // The change is committed. A SIEM that cannot be reached must not make the command fail.
+        if let Err(error) = announce_state(db, &device, state).await {
+            eprintln!(
+                "WARNING: {device} is {state}, but the SIEM event was not sent: {error:#}",
+                state = state.as_str()
+            );
+        }
+    }
     Ok(())
+}
+
+/// Sends one `device_state` event to the SIEM the server is configured with, if there is one.
+async fn announce_state(db: &PgPool, device: &str, state: devices::State) -> anyhow::Result<()> {
+    let Some(sink) = siem::OneShot::from_env()? else {
+        return Ok(());
+    };
+    let pseudonym = Pseudonym::try_from(device.to_owned()).map_err(anyhow::Error::msg)?;
+    let note = devices::note(&mut *db.acquire().await?, &pseudonym).await?;
+    let event = siem::state_event(&pseudonym, &note, state.as_str(), OffsetDateTime::now_utc());
+    tokio::task::spawn_blocking(move || sink.send(&event)).await?
 }
 
 fn router(app: App) -> Router {
@@ -1916,6 +1937,92 @@ mod tests {
             "expected two witness pushes within four seconds, saw {}",
             pushes.load(std::sync::atomic::Ordering::Relaxed)
         );
+    }
+
+    /// `devices approve` and `devices revoke` send one `device_state` event for a change and none for
+    /// an action that changes nothing. The child process reads `GATEWAY_SIEM_FILE` as the CLI does.
+    #[tokio::test]
+    #[ignore = "needs TEST_DATABASE_URL"]
+    async fn device_commands_send_one_event_per_real_change() {
+        const CHILD: &str = "OPEN_PACT_TEST_DEVICE_EVENTS_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let sink = std::env::temp_dir().join(format!(
+                "open-pact-device-events-{:032x}.ndjson",
+                rand::random::<u128>()
+            ));
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "tests::device_commands_send_one_event_per_real_change",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("GATEWAY_SIEM_FILE", &sink)
+                .output()
+                .unwrap();
+            let _ = std::fs::remove_file(&sink);
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let sink = std::path::PathBuf::from(std::env::var_os("GATEWAY_SIEM_FILE").unwrap());
+        let events = || -> Vec<Value> {
+            std::fs::read_to_string(&sink)
+                .unwrap_or_default()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect()
+        };
+        let db = testdb::fresh().await;
+        let manifest = format!("sha256:{}", "ab".repeat(32));
+        let device = format!("pseudonym:{}", "01".repeat(32));
+        testdb::enrolled_device(&db, &device, &manifest).await;
+        let invitation = format!("sha256:{}", "cd".repeat(32));
+        sqlx::query("INSERT INTO invitations (hash, note, expires_at) VALUES ($1, 'Laptop, Example Person', now() + interval '1 day')")
+            .bind(&invitation)
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE devices SET state = 'pending', invitation = $1 WHERE pseudonym = $2")
+            .bind(&invitation)
+            .bind(&device)
+            .execute(&db)
+            .await
+            .unwrap();
+        let approve = || DevicesCommand::Approve {
+            prefix: "01010101".into(),
+        };
+        let revoke = || DevicesCommand::Revoke {
+            pseudonym: device.clone(),
+        };
+
+        admin_devices(&db, approve()).await.unwrap();
+        let sent = events();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        let body = &sent[0]["open_pact"];
+        assert_eq!(body["event"], "device_state");
+        assert_eq!(body["state"], "approved");
+        assert_eq!(body["device_pseudonym"], device);
+        assert_eq!(body["device_note"], "Laptop, Example Person");
+
+        // The command refuses a device that is no longer pending. The change itself is a no-op.
+        assert!(admin_devices(&db, approve()).await.is_err());
+        let again = devices::apply(&db, &device, Action::Approve).await.unwrap();
+        assert!(again.changed_to.is_none());
+        assert_eq!(events().len(), 1);
+
+        admin_devices(&db, revoke()).await.unwrap();
+        let sent = events();
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert_eq!(sent[1]["open_pact"]["state"], "revoked");
+
+        admin_devices(&db, revoke()).await.unwrap();
+        assert_eq!(events().len(), 2);
     }
 
     /// R4-L2: `invite --ttl` is checked where the command line is read, before any database or
