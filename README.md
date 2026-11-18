@@ -393,7 +393,7 @@ Windows collects the controls in one cached PowerShell batch. A missing source, 
 | `antimalware_active_threats` | Count of `Get-MpThreat` results with `IsActive` | Defender threat read access |
 | `work_account` | Administrators SID in token groups, including UAC deny-only groups. SYSTEM uses the active console user token | Own token, or SYSTEM for the console token |
 | `uptime_days` | Whole days since `Win32_OperatingSystem.LastBootUpTime` | CIM read access |
-| `password_min_length` | `MinPasswordLength` of the local account policy through ADSI; 0 means `none` | Device user |
+| `password_min_length` | Minimum password length of the local account policy (`NetUserModalsGet`); 0 means `none` | Device user |
 | `preboot_auth` | OS-volume BitLocker protection and numeric key-protector types; recovery passwords do not establish the startup method | SYSTEM or elevated administrator |
 | `antimalware_signature_age_days` | Defender `AntivirusSignatureLastUpdated` | Defender status read access |
 | `antimalware_full_scan_age_days` | Defender `FullScanEndTime`; absent date means `unknown` | Defender status read access |

@@ -396,11 +396,14 @@ pub fn parse_last_update(value: &str) -> Option<Date> {
 }
 
 /// The Shell property has no official value table, so unrecognized values stay unknown.
+/// Measured as an administrator on Windows 11 24H2: 1 is protection on, 2 is a volume with no
+/// encryption, 5 is an encrypted volume whose protectors are off, and 6 is a locked volume.
+/// A standard-user token reads 0 for every state.
 pub fn parse_bitlocker(out: &str) -> &'static str {
     match out.trim() {
         "1" => "full",
-        "3" | "4" | "5" | "8" => "partial",
-        "2" | "7" => "none",
+        "3" | "4" | "8" => "partial",
+        "2" | "5" | "7" => "none",
         _ => "unknown",
     }
 }
@@ -459,12 +462,18 @@ fn screen_savers_lock(data: &str) -> Lock {
         let [active, secure, timeout, executable] = fields.as_slice() else {
             return Lock::Unknown;
         };
-        let lock = screen_saver_lock(Some(active), Some(secure), Some(timeout));
-        let lock = match (lock, *executable) {
-            (Lock::None | Lock::Unknown, _) => lock,
-            (_, "valid") => lock,
-            (_, "missing") => Lock::None,
-            _ => Lock::Unknown,
+        let lock = match (*active, *executable) {
+            ("!", _) => Lock::Unknown,
+            // Windows starts no saver without an active flag or a saver program, so nothing locks.
+            ("", _) | (_, "none") => Lock::None,
+            _ => {
+                let lock = screen_saver_lock(Some(active), Some(secure), Some(timeout));
+                match (lock, *executable) {
+                    (Lock::None | Lock::Unknown, _) | (_, "valid") => lock,
+                    (_, "missing") => Lock::None,
+                    _ => Lock::Unknown,
+                }
+            }
         };
         if lock == Lock::Unknown {
             return Lock::Unknown;
@@ -840,6 +849,33 @@ mod tests {
         );
         assert_eq!(parse_process_audit(&values["process_audit"]), "off");
         assert_eq!(parse_logging(&values["powershell_logging"]), "off");
+    }
+
+    #[test]
+    fn screen_saver_records_measured_on_windows_11() {
+        // Measured on a default Windows 11 Pro 24H2 account: the flag is 1 and nothing else is set.
+        for (raw, expected) in [
+            ("1|||none", "none"),
+            ("|||none", "none"),
+            ("1|1|300|none", "none"),
+            ("1|1|300|valid", "le_5min"),
+            ("1|1|300|unknown", "unknown"),
+            ("!|1|300|valid", "unknown"),
+        ] {
+            assert_eq!(parse_screen_savers(raw), expected, "{raw}");
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn native_batch_reads_the_local_password_policy() {
+        let batch = batch();
+        let text = batch.values.get("password_min_length").map(String::as_str);
+        assert!(
+            text.is_some_and(|text| text.parse::<u32>().is_ok()),
+            "password_min_length={text:?}; {}",
+            batch.diagnostics
+        );
     }
 
     #[test]
