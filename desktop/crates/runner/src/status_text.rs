@@ -160,7 +160,7 @@ fn parse_finding(message: &str) -> Option<Finding<'_>> {
 }
 
 /// "19h", "30m", "3d" or "2d 5h" as the gateway prints the time left.
-fn span_delta(span: &str) -> Option<Duration> {
+pub(crate) fn span_delta(span: &str) -> Option<Duration> {
     let mut total = Duration::ZERO;
     let mut parts = 0;
     for part in span.split(' ') {

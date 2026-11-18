@@ -6,6 +6,8 @@ pub mod desktop;
 pub mod engine;
 pub mod manifest;
 pub mod ownership;
+#[cfg(feature = "client")]
+pub mod rejection;
 pub mod results;
 #[cfg(all(feature = "client", any(test, feature = "snapshot")))]
 pub mod samples;

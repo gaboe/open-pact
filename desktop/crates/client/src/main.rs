@@ -613,12 +613,7 @@ impl AppView {
                 let signed = status.manifest.as_ref().map(|m| m.signed.to_string());
                 let agreement = status.manifest.as_ref().and_then(|m| agreement_text(&m.agreement));
                 if let Some(check) = self.last_check.as_ref().filter(|check| !check.accepted) {
-                    let reasons = if check.reasons.is_empty() {
-                        "The company did not accept the last check.".to_owned()
-                    } else {
-                        format!("The company did not accept the last check: {}", check.reasons.join("; "))
-                    };
-                    view = view.child(banner(reasons, BAD, BAD_WASH));
+                    view = view.child(rejection_panel(check));
                 }
                 view = view
                     .child(actions().child(Button::new("checks").label(if self.all_controls { "Hide every check" } else { "Show every check" }).on_click(cx.listener(|this, _, _, cx| { this.all_controls = !this.all_controls; cx.notify(); })))
@@ -658,7 +653,6 @@ impl AppView {
                 view.child(div().flex().gap_1()
                         .child(self.button("refresh", "Refresh status", |_, _| Operation::Status, false, cx).ghost().small())
                         .child(self.button("changes", "Review changes", |_, _| Operation::Changes, false, cx).ghost().small()))
-                    .max_w(px(860.))
             }
             Screen::Changed(changes) => {
                 let mut list = table();
@@ -675,6 +669,103 @@ impl AppView {
             }
         }
     }
+}
+
+/// The reasons the company gave for not accepting the last check: a headline, then one row per
+/// reason with its measured value, its requirement, and its grace.
+fn rejection_panel(check: &ClaimReport) -> Div {
+    let sent = runner::text::readable_local(&check.sent_at);
+    let rows = check.reasons.iter().map(|reason| {
+        let row = runner::rejection::reason_row(
+            reason,
+            open_pact_core::timestamp::parse_rfc3339(&check.sent_at),
+            runner::zone::to_local,
+        );
+        let readable = row.detail.is_some();
+        div()
+            .flex()
+            .items_start()
+            .gap_3()
+            .px_4()
+            .py(px(10.))
+            .border_t_1()
+            .border_color(rgb(RULE_2))
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(12.))
+                    .mt(px(7.))
+                    .flex()
+                    .justify_center()
+                    .child(dot(BAD).size(px(8.))),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_0p5()
+                    .child(
+                        div()
+                            .when(readable, |name| name.font_weight(FontWeight::SEMIBOLD))
+                            .when(!readable, |name| {
+                                name.text_size(px(14.)).text_color(rgb(INK_2))
+                            })
+                            .child(row.name),
+                    )
+                    .when_some(row.detail, |item, detail| {
+                        item.child(
+                            div()
+                                .text_size(px(14.))
+                                .text_color(rgb(INK_2))
+                                .child(detail),
+                        )
+                    }),
+            )
+            .when_some(row.grace, |line, grace| {
+                let tone = match grace {
+                    runner::rejection::GraceState::Ended => Tone::Bad,
+                    runner::rejection::GraceState::EndsAt(_) => Tone::Warn,
+                };
+                line.child(pill(grace.text(), tone).flex_none())
+            })
+    });
+    div()
+        .flex()
+        .flex_col()
+        .rounded(px(10.))
+        .border_1()
+        .border_color(rgb(RULE))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_3()
+                .px_4()
+                .py_3()
+                .child(dot(BAD))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_w_0()
+                        .gap_0p5()
+                        .child(
+                            div()
+                                .text_size(px(16.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child("The company did not accept the last check"),
+                        )
+                        .child(note(if check.reasons.is_empty() {
+                            format!("Sent {sent}. The company gave no reason. Tell IT.")
+                        } else {
+                            format!("Sent {sent}. Fix these, then press Check now.")
+                        })),
+                ),
+        )
+        .children(rows)
 }
 
 fn step_view(event: &JoinStep) -> Div {
@@ -734,13 +825,8 @@ async fn status_of(session: &Session) -> Result<Report, String> {
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let content = self.content(window, cx);
-        let mut page = column()
-            .id("client")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .gap_4()
-            .p_7();
+        // One readable column, centred, so a wide or full-screen window does not stretch lines.
+        let mut page = column().w_full().max_w(px(960.)).gap_4();
         if let Some(copies) = self.copies_view(cx) {
             page = page.child(copies);
         }
@@ -763,6 +849,16 @@ impl Render for AppView {
                 start_update(&mut this.update, cx, runner, |view| &mut view.update);
             }),
         );
+        let page = div()
+            .id("client")
+            .flex()
+            .flex_col()
+            .items_center()
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .p_7()
+            .child(page);
         div()
             .size_full()
             .flex()
@@ -860,8 +956,14 @@ fn snapshots(output: PathBuf) {
         ),
         ("client-7-revoked", Screen::Status(Arc::new(revoked))),
         ("client-8-denied", Screen::Status(Arc::new(status()))),
+        ("client-8-denied-1512", Screen::Status(Arc::new(status()))),
+        ("client-8-denied-2560", Screen::Status(Arc::new(status()))),
         (
             "client-9-actions",
+            Screen::Status(Arc::new(samples::report_needs_action())),
+        ),
+        (
+            "client-9-actions-2560",
             Screen::Status(Arc::new(samples::report_needs_action())),
         ),
         (
@@ -882,18 +984,14 @@ fn snapshots(output: PathBuf) {
         ("client-e-waiting", Screen::Status(Arc::new(status()))),
         ("client-f-operations", Screen::Status(Arc::new(status()))),
     ] {
-        let width = if matches!(name, "client-9-actions" | "client-a-vpn-only") {
-            1100.
-        } else {
-            520.
+        let (width, height) = match name {
+            "client-9-actions" | "client-a-vpn-only" => (1100., 980.),
+            _ if name.ends_with("-1512") => (1512., 982.),
+            _ if name.ends_with("-2560") => (2560., 1440.),
+            _ => (520., 740.),
         };
-        snapshot(
-            &output,
-            name,
-            width,
-            if width > 600. { 980. } else { 740. },
-            |window, cx| {
-                cx.new(|cx| {
+        snapshot(&output, name, width, height, |window, cx| {
+            cx.new(|cx| {
                     let mut app = AppView::new(
                         screen,
                         Engine::start().expect("the background runtime"),
@@ -907,7 +1005,7 @@ fn snapshots(output: PathBuf) {
                     if name.starts_with("client-b") || name.starts_with("client-c") {
                         app.update = UpdateState::Available("0.1.1".into());
                     }
-                    if name == "client-8-denied" {
+                    if name.starts_with("client-8-denied") {
                         app.last_check = Some(samples::denied_check());
                         app.all_controls = true;
                     }
@@ -931,7 +1029,6 @@ fn snapshots(output: PathBuf) {
                     }
                     app
                 })
-            },
-        );
+        });
     }
 }
