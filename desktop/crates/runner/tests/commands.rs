@@ -72,6 +72,22 @@ fn durations_round_trip_exactly() {
 }
 
 #[test]
+fn word_dates_tolerate_extra_whitespace() {
+    let day = parse_date("2026-10-01");
+    for text in [
+        "1 Oct 2026",
+        "  1 Oct 2026  ",
+        "1  Oct 2026",
+        "1 Oct   2026",
+        "1\tOctober\t2026",
+        " 1   October 2026 ",
+    ] {
+        assert_eq!(parse_date(text), day, "{text:?}");
+    }
+    assert_eq!(parse_date("1 Oct"), None);
+}
+
+#[test]
 fn requirements_read_as_words() {
     let form = form(MANIFEST);
     let control = |id: &str| form.control(id).unwrap();

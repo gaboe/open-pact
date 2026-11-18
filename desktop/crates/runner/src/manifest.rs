@@ -110,9 +110,11 @@ const WORD_DATES: [&[BorrowedFormatItem<'static>]; 2] = [
 pub fn parse_date(text: &str) -> Option<Date> {
     let text = text.trim();
     parse_iso_date(text).or_else(|| {
+        // A run of whitespace counts as the one space of the word formats.
+        let words = text.split_whitespace().collect::<Vec<_>>().join(" ");
         WORD_DATES
             .iter()
-            .find_map(|format| Date::parse(text, format).ok())
+            .find_map(|format| Date::parse(&words, format).ok())
     })
 }
 
