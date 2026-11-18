@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     fs::{File, OpenOptions},
     io::{BufReader, Read, Seek, SeekFrom, Write},
     net::{TcpStream, ToSocketAddrs},
@@ -12,7 +12,7 @@ use std::{
 use time::OffsetDateTime;
 
 use anyhow::{Context, bail};
-use open_pact_core::{Claim, Manifest, verified_trust_level};
+use open_pact_core::{Claim, ControlStanding, Manifest, verified_trust_level};
 use rustls::{
     ClientConfig, ClientConnection, RootCertStore, StreamOwned,
     pki_types::{CertificateDer, ServerName, pem::PemObject},
@@ -23,6 +23,8 @@ const CAPACITY: usize = 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 // Control values keep their original JSON type. Prefixing avoids collisions with event metadata.
+// `standings` is the gateway's own evaluation of the claim, so the status of a control cannot
+// differ from the verdict.
 pub fn event(
     manifest: &Manifest,
     claim: &Claim,
@@ -30,6 +32,7 @@ pub fn event(
     reasons: &[String],
     warnings: &[String],
     access_until: Option<OffsetDateTime>,
+    standings: &BTreeMap<String, ControlStanding>,
 ) -> Value {
     let mut body = json!({
         "schema_version": 1,
@@ -44,14 +47,34 @@ pub fn event(
         "reasons": reasons,
         "warnings": warnings,
         "access_until": access_until.map(open_pact_core::timestamp::rfc3339_secs),
+        "access_ends": standings
+            .values()
+            .filter_map(|standing| match standing {
+                ControlStanding::Warn { deadline } => *deadline,
+                _ => None,
+            })
+            .min()
+            .map(open_pact_core::timestamp::rfc3339_secs),
     });
     if !device_note.is_empty() {
         body["device_note"] = json!(device_note);
     }
     for control in &manifest.body().controls {
-        if let Some(value) = claim.results.get(&control.id) {
-            body[format!("result_{}", control.id)] = json!(value);
-        }
+        let Some(value) = claim.results.get(&control.id) else {
+            continue;
+        };
+        let standing = standings.get(&control.id);
+        let (status, deadline) = match standing {
+            Some(ControlStanding::Warn { deadline }) => ("warn", *deadline),
+            Some(ControlStanding::Fail) => ("fail", None),
+            _ if value == "n/a" => ("n/a", None),
+            Some(ControlStanding::Pass) => ("pass", None),
+            None => ("report", None),
+        };
+        body[format!("result_{}", control.id)] = json!(value);
+        body[format!("status_{}", control.id)] = json!(status);
+        body[format!("deadline_{}", control.id)] =
+            json!(deadline.map(open_pact_core::timestamp::rfc3339_secs));
     }
     json!({"open_pact": body})
 }
@@ -478,9 +501,17 @@ mod tests {
     fn event_names_the_device_with_its_invitation_note() {
         let manifest = Manifest::parse(include_bytes!("../../../examples/manifest.toml")).unwrap();
         let claim = claim(&manifest);
-        let named = event(&manifest, &claim, "Laptop, Example Person", &[], &[], None);
+        let named = event(
+            &manifest,
+            &claim,
+            "Laptop, Example Person",
+            &[],
+            &[],
+            None,
+            &BTreeMap::new(),
+        );
         assert_eq!(named["open_pact"]["device_note"], "Laptop, Example Person");
-        let unnamed = event(&manifest, &claim, "", &[], &[], None);
+        let unnamed = event(&manifest, &claim, "", &[], &[], None, &BTreeMap::new());
         assert!(unnamed["open_pact"].get("device_note").is_none());
     }
 
@@ -488,7 +519,15 @@ mod tests {
     fn event_contains_only_declared_results_and_selected_metadata() {
         let manifest = Manifest::parse(include_bytes!("../../../examples/manifest.toml")).unwrap();
         let claim = claim(&manifest);
-        let event = event(&manifest, &claim, "", &["device revoked".into()], &[], None);
+        let event = event(
+            &manifest,
+            &claim,
+            "",
+            &["device revoked".into()],
+            &[],
+            None,
+            &BTreeMap::new(),
+        );
         let body = &event["open_pact"];
         assert_eq!(event.as_object().unwrap().len(), 1);
         assert_eq!(body["result_disk_encryption"], "full");
@@ -498,14 +537,30 @@ mod tests {
         assert!(body["access_until"].is_null());
         let until = open_pact_core::timestamp::parse_rfc3339("2026-11-17T10:20:00Z").unwrap();
         assert_eq!(
-            super::event(&manifest, &claim, "", &[], &[], Some(until))["open_pact"]["access_until"],
+            super::event(
+                &manifest,
+                &claim,
+                "",
+                &[],
+                &[],
+                Some(until),
+                &BTreeMap::new()
+            )["open_pact"]["access_until"],
             "2026-11-17T10:20:00Z"
         );
         // The end is written in whole seconds and in UTC, whatever fraction or offset it had.
         let until =
             open_pact_core::timestamp::parse_rfc3339("2026-11-17T12:20:00.9+02:00").unwrap();
         assert_eq!(
-            super::event(&manifest, &claim, "", &[], &[], Some(until))["open_pact"]["access_until"],
+            super::event(
+                &manifest,
+                &claim,
+                "",
+                &[],
+                &[],
+                Some(until),
+                &BTreeMap::new()
+            )["open_pact"]["access_until"],
             "2026-11-17T10:20:00Z"
         );
         assert_eq!(body["asserted_trust_level"], "L1");
@@ -515,9 +570,172 @@ mod tests {
         assert!(!event.to_string().contains("private_extra"));
         assert!(!event.to_string().contains("must not leave"));
         assert_eq!(
-            super::event(&manifest, &claim, "", &[], &[], None)["open_pact"]["verdict"],
+            super::event(&manifest, &claim, "", &[], &[], None, &BTreeMap::new())["open_pact"]["verdict"],
             "allow"
         );
+    }
+
+    fn claim_of(manifest: &Manifest, os: &str, results: Value) -> Claim {
+        let key = PublicKey::from(&dev_key::generate());
+        serde_json::from_value(json!({
+            "manifest": manifest.hash(), "device": Pseudonym::of(&key), "device_key": key,
+            "nonce": "fictional", "time": "2026-10-20T00:00:00Z", "client": "open-pact-client 0.2.0",
+            "os": os, "trust_level": "L1", "results": results
+        }))
+        .unwrap()
+    }
+
+    fn at(text: &str) -> OffsetDateTime {
+        open_pact_core::timestamp::parse_rfc3339(text).unwrap()
+    }
+
+    #[test]
+    fn event_gives_each_supplied_control_a_status_and_a_deadline() {
+        let manifest = Manifest::parse(include_bytes!("../../../examples/manifest.toml")).unwrap();
+        let claim = claim_of(
+            &manifest,
+            "linux",
+            json!({
+                "disk_encryption": "full",
+                "os_patch_age_days": 31,
+                "screen_lock": "gt_15min",
+                "firewall": "on",
+                "process_audit": "n/a",
+                "os_supported": "n/a",
+            }),
+        );
+        let soon = at("2026-10-21T00:00:00Z");
+        let later = at("2026-11-03T00:00:00Z");
+        let standings = BTreeMap::from([
+            ("disk_encryption".to_owned(), ControlStanding::Pass),
+            ("os_patch_age_days".to_owned(), ControlStanding::Fail),
+            (
+                "screen_lock".to_owned(),
+                ControlStanding::Warn {
+                    deadline: Some(later),
+                },
+            ),
+            // The gateway enforces this one, but the claim does not supply it.
+            (
+                "remote_wipe".to_owned(),
+                ControlStanding::Warn {
+                    deadline: Some(soon),
+                },
+            ),
+            ("os_supported".to_owned(), ControlStanding::Pass),
+        ]);
+        let event = event(&manifest, &claim, "", &[], &[], None, &standings);
+        let body = &event["open_pact"];
+        for (id, status) in [
+            ("disk_encryption", "pass"),
+            ("os_patch_age_days", "fail"),
+            ("screen_lock", "warn"),
+            ("firewall", "report"),
+            ("process_audit", "n/a"),
+            ("os_supported", "n/a"),
+        ] {
+            assert_eq!(body[format!("status_{id}")], status, "{id}");
+        }
+        assert_eq!(
+            body["result_screen_lock"], "gt_15min",
+            "results stay as sent"
+        );
+        assert_eq!(body["deadline_screen_lock"], "2026-11-03T00:00:00Z");
+        for id in [
+            "disk_encryption",
+            "os_patch_age_days",
+            "firewall",
+            "process_audit",
+            "os_supported",
+        ] {
+            let field = body
+                .get(format!("deadline_{id}"))
+                .unwrap_or_else(|| panic!("deadline_{id} must be present as null, not omitted"));
+            assert!(field.is_null(), "{id}");
+        }
+        assert!(body.get("status_remote_wipe").is_none());
+        assert_eq!(
+            body["access_ends"], "2026-10-21T00:00:00Z",
+            "the earliest warn deadline of the evaluation"
+        );
+    }
+
+    #[test]
+    fn access_ends_is_null_without_a_warn_and_for_a_grace_that_never_ends() {
+        let manifest = Manifest::parse(include_bytes!("../../../examples/manifest.toml")).unwrap();
+        let claim = claim(&manifest);
+        let none = event(
+            &manifest,
+            &claim,
+            "",
+            &[],
+            &[],
+            None,
+            &BTreeMap::from([
+                ("disk_encryption".to_owned(), ControlStanding::Pass),
+                ("os_patch_age_days".to_owned(), ControlStanding::Fail),
+            ]),
+        );
+        assert!(none["open_pact"]["access_ends"].is_null());
+        let unbounded = event(
+            &manifest,
+            &claim,
+            "",
+            &[],
+            &[],
+            None,
+            &BTreeMap::from([(
+                "os_patch_age_days".to_owned(),
+                ControlStanding::Warn { deadline: None },
+            )]),
+        );
+        assert_eq!(unbounded["open_pact"]["status_os_patch_age_days"], "warn");
+        assert!(unbounded["open_pact"]["deadline_os_patch_age_days"].is_null());
+        assert!(unbounded["open_pact"]["access_ends"].is_null());
+    }
+
+    #[test]
+    fn event_statuses_follow_the_gateway_evaluation() {
+        let manifest = Manifest::parse(include_bytes!("../../../examples/manifest.toml")).unwrap();
+        let claim = claim_of(
+            &manifest,
+            "linux",
+            json!({
+                "disk_encryption": "none",
+                "firewall": "off",
+                "os_supported": "no",
+                "screen_lock": "le_5min",
+                "os_patch_age_days": 12,
+            }),
+        );
+        let now = at("2026-10-20T00:00:00Z");
+        let evaluation = open_pact_core::evaluate(
+            &manifest,
+            &claim,
+            now,
+            &open_pact_core::FirstFailures::new(),
+        );
+        let event = event(&manifest, &claim, "", &[], &[], None, &evaluation.controls);
+        let body = &event["open_pact"];
+        assert_eq!(body["status_disk_encryption"], "fail", "grace 0d");
+        assert!(body["deadline_disk_encryption"].is_null());
+        assert_eq!(body["status_firewall"], "warn", "grace 1d");
+        assert_eq!(body["deadline_firewall"], "2026-10-21T00:00:00Z");
+        assert_eq!(body["status_os_supported"], "warn", "grace 14d");
+        assert_eq!(body["deadline_os_supported"], "2026-11-03T00:00:00Z");
+        assert_eq!(body["status_screen_lock"], "pass");
+        assert_eq!(body["status_os_patch_age_days"], "pass");
+        assert_eq!(body["access_ends"], "2026-10-21T00:00:00Z");
+
+        let late = at("2026-10-22T00:00:00Z");
+        let first = open_pact_core::FirstFailures::from([("firewall".to_owned(), now)]);
+        let ended = open_pact_core::evaluate(&manifest, &claim, late, &first);
+        let event = super::event(&manifest, &claim, "", &[], &[], None, &ended.controls);
+        assert_eq!(
+            event["open_pact"]["status_firewall"], "fail",
+            "the grace is over"
+        );
+        assert!(event["open_pact"]["deadline_firewall"].is_null());
     }
 
     #[test]

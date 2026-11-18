@@ -22,8 +22,24 @@ pub type FirstFailures = BTreeMap<String, OffsetDateTime>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Evaluation {
     pub decision: Decision,
+    /// How each control the enforced manifest requires on the claim's OS stands. A control with no
+    /// requirement on that OS is absent: it is reported only.
+    pub controls: BTreeMap<String, ControlStanding>,
     /// What the gateway stores for the next claim of this device.
     pub first_failures: FirstFailures,
+}
+
+/// How one required control stands in the evaluation that produced the decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlStanding {
+    Pass,
+    /// Failing within its grace: the claim is allowed with a warning. The deadline is when the grace
+    /// ends, or None when the grace never ends.
+    Warn {
+        deadline: Option<OffsetDateTime>,
+    },
+    /// Failing with no grace, or with the grace over. This denies the claim.
+    Fail,
 }
 
 /// Where a failing control stands against its grace period.
@@ -55,6 +71,17 @@ impl Grace {
 
     fn denies(&self) -> bool {
         !matches!(self, Grace::Left(_))
+    }
+
+    fn standing(&self, now: OffsetDateTime) -> ControlStanding {
+        match self {
+            Grace::Left(left) => ControlStanding::Warn {
+                deadline: (*left != timestamp::MAX)
+                    .then(|| now.checked_add(*left))
+                    .flatten(),
+            },
+            Grace::None | Grace::Ended(_) => ControlStanding::Fail,
+        }
     }
 
     fn describe(&self, name: &str) -> String {
@@ -280,6 +307,7 @@ pub fn evaluate_under(
     let envelope_clean = deny.is_empty();
 
     let mut next = FirstFailures::new();
+    let mut standing = BTreeMap::new();
     for control in &body.controls {
         let Some(required) = control.required.get(&claim.os) else {
             continue;
@@ -293,6 +321,7 @@ pub fn evaluate_under(
                 let since = since.unwrap_or(now);
                 next.insert(id.clone(), since);
                 let grace = Grace::of(&control.grace, since, now);
+                standing.insert(id.clone(), grace.standing(now));
                 if grace.denies() {
                     deny.push(Reason::NotAccepted { id, grace });
                 } else {
@@ -303,10 +332,17 @@ pub fn evaluate_under(
             if let Some(since) = since {
                 next.insert(id.clone(), since);
             }
+            standing.insert(id.clone(), ControlStanding::Fail);
             deny.push(Reason::Missing { id, os: claim.os });
             continue;
         };
-        if required.contains(value) || !collected.is_some_and(|c| c.output.contains(value)) {
+        if required.contains(value) {
+            standing.insert(id, ControlStanding::Pass);
+            continue;
+        }
+        if !collected.is_some_and(|c| c.output.contains(value)) {
+            // The envelope check above already denies this claim.
+            standing.insert(id, ControlStanding::Fail);
             continue;
         }
         let since = since.unwrap_or(now);
@@ -318,6 +354,7 @@ pub fn evaluate_under(
             &control.grace
         };
         let grace = Grace::of(span, since, now);
+        standing.insert(id.clone(), grace.standing(now));
         let denies = grace.denies();
         let reason = if unknown {
             Reason::Unknown {
@@ -347,6 +384,7 @@ pub fn evaluate_under(
     };
     Evaluation {
         decision,
+        controls: standing,
         first_failures: if envelope_clean {
             next
         } else {
@@ -702,6 +740,56 @@ mod tests {
         assert_eq!(
             reasons(e.decision),
             ["firewall = off, on required, grace 1d ended"]
+        );
+    }
+
+    #[test]
+    fn controls_stand_as_pass_warn_or_fail_with_the_end_of_their_grace() {
+        let m = manifest();
+        let mut c = with(&[
+            ("firewall", "off"),
+            ("disk_encryption", "unknown"),
+            ("os_supported", "no"),
+            ("screen_lock", "none"),
+        ]);
+        c.results.remove("os_patch_age_days");
+        let late = FirstFailures::from([("screen_lock".to_string(), now() - Duration::hours(30))]);
+        let e = evaluate(&m, &c, now(), &late);
+        assert_eq!(
+            e.controls["firewall"],
+            ControlStanding::Warn {
+                deadline: Some(now() + Duration::hours(24))
+            }
+        );
+        assert_eq!(
+            e.controls["disk_encryption"],
+            ControlStanding::Warn {
+                deadline: Some(now() + Duration::days(7))
+            },
+            "unknown_grace, not the 0d grace of the control"
+        );
+        assert_eq!(
+            e.controls["os_supported"],
+            ControlStanding::Warn {
+                deadline: Some(now() + Duration::days(14))
+            }
+        );
+        assert_eq!(
+            e.controls["screen_lock"],
+            ControlStanding::Fail,
+            "grace 1d ended"
+        );
+        assert_eq!(
+            e.controls["os_patch_age_days"],
+            ControlStanding::Fail,
+            "missing"
+        );
+        let passing = evaluate(&m, &claim(&PASSING), now(), &FirstFailures::new());
+        assert!(
+            passing
+                .controls
+                .values()
+                .all(|s| *s == ControlStanding::Pass)
         );
     }
 
