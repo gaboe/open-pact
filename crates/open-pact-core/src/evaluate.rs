@@ -90,7 +90,7 @@ pub enum Reason {
     },
     #[error("claim time {} is older than claim_max_age {}", timestamp::display(.time), .max_age)]
     Stale { time: OffsetDateTime, max_age: Span },
-    #[error("client must be \"open-pact-client <major>.<minor>.<patch>\"")]
+    #[error("client must be \"open-pact-client <major>.<minor>.<patch>[-<prerelease>]\"")]
     BadClient,
     #[error("claim time {} is more than 5 minutes in the future", timestamp::display(.0))]
     FromFuture(OffsetDateTime),
@@ -158,11 +158,21 @@ fn is_client_version(client: &str) -> bool {
     let Some(version) = client.strip_prefix("open-pact-client ") else {
         return false;
     };
-    let parts: Vec<&str> = version.split('.').collect();
+    let (core, pre) = match version.split_once('-') {
+        Some((core, pre)) => (core, Some(pre)),
+        None => (version, None),
+    };
+    let parts: Vec<&str> = core.split('.').collect();
     parts.len() == 3
         && parts
             .iter()
             .all(|p| p.parse::<u32>().is_ok_and(|n| n.to_string() == *p))
+        && pre.is_none_or(|pre| {
+            pre.len() <= 64
+                && pre.split('.').all(|id| {
+                    !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                })
+        })
 }
 
 /// Evaluate required controls without grace. Missing and unknown values fail.
@@ -437,7 +447,12 @@ mod tests {
     #[test]
     fn client_must_be_a_bare_version_and_is_not_stored_otherwise() {
         let m = manifest();
-        for ok in ["open-pact-client 0.0.1", "open-pact-client 10.20.30"] {
+        for ok in [
+            "open-pact-client 0.0.1",
+            "open-pact-client 10.20.30",
+            "open-pact-client 0.8.1-rc.3",
+            "open-pact-client 1.0.0-alpha-1.2",
+        ] {
             assert!(is_client_version(ok), "{ok}");
         }
         for bad in [
@@ -450,6 +465,11 @@ mod tests {
             &format!("open-pact-client {}.2.3", "7".repeat(65_536)),
             "open-pact-client 0001.2.3",
             "open-pact-client 4294967296.0.0",
+            "open-pact-client 1.2.3-",
+            "open-pact-client 1.2.3-rc..1",
+            "open-pact-client 1.2.3-rc 1",
+            "open-pact-client 1.2.3-rc_1",
+            &format!("open-pact-client 1.2.3-{}", "a".repeat(65)),
         ] {
             let mut c = claim(&[]);
             c.client = bad.into();
