@@ -59,6 +59,54 @@
       "known_diff": null
     },
     {
+      "name": "windows-smartscreen-absent",
+      "os": "windows",
+      "input": [
+        "|",
+        "[{\"kind\":\"edge\",\"policy\":{},\"recommended\":{},\"prefs\":{}}]"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "on",
+      "known_diff": null
+    },
+    {
+      "name": "windows-smartscreen-warn",
+      "os": "windows",
+      "input": [
+        "|Warn",
+        "[{\"kind\":\"edge\",\"policy\":{},\"recommended\":{},\"prefs\":{}}]"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "on",
+      "known_diff": null
+    },
+    {
+      "name": "windows-smartscreen-off",
+      "os": "windows",
+      "input": [
+        "|Off",
+        "[{\"kind\":\"edge\",\"policy\":{},\"recommended\":{},\"prefs\":{}}]"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "off",
+      "known_diff": null
+    },
+    {
+      "name": "windows-smartscreen-unreadable",
+      "os": "windows",
+      "input": [
+        "|!",
+        "[{\"kind\":\"edge\",\"policy\":{},\"recommended\":{},\"prefs\":{}}]"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
       "name": "macos-6",
       "os": "macos",
       "input": [

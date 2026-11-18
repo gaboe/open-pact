@@ -686,7 +686,8 @@ fn smartscreen(text: &str) -> Protection {
         "1" => Protection::On,
         "" => match local {
             "Off" => Protection::Off,
-            "Warn" | "RequireAdmin" => Protection::On,
+            // No value means the Windows default, which is on.
+            "" | "Warn" | "RequireAdmin" => Protection::On,
             _ => Protection::Unknown,
         },
         _ => Protection::Unknown,
@@ -1028,7 +1029,9 @@ mod tests {
         for (screen, browsers, expected) in [
             ("|Warn", json!([]), "on"),
             ("|Off", json!([]), "off"),
-            ("|", json!([]), "unknown"),
+            ("|", json!([]), "on"),
+            ("|!", json!([]), "unknown"),
+            ("|Block", json!([]), "unknown"),
             ("1|Off", json!([on.clone()]), "on"),
             ("0|Warn", json!([on.clone()]), "off"),
             ("|RequireAdmin", json!([on.clone()]), "on"),
