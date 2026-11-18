@@ -1681,6 +1681,8 @@ struct SetupContext {
     /// Folders from an `open-pact.toml` of an earlier client.
     legacy: Vec<PathBuf>,
     user_home: Option<PathBuf>,
+    /// This process runs elevated on Windows.
+    elevated: bool,
 }
 
 fn folder_list(folders: &[PathBuf]) -> String {
@@ -1709,12 +1711,19 @@ fn setup_questions(
         };
         auto_send = confirm_yes_by_default_from(question, input, output)?;
         if auto_send && context.os == Os::Windows {
-            run_as = if confirm_from(
-                "Run the job as SYSTEM instead of as you? SYSTEM needs an elevated PowerShell prompt"
-                    .into(),
-                input,
-                output,
-            )? {
+            let default = device_config::default_run_as(
+                true,
+                context.elevated,
+                context.current.setup_answered,
+                run_as,
+            );
+            let question = "Run the job as SYSTEM instead of as you? SYSTEM needs an elevated PowerShell prompt";
+            let system = if default == device_config::RunAs::System {
+                confirm_yes_by_default_from(question, input, output)?
+            } else {
+                confirm_from(question.into(), input, output)?
+            };
+            run_as = if system {
                 device_config::RunAs::System
             } else {
                 device_config::RunAs::User
@@ -1811,9 +1820,19 @@ fn setup_answers(context: &SetupContext, answers: &json_out::Answers) -> SetupCh
             }
         }
     }
+    let run_as = if auto_send {
+        device_config::default_run_as(
+            context.os == Os::Windows,
+            context.elevated,
+            context.current.setup_answered,
+            context.current.run_as,
+        )
+    } else {
+        context.current.run_as
+    };
     SetupChoices {
         auto_send,
-        run_as: context.current.run_as,
+        run_as,
         folders,
     }
 }
@@ -1868,6 +1887,7 @@ fn setup_context(home: &Home) -> Result<SetupContext> {
         legacy: device_config::legacy_folders(home, user_home.as_deref()),
         manifest,
         user_home,
+        elevated: DeviceKey::process_is_elevated(),
     })
 }
 
@@ -9354,6 +9374,7 @@ grace = "1d"
             suggested: Vec::new(),
             legacy: Vec::new(),
             user_home: Some(PathBuf::from("/home/example")),
+            elevated: false,
         }
     }
 
@@ -9445,6 +9466,66 @@ grace = "1d"
         );
         let (choices, output) = answer(&context, "n\n\n");
         assert!(!choices.auto_send && !output.contains("SYSTEM"));
+    }
+
+    #[test]
+    fn step_five_defaults_the_job_to_system_for_an_elevated_new_windows_device() {
+        let mut context = setup_context(&demo_manifest(), Os::Windows);
+        context.elevated = true;
+        let (choices, output) = answer(&context, "y\n\n\n");
+        assert_eq!(choices.run_as, device_config::RunAs::System);
+        assert!(output.contains("SYSTEM needs an elevated PowerShell prompt [Y/n] "));
+        let (choices, _) = answer(&context, "y\nn\n\n");
+        assert_eq!(
+            choices.run_as,
+            device_config::RunAs::User,
+            "the owner can still say no"
+        );
+        let mut answered = setup_context(&demo_manifest(), Os::Windows);
+        answered.elevated = true;
+        answered.current.setup_answered = true;
+        let (choices, output) = answer(&answered, "y\n\n\n");
+        assert_eq!(choices.run_as, device_config::RunAs::User);
+        assert!(output.contains("SYSTEM needs an elevated PowerShell prompt [y/N] "));
+    }
+
+    #[test]
+    fn setup_answers_default_the_job_to_system_for_an_elevated_new_windows_device() {
+        let context = |os, elevated, answered, run_as| {
+            let mut context = setup_context(&demo_manifest(), os);
+            context.elevated = elevated;
+            context.current.setup_answered = answered;
+            context.current.run_as = run_as;
+            context
+        };
+        let on = json_out::Answers {
+            auto_send: true,
+            folders: Vec::new(),
+        };
+        let user = device_config::RunAs::User;
+        let system = device_config::RunAs::System;
+        assert_eq!(
+            setup_answers(&context(Os::Windows, true, false, user), &on).run_as,
+            system
+        );
+        assert_eq!(
+            setup_answers(&context(Os::Windows, false, false, user), &on).run_as,
+            user
+        );
+        assert_eq!(
+            setup_answers(&context(Os::Windows, true, true, user), &on).run_as,
+            user
+        );
+        assert_eq!(
+            setup_answers(&context(Os::Macos, true, false, user), &on).run_as,
+            user
+        );
+        let off = json_out::Answers::default();
+        assert_eq!(
+            setup_answers(&context(Os::Windows, true, false, user), &off).run_as,
+            user,
+            "no job, no change"
+        );
     }
 
     #[test]
@@ -10421,6 +10502,7 @@ grace = "1d"
             suggested: Vec::new(),
             legacy: Vec::new(),
             user_home: None,
+            elevated: false,
         };
         let answers = json_out::Answers {
             auto_send: true,

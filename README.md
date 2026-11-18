@@ -532,7 +532,7 @@ Limited Windows operations leave orphaned protected state and the shared binary 
 
 ### Windows device keys
 
-On Windows, a new join needs an elevated administrator process, so that the device key goes into the TPM and the scheduled job can run as SYSTEM. A non-elevated join of a home with no device key stops before any request, with an error that says to run the same command in PowerShell as administrator. `--software-key` skips the check, for testing: it creates a software key and reports `key_protection = os_permissions`. Existing keys stay in use, so a home that already has a key joins and resumes without elevation.
+On Windows, a new join needs an elevated administrator process, so that the device key goes into the TPM and the scheduled job can run as SYSTEM. A non-elevated join of a home with no device key stops before any request, with an error that says to run the same command in PowerShell as administrator. An elevated join enrols the account that runs it, so use Run as administrator with the account you sign in with every day. A new elevated join defaults the scheduled job to SYSTEM; an owner who already chose keeps the choice. `--software-key` skips the check, for testing: it creates a software key and reports `key_protection = os_permissions`. Existing keys stay in use, so a home that already has a key joins and resumes without elevation.
 
 An elevated administrator Windows join tries a non-exportable ECDSA P-256 key in the TPM through the
 Microsoft Platform Crypto Provider. The private key does not leave the TPM.

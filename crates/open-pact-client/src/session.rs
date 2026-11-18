@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Result, anyhow};
 
 use crate::device_config;
+use crate::device_key::DeviceKey;
 use crate::json_out::{self, Answers, Json};
 use crate::{
     APPROVAL_POLL_INTERVAL, AcceptPreview, ClaimReport, Home, Host, JoinOptions, JoinPreview,
@@ -80,6 +81,14 @@ impl Session {
     /// The device status. With `online` it also asks the gateway, the VPN probe and the OS.
     pub async fn status(&self, online: bool) -> Result<status::Report> {
         status::report(&self.home, online, self.insecure_dev, &self.cli).await
+    }
+
+    /// Whether a join of a new device would stop at once for lack of an elevated process: on
+    /// Windows, when this process is not elevated and the home holds no device key. An app asks
+    /// before it shows the invitation, so that the owner does not paste it twice. It is false on
+    /// every other system.
+    pub fn join_needs_elevation(&self) -> Result<bool> {
+        DeviceKey::join_needs_elevation(&self.home.0, false)
     }
 
     /// What joining would sign. Makes GET requests only and writes no file.
