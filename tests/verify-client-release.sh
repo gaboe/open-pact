@@ -51,7 +51,7 @@ case "$1" in
     )
     if [ "${MOCK_PACKAGE_ASSETS:-}" = 1 ]; then
       if [ "${MOCK_PRERELEASE:-}" = 1 ]; then
-        assets+=(open-pact-client_0.3.1~rc.1_amd64.deb open-pact-client-0.3.1~rc.1-1.x86_64.rpm)
+        assets+=(open-pact-client_0.3.1-rc.1_amd64.deb open-pact-client-0.3.1-rc.1-1.x86_64.rpm)
       else
         assets+=(open-pact-client_1.2.3_amd64.deb open-pact-client-1.2.3-1.x86_64.rpm)
       fi
@@ -92,7 +92,7 @@ assets=(
 )
 if [ "${MOCK_PACKAGE_ASSETS:-}" = 1 ]; then
   if [ "${MOCK_PRERELEASE:-}" = 1 ]; then
-    assets+=(open-pact-client_0.3.1~rc.1_amd64.deb open-pact-client-0.3.1~rc.1-1.x86_64.rpm)
+    assets+=(open-pact-client_0.3.1-rc.1_amd64.deb open-pact-client-0.3.1-rc.1-1.x86_64.rpm)
   else
     assets+=(open-pact-client_1.2.3_amd64.deb open-pact-client-1.2.3-1.x86_64.rpm)
   fi
@@ -208,10 +208,10 @@ EXPECTED
   if [ "$include_packages" = 1 ]; then
     if [ "$prerelease" = 1 ]; then
       cat >> "$tmp/$name.expected" <<'EXPECTED'
-open-pact-client-0.3.1~rc.1-1.x86_64.rpm
-open-pact-client-0.3.1~rc.1-1.x86_64.rpm.sigstore.json
-open-pact-client_0.3.1~rc.1_amd64.deb
-open-pact-client_0.3.1~rc.1_amd64.deb.sigstore.json
+open-pact-client-0.3.1-rc.1-1.x86_64.rpm
+open-pact-client-0.3.1-rc.1-1.x86_64.rpm.sigstore.json
+open-pact-client_0.3.1-rc.1_amd64.deb
+open-pact-client_0.3.1-rc.1_amd64.deb.sigstore.json
 EXPECTED
     else
       cat >> "$tmp/$name.expected" <<'EXPECTED'

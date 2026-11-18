@@ -70,6 +70,15 @@ def needs(job: str) -> list[str]:
     return re.findall(r"[a-z][a-z0-9-]*", match.group(1))
 
 
+class AssetNameTest(unittest.TestCase):
+    def test_the_package_job_keeps_every_asset_name_as_github_stores_it(self):
+        package = jobs("client-release.yml")["package"]
+        self.assertIn('mv "$path" "${path//\\~/-}"', package)
+        rename = package.index('mv "$path"')
+        self.assertLess(rename, package.index("sha256sum open-pact-client*"))
+        self.assertLess(package.index("^[A-Za-z0-9._-]+$"), package.index("sha256sum open-pact-client*"))
+
+
 class SigningJobTest(unittest.TestCase):
     """Only a minimal job may mint the Cosign signature that the updater trusts."""
 

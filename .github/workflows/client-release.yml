@@ -177,11 +177,22 @@ jobs:
         run: |
           VERSION="${VERSION#v}" nfpm package --config packaging/nfpm.yaml --packager deb --target dist/
           VERSION="${VERSION#v}" nfpm package --config packaging/nfpm.yaml --packager rpm --target dist/
+          # GitHub renames "~" in asset names, so SHA256SUMS would name files the release lacks.
+          for path in dist/*~*; do
+            if [[ -e "$path" ]]; then mv "$path" "${path//\~/-}"; fi
+          done
       - name: Include third-party data license
         run: cp NOTICE dist/NOTICE
       - name: Create checksums
         working-directory: dist
-        run: sha256sum open-pact-client* open-pact-desktop-*.zip NOTICE > SHA256SUMS
+        run: |
+          for name in open-pact-client* open-pact-desktop-*.zip NOTICE; do
+            if [[ ! "$name" =~ ^[A-Za-z0-9._-]+$ ]]; then
+              echo "release asset name GitHub would rewrite: $name" >&2
+              exit 1
+            fi
+          done
+          sha256sum open-pact-client* open-pact-desktop-*.zip NOTICE > SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
           name: release-dist
