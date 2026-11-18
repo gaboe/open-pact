@@ -155,7 +155,7 @@ pub fn verify_cosignatures<'p>(
     let max_age = policy
         .checkpoint_max_age
         .min_duration()
-        .and_then(|d| u64::try_from(d.num_seconds()).ok())
+        .and_then(|d| u64::try_from(d.whole_seconds()).ok())
         .unwrap_or(u64::MAX);
     let mut counted = vec![];
     let mut problems = vec![];

@@ -1,5 +1,4 @@
 use anyhow::Context;
-use chrono::{DateTime, Utc};
 use open_pact_core::{SigningKey, dev_key};
 use rcgen::{
     BasicConstraints, CertificateParams, CertificateSigningRequestParams, DistinguishedName,
@@ -92,13 +91,14 @@ impl Keys {
 }
 
 /// The end of a certificate, as the certificate itself states it.
-pub fn certificate_not_after(pem: &str) -> anyhow::Result<DateTime<Utc>> {
+pub fn certificate_not_after(pem: &str) -> anyhow::Result<OffsetDateTime> {
     use x509_parser::prelude::{FromDer, X509Certificate};
     let (_, pem) = x509_parser::pem::parse_x509_pem(pem.as_bytes())
         .map_err(|e| anyhow::anyhow!("certificate is not PEM: {e}"))?;
     let (_, cert) = X509Certificate::from_der(&pem.contents)
         .map_err(|e| anyhow::anyhow!("certificate is not X.509: {e}"))?;
-    DateTime::from_timestamp(cert.validity().not_after.timestamp(), 0)
+    OffsetDateTime::from_unix_timestamp(cert.validity().not_after.timestamp())
+        .ok()
         .context("certificate end is out of range")
 }
 
@@ -143,9 +143,9 @@ impl Ca {
         &self,
         csr_pem: &str,
         cn: &str,
-        not_after: DateTime<Utc>,
+        not_after: OffsetDateTime,
     ) -> Result<String, String> {
-        let not_after = OffsetDateTime::from_unix_timestamp(not_after.timestamp())
+        let not_after = OffsetDateTime::from_unix_timestamp(not_after.unix_timestamp())
             .map_err(|e| format!("certificate end is out of range: {e}"))?;
         bare_csr_der(csr_pem)?;
         let csr = CertificateSigningRequestParams::from_pem(csr_pem)
@@ -309,8 +309,8 @@ mod tests {
 
     use super::*;
 
-    fn in_an_hour() -> DateTime<Utc> {
-        Utc::now() + chrono::TimeDelta::hours(1)
+    fn in_an_hour() -> OffsetDateTime {
+        OffsetDateTime::now_utc() + Duration::hours(1)
     }
 
     fn ca() -> Ca {
@@ -379,19 +379,18 @@ mod tests {
     #[test]
     fn the_stored_end_is_the_end_the_certificate_states() {
         let ca = ca();
-        let before = chrono::Utc::now();
+        let before = OffsetDateTime::now_utc();
         let issued = ca
             .issue(
                 &csr(&KeyPair::generate().unwrap()),
                 "abc",
-                before + chrono::TimeDelta::minutes(20),
+                before + Duration::minutes(20),
             )
             .unwrap();
         let lifetime = certificate_not_after(&issued).unwrap() - before;
         // Certificate times have whole seconds, so the end can fall up to one second early.
         assert!(
-            lifetime >= chrono::TimeDelta::seconds(1199)
-                && lifetime <= chrono::TimeDelta::minutes(20),
+            lifetime >= Duration::seconds(1199) && lifetime <= Duration::minutes(20),
             "{lifetime}"
         );
     }
@@ -401,7 +400,9 @@ mod tests {
     #[test]
     fn a_late_signer_does_not_extend_the_certificate_past_the_given_end() {
         let ca = ca();
-        let not_after = chrono::DateTime::from_timestamp(Utc::now().timestamp() + 30, 0).unwrap();
+        let not_after =
+            OffsetDateTime::from_unix_timestamp(OffsetDateTime::now_utc().unix_timestamp() + 30)
+                .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(1500));
         let issued = ca
             .issue(&csr(&KeyPair::generate().unwrap()), "abc", not_after)
@@ -413,8 +414,10 @@ mod tests {
     fn issues_a_client_certificate_for_the_csr_key_signed_by_the_ca() {
         let ca = ca();
         let vpn_key = KeyPair::generate().unwrap();
-        let not_after =
-            chrono::DateTime::from_timestamp(Utc::now().timestamp() + 86_400, 0).unwrap();
+        let not_after = OffsetDateTime::from_unix_timestamp(
+            OffsetDateTime::now_utc().unix_timestamp() + 86_400,
+        )
+        .unwrap();
         let issued = ca.issue(&csr(&vpn_key), "abc", not_after).unwrap();
         let (ca_der, cert_der) = (der(&ca.cert_pem), der(&issued));
         let (_, ca_cert) = X509Certificate::from_der(&ca_der).unwrap();
@@ -433,7 +436,10 @@ mod tests {
         assert!(eku.client_auth && !eku.server_auth);
         let lifetime =
             cert.validity().not_after.timestamp() - cert.validity().not_before.timestamp();
-        assert_eq!(cert.validity().not_after.timestamp(), not_after.timestamp());
+        assert_eq!(
+            cert.validity().not_after.timestamp(),
+            not_after.unix_timestamp()
+        );
         assert!(
             (lifetime - (Duration::hours(24) + CLOCK_SKEW).whole_seconds()).abs() <= 1,
             "{lifetime}"

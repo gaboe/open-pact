@@ -420,9 +420,9 @@ fn next_due(schedule: &Schedule, state: &State, now: i64) -> NextDue {
 }
 
 fn time_text(time: i64) -> String {
-    chrono::DateTime::from_timestamp(time, 0).map_or_else(
-        || "an unknown time".to_owned(),
-        |time| time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    time::OffsetDateTime::from_unix_timestamp(time).map_or_else(
+        |_| "an unknown time".to_owned(),
+        open_pact_core::timestamp::rfc3339_secs,
     )
 }
 
@@ -471,7 +471,7 @@ fn due_text(state_home: Result<Home>, schedule: &Schedule) -> Vec<String> {
         Ok(state) => next_due_lines(
             schedule,
             &state.unwrap_or_default(),
-            chrono::Utc::now().timestamp(),
+            time::OffsetDateTime::now_utc().unix_timestamp(),
         ),
         Err(error) => vec![format!(
             "Next check and claim: unknown. The job's saved state cannot be read ({error:#})."
@@ -1534,7 +1534,7 @@ pub(crate) async fn tick_with_scan(
         save(state_home, STATE, &state)?;
     }
     // A wake with nothing due ends here: no check, no scan, no gateway request.
-    let now = chrono::Utc::now().timestamp();
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
     if plan(schedule, &state, place, now, check_floor_secs()).idle() {
         return Ok(());
     }
@@ -1561,7 +1561,7 @@ pub(crate) async fn tick_with_scan(
     .await?;
     let events = read_events();
     let compliance = prepared.compliance().clone();
-    let now = chrono::Utc::now().timestamp();
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
     state.last_check = Some(now);
     state.observe_compliance(&compliance);
     state.observe_failures(&compliance, now);
@@ -1581,7 +1581,12 @@ pub(crate) async fn tick_with_scan(
             .send(home, async || may_send(schedule).await)
             .await?;
         note_outcome(home, &mut state, trigger, &outcome);
-        state.record(&outcome, chrono::Utc::now().timestamp(), events, compliance);
+        state.record(
+            &outcome,
+            time::OffsetDateTime::now_utc().unix_timestamp(),
+            events,
+            compliance,
+        );
     } else if !state.baseline().security_log_cleared || !state.baseline().antimalware_detection {
         state.establish_baseline(events);
     }
@@ -1614,7 +1619,7 @@ fn lapsed_controls(
             let since = state.first_failed.get(id).copied().unwrap_or(now);
             let ended = span.is_zero()
                 || span.min_duration().is_some_and(|length| {
-                    chrono::TimeDelta::seconds(now.saturating_sub(since)) > length
+                    time::Duration::seconds(now.saturating_sub(since)) > length
                 });
             ended.then(|| id.clone())
         })
@@ -1770,7 +1775,7 @@ fn append_job_log(home: &Home, line: &str) -> std::io::Result<()> {
     writeln!(
         options.open(&path)?,
         "{} {line}",
-        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        open_pact_core::timestamp::rfc3339_secs(time::OffsetDateTime::now_utc())
     )
 }
 
@@ -2306,11 +2311,11 @@ async fn status(home: &Home) -> Result<()> {
     );
     if let Some(state) = schedule_home.read_json::<State>(STATE)?
         && let Some(last) = state.last_success
-        && let Some(time) = chrono::DateTime::from_timestamp(last, 0)
+        && let Some(time) = time::OffsetDateTime::from_unix_timestamp(last).ok()
     {
         println!(
             "Last claim the gateway answered: {}.",
-            time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            open_pact_core::timestamp::rfc3339_secs(time)
         );
     }
     print_next_due();
@@ -3021,7 +3026,7 @@ esac
         let fresh = due_text(Ok(Home(state_home.0.clone())), &vpn);
         assert!(fresh.iter().any(|line| line.starts_with("Next check due")));
         // A state the job saved, with a check a moment ago, is the one that counts.
-        let now = chrono::Utc::now().timestamp();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
         save(
             &state_home,
             STATE,
@@ -3122,6 +3127,15 @@ esac
             .send,
             Some(T)
         );
+    }
+
+    /// The job's times are written in UTC with whole seconds and a `Z`, as chrono wrote them.
+    #[test]
+    fn time_text_writes_whole_seconds_in_utc_and_names_an_unreadable_time() {
+        assert_eq!(time_text(0), "1970-01-01T00:00:00Z");
+        assert_eq!(time_text(1_794_906_000), "2026-11-17T09:00:00Z");
+        assert_eq!(time_text(-1), "1969-12-31T23:59:59Z");
+        assert_eq!(time_text(i64::MAX), "an unknown time");
     }
 
     #[test]
@@ -4807,7 +4821,7 @@ Write-Output 'refused'
             STATE,
             &State {
                 vpn_up: true,
-                last_success: Some(chrono::Utc::now().timestamp()),
+                last_success: Some(time::OffsetDateTime::now_utc().unix_timestamp()),
                 ..State::default()
             },
         )
@@ -4901,7 +4915,7 @@ Write-Output 'refused'
             &State {
                 vpn_up: false,
                 reconnect_pending: false,
-                last_success: Some(chrono::Utc::now().timestamp() - 2 * 3600),
+                last_success: Some(time::OffsetDateTime::now_utc().unix_timestamp() - 2 * 3600),
                 last_events: None,
                 event_baseline: None,
                 ..State::default()
@@ -4915,7 +4929,7 @@ Write-Output 'refused'
         let connected: State = home.read_json(STATE).unwrap().unwrap();
         assert!(connected.vpn_up);
         assert!(connected.reconnect_pending);
-        assert!(connected.should_send(chrono::Utc::now().timestamp(), 55 * 60));
+        assert!(connected.should_send(time::OffsetDateTime::now_utc().unix_timestamp(), 55 * 60));
         drop(listener);
         let reserved = tokio::net::TcpSocket::new_v4().unwrap();
         reserved.bind("127.0.0.1:0".parse().unwrap()).unwrap();

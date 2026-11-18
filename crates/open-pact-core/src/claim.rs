@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64};
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
 
 use crate::{
     ControlValue, CsrHash, Error, LogHash, ManifestHash, Os, Pseudonym, PublicKey, Signature,
@@ -25,7 +25,8 @@ pub struct Claim {
     pub device: Pseudonym,
     pub device_key: PublicKey,
     pub nonce: String,
-    pub time: DateTime<Utc>,
+    #[serde(with = "crate::timestamp::serde_rfc3339")]
+    pub time: OffsetDateTime,
     pub client: String,
     pub os: Os,
     pub trust_level: TrustLevel,
@@ -177,7 +178,7 @@ mod tests {
             device: Pseudonym::of(&device_key),
             device_key,
             nonce: "n0".into(),
-            time: "2026-11-03T08:12:44Z".parse().unwrap(),
+            time: crate::timestamp::parse_rfc3339("2026-11-03T08:12:44Z").unwrap(),
             client: "open-pact-client 0.0.1".into(),
             os: Os::Macos,
             trust_level: TrustLevel::L0,

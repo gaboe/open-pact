@@ -582,7 +582,7 @@ mod tests {
     fn repository_paths_with_control_characters_are_escaped_and_never_suggested() {
         let home = Path::new("/home/example");
         let scan = crate::checks::repos::RepoScan {
-            scanned_at: chrono::Utc::now().timestamp(),
+            scanned_at: time::OffsetDateTime::now_utc().unix_timestamp(),
             managed_repos_outside: 2,
             managed_repos_total: 2,
             outside_paths: Vec::new(),
@@ -607,7 +607,7 @@ mod tests {
     fn step_four_summary_groups_paths_and_places_the_partial_note_last() {
         let home = Path::new("/home/example");
         let scan = crate::checks::repos::RepoScan {
-            scanned_at: chrono::Utc::now().timestamp(),
+            scanned_at: time::OffsetDateTime::now_utc().unix_timestamp(),
             managed_repos_outside: 3,
             managed_repos_total: 3,
             outside_paths: Vec::new(),
@@ -635,7 +635,7 @@ mod tests {
     #[test]
     fn step_four_summary_reports_no_repositories_and_unavailable_paths() {
         let empty = crate::checks::repos::RepoScan {
-            scanned_at: chrono::Utc::now().timestamp(),
+            scanned_at: time::OffsetDateTime::now_utc().unix_timestamp(),
             managed_repos_outside: 0,
             managed_repos_total: 0,
             outside_paths: Vec::new(),

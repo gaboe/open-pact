@@ -81,7 +81,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         device: Pseudonym::of(&device_key),
         device_key,
         nonce: nonce.clone(),
-        time: chrono::DateTime::from_timestamp(chrono::Utc::now().timestamp(), 0).ok_or("clock")?,
+        time: time::OffsetDateTime::from_unix_timestamp(
+            time::OffsetDateTime::now_utc().unix_timestamp(),
+        )
+        .map_err(|_| "clock")?,
         client: concat!("open-pact-client ", env!("CARGO_PKG_VERSION")).into(),
         os,
         trust_level: TrustLevel::L0,

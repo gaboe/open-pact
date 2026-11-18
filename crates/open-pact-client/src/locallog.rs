@@ -80,7 +80,7 @@ pub fn append_with_status(
 
 fn make_record(sent_bytes: &[u8], response_bytes: &[u8], status: Option<u16>) -> Record {
     Record {
-        time: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        time: open_pact_core::timestamp::rfc3339_secs(time::OffsetDateTime::now_utc()),
         sent_b64: STANDARD.encode(sent_bytes),
         sent_sha256: hex::encode(Sha256::digest(sent_bytes)),
         response_b64: STANDARD.encode(response_bytes),
@@ -259,5 +259,26 @@ mod tests {
         record.status = Some(200);
         fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
         assert_eq!(read(&path).unwrap()[0].status, Some(200));
+    }
+}
+
+#[cfg(test)]
+mod timestamp_pins {
+    use super::*;
+
+    #[test]
+    fn record_time_is_whole_seconds_in_utc() {
+        let time = make_record(b"", b"", None).time;
+        assert_eq!(time.len(), 20, "{time}");
+        assert!(
+            time.bytes().enumerate().all(|(i, b)| match i {
+                4 | 7 => b == b'-',
+                10 => b == b'T',
+                13 | 16 => b == b':',
+                19 => b == b'Z',
+                _ => b.is_ascii_digit(),
+            }),
+            "{time}"
+        );
     }
 }

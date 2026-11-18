@@ -2,10 +2,10 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, Utc};
 use clap::Args;
 use open_pact_core::{DeviceStatus, Manifest, ManifestHash, verify_claim};
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
 
 use crate::device_config::DeviceConfig;
 use crate::schedule::JobStatus;
@@ -145,7 +145,7 @@ async fn collect(home: &Home, online: bool, insecure_dev: bool) -> Result<Report
         home,
         online,
         insecure_dev,
-        Utc::now(),
+        OffsetDateTime::now_utc(),
         crate::schedule::inspect_job,
     )
     .await
@@ -155,7 +155,7 @@ async fn collect_with(
     home: &Home,
     online: bool,
     insecure_dev: bool,
-    now: DateTime<Utc>,
+    now: OffsetDateTime,
     inspect_job: impl FnOnce(&Home, &DeviceConfig) -> Result<JobStatus>,
 ) -> Result<Report> {
     let mut damaged = Vec::new();
@@ -200,7 +200,7 @@ async fn collect_with(
             vpn: "not probed".into(),
             last_scheduled_claim: tick
                 .last_success
-                .and_then(|time| DateTime::from_timestamp(time, 0))
+                .and_then(|time| OffsetDateTime::from_unix_timestamp(time).ok())
                 .map(|time| ScheduledClaim { answered_at: timestamp(time), response: None }),
             last_job_note: tick.last_note.clone(),
             last_job_log_line: job_log.and_then(|text| text.lines().rev().find(|line| !line.trim().is_empty()).map(|line| line.chars().take(512).collect())),
@@ -669,8 +669,8 @@ async fn refresh(
     })
 }
 
-fn timestamp(time: DateTime<Utc>) -> String {
-    time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+fn timestamp(time: OffsetDateTime) -> String {
+    open_pact_core::timestamp::rfc3339_secs(time)
 }
 
 type Outcome = (&'static str, Vec<String>, Vec<String>);
@@ -699,18 +699,18 @@ fn outcome_of(record: &locallog::Record) -> Result<Outcome> {
 }
 
 /// The gateway prints the time left as "23h", "30m", "3d" or "2d 5h" and rounds it down.
-fn access_span(message: &str) -> Option<(&str, chrono::TimeDelta)> {
+fn access_span(message: &str) -> Option<(&str, time::Duration)> {
     const MARK: &str = "access ends in ";
     let span = &message[message.rfind(MARK)? + MARK.len()..];
-    let mut total = chrono::TimeDelta::zero();
+    let mut total = time::Duration::ZERO;
     let mut parts = 0;
     for part in span.split(' ') {
         let (number, unit) = part.split_at(part.len().checked_sub(1)?);
         let number: i64 = number.parse().ok()?;
         total += match unit {
-            "m" => chrono::TimeDelta::try_minutes(number)?,
-            "h" => chrono::TimeDelta::try_hours(number)?,
-            "d" => chrono::TimeDelta::try_days(number)?,
+            "m" => open_pact_core::timestamp::seconds(number.checked_mul(60)?)?,
+            "h" => open_pact_core::timestamp::seconds(number.checked_mul(3600)?)?,
+            "d" => open_pact_core::timestamp::seconds(number.checked_mul(86400)?)?,
             _ => return None,
         };
         parts += 1;
@@ -718,13 +718,12 @@ fn access_span(message: &str) -> Option<(&str, chrono::TimeDelta)> {
     (1..=2).contains(&parts).then_some((span, total))
 }
 
-fn warning_deadline(message: &str, response_time: &str, now: DateTime<Utc>) -> String {
+fn warning_deadline(message: &str, response_time: &str, now: OffsetDateTime) -> String {
     let Some((span, left)) = access_span(message) else {
         return "Exact deadline unknown; the gateway warning gives no time.".into();
     };
-    let Some(deadline) = DateTime::parse_from_rfc3339(response_time)
-        .ok()
-        .and_then(|time| time.to_utc().checked_add_signed(left))
+    let Some(deadline) = open_pact_core::timestamp::parse_rfc3339(response_time)
+        .and_then(|time| time.to_offset(time::UtcOffset::UTC).checked_add(left))
     else {
         return "Exact deadline unknown; the response time is unreadable.".into();
     };
@@ -787,7 +786,7 @@ impl Report {
         home: &Home,
         enrolment: &Enrolment,
         manifest: Option<&Manifest>,
-        now: DateTime<Utc>,
+        now: OffsetDateTime,
         command: &str,
     ) -> Result<()> {
         let (records, damaged) = locallog::read_lenient(&home.file("claims.jsonl"))?;
@@ -890,9 +889,9 @@ impl Report {
             {
                 let expires = claim
                     .time
-                    .checked_add_signed(age)
+                    .checked_add(age)
                     .context("claim expiry overflows")?;
-                if now > expires || claim.time > now + chrono::TimeDelta::minutes(5) {
+                if now > expires || claim.time > now + time::Duration::minutes(5) {
                     self.issue(
                         Urgency::Action,
                         "The recorded claim is stale or has a future time.",
@@ -1109,3 +1108,65 @@ impl Report {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod timestamp_pins {
+    use super::*;
+
+    fn at(s: &str) -> OffsetDateTime {
+        open_pact_core::timestamp::parse_rfc3339(s).unwrap()
+    }
+
+    #[test]
+    fn timestamps_drop_fractions_and_read_offsets() {
+        assert_eq!(
+            timestamp(at("2026-11-16T10:00:00.999Z")),
+            "2026-11-16T10:00:00Z"
+        );
+        assert_eq!(
+            timestamp(at("2026-11-16T11:00:00.5+01:00")),
+            "2026-11-16T10:00:00Z"
+        );
+    }
+
+    #[test]
+    fn access_spans_read_minutes_hours_and_days_and_refuse_overflow() {
+        assert_eq!(
+            access_span("firewall = off, access ends in 2d 5h"),
+            Some(("2d 5h", time::Duration::hours(53)))
+        );
+        assert_eq!(
+            access_span("access ends in 30m").map(|(_, left)| left),
+            Some(time::Duration::minutes(30))
+        );
+        assert_eq!(
+            access_span("access ends in 153722867280912m").map(|(_, left)| left.whole_seconds()),
+            Some(9_223_372_036_854_720)
+        );
+        assert_eq!(access_span("access ends in 153722867280913m"), None);
+        assert_eq!(access_span("access ends in 9999999999999999h"), None);
+        assert_eq!(access_span("access ends in 3x"), None);
+    }
+
+    #[test]
+    fn warning_deadlines_add_the_time_left_to_the_response_time() {
+        let now = at("2026-11-16T10:00:00Z");
+        let message = "firewall = off, access ends in 23h";
+        assert_eq!(
+            warning_deadline(message, "2026-11-16T09:50:00Z", now),
+            "about 2026-11-17T08:50:00Z (gateway said 'access ends in 23h' at 2026-11-16T09:50:00Z)"
+        );
+        assert_eq!(
+            warning_deadline(message, "2026-11-16T11:50:00.9+02:00", now),
+            "about 2026-11-17T08:50:00Z (gateway said 'access ends in 23h' at 2026-11-16T11:50:00.9+02:00)"
+        );
+        assert_eq!(
+            warning_deadline(message, "2026-11-16T09:50:00Z", at("2026-11-17T09:00:00Z")),
+            "Deadline passed at about 2026-11-17T08:50:00Z (gateway said 'access ends in 23h' at 2026-11-16T09:50:00Z)"
+        );
+        assert_eq!(
+            warning_deadline(message, "yesterday", now),
+            "Exact deadline unknown; the response time is unreadable."
+        );
+    }
+}

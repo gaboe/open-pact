@@ -1,8 +1,8 @@
 use std::fs;
 
-use chrono::{DateTime, Utc};
 use open_pact_core::ControlValue;
 use serde::Deserialize;
+use time::OffsetDateTime;
 
 use super::common::{bounded_age, parse_groups};
 use super::exec::run_status;
@@ -136,7 +136,7 @@ pub fn work_account() -> ControlValue {
 pub fn uptime_days() -> ControlValue {
     command("/usr/sbin/sysctl", &["-n", "kern.boottime"]).map_or_else(
         || "unknown".into(),
-        |s| parse_boot_time(&s, Utc::now().timestamp()),
+        |s| parse_boot_time(&s, OffsetDateTime::now_utc().unix_timestamp()),
     )
 }
 fn parse_boot_time(text: &str, now: i64) -> ControlValue {
@@ -294,10 +294,14 @@ pub fn antimalware_signature_age_days() -> ControlValue {
     let Some(history) = command("/usr/bin/plutil", &["-p", HISTORY]) else {
         return "unknown".into();
     };
-    parse_signature_age(&history, version.trim(), Utc::now())
+    parse_signature_age(&history, version.trim(), OffsetDateTime::now_utc())
 }
 
-fn parse_signature_age(history: &str, installed_version: &str, now: DateTime<Utc>) -> ControlValue {
+fn parse_signature_age(
+    history: &str,
+    installed_version: &str,
+    now: OffsetDateTime,
+) -> ControlValue {
     if !history.trim_start().starts_with('[') || !history.trim_end().ends_with(']') {
         return "unknown".into();
     }
@@ -311,9 +315,7 @@ fn parse_signature_age(history: &str, installed_version: &str, now: DateTime<Utc
             name = "";
             version = "";
         } else if let Some(value) = line.strip_prefix("\"date\" => ") {
-            date = DateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S %z")
-                .ok()
-                .map(|date| date.with_timezone(&Utc));
+            date = open_pact_core::timestamp::parse_iso_with_offset(value);
         } else if let Some(value) = line.strip_prefix("\"displayName\" => ") {
             name = value.trim_matches('"');
         } else if let Some(value) = line.strip_prefix("\"displayVersion\" => ") {
@@ -328,7 +330,7 @@ fn parse_signature_age(history: &str, installed_version: &str, now: DateTime<Utc
             if date > now {
                 "unknown".into()
             } else {
-                bounded_age((now - date).num_days(), 3650)
+                bounded_age((now - date).whole_days(), 3650)
             }
         },
     )
@@ -396,9 +398,9 @@ mod tests {
     "displayVersion" => "163"
   }
 ]"#;
-        let now = DateTime::parse_from_rfc3339("2026-10-20T00:00:00Z")
+        let now = open_pact_core::timestamp::parse_rfc3339("2026-10-20T00:00:00Z")
             .unwrap()
-            .with_timezone(&Utc);
+            .to_offset(time::UtcOffset::UTC);
         assert_eq!(
             parse_signature_age(history, "5367", now),
             ControlValue::Integer(5)
@@ -408,9 +410,9 @@ mod tests {
             parse_signature_age(
                 history,
                 "5367",
-                DateTime::parse_from_rfc3339("2026-10-01T00:00:00Z")
+                open_pact_core::timestamp::parse_rfc3339("2026-10-01T00:00:00Z")
                     .unwrap()
-                    .with_timezone(&Utc)
+                    .to_offset(time::UtcOffset::UTC)
             ),
             "unknown"
         );
@@ -419,18 +421,18 @@ mod tests {
     #[test]
     fn signature_age_counts_completed_elapsed_days() {
         let history = "[\n 0 => {\n \"date\" => 2026-10-19 23:59:00 +0000\n \"displayName\" => \"XProtectPlistConfigData\"\n \"displayVersion\" => \"5367\"\n }\n]";
-        let now = chrono::DateTime::parse_from_rfc3339("2026-10-20T00:01:00Z").unwrap();
+        let now = open_pact_core::timestamp::parse_rfc3339("2026-10-20T00:01:00Z").unwrap();
         assert_eq!(
-            parse_signature_age(history, "5367", now.with_timezone(&Utc)),
+            parse_signature_age(history, "5367", now.to_offset(time::UtcOffset::UTC)),
             ControlValue::Integer(0)
         );
     }
     #[test]
     fn steer_003_future_signature_receipt_is_unknown() {
         let history = "[\n 0 => {\n \"date\" => 2026-10-21 00:01:00 +0000\n \"displayName\" => \"XProtectPlistConfigData\"\n \"displayVersion\" => \"5367\"\n }\n]";
-        let now = DateTime::parse_from_rfc3339("2026-10-20T23:59:00Z")
+        let now = open_pact_core::timestamp::parse_rfc3339("2026-10-20T23:59:00Z")
             .unwrap()
-            .with_timezone(&Utc);
+            .to_offset(time::UtcOffset::UTC);
         assert_eq!(parse_signature_age(history, "5367", now), "unknown");
     }
 }
@@ -497,3 +499,40 @@ mod v31_tests {
 #[cfg(test)]
 #[path = "../../tests/contracts/adapters/macos_v3.rs"]
 pub(super) mod contract_adapter;
+
+#[cfg(test)]
+mod timestamp_pins {
+    use super::*;
+
+    fn signature_age(date: &str) -> ControlValue {
+        let history = format!(
+            "[\n 0 => {{\n \"date\" => {date}\n \"displayName\" => \"XProtectPlistConfigData\"\n \"displayVersion\" => \"5367\"\n }}\n]"
+        );
+        parse_signature_age(
+            &history,
+            "5367",
+            open_pact_core::timestamp::parse_rfc3339("2026-10-20T12:00:00Z").unwrap(),
+        )
+    }
+
+    #[test]
+    fn signature_dates_read_numeric_offsets() {
+        assert_eq!(
+            signature_age("2026-10-19 23:59:00 +0000"),
+            ControlValue::Integer(0)
+        );
+        assert_eq!(
+            signature_age("2026-10-19 23:59:00 +0200"),
+            ControlValue::Integer(0)
+        );
+        assert_eq!(
+            signature_age("2026-10-19 23:59:00 -0130"),
+            ControlValue::Integer(0)
+        );
+        assert_eq!(
+            signature_age("2026-10-19 23:59:00 +02:00"),
+            ControlValue::Integer(0)
+        );
+        assert_eq!(signature_age("2026-10-19 23:59:00 UTC"), "unknown");
+    }
+}

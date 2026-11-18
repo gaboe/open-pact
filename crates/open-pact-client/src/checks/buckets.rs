@@ -1,13 +1,13 @@
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
-use chrono::NaiveDate;
+use time::Date;
 
 #[cfg(any(target_os = "linux", test))]
 pub fn elapsed_age_days(
-    last: chrono::DateTime<chrono::Utc>,
-    now: chrono::DateTime<chrono::Utc>,
+    last: time::OffsetDateTime,
+    now: time::OffsetDateTime,
     max: i32,
 ) -> open_pact_core::ControlValue {
-    let days = (now - last).num_days();
+    let days = (now - last).whole_days();
     if (0..=i64::from(max)).contains(&days) {
         (days as i32).into()
     } else {
@@ -16,8 +16,8 @@ pub fn elapsed_age_days(
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
-pub fn patch_age(last: NaiveDate, today: NaiveDate) -> open_pact_core::ControlValue {
-    match (today - last).num_days() {
+pub fn patch_age(last: Date, today: Date) -> open_pact_core::ControlValue {
+    match (today - last).whole_days() {
         days @ 0..=3650 => open_pact_core::ControlValue::Integer(days as i32),
         _ => "unknown".into(),
     }
@@ -78,8 +78,8 @@ impl Lock {
 mod tests {
     use super::*;
 
-    fn d(y: i32, m: u32, day: u32) -> NaiveDate {
-        NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    fn d(y: i32, m: u32, day: u32) -> Date {
+        open_pact_core::timestamp::ymd(y, m, day).unwrap()
     }
 
     #[test]
@@ -108,13 +108,13 @@ mod tests {
         let today = d(2026, 10, 31);
         for days in [0, 3650] {
             assert_eq!(
-                patch_age(today - chrono::TimeDelta::days(days), today),
+                patch_age(today - time::Duration::days(days), today),
                 open_pact_core::ControlValue::Integer(days as i32)
             );
         }
         for days in [-1, 3651] {
             assert_eq!(
-                patch_age(today - chrono::TimeDelta::days(days), today),
+                patch_age(today - time::Duration::days(days), today),
                 "unknown"
             );
         }
@@ -158,5 +158,31 @@ mod tests {
         assert_eq!(lock_delay(301), "le_15min");
         assert_eq!(lock_delay(900), "le_15min");
         assert_eq!(lock_delay(901), "gt_15min");
+    }
+}
+
+#[cfg(test)]
+mod timestamp_pins {
+    use super::*;
+
+    fn at(s: &str) -> time::OffsetDateTime {
+        open_pact_core::timestamp::parse_rfc3339(s).unwrap()
+    }
+
+    #[test]
+    fn elapsed_days_truncate_toward_zero() {
+        let now = at("2026-10-12T00:00:00Z");
+        assert_eq!(
+            elapsed_age_days(at("2026-10-12T12:00:00Z"), now, 3650),
+            open_pact_core::ControlValue::Integer(0)
+        );
+        assert_eq!(
+            elapsed_age_days(at("2026-10-10T12:00:00.5Z"), now, 3650),
+            open_pact_core::ControlValue::Integer(1)
+        );
+        assert_eq!(
+            elapsed_age_days(at("2026-10-13T12:00:00Z"), now, 3650),
+            "unknown"
+        );
     }
 }

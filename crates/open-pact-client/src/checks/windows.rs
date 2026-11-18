@@ -1,4 +1,3 @@
-use chrono::{NaiveDate, Utc};
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -6,6 +5,7 @@ use std::time::Duration;
 use super::buckets::{self, Lock};
 use super::exec::capture;
 use open_pact_core::ControlValue;
+use time::Date;
 const POWERSHELL: &str = include_str!("windows.ps1");
 const BATCH_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -55,7 +55,7 @@ fn parse_log_cleared(text: &str) -> ControlValue {
     if text == "null" {
         return ControlValue::Null;
     }
-    if text.ends_with('Z') && chrono::DateTime::parse_from_rfc3339(text).is_ok() {
+    if text.ends_with('Z') && open_pact_core::timestamp::is_rfc3339(text) {
         text.into()
     } else {
         "unknown".into()
@@ -96,7 +96,7 @@ fn lock() -> Lock {
 pub fn os_supported() -> ControlValue {
     value("os")
         .map_or("unknown", |data| {
-            parse_os_supported(data, Utc::now().date_naive())
+            parse_os_supported(data, time::OffsetDateTime::now_utc().date())
         })
         .into()
 }
@@ -104,14 +104,14 @@ pub fn os_supported() -> ControlValue {
 pub fn os_patch_age_days() -> ControlValue {
     parse_patch_age(
         value("patch_date").unwrap_or_default(),
-        Utc::now().date_naive(),
+        time::OffsetDateTime::now_utc().date(),
     )
 }
 
-fn parse_patch_age(text: &str, today: NaiveDate) -> ControlValue {
+fn parse_patch_age(text: &str, today: Date) -> ControlValue {
     parse_last_update(text)
         .and_then(|date| {
-            let days = today.signed_duration_since(date).num_days();
+            let days = (today - date).whole_days();
             i32::try_from(days)
                 .ok()
                 .filter(|days| (0..=3650).contains(days))
@@ -122,8 +122,8 @@ fn parse_patch_age(text: &str, today: NaiveDate) -> ControlValue {
 
 #[cfg(test)]
 pub(super) fn contract_patch_age(
-    last: chrono::DateTime<chrono::Utc>,
-    now: chrono::DateTime<chrono::Utc>,
+    last: time::OffsetDateTime,
+    now: time::OffsetDateTime,
 ) -> ControlValue {
     buckets::elapsed_age_days(last, now, 3650)
 }
@@ -391,8 +391,8 @@ pub fn parse_dword(value: &str) -> Option<u32> {
         .or_else(|| value.parse().ok())
 }
 
-pub fn parse_last_update(value: &str) -> Option<NaiveDate> {
-    NaiveDate::parse_from_str(value.trim(), "%Y-%m-%d").ok()
+pub fn parse_last_update(value: &str) -> Option<Date> {
+    open_pact_core::timestamp::parse_date(value.trim())
 }
 
 /// The Shell property has no official value table, so unrecognized values stay unknown.
@@ -682,7 +682,7 @@ const LIFECYCLES: &[Lifecycle] = &[
     },
 ];
 
-pub fn parse_os_supported(data: &str, today: NaiveDate) -> &'static str {
+pub fn parse_os_supported(data: &str, today: Date) -> &'static str {
     let fields: Vec<_> = data.split('|').collect();
     let [build, version, edition, install_type] = fields.as_slice() else {
         return "unknown";
@@ -703,7 +703,7 @@ pub fn parse_os_supported(data: &str, today: NaiveDate) -> &'static str {
                 && row.editions.contains(edition)
                 && (server || version.is_empty() || row.version == *version)
         })
-        .and_then(|row| NaiveDate::from_ymd_opt(row.end.0, row.end.1, row.end.2))
+        .and_then(|row| open_pact_core::timestamp::ymd(row.end.0, row.end.1, row.end.2))
         .map_or("unknown", |end| if today <= end { "yes" } else { "no" })
 }
 
@@ -976,7 +976,7 @@ mod tests {
 
     #[test]
     fn patch_age_returns_integer_days_and_rejects_future_dates() {
-        let today = NaiveDate::from_ymd_opt(2026, 10, 20).unwrap();
+        let today = open_pact_core::timestamp::ymd(2026, 10, 20).unwrap();
         assert_eq!(
             parse_patch_age("2026-10-13", today),
             ControlValue::Integer(7)
@@ -1125,10 +1125,10 @@ mod tests {
             ("20348|21H2|ServerStandard|Server", "2031-10-14"),
             ("26100|24H2|ServerStandard|Server", "2034-11-14"),
         ] {
-            let end = NaiveDate::parse_from_str(end, "%Y-%m-%d").unwrap();
+            let end = open_pact_core::timestamp::parse_date(end).unwrap();
             assert_eq!(parse_os_supported(raw, end), "yes", "{raw}");
             assert_eq!(
-                parse_os_supported(raw, end.succ_opt().unwrap()),
+                parse_os_supported(raw, end.next_day().unwrap()),
                 "no",
                 "{raw}"
             );
@@ -1138,7 +1138,7 @@ mod tests {
     #[test]
     fn every_lifecycle_row_and_edition_is_reachable_at_its_boundary() {
         for row in LIFECYCLES {
-            let last = NaiveDate::from_ymd_opt(row.end.0, row.end.1, row.end.2).unwrap();
+            let last = open_pact_core::timestamp::ymd(row.end.0, row.end.1, row.end.2).unwrap();
             for edition in row.editions {
                 for install in if row.server {
                     &["Server", "Server Core"][..]
@@ -1149,7 +1149,7 @@ mod tests {
                         let raw = format!("{}|{version}|{edition}|{install}", row.build);
                         assert_eq!(parse_os_supported(&raw, last), "yes", "{raw}");
                         assert_eq!(
-                            parse_os_supported(&raw, last.succ_opt().unwrap()),
+                            parse_os_supported(&raw, last.next_day().unwrap()),
                             "no",
                             "{raw}"
                         );
@@ -1157,7 +1157,7 @@ mod tests {
                 }
             }
         }
-        let today = NaiveDate::from_ymd_opt(2026, 10, 20).unwrap();
+        let today = open_pact_core::timestamp::ymd(2026, 10, 20).unwrap();
         for raw in [
             "26100|24H2|UnknownEdition|Client",
             "26100|24H2|Professional|Server",
@@ -1177,7 +1177,7 @@ mod tests {
 
     #[test]
     fn windows_iot_releases_have_their_own_lifecycle() {
-        let today = NaiveDate::from_ymd_opt(2026, 10, 20).unwrap();
+        let today = open_pact_core::timestamp::ymd(2026, 10, 20).unwrap();
         for data in [
             "22631|23H2|IoTEnterprise|Client",
             "26100|24H2|IoTEnterprise|Client",
@@ -1193,7 +1193,7 @@ mod tests {
 
     #[test]
     fn supported_servers_use_server_lifecycle() {
-        let today = NaiveDate::from_ymd_opt(2026, 10, 20).unwrap();
+        let today = open_pact_core::timestamp::ymd(2026, 10, 20).unwrap();
         for data in [
             "14393|1607|ServerStandard|Server",
             "17763|1809|ServerDatacenter|Server Core",
@@ -1210,7 +1210,7 @@ mod tests {
 
     #[test]
     fn os_supported() {
-        let today = NaiveDate::from_ymd_opt(2026, 10, 20).unwrap();
+        let today = open_pact_core::timestamp::ymd(2026, 10, 20).unwrap();
         assert_eq!(
             parse_os_supported("26200|25H2|Professional|Client", today),
             "yes"
@@ -1234,7 +1234,7 @@ mod tests {
         assert_eq!(
             parse_os_supported(
                 "19044|21H2|EnterpriseS|Client",
-                NaiveDate::from_ymd_opt(2027, 1, 13).unwrap()
+                open_pact_core::timestamp::ymd(2027, 1, 13).unwrap()
             ),
             "no"
         );
@@ -1245,11 +1245,11 @@ mod tests {
     fn patch_age_is_unknown_without_lcu_evidence() {
         assert_eq!(
             parse_last_update("2026-10-13\r\n"),
-            NaiveDate::from_ymd_opt(2026, 10, 13)
+            open_pact_core::timestamp::ymd(2026, 10, 13)
         );
         assert_eq!(parse_last_update("October 13, 2026"), None);
         assert_eq!(
-            parse_patch_age("", NaiveDate::from_ymd_opt(2026, 10, 20).unwrap()),
+            parse_patch_age("", open_pact_core::timestamp::ymd(2026, 10, 20).unwrap()),
             "unknown"
         );
     }
@@ -1365,3 +1365,60 @@ mod v31_tests {
 #[cfg(test)]
 #[path = "../../tests/contracts/adapters/windows.rs"]
 pub(super) mod contract_adapter;
+
+#[cfg(test)]
+mod timestamp_pins {
+    use super::*;
+
+    #[test]
+    fn log_cleared_stamps_must_end_in_z_and_parse() {
+        assert_eq!(
+            parse_log_cleared("2026-10-12T09:00:00Z"),
+            ControlValue::from("2026-10-12T09:00:00Z")
+        );
+        assert_eq!(
+            parse_log_cleared("2026-10-12T09:00:00.5Z"),
+            ControlValue::from("2026-10-12T09:00:00.5Z")
+        );
+        assert_eq!(
+            parse_log_cleared("2026-10-12T23:59:60Z"),
+            ControlValue::from("2026-10-12T23:59:60Z")
+        );
+        assert_eq!(parse_log_cleared("2026-10-12T09:00:00+00:00"), "unknown");
+        assert_eq!(parse_log_cleared("2026-02-30T00:00:00Z"), "unknown");
+        assert_eq!(parse_log_cleared("null"), ControlValue::Null);
+    }
+
+    #[test]
+    fn last_update_dates_read_iso_days_with_chrono_display() {
+        assert_eq!(
+            parse_last_update("2026-10-13\r\n").map(|d| d.to_string()),
+            Some("2026-10-13".into())
+        );
+        assert_eq!(
+            parse_last_update("2026-1-5").map(|d| d.to_string()),
+            Some("2026-01-05".into())
+        );
+        assert_eq!(parse_last_update("2026-02-30"), None);
+        assert_eq!(parse_last_update("2026-10-13T00:00:00Z"), None);
+        assert_eq!(
+            parse_last_update("026-10-13").map(|d| d.to_string()),
+            Some("0026-10-13".into())
+        );
+        assert_eq!(
+            parse_last_update("+2026-10-13").map(|d| d.to_string()),
+            Some("2026-10-13".into())
+        );
+        assert_eq!(parse_last_update("02026-10-13"), None);
+        assert_eq!(parse_last_update("10000-01-01"), None);
+        assert_eq!(
+            parse_last_update("-0001-10-13").map(|d| d.to_string()),
+            Some("-0001-10-13".into())
+        );
+        assert_eq!(
+            parse_last_update("2026-10-1").map(|d| d.to_string()),
+            Some("2026-10-01".into())
+        );
+        assert_eq!(parse_last_update("2026-010-13"), None);
+    }
+}

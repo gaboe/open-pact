@@ -1,7 +1,6 @@
-use chrono::{NaiveDate, Utc};
-
 use super::buckets::{self, Lock};
 use super::exec::{Ran, run, run_status};
+use time::Date;
 
 const SOCKETFILTERFW: &str = "/usr/libexec/ApplicationFirewall/socketfilterfw";
 const INSTALL_HISTORY: &str = "/Library/Receipts/InstallHistory.plist";
@@ -65,7 +64,7 @@ pub fn os_patch_age_days() -> open_pact_core::ControlValue {
         .and_then(|t| parse_last_macos_update(&t))
         .map_or_else(
             || "unknown".into(),
-            |last| buckets::patch_age(last, Utc::now().date_naive()),
+            |last| buckets::patch_age(last, time::OffsetDateTime::now_utc().date()),
         )
 }
 
@@ -225,7 +224,7 @@ pub fn parse_os_supported(version: &str) -> &'static str {
     }
 }
 
-pub fn parse_last_macos_update(plist: &str) -> Option<NaiveDate> {
+pub fn parse_last_macos_update(plist: &str) -> Option<Date> {
     let mut date = None;
     let mut latest = None;
     for line in plist.lines().map(str::trim) {
@@ -233,7 +232,7 @@ pub fn parse_last_macos_update(plist: &str) -> Option<NaiveDate> {
             date = rest
                 .split_whitespace()
                 .next()
-                .and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok());
+                .and_then(open_pact_core::timestamp::parse_date);
         } else if let Some(name) = line.strip_prefix("\"displayName\" => \"") {
             let is_release = name.starts_with("macOS ") && name.chars().any(|c| c.is_ascii_digit());
             if is_release {
@@ -447,7 +446,7 @@ mod tests {
 ]"#;
         assert_eq!(
             parse_last_macos_update(plist),
-            NaiveDate::from_ymd_opt(2025, 6, 10)
+            open_pact_core::timestamp::ymd(2025, 6, 10)
         );
         assert_eq!(parse_last_macos_update("[]"), None);
     }

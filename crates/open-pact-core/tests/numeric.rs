@@ -17,7 +17,7 @@ fn claim(m: &Manifest, value: ControlValue) -> Claim {
         device: Pseudonym::of(&device_key),
         device_key,
         nonce: "fictional-nonce".into(),
-        time: "2026-10-12T09:00:00Z".parse().unwrap(),
+        time: open_pact_core::timestamp::parse_rfc3339("2026-10-12T09:00:00Z").unwrap(),
         client: "open-pact-client 0.2.0".into(),
         os: Os::Linux,
         trust_level: TrustLevel::L0,
@@ -81,7 +81,7 @@ fn integer_limits_and_unknown_use_existing_grace_rules() {
         let c = claim(&m, value);
         let e = evaluate(&m, &c, c.time, &FirstFailures::new());
         assert!(matches!(e.decision, Decision::Allow { warnings } if warnings.len() == 1));
-        let later = c.time + chrono::TimeDelta::days(8);
+        let later = c.time + time::Duration::days(8);
         let mut c = c;
         c.time = later;
         assert!(matches!(
@@ -114,7 +114,7 @@ fn password_min_length_requires_the_signed_minimum_and_none_never_satisfies_it()
         assert!(matches!(e.decision, Decision::Allow { warnings } if warnings.len() == 1));
         assert!(e.first_failures.contains_key("password_min_length"));
         let mut later = c.clone();
-        later.time = c.time + chrono::TimeDelta::days(8);
+        later.time = c.time + time::Duration::days(8);
         assert!(matches!(
             evaluate(&m, &later, later.time, &e.first_failures).decision,
             Decision::Deny { .. }
