@@ -2,7 +2,9 @@ name: dependency-check
 
 on:
   push:
+    paths-ignore: ['desktop/**']
   pull_request:
+    paths-ignore: ['desktop/**']
   release:
     types: [published]
 

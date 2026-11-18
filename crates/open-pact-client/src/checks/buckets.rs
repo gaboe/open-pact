@@ -31,6 +31,49 @@ pub fn lock_delay(seconds: u64) -> &'static str {
     }
 }
 
+/// What a reader found about the time until the screen locks. `screen_lock@1` reports it in
+/// buckets and `screen_lock@2` in whole minutes, so both read the setting once and convert.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lock {
+    /// No automatic lock, or a lock that needs no password.
+    None,
+    /// The setting cannot be read, or is not understood.
+    Unknown,
+    /// The total time from the last input to a locked screen.
+    Seconds(u64),
+}
+
+impl Lock {
+    /// The `screen_lock@1` value.
+    pub fn bucket(self) -> &'static str {
+        match self {
+            Lock::None => "none",
+            Lock::Unknown => "unknown",
+            Lock::Seconds(seconds) => lock_delay(seconds),
+        }
+    }
+
+    /// The `screen_lock@2` value: whole minutes, rounded up. `unknown` when the total does not fit.
+    pub fn minutes(self) -> open_pact_core::ControlValue {
+        match self {
+            Lock::None => "none".into(),
+            Lock::Unknown => "unknown".into(),
+            Lock::Seconds(seconds) => i32::try_from(seconds.div_ceil(60))
+                .map_or_else(|_| "unknown".into(), open_pact_core::ControlValue::Integer),
+        }
+    }
+
+    /// The weaker of two locks: a missing or longer lock wins, and an unreadable one decides.
+    #[cfg(any(target_os = "windows", target_os = "macos", test))]
+    pub fn weaker(self, other: Lock) -> Lock {
+        match (self, other) {
+            (Lock::Unknown, _) | (_, Lock::Unknown) => Lock::Unknown,
+            (Lock::None, _) | (_, Lock::None) => Lock::None,
+            (Lock::Seconds(a), Lock::Seconds(b)) => Lock::Seconds(a.max(b)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -75,6 +118,37 @@ mod tests {
                 "unknown"
             );
         }
+    }
+
+    #[test]
+    fn a_lock_converts_to_buckets_and_whole_minutes_rounded_up() {
+        use open_pact_core::ControlValue::Integer;
+        for (lock, bucket, minutes) in [
+            (Lock::Seconds(0), "le_5min", Integer(0)),
+            (Lock::Seconds(1), "le_5min", Integer(1)),
+            (Lock::Seconds(60), "le_5min", Integer(1)),
+            (Lock::Seconds(61), "le_5min", Integer(2)),
+            (Lock::Seconds(300), "le_5min", Integer(5)),
+            (Lock::Seconds(301), "le_15min", Integer(6)),
+            (Lock::Seconds(900), "le_15min", Integer(15)),
+            (Lock::Seconds(901), "gt_15min", Integer(16)),
+            (Lock::Seconds(u64::MAX), "gt_15min", "unknown".into()),
+            (Lock::None, "none", "none".into()),
+            (Lock::Unknown, "unknown", "unknown".into()),
+        ] {
+            assert_eq!(lock.bucket(), bucket, "{lock:?}");
+            assert_eq!(lock.minutes(), minutes, "{lock:?}");
+        }
+    }
+
+    #[test]
+    fn the_weaker_lock_is_the_longer_one_and_unknown_decides() {
+        let (a, b) = (Lock::Seconds(300), Lock::Seconds(600));
+        assert_eq!(a.weaker(b), b);
+        assert_eq!(b.weaker(a), b);
+        assert_eq!(a.weaker(Lock::None), Lock::None);
+        assert_eq!(Lock::None.weaker(Lock::Unknown), Lock::Unknown);
+        assert_eq!(a.weaker(Lock::Unknown), Lock::Unknown);
     }
 
     #[test]

@@ -12,10 +12,10 @@ const CHECK_LIMIT: Duration = Duration::from_secs(3);
 const OPT_OUT: &str = "OPEN_PACT_NO_UPDATE_CHECK";
 
 #[derive(Debug, Serialize)]
-pub(crate) struct Notice {
-    pub(crate) current: String,
-    pub(crate) latest: String,
-    pub(crate) command: Option<&'static str>,
+pub struct Notice {
+    pub current: String,
+    pub latest: String,
+    pub command: Option<&'static str>,
 }
 
 #[derive(Deserialize)]

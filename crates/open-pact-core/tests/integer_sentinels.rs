@@ -52,6 +52,52 @@ fn integer_sentinels_can_be_required_without_bypassing_limits() {
 }
 
 #[test]
+fn screen_lock_in_minutes_is_an_integer_output_with_none_compared_to_a_maximum() {
+    // builtin:screen_lock@2 needs no code in core: the manifest declares its output, and an
+    // integer output with the sentinel "none" is compared to a maximum like os_patch_age_days.
+    let text = DEMO.replacen(
+        "check = \"builtin:screen_lock@1\"\noutput = [\"le_5min\", \"le_15min\", \"gt_15min\", \"none\", \"unknown\"]\nrequired = { macos = \"le_5min\", windows = \"le_5min\", linux = \"le_5min\" }",
+        "check = \"builtin:screen_lock@2\"\noutput = { integer = { min = 0, max = 1440 }, values = [\"none\"] }\nrequired = { macos = { max = 5 }, windows = { max = 5 }, linux = { max = 10 } }",
+        1,
+    );
+    assert_ne!(text, DEMO);
+    let m = parse(&text);
+    let control = m.body().control("screen_lock").unwrap();
+    for value in [
+        0.into(),
+        5.into(),
+        1440.into(),
+        "none".into(),
+        "unknown".into(),
+    ] {
+        assert!(control.output.contains(&value), "{value}");
+    }
+    for value in [(-1).into(), 1441.into(), "off".into(), "le_5min".into()] {
+        assert!(!control.output.contains(&value), "{value}");
+    }
+    let linux = &control.required[&Os::Linux];
+    for value in [0.into(), 10.into()] {
+        assert!(linux.contains(&value), "{value}");
+    }
+    for value in [11.into(), "none".into(), "unknown".into()] {
+        assert!(!linux.contains(&value), "{value}");
+    }
+    assert!(control.required[&Os::Macos].contains(&5.into()));
+    assert!(!control.required[&Os::Macos].contains(&6.into()));
+    // A maximum beyond the output's range is not a requirement the control can report.
+    assert!(
+        Manifest::parse(
+            text.replace("linux = { max = 10 }", "linux = { max = 1441 }")
+                .as_bytes()
+        )
+        .is_err()
+    );
+    // Moving from the buckets of screen_lock@1 to minutes changes the check and the output kind,
+    // so the owner has to agree to it.
+    assert!(is_narrowing(&parse(DEMO), &m).is_err());
+}
+
+#[test]
 fn adding_a_sentinel_expands_disclosure_and_needs_consent() {
     let full = parse(DEMO);
     let fewer = parse(&DEMO.replacen(r#"values = ["n/a"]"#, "values = []", 1));

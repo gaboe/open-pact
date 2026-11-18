@@ -1,0 +1,17 @@
+#!/bin/sh
+set -eu
+case "$*" in
+  --version) printf '%s\n' 'open-pact-client 0.6.0' ;;
+  'manifest check --json')
+    # The answer follows a marker comment in the draft, so tests need no shared state.
+    draft=$(cat)
+    case "$draft" in
+      *'# fixture:old-cli'*) printf '%s\n' "error: unrecognized subcommand 'check'" >&2; exit 2 ;;
+      *'# fixture:keys'*) printf '%s\n' '{"ok":false,"errors":[{"message":"controls.os_patch_age_days: required.windows 3651 is above the output range","line":null,"key":"controls.os_patch_age_days.required.windows"}]}'; exit 1 ;;
+      *'# fixture:line'*)
+        line=$(printf '%s\n' "$draft" | grep -n 'fixture:line' | head -n 1 | cut -d: -f1)
+        printf '{"ok":false,"errors":[{"message":"invalid TOML value","line":%s,"key":null}]}\n' "$line"; exit 1 ;;
+      *) printf '%s\n' '{"ok":true,"errors":[]}' ;;
+    esac ;;
+  *) printf '%s\n' '{"error":"Unexpected fixture command"}'; exit 1 ;;
+esac

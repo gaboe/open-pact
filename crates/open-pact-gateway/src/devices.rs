@@ -281,24 +281,32 @@ pub fn claim_outcome(
 }
 
 /// Records the last claim decision of the enrolment `device` holds under `manifest`, in the
-/// transaction that decides the claim.
+/// transaction that decides the claim. `access_until` is the end of the certificate the claim got.
+/// An accepted claim that got none ended its access at `at`, so it stores `at`. The column stays
+/// null after a denial and for a row the gateway wrote before it kept the end, which reads as an
+/// unknown standing until the next claim.
 pub async fn record_claim(
     conn: &mut PgConnection,
     device: &Pseudonym,
     manifest: &str,
     at: OffsetDateTime,
     result: ClaimResult,
+    access_until: Option<OffsetDateTime>,
     reasons: &[String],
 ) -> anyhow::Result<()> {
     sqlx::query(
-        "UPDATE devices SET last_claim_at = $3, last_result = $4, last_reasons = $5 \
-         WHERE pseudonym = $1 AND manifest_hash = $2",
+        "UPDATE devices SET last_claim_at = $3, last_result = $4, last_reasons = $5, \
+         last_access_until = $6 WHERE pseudonym = $1 AND manifest_hash = $2",
     )
     .bind(device.as_str())
     .bind(manifest)
     .bind(at)
     .bind(result.as_str())
     .bind(reasons)
+    .bind(match result {
+        ClaimResult::Denied => None,
+        _ => Some(access_until.unwrap_or(at)),
+    })
     .execute(conn)
     .await?;
     Ok(())

@@ -9,8 +9,8 @@ COPY docs docs
 COPY examples examples
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && \
-    cargo test --workspace && cargo test -p open-pact-client --no-run 2>/tmp/client-test.log && \
-    binary=$(sed -n 's/.*Executable unittests src\/main.rs (\(.*\)).*/\1/p' /tmp/client-test.log) && \
+    cargo test --workspace && cargo test -p open-pact-client --lib --no-run 2>/tmp/client-test.log && \
+    binary=$(sed -n 's/.*Executable unittests src\/lib.rs (\(.*\)).*/\1/p' /tmp/client-test.log) && \
     test -n "$binary" && cp "$binary" /open-pact-checks && \
     cargo build -p open-pact-client && cp target/debug/open-pact-client /open-pact-client
 

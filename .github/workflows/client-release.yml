@@ -8,8 +8,19 @@ permissions:
   contents: read
 
 jobs:
+  version:
+    name: Check the version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Test the packaging scripts
+        run: python3 -m unittest discover -s scripts/packaging -p 'test_*.py'
+      - name: Check that the tag names both workspace versions
+        run: python3 scripts/packaging/check-release-version.py "$GITHUB_REF_NAME"
+
   build:
     name: Build ${{ matrix.target }}
+    needs: version
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -37,6 +48,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install --yes musl-tools
       - name: Build client
         run: cargo build --locked --release --package open-pact-client --target ${{ matrix.target }}
+      - name: Check the Windows client imports no Visual C++ runtime
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        run: python scripts/packaging/check-windows-imports.py "target/${{ matrix.target }}/release/open-pact-client.exe"
       - name: Name release binary
         shell: bash
         run: cp "target/${{ matrix.target }}/release/open-pact-client${{ matrix.target == 'x86_64-pc-windows-msvc' && '.exe' || '' }}" "${{ matrix.binary }}"
@@ -47,17 +61,107 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  release:
+  desktop-macos:
+    name: Desktop apps for macOS
     needs: build
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.100.0
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Build both apps for both Mac architectures
+        run: |
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo build --release --locked --workspace --target "$target"
+          done
+          mkdir universal
+          for binary in open-pact open-pact-admin; do
+            lipo -create -output "universal/$binary" \
+              "target/aarch64-apple-darwin/release/$binary" \
+              "target/x86_64-apple-darwin/release/$binary"
+          done
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: client-*
+          merge-multiple: true
+          path: ${{ github.workspace }}/cli
+      - name: Join the command line tool of this run
+        working-directory: ${{ github.workspace }}/cli
+        run: |
+          lipo -create -output open-pact-client \
+            open-pact-client-aarch64-apple-darwin \
+            open-pact-client-x86_64-apple-darwin
+          chmod +x open-pact-client
+      - name: Bundle, sign ad hoc, and zip
+        env:
+          TAG: ${{ github.ref_name }}
+          OPEN_PACT_APP_DIR: universal
+        run: |
+          sh scripts/build-macos.sh "$GITHUB_WORKSPACE/cli/open-pact-client"
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          ditto -c -k --norsrc dist "$GITHUB_WORKSPACE/out/open-pact-desktop-${TAG#v}-macos.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-macos
+          path: out/*
+          if-no-files-found: error
+          retention-days: 1
+
+  desktop-windows:
+    name: Desktop apps for Windows
+    needs: build
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.100.0
+      - uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: '20.1'
+      - name: Build both apps
+        run: cargo build --release --locked --workspace
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: client-*
+          merge-multiple: true
+          path: ${{ github.workspace }}/cli
+      - name: Zip the apps with the command line tool of this run
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          mkdir stage "$GITHUB_WORKSPACE/out"
+          cp target/release/open-pact.exe target/release/open-pact-admin.exe stage/
+          cp "$GITHUB_WORKSPACE/cli/open-pact-client-x86_64-pc-windows-msvc.exe" stage/open-pact-client.exe
+          name="open-pact-desktop-${TAG#v}-windows-x64.zip"
+          powershell -NoProfile -Command "Compress-Archive -Path stage/* -DestinationPath \"$GITHUB_WORKSPACE/out/$name\""
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-windows
+          path: out/*
+          if-no-files-found: error
+          retention-days: 1
+
+  package:
+    name: Package and checksum
+    needs: [build, desktop-macos, desktop-windows]
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      id-token: write
     steps:
       - uses: actions/checkout@v6
       - uses: actions/download-artifact@v4
         with:
           pattern: client-*
+          merge-multiple: true
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: desktop-*
           merge-multiple: true
           path: dist
       - uses: actions/setup-go@v6
@@ -73,21 +177,84 @@ jobs:
         run: |
           VERSION="${VERSION#v}" nfpm package --config packaging/nfpm.yaml --packager deb --target dist/
           VERSION="${VERSION#v}" nfpm package --config packaging/nfpm.yaml --packager rpm --target dist/
+          # GitHub renames "~" in asset names, so SHA256SUMS would name files the release lacks.
+          for path in dist/*~*; do
+            if [[ -e "$path" ]]; then mv "$path" "${path//\~/-}"; fi
+          done
       - name: Include third-party data license
         run: cp NOTICE dist/NOTICE
-      - uses: sigstore/cosign-installer@v4.1.2
-      - name: Create checksums and signatures
+      - name: Create checksums
         working-directory: dist
         run: |
-          sha256sum open-pact-client* NOTICE > SHA256SUMS
-          for file in open-pact-client* NOTICE SHA256SUMS; do
-            cosign sign-blob --yes --bundle "$file.sigstore.json" "$file"
+          for name in open-pact-client* open-pact-desktop-*.zip NOTICE; do
+            if [[ ! "$name" =~ ^[A-Za-z0-9._-]+$ ]]; then
+              echo "release asset name GitHub would rewrite: $name" >&2
+              exit 1
+            fi
           done
+          sha256sum open-pact-client* open-pact-desktop-*.zip NOTICE > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-dist
+          path: dist
+          if-no-files-found: error
+          retention-days: 1
+
+  sign:
+    # The only job with the identity token. The updater trusts a release through
+    # the Cosign signature over SHA256SUMS, so only this job may mint it. It runs
+    # three actions, each pinned by commit SHA, and no build or release tool.
+    name: Sign the checksums
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-dist
+          path: dist
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.0.6
+      - name: Sign SHA256SUMS and every file it lists
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          sha256sum --check --strict SHA256SUMS
+          cosign sign-blob --yes --bundle SHA256SUMS.sigstore.json SHA256SUMS
+          while read -r _ name; do
+            name="${name#\*}"
+            cosign sign-blob --yes --bundle "$name.sigstore.json" "$name"
+          done < SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-signatures
+          path: dist/*.sigstore.json
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: Publish the release
+    needs: [package, sign]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-dist
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-signatures
+          path: dist
       - name: Generate package manager metadata
         if: ${{ !contains(github.ref_name, '-') }}
         run: |
           python3 scripts/packaging/generate-release-metadata.py "${GITHUB_REF_NAME#v}" dist/SHA256SUMS \
-            --homebrew-dir dist/Formula --scoop-dir dist/bucket
+            --homebrew-dir dist/Formula --scoop-dir dist/bucket --desktop
       - name: Attach assets to the GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -95,12 +262,15 @@ jobs:
           TAG: ${{ github.ref_name }}
         shell: bash
         run: |
+          # A draft stays invisible until every asset is uploaded and checked.
           if ! gh release view "$TAG" >/dev/null 2>&1; then
-            gh release create "$TAG" --verify-tag --title "$TAG" --notes "" || gh release view "$TAG" >/dev/null
+            flag=
+            if [[ "$TAG" =~ - ]]; then flag=--prerelease; fi
+            gh release create "$TAG" --verify-tag --draft --title "$TAG" --notes "" $flag || gh release view "$TAG" >/dev/null
           fi
-          assets=(dist/open-pact-client* dist/NOTICE dist/NOTICE.sigstore.json dist/SHA256SUMS dist/SHA256SUMS.sigstore.json)
+          assets=(dist/open-pact-client* dist/open-pact-desktop-*.zip dist/open-pact-desktop-*.zip.sigstore.json dist/NOTICE dist/NOTICE.sigstore.json dist/SHA256SUMS dist/SHA256SUMS.sigstore.json)
           if [[ ! "$TAG" =~ - ]]; then
-            assets+=(dist/Formula/open-pact.rb dist/bucket/open-pact.json)
+            assets+=(dist/Formula/open-pact.rb dist/bucket/open-pact.json dist/bucket/open-pact-desktop.json)
           fi
           gh release upload "$TAG" "${assets[@]}" --clobber
           release_assets=$(gh release view "$TAG" --json assets --jq '.assets[].name')
@@ -111,6 +281,16 @@ jobs:
               exit 1
             fi
           done
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          flag=
+          if [[ "$TAG" =~ - ]]; then flag=--prerelease; fi
+          gh release edit "$TAG" --draft=false $flag
       - name: Publish Homebrew tap and Scoop bucket
         env:
           PACKAGING_TOKEN: ${{ secrets.PACKAGING_TOKEN }}
@@ -129,7 +309,7 @@ jobs:
           git clone "https://x-access-token:${PACKAGING_TOKEN}@github.com/gaboe/scoop-bucket.git" /tmp/scoop-bucket
           mkdir -p /tmp/homebrew-tap/Formula /tmp/scoop-bucket/bucket
           cp dist/Formula/open-pact.rb /tmp/homebrew-tap/Formula/open-pact.rb
-          cp dist/bucket/open-pact.json /tmp/scoop-bucket/bucket/open-pact.json
+          cp dist/bucket/open-pact.json dist/bucket/open-pact-desktop.json /tmp/scoop-bucket/bucket/
           git -C /tmp/homebrew-tap config user.name "github-actions[bot]"
           git -C /tmp/homebrew-tap config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git -C /tmp/homebrew-tap add Formula/open-pact.rb
@@ -139,7 +319,7 @@ jobs:
           fi
           git -C /tmp/scoop-bucket config user.name "github-actions[bot]"
           git -C /tmp/scoop-bucket config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git -C /tmp/scoop-bucket add bucket/open-pact.json
+          git -C /tmp/scoop-bucket add bucket/open-pact.json bucket/open-pact-desktop.json
           if ! git -C /tmp/scoop-bucket diff --cached --quiet; then
             git -C /tmp/scoop-bucket commit -m "chore: update open-pact to ${GITHUB_REF_NAME#v}"
             git -C /tmp/scoop-bucket push

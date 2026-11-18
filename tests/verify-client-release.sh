@@ -51,12 +51,19 @@ case "$1" in
     )
     if [ "${MOCK_PACKAGE_ASSETS:-}" = 1 ]; then
       if [ "${MOCK_PRERELEASE:-}" = 1 ]; then
-        assets+=(open-pact-client_0.3.1~rc.1_amd64.deb open-pact-client-0.3.1~rc.1-1.x86_64.rpm)
+        assets+=(open-pact-client_0.3.1-rc.1_amd64.deb open-pact-client-0.3.1-rc.1-1.x86_64.rpm)
       else
         assets+=(open-pact-client_1.2.3_amd64.deb open-pact-client-1.2.3-1.x86_64.rpm)
       fi
     fi
-    for file in "${assets[@]}"; do
+    if [ "${MOCK_DESKTOP_ASSETS:-}" = 1 ]; then
+      if [ "${MOCK_PRERELEASE:-}" = 1 ]; then
+        assets+=(open-pact-desktop-0.3.1-rc.1-macos.zip open-pact-desktop-0.3.1-rc.1-windows-x64.zip)
+      else
+        assets+=(open-pact-desktop-1.2.3-macos.zip open-pact-desktop-1.2.3-windows-x64.zip)
+      fi
+    fi
+        for file in "${assets[@]}"; do
       printf '%s\n%s.sigstore.json\n' "$file" "$file"
     done
     exit 0
@@ -85,9 +92,16 @@ assets=(
 )
 if [ "${MOCK_PACKAGE_ASSETS:-}" = 1 ]; then
   if [ "${MOCK_PRERELEASE:-}" = 1 ]; then
-    assets+=(open-pact-client_0.3.1~rc.1_amd64.deb open-pact-client-0.3.1~rc.1-1.x86_64.rpm)
+    assets+=(open-pact-client_0.3.1-rc.1_amd64.deb open-pact-client-0.3.1-rc.1-1.x86_64.rpm)
   else
     assets+=(open-pact-client_1.2.3_amd64.deb open-pact-client-1.2.3-1.x86_64.rpm)
+  fi
+fi
+if [ "${MOCK_DESKTOP_ASSETS:-}" = 1 ]; then
+  if [ "${MOCK_PRERELEASE:-}" = 1 ]; then
+    assets+=(open-pact-desktop-0.3.1-rc.1-macos.zip open-pact-desktop-0.3.1-rc.1-windows-x64.zip)
+  else
+    assets+=(open-pact-desktop-1.2.3-macos.zip open-pact-desktop-1.2.3-windows-x64.zip)
   fi
 fi
 expected_patterns=()
@@ -153,10 +167,12 @@ run_success() {
   local name=$1
   shift
   local include_packages=0
+  local include_desktop=0
   local prerelease=0
   local release_tag=v1.2.3
   for setting in "$@"; do
     [ "$setting" = MOCK_PACKAGE_ASSETS=1 ] && include_packages=1
+    [ "$setting" = MOCK_DESKTOP_ASSETS=1 ] && include_desktop=1
     [ "$setting" = MOCK_PRERELEASE=1 ] && prerelease=1
     [[ "$setting" = MOCK_RELEASE_TAG=* ]] && release_tag=${setting#*=}
   done
@@ -164,7 +180,7 @@ run_success() {
   local marker="$tmp/$name.work-path"
   local out
   env -u MOCK_GH_FAIL -u MOCK_MISSING -u MOCK_MISSING_BUNDLE \
-    -u MOCK_BAD_CHECKSUM -u MOCK_COSIGN_FAIL -u MOCK_PACKAGE_ASSETS \
+    -u MOCK_BAD_CHECKSUM -u MOCK_COSIGN_FAIL -u MOCK_PACKAGE_ASSETS -u MOCK_DESKTOP_ASSETS \
     -u MOCK_PRERELEASE -u MOCK_RELEASE_TAG \
     "$@" "MOCK_WORK_PATH_FILE=$marker" "$script" "$release_tag" > "$output"
   out=$(sed -n '$s/^verified files: //p' "$output")
@@ -192,10 +208,10 @@ EXPECTED
   if [ "$include_packages" = 1 ]; then
     if [ "$prerelease" = 1 ]; then
       cat >> "$tmp/$name.expected" <<'EXPECTED'
-open-pact-client-0.3.1~rc.1-1.x86_64.rpm
-open-pact-client-0.3.1~rc.1-1.x86_64.rpm.sigstore.json
-open-pact-client_0.3.1~rc.1_amd64.deb
-open-pact-client_0.3.1~rc.1_amd64.deb.sigstore.json
+open-pact-client-0.3.1-rc.1-1.x86_64.rpm
+open-pact-client-0.3.1-rc.1-1.x86_64.rpm.sigstore.json
+open-pact-client_0.3.1-rc.1_amd64.deb
+open-pact-client_0.3.1-rc.1_amd64.deb.sigstore.json
 EXPECTED
     else
       cat >> "$tmp/$name.expected" <<'EXPECTED'
@@ -203,6 +219,23 @@ open-pact-client-1.2.3-1.x86_64.rpm
 open-pact-client-1.2.3-1.x86_64.rpm.sigstore.json
 open-pact-client_1.2.3_amd64.deb
 open-pact-client_1.2.3_amd64.deb.sigstore.json
+EXPECTED
+    fi
+  fi
+  if [ "$include_desktop" = 1 ]; then
+    if [ "$prerelease" = 1 ]; then
+      cat >> "$tmp/$name.expected" <<'EXPECTED'
+open-pact-desktop-0.3.1-rc.1-macos.zip
+open-pact-desktop-0.3.1-rc.1-macos.zip.sigstore.json
+open-pact-desktop-0.3.1-rc.1-windows-x64.zip
+open-pact-desktop-0.3.1-rc.1-windows-x64.zip.sigstore.json
+EXPECTED
+    else
+      cat >> "$tmp/$name.expected" <<'EXPECTED'
+open-pact-desktop-1.2.3-macos.zip
+open-pact-desktop-1.2.3-macos.zip.sigstore.json
+open-pact-desktop-1.2.3-windows-x64.zip
+open-pact-desktop-1.2.3-windows-x64.zip.sigstore.json
 EXPECTED
     fi
   fi
@@ -240,6 +273,8 @@ run_missing_asset() {
 run_success successful-download
 run_success package-download MOCK_PACKAGE_ASSETS=1
 run_success prerelease-package-download MOCK_PACKAGE_ASSETS=1 MOCK_PRERELEASE=1 MOCK_RELEASE_TAG=v0.3.1-rc.1
+run_success desktop-download MOCK_PACKAGE_ASSETS=1 MOCK_DESKTOP_ASSETS=1
+run_success prerelease-desktop-download MOCK_PACKAGE_ASSETS=1 MOCK_DESKTOP_ASSETS=1 MOCK_PRERELEASE=1 MOCK_RELEASE_TAG=v0.3.1-rc.1
 run_failure github-download MOCK_GH_FAIL=1
 run_failure bad-checksum MOCK_BAD_CHECKSUM=1
 run_failure signature-check MOCK_COSIGN_FAIL=NOTICE
@@ -255,6 +290,9 @@ for file in \
 done
 run_missing_asset open-pact-client_1.2.3_amd64.deb MOCK_PACKAGE_ASSETS=1
 run_missing_asset open-pact-client-1.2.3-1.x86_64.rpm MOCK_PACKAGE_ASSETS=1
+run_missing_asset open-pact-desktop-1.2.3-macos.zip MOCK_DESKTOP_ASSETS=1
+run_missing_asset open-pact-desktop-1.2.3-windows-x64.zip MOCK_DESKTOP_ASSETS=1
+run_failure missing-desktop-bundle MOCK_DESKTOP_ASSETS=1 MOCK_MISSING_BUNDLE=open-pact-desktop-1.2.3-macos.zip
 run_failure missing-package-bundle MOCK_PACKAGE_ASSETS=1 MOCK_MISSING_BUNDLE=open-pact-client_1.2.3_amd64.deb
 run_failure missing-rpm-bundle MOCK_PACKAGE_ASSETS=1 MOCK_MISSING_BUNDLE=open-pact-client-1.2.3-1.x86_64.rpm
 

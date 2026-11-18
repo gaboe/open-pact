@@ -1,10 +1,12 @@
 mod accept;
+mod builtins;
 mod claim;
 mod crypto;
 pub mod dev_key;
 mod enrol;
 mod evaluate;
 mod invitation;
+mod lease;
 mod log;
 mod manifest;
 mod narrowing;
@@ -14,6 +16,7 @@ pub mod timestamp;
 mod witness;
 
 pub use accept::{AcceptRequest, accept_statement};
+pub use builtins::{BUILTINS, LATER_VERSIONS, builtin_about, builtin_defaults, check_supported};
 pub use claim::{
     Claim, LogCheckpoint, VerifiedClaim, Virtualized, sign_claim, sign_claim_with, verify_claim,
 };
@@ -26,14 +29,16 @@ pub use evaluate::{
     evaluate_under, verified_trust_level,
 };
 pub use invitation::{InvalidInvitation, Invitation, InvitationCode, InvitationHash};
+pub use lease::vpn_lease;
 pub use log::{
     Entry, EntryKind, LogHash, consistency_proof, inclusion_proof, leaf_hash, root,
     verify_consistency, verify_inclusion,
 };
 pub use manifest::{
-    Accepted, AcceptedValues, Control, ControlValue, IntegerOutput, IntegerRange, Interval,
-    LogPolicy, Manifest, ManifestBody, Maximum, Metadata, Minimum, Os, Output, ProbeAddress,
-    ProbeName, Schedule, SendPolicy, Source, Span, TimestampOutput, TrustLevel, Witness,
+    Accepted, AcceptedValues, CheckPeriod, Control, ControlValue, IntegerOutput, IntegerRange,
+    Interval, LogPolicy, Manifest, ManifestBody, Maximum, Metadata, Minimum, OnConnect, Os, Output,
+    Place, Probe, ProbeAddress, ProbeName, Schedule, Source, Span, TimestampOutput, TrustLevel,
+    VpnSlot, Witness,
 };
 pub use narrowing::{Violation, is_narrowing, schedule_widened};
 pub use note::{Checkpoint, LogKey, Note, NoteSignature, WitnessKey};

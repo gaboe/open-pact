@@ -1,0 +1,1 @@
+[{"version":2,"manifest_hash":"sha256:669570162cb789fec4dd7e55126b32d5ebfaf337709db90927bd134dd7be5c28","created_at":"2026-11-16T12:00:00Z","note":"OS update at most 14 days on macOS","active":false},{"version":1,"manifest_hash":"sha256:dbdd4ac84812f971ab53cd1028e19f84ae556df3a89e845cc16ea9c36402d2fd","created_at":"2026-11-16T10:00:00Z","note":"Initial manifest","active":true}]

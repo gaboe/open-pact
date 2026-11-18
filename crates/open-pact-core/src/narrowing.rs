@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use crate::{Manifest, Metadata, Os, Output, Schedule};
+use crate::{Manifest, Metadata, OnConnect, Os, Output, Place, Schedule};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Violation {
@@ -38,7 +38,9 @@ pub enum Violation {
     TrustLevelHigher,
     #[error("the [log] witness policy changed")]
     WitnessPolicyChanged,
-    #[error("the [schedule] adds automatic claims or sends them more often or in more places")]
+    #[error(
+        "the [schedule] adds automatic claims, sends them more often or in more places, or checks more often"
+    )]
     ScheduleWidened,
 }
 
@@ -46,12 +48,37 @@ fn added<T: Ord + Clone>(old: &BTreeSet<T>, new: &BTreeSet<T>) -> Vec<T> {
     new.difference(old).cloned().collect()
 }
 
+/// True when the new schedule asks more of the owner than the one the owner signed. It counts as
+/// more when a send or check period rises at the VPN or elsewhere, when the VPN interval is shorter
+/// as written, when it probes another address, or when it sends a claim at once on connect where
+/// the old one waited for its interval. A rate that falls, or a removed part, is never a widening.
 pub fn schedule_widened(old: Option<&Schedule>, new: Option<&Schedule>) -> bool {
     new.is_some_and(|now| {
         old.is_none_or(|was| {
-            was.policy != now.policy || now.interval.as_secs() < was.interval.as_secs()
+            let at = [Place::Vpn, Place::Elsewhere];
+            let sends_more = at
+                .into_iter()
+                .any(|place| rises(was.period(place), now.period(place)))
+                || rises(was.vpn_interval(), now.vpn_interval());
+            let checks_more = at
+                .into_iter()
+                .any(|place| rises(was.check_period(place), now.check_period(place)));
+            let new_probe = now.probe().is_some() && was.probe() != now.probe();
+            let connects_sooner = was.on_connect() == Some(OnConnect::WaitForInterval)
+                && now.on_connect() == Some(OnConnect::Send);
+            sends_more || checks_more || new_probe || connects_sooner
         })
     })
+}
+
+/// Whether a rate rises: it appears where there was none, or it gets shorter. A rate that goes
+/// away does not rise.
+fn rises<T: Ord>(was: Option<T>, now: Option<T>) -> bool {
+    match (was, now) {
+        (_, None) => false,
+        (None, Some(_)) => true,
+        (Some(was), Some(now)) => now < was,
+    }
 }
 
 pub fn is_narrowing(old: &Manifest, new: &Manifest) -> Result<(), Vec<Violation>> {
@@ -247,6 +274,149 @@ mod tests {
         assert!(!schedule_widened(Some(&vpn_55m), Some(&vpn_2h)));
         assert!(!schedule_widened(Some(&vpn_55m), Some(&vpn_55m)));
         assert!(!schedule_widened(None, None));
+    }
+
+    fn places(table: &str) -> Schedule {
+        toml::from_str(table).unwrap()
+    }
+
+    const VPN: &str = "[vpn]\nprobe = \"10.0.0.1:443\"\ninterval = \"1h\"\n";
+
+    #[test]
+    fn the_place_form_widens_when_it_sends_more_or_checks_more() {
+        let base = places(VPN);
+        let always = |interval: &str| format!("[always]\ninterval = \"{interval}\"\n");
+        let widened = |old: &Schedule, new: &Schedule| schedule_widened(Some(old), Some(new));
+
+        assert!(!widened(&base, &base));
+        // A shorter send interval on the VPN.
+        assert!(widened(
+            &base,
+            &places("[vpn]\nprobe = \"10.0.0.1:443\"\ninterval = \"30m\"\n")
+        ));
+        assert!(!widened(
+            &base,
+            &places("[vpn]\nprobe = \"10.0.0.1:443\"\ninterval = \"2h\"\n")
+        ));
+        // A shorter check period on the VPN, a longer one, and the same one written out.
+        let checks = |check: &str| {
+            places(&format!(
+                "[vpn]\nprobe = \"10.0.0.1:443\"\ncheck = \"{check}\"\ninterval = \"1h\"\n"
+            ))
+        };
+        assert!(widened(&base, &checks("1m")));
+        assert!(widened(&checks("10m"), &checks("9m")));
+        assert!(!widened(&base, &checks("5m")));
+        assert!(!widened(&base, &checks("10m")));
+        // Adding the part for any network, shortening it, and lengthening it.
+        let both = |interval: &str| places(&format!("{VPN}{}", always(interval)));
+        assert!(widened(&base, &both("24h")));
+        assert!(!widened(&both("24h"), &base));
+        assert!(widened(&both("24h"), &both("12h")));
+        assert!(!widened(&both("12h"), &both("24h")));
+        // Dropping the VPN part keeps the cadence on the VPN and narrows the rest.
+        assert!(!widened(&both("24h"), &places(&always("24h"))));
+        assert!(widened(&places(&always("24h")), &places(&always("12h"))));
+        assert!(!widened(&places(&always("12h")), &places(&always("24h"))));
+        // A new probe, or a new TLS name, needs the owner.
+        assert!(widened(
+            &base,
+            &places("[vpn]\nprobe = \"10.0.0.2:443\"\ninterval = \"1h\"\n")
+        ));
+        assert!(widened(
+            &base,
+            &places(
+                "[vpn]\nprobe = \"10.0.0.1:443\"\nprobe_name = \"vpn.example.org\"\ninterval = \"1h\"\n"
+            )
+        ));
+        // A part for any network is wider than none, in either order of forms.
+        assert!(schedule_widened(None, Some(&base)));
+        assert!(!schedule_widened(Some(&base), None));
+    }
+
+    #[test]
+    fn the_flat_form_widens_into_the_place_form_only_where_it_sends_more() {
+        let flat_vpn = places("mode = \"vpn\"\nvpn_probe = \"10.0.0.1:443\"\ninterval = \"1h\"");
+        let flat_always = places("mode = \"always\"\ninterval = \"1h\"");
+        let widened = |old: &Schedule, new: &Schedule| schedule_widened(Some(old), Some(new));
+
+        // The same interval, but the connect claim no longer waits for it.
+        assert!(widened(&flat_vpn, &places(VPN)));
+        // Even with a longer interval and the same check period: the owner never agreed to it.
+        assert!(widened(
+            &flat_vpn,
+            &places("[vpn]\nprobe = \"10.0.0.1:443\"\ncheck = \"5m\"\ninterval = \"2h\"\n")
+        ));
+        // Adding any network to a flat VPN schedule widens.
+        assert!(widened(
+            &flat_vpn,
+            &places(&format!("{VPN}[always]\ninterval = \"24h\"\n"))
+        ));
+        // The flat form for any network rewritten as the place form is the same schedule.
+        assert!(!widened(
+            &flat_always,
+            &places("[always]\ninterval = \"1h\"\n")
+        ));
+        assert!(widened(
+            &flat_always,
+            &places("[always]\ninterval = \"30m\"\n")
+        ));
+        // The place form never widens into the flat form by itself: it sends no sooner on connect.
+        assert!(!widened(&places(VPN), &flat_vpn));
+    }
+
+    #[test]
+    fn a_manifest_that_adds_the_part_for_any_network_needs_the_owner() {
+        let start = DEMO.find("\n[schedule]").unwrap();
+        let head = &DEMO[..start];
+        let vpn = format!("{head}\n[schedule.vpn]\nprobe = \"10.0.0.1:443\"\ninterval = \"1h\"\n");
+        let both = format!("{vpn}\n[schedule.always]\ninterval = \"24h\"\n");
+        let (vpn, both) = (
+            Manifest::parse(vpn.as_bytes()).unwrap(),
+            Manifest::parse(both.as_bytes()).unwrap(),
+        );
+        assert_eq!(
+            is_narrowing(&vpn, &both),
+            Err(vec![Violation::ScheduleWidened])
+        );
+        assert_eq!(is_narrowing(&both, &vpn), Ok(()));
+    }
+
+    #[test]
+    fn removing_the_vpn_part_widens_when_the_any_network_part_checks_more() {
+        // The any-network part checks every 5 minutes wherever it applies, so dropping a VPN part
+        // that checked every 10 minutes raises the check rate on the VPN.
+        let old = places(
+            "[vpn]\nprobe = \"10.0.0.1:443\"\ncheck = \"10m\"\ninterval = \"1h\"\n[always]\ninterval = \"1h\"\n",
+        );
+        assert!(schedule_widened(
+            Some(&old),
+            Some(&places("[always]\ninterval = \"1h\"\n"))
+        ));
+        assert!(schedule_widened(
+            Some(&old),
+            Some(&places("mode = \"always\"\ninterval = \"1h\""))
+        ));
+        // With the default check period the same removal checks no more and sends no more.
+        let default_check = places(
+            "[vpn]\nprobe = \"10.0.0.1:443\"\ninterval = \"1h\"\n[always]\ninterval = \"1h\"\n",
+        );
+        assert!(!schedule_widened(
+            Some(&default_check),
+            Some(&places("[always]\ninterval = \"1h\"\n"))
+        ));
+    }
+
+    #[test]
+    fn a_shorter_vpn_interval_widens_even_when_the_any_network_interval_is_shorter() {
+        let old = places(
+            "[vpn]\nprobe = \"10.0.0.1:443\"\ninterval = \"1h\"\n[always]\ninterval = \"5m\"\n",
+        );
+        let new = places(
+            "[vpn]\nprobe = \"10.0.0.1:443\"\ninterval = \"30m\"\n[always]\ninterval = \"5m\"\n",
+        );
+        assert!(schedule_widened(Some(&old), Some(&new)));
+        assert!(!schedule_widened(Some(&new), Some(&old)));
     }
 
     #[test]

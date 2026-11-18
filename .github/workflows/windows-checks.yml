@@ -2,7 +2,9 @@ name: windows-checks
 
 on:
   push:
+    paths-ignore: ['desktop/**']
   pull_request:
+    paths-ignore: ['desktop/**']
   workflow_dispatch:
 
 permissions:

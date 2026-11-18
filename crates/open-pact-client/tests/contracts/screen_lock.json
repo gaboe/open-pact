@@ -190,6 +190,50 @@
       "known_diff": null
     },
     {
+      "name": "windows-17",
+      "os": "windows",
+      "input": [
+        "1|||none"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "none",
+      "known_diff": null
+    },
+    {
+      "name": "windows-18",
+      "os": "windows",
+      "input": [
+        "|||none"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "none",
+      "known_diff": null
+    },
+    {
+      "name": "windows-19",
+      "os": "windows",
+      "input": [
+        "1|1|300|none"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "none",
+      "known_diff": null
+    },
+    {
+      "name": "windows-20",
+      "os": "windows",
+      "input": [
+        "!|1|300|valid"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
       "name": "linux-17",
       "os": "linux",
       "input": [

@@ -20,13 +20,13 @@ scoop install gaboe/open-pact
 For Debian or Ubuntu, download the `.deb` from the [client releases](https://github.com/gaboe/open-pact/releases), then run:
 
 ```sh
-sudo apt install ./open-pact-client_0.7.1_amd64.deb
+sudo apt install ./open-pact-client_0.8.1_amd64.deb
 ```
 
 For Fedora, download the `.rpm` from the [client releases](https://github.com/gaboe/open-pact/releases), then run:
 
 ```sh
-sudo dnf install ./open-pact-client-0.7.1-1.x86_64.rpm
+sudo dnf install ./open-pact-client-0.8.1-1.x86_64.rpm
 ```
 
 Homebrew and Scoop check the SHA-256 value recorded in their formula or manifest. They do not verify the Cosign signature. The Linux commands install local files, so verify them with the release steps below before you install them. Run `brew upgrade` or `scoop update open-pact` to update an installed client. For APT or DNF, download and install each new release when you choose to update.
@@ -36,10 +36,10 @@ Homebrew and Scoop check the SHA-256 value recorded in their formula or manifest
 Run the verification script with a release tag:
 
 ```sh
-scripts/verify-client-release.sh v0.7.1
+scripts/verify-client-release.sh v0.8.1
 ```
 
-The script checks every checksum and Sigstore bundle. It keeps the verified files in a private temporary directory when verification succeeds. It removes the directory if verification fails. It prints the directory path on the last line. Copy that path for the install command.
+The script checks every checksum and Sigstore bundle. For a release that has them, it also checks the desktop app zips (`open-pact-desktop-<version>-macos.zip` and `open-pact-desktop-<version>-windows-x64.zip`). The desktop installers, `desktop/scripts/install-desktop.sh` and `install-desktop.ps1`, check the zip against its line in `SHA256SUMS` but do not verify the Cosign signature. It keeps the verified files in a private temporary directory when verification succeeds. It removes the directory if verification fails. It prints the directory path on the last line. Copy that path for the install command.
 
 Set `verified_dir` to the printed path:
 
@@ -84,8 +84,8 @@ The script needs GitHub CLI, Cosign, and `sha256sum` or `shasum`. Set `GH_REPO` 
 The verified directory includes the `.deb` and `.rpm` packages. Install them with the matching package manager:
 
 ```sh
-sudo apt install "$verified_dir/open-pact-client_0.7.1_amd64.deb"
-sudo dnf install "$verified_dir/open-pact-client-0.7.1-1.x86_64.rpm"
+sudo apt install "$verified_dir/open-pact-client_0.8.1_amd64.deb"
+sudo dnf install "$verified_dir/open-pact-client-0.8.1-1.x86_64.rpm"
 ```
 
 ## Join and check the gateway
@@ -133,6 +133,8 @@ open-pact-client manifest check --json < manifest.toml
 
 It prints `Manifest is valid.` and exits 0, or prints one line per error and exits 1. Wrong arguments exit 2. With `--json`, stdout holds one document: `{"ok":true,"errors":[]}`, or `{"ok":false,"errors":[{"message":"...","line":12,"key":"log.witness_quorum"}]}`. `line` is the 1-based line of a TOML error, and `key` is the manifest key a rule error names. Each is `null` when the error has none. A draft that passes can still need a newer client if it uses a builtin that the client in your hand does not have.
 
+`open-pact-client manifest builtins` lists each built-in check that this client runs, with its default text: one line per check, the check name such as `builtin:firewall@1`, two spaces, then the text. With `--json` it prints one array of objects with `check`, `id` and `about`. The default text lives only in the client. A control's `description` in the manifest replaces it in the manifest summary, and the apps read the default from this command.
+
 ### Accept a changed manifest
 
 When the company changes the manifest, `check` prints a line that names the new hash and asks you to run `accept`. The device keeps its approval and VPN access meanwhile. Controls that the new manifest adds or tightens fail now. The gateway accepts claims for the length of each control's grace and warns you. When the grace runs out, access ends.
@@ -143,9 +145,9 @@ open-pact-client accept
 
 The client fetches the new manifest and checks its company signature, the pinned keys and the log checkpoint under the new manifest's log policy. It shows the manifest and what changed against the one you signed: added, removed, and changed controls, `disclosed_metadata`, `claim_retention`, `claim_recipients`, `data_controller`, the minimum trust level, `unknown_grace`, `claim_max_age`, the issuer, the validity date and the log policy. A changed control shows its requirement for each operating system that differs. If you confirm, the owner key and the device key sign the new hash. The gateway moves the device to the new manifest without a new invitation or approval. The client then stores the new manifest, and the next `check` runs its checks. Pass `--yes` to sign without the prompt.
 
-When a new manifest adds automatic sending, changes its mode or probe, or shortens its interval, `accept` turns automatic sending off after the gateway confirms the new manifest. Run `open-pact-client schedule on` to agree to the new schedule.
+When a new manifest adds automatic sending, changes its mode or probe, shortens an interval, checks more often, or turns the wait for the interval at a connect into an immediate claim, `accept` turns automatic sending off after the gateway confirms the new manifest. Run `open-pact-client schedule on` to agree to the new schedule.
 
-Before you sign, `accept` prints the absolute path of a copy of the whole new manifest, so you can read all of it. The copy is removed when the command ends. A change to `[schedule]` appears in the list of changes in plain words, such as `Automatic claims: only while vpn.example.org answers at 10.0.0.1:443, every 55 minutes, and at once when a check result changes`. Until you accept, the job keeps the policy of the manifest you signed.
+Before you sign, `accept` prints the absolute path of a copy of the whole new manifest, so you can read all of it. The copy is removed when the command ends. A change to `[schedule]` appears in the list of changes in plain words, such as the consent line above. When automatic sending stays on, `accept` also prints the new consent line and when the next check and the next claim fall due. Until you accept, the job keeps the policy of the manifest you signed.
 
 Run `open-pact-client manifest show` to review the signed manifest stored on this device. It checks that `manifest.toml` still matches the hash in `enrolment.json`, then prints the manifest summary, signed hash, and the absolute path of the full text. It also prints the automatic-claims line. It also prints the manifest's transparency log entry index when the client has it. If the index is not stored, use `open-pact-client log prove` to verify the entries available to this device. This command reads local files and does not contact the gateway.
 
@@ -181,22 +183,34 @@ open-pact-client check --dry-run
 
 The command runs the same local checks as `check` and prints the claim as JSON. It adds `manifest_toml` when the gateway enforces a different manifest. It makes GET requests for the manifest, log key, checkpoint, and any needed consistency proof. It sends no nonce request or signed POST. It writes no file. The dry run never suppresses the claim. When the saved device status is pending or revoked, it prints one `Last known status` line after the claim, because `check` asks the gateway again. It cannot verify private log entries or current device status because those checks need a signed request. When the dry run prints a claim, it also prints this line: `check also asks the gateway whether this device may send; the dry run skips that signed request.` The nonce, time, and VPN certificate request appear as placeholders. The scheduled job sends the same claim.
 
-## Send claims automatically
+Add `--timings` to measure what one run costs:
 
-The company decides whether the job may send, and how, in the `[schedule]` table of the signed manifest. The table is part of the signed text and its hash. You decide only whether to turn it on. The job runs the claim pipeline of `check` and sends the same claim. The gateway is the only server.
-
-```toml
-[schedule]
-mode = "vpn"
-vpn_probe = "10.0.0.1:443"
-vpn_probe_name = "vpn.example.org"
-interval = "55m"
+```sh
+open-pact-client check --dry-run --timings
 ```
 
-- `mode = "vpn"` sends only while `vpn_probe` answers. It needs `vpn_probe`. `vpn_probe_name` is optional.
-- `mode = "always"` sends on any network. It takes no `vpn_probe` and no `vpn_probe_name`. The client says so in plain words: `Automatic claims: every 55 minutes on any network`.
-- `interval` is the time between periodic claims, from `5m` to `24h`, written as whole minutes or hours such as `55m` or `2h`, without a sign or a leading zero. The client prints it in words: `55 minutes`, `1 hour`, `90 minutes`. It is the shortest time between two automatic claims.
-- A manifest without `[schedule]` means the company did not define automatic sending. `schedule on` refuses, and you send claims by hand with `check`.
+It prints, on the error stream and after the claim, the wall time of the whole run and the CPU time (user and system) of the client process and of its child processes: `Timings: wall time of the whole run 0.62 s`, then one line for each. Unix reads both from `getrusage`. On Windows it reads the client process, and for the child processes it adds the CPU time of each command that a check ran, such as the PowerShell batch. Run it about twenty times on each kind of device and read the median before you set a short `check` period. `--timings` works only with `--dry-run`, and it writes and sends nothing more than the dry run does.
+
+## Send claims automatically
+
+The company decides whether the job may check and send, and how, in the `[schedule]` table of the signed manifest. The table is part of the signed text and its hash. You decide only whether to turn it on. The job runs the claim pipeline of `check` and sends the same claim. The gateway is the only server.
+
+```toml
+[schedule.vpn]                    # while the company VPN answers
+probe = "10.0.0.1:443"            # host:port that answers only on the company VPN
+probe_name = "vpn.example.org"    # optional TLS name that the probe must present
+interval = "1h"                   # the longest time between claims on the VPN: 5m to 24h
+check = "5m"                      # optional: how often the device checks itself on the VPN, 1m to 24h; default 5m
+
+[schedule.always]                 # optional: on any network
+interval = "24h"
+```
+
+- `[schedule.vpn]` works while `probe` answers. It needs `probe` and `interval`. `probe_name` and `check` are optional.
+- `[schedule.always]` works on any network and needs no probe. The manifest needs at least one of the two tables.
+- `interval` is a time from `5m` to `24h`, written as whole minutes or hours such as `55m` or `2h`, without a sign or a leading zero. `check` uses the same text. The client prints times in words: `5 minutes`, `1 hour`, `90 minutes`.
+- The consent line says all of it in plain words, for example: `Automatic claims: on the company VPN (vpn.example.org at 10.0.0.1:443) checks every 5 minutes, sends at once on connect or when a result gets worse, and at least every hour; on any network every 24 hours, and at once when a result gets worse.` `schedule on`, `schedule status`, `accept`, and `manifest show` print this line. It is the text you agree to.
+- The older flat table (`mode = "vpn"` or `"always"`, `vpn_probe`, `vpn_probe_name`, `interval`) still works and keeps its old meaning, with one exception that the next paragraphs name. A manifest without `[schedule]` means the company did not define automatic sending. `schedule on` refuses, and you send claims by hand with `check`.
 
 Turn the job on, look at it, or turn it off:
 
@@ -207,13 +221,26 @@ open-pact-client schedule status
 open-pact-client schedule off
 ```
 
-`schedule on` prints the policy line, then `schedule: install`, then `Your choice: automatic sending is on.` A second run prints `no changes` and the same choice line, and a changed executable path prints `schedule: update`. Dry run prints the planned change and writes nothing. `schedule status` shows the company's policy, your choice, and the state of the job. Keep the client binary at its installed path. Use the same absolute `--home` for each command. If the entire client home is already missing, `schedule off` removes the remaining job without recreating that home. The job reads the policy from the manifest you signed. A manifest change that keeps or narrows the schedule needs no new `schedule on`. After `accept` signs a manifest that widens it, run `schedule on` again.
+`schedule on` prints the policy line, then `schedule: install`, then `Your choice: automatic sending is on.` A second run prints `no changes` and the same choice line, and a changed executable path prints `schedule: update`. A job that client 0.7 installed wakes every five minutes: `schedule on` prints `schedule: update` and rewrites it to wake every minute on macOS, Linux and Windows. Dry run prints the planned change and writes nothing. `schedule status` shows the consent line, your choice, the state of the job, the last claim that the gateway answered, the last check, and when the next check and the next claim fall due. For a SYSTEM job on Windows it reads that job's protected state: run it from an elevated prompt. When the state cannot be read, `schedule status` and `accept` say that the times are unknown and why. It derives the due times from the same rules as the job, and it assumes that the device stays where the last run found it (on the VPN or not). Keep the client binary at its installed path. Use the same absolute `--home` for each command. If the entire client home is already missing, `schedule off` removes the remaining job without recreating that home. The job reads the policy from the manifest you signed. A manifest change that keeps or narrows the schedule needs no new `schedule on`. After `accept` signs a manifest that widens it, run `schedule on` again. A change that only checks more often counts as widening.
 
-Choose a `vpn_probe` that connects only on the company VPN. With `mode = "vpn"`, the job tries a TCP connection to it every five minutes, with a two-second timeout. Use brackets around IPv6 addresses. An address that also answers off the VPN makes the job send off the VPN.
+### What one wake does
 
-A private address such as `10.0.0.1:443` can also exist on other networks, such as hotel or home routers, so a TCP connection alone can match the wrong network. With `vpn_probe_name`, the probe connects to `vpn_probe` without a DNS lookup of the name, and it needs a TLS certificate that is valid for that name. The certificate must chain to a root that the client trusts for its HTTPS requests. The probe has five seconds in total, and any HTTP status counts as an answer. The probe does not use a proxy. An empty value or an IP address for `vpn_probe_name` is an error in the manifest.
+The OS wakes the job every minute. A wake costs one process start and, with a VPN table, one probe. It decides first, from the saved state and the clock, whether anything is due. When nothing is due, it exits at once: no check, no repository scan, no gateway request. `check --dry-run --timings` measures what a run costs on your machine.
 
-With `mode = "vpn"`, the job probes before it prepares the claim, again at the start of the send before any gateway request (the manifest, the log, a nonce), and once more before the POST of the claim. It sends when the last attempt that the gateway answered is older than `interval`, or when there is none. A connection that returns inside the interval does not send. With `mode = "always"`, it does not probe and sends every `interval`. An accepted claim and a denied claim both count as answered. So does an answer without a verdict: the device waits for approval, IT revoked it, the manifest awaits `accept`, or the log did not verify. The job then asks again only after the interval, and writes each piece of news to `schedule.log` once. A send that gets no answer (a network error) retries on the next run. It scans repositories at most once a day, before it takes the claim lock, and uses the stored counts between scans. The job takes the same lock as `check` and `accept` only for the gateway part, and it skips a run while one of them holds it. A command you start waits up to 60 seconds for the lock and prints one line that it waits for the scheduled job. A required control that changes from compliant to non-compliant triggers an extra claim at once, inside the interval. Missing results and `unknown` count as non-compliant without grace. Controls with no requirement do not trigger.
+- **On the VPN** the job checks every `check` period (at least five minutes on Windows, because one Windows check starts PowerShell) and on the first wake after the VPN connects. It sends at once on a connect, at once when a required control changes from compliant to non-compliant, and at least every `interval`. A connect claim goes at most once every five minutes: when the gateway answered a claim less than five minutes ago, a VPN that comes and goes does not send again, and the periodic claim and any change still do.
+- **Off the VPN** the job only probes. It runs no check and sends nothing. With `[schedule.always]` it checks every five minutes, sends at once when a result gets worse, and sends every `interval` of that table.
+- A claim that is due always runs fresh checks first.
+- The flat 0.7 form keeps its interval gating: with `mode = "vpn"` it sends when the last answered attempt is older than `interval`, also at a connect, and with `mode = "always"` it sends every `interval`. The faster wake changes only how often it checks: every five minutes while the VPN answers (and every five minutes with `mode = "always"`), and on the first wake after a connect. It no longer runs checks off the VPN.
+
+### Access ends when the device stops being compliant
+
+The VPN accepts only a certificate that the gateway issued after a compliant claim, and the gateway never issues one that outlives the nearest grace deadline. The client adds a second step on the device. When a check finds a required control non-compliant and that control's grace has ended on this device, the job deletes the installed VPN certificate (`vpn/current`, every generation, and the files `ca.pem` and `vpn-cert.pem`), writes one line to `schedule.log` (`Removed the VPN certificate: firewall failed and its grace ended. A claim goes out at once.`), and sends a claim at once. Grace counts from the first check on this device that saw the failure, as the gateway counts from the first claim it saw. A grace of `0d` ends at once. A result that cannot be read counts against `unknown_grace`, also on a control with no grace. A control that passes starts its grace again. The client first saves the pending claim in its state file, so a crash after the deletion still sends the claim on the next run. Then it writes a `vpn-removal-pending` file in the client home and syncs it to disk, so an interruption (a crash, a power loss) cannot leave a usable certificate behind: the next claim, and on Windows the next start of a command that recovers the VPN files, finishes the deletion and never restores the certificate. If the deletion fails, for example because another program holds the file, the job logs the error once and still sends the claim at once. The claim does not wait for the deletion: a blocked recovery step before the send is logged and the claim goes out. A later claim that the gateway accepts installs a new certificate as always and removes that file. A denied claim installs none, so the device stays off the VPN until the control passes.
+
+Choose a `probe` that connects only on the company VPN. The job tries a TCP connection to it, with a two-second timeout. Use brackets around IPv6 addresses. An address that also answers off the VPN makes the job send off the VPN.
+
+A private address such as `10.0.0.1:443` can also exist on other networks, such as hotel or home routers, so a TCP connection alone can match the wrong network. With `probe_name`, the probe connects to `probe` without a DNS lookup of the name, and it needs a TLS certificate that is valid for that name. The certificate must chain to a root that the client trusts for its HTTPS requests. The probe has five seconds in total, and any HTTP status counts as an answer. The probe does not use a proxy. An empty value or an IP address for `probe_name` is an error in the manifest. (The flat form names them `vpn_probe` and `vpn_probe_name`.)
+
+Where the schedule has a VPN table, the job probes on every wake, before it prepares the claim, again at the start of the send before any gateway request (the manifest, the log, a nonce), and once more before the POST of the claim. It sends nothing more when a probe fails. An accepted claim and a denied claim both count as answered. So does an answer without a verdict: the device waits for approval, IT revoked it, the manifest awaits `accept`, or the log did not verify. The job then asks again only after the interval, and writes each piece of news to `schedule.log` once. A send that gets no answer (a network error) retries on the next run. It scans repositories at most once a day, before it takes the claim lock, and uses the stored counts between scans. The job takes the same lock as `check` and `accept` only for the gateway part, and it skips a run while one of them holds it. A command you start waits up to 60 seconds for the lock and prints one line that it waits for the scheduled job. A required control that changes from compliant to non-compliant triggers an extra claim at once, inside the interval, when the next check finds it. Missing results and `unknown` count as non-compliant without grace. Controls with no requirement do not trigger.
 
 When the company changes the manifest and you have not yet run `accept`, the job keeps the policy of the manifest you signed. It writes the accept notice to `schedule.log`. The job also does nothing while automatic sending is off.
 
@@ -375,7 +402,7 @@ The exit code tells a script what to do:
 | Windows event claims do not trigger | Check Event Log Readers access for the limited task user. Check that Defender history can be read. |
 | Linux `schedule on` cannot reach systemd | Start the user systemd manager. Run `schedule on` again. |
 | `schedule on` says the company did not define automatic sending | The signed manifest has no `[schedule]`. Send claims by hand with `check`, or ask the company to add the table. |
-| Schedule does not send | Run `schedule status`. Read `schedule.log` in the client home. With `mode = "vpn"`, check that `vpn_probe` connects while the VPN is up and that the binary remains at its installed path. With `vpn_probe_name`, check that the probe presents a certificate for that name from a trusted root. |
+| Schedule does not send | Run `schedule status`. Read `schedule.log` in the client home. Check that `probe` (flat form `vpn_probe`) connects while the VPN is up and that the binary remains at its installed path. With `probe_name`, check that the probe presents a certificate for that name from a trusted root. A wake that finds nothing due writes nothing: `schedule status` shows when the next check and claim fall due. |
 | `schedule off` cannot find the job | Use the same absolute `--home` path that you used for `schedule on`. |
 | The client says `open-pact.toml` is ignored | The file belongs to an earlier client. Use `schedule on` and `folders add` instead, then delete the file. |
 
@@ -389,7 +416,7 @@ On Windows, use the account that created the CNG key or SYSTEM. A different admi
 
 Run the client as the account that uses the device. `work_account` reports `admin` for membership in `sudo`, `wheel`, or `root`. The systemd user timer needs a running user manager. A container without that manager cannot install or exercise the user timer.
 
-To use the Linux ClamAV detection trigger, route `clamonacc` or `clamd` detection output to the system journal. Give the client account read access to that journal. The client reads trusted process names and `FOUND` records. The scheduled job checks every five minutes while the VPN is connected. File-only logs do not supply this trigger. A denied journal read preserves the saved detection baseline.
+To use the Linux ClamAV detection trigger, route `clamonacc` or `clamd` detection output to the system journal. Give the client account read access to that journal. The client reads trusted process names and `FOUND` records. The scheduled job reads it on each check: every `check` period (five minutes unless the manifest says otherwise) while the VPN is connected. File-only logs do not supply this trigger. A denied journal read preserves the saved detection baseline.
 
 The boot authentication check reads root and active swap mappings from `lsblk` and `/etc/crypttab`. An unspecified crypttab key reports `unknown` because automatic keys cannot be excluded. Explicit hardware PIN options report `user_secret`. A configured TPM2, FIDO2, or Clevis unlock reports `hardware_only`. A keyfile on a verified unencrypted filesystem reports `none`. Missing evidence reports `unknown`.
 

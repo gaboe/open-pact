@@ -22,6 +22,7 @@ use time::OffsetDateTime;
 
 use crate::claims::{Opener, SELECT_STORED, Stored, StoredRow};
 use crate::seal::SealingKey;
+use crate::standing::{self, Standing};
 use crate::{devices, grace};
 
 /// How many rows one query reads while `list` looks for matches.
@@ -101,6 +102,10 @@ pub struct Summary {
     /// Null for a claim an early version stored with no decision.
     pub result: Option<Outcome>,
     pub failed_controls: Vec<String>,
+    /// The end of the VPN certificate this claim got. Null when it got none.
+    pub access_until: Option<String>,
+    /// The device's standing when the command runs, from its last claim decision.
+    pub standing: Standing,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -148,9 +153,13 @@ pub struct Detail {
     pub trust_level: TrustLevel,
     pub result: Option<Outcome>,
     pub controls: Vec<ControlRow>,
+    /// The end of the VPN certificate this claim got. Null when it got none.
+    pub access_until: Option<String>,
+    /// The device's standing when the command runs, from its last claim decision.
+    pub standing: Standing,
 }
 
-fn stamp(t: OffsetDateTime) -> String {
+pub fn stamp(t: OffsetDateTime) -> String {
     open_pact_core::timestamp::rfc3339_secs(t)
 }
 
@@ -167,6 +176,7 @@ fn parse_claim(stored: &Value) -> anyhow::Result<Claim> {
         .context("the claim is not an object")?;
     fields.remove("verified_trust_level");
     fields.remove("certificate_sha256");
+    fields.remove("certificate_not_after");
     if let Some(asserted) = fields.remove("asserted_trust_level") {
         fields.insert("trust_level".into(), asserted);
     }
@@ -231,6 +241,27 @@ fn failed_controls(manifest: &Manifest, claim: &Claim) -> Vec<String> {
         .collect()
 }
 
+/// The end of the certificate a claim got, as the claim stores it. None for a claim without one.
+fn access_until(stored: &Value) -> Option<String> {
+    stored["certificate_not_after"].as_str().map(str::to_owned)
+}
+
+/// The standing of a device now, from its last claim decision and the send interval of the
+/// manifest that decision was made under.
+async fn device_standing(
+    db: &PgPool,
+    manifests: &mut Manifests<'_>,
+    device: &str,
+    now: OffsetDateTime,
+) -> anyhow::Result<Standing> {
+    let last = standing::last_decision(db, device).await?;
+    let interval = match &last {
+        Some(last) => standing::send_interval(manifests.get(&last.manifest).await?),
+        None => None,
+    };
+    Ok(standing::standing(last.as_ref(), interval, now))
+}
+
 fn outcome(allowed: Option<bool>, failed: Option<&[String]>) -> Option<Outcome> {
     match (allowed?, failed) {
         (false, _) => Some(Outcome::Denied),
@@ -254,6 +285,8 @@ pub async fn list(
     let mut opener = Opener::new(db, kek);
     let mut manifests = Manifests::new(db, startup);
     let mut notes: HashMap<String, String> = HashMap::new();
+    let mut standings: HashMap<String, Standing> = HashMap::new();
+    let now = OffsetDateTime::now_utc();
     let mut listing = Listing {
         claims: vec![],
         unreadable: 0,
@@ -309,10 +342,16 @@ pub async fn list(
                 let note = device_note(db, &stored.device).await?;
                 notes.insert(stored.device.clone(), note);
             }
+            if !standings.contains_key(&stored.device) {
+                let standing = device_standing(db, &mut manifests, &stored.device, now).await?;
+                standings.insert(stored.device.clone(), standing);
+            }
             listing.claims.push(Summary {
                 id: stored.id,
                 received_at: stamp(stored.received_at),
                 device_note: notes[&stored.device].clone(),
+                access_until: access_until(&stored.claim),
+                standing: standings[&stored.device],
                 device: stored.device,
                 manifest_hash: hash,
                 result,
@@ -357,7 +396,8 @@ pub async fn show(
     let hash = claim.manifest.as_str().to_owned();
     let trust_level = serde_json::from_value(stored_claim["verified_trust_level"].clone())
         .unwrap_or(claim.trust_level);
-    let manifest = Manifests::new(db, startup).get(&hash).await?.cloned();
+    let mut manifests = Manifests::new(db, startup);
+    let manifest = manifests.get(&hash).await?.cloned();
 
     let (controls, failed) = match &manifest {
         Some(manifest) => {
@@ -418,10 +458,13 @@ pub async fn show(
             None,
         ),
     };
+    let standing = device_standing(db, &mut manifests, &device, OffsetDateTime::now_utc()).await?;
     Ok(Detail {
         id,
         received_at: stamp(received_at),
         device_note: device_note(db, &device).await?,
+        access_until: access_until(&stored_claim),
+        standing,
         device,
         manifest_hash: hash,
         os: claim.os,
@@ -615,8 +658,19 @@ grace = "1d"
     }
 
     async fn put(db: &PgPool, retention: &str, claim: &Claim, allowed: bool) -> i64 {
+        put_with(db, retention, claim, allowed, None).await
+    }
+
+    /// Stores a claim as the handler does, with the end of the certificate it got.
+    async fn put_with(
+        db: &PgPool,
+        retention: &str,
+        claim: &Claim,
+        allowed: bool,
+        access_until: Option<OffsetDateTime>,
+    ) -> i64 {
         let retention: Span = retention.to_string().try_into().unwrap();
-        let payload = crate::stored_claim(claim, None).unwrap();
+        let payload = crate::stored_claim(claim, None, access_until).unwrap();
         let mut conn = db.acquire().await.unwrap();
         claims::store(
             &mut conn,
@@ -748,6 +802,156 @@ grace = "1d"
             b,
             ids,
         }
+    }
+
+    /// The certificate end is the claim's own. The standing follows the device's last decision:
+    /// current while the certificate runs, denied after a denial, lapsed once it ends, and silent for
+    /// a device that never decided.
+    #[tokio::test]
+    #[ignore = "needs TEST_DATABASE_URL"]
+    async fn access_until_and_standing_follow_the_last_decision() {
+        let w = world().await;
+        let now = OffsetDateTime::now_utc();
+        let until = now + Duration::hours(1);
+        let ok = [("disk_encryption", "full"), ("firewall", "on")];
+        let id = put_with(
+            &w.db,
+            "12mo",
+            &claim(
+                &w.a,
+                w.manifest.hash(),
+                Os::Linux,
+                now - Duration::minutes(1),
+                &ok,
+            ),
+            true,
+            Some(until),
+        )
+        .await;
+        let hash = w.manifest.hash().as_str().to_owned();
+        let mut conn = w.db.acquire().await.unwrap();
+        devices::record_claim(
+            &mut conn,
+            &w.a,
+            &hash,
+            now,
+            devices::ClaimResult::Accepted,
+            Some(until),
+            &[],
+        )
+        .await
+        .unwrap();
+
+        let detail = show(&w.db, &w.kek, None, id).await.unwrap();
+        assert_eq!(detail.access_until, Some(stamp(until)));
+        assert_eq!(detail.standing, Standing::Current);
+        let listing = list(&w.db, &w.kek, None, &filter()).await.unwrap();
+        assert_eq!(listing.claims[0].id, id);
+        assert_eq!(listing.claims[0].access_until, Some(stamp(until)));
+        assert!(
+            listing.claims[1..].iter().all(|c| c.access_until.is_none()),
+            "older claims kept no certificate"
+        );
+        let other = listing
+            .claims
+            .iter()
+            .find(|c| c.device == w.b.as_str())
+            .unwrap();
+        assert_eq!(
+            other.standing,
+            Standing::Silent,
+            "a device that never decided"
+        );
+
+        devices::record_claim(
+            &mut conn,
+            &w.a,
+            &hash,
+            now,
+            devices::ClaimResult::Denied,
+            None,
+            &["device revoked".into()],
+        )
+        .await
+        .unwrap();
+        let detail = show(&w.db, &w.kek, None, id).await.unwrap();
+        assert_eq!(detail.standing, Standing::Denied);
+        assert_eq!(
+            detail.access_until,
+            Some(stamp(until)),
+            "the claim keeps its own certificate end"
+        );
+
+        devices::record_claim(
+            &mut conn,
+            &w.a,
+            &hash,
+            now - Duration::minutes(5),
+            devices::ClaimResult::Accepted,
+            Some(now - Duration::minutes(1)),
+            &[],
+        )
+        .await
+        .unwrap();
+        let detail = show(&w.db, &w.kek, None, id).await.unwrap();
+        assert_eq!(detail.standing, Standing::Lapsed);
+    }
+
+    /// A device row from before the gateway kept the certificate end has a null end. Its standing is
+    /// unknown until the device claims again, and the new claim ends the doubt.
+    #[tokio::test]
+    #[ignore = "needs TEST_DATABASE_URL"]
+    async fn a_device_with_no_recorded_certificate_end_is_unknown_until_its_next_claim() {
+        let w = world().await;
+        let now = OffsetDateTime::now_utc();
+        let ok = [("disk_encryption", "full"), ("firewall", "on")];
+        let id = put_with(
+            &w.db,
+            "12mo",
+            &claim(
+                &w.a,
+                w.manifest.hash(),
+                Os::Linux,
+                now - Duration::minutes(1),
+                &ok,
+            ),
+            true,
+            None,
+        )
+        .await;
+        let hash = w.manifest.hash().as_str().to_owned();
+        sqlx::query(
+            "UPDATE devices SET last_claim_at = $3, last_result = 'accepted', last_reasons = '{}', \
+             last_access_until = NULL WHERE pseudonym = $1 AND manifest_hash = $2",
+        )
+        .bind(w.a.as_str())
+        .bind(&hash)
+        .bind(now - Duration::minutes(1))
+        .execute(&w.db)
+        .await
+        .unwrap();
+        let detail = show(&w.db, &w.kek, None, id).await.unwrap();
+        assert_eq!(detail.standing, Standing::Unknown);
+        assert_eq!(detail.access_until, None);
+
+        let mut conn = w.db.acquire().await.unwrap();
+        devices::record_claim(
+            &mut conn,
+            &w.a,
+            &hash,
+            now,
+            devices::ClaimResult::Accepted,
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
+        let detail = show(&w.db, &w.kek, None, id).await.unwrap();
+        assert_eq!(
+            detail.standing,
+            Standing::Lapsed,
+            "a new claim without a certificate ended its access when it was decided"
+        );
     }
 
     fn ids(listing: &Listing) -> Vec<i64> {
@@ -1204,6 +1408,8 @@ grace = "1d"
                 manifest_hash: "sha256:x".into(),
                 result: Some(Outcome::Denied),
                 failed_controls: vec!["firewall".into(), "screen_lock".into()],
+                access_until: None,
+                standing: Standing::Denied,
             }],
             unreadable: 2,
         };

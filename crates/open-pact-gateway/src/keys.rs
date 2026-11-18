@@ -90,6 +90,18 @@ impl Keys {
     }
 }
 
+/// The end of a certificate, as the certificate itself states it.
+pub fn certificate_not_after(pem: &str) -> anyhow::Result<OffsetDateTime> {
+    use x509_parser::prelude::{FromDer, X509Certificate};
+    let (_, pem) = x509_parser::pem::parse_x509_pem(pem.as_bytes())
+        .map_err(|e| anyhow::anyhow!("certificate is not PEM: {e}"))?;
+    let (_, cert) = X509Certificate::from_der(&pem.contents)
+        .map_err(|e| anyhow::anyhow!("certificate is not X.509: {e}"))?;
+    OffsetDateTime::from_unix_timestamp(cert.validity().not_after.timestamp())
+        .ok()
+        .context("certificate end is out of range")
+}
+
 fn common_name(cn: &str) -> DistinguishedName {
     let mut dn = DistinguishedName::new();
     dn.push(DnType::CommonName, cn);
@@ -125,7 +137,16 @@ impl Ca {
         })
     }
 
-    pub fn issue(&self, csr_pem: &str, cn: &str, validity: Duration) -> Result<String, String> {
+    /// A client certificate that ends at `not_after`, an absolute time the caller fixed from one
+    /// clock reading, so the time spent before signing never extends it.
+    pub fn issue(
+        &self,
+        csr_pem: &str,
+        cn: &str,
+        not_after: OffsetDateTime,
+    ) -> Result<String, String> {
+        let not_after = OffsetDateTime::from_unix_timestamp(not_after.unix_timestamp())
+            .map_err(|e| format!("certificate end is out of range: {e}"))?;
         bare_csr_der(csr_pem)?;
         let csr = CertificateSigningRequestParams::from_pem(csr_pem)
             .map_err(|e| format!("csr_pem is not a valid signed certificate request: {e}"))?;
@@ -136,7 +157,7 @@ impl Ca {
         params.use_authority_key_identifier_extension = true;
         let now = OffsetDateTime::now_utc();
         params.not_before = now - CLOCK_SKEW;
-        params.not_after = now + validity;
+        params.not_after = not_after;
         params.serial_number = Some(random_serial());
         let cert = params
             .signed_by(&csr.public_key, &self.issuer)
@@ -288,6 +309,10 @@ mod tests {
 
     use super::*;
 
+    fn in_an_hour() -> OffsetDateTime {
+        OffsetDateTime::now_utc() + Duration::hours(1)
+    }
+
     fn ca() -> Ca {
         let key = KeyPair::generate().unwrap();
         Ca::new(Ca::self_signed_pem(&key).unwrap(), key).unwrap()
@@ -352,12 +377,48 @@ mod tests {
     }
 
     #[test]
+    fn the_stored_end_is_the_end_the_certificate_states() {
+        let ca = ca();
+        let before = OffsetDateTime::now_utc();
+        let issued = ca
+            .issue(
+                &csr(&KeyPair::generate().unwrap()),
+                "abc",
+                before + Duration::minutes(20),
+            )
+            .unwrap();
+        let lifetime = certificate_not_after(&issued).unwrap() - before;
+        // Certificate times have whole seconds, so the end can fall up to one second early.
+        assert!(
+            lifetime >= Duration::seconds(1199) && lifetime <= Duration::minutes(20),
+            "{lifetime}"
+        );
+    }
+
+    /// The end is the absolute time the caller fixed. Time spent before the signer reads its clock
+    /// does not move it.
+    #[test]
+    fn a_late_signer_does_not_extend_the_certificate_past_the_given_end() {
+        let ca = ca();
+        let not_after =
+            OffsetDateTime::from_unix_timestamp(OffsetDateTime::now_utc().unix_timestamp() + 30)
+                .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        let issued = ca
+            .issue(&csr(&KeyPair::generate().unwrap()), "abc", not_after)
+            .unwrap();
+        assert_eq!(certificate_not_after(&issued).unwrap(), not_after);
+    }
+
+    #[test]
     fn issues_a_client_certificate_for_the_csr_key_signed_by_the_ca() {
         let ca = ca();
         let vpn_key = KeyPair::generate().unwrap();
-        let issued = ca
-            .issue(&csr(&vpn_key), "abc", Duration::hours(24))
-            .unwrap();
+        let not_after = OffsetDateTime::from_unix_timestamp(
+            OffsetDateTime::now_utc().unix_timestamp() + 86_400,
+        )
+        .unwrap();
+        let issued = ca.issue(&csr(&vpn_key), "abc", not_after).unwrap();
         let (ca_der, cert_der) = (der(&ca.cert_pem), der(&issued));
         let (_, ca_cert) = X509Certificate::from_der(&ca_der).unwrap();
         let (_, cert) = X509Certificate::from_der(&cert_der).unwrap();
@@ -375,13 +436,20 @@ mod tests {
         assert!(eku.client_auth && !eku.server_auth);
         let lifetime =
             cert.validity().not_after.timestamp() - cert.validity().not_before.timestamp();
-        assert_eq!(lifetime, (Duration::hours(24) + CLOCK_SKEW).whole_seconds());
+        assert_eq!(
+            cert.validity().not_after.timestamp(),
+            not_after.unix_timestamp()
+        );
+        assert!(
+            (lifetime - (Duration::hours(24) + CLOCK_SKEW).whole_seconds()).abs() <= 1,
+            "{lifetime}"
+        );
     }
 
     #[test]
     fn issues_only_its_own_subject_and_extensions() {
         let csr = csr(&KeyPair::generate().unwrap());
-        let issued = ca().issue(&csr, "abc", Duration::hours(1)).unwrap();
+        let issued = ca().issue(&csr, "abc", in_an_hour()).unwrap();
         let der = der(&issued);
         let (_, cert) = X509Certificate::from_der(&der).unwrap();
 
@@ -418,7 +486,7 @@ mod tests {
             .unwrap()
             .pem()
             .unwrap();
-        assert!(ca().issue(&bare, "abc", Duration::hours(1)).is_ok());
+        assert!(ca().issue(&bare, "abc", in_an_hour()).is_ok());
 
         let mut subject = bare_params();
         subject.distinguished_name = common_name("FICTIONAL private note");
@@ -450,7 +518,7 @@ mod tests {
             ("not a CSR", "FICTIONAL_PRIVATE_NOT_A_CSR".to_string()),
         ] {
             assert!(
-                ca().issue(&pem, "abc", Duration::hours(1)).is_err(),
+                ca().issue(&pem, "abc", in_an_hour()).is_err(),
                 "{what} accepted"
             );
         }
@@ -485,11 +553,11 @@ mod tests {
         ] {
             let pem = rebuild_with_signature_algorithm(&bare, &algorithm);
             assert!(
-                ca().issue(&pem, "abc", Duration::hours(1)).is_err(),
+                ca().issue(&pem, "abc", in_an_hour()).is_err(),
                 "{what} accepted"
             );
         }
-        assert!(ca().issue(&bare, "abc", Duration::hours(1)).is_ok());
+        assert!(ca().issue(&bare, "abc", in_an_hour()).is_ok());
     }
 
     /// A request for `info`, freshly signed by `key`, so only its structure can make it fail.
@@ -536,7 +604,7 @@ mod tests {
 
         let resigned = signed_request(&key, &request_info(spki));
         assert!(
-            ca().issue(&resigned, "abc", Duration::hours(1)).is_ok(),
+            ca().issue(&resigned, "abc", in_an_hour()).is_ok(),
             "the re-signed bare request"
         );
         for (what, spki) in [
@@ -545,7 +613,7 @@ mod tests {
         ] {
             let pem = signed_request(&key, &request_info(&spki));
             assert!(
-                ca().issue(&pem, "abc", Duration::hours(1)).is_err(),
+                ca().issue(&pem, "abc", in_an_hour()).is_err(),
                 "extra field {what} accepted"
             );
         }
@@ -562,7 +630,7 @@ mod tests {
         let info = parsed.certification_request_info.raw;
         let zero = signed_request_with_unused_bits(&key, info, 0);
         assert!(
-            ca().issue(&zero, "abc", Duration::hours(1)).is_ok(),
+            ca().issue(&zero, "abc", in_an_hour()).is_ok(),
             "zero unused bits"
         );
         for unused in 1..=7 {
@@ -573,7 +641,7 @@ mod tests {
                 "{unused} unused bits"
             );
             assert!(
-                ca().issue(&pem, "abc", Duration::hours(1)).is_err(),
+                ca().issue(&pem, "abc", in_an_hour()).is_err(),
                 "{unused} unused bits accepted"
             );
         }
@@ -593,10 +661,9 @@ mod tests {
         let tampered = lines.join("\n") + "\n";
         assert_ne!(tampered.trim(), pem.trim());
         assert_eq!(
-            ca().issue(&tampered, "abc", Duration::hours(1))
-                .unwrap_err(),
+            ca().issue(&tampered, "abc", in_an_hour()).unwrap_err(),
             "csr_pem is not a valid signed certificate request: Invalid CSR signature"
         );
-        assert!(ca().issue(&pem, "abc", Duration::hours(1)).is_ok());
+        assert!(ca().issue(&pem, "abc", in_an_hour()).is_ok());
     }
 }

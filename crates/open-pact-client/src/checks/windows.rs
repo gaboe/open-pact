@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use super::buckets;
+use super::buckets::{self, Lock};
 use super::exec::capture;
 use open_pact_core::ControlValue;
 use time::Date;
@@ -72,16 +72,25 @@ pub fn firewall() -> ControlValue {
 
 /// A lock timeout set by policy wins over the user's secure screen saver.
 pub fn screen_lock() -> ControlValue {
+    lock().bucket().into()
+}
+
+/// `screen_lock@2`: the same setting in whole minutes.
+pub fn screen_lock_minutes() -> ControlValue {
+    lock().minutes()
+}
+
+fn lock() -> Lock {
     match value("lock_policy") {
-        Some("!") | None => return "unknown".into(),
+        Some("!") | None => return Lock::Unknown,
         Some(value) if !value.is_empty() => match parse_dword(value) {
-            Some(seconds) if seconds > 0 => return buckets::lock_delay(u64::from(seconds)).into(),
+            Some(seconds) if seconds > 0 => return Lock::Seconds(u64::from(seconds)),
             Some(_) => {}
-            None => return "unknown".into(),
+            None => return Lock::Unknown,
         },
         _ => {}
     }
-    parse_screen_savers(value("screen_savers").unwrap_or_default()).into()
+    screen_savers_lock(value("screen_savers").unwrap_or_default())
 }
 
 pub fn os_supported() -> ControlValue {
@@ -387,11 +396,14 @@ pub fn parse_last_update(value: &str) -> Option<Date> {
 }
 
 /// The Shell property has no official value table, so unrecognized values stay unknown.
+/// Measured as an administrator on Windows 11 24H2: 1 is protection on, 2 is a volume with no
+/// encryption, 5 is an encrypted volume whose protectors are off, and 6 is a locked volume.
+/// A standard-user token reads 0 for every state.
 pub fn parse_bitlocker(out: &str) -> &'static str {
     match out.trim() {
         "1" => "full",
-        "3" | "4" | "5" | "8" => "partial",
-        "2" | "7" => "none",
+        "3" | "4" | "8" => "partial",
+        "2" | "5" | "7" => "none",
         _ => "unknown",
     }
 }
@@ -412,52 +424,61 @@ pub fn parse_screen_saver(
     secure: Option<&str>,
     timeout: Option<&str>,
 ) -> &'static str {
+    screen_saver_lock(active, secure, timeout).bucket()
+}
+
+fn screen_saver_lock(active: Option<&str>, secure: Option<&str>, timeout: Option<&str>) -> Lock {
     match (active, secure) {
-        (Some("0"), _) | (Some("1"), Some("0")) => "none",
+        (Some("0"), _) | (Some("1"), Some("0")) => Lock::None,
         (Some("1"), Some("1")) => {
             timeout
                 .and_then(|t| t.trim().parse::<u64>().ok())
-                .map_or("unknown", |seconds| {
+                .map_or(Lock::Unknown, |seconds| {
                     if seconds == 0 {
-                        "none"
+                        Lock::None
                     } else {
-                        buckets::lock_delay(seconds)
+                        Lock::Seconds(seconds)
                     }
                 })
         }
-        _ => "unknown",
+        _ => Lock::Unknown,
     }
 }
 
+#[cfg(test)]
 fn parse_screen_savers(data: &str) -> &'static str {
-    let mut weakest = "le_5min";
+    screen_savers_lock(data).bucket()
+}
+
+/// The weakest screen saver lock of the users in `data`. A saver whose program is missing locks
+/// nothing, and one that cannot be judged makes the whole answer unknown.
+fn screen_savers_lock(data: &str) -> Lock {
     if data.is_empty() {
-        return "unknown";
+        return Lock::Unknown;
     }
+    let mut weakest = Lock::Seconds(0);
     for user in data.split(';') {
         let fields: Vec<_> = user.split('|').collect();
         let [active, secure, timeout, executable] = fields.as_slice() else {
-            return "unknown";
+            return Lock::Unknown;
         };
-        let state = parse_screen_saver(Some(active), Some(secure), Some(timeout));
-        let state = match (state, *executable) {
-            ("none" | "unknown", _) => state,
-            (_, "valid") => state,
-            (_, "missing") => "none",
-            _ => "unknown",
+        let lock = match (*active, *executable) {
+            ("!", _) => Lock::Unknown,
+            // Windows starts no saver without an active flag or a saver program, so nothing locks.
+            ("", _) | (_, "none") => Lock::None,
+            _ => {
+                let lock = screen_saver_lock(Some(active), Some(secure), Some(timeout));
+                match (lock, *executable) {
+                    (Lock::None | Lock::Unknown, _) | (_, "valid") => lock,
+                    (_, "missing") => Lock::None,
+                    _ => Lock::Unknown,
+                }
+            }
         };
-        if state == "unknown" {
-            return "unknown";
+        if lock == Lock::Unknown {
+            return Lock::Unknown;
         }
-        let rank = |value| match value {
-            "none" => 3,
-            "gt_15min" => 2,
-            "le_15min" => 1,
-            _ => 0,
-        };
-        if rank(state) > rank(weakest) {
-            weakest = state;
-        }
+        weakest = weakest.weaker(lock);
     }
     weakest
 }
@@ -831,6 +852,33 @@ mod tests {
     }
 
     #[test]
+    fn screen_saver_records_measured_on_windows_11() {
+        // Measured on a default Windows 11 Pro 24H2 account: the flag is 1 and nothing else is set.
+        for (raw, expected) in [
+            ("1|||none", "none"),
+            ("|||none", "none"),
+            ("1|1|300|none", "none"),
+            ("1|1|300|valid", "le_5min"),
+            ("1|1|300|unknown", "unknown"),
+            ("!|1|300|valid", "unknown"),
+        ] {
+            assert_eq!(parse_screen_savers(raw), expected, "{raw}");
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn native_batch_reads_the_local_password_policy() {
+        let batch = batch();
+        let text = batch.values.get("password_min_length").map(String::as_str);
+        assert!(
+            text.is_some_and(|text| text.parse::<u32>().is_ok()),
+            "password_min_length={text:?}; {}",
+            batch.diagnostics
+        );
+    }
+
+    #[test]
     fn event_marker_reads_keep_sources_independent() {
         assert_eq!(
             parse_event_marker_read(Some("1792500000")),
@@ -1011,7 +1059,7 @@ mod tests {
         assert_eq!(parse_bitlocker("2"), "none");
         assert_eq!(parse_bitlocker("3"), "partial");
         assert_eq!(parse_bitlocker("4"), "partial");
-        assert_eq!(parse_bitlocker("5"), "partial");
+        assert_eq!(parse_bitlocker("5"), "none");
         assert_eq!(parse_bitlocker("6"), "unknown");
         assert_eq!(parse_bitlocker("7"), "none");
         assert_eq!(parse_bitlocker("8"), "partial");
@@ -1065,6 +1113,22 @@ mod tests {
             ("unknown", "unknown"),
         ] {
             assert_eq!(parse_screen_savers(data), expected, "{data}");
+        }
+    }
+
+    #[test]
+    fn screen_saver_minutes_use_the_weakest_user_and_round_up() {
+        use ControlValue::Integer;
+        for (data, expected) in [
+            ("1|1|300|valid", Integer(5)),
+            ("1|1|301|valid", Integer(6)),
+            ("1|1|300|valid;1|1|1200|valid", Integer(20)),
+            ("1|1|300|missing", "none".into()),
+            ("1|1|300|valid;0|||unknown", "none".into()),
+            ("1|1|300|valid;!|!|!|unknown", "unknown".into()),
+            ("", "unknown".into()),
+        ] {
+            assert_eq!(screen_savers_lock(data).minutes(), expected, "{data}");
         }
     }
 

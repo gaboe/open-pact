@@ -38,6 +38,7 @@ function UserScreenSaver($userRoot) {
     }
     $exe = $values['SCRNSAVE.EXE']
     $valid = 'unknown'
+    if ($exe -eq '') { $valid = 'none' }
     if ($exe -ne '' -and $exe -ne '!') {
         $exe = $exe.Trim('"')
         $exe = $exe -replace '(?i)%windir%|%systemroot%', $env:windir
@@ -295,11 +296,25 @@ RunSection {
 }
 RunSection {
     try {
-        $raw = ([ADSI]"WinNT://$env:COMPUTERNAME").MinPasswordLength
-        if ($raw -is [System.DirectoryServices.PropertyValueCollection]) { $raw = $raw.Value }
-        if ($null -eq $raw -or $raw -isnot [int] -or $raw -lt 0) { throw 'Unreadable minimum length' }
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class PactModals {
+    [DllImport("netapi32.dll")] static extern int NetUserModalsGet(string server, int level, out IntPtr buffer);
+    [DllImport("netapi32.dll")] static extern int NetApiBufferFree(IntPtr buffer);
+    public static int MinPasswordLength() {
+        IntPtr buffer;
+        int status = NetUserModalsGet(null, 0, out buffer);
+        if (status != 0) { throw new System.ComponentModel.Win32Exception(status); }
+        try { return Marshal.ReadInt32(buffer, 0); }
+        finally { NetApiBufferFree(buffer); }
+    }
+}
+'@ -ErrorAction Stop
+        $raw = [PactModals]::MinPasswordLength()
+        if ($raw -lt 0) { throw 'Unreadable minimum length' }
         Emit 'password_min_length' ($raw.ToString([Globalization.CultureInfo]::InvariantCulture))
-    } catch { Emit 'password_min_length' 'unknown' }
+    } catch { [Console]::Error.WriteLine('password_min_length: ' + $_.Exception.Message); Emit 'password_min_length' 'unknown' }
 }
 RunSection {
     try {

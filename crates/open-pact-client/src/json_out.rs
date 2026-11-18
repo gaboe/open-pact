@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
-use open_pact_core::{ControlValue, ManifestHash, Pseudonym};
+use open_pact_core::ControlValue;
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -30,30 +30,29 @@ pub(crate) struct Answers {
     pub(crate) folders: Vec<PathBuf>,
 }
 
+/// Where a wizard step stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
-enum StepState {
+pub enum StepState {
     Started,
     Done,
     Waiting,
     Skipped,
 }
 
-#[derive(Serialize)]
-struct StepEvent<'a> {
-    step: u8,
-    title: &'a str,
-    state: StepState,
+/// One step event of `join --json`, and what an app's step callback receives. `step` is 1 to 6,
+/// or 0 for an event outside the wizard, such as the wait for the scheduled job.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct JoinStep {
+    pub step: u8,
+    pub title: String,
+    pub state: StepState,
     #[serde(skip_serializing_if = "Option::is_none")]
-    detail: Option<Value>,
+    pub detail: Option<Value>,
 }
 
-#[derive(Serialize)]
-struct ResultEvent<'a> {
-    result: &'a str,
-    device: &'a Pseudonym,
-    manifest_hash: &'a ManifestHash,
-}
+/// The title of the event that says a command waits for the scheduled job.
+pub const WAITING_FOR_JOB: &str = "Waiting for the scheduled job";
 
 #[derive(Serialize)]
 struct ErrorDocument<'a> {
@@ -63,20 +62,20 @@ struct ErrorDocument<'a> {
 /// One control of a sent claim: what the device reported and whether the manifest requires and
 /// accepts it. `ok` is null for a control the manifest does not require on this system.
 #[derive(Clone, Debug, PartialEq, Serialize)]
-pub(crate) struct ControlReport {
-    pub(crate) id: String,
-    pub(crate) value: ControlValue,
-    pub(crate) ok: Option<bool>,
+pub struct ControlReport {
+    pub id: String,
+    pub value: ControlValue,
+    pub ok: Option<bool>,
 }
 
 /// The facts of a claim the gateway answered.
 #[derive(Clone, Debug, PartialEq, Serialize)]
-pub(crate) struct ClaimReport {
-    pub(crate) sent_at: String,
-    pub(crate) accepted: bool,
-    pub(crate) warnings: Vec<String>,
-    pub(crate) reasons: Vec<String>,
-    pub(crate) controls: Vec<ControlReport>,
+pub struct ClaimReport {
+    pub sent_at: String,
+    pub accepted: bool,
+    pub warnings: Vec<String>,
+    pub reasons: Vec<String>,
+    pub controls: Vec<ControlReport>,
 }
 
 impl ClaimReport {
@@ -117,8 +116,13 @@ struct State {
     write_error: Option<String>,
 }
 
+type StepObserver = Box<dyn FnMut(JoinStep) + Send>;
+
+/// Where one command's output goes: JSON lines to a writer (the CLI), step events to a callback
+/// (an app), or both. With no writer the command is silent: it also keeps its warnings off stderr.
 pub(crate) struct Json {
-    out: Mutex<Box<dyn Write + Send>>,
+    out: Option<Mutex<Box<dyn Write + Send>>>,
+    observer: Option<Mutex<StepObserver>>,
     state: Mutex<State>,
     pub(crate) answers: Answers,
 }
@@ -132,41 +136,62 @@ const MAX_NOTES: usize = 20;
 impl Json {
     pub(crate) fn new(out: impl Write + Send + 'static, answers: Answers) -> Arc<Json> {
         Arc::new(Json {
-            out: Mutex::new(Box::new(out)),
+            out: Some(Mutex::new(Box::new(out))),
+            observer: None,
+            state: Mutex::new(State::default()),
+            answers,
+        })
+    }
+
+    /// A silent command whose step events go to `observer`.
+    pub(crate) fn observed(
+        answers: Answers,
+        observer: impl FnMut(JoinStep) + Send + 'static,
+    ) -> Arc<Json> {
+        Arc::new(Json {
+            out: None,
+            observer: Some(Mutex::new(Box::new(observer))),
             state: Mutex::new(State::default()),
             answers,
         })
     }
 
     fn line(&self, value: &impl Serialize, pretty: bool) {
+        if self.out.is_none() {
+            return;
+        }
         if let Err(error) = self.write_line(value, pretty) {
             self.state.lock().unwrap().write_error.get_or_insert(error);
         }
     }
 
     fn write_line(&self, value: &impl Serialize, pretty: bool) -> Result<(), String> {
+        let Some(out) = &self.out else {
+            return Ok(());
+        };
         let text = if pretty {
             serde_json::to_string_pretty(value)
         } else {
             serde_json::to_string(value)
         }
         .map_err(|error| format!("could not serialize the output: {error}"))?;
-        let mut out = self.out.lock().unwrap();
+        let mut out = out.lock().unwrap();
         writeln!(out, "{text}")
             .and_then(|()| out.flush())
             .map_err(|error| format!("could not write the output: {error}"))
     }
 
     fn step_event(&self, step: u8, title: &str, state: StepState, detail: Option<Value>) {
-        self.line(
-            &StepEvent {
-                step,
-                title,
-                state,
-                detail,
-            },
-            false,
-        );
+        let event = JoinStep {
+            step,
+            title: title.to_owned(),
+            state,
+            detail,
+        };
+        self.line(&event, false);
+        if let Some(observer) = &self.observer {
+            (observer.lock().unwrap())(event);
+        }
     }
 
     fn close_open(&self, detail: Option<Value>) {
@@ -323,21 +348,14 @@ pub(crate) fn claim() -> Option<ClaimReport> {
 
 /// Ends the open step, unless it waits for someone else, and prints the last line of a
 /// `join --json`.
-pub(crate) fn finish(result: &str, device: &Pseudonym, manifest_hash: &ManifestHash) {
+pub(crate) fn finish(result: &crate::JoinResult) {
     with(|json| {
         if json.state.lock().unwrap().waiting {
             json.state.lock().unwrap().open = None;
         } else {
             json.close_open(None);
         }
-        json.line(
-            &ResultEvent {
-                result,
-                device,
-                manifest_hash,
-            },
-            false,
-        );
+        json.line(result, false);
     });
 }
 
@@ -352,10 +370,27 @@ pub(crate) fn not_sent_detail(reason: &str) -> Value {
     json!({ "sent": false, "reason": reason })
 }
 
-/// Stops the process after a Ctrl-C, with the exit code 130.
-pub(crate) fn exit_interrupted() -> ! {
-    error("interrupted");
-    std::process::exit(130)
+/// The command waits for another one, usually the scheduled job. An app that asked for step events
+/// gets one and `true`: the command stays silent. Otherwise the caller prints its own line.
+pub(crate) fn waiting_for_job() -> bool {
+    with(|json| {
+        let Some(observer) = &json.observer else {
+            return false;
+        };
+        (observer.lock().unwrap())(JoinStep {
+            step: 0,
+            title: WAITING_FOR_JOB.to_owned(),
+            state: StepState::Waiting,
+            detail: None,
+        });
+        true
+    })
+    .unwrap_or(false)
+}
+
+/// Whether warnings may go to stderr: not for a command that runs silent for an app.
+pub(crate) fn stderr_allowed() -> bool {
+    with(|json| json.out.is_some()).unwrap_or(true)
 }
 
 #[cfg(test)]

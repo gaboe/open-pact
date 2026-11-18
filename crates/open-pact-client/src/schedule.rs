@@ -5,8 +5,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use clap::Subcommand;
-use open_pact_core::{ManifestHash, ProbeName, SendPolicy};
+use open_pact_core::{CheckPeriod, Manifest, ManifestHash, OnConnect, Place, ProbeName, Schedule};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -36,45 +35,33 @@ const HOME_REMOVE_FILES: &[&str] = &[
     JOB_LOG,
     "schedule.log.1",
 ];
+/// How often the OS wakes the job. Each wake costs one process start and one probe; the check and
+/// send periods come from the signed manifest, and a wake with nothing due exits at once.
+const WAKE_MINUTES: u32 = 1;
+const WAKE_SECS: u32 = WAKE_MINUTES * 60;
+/// The wake period as Task Scheduler reports a trigger's repeat interval.
+const WAKE_ISO: &str = "PT1M";
 const REPO_SCAN_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const LOCK: &str = "report-schedule.lock";
 
-#[derive(Subcommand)]
-pub(crate) enum Command {
-    /// Install the job that sends claims by itself, as the signed manifest allows
+/// The `schedule` commands of the CLI, without the parser.
+#[derive(Clone, Debug)]
+pub enum Command {
     On {
-        /// Windows only: run the job as SYSTEM. Needs an elevated PowerShell prompt
-        #[arg(long, hide = !cfg!(windows), conflicts_with = "user")]
         system: bool,
-        /// Windows only: run the job as the current user
-        #[arg(long, hide = !cfg!(windows))]
         user: bool,
-        /// Show what would change and change nothing
-        #[arg(long)]
         dry_run: bool,
     },
-    /// Remove the job
     Off {
-        /// Show what would change and change nothing
-        #[arg(long)]
         dry_run: bool,
     },
-    /// Show whether the job is installed and what the signed manifest allows
     Status,
-    #[command(hide = true)]
     Run {
-        #[arg(long)]
         system: bool,
-        /// The profile whose repositories and `~` paths count, when the job does not run as that user
-        #[arg(long)]
         user_home: Option<PathBuf>,
     },
-    #[command(hide = true)]
     Probe {
-        #[arg(long)]
         address: String,
-        /// The DNS name that the probe's TLS certificate must carry
-        #[arg(long)]
         name: Option<String>,
     },
 }
@@ -111,8 +98,9 @@ impl Trigger {
     }
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 struct State {
+    /// Whether the last wake found the VPN answering.
     vpn_up: bool,
     #[serde(default)]
     reconnect_pending: bool,
@@ -135,6 +123,16 @@ struct State {
     last_observed_compliance: Option<BTreeMap<String, bool>>,
     #[serde(default)]
     event_pending: bool,
+    /// When the last local check finished. A connect clears it, so the first wake on the VPN checks.
+    #[serde(default)]
+    last_check: Option<i64>,
+    /// When each control that fails now first failed on this device, for the local grace.
+    #[serde(default)]
+    first_failed: BTreeMap<String, i64>,
+    /// A removal at grace expiry failed and its claim was already forced, so the next check that
+    /// fails the same way does not force another.
+    #[serde(default)]
+    removal_failed: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -147,6 +145,7 @@ impl State {
     fn observe(&mut self, vpn_up: bool) {
         if vpn_up && !self.vpn_up {
             self.reconnect_pending = true;
+            self.last_check = None;
         }
         self.vpn_up = vpn_up;
     }
@@ -159,8 +158,29 @@ impl State {
             .is_none_or(|last| now < last || now.saturating_sub(last) >= interval)
     }
 
-    fn should_send(&self, now: i64, interval: i64) -> bool {
-        self.vpn_up && self.interval_elapsed(now, interval)
+    /// The gateway answered an attempt less than `within` seconds ago.
+    fn answered_within(&self, now: i64, within: i64) -> bool {
+        self.last_attempt
+            .max(self.last_success)
+            .is_some_and(|last| now >= last && now - last < within)
+    }
+
+    /// The last local check is older than `period`, or there is none, or the clock ran back.
+    fn check_older_than(&self, now: i64, period: i64) -> bool {
+        self.last_check
+            .is_none_or(|last| now < last || now - last >= period)
+    }
+
+    /// Notes when each control first failed on this device, and forgets a control that passes or
+    /// is no longer required.
+    fn observe_failures(&mut self, compliance: &BTreeMap<String, bool>, now: i64) {
+        self.first_failed
+            .retain(|id, _| compliance.get(id) == Some(&false));
+        for (id, compliant) in compliance {
+            if !compliant {
+                self.first_failed.entry(id.clone()).or_insert(now);
+            }
+        }
     }
 
     fn new_events(&self, current: checks::EventMarkerReads) -> bool {
@@ -189,22 +209,6 @@ impl State {
             self.event_pending = true;
         }
         self.last_observed_compliance = Some(current.clone());
-    }
-
-    fn due(&self, now: i64, interval: i64) -> Option<Trigger> {
-        if !self.vpn_up {
-            None
-        } else if self.event_pending {
-            Some(Trigger::Event)
-        } else if self.should_send(now, interval) {
-            Some(if self.reconnect_pending {
-                Trigger::Connect
-            } else {
-                Trigger::Periodic
-            })
-        } else {
-            None
-        }
     }
 
     fn acknowledged(&mut self, now: i64, events: checks::EventMarkerReads) {
@@ -314,6 +318,199 @@ fn newer(current: checks::EventMarkerRead, initialized: bool, previous: Option<i
             if previous.is_none_or(|previous| current > previous))
 }
 
+/// A connect claim comes at most this often (seconds). A VPN that flaps does not flood the gateway:
+/// the claim that went out within this window already proves the device, and any change in a
+/// result still sends at once.
+const CONNECT_REUSE_SECS: i64 = 5 * 60;
+/// How often a device that sends on any network, off the VPN, runs its checks.
+const ELSEWHERE_CHECK_SECS: i64 = 5 * 60;
+/// The shortest check period on Windows, where one check starts PowerShell. Lower it only after
+/// `check --dry-run --timings` shows a median cost the fleet accepts.
+const WINDOWS_CHECK_FLOOR_SECS: i64 = 5 * 60;
+
+fn check_floor_secs() -> i64 {
+    if cfg!(windows) {
+        WINDOWS_CHECK_FLOOR_SECS
+    } else {
+        0
+    }
+}
+
+/// What one wake does, decided before any check runs.
+#[derive(Debug, PartialEq, Eq)]
+struct Plan {
+    /// Run the checks now. A wake that runs none exits after its probe.
+    check: bool,
+    /// Send a claim after the checks, and why. A result that gets worse during the checks adds an
+    /// `Event` send; ask again after them.
+    send: Option<Trigger>,
+}
+
+impl Plan {
+    fn idle(&self) -> bool {
+        !self.check && self.send.is_none()
+    }
+}
+
+/// How far ahead `next_due` looks. A send interval is at most 24 hours.
+const HORIZON_SECS: i64 = 3 * 24 * 60 * 60;
+
+/// The first second at or after `now` where `due` holds, if it holds within the horizon. `due`
+/// only turns from false to true as time passes.
+fn first_time(now: i64, due: impl Fn(i64) -> bool) -> Option<i64> {
+    if due(now) {
+        return Some(now);
+    }
+    let end = now.saturating_add(HORIZON_SECS);
+    if !due(end) {
+        return None;
+    }
+    let (mut low, mut high) = (now, end);
+    while high - low > 1 {
+        let middle = low + (high - low) / 2;
+        if due(middle) {
+            high = middle;
+        } else {
+            low = middle;
+        }
+    }
+    Some(high)
+}
+
+/// When the next check and the next claim fall due if the device stays where the last wake found
+/// it. Derived from `plan`, so it says what the job will do.
+#[derive(Debug, PartialEq, Eq)]
+struct NextDue {
+    check: Option<i64>,
+    send: Option<i64>,
+}
+
+fn next_due(schedule: &Schedule, state: &State, now: i64) -> NextDue {
+    let place = if state.vpn_up {
+        Place::Vpn
+    } else {
+        Place::Elsewhere
+    };
+    let floor = check_floor_secs();
+    NextDue {
+        check: first_time(now, |at| plan(schedule, state, place, at, floor).check),
+        send: first_time(now, |at| {
+            plan(schedule, state, place, at, floor).send.is_some()
+        }),
+    }
+}
+
+fn time_text(time: i64) -> String {
+    time::OffsetDateTime::from_unix_timestamp(time).map_or_else(
+        |_| "an unknown time".to_owned(),
+        open_pact_core::timestamp::rfc3339_secs,
+    )
+}
+
+/// What `schedule status` and `accept` say about the job's next steps.
+fn next_due_lines(schedule: &Schedule, state: &State, now: i64) -> Vec<String> {
+    let next = next_due(schedule, state, now);
+    let off_vpn = !state.vpn_up && !schedule.may_send(Place::Elsewhere);
+    let line = |what: &str, due: Option<i64>| match due {
+        Some(time) if time <= now => format!("Next {what} due: at the next wake, within a minute."),
+        Some(time) => format!("Next {what} due: {}.", time_text(time)),
+        None if off_vpn => format!(
+            "Next {what} due: none while the VPN does not answer. The job only tests whether it does."
+        ),
+        None => format!("Next {what} due: none within three days."),
+    };
+    let mut lines = Vec::new();
+    if let Some(last) = state.last_check {
+        lines.push(format!("Last check: {}.", time_text(last)));
+    }
+    lines.push(line("check", next.check));
+    lines.push(line("claim", next.send));
+    lines
+}
+
+/// The home that holds the job's saved state: the client home for a user job, the protected
+/// directory of the SYSTEM job on Windows.
+fn job_state_home(home: &Home, run_as: RunAs, executable: &Path) -> Result<Home> {
+    let absolute = Home(schedule_home(&home.0, true)?);
+    match run_as {
+        RunAs::User => Ok(absolute),
+        RunAs::System if crate::current_os()? == open_pact_core::Os::Windows => Ok(Home(
+            windows_protected_paths(&absolute, false, executable)?.1,
+        )),
+        RunAs::System => bail!("a SYSTEM job exists only on Windows"),
+    }
+}
+
+/// `next_due_lines` from the saved state of the job that runs (`run_as`), or from a fresh state
+/// when the job has not run yet. A state that cannot be read is said so: it is not a new job.
+pub(crate) fn next_due_text(
+    home: &Home,
+    run_as: RunAs,
+    schedule: &Schedule,
+    executable: &Path,
+) -> Vec<String> {
+    due_text(job_state_home(home, run_as, executable), schedule)
+}
+
+fn due_text(state_home: Result<Home>, schedule: &Schedule) -> Vec<String> {
+    match state_home.and_then(|state_home| state_home.read_json::<State>(STATE)) {
+        Ok(state) => next_due_lines(
+            schedule,
+            &state.unwrap_or_default(),
+            time::OffsetDateTime::now_utc().unix_timestamp(),
+        ),
+        Err(error) => vec![format!(
+            "Next check and claim: unknown. The job's saved state cannot be read ({error:#})."
+        )],
+    }
+}
+
+/// The decision of one wake. Pure: the caller probes for `place`, reads `state` and the clock,
+/// and then does only what the plan names.
+///
+/// - Checks: on the VPN every `check` of the schedule and on the first wake after a connect;
+///   elsewhere only where the schedule sends from any network, every five minutes. A claim that is
+///   due always runs fresh checks first. `check_floor` raises the VPN check period (Windows).
+/// - Sends: where the schedule allows a claim at this place, at once when a result got worse, at
+///   once on a connect (unless a claim was answered within the last five minutes; the flat 0.7 form
+///   waits for its interval), and when the interval has passed.
+fn plan(schedule: &Schedule, state: &State, place: Place, now: i64, check_floor: i64) -> Plan {
+    let connect = place == Place::Vpn && state.reconnect_pending;
+    let send = schedule.period(place).and_then(|period| {
+        if state.event_pending {
+            Some(Trigger::Event)
+        } else if connect
+            && schedule.on_connect() == Some(OnConnect::Send)
+            && !state.answered_within(now, CONNECT_REUSE_SECS)
+        {
+            Some(Trigger::Connect)
+        } else if state.interval_elapsed(now, period.as_secs()) {
+            Some(if connect {
+                Trigger::Connect
+            } else {
+                Trigger::Periodic
+            })
+        } else {
+            None
+        }
+    });
+    let check_period = match place {
+        Place::Vpn => schedule
+            .vpn_check_period()
+            .map_or(CheckPeriod::DEFAULT.as_secs(), |period| period.as_secs())
+            .max(check_floor),
+        Place::Elsewhere => ELSEWHERE_CHECK_SECS.max(check_floor),
+    };
+    let checks_here = match place {
+        Place::Vpn => true,
+        Place::Elsewhere => schedule.may_send(place),
+    };
+    Plan {
+        check: send.is_some() || (checks_here && state.check_older_than(now, check_period)),
+        send,
+    }
+}
+
 async fn probe_process(command: &mut tokio::process::Command, limit: Duration) -> bool {
     command
         .kill_on_drop(true)
@@ -333,16 +530,13 @@ async fn probe_process(command: &mut tokio::process::Command, limit: Duration) -
 
 /// Whether the VPN answers at `probe`. With `name`, the answer must also be a TLS connection whose
 /// certificate is valid for `name`.
-pub(crate) async fn vpn_up(probe: &str, name: Option<&str>) -> bool {
+pub(crate) async fn vpn_up(probe: &str, name: Option<&str>, executable: &Path) -> bool {
     let Some(name) = name else {
-        return tcp_up(probe).await;
+        return tcp_up(probe, executable).await;
     };
     if let Ok(address) = probe.parse::<std::net::SocketAddr>() {
         return named_up(address, name, Vec::new()).await;
     }
-    let Ok(executable) = std::env::current_exe() else {
-        return false;
-    };
     // System DNS can block indefinitely. Only a separate process can be cancelled.
     probe_process(
         tokio::process::Command::new(executable).args([
@@ -358,7 +552,7 @@ pub(crate) async fn vpn_up(probe: &str, name: Option<&str>) -> bool {
     .await
 }
 
-async fn tcp_up(probe: &str) -> bool {
+async fn tcp_up(probe: &str, executable: &Path) -> bool {
     if let Ok(address) = probe.parse::<std::net::SocketAddr>() {
         return matches!(
             tokio::time::timeout(
@@ -369,9 +563,6 @@ async fn tcp_up(probe: &str) -> bool {
             Ok(Ok(_))
         );
     }
-    let Ok(executable) = std::env::current_exe() else {
-        return false;
-    };
     // System DNS can block indefinitely. Only a separate process can be cancelled.
     probe_process(
         tokio::process::Command::new(executable).args(["schedule", "probe", "--address", probe]),
@@ -640,7 +831,7 @@ impl Job {
 <plist version="1.0"><dict>
 <key>Label</key><string>{}</string>
 <key>ProgramArguments</key><array>{args}</array>
-<key>StartInterval</key><integer>300</integer>
+<key>StartInterval</key><integer>{WAKE_SECS}</integer>
 <key>RunAtLoad</key><true/>
 <key>StandardOutPath</key><string>{log}</string>
 <key>StandardErrorPath</key><string>{log}</string>
@@ -674,7 +865,7 @@ impl Job {
 
     fn timer(&self) -> String {
         format!(
-            "[Unit]\nDescription=Check VPN for open-pact claims every five minutes\n[Timer]\nOnStartupSec=1min\nOnUnitActiveSec=5min\nAccuracySec=1s\nUnit={}.service\n[Install]\nWantedBy=timers.target\n",
+            "[Unit]\nDescription=Wake open-pact every minute and send claims when the signed schedule says so\n[Timer]\nOnStartupSec=1min\nOnUnitActiveSec=1min\nAccuracySec=1s\nUnit={}.service\n[Install]\nWantedBy=timers.target\n",
             self.id
         )
     }
@@ -687,7 +878,7 @@ impl Job {
             "/SC".into(),
             "MINUTE".into(),
             "/MO".into(),
-            "5".into(),
+            WAKE_MINUTES.to_string(),
             "/TR".into(),
             self.argv
                 .iter()
@@ -1036,11 +1227,15 @@ public static class OpenPactNative {
 }
 "#;
 
-fn windows_protected_paths(home: &Home, copy_binary: bool) -> Result<(PathBuf, PathBuf)> {
+fn windows_protected_paths(
+    home: &Home,
+    copy_binary: bool,
+    executable: &Path,
+) -> Result<(PathBuf, PathBuf)> {
     let absolute = &home.0;
     validate_windows_home(absolute)?;
     let hash = hex::encode(Sha256::digest(text(absolute)?.as_bytes()));
-    let source = powershell_literal(text(&std::env::current_exe()?)?);
+    let source = powershell_literal(text(executable)?);
     let script = windows_protected_paths_script(&hash, &source, copy_binary);
     let paths = windows_powershell(&script)?;
     let mut lines = paths.lines();
@@ -1254,14 +1449,26 @@ fn validate_system_install(system: bool, os: open_pact_core::Os) -> Result<()> {
     Ok(())
 }
 
-/// Whether the policy lets the job send now. A policy without a VPN needs no probe.
-async fn may_send(policy: &SendPolicy) -> bool {
-    match policy {
-        SendPolicy::Vpn { probe, name } => {
-            vpn_up(probe.as_str(), name.as_ref().map(ProbeName::as_str)).await
+/// Where the device is now: on the VPN when the schedule has a probe and it answers.
+async fn place(schedule: &Schedule, executable: &Path) -> Place {
+    match schedule.probe() {
+        Some(probe)
+            if vpn_up(
+                probe.address.as_str(),
+                probe.name.as_ref().map(ProbeName::as_str),
+                executable,
+            )
+            .await =>
+        {
+            Place::Vpn
         }
-        SendPolicy::Always => true,
+        _ => Place::Elsewhere,
     }
+}
+
+/// Whether the schedule lets the job send now. A schedule without a VPN part needs no probe.
+async fn may_send(schedule: &Schedule, executable: &Path) -> bool {
+    schedule.may_send(place(schedule, executable).await)
 }
 
 /// One scheduled run: note whether the policy lets the job send, collect the results, and send a
@@ -1271,6 +1478,7 @@ pub(crate) async fn tick(
     state_home: &Home,
     user_home: Option<&Path>,
     authorization: &ScheduleAuthorization,
+    executable: &Path,
     read_events: impl FnOnce() -> checks::EventMarkerReads,
 ) -> Result<()> {
     tick_with_scan(
@@ -1278,6 +1486,7 @@ pub(crate) async fn tick(
         state_home,
         user_home,
         authorization,
+        executable,
         read_events,
         claim::scan_if_due(home, user_home, REPO_SCAN_INTERVAL),
     )
@@ -1290,6 +1499,9 @@ pub(crate) struct ScheduleAuthorization {
     pub(crate) manifest_hash: ManifestHash,
     pub(crate) schedule: open_pact_core::Schedule,
     pub(crate) owner_consented: bool,
+    /// Whether a failing control whose grace ended deletes the VPN certificate. The job always
+    /// does; a test turns it off where the machine's real check results must not matter.
+    pub(crate) self_removal: bool,
 }
 
 pub(crate) async fn tick_with_scan(
@@ -1297,13 +1509,23 @@ pub(crate) async fn tick_with_scan(
     state_home: &Home,
     user_home: Option<&Path>,
     authorization: &ScheduleAuthorization,
+    executable: &Path,
     read_events: impl FnOnce() -> checks::EventMarkerReads,
     scan: impl Future<Output = Result<()>>,
 ) -> Result<()> {
-    let policy = &authorization.schedule.policy;
+    let schedule = &authorization.schedule;
     let mut state: State = state_home.read_json(STATE)?.unwrap_or_default();
-    state.observe(may_send(policy).await);
-    save(state_home, STATE, &state)?;
+    let before = state.clone();
+    let place = place(schedule, executable).await;
+    state.observe(place == Place::Vpn);
+    if state != before || !state_home.file(STATE).exists() {
+        save(state_home, STATE, &state)?;
+    }
+    // A wake with nothing due ends here: no check, no scan, no gateway request.
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    if plan(schedule, &state, place, now, check_floor_secs()).idle() {
+        return Ok(());
+    }
     // The scan can take long. It runs before the claim lock, which `check` and `accept` wait for.
     scan.await?;
     let Some(_claim_lock) = claim::try_lock(home)? else {
@@ -1327,12 +1549,25 @@ pub(crate) async fn tick_with_scan(
     .await?;
     let events = read_events();
     let compliance = prepared.compliance().clone();
-    state.observe_compliance(&compliance);
-    state.event_pending |= state.new_events(events);
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
-    if let Some(trigger) = state.due(now, authorization.schedule.interval.as_secs()) {
+    state.last_check = Some(now);
+    state.observe_compliance(&compliance);
+    state.observe_failures(&compliance, now);
+    state.event_pending |= state.new_events(events);
+    if authorization.self_removal {
+        let lapsed = lapsed_controls(&manifest, &compliance, prepared.results(), &state, now);
+        if lapsed.is_empty() {
+            state.removal_failed = false;
+        } else {
+            retire_certificate(home, state_home, &mut state, &lapsed)?;
+        }
+    }
+    let due = plan(schedule, &state, place, now, check_floor_secs()).send;
+    if let Some(trigger) = due {
         save(state_home, STATE, &state)?;
-        let outcome = prepared.send(home, async || may_send(policy).await).await?;
+        let outcome = prepared
+            .send(home, || may_send(schedule, executable))
+            .await?;
         note_outcome(home, &mut state, trigger, &outcome);
         state.record(
             &outcome,
@@ -1344,6 +1579,94 @@ pub(crate) async fn tick_with_scan(
         state.establish_baseline(events);
     }
     save(state_home, STATE, &state)?;
+    Ok(())
+}
+
+/// The controls that fail now and whose grace has ended on this device, so the gateway would deny
+/// them too. Grace counts from the first check that saw the failure; `0d` ends at once, and a result
+/// that cannot be read counts against `unknown_grace`.
+fn lapsed_controls(
+    manifest: &Manifest,
+    compliance: &BTreeMap<String, bool>,
+    results: &BTreeMap<String, open_pact_core::ControlValue>,
+    state: &State,
+    now: i64,
+) -> Vec<String> {
+    let body = manifest.body();
+    compliance
+        .iter()
+        .filter(|(_, compliant)| !**compliant)
+        .filter_map(|(id, _)| {
+            let control = body.control(id)?;
+            let unknown = results.get(id).is_none_or(|value| value == "unknown");
+            let span = if unknown {
+                &body.unknown_grace
+            } else {
+                &control.grace
+            };
+            let since = state.first_failed.get(id).copied().unwrap_or(now);
+            let ended = span.is_zero()
+                || span.min_duration().is_some_and(|length| {
+                    time::Duration::seconds(now.saturating_sub(since)) > length
+                });
+            ended.then(|| id.clone())
+        })
+        .collect()
+}
+
+/// A control failed and its grace ended: the device stops being a good VPN client by itself. It
+/// deletes the installed VPN certificate, writes one line to the job log, and asks for a claim at
+/// once. A claim that the gateway accepts later installs a new certificate as always.
+///
+/// The claim is owed from the moment the deletion starts, so the pending claim is saved before the
+/// first file goes: a crash after the deletion still leaves it for the next run, which sends it.
+/// The save is skipped inside a run of failed removals, whose one claim was forced already.
+fn retire_certificate(
+    home: &Home,
+    state_home: &Home,
+    state: &mut State,
+    lapsed: &[String],
+) -> Result<()> {
+    if home.vpn_removal_owed() && !state.removal_failed {
+        state.event_pending = true;
+        save(state_home, STATE, state)?;
+    }
+    let removal = home.remove_vpn_pair();
+    if removal.is_ok() {
+        state.removal_failed = false;
+    }
+    match removal {
+        Ok(false) => {}
+        Ok(true) => {
+            job_log(
+                home,
+                &format!(
+                    "Removed the VPN certificate: {} failed and its grace ended. A claim goes out at once.",
+                    lapsed.join(", ")
+                ),
+            );
+            state.event_pending = true;
+        }
+        Err(error) => {
+            // The certificate may still work, so the gateway must hear of the failure now. One
+            // forced claim per run of failures: a later check does not repeat it.
+            if !state.removal_failed {
+                state.event_pending = true;
+                state.removal_failed = true;
+            }
+            let key = format!("removal failed {error:#}");
+            if state.last_note.as_deref() != Some(key.as_str()) {
+                job_log(
+                    home,
+                    &format!(
+                        "Could not remove the VPN certificate after {} failed: {error:#}",
+                        lapsed.join(", ")
+                    ),
+                );
+                state.last_note = Some(key);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1407,7 +1730,7 @@ fn note_outcome(home: &Home, state: &mut State, trigger: Trigger, outcome: &Outc
 
 /// Appends a dated line to the job log. The log keeps the last two files of at most
 /// `JOB_LOG_LIMIT` bytes each. A failed write is only reported: it must not stop the job.
-fn job_log(home: &Home, line: &str) {
+pub(crate) fn job_log(home: &Home, line: &str) {
     if let Err(error) = append_job_log(home, line) {
         eprintln!(
             "warning: could not write {}: {error}",
@@ -1479,6 +1802,8 @@ struct Observed {
 struct WindowsTaskState {
     trigger_enabled: bool,
     trigger_type: Option<i32>,
+    /// The repeat interval of the trigger, as Task Scheduler writes it (such as `PT1M`).
+    repetition: Option<String>,
     protected_binary: Option<ProtectedBinaryState>,
 }
 
@@ -1492,6 +1817,7 @@ impl WindowsTaskState {
     fn matches_desired(&self, system: bool) -> bool {
         self.trigger_enabled
             && self.trigger_type == Some(1)
+            && self.repetition.as_deref() == Some(WAKE_ISO)
             && (!system
                 || self
                     .protected_binary
@@ -1552,6 +1878,7 @@ $triggers = @($task.Definition.Triggers)
 if ($triggers.Count -eq 1) {{
     Write-Output ("trigger_enabled=" + [int]$triggers[0].Enabled)
     Write-Output ("trigger_type=" + $triggers[0].Type)
+    Write-Output ("repetition=" + $triggers[0].Repetition.Interval)
 }}
 if (IsSystemTask $task) {{
     $protected = Join-Path (Join-Path (ProgramFilesPath) 'open-pact') 'open-pact-client.exe'
@@ -1560,7 +1887,7 @@ if (IsSystemTask $task) {{
     $protectedMatches = $protectedExists -and (Get-FileHash -LiteralPath $protected -Algorithm SHA256).Hash -eq (Get-FileHash -LiteralPath {source} -Algorithm SHA256).Hash
     Write-Output ("protected_matches=" + [int]$protectedMatches)
 }}
-if ($action.Count -eq 1 -and $action[0].Path -eq {binary} -and $action[0].Arguments -eq {args} -and $task.Enabled -and $triggers.Count -eq 1 -and $triggers[0].Enabled -and $triggers[0].Type -eq 1 -and $triggers[0].Repetition.Interval -eq 'PT5M') {{ Write-Output 'matches' }}
+if ($action.Count -eq 1 -and $action[0].Path -eq {binary} -and $action[0].Arguments -eq {args} -and $task.Enabled -and $triggers.Count -eq 1 -and $triggers[0].Enabled -and $triggers[0].Type -eq 1 -and $triggers[0].Repetition.Interval -eq '{WAKE_ISO}') {{ Write-Output 'matches' }}
 "#,
         binary = powershell_literal(text(executable)?),
         args = powershell_literal(expected_args),
@@ -1568,13 +1895,18 @@ if ($action.Count -eq 1 -and $action[0].Path -eq {binary} -and $action[0].Argume
     ))
 }
 
-fn observe(home: &Home, desired: Option<&Applied>, inspect_protected: bool) -> Result<Observed> {
+fn observe(
+    home: &Home,
+    desired: Option<&Applied>,
+    inspect_protected: bool,
+    current_executable: &Path,
+) -> Result<Observed> {
     let source_executable = desired
         .map(|settings| settings.executable.clone())
-        .unwrap_or(std::env::current_exe()?);
+        .unwrap_or_else(|| current_executable.to_path_buf());
     let executable = desired
         .map(|settings| settings.executable.clone())
-        .unwrap_or(std::env::current_exe()?);
+        .unwrap_or_else(|| current_executable.to_path_buf());
     let executable = if crate::current_os()? == open_pact_core::Os::Windows
         && desired.is_some_and(|settings| settings.run_as == RunAs::System)
     {
@@ -1658,6 +1990,10 @@ fn observe(home: &Home, desired: Option<&Applied>, inspect_protected: bool) -> R
                 .then(|| WindowsTaskState {
                     trigger_enabled: field("trigger_enabled=") == Some(1),
                     trigger_type: field("trigger_type="),
+                    repetition: output
+                        .lines()
+                        .find_map(|line| line.strip_prefix("repetition="))
+                        .map(|value| value.trim().to_owned()),
                     protected_binary: system.then(|| ProtectedBinaryState {
                         exists: field("protected_exists=") == Some(1),
                         matches_source: field("protected_matches=") == Some(1),
@@ -1680,21 +2016,18 @@ fn observe(home: &Home, desired: Option<&Applied>, inspect_protected: bool) -> R
 }
 
 /// The exact command that makes `change` (such as `schedule off`) from an elevated prompt.
-pub(crate) fn apply_command(home: &Path, change: &str) -> String {
+pub(crate) fn apply_command(home: &Path, change: &str, executable: &Path) -> String {
     #[cfg(windows)]
     {
         format!(
             "& {} --home {} {change}",
-            powershell_literal(
-                &std::env::current_exe()
-                    .unwrap_or_else(|_| PathBuf::from("open-pact-client.exe"))
-                    .to_string_lossy()
-            ),
+            powershell_literal(&executable.to_string_lossy()),
             powershell_literal(&home.to_string_lossy())
         )
     }
     #[cfg(not(windows))]
     {
+        let _ = executable;
         format!(
             "open-pact-client --home '{}' {change}",
             home.to_string_lossy().replace('\'', "'\"'\"'")
@@ -1745,41 +2078,55 @@ impl Wanted {
     }
 }
 
+/// What the job should be when `wanted` is on: it runs `executable`, the installed client, and
+/// never the program that asks for the change. Nothing when `wanted` is off.
+fn desired_job(wanted: Wanted, executable: &Path) -> Result<Option<Applied>> {
+    let Wanted::On(run_as) = wanted else {
+        return Ok(None);
+    };
+    if executable.as_os_str().is_empty() {
+        bail!("cannot find the path of this program, so the job cannot be installed");
+    }
+    Ok(Some(Applied {
+        run_as,
+        executable: executable.to_path_buf(),
+        user_home: (run_as == RunAs::System)
+            .then(|| {
+                std::env::var_os("USERPROFILE").map(PathBuf::from).context(
+                    "USERPROFILE is not set; a SYSTEM job needs the profile whose repositories it scans",
+                )
+            })
+            .transpose()?,
+    }))
+}
+
 /// Installs, updates or removes the OS job so it matches `wanted`.
-pub(crate) async fn change_job(home: &Home, wanted: Wanted, dry_run: bool) -> Result<()> {
+pub(crate) async fn change_job(
+    home: &Home,
+    wanted: Wanted,
+    dry_run: bool,
+    executable: &Path,
+) -> Result<()> {
     let home_exists = home.0.try_exists()?;
     let requested_system = wanted == Wanted::On(RunAs::System);
     let retry = wanted.command();
     let home = Home(schedule_home(&home.0, true)?);
-    let desired = match wanted {
-        Wanted::On(run_as) => Some(Applied {
-            run_as,
-            executable: std::env::current_exe()?,
-            user_home: (run_as == RunAs::System)
-                .then(|| {
-                    std::env::var_os("USERPROFILE").map(PathBuf::from).context(
-                        "USERPROFILE is not set; a SYSTEM job needs the profile whose repositories it scans",
-                    )
-                })
-                .transpose()?,
-        }),
-        Wanted::Off => None,
-    };
+    let desired = desired_job(wanted, executable)?;
     let elevated =
         crate::current_os()? == open_pact_core::Os::Windows && windows_require_elevation().is_ok();
     if requested_system && !elevated {
         bail!(
             "Run this exact command from an elevated PowerShell prompt:\n{}",
-            apply_command(&home.0, retry)
+            apply_command(&home.0, retry, executable)
         );
     }
-    let observed = observe(&home, desired.as_ref(), elevated)
-        .with_context(|| format!("Cannot inspect the scheduled job. If access is denied, run this exact command from an elevated prompt:\n{}", apply_command(&home.0, retry)))?;
+    let observed = observe(&home, desired.as_ref(), elevated, executable)
+        .with_context(|| format!("Cannot inspect the scheduled job. If access is denied, run this exact command from an elevated prompt:\n{}", apply_command(&home.0, retry, executable)))?;
     let system = needs_system_cleanup(requested_system, desired.is_none(), &observed);
     if system && !elevated {
         bail!(
             "Run this exact command from an elevated PowerShell prompt:\n{}",
-            apply_command(&home.0, retry)
+            apply_command(&home.0, retry, executable)
         );
     }
     let _lock = if dry_run || !home_exists {
@@ -1790,7 +2137,7 @@ pub(crate) async fn change_job(home: &Home, wanted: Wanted, dry_run: bool) -> Re
     let observed = if dry_run {
         observed
     } else {
-        observe(&home, desired.as_ref(), elevated)?
+        observe(&home, desired.as_ref(), elevated, executable)?
     };
     let applied = read_applied(&home)?;
     let change = reconcile(desired.as_ref(), applied.as_ref(), &observed);
@@ -1807,7 +2154,13 @@ pub(crate) async fn change_job(home: &Home, wanted: Wanted, dry_run: bool) -> Re
         Change::Install | Change::Update => {
             let desired = desired.as_ref().unwrap();
             if observed.system && desired.run_as == RunAs::User {
-                operate(&home, Operation::Uninstall { system: true }, true).await?;
+                operate(
+                    &home,
+                    Operation::Uninstall { system: true },
+                    true,
+                    executable,
+                )
+                .await?;
             }
             operate(
                 &home,
@@ -1816,12 +2169,13 @@ pub(crate) async fn change_job(home: &Home, wanted: Wanted, dry_run: bool) -> Re
                     user_home: desired.user_home.clone(),
                 },
                 true,
+                executable,
             )
             .await?;
             save(&home, APPLIED, desired)?;
         }
         Change::Remove => {
-            operate(&home, Operation::Uninstall { system }, true).await?;
+            operate(&home, Operation::Uninstall { system }, true, executable).await?;
             remove_if_exists(&home.file(APPLIED))?;
         }
         Change::None => {}
@@ -1830,7 +2184,12 @@ pub(crate) async fn change_job(home: &Home, wanted: Wanted, dry_run: bool) -> Re
 }
 
 /// `schedule on`: needs a manifest that defines automatic sending.
-pub(crate) async fn turn_on(home: &Home, run_as: Option<RunAs>, dry_run: bool) -> Result<()> {
+pub(crate) async fn turn_on(
+    home: &Home,
+    run_as: Option<RunAs>,
+    dry_run: bool,
+    executable: &Path,
+) -> Result<()> {
     let manifest = home.signed_manifest()?;
     let Some(schedule) = &manifest.body().schedule else {
         bail!(
@@ -1842,7 +2201,7 @@ pub(crate) async fn turn_on(home: &Home, run_as: Option<RunAs>, dry_run: bool) -
     let run_as = run_as.unwrap_or(config.run_as);
     validate_system_install(run_as == RunAs::System, crate::current_os()?)?;
     println!("{schedule}");
-    change_job(home, Wanted::On(run_as), dry_run).await?;
+    change_job(home, Wanted::On(run_as), dry_run, executable).await?;
     if !dry_run {
         let _claim_lock = claim::lock(home).await?;
         config = DeviceConfig::load_or_migrate(home, crate::user_profile().as_deref(), true)?;
@@ -1855,8 +2214,8 @@ pub(crate) async fn turn_on(home: &Home, run_as: Option<RunAs>, dry_run: bool) -
 }
 
 /// `schedule off`: removes the job and remembers the owner's no.
-pub(crate) async fn turn_off(home: &Home, dry_run: bool) -> Result<()> {
-    change_job(home, Wanted::Off, dry_run).await?;
+pub(crate) async fn turn_off(home: &Home, dry_run: bool, executable: &Path) -> Result<()> {
+    change_job(home, Wanted::Off, dry_run, executable).await?;
     if !dry_run && home.0.is_dir() {
         let _claim_lock = claim::lock(home).await?;
         let mut config = DeviceConfig::load(home)?;
@@ -1870,7 +2229,7 @@ pub(crate) async fn turn_off(home: &Home, dry_run: bool) -> Result<()> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum JobStatus {
+pub enum JobStatus {
     Current,
     Missing,
     Outdated,
@@ -1879,17 +2238,27 @@ pub(crate) enum JobStatus {
     SystemUnconfirmed,
 }
 
-pub(crate) fn inspect_job(home: &Home, config: &DeviceConfig) -> Result<JobStatus> {
+/// The executable that the recorded OS job runs. `None` when no job is recorded.
+pub(crate) fn recorded_executable(home: &Home) -> Result<Option<PathBuf>> {
+    let home = Home(schedule_home(&home.0, true)?);
+    Ok(read_applied(&home)?.map(|applied| applied.executable))
+}
+
+pub(crate) fn inspect_job(
+    home: &Home,
+    config: &DeviceConfig,
+    executable: &Path,
+) -> Result<JobStatus> {
     if config.auto_send && config.run_as == RunAs::System {
         return Ok(JobStatus::SystemUnconfirmed);
     }
     let desired = config.auto_send.then(|| Applied {
         run_as: config.run_as,
-        executable: std::env::current_exe().unwrap_or_default(),
+        executable: executable.to_path_buf(),
         user_home: None,
     });
     let home = Home(schedule_home(&home.0, true)?);
-    let observed = observe(&home, desired.as_ref(), false)?;
+    let observed = observe(&home, desired.as_ref(), false, executable)?;
     let applied = read_applied(&home)?;
     Ok(
         match reconcile(desired.as_ref(), applied.as_ref(), &observed) {
@@ -1903,7 +2272,7 @@ pub(crate) fn inspect_job(home: &Home, config: &DeviceConfig) -> Result<JobStatu
 }
 
 /// `schedule status`: the owner's choice, the company's policy and the state of the job.
-async fn status(home: &Home) -> Result<()> {
+async fn status(home: &Home, executable: &Path) -> Result<()> {
     let config = DeviceConfig::load_or_migrate(home, crate::user_profile().as_deref(), false)?;
     let signed = home.signed_manifest();
     let signed_schedule = signed
@@ -1924,9 +2293,19 @@ async fn status(home: &Home) -> Result<()> {
     );
     let desired = config.auto_send.then(|| Applied {
         run_as: config.run_as,
-        executable: std::env::current_exe().unwrap_or_default(),
+        executable: executable.to_path_buf(),
         user_home: None,
     });
+    let print_next_due = || {
+        if desired.is_some()
+            && let Ok(manifest) = home.signed_manifest()
+            && let Some(schedule) = &manifest.body().schedule
+        {
+            for line in next_due_text(home, config.run_as, schedule, executable) {
+                println!("{line}");
+            }
+        }
+    };
     if desired
         .as_ref()
         .is_some_and(|desired| desired.run_as == RunAs::System)
@@ -1934,10 +2313,11 @@ async fn status(home: &Home) -> Result<()> {
         println!(
             "The job runs as SYSTEM. Run `schedule on --system` from an elevated prompt to change it."
         );
+        print_next_due();
         return Ok(());
     }
     let schedule_home = Home(schedule_home(&home.0, true)?);
-    let observed = observe(&schedule_home, desired.as_ref(), false)?;
+    let observed = observe(&schedule_home, desired.as_ref(), false, executable)?;
     let applied = read_applied(&schedule_home)?;
     let command = crate::client_command(&home.0);
     println!(
@@ -1964,10 +2344,11 @@ async fn status(home: &Home) -> Result<()> {
             open_pact_core::timestamp::rfc3339_secs(time)
         );
     }
+    print_next_due();
     Ok(())
 }
 
-pub(crate) async fn run(home: &Home, command: Command) -> Result<()> {
+pub(crate) async fn run(home: &Home, command: Command, executable: &Path) -> Result<()> {
     match command {
         Command::On {
             system,
@@ -1979,12 +2360,18 @@ pub(crate) async fn run(home: &Home, command: Command) -> Result<()> {
             } else {
                 user.then_some(RunAs::User)
             };
-            turn_on(home, run_as, dry_run).await
+            turn_on(home, run_as, dry_run, executable).await
         }
-        Command::Off { dry_run } => turn_off(home, dry_run).await,
-        Command::Status => status(home).await,
+        Command::Off { dry_run } => turn_off(home, dry_run, executable).await,
+        Command::Status => status(home, executable).await,
         Command::Run { system, user_home } => {
-            operate(home, Operation::Run { system, user_home }, false).await
+            operate(
+                home,
+                Operation::Run { system, user_home },
+                false,
+                executable,
+            )
+            .await
         }
         Command::Probe { address, name } => probe_command(&address, name.as_deref()).await,
     }
@@ -1992,16 +2379,25 @@ pub(crate) async fn run(home: &Home, command: Command) -> Result<()> {
 
 /// One run of the job. The policy comes from the manifest the owner signed, never from a manifest
 /// that waits for acceptance.
-async fn run_tick(home: &Home, state_home: &Home, user_home: Option<&Path>) -> Result<()> {
+async fn run_tick(
+    home: &Home,
+    state_home: &Home,
+    user_home: Option<&Path>,
+    executable: &Path,
+) -> Result<()> {
     let authorization = {
         let Some(_claim_lock) = claim::try_lock(home)? else {
             return Ok(());
         };
         let config = DeviceConfig::load_or_migrate(home, user_home, true)?;
         let command = crate::client_command(&home.0);
-        if let Some(notice) =
-            device_config::legacy_notice(home, device_config::Surface::Job, &command, &config)
-        {
+        if let Some(notice) = device_config::legacy_notice(
+            home,
+            device_config::Surface::Job,
+            &command,
+            &config,
+            executable,
+        ) {
             job_log(home, &notice);
         }
         if !config.auto_send {
@@ -2015,6 +2411,7 @@ async fn run_tick(home: &Home, state_home: &Home, user_home: Option<&Path>) -> R
             manifest_hash: manifest.hash().clone(),
             schedule,
             owner_consented: config.auto_send,
+            self_removal: true,
         }
     };
     tick(
@@ -2022,12 +2419,18 @@ async fn run_tick(home: &Home, state_home: &Home, user_home: Option<&Path>) -> R
         state_home,
         user_home,
         &authorization,
+        executable,
         checks::event_markers,
     )
     .await
 }
 
-async fn operate(home: &Home, command: Operation, home_locked: bool) -> Result<()> {
+async fn operate(
+    home: &Home,
+    command: Operation,
+    home_locked: bool,
+    executable: &Path,
+) -> Result<()> {
     let os = crate::current_os()?;
     if let Operation::Install { system, .. } = &command
         && *system
@@ -2063,7 +2466,7 @@ async fn operate(home: &Home, command: Operation, home_locked: bool) -> Result<(
         windows_require_elevation()?;
     }
     let protected_paths = if os == open_pact_core::Os::Windows && (system_run || system_install) {
-        Some(windows_protected_paths(&home, system_install)?)
+        Some(windows_protected_paths(&home, system_install, executable)?)
     } else {
         None
     };
@@ -2092,7 +2495,7 @@ async fn operate(home: &Home, command: Operation, home_locked: bool) -> Result<(
                     home.file(JOB_LOG).display()
                 );
             }
-            let result = run_tick(&home, &state_home, user_home.as_deref()).await;
+            let result = run_tick(&home, &state_home, user_home.as_deref(), executable).await;
             if let Err(error) = &result {
                 job_log(&home, &format!("error: {error:#}"));
             }
@@ -2110,7 +2513,7 @@ async fn operate(home: &Home, command: Operation, home_locked: bool) -> Result<(
                     .context("SYSTEM install paths were not prepared")?;
                 (binary.clone(), Home(state.clone()))
             } else {
-                (std::env::current_exe()?, Home(home.0.clone()))
+                (executable.to_path_buf(), Home(home.0.clone()))
             };
             if os == open_pact_core::Os::Windows && text(&executable)?.contains('%') {
                 bail!("choose an executable path without %");
@@ -2131,12 +2534,12 @@ async fn operate(home: &Home, command: Operation, home_locked: bool) -> Result<(
             };
             register(&job, RegistrationAction::Install(run_as))?;
             println!(
-                "Installed {}. The OS runs it every five minutes. It sends the same claim as `check`, as the signed manifest allows. It writes what needs your attention to {}.",
+                "Installed {}. The OS runs it every minute and it does nothing until a check or a claim is due. It sends the same claim as `check`, as the signed manifest allows. It writes what needs your attention to {}.",
                 job.id, job.log
             );
         }
         Operation::Uninstall { system } => {
-            let job = Job::new(&std::env::current_exe()?, &home.0)?;
+            let job = Job::new(executable, &home.0)?;
             if os == open_pact_core::Os::Windows {
                 if system {
                     windows_system_uninstall(&job, &home)?;
@@ -2412,56 +2815,742 @@ esac
         }
     }
 
+    const T: i64 = 1_000_000;
+
+    /// Controls of the example manifest: `disk_encryption` has no grace, `firewall` one day,
+    /// `unknown_grace` is seven days.
+    fn lapsed(rows: &[(&str, &str, Option<i64>)]) -> Vec<String> {
+        let manifest = Manifest::parse(include_bytes!("../../../examples/manifest.toml")).unwrap();
+        let compliance = rows
+            .iter()
+            .map(|(id, value, _)| ((*id).to_owned(), *value == "full" || *value == "on"))
+            .collect();
+        let results = rows
+            .iter()
+            .map(|(id, value, _)| ((*id).to_owned(), (*value).into()))
+            .collect();
+        let state = State {
+            first_failed: rows
+                .iter()
+                .filter_map(|(id, _, ago)| Some(((*id).to_owned(), T - (*ago)?)))
+                .collect(),
+            ..State::default()
+        };
+        lapsed_controls(&manifest, &compliance, &results, &state, T)
+    }
+
+    /// A removal that fails at grace expiry still asks for the claim, once per run of failures.
+    /// `ca.pem` is a non-empty directory, so deleting it fails on every OS.
     #[test]
-    fn imperative_setup_commands_are_removed() {
-        use clap::Parser;
-        for args in [
-            vec![
-                "client",
-                "schedule",
-                "install",
-                "--collector",
-                "https://example.org",
-            ],
-            vec!["client", "schedule", "uninstall"],
-            vec!["client", "report", "--collector", "https://example.org"],
-            vec!["client", "report", "--dry-run"],
-            vec!["client", "log", "reports"],
-            vec!["client", "apply"],
-            vec!["client", "finish"],
-            vec!["client", "config", "example"],
-        ] {
-            assert!(crate::Cli::try_parse_from(args).is_err());
+    fn a_failed_removal_at_grace_expiry_still_forces_the_claim_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+        home.install_vpn_pair(b"CA", b"certificate").unwrap();
+        std::fs::remove_file(home.file("ca.pem")).unwrap();
+        std::fs::create_dir(home.file("ca.pem")).unwrap();
+        std::fs::write(home.file("ca.pem").join("held"), b"x").unwrap();
+        let vpn = places(Some(("1h", "5m")), None);
+        // A recent answered claim, a control that has failed since before: no event came from the
+        // compliance change itself.
+        let state_dir = tempfile::tempdir().unwrap();
+        let state_home = Home(state_dir.path().to_path_buf());
+        let mut state = State {
+            last_observed_compliance: Some(BTreeMap::from([("firewall".to_owned(), false)])),
+            ..state(false, Some(10 * MIN), Some(10 * MIN), false)
+        };
+        assert_eq!(plan(&vpn, &state, Place::Vpn, T, 0).send, None);
+        retire_certificate(&home, &state_home, &mut state, &["firewall".to_owned()]).unwrap();
+        assert!(state.event_pending);
+        assert_eq!(
+            plan(&vpn, &state, Place::Vpn, T, 0).send,
+            Some(Trigger::Event)
+        );
+        let log = std::fs::read_to_string(home.file(JOB_LOG)).unwrap();
+        assert!(log.contains("Could not remove the VPN certificate"));
+        // The claim went out; the next check fails to remove it the same way: no second claim.
+        state.event_pending = false;
+        retire_certificate(&home, &state_home, &mut state, &["firewall".to_owned()]).unwrap();
+        assert!(!state.event_pending);
+        // The deletion works later and the failure run is over.
+        std::fs::remove_dir_all(home.file("ca.pem")).unwrap();
+        retire_certificate(&home, &state_home, &mut state, &["firewall".to_owned()]).unwrap();
+        assert!(!state.removal_failed);
+    }
+
+    /// The forced claim is saved before the deletion starts. A crash at any step of the
+    /// deletion leaves it pending for the next run, which plans a claim at once.
+    #[test]
+    fn a_crash_during_the_removal_leaves_the_forced_claim_pending() {
+        let vpn = places(Some(("1h", "5m")), None);
+        let mut completed = false;
+        for step in 1..=32 {
+            let dir = tempfile::tempdir().unwrap();
+            let home = Home(dir.path().join("fictional-home"));
+            home.install_vpn_pair(b"CA one", b"certificate one")
+                .unwrap();
+            let state_dir = tempfile::tempdir().unwrap();
+            let state_home = Home(state_dir.path().to_path_buf());
+            // A recent answered claim and a control that has failed since before: no event came
+            // from the compliance change itself.
+            let mut state = State {
+                last_observed_compliance: Some(BTreeMap::from([("firewall".to_owned(), false)])),
+                ..state(false, Some(10 * MIN), Some(10 * MIN), false)
+            };
+            crate::INTERRUPT_AFTER.with(|left| left.set(Some(step)));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                retire_certificate(&home, &state_home, &mut state, &["firewall".to_owned()])
+            }));
+            crate::INTERRUPT_AFTER.with(|left| left.set(None));
+            // Only the saved state survives the crash. Recovery then finishes the deletion.
+            let saved: State = state_home
+                .read_json(STATE)
+                .unwrap()
+                .unwrap_or_else(|| panic!("step {step}: no state was saved"));
+            assert!(saved.event_pending, "step {step}: the claim is pending");
+            home.recover_vpn().unwrap();
+            assert!(
+                !home.vpn_removal_owed(),
+                "step {step}: nothing left to delete"
+            );
+            assert_eq!(
+                plan(&vpn, &saved, Place::Vpn, T, 0).send,
+                Some(Trigger::Event),
+                "step {step}: the next run sends the claim"
+            );
+            if result.is_ok() {
+                completed = true;
+                break;
+            }
         }
-        assert!(crate::Cli::try_parse_from(["client", "check", "--dry-run"]).is_ok());
-        for args in [
-            vec!["client", "schedule", "on"],
-            vec!["client", "schedule", "on", "--dry-run"],
-            vec!["client", "schedule", "off"],
-            vec!["client", "schedule", "status"],
-            vec!["client", "folders", "list"],
-            vec!["client", "folders", "add", "~/work"],
-            vec!["client", "folders", "remove", "~/work"],
-        ] {
-            assert!(crate::Cli::try_parse_from(args).is_ok());
-        }
-        assert!(
-            crate::Cli::try_parse_from(["client", "schedule", "on", "--system", "--user"]).is_err()
+        assert!(completed, "the removal never finished");
+    }
+
+    #[test]
+    fn a_control_lapses_when_its_grace_has_ended() {
+        const DAY: i64 = 86_400;
+        // No grace: at once, even on the first check that saw it.
+        assert_eq!(
+            lapsed(&[("disk_encryption", "none", None)]),
+            ["disk_encryption"]
+        );
+        assert_eq!(
+            lapsed(&[("disk_encryption", "none", Some(0))]),
+            ["disk_encryption"]
+        );
+        // One day of grace ends after the day, not at it.
+        assert!(lapsed(&[("firewall", "off", None)]).is_empty());
+        assert!(lapsed(&[("firewall", "off", Some(DAY - 1))]).is_empty());
+        assert!(lapsed(&[("firewall", "off", Some(DAY))]).is_empty());
+        assert_eq!(lapsed(&[("firewall", "off", Some(DAY + 1))]), ["firewall"]);
+        // A result that cannot be read counts against `unknown_grace`, also on a no-grace control.
+        assert!(lapsed(&[("firewall", "unknown", Some(7 * DAY))]).is_empty());
+        assert_eq!(
+            lapsed(&[("firewall", "unknown", Some(7 * DAY + 1))]),
+            ["firewall"]
+        );
+        assert!(lapsed(&[("disk_encryption", "unknown", Some(60))]).is_empty());
+        // A control that passes never lapses, and a control the manifest lacks is ignored.
+        assert!(lapsed(&[("firewall", "on", Some(30 * DAY))]).is_empty());
+        assert!(lapsed(&[("not_in_the_manifest", "off", Some(30 * DAY))]).is_empty());
+        assert_eq!(
+            lapsed(&[
+                ("firewall", "off", Some(2 * DAY)),
+                ("disk_encryption", "none", None),
+                ("os_supported", "no", Some(DAY)),
+            ]),
+            ["disk_encryption", "firewall"]
         );
     }
 
-    fn vpn(probe: &str) -> SendPolicy {
-        SendPolicy::Vpn {
-            probe: open_pact_core::ProbeAddress::try_from(probe.to_owned()).unwrap(),
+    #[test]
+    fn the_local_grace_starts_at_the_first_failure_and_resets_when_the_control_passes() {
+        let mut state = State::default();
+        let failing = |firewall| {
+            BTreeMap::from([
+                ("firewall".to_owned(), firewall),
+                ("os_supported".to_owned(), false),
+            ])
+        };
+        state.observe_failures(&failing(false), 100);
+        state.observe_failures(&failing(false), 500);
+        assert_eq!(
+            state.first_failed["firewall"], 100,
+            "the first failure stands"
+        );
+        state.observe_failures(&failing(true), 600);
+        assert!(
+            !state.first_failed.contains_key("firewall"),
+            "a pass clears it"
+        );
+        state.observe_failures(&failing(false), 700);
+        assert_eq!(state.first_failed["firewall"], 700);
+        state.observe_failures(&BTreeMap::from([("firewall".to_owned(), false)]), 800);
+        assert!(
+            !state.first_failed.contains_key("os_supported"),
+            "a control the manifest no longer requires is forgotten"
+        );
+    }
+
+    fn probe() -> open_pact_core::Probe {
+        open_pact_core::Probe {
+            address: open_pact_core::ProbeAddress::try_from("10.0.0.1:443".to_owned()).unwrap(),
             name: None,
         }
     }
 
-    fn every_55_minutes(policy: SendPolicy) -> open_pact_core::Schedule {
-        open_pact_core::Schedule {
-            policy,
-            interval: open_pact_core::Interval::try_from("55m".to_owned()).unwrap(),
+    fn interval(text: &str) -> open_pact_core::Interval {
+        open_pact_core::Interval::try_from(text.to_owned()).unwrap()
+    }
+
+    /// `[schedule.vpn]` with these periods, and `[schedule.always]` when given.
+    fn places(vpn: Option<(&str, &str)>, always: Option<&str>) -> Schedule {
+        let vpn = vpn.map(|(send, check)| {
+            let mut slot = open_pact_core::VpnSlot::new(probe(), interval(send));
+            slot.check = CheckPeriod::try_from(check.to_owned()).unwrap();
+            slot
+        });
+        Schedule::new(vpn, always.map(interval)).unwrap()
+    }
+
+    /// A state with the last answered attempt and the last check `ago` seconds before `T`.
+    fn state(reconnect: bool, attempt: Option<i64>, check: Option<i64>, event: bool) -> State {
+        State {
+            vpn_up: true,
+            reconnect_pending: reconnect,
+            last_attempt: attempt.map(|ago| T - ago),
+            last_check: check.map(|ago| T - ago),
+            event_pending: event,
+            ..State::default()
         }
+    }
+
+    const MIN: i64 = 60;
+
+    #[test]
+    fn next_due_text_reads_the_state_of_the_job_that_runs() {
+        let vpn = places(Some(("10m", "5m")), None);
+        let dir = tempfile::tempdir().unwrap();
+        let state_home = Home(dir.path().to_path_buf());
+        // No saved state: a new job. It checks at the next wake.
+        let fresh = due_text(Ok(Home(state_home.0.clone())), &vpn);
+        assert!(fresh.iter().any(|line| line.starts_with("Next check due")));
+        // A state the job saved, with a check a moment ago, is the one that counts.
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        save(
+            &state_home,
+            STATE,
+            &State {
+                vpn_up: true,
+                last_check: Some(now - MIN),
+                last_attempt: Some(now - MIN),
+                ..State::default()
+            },
+        )
+        .unwrap();
+        let lines = due_text(Ok(Home(state_home.0.clone())), &vpn);
+        assert!(lines.iter().any(|line| line.starts_with("Last check:")));
+        assert_ne!(lines, fresh);
+        // A state that cannot be read is said so; it is not a new job.
+        std::fs::write(state_home.file(STATE), b"{ not json").unwrap();
+        let unreadable = due_text(Ok(Home(state_home.0.clone())), &vpn);
+        assert_eq!(unreadable.len(), 1);
+        assert!(unreadable[0].contains("cannot be read"), "{unreadable:?}");
+        let missing = due_text(Err(anyhow::anyhow!("access denied")), &vpn);
+        assert!(missing[0].contains("cannot be read"), "{missing:?}");
+        assert!(missing[0].contains("access denied"));
+    }
+
+    /// `schedule status` and `accept` ask for the job's own state: a user job keeps it in the
+    /// client home, and a SYSTEM job in the protected directory of Windows. The Windows lookup
+    /// itself runs PowerShell and has no unit test.
+    #[test]
+    fn the_job_state_home_follows_who_runs_the_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+        assert_eq!(
+            job_state_home(&home, RunAs::User, &std::env::current_exe().unwrap())
+                .unwrap()
+                .0,
+            schedule_home(&home.0, true).unwrap()
+        );
+        if crate::current_os().unwrap() != open_pact_core::Os::Windows {
+            let vpn = places(Some(("10m", "5m")), None);
+            let lines = next_due_text(
+                &home,
+                RunAs::System,
+                &vpn,
+                &std::env::current_exe().unwrap(),
+            );
+            assert_eq!(lines.len(), 1);
+            assert!(lines[0].contains("only on Windows"), "{lines:?}");
+        }
+    }
+
+    #[test]
+    fn next_due_says_when_the_job_will_check_and_send() {
+        let vpn = places(Some(("10m", "5m")), None);
+        let on_vpn = State {
+            vpn_up: true,
+            ..state(false, Some(4 * MIN), Some(2 * MIN), false)
+        };
+        // Check at 5 minutes after the last one (3 minutes from now); claim 10 minutes after the answer.
+        assert_eq!(
+            next_due(&vpn, &on_vpn, T),
+            NextDue {
+                check: Some(T + 3 * MIN),
+                send: Some(T + 6 * MIN)
+            }
+        );
+        // Nothing ran yet: both at the next wake.
+        let fresh = State {
+            vpn_up: true,
+            ..State::default()
+        };
+        assert_eq!(
+            next_due(&vpn, &fresh, T),
+            NextDue {
+                check: Some(T),
+                send: Some(T)
+            }
+        );
+        // Off the VPN with only a VPN slot: nothing falls due.
+        let off = State::default();
+        assert_eq!(
+            next_due(&vpn, &off, T),
+            NextDue {
+                check: None,
+                send: None
+            }
+        );
+        let lines = next_due_lines(&vpn, &off, T);
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.contains("none while the VPN does not answer")),
+            "{lines:?}"
+        );
+        // A held event is due now.
+        let event = state(false, Some(MIN), Some(MIN), true);
+        assert_eq!(
+            next_due(
+                &vpn,
+                &State {
+                    vpn_up: true,
+                    ..event
+                },
+                T
+            )
+            .send,
+            Some(T)
+        );
+    }
+
+    /// The job's times are written in UTC with whole seconds and a `Z`, as chrono wrote them.
+    #[test]
+    fn time_text_writes_whole_seconds_in_utc_and_names_an_unreadable_time() {
+        assert_eq!(time_text(0), "1970-01-01T00:00:00Z");
+        assert_eq!(time_text(1_794_906_000), "2026-11-17T09:00:00Z");
+        assert_eq!(time_text(-1), "1969-12-31T23:59:59Z");
+        assert_eq!(time_text(i64::MAX), "an unknown time");
+    }
+
+    #[test]
+    fn the_next_due_lines_name_the_last_check_and_both_times() {
+        let vpn = places(Some(("10m", "5m")), None);
+        let on_vpn = State {
+            vpn_up: true,
+            ..state(false, Some(4 * MIN), Some(2 * MIN), false)
+        };
+        assert_eq!(
+            next_due_lines(&vpn, &on_vpn, T),
+            [
+                format!("Last check: {}.", time_text(T - 2 * MIN)),
+                format!("Next check due: {}.", time_text(T + 3 * MIN)),
+                format!("Next claim due: {}.", time_text(T + 6 * MIN)),
+            ]
+        );
+        let due_now = State {
+            vpn_up: true,
+            ..State::default()
+        };
+        assert_eq!(
+            next_due_lines(&vpn, &due_now, T),
+            [
+                "Next check due: at the next wake, within a minute.".to_owned(),
+                "Next claim due: at the next wake, within a minute.".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_decides_checks_and_sends_from_the_schedule_place_and_state() {
+        use Place::{Elsewhere, Vpn};
+        let vpn = places(Some(("10m", "5m")), None);
+        let vpn_every_minute = places(Some(("10m", "1m")), None);
+        let both = places(Some(("10m", "5m")), Some("4h"));
+        let always = places(None, Some("4h"));
+        let flat_vpn = Schedule::legacy_vpn(probe(), interval("55m"));
+        let flat_always = Schedule::legacy_always(interval("55m"));
+        let go = |check, send| Plan { check, send };
+        let idle = go(false, None);
+        let rows: Vec<(&str, &Schedule, Place, State, i64, Plan)> = vec![
+            // Off the VPN with only a VPN slot: nothing runs, whatever the state says.
+            (
+                "off the VPN",
+                &vpn,
+                Elsewhere,
+                state(false, None, None, false),
+                0,
+                idle,
+            ),
+            (
+                "off the VPN, event held",
+                &vpn,
+                Elsewhere,
+                state(false, None, None, true),
+                0,
+                go(false, None),
+            ),
+            (
+                "off the VPN, reconnect held",
+                &vpn,
+                Elsewhere,
+                state(true, Some(99 * MIN), None, false),
+                0,
+                go(false, None),
+            ),
+            // A connect: check at once and send at once.
+            (
+                "connect, never sent",
+                &vpn,
+                Vpn,
+                state(true, None, None, false),
+                0,
+                go(true, Some(Trigger::Connect)),
+            ),
+            (
+                "connect, last answer 6 minutes ago",
+                &vpn,
+                Vpn,
+                state(true, Some(6 * MIN), Some(6 * MIN), false),
+                0,
+                go(true, Some(Trigger::Connect)),
+            ),
+            // The flapping guard: an answer within five minutes holds the connect claim back, but the
+            // first wake after the connect still checks.
+            (
+                "connect, last answer 3 minutes ago",
+                &vpn,
+                Vpn,
+                state(true, Some(3 * MIN), None, false),
+                0,
+                go(true, None),
+            ),
+            (
+                "connect, last answer 4m59s ago",
+                &vpn,
+                Vpn,
+                state(true, Some(5 * MIN - 1), None, false),
+                0,
+                go(true, None),
+            ),
+            (
+                "connect, last answer 5m ago",
+                &vpn,
+                Vpn,
+                state(true, Some(5 * MIN), None, false),
+                0,
+                go(true, Some(Trigger::Connect)),
+            ),
+            // Steady state on the VPN.
+            (
+                "steady, nothing due",
+                &vpn,
+                Vpn,
+                state(false, Some(4 * MIN), Some(4 * MIN), false),
+                0,
+                go(false, None),
+            ),
+            (
+                "steady, check due",
+                &vpn,
+                Vpn,
+                state(false, Some(4 * MIN), Some(5 * MIN), false),
+                0,
+                go(true, None),
+            ),
+            (
+                "steady, interval due",
+                &vpn,
+                Vpn,
+                state(false, Some(10 * MIN), Some(MIN), false),
+                0,
+                go(true, Some(Trigger::Periodic)),
+            ),
+            (
+                "steady, 9m59s since the answer",
+                &vpn,
+                Vpn,
+                state(false, Some(10 * MIN - 1), Some(MIN), false),
+                0,
+                go(false, None),
+            ),
+            // A result that got worse sends at once, and its checks run again.
+            (
+                "event",
+                &vpn,
+                Vpn,
+                state(false, Some(MIN), Some(MIN), true),
+                0,
+                go(true, Some(Trigger::Event)),
+            ),
+            (
+                "event beats connect",
+                &vpn,
+                Vpn,
+                state(true, None, None, true),
+                0,
+                go(true, Some(Trigger::Event)),
+            ),
+            // The check period comes from the manifest, and Windows raises it to five minutes.
+            (
+                "check every minute, 59 s",
+                &vpn_every_minute,
+                Vpn,
+                state(false, Some(MIN), Some(MIN - 1), false),
+                0,
+                go(false, None),
+            ),
+            (
+                "check every minute, 60 s",
+                &vpn_every_minute,
+                Vpn,
+                state(false, Some(MIN), Some(MIN), false),
+                0,
+                go(true, None),
+            ),
+            (
+                "check every minute, Windows floor",
+                &vpn_every_minute,
+                Vpn,
+                state(false, Some(MIN), Some(4 * MIN), false),
+                300,
+                go(false, None),
+            ),
+            (
+                "check every minute, Windows floor reached",
+                &vpn_every_minute,
+                Vpn,
+                state(false, Some(MIN), Some(5 * MIN), false),
+                300,
+                go(true, None),
+            ),
+            (
+                "a clock that ran back checks",
+                &vpn,
+                Vpn,
+                state(false, Some(MIN), Some(-5 * MIN), false),
+                0,
+                go(true, None),
+            ),
+            // Both slots: elsewhere checks every five minutes and sends on the always interval.
+            (
+                "both, elsewhere, nothing due",
+                &both,
+                Elsewhere,
+                state(false, Some(MIN), Some(4 * MIN), false),
+                0,
+                go(false, None),
+            ),
+            (
+                "both, elsewhere, check due",
+                &both,
+                Elsewhere,
+                state(false, Some(MIN), Some(5 * MIN), false),
+                0,
+                go(true, None),
+            ),
+            (
+                "both, elsewhere, interval due",
+                &both,
+                Elsewhere,
+                state(false, Some(4 * 60 * MIN), Some(MIN), false),
+                0,
+                go(true, Some(Trigger::Periodic)),
+            ),
+            (
+                "both, elsewhere, event",
+                &both,
+                Elsewhere,
+                state(false, Some(MIN), Some(MIN), true),
+                0,
+                go(true, Some(Trigger::Event)),
+            ),
+            (
+                "both, on the VPN, VPN interval",
+                &both,
+                Vpn,
+                state(false, Some(10 * MIN), Some(MIN), false),
+                0,
+                go(true, Some(Trigger::Periodic)),
+            ),
+            (
+                "both, on the VPN, connect",
+                &both,
+                Vpn,
+                state(true, Some(60 * MIN), None, false),
+                0,
+                go(true, Some(Trigger::Connect)),
+            ),
+            // Always only: no probe, the place is always elsewhere.
+            (
+                "always, never sent",
+                &always,
+                Elsewhere,
+                state(false, None, None, false),
+                0,
+                go(true, Some(Trigger::Periodic)),
+            ),
+            (
+                "always, nothing due",
+                &always,
+                Elsewhere,
+                state(false, Some(MIN), Some(MIN), false),
+                0,
+                go(false, None),
+            ),
+            // The flat 0.7 forms keep their interval gating: the connect claim waits for it.
+            (
+                "flat vpn, connect inside the interval",
+                &flat_vpn,
+                Vpn,
+                state(true, Some(10 * MIN), None, false),
+                0,
+                go(true, None),
+            ),
+            (
+                "flat vpn, connect after the interval",
+                &flat_vpn,
+                Vpn,
+                state(true, Some(55 * MIN), None, false),
+                0,
+                go(true, Some(Trigger::Connect)),
+            ),
+            (
+                "flat vpn, steady check",
+                &flat_vpn,
+                Vpn,
+                state(false, Some(10 * MIN), Some(5 * MIN), false),
+                0,
+                go(true, None),
+            ),
+            (
+                "flat vpn, off the VPN",
+                &flat_vpn,
+                Elsewhere,
+                state(false, None, None, false),
+                0,
+                go(false, None),
+            ),
+            (
+                "flat always, first wake",
+                &flat_always,
+                Elsewhere,
+                state(false, None, None, false),
+                0,
+                go(true, Some(Trigger::Periodic)),
+            ),
+            (
+                "flat always, between",
+                &flat_always,
+                Elsewhere,
+                state(false, Some(10 * MIN), Some(MIN), false),
+                0,
+                go(false, None),
+            ),
+            (
+                "flat always, at the interval",
+                &flat_always,
+                Elsewhere,
+                state(false, Some(55 * MIN), Some(MIN), false),
+                0,
+                go(true, Some(Trigger::Periodic)),
+            ),
+        ];
+        for (name, schedule, place, state, floor, expected) in rows {
+            assert_eq!(plan(schedule, &state, place, T, floor), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_wake_with_nothing_due_is_idle_and_a_due_claim_always_checks() {
+        let vpn = places(Some(("10m", "5m")), None);
+        let quiet = plan(
+            &vpn,
+            &state(false, Some(MIN), Some(MIN), false),
+            Place::Vpn,
+            T,
+            0,
+        );
+        assert!(quiet.idle());
+        for send_due in [
+            state(false, Some(10 * MIN), Some(MIN), false),
+            state(false, Some(MIN), Some(MIN), true),
+            state(true, None, Some(MIN), false),
+        ] {
+            let due = plan(&vpn, &send_due, Place::Vpn, T, 0);
+            assert!(due.send.is_some() && due.check && !due.idle());
+        }
+    }
+
+    #[test]
+    fn a_connect_clears_the_last_check_so_the_first_wake_checks() {
+        let mut state = State {
+            last_check: Some(T),
+            ..State::default()
+        };
+        state.observe(false);
+        assert_eq!(state.last_check, Some(T), "off the VPN changes nothing");
+        state.observe(true);
+        assert!(state.reconnect_pending);
+        assert_eq!(state.last_check, None);
+        state.last_check = Some(T);
+        state.observe(true);
+        assert_eq!(state.last_check, Some(T), "staying connected is no connect");
+    }
+
+    /// The decisions the flat 0.7 VPN form made before `plan`: the old tests still hold them.
+    impl State {
+        fn due(&self, now: i64, interval: i64) -> Option<Trigger> {
+            let schedule = open_pact_core::Schedule::legacy_vpn(
+                open_pact_core::Probe {
+                    address: open_pact_core::ProbeAddress::try_from("10.0.0.1:443".to_owned())
+                        .unwrap(),
+                    name: None,
+                },
+                open_pact_core::Interval::try_from(format!("{}m", interval / 60)).unwrap(),
+            );
+            let place = if self.vpn_up {
+                Place::Vpn
+            } else {
+                Place::Elsewhere
+            };
+            plan(&schedule, self, place, now, 0).send
+        }
+
+        fn should_send(&self, now: i64, interval: i64) -> bool {
+            self.vpn_up && self.interval_elapsed(now, interval)
+        }
+    }
+
+    fn every_55_minutes_on_the_vpn(probe: &str) -> open_pact_core::Schedule {
+        open_pact_core::Schedule::legacy_vpn(
+            open_pact_core::Probe {
+                address: open_pact_core::ProbeAddress::try_from(probe.to_owned()).unwrap(),
+                name: None,
+            },
+            open_pact_core::Interval::try_from("55m".to_owned()).unwrap(),
+        )
     }
 
     #[test]
@@ -2541,6 +3630,7 @@ esac
             windows_task: Some(WindowsTaskState {
                 trigger_enabled: false,
                 trigger_type: Some(1),
+                repetition: Some(WAKE_ISO.into()),
                 protected_binary: None,
             }),
             ..Observed::default()
@@ -2553,6 +3643,7 @@ esac
             windows_task: Some(WindowsTaskState {
                 trigger_enabled: true,
                 trigger_type: Some(7),
+                repetition: Some(WAKE_ISO.into()),
                 protected_binary: None,
             }),
             ..disabled
@@ -2561,6 +3652,55 @@ esac
             reconcile(Some(&settings), applied, &wrong_type),
             Change::Update
         );
+    }
+
+    #[test]
+    fn a_five_minute_job_is_rewritten_for_the_one_minute_wake() {
+        let settings = Applied {
+            run_as: RunAs::User,
+            executable: PathBuf::from("C:\\Program Files\\open-pact\\open-pact-client.exe"),
+            user_home: None,
+        };
+        let task = |repetition: Option<&str>| Observed {
+            exists: true,
+            matches: true,
+            windows_task: Some(WindowsTaskState {
+                trigger_enabled: true,
+                trigger_type: Some(1),
+                repetition: repetition.map(str::to_owned),
+                protected_binary: None,
+            }),
+            ..Observed::default()
+        };
+        for stale in [Some("PT5M"), Some("PT10M"), None] {
+            assert_eq!(
+                reconcile(Some(&settings), Some(&settings), &task(stale)),
+                Change::Update,
+                "{stale:?}"
+            );
+        }
+        assert_eq!(
+            reconcile(Some(&settings), Some(&settings), &task(Some("PT1M"))),
+            Change::None
+        );
+    }
+
+    #[test]
+    fn the_windows_observation_asks_for_the_one_minute_repeat() {
+        let job = Job::new(Path::new("client.exe"), Path::new("fixture-home")).unwrap();
+        let script = windows_observation_script(
+            &job,
+            Path::new("client.exe"),
+            Path::new("client.exe"),
+            "--home",
+        )
+        .unwrap();
+        assert!(
+            script.contains("Repetition.Interval -eq 'PT1M'"),
+            "{script}"
+        );
+        assert!(!script.contains("PT5M"));
+        assert!(script.contains("repetition="));
     }
 
     #[test]
@@ -2588,6 +3728,7 @@ esac
                 windows_task: Some(WindowsTaskState {
                     trigger_enabled: true,
                     trigger_type: Some(1),
+                    repetition: Some(WAKE_ISO.into()),
                     protected_binary: Some(protected_binary),
                 }),
                 ..Observed::default()
@@ -2974,7 +4115,7 @@ Write-Output 'refused'
     fn apply_command_preserves_shell_metacharacters() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home with 'quotes' $cash `false` ; & end");
-        let command = apply_command(&home, "schedule off");
+        let command = apply_command(&home, "schedule off", &std::env::current_exe().unwrap());
         let output = std::process::Command::new("sh")
             .args([
                 "-c",
@@ -3452,10 +4593,34 @@ Write-Output 'refused'
     }
 
     #[test]
+    fn the_job_runs_the_executable_the_caller_names() {
+        let executable = Path::new("/opt/example/open-pact-client");
+        let desired = desired_job(Wanted::On(RunAs::User), executable)
+            .unwrap()
+            .unwrap();
+        assert_eq!(desired.executable, executable);
+        let job = Job::new(&desired.executable, Path::new("/home/example/pact")).unwrap();
+        assert!(
+            job.plist()
+                .contains("<string>/opt/example/open-pact-client</string>")
+        );
+        assert!(
+            job.service()
+                .contains(r#"ExecStart="/opt/example/open-pact-client" "--home""#)
+        );
+        assert!(
+            !job.plist()
+                .contains(&*std::env::current_exe().unwrap().to_string_lossy())
+        );
+        assert!(desired_job(Wanted::Off, executable).unwrap().is_none());
+        assert!(desired_job(Wanted::On(RunAs::User), Path::new("")).is_err());
+    }
+
+    #[test]
     fn launchd_arguments_and_interval_are_encoded() {
         let log = Path::new("/home/example/pact & data").join(JOB_LOG);
         let plist = job().plist();
-        assert!(plist.contains("<key>StartInterval</key><integer>300</integer>"));
+        assert!(plist.contains("<key>StartInterval</key><integer>60</integer>"));
         assert!(plist.contains("<string>/home/example/pact &amp; data</string>"));
         assert!(plist.contains("<string>schedule</string>\n<string>run</string>"));
         assert!(plist.contains("<key>RunAtLoad</key><true/>"));
@@ -3469,8 +4634,8 @@ Write-Output 'refused'
     }
 
     #[test]
-    fn systemd_has_a_five_minute_timer_and_quotes_arguments() {
-        assert!(job().timer().contains("OnUnitActiveSec=5min"));
+    fn systemd_has_a_one_minute_timer_and_quotes_arguments() {
+        assert!(job().timer().contains("OnUnitActiveSec=1min"));
         assert!(
             job()
                 .timer()
@@ -3489,7 +4654,7 @@ Write-Output 'refused'
     }
 
     #[test]
-    fn windows_task_runs_every_five_minutes_as_the_current_user() {
+    fn windows_task_runs_every_minute_as_the_current_user() {
         let job = Job::new(
             Path::new(r"C:\Example App\open-pact-client.exe"),
             Path::new(r"C:\Example User\pact"),
@@ -3504,7 +4669,7 @@ Write-Output 'refused'
                 "/SC",
                 "MINUTE",
                 "/MO",
-                "5",
+                "1",
                 "/TR",
                 r#""C:\Example App\open-pact-client.exe" "--home" "C:\Example User\pact" "schedule" "run""#,
                 "/RL",
@@ -3518,7 +4683,7 @@ Write-Output 'refused'
     }
 
     #[test]
-    fn windows_system_task_runs_every_five_minutes_with_explicit_user_home() {
+    fn windows_system_task_runs_every_minute_with_explicit_user_home() {
         let job = Job::new(
             Path::new(r"C:\Example App\open-pact-client.exe"),
             Path::new(r"C:\Example User\pact"),
@@ -3535,7 +4700,7 @@ Write-Output 'refused'
                 "/SC",
                 "MINUTE",
                 "/MO",
-                "5",
+                "1",
                 "/TR",
                 r#""C:\Example App\open-pact-client.exe" "--home" "C:\Example User\pact" "schedule" "run" "--system" "--user-home" "C:\Users\example user""#,
                 "/RU",
@@ -3561,7 +4726,14 @@ Write-Output 'refused'
     async fn vpn_probe_connects_to_a_listening_port() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
-        assert!(vpn_up(&address.to_string(), None).await);
+        assert!(
+            vpn_up(
+                &address.to_string(),
+                None,
+                &std::env::current_exe().unwrap()
+            )
+            .await
+        );
         drop(listener);
 
         // A closed ephemeral port can be rebound by a parallel test; a bound socket that never
@@ -3569,7 +4741,14 @@ Write-Output 'refused'
         let reserved = tokio::net::TcpSocket::new_v4().unwrap();
         reserved.bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let refused = reserved.local_addr().unwrap();
-        assert!(!vpn_up(&refused.to_string(), None).await);
+        assert!(
+            !vpn_up(
+                &refused.to_string(),
+                None,
+                &std::env::current_exe().unwrap()
+            )
+            .await
+        );
     }
 
     /// A certificate for `name` issued by a fictional CA. Returns the CA as a root that only a test
@@ -3649,7 +4828,12 @@ Write-Output 'refused'
             "the fictional CA is trusted only through the test hook"
         );
         assert!(
-            !vpn_up(&address.to_string(), Some("vpn.example.org")).await,
+            !vpn_up(
+                &address.to_string(),
+                Some("vpn.example.org"),
+                &std::env::current_exe().unwrap()
+            )
+            .await,
             "the production probe does not trust the fictional CA"
         );
     }
@@ -3690,7 +4874,7 @@ Write-Output 'refused'
         enrolment.gateway = format!("http://{}", refused.local_addr().unwrap());
         home.write("enrolment.json", &serde_json::to_vec(&enrolment).unwrap())
             .unwrap();
-        let policy = every_55_minutes(vpn(&listener.local_addr().unwrap().to_string()));
+        let policy = every_55_minutes_on_the_vpn(&listener.local_addr().unwrap().to_string());
         save(
             &state_home,
             STATE,
@@ -3709,18 +4893,56 @@ Write-Output 'refused'
             manifest_hash: home.enrolment().unwrap().manifest,
             schedule: policy.clone(),
             owner_consented: true,
+            self_removal: false,
         };
-        tick(&home, &state_home, None, &authorization, || events(100))
-            .await
-            .unwrap();
+        tick(
+            &home,
+            &state_home,
+            None,
+            &authorization,
+            &std::env::current_exe().unwrap(),
+            || events(100),
+        )
+        .await
+        .unwrap();
         let baseline: State = state_home.read_json(STATE).unwrap().unwrap();
         assert_eq!(
             baseline.last_events.unwrap().security_log_cleared,
             Some(100)
         );
-        let error = tick(&home, &state_home, None, &authorization, || events(101))
-            .await
-            .unwrap_err();
+        // The next check is not due yet, so a wake in between reads no markers at all.
+        tick(
+            &home,
+            &state_home,
+            None,
+            &authorization,
+            &std::env::current_exe().unwrap(),
+            || events(101),
+        )
+        .await
+        .unwrap();
+        let unchanged: State = state_home.read_json(STATE).unwrap().unwrap();
+        assert_eq!(unchanged.last_events, baseline.last_events);
+        assert!(!unchanged.event_pending);
+        save(
+            &state_home,
+            STATE,
+            &State {
+                last_check: Some(baseline.last_check.unwrap() - 10 * 60),
+                ..baseline.clone()
+            },
+        )
+        .unwrap();
+        let error = tick(
+            &home,
+            &state_home,
+            None,
+            &authorization,
+            &std::env::current_exe().unwrap(),
+            || events(101),
+        )
+        .await
+        .unwrap_err();
         assert!(format!("{error:#}").contains("/v1/manifest"), "{error:#}");
         let pending: State = state_home.read_json(STATE).unwrap().unwrap();
         assert_eq!(pending.last_events, baseline.last_events);
@@ -3781,7 +5003,9 @@ Write-Output 'refused'
         )
         .unwrap();
         assert!(
-            run(&home, run_job()).await.is_err(),
+            run(&home, run_job(), &std::env::current_exe().unwrap())
+                .await
+                .is_err(),
             "the gateway is unreachable"
         );
         let connected: State = home.read_json(STATE).unwrap().unwrap();
@@ -3794,7 +5018,9 @@ Write-Output 'refused'
         let refused = reserved.local_addr().unwrap().to_string();
         enrolled_home_with_schedule(dir.path(), Some(&vpn_table(&refused)));
         let _gateway = unreachable_gateway(&home);
-        run(&home, run_job()).await.unwrap();
+        run(&home, run_job(), &std::env::current_exe().unwrap())
+            .await
+            .unwrap();
         let disconnected: State = home.read_json(STATE).unwrap().unwrap();
         assert!(!disconnected.vpn_up);
         assert_eq!(disconnected.last_success, connected.last_success);
@@ -3805,7 +5031,9 @@ Write-Output 'refused'
         let dir = tempfile::tempdir().unwrap();
         let home = enrolled_home_with_schedule(dir.path(), Some(""));
         assert!(home.signed_manifest().unwrap().body().schedule.is_none());
-        let error = turn_on(&home, None, false).await.unwrap_err();
+        let error = turn_on(&home, None, false, &std::env::current_exe().unwrap())
+            .await
+            .unwrap_err();
         assert!(
             format!("{error:#}").contains("did not define automatic sending"),
             "{error:#}"
@@ -3819,7 +5047,9 @@ Write-Output 'refused'
         let dir = tempfile::tempdir().unwrap();
         let home = enrolled_home(dir.path());
         let _gateway = unreachable_gateway(&home);
-        run(&home, run_job()).await.unwrap();
+        run(&home, run_job(), &std::env::current_exe().unwrap())
+            .await
+            .unwrap();
         assert!(!home.file(STATE).exists(), "no probe, no claim");
         assert!(!home.file(JOB_LOG).exists());
     }
@@ -3830,7 +5060,9 @@ Write-Output 'refused'
         let home = enrolled_home_with_schedule(dir.path(), Some(""));
         let _gateway = unreachable_gateway(&home);
         agree(&home);
-        run(&home, run_job()).await.unwrap();
+        run(&home, run_job(), &std::env::current_exe().unwrap())
+            .await
+            .unwrap();
         assert!(!home.file(STATE).exists());
     }
 
@@ -3839,16 +5071,20 @@ Write-Output 'refused'
         const ADDRESS: &str = "OPEN_PACT_TEST_PROBE_ADDRESS";
         if let Ok(address) = std::env::var(ADDRESS) {
             assert!(std::env::var_os("HOME").is_none());
-            let cli = <crate::Cli as clap::Parser>::try_parse_from([
-                "open-pact-client",
-                "schedule",
-                "probe",
-                "--address",
-                &address,
-            ])
-            .unwrap();
+            let cli = crate::Invocation {
+                home: None,
+                insecure_dev: false,
+                command: crate::Command::Schedule {
+                    command: Command::Probe {
+                        address,
+                        name: None,
+                    },
+                },
+            };
             assert_eq!(
-                crate::run(cli).await.unwrap(),
+                crate::run(cli, &std::env::current_exe().unwrap())
+                    .await
+                    .unwrap(),
                 std::process::ExitCode::SUCCESS
             );
             return;
@@ -3946,8 +5182,12 @@ Write-Output 'refused'
             "[schedule]\nenabled = true\nrun_as = 'user'\nmode = 'vpn'\nvpn_probe = '127.0.0.1:1'\n",
         )
         .unwrap();
-        run(&home, run_job()).await.unwrap();
-        run(&home, run_job()).await.unwrap();
+        run(&home, run_job(), &std::env::current_exe().unwrap())
+            .await
+            .unwrap();
+        run(&home, run_job(), &std::env::current_exe().unwrap())
+            .await
+            .unwrap();
         assert!(!home.file(STATE).exists(), "the old file starts no probe");
         let log = std::fs::read_to_string(home.file(JOB_LOG)).unwrap();
         assert_eq!(
@@ -4132,7 +5372,9 @@ Write-Output 'refused'
         let home = enrolled_home(dir.path());
         let _gateway = unreachable_gateway(&home);
         std::fs::write(home.file(JOB_LOG), vec![b'x'; JOB_LOG_LIMIT as usize + 1]).unwrap();
-        run(&home, run_job()).await.unwrap();
+        run(&home, run_job(), &std::env::current_exe().unwrap())
+            .await
+            .unwrap();
         assert_eq!(
             std::fs::metadata(home.file("schedule.log.1"))
                 .unwrap()
@@ -4145,7 +5387,9 @@ Write-Output 'refused'
         );
 
         std::fs::write(home.file(JOB_LOG), b"short").unwrap();
-        run(&home, run_job()).await.unwrap();
+        run(&home, run_job(), &std::env::current_exe().unwrap())
+            .await
+            .unwrap();
         assert_eq!(std::fs::read(home.file(JOB_LOG)).unwrap(), b"short");
         assert_eq!(
             std::fs::metadata(home.file("schedule.log.1"))
@@ -4182,6 +5426,7 @@ Write-Output 'refused'
             manifest_hash: home.enrolment().unwrap().manifest,
             schedule,
             owner_consented: true,
+            self_removal: false,
         };
 
         let held = claim::try_lock(&home).unwrap().unwrap();
@@ -4190,6 +5435,7 @@ Write-Output 'refused'
             &home,
             None,
             &authorization,
+            &std::env::current_exe().unwrap(),
             checks::EventMarkerReads::default,
         )
         .await
@@ -4210,6 +5456,7 @@ Write-Output 'refused'
             &home,
             None,
             &authorization,
+            &std::env::current_exe().unwrap(),
             checks::EventMarkerReads::default,
         )
         .await

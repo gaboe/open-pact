@@ -19,7 +19,7 @@ mod windows;
 
 use std::collections::BTreeMap;
 
-use open_pact_core::{Control, ControlValue, Manifest, Os};
+use open_pact_core::{Control, ControlValue, Os};
 use serde::{Deserialize, Serialize};
 
 use crate::device_config::DeviceConfig;
@@ -61,59 +61,12 @@ pub(crate) fn event_markers() -> EventMarkerReads {
     }
 }
 
-/// The builtins compiled into this client, by control id and version. A manifest control runs only if
-/// its `check` is exactly `builtin:<id>@<version>` from this table.
-const BUILTINS: &[(&str, u32)] = &[
-    ("os_auto_updates", 1),
-    ("antimalware_realtime", 1),
-    ("antimalware_active_threats", 1),
-    ("work_account", 1),
-    ("uptime_days", 1),
-    ("disk_encryption", 1),
-    ("firewall", 1),
-    ("screen_lock", 1),
-    ("os_supported", 1),
-    ("os_patch_age_days", 1),
-    ("password_set", 1),
-    ("auto_login", 1),
-    ("secure_boot", 1),
-    ("antimalware_active", 1),
-    ("preboot_auth", 1),
-    ("antimalware_signature_age_days", 1),
-    ("antimalware_full_scan_age_days", 1),
-    ("web_protection", 1),
-    ("log_oldest_record_days", 1),
-    ("process_audit", 1),
-    ("remote_wipe", 1),
-    ("powershell_logging", 1),
-    ("log_cleared", 1),
-    ("managed_repos_outside", 1),
-    ("managed_repos_total", 1),
-    ("password_min_length", 1),
-];
-
-fn implements(control: &Control) -> bool {
-    BUILTINS
-        .iter()
-        .any(|(id, v)| control.id == *id && control.check == format!("builtin:{id}@{v}"))
-}
-
-/// Refuses a manifest with a control this client cannot run exactly as signed.
-pub fn check_supported(manifest: &Manifest) -> Result<(), String> {
-    let unsupported: Vec<String> = manifest
-        .body()
-        .controls
-        .iter()
-        .filter(|c| !implements(c))
-        .map(|c| format!("{} ({})", c.id, c.check))
-        .collect();
-    if unsupported.is_empty() {
-        Ok(())
+/// `screen_lock@2` reports whole minutes. `screen_lock@1` keeps its buckets.
+fn screen_lock_version(input: &CheckInput<'_>) -> u32 {
+    if input.control.check == "builtin:screen_lock@2" {
+        2
     } else {
-        Err(format!(
-            "this client does not implement {}",
-            unsupported.join(", ")
-        ))
+        1
     }
 }
 
@@ -181,7 +134,10 @@ const MACOS: Registry = &[
         ignore_input!(|| macos::disk_encryption().into()),
     ),
     ("firewall", ignore_input!(|| macos::firewall().into())),
-    ("screen_lock", ignore_input!(|| macos::screen_lock().into())),
+    ("screen_lock", |input| match screen_lock_version(input) {
+        2 => macos::screen_lock_minutes(),
+        _ => macos::screen_lock().into(),
+    }),
     (
         "os_supported",
         ignore_input!(|| macos::os_supported().into()),
@@ -239,7 +195,10 @@ const LINUX: Registry = &[
         ignore_input!(|| linux::disk_encryption().into()),
     ),
     ("firewall", ignore_input!(|| linux::firewall().into())),
-    ("screen_lock", ignore_input!(|| linux::screen_lock().into())),
+    ("screen_lock", |input| match screen_lock_version(input) {
+        2 => linux::screen_lock_minutes(),
+        _ => linux::screen_lock().into(),
+    }),
     (
         "os_supported",
         ignore_input!(|| linux::os_supported().into()),
@@ -297,7 +256,10 @@ const WINDOWS: Registry = &[
     ("uptime_days", ignore_input!(windows::uptime_days)),
     ("disk_encryption", ignore_input!(windows::disk_encryption)),
     ("firewall", ignore_input!(windows::firewall)),
-    ("screen_lock", ignore_input!(windows::screen_lock)),
+    ("screen_lock", |input| match screen_lock_version(input) {
+        2 => windows::screen_lock_minutes(),
+        _ => windows::screen_lock(),
+    }),
     ("os_supported", ignore_input!(windows::os_supported)),
     (
         "os_patch_age_days",
@@ -517,6 +479,7 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use open_pact_core::{BUILTINS, Manifest, check_supported};
 
     fn run_all(os: Os) -> BTreeMap<String, ControlValue> {
         let manifest =
@@ -621,22 +584,29 @@ mod tests {
     }
 
     #[test]
-    fn accepts_only_compiled_builtins_at_their_exact_version() {
+    fn screen_lock_at_version_two_is_a_supported_builtin_and_reports_its_own_value() {
         let demo = include_str!("../../../../examples/manifest.toml");
-        let parse = |toml: &str| Manifest::parse(toml.as_bytes()).unwrap();
-        assert_eq!(check_supported(&parse(demo)), Ok(()));
-        for (from, to) in [
-            ("builtin:firewall@1", "builtin:firewall@2"),
-            ("builtin:firewall@1", "builtin:screen_lock@1"),
-            ("builtin:firewall@1", "builtin:firewall@1 "),
-            (r#"id = "firewall""#, r#"id = "installed_apps""#),
-        ] {
-            let error = check_supported(&parse(&demo.replace(from, to))).unwrap_err();
-            assert!(
-                error.starts_with("this client does not implement"),
-                "{to}: {error}"
-            );
+        let manifest = Manifest::parse(
+            demo.replace("builtin:screen_lock@1", "builtin:screen_lock@2")
+                .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(check_supported(&manifest), Ok(()));
+        let control = manifest.body().control("screen_lock").unwrap();
+        assert_eq!(control.check, "builtin:screen_lock@2");
+        // Off its own OS every check reads unknown; the value is the same for both versions there.
+        for os in Os::ALL {
+            let value = run(os, std::slice::from_ref(control), None, None);
+            assert!(value.contains_key("screen_lock"), "{os}");
         }
+        assert_eq!(
+            screen_lock_version(&CheckInput {
+                control,
+                device_config: None,
+                repo_scan: None
+            }),
+            2
+        );
     }
 
     #[test]

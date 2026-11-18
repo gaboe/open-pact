@@ -98,6 +98,30 @@
       "difference": "Background-data flags do not prove automatic OS installation"
     },
     {
+      "name": "macos-config-data-install-disabled",
+      "os": "macos",
+      "input": [
+        "0",
+        "1",
+        "1"
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "off",
+      "known_diff": null
+    },
+    {
+      "name": "macos-automatic-check-disabled",
+      "os": "macos",
+      "input": [
+        "1",
+        "1",
+        "0"
+      ],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "off",
+      "known_diff": null
+    },
+    {
       "name": "os-install-enabled",
       "os": "macos",
       "input": [

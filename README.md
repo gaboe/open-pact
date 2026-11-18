@@ -89,26 +89,51 @@ scoop install gaboe/open-pact
 For Debian or Ubuntu, download the `.deb` from the [client releases](https://github.com/gaboe/open-pact/releases) and install it:
 
 ```sh
-sudo apt install ./open-pact-client_0.7.1_amd64.deb
+sudo apt install ./open-pact-client_0.8.1_amd64.deb
 ```
 
 For Fedora, download the `.rpm` from the [client releases](https://github.com/gaboe/open-pact/releases) and install it:
 
 ```sh
-sudo dnf install ./open-pact-client-0.7.1-1.x86_64.rpm
+sudo dnf install ./open-pact-client-0.8.1-1.x86_64.rpm
 ```
 
 Homebrew and Scoop check release SHA-256 hashes. The Linux commands install local files. Verify those packages with the release verification steps below before installation. These tools do not update the client automatically. Run `brew upgrade` or `scoop update open-pact` to update an installed client. For APT or DNF, download and install each new release when you choose to update.
 
+## Install the desktop apps
+
+The release also ships two desktop apps: `open-pact` for the employee whose device sends claims, and `open-pact-admin` for the person who writes the manifest and approves devices. Both apps come in one zip per platform. The client app runs the client itself and can install the command-line client for you.
+
+On macOS, run the installer of a release tag. It installs the latest release into `~/Applications`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/gaboe/open-pact/v0.8.1/desktop/scripts/install-desktop.sh | sh
+```
+
+On Windows, use Scoop, or the PowerShell installer when you do not use Scoop. The installer puts the apps in `%LOCALAPPDATA%\open-pact-desktop`:
+
+```powershell
+scoop bucket add gaboe https://github.com/gaboe/scoop-bucket
+scoop install gaboe/open-pact-desktop
+```
+
+```powershell
+irm https://raw.githubusercontent.com/gaboe/open-pact/v0.8.1/desktop/scripts/install-desktop.ps1 | iex
+```
+
+"Latest" skips prereleases. To install a prerelease or one fixed version, set `OPEN_PACT_DESKTOP_VERSION` first, for example `OPEN_PACT_DESKTOP_VERSION=0.8.1` on macOS or `$env:OPEN_PACT_DESKTOP_VERSION = '0.8.1'` on Windows. The Scoop manifest exists only for stable releases. Run the same command again to update.
+
+Both installers check the zip against its line in `SHA256SUMS` before they replace anything. The macOS installer also checks each app's signature. The apps are not notarized by Apple and not Authenticode-signed, so a browser download can be blocked: install with the commands above instead. On Windows, SmartScreen may warn the first time. To also check the Cosign signature of `SHA256SUMS`, run `scripts/verify-client-release.sh` first; it checks the desktop zips too.
+
 ## Verify a release
 
-Client releases include binaries for macOS, Linux, and Windows, plus `.deb` and `.rpm` packages. They also include `NOTICE`, `SHA256SUMS`, and Sigstore bundles for each binary, package, `NOTICE`, and `SHA256SUMS`. Verify a client release with `scripts/verify-client-release.sh v0.7.1`. The script downloads these files from the GitHub release, checks their hashes, and verifies their signatures against the tagged release workflow. It needs GitHub CLI, Cosign, and `sha256sum` or `shasum`. Set `GH_REPO` to check a release from a fork. See the [client release verification procedure](docs/client.md#verify-a-release) to save and install a verified binary or Linux package.
+Client releases include binaries for macOS, Linux, and Windows, plus `.deb` and `.rpm` packages. They also include `NOTICE`, `SHA256SUMS`, and Sigstore bundles for each binary, package, `NOTICE`, and `SHA256SUMS`. Verify a client release with `scripts/verify-client-release.sh v0.8.1`. The script downloads these files from the GitHub release, checks their hashes, and verifies their signatures against the tagged release workflow. It needs GitHub CLI, Cosign, and `sha256sum` or `shasum`. Set `GH_REPO` to check a release from a fork. See the [client release verification procedure](docs/client.md#verify-a-release) to save and install a verified binary or Linux package.
 
 The gateway image is reproducible: a pinned toolchain and builder, a static musl binary, `FROM scratch`, and timestamps fixed to the commit time. CI builds each release twice on separate runners and fails when the digests differ. The witness image (`ghcr.io/<owner>/open-pact-witness`, the Dockerfile `witness` target) is built and checked the same way. To check a release yourself, run `scripts/verify-release.sh v0.0.1 ghcr.io/<owner>/open-pact-gateway@sha256:<digest>`, or add `--target witness` and the witness image reference. It rebuilds the tag from the public source, prints the digest, and exits nonzero on a mismatch. It needs Docker with buildx and takes several minutes. The image carries no system CA bundle. Optional SIEM TLS uses its explicitly mounted CA file. Do not use `sslmode=verify-full` for PostgreSQL without providing its CA.
 
 ## License
 
-This project is licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE).
+This project is licensed under the MIT License. See [LICENSE](LICENSE). Earlier releases were published under the Apache License, Version 2.0.
 
 ## Gateway API
 
@@ -127,7 +152,7 @@ This project is licensed under the Apache License, Version 2.0. See [LICENSE](LI
 | `GET /v1/log` | 410: the v0.1.0 hash-chain endpoint is gone |
 | `GET /` | public page: enforced manifest, company key, log checkpoint, witness key count, VPN CA; no device or claim data |
 
-A claim is accepted only if the device is enrolled for the enforced manifest and approved, the `client` field is exactly `open-pact-client <major>.<minor>.<patch>`, the nonce is unused, the claim time is within `claim_max_age` and not more than 5 minutes ahead, and the results meet the manifest. The client posts `{"jws": ..., "csr_pem": ...}`. The certificate request travels beside the JWS, and the signed claim carries only `csr_sha256`, the SHA-256 of the request's DER. The request must carry a P-256 public key and nothing else: canonical PEM with no text around it, an empty subject, and no attributes or extensions. If the request matches `csr_sha256`, the gateway issues a client certificate for its public key: CN = the pseudonym's 64 hex digits, extended key usage `clientAuth`, key usage `digitalSignature` and an authority key identifier, valid 24 hours or `claim_max_age` if shorter. The gateway stores the signed claim and the certificate's SHA-256, never the request. Each version component in `client` is a `u32` without leading zeros, so the field stays short.
+A claim is accepted only if the device is enrolled for the enforced manifest and approved, the `client` field is exactly `open-pact-client <major>.<minor>.<patch>`, optionally followed by `-alpha.<n>`, `-beta.<n>` or `-rc.<n>`, the nonce is unused, the claim time is within `claim_max_age` and not more than 5 minutes ahead, and the results meet the manifest. The client posts `{"jws": ..., "csr_pem": ...}`. The certificate request travels beside the JWS, and the signed claim carries only `csr_sha256`, the SHA-256 of the request's DER. The request must carry a P-256 public key and nothing else: canonical PEM with no text around it, an empty subject, and no attributes or extensions. If the request matches `csr_sha256`, the gateway issues a client certificate for its public key: CN = the pseudonym's 64 hex digits, extended key usage `clientAuth`, key usage `digitalSignature` and an authority key identifier, valid 24 hours or `claim_max_age` if shorter. The gateway stores the signed claim and the certificate's SHA-256, never the request. Each version component in `client` is a `u32` without leading zeros, so the field stays short.
 
 **Grace.** The gateway stores, per device, manifest and control, the time it first saw a required control fail or report `unknown`. A passing value clears it; a missing result denies at once and keeps it. While the failure is younger than the control's `grace` (or `unknown_grace` for `unknown`), the claim is accepted with a warning such as `firewall = off, on required, access ends in 23h`. After that it is denied with `firewall = off, on required, grace 1d ended`. `grace = "0d"` denies the first failed claim. Changing between a failed value and `unknown` keeps the first time. Only a claim that passes the client, manifest, time, trust level and disclosure checks from an enrolled device changes the stored times.
 
@@ -176,6 +201,7 @@ Each JSON event has exactly one top-level key, `open_pact`. Its fields are flat.
 | `verdict` | `allow` or `deny`, including enrolment state and certificate-request checks. |
 | `reasons` | Array, empty for allow. |
 | `warnings` | Array, including failures still within grace on an allow verdict. |
+| `access_until` | RFC 3339 UTC time, the end of the VPN certificate that the claim got, or `null` when it got none. |
 | `result_<control id>` | The result exactly as disclosed, with no derived values. For example `result_os_patch_age_days: 31`. |
 
 TLS sends RFC 5424 messages with facility `local0`, severity `informational`, app name `open-pact`, and message ID `status`. The timestamp and hostname in the syslog header are NILVALUE. The JSON body contains the signed claim time. RFC 5425 octet counting prefixes the UTF-8 byte length of the complete syslog message and one space. File output contains only JSON and a newline, without a syslog header or length prefix.
@@ -257,17 +283,22 @@ witness_quorum = 1          # cosignatures a client requires
 checkpoint_max_age = "1h"   # oldest cosignature a client accepts
 ```
 
-The optional `[schedule]` table tells devices when to send claims automatically. It is part of the signed manifest and of its hash:
+The optional `[schedule]` table tells devices when to check themselves and when to send claims automatically. It is part of the signed manifest and of its hash:
 
 ```toml
-[schedule]
-mode = "vpn"                     # or "always"
-vpn_probe = "10.0.0.1:443"       # host:port that answers only on the company VPN; required with vpn, rejected with always
-vpn_probe_name = "vpn.example.org" # optional TLS name that the probe must present
-interval = "55m"                 # 5m to 24h between periodic claims
+[schedule.vpn]                    # while the company VPN answers
+probe = "10.0.0.1:443"            # host:port that answers only on the company VPN
+probe_name = "vpn.example.org"    # optional TLS name that the probe must present
+interval = "1h"                   # the longest time between claims on the VPN: 5m to 24h
+check = "5m"                      # optional: how often the device checks itself on the VPN, 1m to 24h; default 5m
+
+[schedule.always]                 # optional: on any network
+interval = "24h"
 ```
 
-Without `[schedule]`, devices send claims only by hand with `check`. The owner turns automatic sending on or off on the device. The client shows the table in plain words, such as `Automatic claims: only while vpn.example.org answers at 10.0.0.1:443, every 55 minutes, and at once when a check result changes` or `Automatic claims: every 55 minutes on any network, and at once when a check result changes`. The interval is the shortest time between two automatic claims. Only a change of a check result sends a claim sooner. Every change of the manifest, the schedule included, needs the owner's `accept`; until then the job keeps the policy the owner signed. Anyone who can reach `GET /v1/manifest` can read the probe address, so choose an address that is no secret.
+The manifest needs at least one of the two tables. The older flat table (`mode = "vpn"` or `"always"`, `vpn_probe`, `vpn_probe_name`, `interval`) still parses and keeps its old meaning. Without `[schedule]`, devices send claims only by hand with `check`. The owner turns automatic sending on or off on the device. The client shows the table in plain words, such as `Automatic claims: on the company VPN (vpn.example.org at 10.0.0.1:443) checks every 5 minutes, sends at once on connect or when a result gets worse, and at least every hour; on any network every 24 hours, and at once when a result gets worse.` On the VPN a device checks itself every `check`, sends at once when it connects (at most once every five minutes) and when a required result gets worse, and at least every `interval`. Off the VPN it only probes, unless `[schedule.always]` asks it to check every five minutes and send every `interval` of that table. `check` is local work, not more sending, but a shorter `check` is new work on the device, so the owner must agree to it again with `schedule on` after `accept`. Every change of the manifest, the schedule included, needs the owner's `accept`; until then the job keeps the policy the owner signed. Anyone who can reach `GET /v1/manifest` can read the probe address, so choose an address that is no secret.
+
+A device whose check finds a required control non-compliant, with its grace ended on the device, deletes its own VPN certificate and sends a claim at once. A claim that the gateway denies installs no new certificate.
 
 Clients up to 0.4.9 reject a manifest that has a `[schedule]` table, so `join` and `accept` fail on them. Upgrade every client before the company adds `[schedule]`.
 
@@ -362,7 +393,7 @@ All checks are read-only. macOS and Linux checks run as the device owner. Window
 
 | Control | macOS | Linux |
 | --- | --- | --- |
-| `os_auto_updates` | `ConfigDataInstall` and `CriticalUpdateInstall` both enabled | Enabled and active apt or dnf timer with automatic installation configured |
+| `os_auto_updates` | `AutomaticCheckEnabled`, `ConfigDataInstall` and `CriticalUpdateInstall` all enabled | Enabled and active apt or dnf timer with automatic installation configured |
 | `antimalware_realtime` | XProtect present, registered and enabled | Running `clamonacc` process |
 | `antimalware_active_threats` | `n/a` | `unknown` |
 | `work_account` | Current account membership in `admin` | Current account membership in `sudo` or `wheel` |
@@ -387,7 +418,7 @@ Windows collects the controls in one cached PowerShell batch. A missing source, 
 | `antimalware_active_threats` | Count of `Get-MpThreat` results with `IsActive` | Defender threat read access |
 | `work_account` | Administrators SID in token groups, including UAC deny-only groups. SYSTEM uses the active console user token | Own token, or SYSTEM for the console token |
 | `uptime_days` | Whole days since `Win32_OperatingSystem.LastBootUpTime` | CIM read access |
-| `password_min_length` | `MinPasswordLength` of the local account policy through ADSI; 0 means `none` | Device user |
+| `password_min_length` | Minimum password length of the local account policy (`NetUserModalsGet`); 0 means `none` | Device user |
 | `preboot_auth` | OS-volume BitLocker protection and numeric key-protector types; recovery passwords do not establish the startup method | SYSTEM or elevated administrator |
 | `antimalware_signature_age_days` | Defender `AntivirusSignatureLastUpdated` | Defender status read access |
 | `antimalware_full_scan_age_days` | Defender `FullScanEndTime`; absent date means `unknown` | Defender status read access |
@@ -402,13 +433,13 @@ Defender metrics require Defender in Normal mode with its antivirus and service 
 
 On Windows, `preboot_auth`, `log_oldest_record_days`, `process_audit`, and `log_cleared` need SYSTEM or an elevated administrator. The `web_protection` check also needs SYSTEM to read browser settings for other user profiles. Answer yes to the SYSTEM question in the join wizard, or run `schedule on --system` from an elevated PowerShell prompt, to run these checks as SYSTEM. The task reads Windows settings and reports their values. It does not change those settings.
 
-Windows `screen_lock` uses a machine inactivity limit first. Otherwise it reads the effective screen-saver policy before local desktop settings. It requires a positive timer, secure mode, and an existing `.scr` file. As SYSTEM, it reads the HKU hives of interactive users. The weakest readable user setting decides. Missing users, unloaded hives, and unreadable evidence return `unknown`.
+`screen_lock@1` reports buckets and `screen_lock@2` whole minutes, rounded up, of the same setting; on macOS `@2` adds the screen saver idle time and the display sleep time to the password delay, while `@1` reads the password delay only (see [docs/controls.md](docs/controls.md)). Windows `screen_lock` uses a machine inactivity limit first. Otherwise it reads the effective screen-saver policy before local desktop settings. It requires a positive timer, secure mode, and an existing `.scr` file. An absent enabled flag or an empty saver program means no saver runs, so the result is `none`. As SYSTEM, it reads the HKU hives of interactive users. The weakest readable user setting decides. Missing users, unloaded hives, and unreadable evidence return `unknown`.
 
 Windows `os_supported` uses an edition-aware lifecycle table for client, IoT Enterprise, LTSC/LTSB, and Server releases. Older systems use `ReleaseId` when `DisplayVersion` is absent. Missing lifecycle entries and unverified Windows 10 ESU status return `unknown`.
 
 Windows browser discovery checks standard Program Files and per-user Local AppData installations. Chromium profiles use Local AppData user-data directories or a mandatory `UserDataDir` policy. Hidden profiles are included. Missing or unreadable policy directories return `unknown`. Known mandatory protection policy still decides when a profile read fails. Firefox uses Roaming AppData profiles and installation-directory `distribution/policies.json`. Machine registry policy takes precedence over user policy. Recommended Chromium policy stays below explicit user preferences. Firefox supports JSON Preferences policy and legacy per-preference DWORD policy. Firefox registry policy takes precedence over the distribution file.
 
-As SYSTEM, the reader checks every non-special Windows user profile and its loaded HKEY_USERS policy hive. It returns `unknown` for an installed browser with an unloaded hive or unreadable settings. It does not load hives or change permissions. Custom installation locations and command-line `--user-data-dir` overrides are outside discovery. Unsupported `UserDataDir` variables return `unknown`. SmartScreen must be readable and on for Windows `web_protection=on`; Windows never reports `n/a`.
+As SYSTEM, the reader checks every non-special Windows user profile and its loaded HKEY_USERS policy hive. It returns `unknown` for an installed browser with an unloaded hive or unreadable settings. It does not load hives or change permissions. Custom installation locations and command-line `--user-data-dir` overrides are outside discovery. Unsupported `UserDataDir` variables return `unknown`. SmartScreen must be readable and on for Windows `web_protection=on`; an absent `SmartScreenEnabled` value is the Windows default, which is on; Windows never reports `n/a`.
 
 
 `antimalware_active` now checks XProtect instead of Gatekeeper. This is a breaking mechanism change. [Apple describes XProtect as macOS antivirus technology](https://support.apple.com/guide/security/protecting-against-malware-sec469d47bd8/web). The signature-age reader matches `CFBundleShortVersionString` with an `XProtectPlistConfigData` receipt in `InstallHistory.plist`. It uses the matching receipt date because a bundle build date or file modification date does not establish when definitions were installed.
@@ -457,11 +488,11 @@ Run `check --dry-run` to see what `check` would send now:
 open-pact-client check --dry-run
 ```
 
-The command runs the same local checks and prints the claim as JSON. It adds `manifest_toml` when the gateway enforces a different manifest. It makes GET requests for the manifest, log key, checkpoint, and any needed consistency proof. It sends no nonce request or signed POST. It writes no file. The dry run never suppresses the claim. When the saved device status is pending or revoked, it prints one `Last known status` line after the claim, because `check` asks the gateway again. It cannot verify private log entries or current device status because those checks need a signed request. When the dry run prints a claim, it also prints this line: `check also asks the gateway whether this device may send; the dry run skips that signed request.` The nonce, time, and VPN certificate request appear as placeholders. The scheduled job sends the same claim.
+The command runs the same local checks and prints the claim as JSON. It adds `manifest_toml` when the gateway enforces a different manifest. It makes GET requests for the manifest, log key, checkpoint, and any needed consistency proof. It sends no nonce request or signed POST. It writes no file. The dry run never suppresses the claim. When the saved device status is pending or revoked, it prints one `Last known status` line after the claim, because `check` asks the gateway again. It cannot verify private log entries or current device status because those checks need a signed request. When the dry run prints a claim, it also prints this line: `check also asks the gateway whether this device may send; the dry run skips that signed request.` The nonce, time, and VPN certificate request appear as placeholders. The scheduled job sends the same claim. Add `--timings` to print, on the error stream, the wall time of the whole run and the CPU time (user and system) of the client process and its child processes. Unix reads them from `getrusage`. On Windows the child time counts the commands that the checks ran, such as the PowerShell batch. Run it about twenty times on each kind of device before you set a short `check` period. It needs `--dry-run`.
 
 ## Send claims automatically
 
-The scheduled job runs the claim pipeline of `check` on its own. The company chooses the policy in `[schedule]` of the signed manifest: `mode = "vpn"` sends only while the device is on the company VPN, and `mode = "always"` sends on any network. You choose whether the job runs:
+The scheduled job runs the claim pipeline of `check` on its own. The company chooses the policy in `[schedule]` of the signed manifest: `[schedule.vpn]` works only while the device is on the company VPN, and `[schedule.always]` works on any network. You choose whether the job runs:
 
 ```sh
 open-pact-client schedule on --dry-run
@@ -469,25 +500,29 @@ open-pact-client schedule on
 open-pact-client schedule on
 ```
 
-`schedule on` refuses when the manifest has no `[schedule]`. It prints the policy line. The first run prints `schedule: install`. The second prints `no changes`. A changed executable path prints `schedule: update`. Dry run prints the planned change and writes nothing. Keep the binary at its installed path. macOS uses a launchd LaunchAgent. Linux uses a systemd user timer and needs a running user manager. Windows uses Task Scheduler. No separate client daemon is needed.
+`schedule on` refuses when the manifest has no `[schedule]`. It prints the policy line. The first run prints `schedule: install`. The second prints `no changes`. A changed executable path prints `schedule: update`, and so does a job that client 0.7 installed: it wakes every five minutes, and `schedule on` rewrites it to wake every minute. `schedule status` prints the consent line, your choice, the state of the job, the last answered claim, the last check, and when the next check and claim fall due. Dry run prints the planned change and writes nothing. Keep the binary at its installed path. macOS uses a launchd LaunchAgent. Linux uses a systemd user timer and needs a running user manager. Windows uses Task Scheduler. No separate client daemon is needed.
 
 Use the same absolute `--home` for each command. The scheduled run reads the policy from the manifest you signed every time. When the company changes the manifest and you have not yet run `accept`, the job keeps the policy you signed and writes the accept notice to `schedule.log`. To stop the job, run `open-pact-client schedule off`. The command removes the job and its state and records your no. If the entire client home is already missing, it removes the remaining job without recreating that home.
 
 On Windows, choose SYSTEM in the wizard or run `schedule on --system` from an elevated PowerShell prompt. Without elevation, the command prints the exact command and changes nothing. Other operating systems reject `--system`. The installer copies the client into `%ProgramFiles%\open-pact\open-pact-client.exe` and refuses a directory that non-administrators can write. The SYSTEM job runs with `--system --user-home <profile>`. It reads the selected user's absolute `--home`, expands `~` in the folders of `device.json` against that profile, and refuses reparse-point files. It keeps its state under `%ProgramData%\open-pact\system\<home hash>`, with access limited to SYSTEM and Administrators. Choose a home path without `%`.
 
-With `mode = "vpn"`, `vpn_probe` must be a `host:port` that connects only on the company VPN. The job sends nothing while it does not connect, so an address that also answers off the VPN makes the job send off the VPN. A probe can succeed just before the VPN disconnects.
+`probe` (flat form: `vpn_probe`) must be a `host:port` that connects only on the company VPN. The job sends nothing from the VPN table while it does not connect, so an address that also answers off the VPN makes the job send off the VPN. A probe can succeed just before the VPN disconnects.
 
-A private address such as `10.0.0.1:443` can also exist on other networks, such as hotel or home routers, so a TCP connection alone can match the wrong network. With `vpn_probe_name` in the manifest, the probe connects to `vpn_probe` without a DNS lookup of the name. It needs a TLS certificate that is valid for the name and chains to a root that the client trusts for its HTTPS requests. Any HTTP status counts as an answer. The probe has five seconds in total and does not use a proxy. An empty value or an IP address for `vpn_probe_name` does not parse.
+A private address such as `10.0.0.1:443` can also exist on other networks, such as hotel or home routers, so a TCP connection alone can match the wrong network. With `probe_name` (flat form: `vpn_probe_name`) in the manifest, the probe connects to `probe` without a DNS lookup of the name. It needs a TLS certificate that is valid for the name and chains to a root that the client trusts for its HTTPS requests. Any HTTP status counts as an answer. The probe has five seconds in total and does not use a proxy. An empty value or an IP address for `probe_name` does not parse.
 
-With `mode = "vpn"`, the job tries a TCP connection to `vpn_probe` every five minutes, with a two-second timeout that includes name resolution. With `vpn_probe_name`, it tries the TLS probe instead. Use brackets around IPv6 addresses. A successful connection records connectivity for this check. The job sends when the last attempt that the gateway answered is older than `interval`, or when there is none. A connection that returns inside the interval does not send. The job probes again at the start of the send, before any gateway request (the manifest, the log, a nonce), and once more before the POST of the claim. It sends nothing more when a probe fails, so a device that left the VPN during the repository scan sends nothing, not even a log request. DNS runs in a child process that the parent kills at the deadline: two seconds for TCP, five seconds with `vpn_probe_name`. A disconnect and reconnect entirely between two probes is not observed. A send that gets no answer from the gateway (a network error) retries on the next run. If the clock moves behind the last answer time, the next connected run retries and resets that time. With `mode = "always"`, the job does not probe and sends when `interval` has passed since the last answered attempt.
+The OS wakes the job every minute (launchd `StartInterval` 60, a systemd timer of one minute, Task Scheduler every minute). A wake costs one process start and one probe. It first decides, from the saved state and the clock, whether anything is due, and when nothing is due it exits at once: no check, no repository scan, no gateway request.
+
+On the VPN the job checks every `check` period (at least five minutes on Windows, where one check starts PowerShell) and on the first wake after the VPN connects. It sends at once on a connect, at once when a required control changes from compliant to non-compliant, and at least every `interval`. A connect claim goes at most once every five minutes: when the gateway answered a claim less than five minutes ago, a VPN that flaps does not send again. Off the VPN the job runs no check and sends nothing, except under `[schedule.always]`, which checks every five minutes and sends every its `interval`. A claim that is due always runs fresh checks first. The flat 0.7 form keeps its interval gating (it sends when the last answered attempt is older than `interval`, also at a connect), and checks every five minutes while it may send.
+
+The probe is a TCP connection with a two-second timeout that includes name resolution. With `probe_name`, it tries the TLS probe instead. Use brackets around IPv6 addresses. A successful connection records connectivity for this check. The job probes again at the start of the send, before any gateway request (the manifest, the log, a nonce), and once more before the POST of the claim. It sends nothing more when a probe fails, so a device that left the VPN during the repository scan sends nothing, not even a log request. DNS runs in a child process that the parent kills at the deadline: two seconds for TCP, five seconds with `vpn_probe_name`. A disconnect and reconnect entirely between two probes is not observed. A send that gets no answer from the gateway (a network error) retries on the next run. If the clock moves behind the last answer time, the next connected run retries and resets that time. Without a VPN table the job does not probe and sends when `interval` has passed since the last answered attempt.
 
 The job scans repositories at most once a day, before it takes the claim lock, and uses the stored counts in `repo-scan.json` between scans. It holds the claim lock, the lock of `check` and `accept`, only for the gateway part. When one of them runs, the job skips that run. A command you start waits up to 60 seconds for the lock and prints one line that it waits for the scheduled job. A claim that the gateway accepts or denies counts as sent. So does an answer without a verdict on the claim: the device waits for approval, IT revoked it, the manifest awaits `accept`, or the log did not verify. After any of these the job asks again only when `interval` has passed, and writes each piece of news to `schedule.log` once, when it changes.
 
-Every run evaluates the collected results against this OS's requirements in the signed manifest. A required control that changes from compliant to non-compliant triggers an extra claim. Missing results and `unknown` count as non-compliant, regardless of grace. Controls with no requirement for this OS never trigger. The first claim that the gateway answers sets the compliance baseline. Later answers replace that baseline with the results sent.
+Every check evaluates the collected results against this OS's requirements in the signed manifest. A required control that changes from compliant to non-compliant triggers an extra claim. Missing results and `unknown` count as non-compliant, regardless of grace. Controls with no requirement for this OS never trigger. The first claim that the gateway answers sets the compliance baseline. Later answers replace that baseline with the results sent.
 
 On Windows, Security event 1102 and any new Defender detection also trigger an extra claim, even if the threat is already resolved. The task user needs `Event Log Readers` access or SYSTEM access to read the Security log. The first successful read of each event source sets its baseline. Later marker advances are saved only after the gateway answers.
 
-The job sends at most one claim per five-minute run and, with `mode = "vpn"`, sends nothing off VPN. A change of a check result is the one reason to send inside the interval. The job holds detected events and compliance failures while the VPN is down, even if the control recovers before reconnecting. The next detected connection sends a claim with current results. Only an answer from the gateway clears the pending event. Events before the first successful baseline read are part of that baseline.
+The job sends at most one claim per wake and, with only a VPN table, sends nothing off VPN. A change of a check result is the one reason to send inside the interval. The job holds detected events and compliance failures while the VPN is down, even if the control recovers before reconnecting. The next detected connection sends a claim with current results. Only an answer from the gateway clears the pending event. Events before the first successful baseline read are part of that baseline.
 
 The job cannot ask you anything. When only you can fix a problem, it writes one dated line to `schedule.log` in the client home: a changed manifest (run `accept`), a gateway denial with its reasons, a device that waits for approval or was revoked, a transparency log alarm, or an error. The log keeps one old copy: the job moves `schedule.log` to `schedule.log.1` at the start of a run when the file has reached 256 KiB. A log alarm installs no VPN certificate. Read the file after a missed VPN login. Run `check` to see the full result. `claims.jsonl` keeps every claim and response, as for `check`.
 

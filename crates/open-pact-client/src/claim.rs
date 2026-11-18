@@ -57,10 +57,13 @@ fn open(home: &Home) -> Result<Option<File>> {
 /// so once: the holder is usually the scheduled job.
 pub(crate) async fn lock(home: &Home) -> Result<ClaimLock> {
     lock_for(home, WAIT, || {
-        eprintln!(
-            "Waiting for the scheduled job, which holds {}. It releases the lock when its claim is done.",
-            home.file(LOCK).display()
-        );
+        // An app that follows the steps shows this itself; the CLI prints it.
+        if !crate::json_out::waiting_for_job() {
+            eprintln!(
+                "Waiting for the scheduled job, which holds {}. It releases the lock when its claim is done.",
+                home.file(LOCK).display()
+            );
+        }
     })
     .await
 }
@@ -180,7 +183,7 @@ pub(crate) async fn prepare(
             &enrolment.manifest,
         ));
     }
-    crate::checks::check_supported(&manifest)
+    open_pact_core::check_supported(&manifest)
         .map_err(|e| anyhow::anyhow!("{e}; nothing was run or sent"))?;
     let scan = if !can_scan_repositories {
         None
@@ -387,6 +390,11 @@ impl Prepared {
         &self.compliance
     }
 
+    /// What each check found.
+    pub(crate) fn results(&self) -> &BTreeMap<String, ControlValue> {
+        &self.results
+    }
+
     /// The table of results, and what the repository scan could not read.
     pub(crate) fn print_local_report(&self) {
         device_config::print_table(
@@ -507,7 +515,11 @@ impl Prepared {
     /// Verifies the log, signs the claim, posts it and installs the VPN pair the gateway answers
     /// with. `probe` runs before the first gateway request and again once the claim is ready,
     /// before the first POST; when it returns false, nothing more is sent.
-    pub(crate) async fn send(self, home: &Home, probe: impl AsyncFn() -> bool) -> Result<Outcome> {
+    pub(crate) async fn send<Probe, Probing>(self, home: &Home, probe: Probe) -> Result<Outcome>
+    where
+        Probe: Fn() -> Probing,
+        Probing: Future<Output = bool>,
+    {
         if !probe().await {
             println!("The VPN probe failed before the gateway was contacted. Nothing was sent.");
             return Ok(Outcome::NotSent(NotSent::OffVpn));
@@ -515,7 +527,16 @@ impl Prepared {
         let mut enrolment = self.enrolment.clone();
         let manifest = &self.manifest;
         let os = self.os;
-        home.recover_vpn()?;
+        // A removal that cannot finish must not keep the gateway from hearing of this device:
+        // the claim goes out while the certificate stays blocked.
+        if let Err(error) = home.recover_vpn() {
+            crate::schedule::job_log(
+                home,
+                &format!(
+                    "Could not finish the VPN certificate removal: {error:#}. The claim goes on."
+                ),
+            );
+        }
         let command = crate::client_command(&home.0);
         let http = crate::http_client()?;
         let enforced = crate::enforced_manifest(&http, &enrolment.gateway).await?;

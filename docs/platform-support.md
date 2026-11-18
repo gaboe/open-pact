@@ -1,12 +1,12 @@
 # Platform support
 
-This page lists the built-in controls in `crates/open-pact-client/src/checks/mod.rs`. Each row gives the result type or the source that the client reads. A failed read returns `unknown` unless the table says `n/a`.
+This page lists the built-in controls. The catalog is in `crates/open-pact-core/src/builtins.rs`, and the checks that run them are in `crates/open-pact-client/src/checks/mod.rs`. Each row gives the result type or the source that the client reads. A failed read returns `unknown` unless the table says `n/a`.
 
 | Control | macOS | Windows | Linux | Required privilege |
 | --- | --- | --- | --- | --- |
 | `disk_encryption` | `full`, `none`, or `unknown` from FileVault | `full`, `partial`, `none`, or `unknown` from BitLocker | `full`, `partial`, `none`, or `unknown` from mounted writable, persistent local disks and swap; excludes boot and removable media | Run as the device user. |
 | `firewall` | `on`, `off`, or `unknown` | `on`, `off`, or `unknown` | `on`, `off`, or `unknown` | Run as the device user. |
-| `screen_lock` | `le_5min`, `le_15min`, `gt_15min`, `none`, or `unknown` | `le_5min`, `le_15min`, `gt_15min`, `none`, or `unknown` | `le_5min`, `le_15min`, `gt_15min`, `none`, or `unknown` | Windows SYSTEM reads interactive user profiles. Other checks use the device user. |
+| `screen_lock` | `@1`: `le_5min`, `le_15min`, `gt_15min`, `none`, or `unknown`. `@2`: whole minutes, `none`, or `unknown` | `@1`: `le_5min`, `le_15min`, `gt_15min`, `none`, or `unknown`. `@2`: whole minutes, `none`, or `unknown` | `@1`: `le_5min`, `le_15min`, `gt_15min`, `none`, or `unknown`. `@2`: whole minutes, `none`, or `unknown` | Windows SYSTEM reads interactive user profiles. Other checks use the device user. |
 | `os_supported` | `yes`, `no`, or `unknown` | `yes`, `no`, or `unknown` | `yes`, `no`, or `unknown` | Run as the device user. |
 | `os_patch_age_days` | Integer days or `unknown` | Integer days or `unknown` | Integer days or `unknown` | Windows needs administrator or SYSTEM access. macOS and Linux use the device user. |
 | `os_auto_updates` | Automatic security data and critical updates enabled | Automatic updates enabled and not paused | Enabled and active apt or dnf timer with automatic installation configured | Settings read access. |
@@ -30,7 +30,7 @@ This page lists the built-in controls in `crates/open-pact-client/src/checks/mod
 | `log_cleared` | `n/a` | RFC 3339 UTC time, JSON null, or `unknown` from Security and System logs | `n/a` | Windows needs administrator or SYSTEM access to read both logs. |
 | VPN certificate installation | Supported | Supported; `vpn\current` pointer, flat copies can lag while another program holds them open | Supported | Device user. |
 | Device key protection | `secure_enclave` or `os_permissions` | `tpm` or `os_permissions` | `os_permissions` | Joining user and SYSTEM on Windows. |
-| Claim scheduler | launchd LaunchAgent, every five minutes | Task Scheduler, every five minutes; limited user or SYSTEM | systemd user timer, every five minutes | The signed manifest must define `[schedule]`, and the owner turns the job on with `schedule on`. Windows SYSTEM install and uninstall need an elevated prompt. Linux needs a running user manager. |
+| Claim scheduler | launchd LaunchAgent, wakes every minute | Task Scheduler, wakes every minute; limited user or SYSTEM | systemd user timer, wakes every minute | The signed manifest must define `[schedule]`, and the owner turns the job on with `schedule on`. Windows SYSTEM install and uninstall need an elevated prompt. Linux needs a running user manager. |
 
 When a control returns `n/a`, the client sends `n/a` only if the manifest allows that value. Otherwise, it sends `unknown` when the manifest allows `unknown`. If neither value is allowed, the client omits the result. An omitted required result can cause the gateway to deny the claim.
 
@@ -94,7 +94,7 @@ Linux `web_protection` reads standard package locations for Chrome, Chromium, an
 
 `antimalware_active_threats` remains `unknown`. A ClamAV `FOUND` record does not say whether a later delete, move, or repair resolved the threat. `antimalware_full_scan_age_days` remains `unknown`. A completed `clamscan` log identifies the selected scan scope, which can be one file or a directory. It does not prove a complete device scan. `password_set` remains `unknown`. Standard users cannot read the shadow database, and a locked local password does not exclude other PAM authentication methods.
 
-The Linux detection marker reads the newest system-journal `FOUND` record from `clamonacc` or `clamd`. It uses the journal's trusted process name and microsecond timestamp. The scheduled five-minute poll can send an extra claim when that marker advances. The scheduler retains a detection across failed sends and VPN disconnection. A journal permission warning returns an unknown read and preserves the previous baseline. File-only ClamAV logging has no supported event marker because a line without a trusted timestamp cannot supply a reliable event time. Operators must route ClamAV detections to the readable system journal for this trigger.
+The Linux detection marker reads the newest system-journal `FOUND` record from `clamonacc` or `clamd`. It uses the journal's trusted process name and microsecond timestamp. The scheduled job reads it on each check (every five minutes by default) and can send an extra claim when that marker advances. The scheduler retains a detection across failed sends and VPN disconnection. A journal permission warning returns an unknown read and preserves the previous baseline. File-only ClamAV logging has no supported event marker because a line without a trusted timestamp cannot supply a reliable event time. Operators must route ClamAV detections to the readable system journal for this trigger.
 
 `log_cleared` stays `n/a` on Linux. Journal rotation and vacuuming remove old files without a retained, authoritative last-clear timestamp. An oldest visible entry cannot distinguish administrative clearing from retention or a new installation.
 

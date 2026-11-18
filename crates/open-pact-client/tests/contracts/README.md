@@ -34,7 +34,7 @@ The ordered inputs follow these conventions.
 | Linux account | Current group IDs, then accepted administrative group records. An optional third entry can record an individual sudoers grant that does not change group membership; the current parser does not read that policy. |
 | Linux signature age | CVD header bytes as text. |
 | Linux preboot | `lsblk` inverse-tree output. The current adapter cannot represent `/proc/cmdline` bytes, crypttab contents, or LUKS metadata. |
-| macOS automatic updates | Normally ConfigDataInstall, then CriticalUpdateInstall. Effective OS-install cases provide the raw AutomaticallyInstallMacOSUpdates setting as the first input; the current parser cannot interpret it, so the case records that difference. |
+| macOS automatic updates | Normally ConfigDataInstall, then CriticalUpdateInstall, then AutomaticCheckEnabled. Effective OS-install cases provide the raw AutomaticallyInstallMacOSUpdates setting as the first input; the current parser cannot interpret it, so the case records that difference. |
 | macOS antimalware | Disabled service output, then XProtect service output. |
 | macOS signature age | Installation history, then installed definition version. |
 | macOS browser policy | One JSON browser record per discovered member. Null represents an unreadable member. No members represents a complete empty inventory. |
