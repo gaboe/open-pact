@@ -186,13 +186,14 @@ The SIEM keeps its own copy. Gateway retention does not delete that copy. The ma
 
 ### Event schema version 1
 
-Each JSON event has exactly one top-level key, `open_pact`. Its fields are flat. Reasons and warnings are arrays of gateway-generated strings. All control results use `result_<control id>` so a control cannot replace event metadata. The value keeps its original JSON type, string or integer. Only declared control results that the claim actually supplied are included. Missing results remain absent. No raw logs, public keys, nonce, JWS, certificate request, certificate, source address, or other device data are exported.
+Each JSON event has exactly one top-level key, `open_pact`. Its fields are flat. Reasons and warnings are arrays of gateway-generated strings. All control results use `result_<control id>` so a control cannot replace event metadata. The value keeps its original JSON type, string or integer. Only declared control results that the claim actually supplied are included. Missing results remain absent. No raw logs, public keys, nonce, JWS, certificate request, certificate, source address, or other device data are exported. The invitation note is IT's own text, not device data; IT should write in it only what the SIEM may hold.
 
 | Field under `open_pact` | Type and meaning |
 | --- | --- |
 | `schema_version` | Integer, currently `1`. |
 | `time` | RFC 3339 UTC time from the signed claim. |
 | `device_pseudonym` | String, the enrolled device's pseudonym. |
+| `device_note` | String, the note IT wrote on the invitation the device enrolled with, for example `Laptop, Example Person`, or `null` when the invitation had none. |
 | `manifest_hash` | String, the hash in the signed claim. |
 | `client_version` | String, for example `open-pact-client 0.5.0`. |
 | `os` | `macos`, `windows`, or `linux`. |

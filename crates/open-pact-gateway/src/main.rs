@@ -989,6 +989,13 @@ async fn claim(
         .await
         .map_err(internal)?;
     }
+    let device_note = if enrolled && !oversharing && app.siem.is_some() {
+        devices::note(&mut tx, &claim.device)
+            .await
+            .map_err(internal)?
+    } else {
+        String::new()
+    };
     tx.commit().await.map_err(internal)?;
     if enrolled
         && !oversharing
@@ -997,6 +1004,7 @@ async fn claim(
         exporter.submit(siem::event(
             &consented,
             claim,
+            &device_note,
             &reasons,
             &warnings,
             access_until,

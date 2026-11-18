@@ -312,6 +312,18 @@ pub async fn record_claim(
     Ok(())
 }
 
+/// The note of the invitation this device enrolled with; empty when it has none.
+pub async fn note(conn: &mut PgConnection, device: &Pseudonym) -> anyhow::Result<String> {
+    let note: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT i.note FROM devices d LEFT JOIN invitations i ON i.hash = d.invitation \
+         WHERE d.pseudonym = $1 ORDER BY d.enrolled_at DESC LIMIT 1",
+    )
+    .bind(device.as_str())
+    .fetch_optional(conn)
+    .await?;
+    Ok(note.flatten().unwrap_or_default())
+}
+
 /// One enrolment as `devices list --json` prints it. The last three fields are the gateway's last
 /// claim decision for this enrolment: null and empty until the device sends a claim.
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -607,5 +619,37 @@ mod tests {
                 revoked: 1
             }
         );
+    }
+
+    /// Run with TEST_DATABASE_URL set, as the other database tests.
+    #[tokio::test]
+    #[ignore = "needs TEST_DATABASE_URL"]
+    async fn the_note_comes_from_the_invitation_the_device_used() {
+        let db = crate::testdb::fresh().await;
+        let manifest = format!("sha256:{}", "ab".repeat(32));
+        let named = format!("pseudonym:{}", "01".repeat(32));
+        let plain = format!("pseudonym:{}", "02".repeat(32));
+        crate::testdb::enrolled_device(&db, &named, &manifest).await;
+        crate::testdb::enrolled_device(&db, &plain, &manifest).await;
+        let hash = format!("sha256:{}", "cd".repeat(32));
+        sqlx::query("INSERT INTO invitations (hash, note, expires_at) VALUES ($1, 'Laptop, Example Person', now() + interval '1 day')")
+            .bind(&hash)
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE devices SET invitation = $1 WHERE pseudonym = $2")
+            .bind(&hash)
+            .bind(&named)
+            .execute(&db)
+            .await
+            .unwrap();
+        let mut conn = db.acquire().await.unwrap();
+        let named = Pseudonym::try_from(named).unwrap();
+        let plain = Pseudonym::try_from(plain).unwrap();
+        assert_eq!(
+            note(&mut conn, &named).await.unwrap(),
+            "Laptop, Example Person"
+        );
+        assert_eq!(note(&mut conn, &plain).await.unwrap(), "");
     }
 }
