@@ -100,6 +100,31 @@ sudo dnf install ./open-pact-client-0.7.1-1.x86_64.rpm
 
 Homebrew and Scoop check release SHA-256 hashes. The Linux commands install local files. Verify those packages with the release verification steps below before installation. These tools do not update the client automatically. Run `brew upgrade` or `scoop update open-pact` to update an installed client. For APT or DNF, download and install each new release when you choose to update.
 
+## Install the desktop apps
+
+The release also ships two desktop apps: `open-pact` for the employee whose device sends claims, and `open-pact-admin` for the person who writes the manifest and approves devices. Both apps come in one zip per platform. The client app runs the client itself and can install the command-line client for you.
+
+On macOS, run the installer of a release tag. It installs the latest release into `~/Applications`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/gaboe/open-pact/v0.8.1-rc.3/desktop/scripts/install-desktop.sh | sh
+```
+
+On Windows, use Scoop, or the PowerShell installer when you do not use Scoop. The installer puts the apps in `%LOCALAPPDATA%\open-pact-desktop`:
+
+```powershell
+scoop bucket add gaboe https://github.com/gaboe/scoop-bucket
+scoop install gaboe/open-pact-desktop
+```
+
+```powershell
+irm https://raw.githubusercontent.com/gaboe/open-pact/v0.8.1-rc.3/desktop/scripts/install-desktop.ps1 | iex
+```
+
+"Latest" skips prereleases. To install a prerelease or one fixed version, set `OPEN_PACT_DESKTOP_VERSION` first, for example `OPEN_PACT_DESKTOP_VERSION=0.8.1-rc.3` on macOS or `$env:OPEN_PACT_DESKTOP_VERSION = '0.8.1-rc.3'` on Windows. The Scoop manifest exists only for stable releases. Run the same command again to update.
+
+Both installers check the zip against its line in `SHA256SUMS` before they replace anything. The macOS installer also checks each app's signature. The apps are not notarized by Apple and not Authenticode-signed, so a browser download can be blocked: install with the commands above instead. On Windows, SmartScreen may warn the first time. To also check the Cosign signature of `SHA256SUMS`, run `scripts/verify-client-release.sh` first; it checks the desktop zips too.
+
 ## Verify a release
 
 Client releases include binaries for macOS, Linux, and Windows, plus `.deb` and `.rpm` packages. They also include `NOTICE`, `SHA256SUMS`, and Sigstore bundles for each binary, package, `NOTICE`, and `SHA256SUMS`. Verify a client release with `scripts/verify-client-release.sh v0.7.1`. The script downloads these files from the GitHub release, checks their hashes, and verifies their signatures against the tagged release workflow. It needs GitHub CLI, Cosign, and `sha256sum` or `shasum`. Set `GH_REPO` to check a release from a fork. See the [client release verification procedure](docs/client.md#verify-a-release) to save and install a verified binary or Linux package.
