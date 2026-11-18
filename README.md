@@ -210,11 +210,30 @@ Each JSON event has exactly one top-level key, `open_pact`. Its fields are flat.
 
 TLS sends RFC 5424 messages with facility `local0`, severity `informational`, app name `open-pact`, and message ID `status`. The timestamp and hostname in the syslog header are NILVALUE. The JSON body contains the signed claim time. RFC 5425 octet counting prefixes the UTF-8 byte length of the complete syslog message and one space. File output contains only JSON and a newline, without a syslog header or length prefix.
 
+### Device state events
+
+When IT approves or revokes a device with `devices approve` or `devices revoke`, the gateway CLI sends one `device_state` event, so the SIEM sees the change at once instead of when the last claim ages out. The CLI runs as its own process, for example under `kubectl exec`. It reads the same `GATEWAY_SIEM_SYSLOG_URL`, `GATEWAY_SIEM_CA`, `GATEWAY_SIEM_FILE` and `GATEWAY_SIEM_FILE_MODE` variables as the server, so the pod or shell needs them too. With no sink configured it sends nothing.
+
+The command sends the event only when the state really changes. A repeated `devices revoke` sends nothing. It sends the event after the database change is committed, waits at most 15 seconds, and does not retry or queue. When the event cannot be sent, the state change stands. The command prints `WARNING: ... the SIEM event was not sent` with the reason on stderr and exits 0. A second `devices revoke` does not resend it, because it changes nothing. Add the missing event at the SIEM by hand.
+
+The event has the same top-level key `open_pact` and `schema_version` as a claim event. A claim event has no `event` field.
+
+| Field under `open_pact` | Type and meaning |
+| --- | --- |
+| `schema_version` | Integer, currently `1`. |
+| `event` | String, `device_state`. |
+| `time` | RFC 3339 UTC time of the change. |
+| `device_pseudonym` | String, the pseudonym of the device. |
+| `device_note` | String, the note of the invitation the device enrolled with, or `null` when it had none. |
+| `state` | `approved` or `revoked`. |
+
+The event carries no verdict, reasons or control results. Rule 100507 in the sample rules raises level 8 for `state` `revoked`. Rule 100500 also matches the event at level 3, because it matches `schema_version`.
+
 ### Wazuh receiver
 
 Sample files are in [deploy/wazuh](deploy/wazuh). Terminate TLS with the sample [rsyslog configuration](deploy/wazuh/rsyslog.conf) beside the Wazuh manager. Install the rsyslog GnuTLS module and a receiver certificate. Restrict its TLS port to the gateway at the firewall. This sample authenticates the receiver to the gateway. It does not authenticate the gateway with a client certificate. The receiver writes only JSON message bodies to `/var/log/open-pact/events.jsonl`. Give that file to a Wazuh agent with [agent-localfile.xml](deploy/wazuh/agent-localfile.xml). A gateway on the receiver host can instead write that file directly with `GATEWAY_SIEM_FILE`. Set file permissions, rotation, and retention for the gateway writer and Wazuh reader.
 
-Install [rules.xml](deploy/wazuh/rules.xml) in the manager's local rules directory. Reserve IDs 100500 through 100506 or change them to avoid local conflicts. Wazuh's [JSON decoder](https://documentation.wazuh.com/current/user-manual/ruleset/decoders/json-decoder.html) reads these events and exposes dynamic fields. An optional [decoder.xml](deploy/wazuh/decoder.xml) shows the same JSON plugin for a receiver with a custom decoder chain. Rules match fields, so either JSON decoder can supply them. See the official [decoder syntax](https://documentation.wazuh.com/current/user-manual/ruleset/ruleset-xml-syntax/decoders.html).
+Install [rules.xml](deploy/wazuh/rules.xml) in the manager's local rules directory. Reserve IDs 100500 through 100507 or change them to avoid local conflicts. Wazuh's [JSON decoder](https://documentation.wazuh.com/current/user-manual/ruleset/decoders/json-decoder.html) reads these events and exposes dynamic fields. An optional [decoder.xml](deploy/wazuh/decoder.xml) shows the same JSON plugin for a receiver with a custom decoder chain. Rules match fields, so either JSON decoder can supply them. See the official [decoder syntax](https://documentation.wazuh.com/current/user-manual/ruleset/ruleset-xml-syntax/decoders.html).
 
 The rules alert on deny, numeric `os_patch_age_days > 30`, numeric `antimalware_signature_age_days` over 3 on Windows and Linux and over 10 on macOS, numeric `antimalware_active_threats > 0`, and a present `log_cleared` other than null or `n/a`. These are control IDs, not check names. The manifest must declare these exact IDs and numeric outputs for the numeric rules. The export does not turn bucketed results such as `gt_30d` into numbers. Wazuh can select one matching child rule for an event with several failures; inspect the event's complete fields and reasons.
 
