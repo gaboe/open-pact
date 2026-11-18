@@ -1426,7 +1426,11 @@ async fn admin_devices(db: &PgPool, command: DevicesCommand) -> anyhow::Result<(
     }
     if let Some(state) = applied.changed_to {
         // The change is committed. A SIEM that cannot be reached must not make the command fail.
-        if let Err(error) = announce_state(db, &device, state).await {
+        let manifest = applied
+            .states
+            .first()
+            .map(|(manifest, _)| manifest.as_str());
+        if let Err(error) = announce_state(db, &device, manifest.unwrap_or_default(), state).await {
             eprintln!(
                 "WARNING: {device} is {state}, but the SIEM event was not sent: {error:#}",
                 state = state.as_str()
@@ -1437,12 +1441,17 @@ async fn admin_devices(db: &PgPool, command: DevicesCommand) -> anyhow::Result<(
 }
 
 /// Sends one `device_state` event to the SIEM the server is configured with, if there is one.
-async fn announce_state(db: &PgPool, device: &str, state: devices::State) -> anyhow::Result<()> {
+async fn announce_state(
+    db: &PgPool,
+    device: &str,
+    manifest: &str,
+    state: devices::State,
+) -> anyhow::Result<()> {
     let Some(sink) = siem::OneShot::from_env()? else {
         return Ok(());
     };
     let pseudonym = Pseudonym::try_from(device.to_owned()).map_err(anyhow::Error::msg)?;
-    let note = devices::note(&mut *db.acquire().await?, &pseudonym).await?;
+    let note = devices::note(&mut *db.acquire().await?, &pseudonym, manifest).await?;
     let event = siem::state_event(&pseudonym, &note, state.as_str(), OffsetDateTime::now_utc());
     tokio::task::spawn_blocking(move || sink.send(&event)).await?
 }
