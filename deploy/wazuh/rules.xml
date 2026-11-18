@@ -15,8 +15,15 @@
   </rule>
   <rule id="100503" level="7">
     <if_sid>100500</if_sid>
+    <field name="open_pact.os" type="pcre2">^(?:windows|linux)$</field>
     <field name="open_pact.result_antimalware_signature_age_days" type="pcre2">^(?:[4-9]|[1-9][0-9]+)$</field>
     <description>open-pact antimalware signatures exceed 3 days</description>
+  </rule>
+  <rule id="100506" level="7">
+    <if_sid>100500</if_sid>
+    <field name="open_pact.os" type="pcre2">^macos$</field>
+    <field name="open_pact.result_antimalware_signature_age_days" type="pcre2">^(?:1[1-9]|[2-9][0-9]|[1-9][0-9]{2,})$</field>
+    <description>open-pact macOS XProtect definitions exceed 10 days</description>
   </rule>
   <rule id="100504" level="10">
     <if_sid>100500</if_sid>
