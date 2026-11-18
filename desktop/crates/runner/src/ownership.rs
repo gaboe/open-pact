@@ -306,6 +306,20 @@ pub fn elevated_system_schedule(installed: &Path, home: &Path, profile: &Path) -
     shell_invocation(Platform::Windows, &line)
 }
 
+/// Starts `exe` again with the `runas` verb, which shows the UAC prompt. The wrapper ends with 0
+/// once the process started, and with 1 when the user cancelled the prompt or the launch failed.
+/// It does not wait for the new process.
+pub fn elevated_restart(exe: &Path) -> Invocation {
+    let line = format!(
+        "$ErrorActionPreference = 'Stop'; \
+         try {{ Start-Process -FilePath {exe} -Verb RunAs }} \
+         catch {{ [Console]::Error.WriteLine('The administrator process did not start: ' + $_.Exception.Message); exit 1 }}; \
+         exit 0",
+        exe = powershell_literal(&exe.to_string_lossy()),
+    );
+    shell_invocation(Platform::Windows, &line)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -452,6 +466,20 @@ mod tests {
         assert!(line.contains("if ($null -eq $run -or $null -eq $run.ExitCode)"));
         assert!(line.ends_with("exit $run.ExitCode"));
         assert!(!line.contains('"'));
+    }
+
+    #[test]
+    fn the_restart_starts_the_app_with_the_runas_verb_and_fails_when_it_does_not_start() {
+        let call = elevated_restart(Path::new(r"C:\Users\O'Fictional\open-pact.exe"));
+        assert_eq!(call.program, "powershell");
+        assert_eq!(&call.args[..2], ["-NoProfile", "-Command"]);
+        let expected = concat!(
+            "$ErrorActionPreference = 'Stop'; ",
+            r"try { Start-Process -FilePath 'C:\Users\O''Fictional\open-pact.exe' -Verb RunAs } ",
+            "catch { [Console]::Error.WriteLine('The administrator process did not start: ' + $_.Exception.Message); exit 1 }; ",
+            "exit 0",
+        );
+        assert_eq!(call.args.last().unwrap(), expected);
     }
 
     #[test]

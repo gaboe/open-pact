@@ -102,7 +102,7 @@ The client checks the gateway keys and transparency checkpoint before it display
 
 Before you sign, step 2 of `join` prints the manifest summary and the absolute path of a file that holds the whole text. Open that file and read all of it. The company wrote it; it is the one file that says what is checked, what is sent and when. After an interactive `join` verifies approval, the wizard asks only for your own choices: whether to send claims automatically (only when the manifest defines automatic sending), on Windows whether the job runs as you or as SYSTEM, and the folders that hold your repositories (only when the manifest counts repositories). It then installs the job if you said yes and offers the first claim. You edit no file. If you stop, run `join` again to resume.
 
-On macOS, `join` reuses an existing device key. It creates a Secure Enclave key only when no key exists and creation succeeds. If creation fails, the client warns and uses a software key. Pass `--software-key` to select a software key for a new device. On Windows, an elevated administrator join tries a TPM key. A non-elevated join or an unavailable provider uses a software key. Marker write and key ACL failures stop join. Linux uses software keys. The owner key and the VPN certificate key are software keys on every platform.
+On macOS, `join` reuses an existing device key. It creates a Secure Enclave key only when no key exists and creation succeeds. If creation fails, the client warns and uses a software key. Pass `--software-key` to select a software key for a new device. On Windows, a new join needs an elevated administrator process and tries a TPM key. A non-elevated join stops before it sends anything, unless the home already holds a device key or `--software-key` is set; open PowerShell with Run as administrator and run the same command again. An unavailable provider uses a software key. Marker write and key ACL failures stop join. Linux uses software keys. The owner key and the VPN certificate key are software keys on every platform.
 
 To run a later check after device approval, use:
 
@@ -313,7 +313,7 @@ Every step prints `{"step": 1-6, "title": "...", "state": "started"|"done"|"wait
 - `approved`: IT approved the device, but setup did not finish or the first claim was denied. A denied first claim exits 1; its reasons are in the `detail` of step 6.
 - `done`: setup is complete and the first claim was accepted.
 
-On a failure the last line is `{"error": "..."}`. When the command has no error of its own, the text is the last message it would have printed. Ctrl+C prints `{"error": "interrupted"}` and exits 130. Run `join --json` without the invitation to resume an enrolled device.
+On a failure the last line is `{"error": "..."}`. A failure that an app can act on adds a fixed `"code"`: `"needs_elevation"` means a new Windows join ran without administrator rights and sent nothing. When the command has no error of its own, the text is the last message it would have printed. Ctrl+C prints `{"error": "interrupted"}` and exits 130. Run `join --json` without the invitation to resume an enrolled device.
 
 ### `check --json`
 

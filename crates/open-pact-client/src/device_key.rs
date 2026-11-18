@@ -20,6 +20,42 @@ const TPM_FILE: &str = "device-tpm.key";
 const SOFTWARE_FILE: &str = "device-dev.pem";
 const SECURE_ENCLAVE_FILE: &str = "device-se.key";
 
+/// The code that `join --json` puts on the error line of a [`NeedsElevation`] refusal.
+pub const NEEDS_ELEVATION_CODE: &str = "needs_elevation";
+
+/// A new device on Windows joins from an elevated process, or it would end with a software key and
+/// no SYSTEM job. The refusal comes before the first network request.
+#[derive(Debug)]
+pub struct NeedsElevation;
+
+impl std::fmt::Display for NeedsElevation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "Join on Windows needs an elevated PowerShell, so that the device key goes into the \
+             TPM and the scheduled job runs as SYSTEM. Open PowerShell with Run as administrator \
+             and run the same join command again. Nothing was sent. To join without that, for \
+             testing only, add --software-key.",
+        )
+    }
+}
+
+impl std::error::Error for NeedsElevation {}
+
+/// True when a join must stop: the process is not elevated, the owner did not ask for a software
+/// key, and the home holds no device key yet. A home with a key keeps using it.
+#[cfg(any(windows, test))]
+fn windows_join_needs_elevation(elevated: bool, software_key: bool, has_key: bool) -> bool {
+    !elevated && !software_key && !has_key
+}
+
+/// Whether `home` already holds a device key of any kind.
+#[cfg(any(windows, test))]
+fn holds_key(home: &Path) -> bool {
+    [TPM_FILE, SECURE_ENCLAVE_FILE, SOFTWARE_FILE]
+        .iter()
+        .any(|name| home.join(name).exists())
+}
+
 #[cfg(any(windows, test))]
 #[derive(Debug)]
 pub(super) struct ProviderUnavailable;
@@ -119,6 +155,16 @@ impl DeviceKey {
         let bytes = crate::read_home_file(&home.join(SOFTWARE_FILE))?;
         let pem = std::str::from_utf8(&bytes)?;
         Ok(Self::Software(dev_key::from_pem(pem)?))
+    }
+
+    /// Whether a join with these choices must stop for lack of an elevated process.
+    #[cfg(windows)]
+    pub fn join_needs_elevation(home: &Path, software: bool) -> Result<bool> {
+        Ok(windows_join_needs_elevation(
+            windows_key::is_elevated()?,
+            software,
+            holds_key(home),
+        ))
     }
 
     /// Reuses the existing key. Tries platform hardware for a new key unless `software`.
@@ -281,6 +327,55 @@ mod tests {
             |statement| key.sign(statement),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn only_a_new_device_without_elevation_or_a_software_key_needs_elevation() {
+        for elevated in [false, true] {
+            for software_key in [false, true] {
+                for has_key in [false, true] {
+                    assert_eq!(
+                        windows_join_needs_elevation(elevated, software_key, has_key),
+                        !elevated && !software_key && !has_key,
+                        "elevated {elevated}, software key {software_key}, has key {has_key}"
+                    );
+                }
+            }
+        }
+        assert!(windows_join_needs_elevation(false, false, false));
+        assert!(!windows_join_needs_elevation(false, false, true));
+        assert!(!windows_join_needs_elevation(false, true, false));
+        assert!(!windows_join_needs_elevation(true, false, false));
+    }
+
+    #[test]
+    fn a_home_holds_a_key_when_any_key_file_exists() {
+        for name in [TPM_FILE, SECURE_ENCLAVE_FILE, SOFTWARE_FILE] {
+            let home = tempfile::tempdir().unwrap();
+            assert!(!holds_key(home.path()), "{name}");
+            std::fs::write(home.path().join(name), b"x").unwrap();
+            assert!(holds_key(home.path()), "{name}");
+        }
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("owner-dev.pem"), b"x").unwrap();
+        assert!(!holds_key(home.path()), "the owner key is not a device key");
+    }
+
+    #[test]
+    fn the_refusal_says_what_to_do_and_that_nothing_was_sent() {
+        let text = NeedsElevation.to_string();
+        for part in [
+            "elevated PowerShell",
+            "Run as administrator",
+            "same join command again",
+            "TPM",
+            "SYSTEM",
+            "Nothing was sent",
+            "--software-key",
+            "testing only",
+        ] {
+            assert!(text.contains(part), "{part}: {text}");
+        }
     }
 
     #[test]

@@ -300,6 +300,19 @@ pub fn install_system_job(
     result
 }
 
+/// Starts this app again through the UAC prompt, for a join that needs administrator rights. The
+/// caller quits this instance when it gets `Ok`. A cancelled prompt is an error with a plain text.
+pub fn restart_elevated(runner: &Runner, exe: &Path) -> Result<(), String> {
+    let call = ownership::elevated_restart(exe);
+    runner
+        .with_timeout(Duration::from_secs(300))
+        .run(Path::new(&call.program), &call.args)
+        .map(|_| ())
+        .map_err(|error| {
+            format!("The restart as administrator was cancelled or did not start: {error}")
+        })
+}
+
 /// The profile whose repositories the SYSTEM job scans: the one of the user who runs the app.
 fn system_profile(variable: Option<std::ffi::OsString>) -> Result<PathBuf, String> {
     variable

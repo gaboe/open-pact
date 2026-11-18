@@ -2,7 +2,7 @@
 
 Verifiable security checks on personally owned devices, without blanket monitoring. The owner signs the company's manifest once. Each time the device connects, the client sends one small signed claim to the company gateway, and a compliant device gets a short-lived VPN client certificate. Read [PAPER.md](PAPER.md) for the design.
 
-Status: proof of concept, not for production. On macOS, `join` tries a Secure Enclave device key. On Windows, an elevated administrator join tries a TPM device key. These keys report trust level L1. If the Windows provider is unavailable, if macOS hardware key creation fails, on Linux, or with `join --software-key`, the device key is a software key with trust level L0. The gateway has no attestation, so it counts every claim as L0 whatever the client reports. The gateway enforces [examples/manifest.toml](examples/manifest.toml), or the file in `MANIFEST_PATH`.
+Status: proof of concept, not for production. On macOS, `join` tries a Secure Enclave device key. On Windows, a new join needs an elevated administrator process and tries a TPM device key. These keys report trust level L1. A non-elevated Windows join stops before it sends anything, unless it has `--software-key` or the home already holds a key. If the Windows provider is unavailable, if macOS hardware key creation fails, on Linux, or with `join --software-key`, the device key is a software key with trust level L0. The gateway has no attestation, so it counts every claim as L0 whatever the client reports. The gateway enforces [examples/manifest.toml](examples/manifest.toml), or the file in `MANIFEST_PATH`.
 
 ## Layout
 
@@ -532,7 +532,7 @@ Limited Windows operations leave orphaned protected state and the shared binary 
 
 ### Windows device keys
 
-On Windows, TPM protection requires an elevated administrator join. A non-elevated join creates a software key and reports `key_protection = os_permissions`. Existing keys stay in use.
+On Windows, a new join needs an elevated administrator process, so that the device key goes into the TPM and the scheduled job can run as SYSTEM. A non-elevated join of a home with no device key stops before any request, with an error that says to run the same command in PowerShell as administrator. `--software-key` skips the check, for testing: it creates a software key and reports `key_protection = os_permissions`. Existing keys stay in use, so a home that already has a key joins and resumes without elevation.
 
 An elevated administrator Windows join tries a non-exportable ECDSA P-256 key in the TPM through the
 Microsoft Platform Crypto Provider. The private key does not leave the TPM.
