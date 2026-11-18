@@ -63,6 +63,60 @@ class ImageVersionGateTest(unittest.TestCase):
             self.assertIn('"$GITHUB_REF_NAME"', job, name)
 
 
+def needs(job: str) -> list[str]:
+    match = re.search(r"^    needs: (.+)$", job, flags=re.M)
+    if not match:
+        return []
+    return re.findall(r"[a-z][a-z0-9-]*", match.group(1))
+
+
+class SigningJobTest(unittest.TestCase):
+    """Only a minimal job may mint the Cosign signature that the updater trusts."""
+
+    def setUp(self):
+        self.text = (WORKFLOWS / "client-release.yml").read_text()
+        self.jobs = jobs("client-release.yml")
+
+    def test_only_the_sign_job_can_request_an_identity_token(self):
+        self.assertNotIn("id-token", self.text.split("\njobs:\n", 1)[0])
+        for name, job in self.jobs.items():
+            if name == "sign":
+                self.assertEqual(re.findall(r"id-token: (\w+)", job), ["write"])
+            else:
+                self.assertNotIn("id-token", job, name)
+
+    def test_only_the_sign_job_runs_cosign(self):
+        for name, job in self.jobs.items():
+            self.assertEqual("cosign sign-blob" in job, name == "sign", name)
+        self.assertEqual(self.text.count("cosign sign-blob"), 2)
+
+    def test_every_action_of_the_sign_job_is_pinned_by_commit_sha(self):
+        uses = re.findall(r"^\s+- uses: (\S+)", self.jobs["sign"], flags=re.M)
+        self.assertTrue(uses)
+        for action in uses:
+            self.assertRegex(action, r"^[\w.-]+/[\w.-]+@[0-9a-f]{40}$")
+        self.assertEqual(
+            sorted(a.split("@")[0] for a in uses),
+            [
+                "actions/download-artifact",
+                "actions/upload-artifact",
+                "sigstore/cosign-installer",
+            ],
+        )
+
+    def test_the_sign_job_pins_the_cosign_release_and_keeps_no_other_step_type(self):
+        sign = self.jobs["sign"]
+        self.assertRegex(sign, r"cosign-release: v\d+\.\d+\.\d+\n")
+        self.assertNotIn("actions/checkout", sign)
+        self.assertEqual(needs(sign), ["package"])
+
+    def test_the_release_job_waits_for_the_signatures_and_holds_no_signing_right(self):
+        release = self.jobs["release"]
+        self.assertIn("sign", needs(release))
+        self.assertIn("name: release-signatures", release)
+        self.assertIn("contents: write", release)
+
+
 MOCK_GH = """#!/usr/bin/env bash
 set -euo pipefail
 echo "$*" >> "$MOCK_DIR/calls"
