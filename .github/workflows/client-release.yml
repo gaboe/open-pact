@@ -61,7 +61,7 @@ jobs:
   desktop-macos:
     name: Desktop apps for macOS
     needs: build
-    runs-on: macos-14
+    runs-on: macos-latest
     defaults:
       run:
         working-directory: desktop
