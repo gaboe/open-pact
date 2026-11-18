@@ -271,17 +271,21 @@ impl Sink {
     }
 }
 
+// One write per line: the file is opened in append mode, and the CLI's device_state events can
+// share it with the server.
 fn append_json_line(file: &mut (impl Read + Write + Seek), json: &[u8]) -> std::io::Result<()> {
+    let mut line = Vec::with_capacity(json.len() + 2);
     if file.seek(SeekFrom::End(0))? > 0 {
         file.seek(SeekFrom::End(-1))?;
         let mut last = [0];
         file.read_exact(&mut last)?;
         if last[0] != b'\n' {
-            file.write_all(b"\n")?;
+            line.push(b'\n');
         }
     }
-    file.write_all(json)?;
-    file.write_all(b"\n")
+    line.extend_from_slice(json);
+    line.push(b'\n');
+    file.write_all(&line)
 }
 
 #[derive(Default)]
@@ -439,7 +443,10 @@ fn sink_from_env() -> anyhow::Result<Option<Sink>> {
     Ok(Some(match (url, file) {
         (None, None) => return Ok(None),
         (Some(_), Some(_)) => bail!("configure only one SIEM sink"),
-        (Some(url), None) => Sink::tls(&url, &std::env::var("GATEWAY_SIEM_CA")?)?,
+        (Some(url), None) => Sink::tls(
+            &url,
+            &std::env::var("GATEWAY_SIEM_CA").context("GATEWAY_SIEM_CA")?,
+        )?,
         (None, Some(path)) => {
             let mode = std::env::var("GATEWAY_SIEM_FILE_MODE")
                 .ok()
