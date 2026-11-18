@@ -4871,7 +4871,7 @@ dependencies = [
 
 [[package]]
 name = "open-pact-admin"
-version = "0.8.1-rc.1"
+version = "0.8.1-rc.2"
 dependencies = [
  "gpui-component",
  "gpui-kit-assets",
@@ -4887,7 +4887,7 @@ dependencies = [
 
 [[package]]
 name = "open-pact-app"
-version = "0.8.1-rc.1"
+version = "0.8.1-rc.2"
 dependencies = [
  "gpui-component",
  "gpui-kit-assets",
@@ -4903,7 +4903,7 @@ dependencies = [
 
 [[package]]
 name = "open-pact-client"
-version = "0.8.1-rc.1"
+version = "0.8.1-rc.2"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -4915,6 +4915,7 @@ dependencies = [
  "open-pact-core",
  "rcgen",
  "reqwest",
+ "ring",
  "security-framework",
  "security-framework-sys",
  "semver",
@@ -4930,7 +4931,7 @@ dependencies = [
 
 [[package]]
 name = "open-pact-core"
-version = "0.8.1-rc.1"
+version = "0.8.1-rc.2"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -6017,7 +6018,7 @@ dependencies = [
 
 [[package]]
 name = "runner"
-version = "0.8.1-rc.1"
+version = "0.8.1-rc.2"
 dependencies = [
  "chrono",
  "dirs 6.0.0",
