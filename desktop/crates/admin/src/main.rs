@@ -9,6 +9,7 @@ use gpui_component::{
     Disableable, Sizable,
     button::{Button, ButtonVariants},
     input::{EditorState, Input, InputEvent, InputState},
+    resizable::{ResizableState, h_resizable, resizable_panel},
     select::{Select, SelectEvent, SelectState},
 };
 use gpui_kit_assets::IconName;
@@ -154,6 +155,8 @@ struct AppView {
     status: Option<String>,
     busy: bool,
     terminal: bool,
+    /// The width the user dragged the left menu to. It lives here, so page switches keep it.
+    layout: Entity<ResizableState>,
     device_filter: String,
     change_note: Entity<InputState>,
     invitation_note: Entity<InputState>,
@@ -257,6 +260,7 @@ impl AppView {
             status: None,
             busy: false,
             terminal: false,
+            layout: cx.new(|_| ResizableState::default()),
             device_filter: "approved".into(),
             change_note: cx
                 .new(|cx| InputState::new(window, cx).default_value("Update open-pact manifest")),
@@ -1355,7 +1359,7 @@ impl AppView {
 }
 
 impl Render for AppView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let _ = (
             &self.editor_subscription,
             &self.setup_subscriptions,
@@ -1374,9 +1378,7 @@ impl Render for AppView {
         let sidebar = div()
             .flex()
             .flex_col()
-            .flex_none()
-            .w(px(200.))
-            .h_full()
+            .size_full()
             .gap_0p5()
             .px(px(10.))
             .py_4()
@@ -1453,7 +1455,20 @@ impl Render for AppView {
                     start_update(&mut this.update, cx, runner, |view| &mut view.update);
                 }),
             ))
-            .child(div().flex().flex_1().min_h_0().child(sidebar).child(main))
+            .child(
+                div().flex().flex_1().min_h_0().child(
+                    h_resizable("admin-layout")
+                        .with_state(&self.layout)
+                        .child(
+                            resizable_panel()
+                                .size(SIDEBAR_WIDTH)
+                                .size_range(SIDEBAR_MIN..sidebar_max(window))
+                                .fixed()
+                                .child(sidebar),
+                        )
+                        .child(resizable_panel().child(main)),
+                ),
+            )
             .child(terminal_drawer(
                 self.terminal,
                 &self.admin.runner,

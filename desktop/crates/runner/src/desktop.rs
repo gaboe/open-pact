@@ -46,6 +46,20 @@ pub fn mono() -> &'static str {
     }
 }
 
+/// The width the left menu starts with, and the narrowest it can be dragged to, so its labels
+/// stay readable.
+pub const SIDEBAR_WIDTH: Pixels = px(200.);
+pub const SIDEBAR_MIN: Pixels = px(160.);
+
+/// The widest the left menu can be dragged to: 40% of the window, never below its minimum.
+pub fn sidebar_max(window: &Window) -> Pixels {
+    sidebar_max_for(window.viewport_size().width)
+}
+
+fn sidebar_max_for(window_width: Pixels) -> Pixels {
+    (window_width * 0.4).max(SIDEBAR_MIN)
+}
+
 pub fn column() -> Div {
     div().flex().flex_col().gap_3()
 }
@@ -704,4 +718,22 @@ pub fn snapshot<V: Render + 'static>(
         .expect("save screenshot");
     cx.update_window(handle.into(), |_, window, _| window.remove_window())
         .expect("close snapshot window");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SIDEBAR_MIN, SIDEBAR_WIDTH, sidebar_max_for};
+    use gpui::px;
+
+    #[test]
+    fn the_menu_may_take_at_most_two_fifths_of_the_window() {
+        assert_eq!(sidebar_max_for(px(1500.)), px(600.));
+        assert_eq!(sidebar_max_for(px(1000.)), px(400.));
+    }
+
+    #[test]
+    fn the_menu_keeps_its_minimum_in_a_narrow_window() {
+        assert_eq!(sidebar_max_for(px(300.)), SIDEBAR_MIN);
+        assert!(SIDEBAR_WIDTH >= SIDEBAR_MIN);
+    }
 }
