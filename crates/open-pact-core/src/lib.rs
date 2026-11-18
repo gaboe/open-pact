@@ -25,8 +25,8 @@ pub use crypto::{
 };
 pub use enrol::{EnrolRequest, enrol_statement};
 pub use evaluate::{
-    Decision, Evaluation, FirstFailures, Grace, Reason, control_compliance, evaluate,
-    evaluate_under, verified_trust_level,
+    ControlStanding, Decision, Evaluation, FirstFailures, Grace, Reason, control_compliance,
+    evaluate, evaluate_under, verified_trust_level,
 };
 pub use invitation::{InvalidInvitation, Invitation, InvitationCode, InvitationHash};
 pub use lease::vpn_lease;

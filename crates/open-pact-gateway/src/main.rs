@@ -910,6 +910,7 @@ async fn claim(
 
     let Evaluation {
         decision,
+        controls,
         first_failures,
     } = evaluate_under(&consented, &app.manifest, claim, now, &first_failures);
     let oversharing = matches!(&decision, Decision::Deny { reasons } if reasons.iter().any(Reason::breaks_disclosure_contract));
@@ -1009,6 +1010,7 @@ async fn claim(
             &reasons,
             &warnings,
             access_until,
+            &controls,
         ));
     }
     if !reasons.is_empty() {
