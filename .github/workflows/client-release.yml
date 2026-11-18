@@ -48,6 +48,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install --yes musl-tools
       - name: Build client
         run: cargo build --locked --release --package open-pact-client --target ${{ matrix.target }}
+      - name: Check the Windows client imports no Visual C++ runtime
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        run: python scripts/packaging/check-windows-imports.py "target/${{ matrix.target }}/release/open-pact-client.exe"
       - name: Name release binary
         shell: bash
         run: cp "target/${{ matrix.target }}/release/open-pact-client${{ matrix.target == 'x86_64-pc-windows-msvc' && '.exe' || '' }}" "${{ matrix.binary }}"
