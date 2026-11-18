@@ -35,7 +35,6 @@ pub fn event(
         "schema_version": 1,
         "time": open_pact_core::timestamp::rfc3339_auto(claim.time),
         "device_pseudonym": claim.device,
-        "device_note": (!device_note.is_empty()).then_some(device_note),
         "manifest_hash": claim.manifest,
         "client_version": claim.client,
         "os": claim.os,
@@ -46,6 +45,9 @@ pub fn event(
         "warnings": warnings,
         "access_until": access_until.map(open_pact_core::timestamp::rfc3339_secs),
     });
+    if !device_note.is_empty() {
+        body["device_note"] = json!(device_note);
+    }
     for control in &manifest.body().controls {
         if let Some(value) = claim.results.get(&control.id) {
             body[format!("result_{}", control.id)] = json!(value);
@@ -479,7 +481,7 @@ mod tests {
         let named = event(&manifest, &claim, "Laptop, Example Person", &[], &[], None);
         assert_eq!(named["open_pact"]["device_note"], "Laptop, Example Person");
         let unnamed = event(&manifest, &claim, "", &[], &[], None);
-        assert_eq!(unnamed["open_pact"]["device_note"], Value::Null);
+        assert!(unnamed["open_pact"].get("device_note").is_none());
     }
 
     #[test]

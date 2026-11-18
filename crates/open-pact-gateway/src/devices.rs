@@ -312,13 +312,19 @@ pub async fn record_claim(
     Ok(())
 }
 
-/// The note of the invitation this device enrolled with; empty when it has none.
-pub async fn note(conn: &mut PgConnection, device: &Pseudonym) -> anyhow::Result<String> {
+/// The note of the invitation this device enrolled with under `manifest_hash`; empty when it has
+/// none.
+pub async fn note(
+    conn: &mut PgConnection,
+    device: &Pseudonym,
+    manifest_hash: &str,
+) -> anyhow::Result<String> {
     let note: Option<Option<String>> = sqlx::query_scalar(
         "SELECT i.note FROM devices d LEFT JOIN invitations i ON i.hash = d.invitation \
-         WHERE d.pseudonym = $1 ORDER BY d.enrolled_at DESC LIMIT 1",
+         WHERE d.pseudonym = $1 AND d.manifest_hash = $2 ORDER BY d.enrolled_at DESC LIMIT 1",
     )
     .bind(device.as_str())
+    .bind(manifest_hash)
     .fetch_optional(conn)
     .await?;
     Ok(note.flatten().unwrap_or_default())
@@ -647,9 +653,11 @@ mod tests {
         let named = Pseudonym::try_from(named).unwrap();
         let plain = Pseudonym::try_from(plain).unwrap();
         assert_eq!(
-            note(&mut conn, &named).await.unwrap(),
+            note(&mut conn, &named, &manifest).await.unwrap(),
             "Laptop, Example Person"
         );
-        assert_eq!(note(&mut conn, &plain).await.unwrap(), "");
+        assert_eq!(note(&mut conn, &plain, &manifest).await.unwrap(), "");
+        let other = format!("sha256:{}", "ef".repeat(32));
+        assert_eq!(note(&mut conn, &named, &other).await.unwrap(), "");
     }
 }

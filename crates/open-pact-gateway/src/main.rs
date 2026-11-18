@@ -71,7 +71,8 @@ enum Command {
         /// How long the invitation stays valid: 30m, 72h, 7d (at most 30d)
         #[arg(long, default_value = "72h", value_parser = invitations::parse_ttl)]
         ttl: time::Duration,
-        /// Who the invitation is for. Stays in the gateway database, never in the log
+        /// Who the invitation is for. Stays in the gateway database and is sent in SIEM events
+        /// when a SIEM sink is configured. It is never in the transparency log
         #[arg(long, default_value = "")]
         note: String,
         /// The gateway URL the owner's client connects to
@@ -990,7 +991,7 @@ async fn claim(
         .map_err(internal)?;
     }
     let device_note = if enrolled && !oversharing && app.siem.is_some() {
-        devices::note(&mut tx, &claim.device)
+        devices::note(&mut tx, &claim.device, manifest_hash)
             .await
             .map_err(internal)?
     } else {
