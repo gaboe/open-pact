@@ -242,12 +242,23 @@ pub fn denied_check() -> ClaimReport {
         sent_at: "2026-11-16T11:48:00Z".into(),
         accepted: false,
         warnings: Vec::new(),
-        reasons: vec!["Password is 4 characters, 10 needed".into()],
-        controls: vec![ControlReport {
-            id: "password_min_length".into(),
-            value: ControlValue::Integer(4),
-            ok: Some(false),
-        }],
+        reasons: vec![
+            "client must be \"open-pact-client <major>.<minor>.<patch>\"".into(),
+            "antimalware_signature_age_days = 6, <= 3 required, grace 1d ended".into(),
+            "password_min_length = 4, >= 10 required, grace 1d ended".into(),
+        ],
+        controls: vec![
+            ControlReport {
+                id: "password_min_length".into(),
+                value: ControlValue::Integer(4),
+                ok: Some(false),
+            },
+            ControlReport {
+                id: "antimalware_signature_age_days".into(),
+                value: ControlValue::Integer(6),
+                ok: Some(false),
+            },
+        ],
     }
 }
 
