@@ -11,13 +11,13 @@ use time::{Duration, OffsetDateTime};
 
 pub fn headline(status: &Report) -> Headline {
     let last = status.last_claim.as_ref().map(|claim| {
-        format!(
-            "Last result {}, {}.",
-            readable_local(&claim.response_at),
-            claim.response
-        )
+        let at = readable_local(&claim.response_at);
+        match claim.response.as_str() {
+            "denied" => format!("The company denied access on {at}."),
+            "accepted" => format!("The company accepted the last check on {at}."),
+            other => format!("Last result {at}, {other}."),
+        }
     });
-    let unchecked = status.current_compliance.starts_with("unknown");
     // A VPN probe that failed is not something to fix on this device.
     let off_vpn = status.issues.iter().any(is_vpn_probe);
     let count = status
@@ -36,15 +36,17 @@ pub fn headline(status: &Report) -> Headline {
             heading: match (count, off_vpn) {
                 (0, true) => "Not on the company VPN".into(),
                 (0, false) => "Action needed".into(),
-                (1, false) => "Fix 1 thing".into(),
-                (n, false) => format!("Fix {n} things"),
-                (1, true) => "Fix 1 thing · not on VPN".into(),
-                (n, true) => format!("Fix {n} things · not on VPN"),
+                (1, _) => "Fix 1 thing".into(),
+                (n, _) => format!("Fix {n} things"),
             },
+            // What happened, what to do, then why the next check may not arrive.
             detail: [
                 last,
-                unchecked.then(|| "Not checked again since then.".into()),
-                Some("After a fix, check again.".into()),
+                (count > 0 || !off_vpn)
+                    .then(|| "Fix the items below, then press Check now.".into()),
+                off_vpn.then(|| {
+                    "Connect the company VPN, so that the next check reaches the company.".into()
+                }),
             ]
             .into_iter()
             .flatten()
@@ -359,7 +361,8 @@ mod tests {
         let action = headline(&report(Verdict::ActionNeeded, 2));
         assert_eq!(action.heading, "Fix 2 things");
         assert_eq!(action.tone, Tone::Warn);
-        assert!(action.detail.contains("Not checked again since then."));
+        assert!(action.detail.contains("then press Check now."));
+        assert!(!action.detail.contains("VPN"));
         assert_eq!(
             headline(&report(Verdict::ActionNeeded, 1)).heading,
             "Fix 1 thing"
@@ -538,13 +541,21 @@ mod tests {
             "The signed VPN probe failed.",
             Some("open-pact-client check"),
         ));
-        assert_eq!(headline(&shown).heading, "Fix 2 things · not on VPN");
+        let both = headline(&shown);
+        assert_eq!(both.heading, "Fix 2 things");
+        assert!(both.detail.contains("then press Check now."));
+        assert!(
+            both.detail
+                .ends_with("so that the next check reaches the company.")
+        );
         shown.issues.truncate(1);
         shown.issues.remove(0);
         shown.issues.push(issue(
             "The signed VPN probe failed.",
             Some("open-pact-client check"),
         ));
-        assert_eq!(headline(&shown).heading, "Not on the company VPN");
+        let vpn = headline(&shown);
+        assert_eq!(vpn.heading, "Not on the company VPN");
+        assert!(!vpn.detail.contains("Check now"));
     }
 }
