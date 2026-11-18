@@ -551,10 +551,7 @@ impl Home {
     fn new(dir: Option<PathBuf>) -> Result<Home> {
         match dir {
             Some(dir) => Ok(Home(dir)),
-            None => {
-                let home = std::env::var_os("HOME").context("HOME is not set")?;
-                Ok(Home(PathBuf::from(home).join(".config/open-pact")))
-            }
+            None => Ok(Home(default_home_dir(user_profile())?)),
         }
     }
 
@@ -1646,6 +1643,16 @@ fn write_temporary(
         let _ = std::fs::remove_file(&temporary);
     }
     result
+}
+
+/// The client's folder inside the user's profile: `.config/open-pact`.
+fn default_home_dir(profile: Option<PathBuf>) -> Result<PathBuf> {
+    let profile = profile.context(if cfg!(windows) {
+        "USERPROFILE is not set"
+    } else {
+        "HOME is not set"
+    })?;
+    Ok(profile.join(".config/open-pact"))
 }
 
 /// The folder of the user's own profile, where `~` points.
@@ -4917,6 +4924,49 @@ pub async fn catch_panic(future: impl Future<Output = Result<ExitCode>>) -> Resu
 mod tests {
     use super::*;
     use crate::device_config::DeviceConfig;
+
+    #[test]
+    fn default_home_is_the_config_folder_of_the_profile() {
+        let profile = PathBuf::from(r"C:\Users\example");
+        assert_eq!(
+            default_home_dir(Some(profile.clone())).unwrap(),
+            profile.join(".config").join("open-pact")
+        );
+        assert!(default_home_dir(None).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn default_home_uses_userprofile_when_home_is_unset() {
+        const CHILD: &str = "OPEN_PACT_TEST_DEFAULT_HOME_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            assert!(std::env::var_os("HOME").is_none());
+            assert_eq!(
+                Home::new(None).unwrap().0,
+                PathBuf::from(r"C:\Users\example")
+                    .join(".config")
+                    .join("open-pact")
+            );
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::default_home_uses_userprofile_when_home_is_unset",
+                "--nocapture",
+            ])
+            .env_remove("HOME")
+            .env("USERPROFILE", r"C:\Users\example")
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[test]
     fn confirmation_reprompts_until_it_gets_a_valid_yes_or_no() {

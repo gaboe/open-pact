@@ -20,6 +20,8 @@ jobs:
           targets: x86_64-pc-windows-msvc
       - name: Build client
         run: cargo build --locked --release --package open-pact-client --target x86_64-pc-windows-msvc
+      - name: Check the Windows client imports no Visual C++ runtime
+        run: python scripts/packaging/check-windows-imports.py target/x86_64-pc-windows-msvc/release/open-pact-client.exe
       - name: Install Scoop from a local manifest
         shell: pwsh
         run: |
