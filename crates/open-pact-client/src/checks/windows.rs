@@ -1059,7 +1059,7 @@ mod tests {
         assert_eq!(parse_bitlocker("2"), "none");
         assert_eq!(parse_bitlocker("3"), "partial");
         assert_eq!(parse_bitlocker("4"), "partial");
-        assert_eq!(parse_bitlocker("5"), "partial");
+        assert_eq!(parse_bitlocker("5"), "none");
         assert_eq!(parse_bitlocker("6"), "unknown");
         assert_eq!(parse_bitlocker("7"), "none");
         assert_eq!(parse_bitlocker("8"), "partial");

@@ -123,6 +123,61 @@
       "difference": "Collector uses undocumented Shell numbers instead of conversion and protection status"
     },
     {
+      "name": "measured-shell-1-protection-on",
+      "os": "windows",
+      "input": [
+        "1"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "full",
+      "known_diff": null
+    },
+    {
+      "name": "measured-shell-2-no-encryption",
+      "os": "windows",
+      "input": [
+        "2"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "none",
+      "known_diff": null
+    },
+    {
+      "name": "measured-shell-5-protectors-off",
+      "os": "windows",
+      "input": [
+        "5"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "none",
+      "known_diff": null
+    },
+    {
+      "name": "measured-shell-6-locked",
+      "os": "windows",
+      "input": [
+        "6"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "measured-shell-0-standard-user",
+      "os": "windows",
+      "input": [
+        "0"
+      ],
+      "code": 0,
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
       "name": "missing-source",
       "os": "windows",
       "input": [
