@@ -76,7 +76,7 @@ id = "antimalware_signature_age_days"
 source = "company_policy"
 check = "builtin:antimalware_signature_age_days@1"
 output = { integer = { min = 0, max = 3650 } }
-required = { macos = { max = 3 }, windows = { max = 3 }, linux = { max = 3 } }
+required = { macos = { max = 10 }, windows = { max = 3 }, linux = { max = 3 } }
 grace = "1d"
 
 [[control]]
