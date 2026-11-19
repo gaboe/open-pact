@@ -189,12 +189,34 @@ try {
             function Get-WindowsPackage { return [pscustomobject]@{PackageName=$unrelated;PackageState='Installed';InstallTime=$date} }
             Assert (((Tokens @(Section 'patch_date')).patch_date) -eq '') "Unrelated package accepted: $unrelated"
         }
+        function Get-ItemProperty { return [pscustomobject]@{CurrentBuild='26100';UBR=1} }
         foreach ($state in @('Staged','InstallPending','UninstallPending','NotPresent')) {
             function Get-WindowsPackage { return [pscustomobject]@{PackageName='Package_for_RollupFix~31bf3856ad364e35~amd64~~26100.33650.1.0';PackageState=$state;InstallTime=$date} }
             Assert (((Tokens @(Section 'patch_date')).patch_date) -eq '') "Unsuccessful package accepted: $state"
         }
         function Get-WindowsPackage { return [pscustomobject]@{PackageName='Package_for_RollupFix~31bf3856ad364e35~amd64~~26100.33650.1.0';PackageState='Installed';InstallTime=$null} }
         Assert (((Tokens @(Section 'patch_date')).patch_date) -eq '') 'Missing timestamp accepted'
+    }
+    Case '1 running build package that awaits a restart gives the patch date' {
+        $old = [DateTime]::UtcNow.AddDays(-20)
+        $new = [DateTime]::UtcNow.AddDays(-1)
+        function Get-ItemProperty { return [pscustomobject]@{CurrentBuild='26100';UBR=9711} }
+        function Get-WindowsPackage {
+            return @(
+                [pscustomobject]@{PackageName='Package_for_RollupFix~31bf3856ad364e35~amd64~~26100.9711.1.0';PackageState='UninstallPending';InstallTime=$old},
+                [pscustomobject]@{PackageName='Package_for_RollupFix~31bf3856ad364e35~amd64~~26100.9974.1.0';PackageState='InstallPending';InstallTime=$new}
+            )
+        }
+        $actual = (Tokens @(Section 'patch_date')).patch_date
+        Assert ($actual -eq $old.ToString('yyyy-MM-dd')) "Expected the running build date, got $actual"
+    }
+    Case '1 pending newer build alone and a removed running build stay unknown' {
+        $date = [DateTime]::UtcNow.AddDays(-1)
+        function Get-ItemProperty { return [pscustomobject]@{CurrentBuild='26100';UBR=9711} }
+        function Get-WindowsPackage { return [pscustomobject]@{PackageName='Package_for_RollupFix~31bf3856ad364e35~amd64~~26100.9974.1.0';PackageState='InstallPending';InstallTime=$date} }
+        Assert (((Tokens @(Section 'patch_date')).patch_date) -eq '') 'Pending newer build was accepted'
+        function Get-WindowsPackage { return [pscustomobject]@{PackageName='Package_for_RollupFix~31bf3856ad364e35~amd64~~26100.9711.1.0';PackageState='NotPresent';InstallTime=$date} }
+        Assert (((Tokens @(Section 'patch_date')).patch_date) -eq '') 'NotPresent running build was accepted'
     }
     Case '3 screen-saver GPO overrides local enabled values' {
         $identity = [pscustomobject]@{IsSystem=$false}

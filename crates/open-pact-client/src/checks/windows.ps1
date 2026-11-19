@@ -93,9 +93,20 @@ RunSection {
 }
 RunSection {
     try {
-        $packages = @(Get-WindowsPackage -Online -ErrorAction Stop | Where-Object {
-            $_.PackageName -match '^Package_for_RollupFix~31bf3856ad364e35~(amd64|arm64|x86)~~[0-9.]+$' -and $_.PackageState -eq 'Installed'
+        $rollups = @(Get-WindowsPackage -Online -ErrorAction Stop | Where-Object {
+            $_.PackageName -match '^Package_for_RollupFix~31bf3856ad364e35~(amd64|arm64|x86)~~[0-9.]+$'
         })
+        # Between Patch Tuesday and the restart, the running build's package is UninstallPending and
+        # the new one is InstallPending, so no package is Installed. The running build still decides.
+        $packages = @()
+        try {
+            $current = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+            if ([string]$current.CurrentBuild -match '^[0-9]+$' -and [string]$current.UBR -match '^[0-9]+$') {
+                $prefix = '~~{0}.{1}.' -f $current.CurrentBuild, $current.UBR
+                $packages = @($rollups | Where-Object { $_.PackageState -ne 'NotPresent' -and $_.PackageName.Contains($prefix) })
+            }
+        } catch { $packages = @() }
+        if ($packages.Count -eq 0) { $packages = @($rollups | Where-Object { $_.PackageState -eq 'Installed' }) }
         $selected = $null
         $now = [DateTime]::UtcNow
         foreach ($package in $packages) {
