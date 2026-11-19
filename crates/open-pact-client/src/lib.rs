@@ -683,7 +683,7 @@ impl Home {
     }
 
     fn vpn_removal_pending(&self) -> bool {
-        std::fs::symlink_metadata(self.file(VPN_REMOVAL_MARKER)).is_ok()
+        home_fs::exists(&self.file(VPN_REMOVAL_MARKER))
     }
 
     /// Whether any generation, temporary file or documented file exists.
@@ -691,10 +691,9 @@ impl Home {
     fn vpn_pair_present(&self) -> bool {
         VPN_FILES
             .iter()
-            .any(|name| std::fs::symlink_metadata(self.file(name)).is_ok())
-            || std::fs::read_dir(self.file(VPN_DIR)).is_ok_and(|mut entries| {
-                entries.any(|entry| entry.is_ok_and(|entry| entry.file_name() != "write.lock"))
-            })
+            .any(|name| home_fs::exists(&self.file(name)))
+            || home_fs::list(&self.file(VPN_DIR))
+                .is_ok_and(|entries| entries.iter().any(|entry| entry.name != "write.lock"))
     }
 
     /// Records the intent to delete, durably: the file and then its directory entry reach disk
@@ -756,19 +755,18 @@ impl Home {
     /// Windows write lock.
     #[cfg(any(unix, windows))]
     fn remove_vpn_leftovers(&self, vpn: &Path) -> Result<bool> {
-        let entries = match std::fs::read_dir(vpn) {
+        let entries = match home_fs::list(vpn) {
             Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(e) => return Err(e).with_context(|| vpn.display().to_string()),
         };
         let mut removed = false;
         for entry in entries {
-            let entry = entry?;
-            if entry.file_name() == "write.lock" {
+            if entry.name == "write.lock" {
                 continue;
             }
-            let path = entry.path();
-            if entry.file_type()?.is_dir() {
+            let path = vpn.join(&entry.name);
+            if entry.directory {
                 home_fs::remove_dir_all(&path)
             } else {
                 home_fs::remove_file(&path)
@@ -1005,15 +1003,13 @@ impl Home {
             })?;
         }
         for parent in [&self.0, &vpn] {
-            let entries = match std::fs::read_dir(parent) {
+            let entries = match home_fs::list(parent) {
                 Ok(entries) => entries,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(e).with_context(|| parent.display().to_string()),
             };
             for entry in entries {
-                let entry = entry?;
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
+                let name = entry.name.to_string_lossy();
                 let temporary = if parent == &vpn {
                     (name.starts_with(".current.") || name.starts_with(".previous."))
                         && name.ends_with(".tmp")
@@ -1024,13 +1020,13 @@ impl Home {
                         && name.ends_with(".tmp")
                 };
                 let old_generation = parent == &vpn
-                    && entry.file_type()?.is_dir()
+                    && entry.directory
                     && current.as_deref() != Some(name.as_ref())
                     && previous.as_deref() != Some(name.as_ref());
                 if old_generation {
-                    home_fs::remove_dir_all(&entry.path())?;
+                    home_fs::remove_dir_all(&parent.join(&entry.name))?;
                 } else if temporary {
-                    home_fs::remove_file(&entry.path())?;
+                    home_fs::remove_file(&parent.join(&entry.name))?;
                 }
             }
         }
@@ -5653,16 +5649,13 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn home_reader_refuses_reparse_point_files() {
+    fn an_unprotected_home_reader_follows_a_symbolic_link_like_std_fs() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("file");
         let link = dir.path().join("link");
         std::fs::write(&file, b"fixture").unwrap();
         std::os::windows::fs::symlink_file(&file, &link).unwrap();
-        assert_eq!(
-            home_fs::read(&link).unwrap_err().kind(),
-            std::io::ErrorKind::PermissionDenied
-        );
+        assert_eq!(home_fs::read(&link).unwrap(), b"fixture");
     }
 
     /// A device enrolled at `gateway` under the demo manifest, with a certificate from an earlier check.
