@@ -1413,14 +1413,17 @@ throw 'scheduled task remains: {name}'
 
 fn windows_end_task_script(job: &Job, enabled: bool) -> String {
     let query = windows_task_query_script(job);
-    let stop = if enabled {
-        ""
+    let (note, stop) = if enabled {
+        ("", "")
     } else {
-        "\n    try { $task.Stop(0) } catch {}"
+        (
+            "\n    Write-Output $(if ($task.Enabled) { 'enabled' } else { 'disabled' })",
+            "\n    try { $task.Stop(0) } catch {}",
+        )
     };
     format!(
         r#"{query}
-if ($null -ne $task -and (IsSystemTask $task)) {{
+if ($null -ne $task -and (IsSystemTask $task)) {{{note}
     try {{ $task.Enabled = ${enabled} }} catch {{}}{stop}
 }}
 "#
@@ -1429,9 +1432,11 @@ if ($null -ne $task -and (IsSystemTask $task)) {{
 
 /// Disables the SYSTEM task, so the scheduler starts no new tick, then ends a running tick so it
 /// releases the state lock and the binary. A task that is not running, or cannot be changed, is
-/// not an error: the lock wait decides.
-fn windows_end_task(job: &Job) {
-    let _ = windows_powershell(&windows_end_task_script(job, false));
+/// not an error: the lock wait decides. Returns whether the task was enabled before, so a failed
+/// removal does not enable a task that the owner had disabled.
+fn windows_end_task(job: &Job) -> bool {
+    windows_powershell(&windows_end_task_script(job, false))
+        .map_or(true, |output| output.trim() != "disabled")
 }
 
 /// Undoes `windows_end_task` when the removal did not finish and the task still exists.
@@ -1472,16 +1477,53 @@ if (Test-Path -LiteralPath $state) {{
     )
 }
 
+/// Whether two Windows paths name the same file: ignores case and a `\\?\` prefix.
+fn same_windows_path(left: &Path, right: &Path) -> bool {
+    let normal = |path: &Path| {
+        let text = path.to_string_lossy().to_lowercase();
+        text.strip_prefix(r"\\?\").unwrap_or(&text).to_owned()
+    };
+    normal(left) == normal(right)
+}
+
+/// Whether the protected SYSTEM binary is the image of this process. It stays locked until this
+/// process ends, so waiting for its removal cannot succeed.
+fn windows_runs_from_protected_binary() -> bool {
+    let Ok(protected) = windows_powershell(&windows_system_executable_script()) else {
+        return false;
+    };
+    std::env::current_exe()
+        .is_ok_and(|current| same_windows_path(&current, Path::new(protected.trim())))
+}
+
 fn windows_cleanup_binary(job: &Job) -> Result<()> {
-    let output = windows_powershell(&windows_cleanup_binary_script(job))?;
+    let output = windows_powershell(&windows_cleanup_binary_script(
+        job,
+        windows_runs_from_protected_binary(),
+    ))?;
     if !output.is_empty() {
         println!("{output}");
     }
     Ok(())
 }
 
-fn windows_cleanup_binary_script(job: &Job) -> String {
+fn windows_cleanup_binary_script(job: &Job, running_image: bool) -> String {
     let query = windows_task_query_script(job);
+    let attempt = if running_image {
+        String::new()
+    } else {
+        format!(
+            r#"
+        $deadline = [DateTime]::UtcNow.AddSeconds({wait})
+        while ($true) {{
+            try {{ Remove-Item -LiteralPath $binary -Force -ErrorAction Stop; $removed = $true; break }} catch {{}}
+            if ([DateTime]::UtcNow -ge $deadline) {{ break }}
+            Start-Sleep -Milliseconds {step}
+        }}"#,
+            wait = SYSTEM_WAIT.as_secs(),
+            step = SYSTEM_WAIT_STEP.as_millis(),
+        )
+    };
     format!(
         r#"{PROTECTED_DIRECTORY}
 {query}
@@ -1499,13 +1541,7 @@ try {{
     $binary = Join-Path $install 'open-pact-client.exe'
     if (Test-Path -LiteralPath $binary) {{
         AssertProtected $binary
-        $removed = $false
-        $deadline = [DateTime]::UtcNow.AddSeconds({wait})
-        while ($true) {{
-            try {{ Remove-Item -LiteralPath $binary -Force -ErrorAction Stop; $removed = $true; break }} catch {{}}
-            if ([DateTime]::UtcNow -ge $deadline) {{ break }}
-            Start-Sleep -Milliseconds {step}
-        }}
+        $removed = $false{attempt}
         if (-not $removed) {{
             QueueBinaryRemoval $binary
             Write-Output 'The SYSTEM client binary is queued for removal at the next reboot.'
@@ -1517,15 +1553,13 @@ if ($leftovers.Count -gt 0) {{
     throw "SYSTEM files remain: $($leftovers.FullName -join ', '). $failure Retry the schedule command, or reboot for queued files."
 }}
 if ($null -ne $failure) {{ throw $failure }}
-"#,
-        wait = SYSTEM_WAIT.as_secs(),
-        step = SYSTEM_WAIT_STEP.as_millis(),
+"#
     )
 }
 
 fn windows_system_uninstall(job: &Job, home: &Home) -> Result<()> {
     let state = windows_existing_system_state(&home.0)?;
-    windows_end_task(job);
+    let was_enabled = windows_end_task(job);
     let _state_lock = match state
         .as_ref()
         .map(|path| {
@@ -1538,7 +1572,9 @@ fn windows_system_uninstall(job: &Job, home: &Home) -> Result<()> {
     {
         Ok(lock) => lock,
         Err(error) => {
-            windows_resume_task(job);
+            if was_enabled {
+                windows_resume_task(job);
+            }
             return Err(error);
         }
     };
@@ -1558,7 +1594,9 @@ fn windows_system_uninstall(job: &Job, home: &Home) -> Result<()> {
         failures.push(format!("{error:#}"));
     }
     if !failures.is_empty() {
-        windows_resume_task(job);
+        if was_enabled {
+            windows_resume_task(job);
+        }
         bail!("SYSTEM cleanup incomplete:\n{}", failures.join("\n"));
     }
     Ok(())
@@ -2764,7 +2802,8 @@ mod tests {
             windows_task_query_script(&job),
             windows_uninstall_script(&job, false),
             windows_existing_system_state_script("fixture-hash"),
-            windows_cleanup_binary_script(&job),
+            windows_cleanup_binary_script(&job, false),
+            windows_cleanup_binary_script(&job, true),
             windows_orphaned_binary_script(&job),
             windows_system_executable_script(),
             windows_observation_script(
@@ -5353,13 +5392,38 @@ Write-Output 'refused'
         assert!(end.contains("IsSystemTask $task"));
         assert!(end.find("$task.Enabled = $false").unwrap() < end.find("$task.Stop(0)").unwrap());
         assert!(!windows_end_task_script(&job, true).contains("$task.Stop"));
-        let cleanup = windows_cleanup_binary_script(&job);
+        assert!(end.find("'disabled'").unwrap() < end.find("$task.Enabled = $false").unwrap());
+        assert!(!windows_end_task_script(&job, true).contains("'disabled'"));
+        let cleanup = windows_cleanup_binary_script(&job, false);
         let remove = cleanup.find("Remove-Item -LiteralPath $binary").unwrap();
         let queue = cleanup.find("QueueBinaryRemoval $binary").unwrap();
         assert!(remove < queue);
         assert!(
             cleanup.contains("AddSeconds(30)") && cleanup.contains("Start-Sleep -Milliseconds 250")
         );
+    }
+
+    #[test]
+    fn the_binary_cleanup_skips_the_wait_for_the_running_image() {
+        let job = Job::new(Path::new("client.exe"), Path::new("fixture-home")).unwrap();
+        let cleanup = windows_cleanup_binary_script(&job, true);
+        assert!(!cleanup.contains("Remove-Item -LiteralPath $binary"));
+        assert!(!cleanup.contains("Start-Sleep"));
+        assert!(cleanup.contains("QueueBinaryRemoval $binary"));
+        assert!(cleanup.contains("$removed = $false"));
+    }
+
+    #[test]
+    fn the_running_image_matches_the_protected_path_in_any_case_and_prefix() {
+        let protected = Path::new(r"C:\Program Files\open-pact\open-pact-client.exe");
+        assert!(same_windows_path(
+            Path::new(r"\\?\c:\program files\Open-Pact\open-pact-client.exe"),
+            protected
+        ));
+        assert!(!same_windows_path(
+            Path::new(r"C:\Users\a\open-pact-client.exe"),
+            protected
+        ));
     }
 
     #[test]
