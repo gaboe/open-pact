@@ -691,6 +691,36 @@ fn lock_system_state(home: &Home) -> Result<ScheduleLock> {
     }
 }
 
+/// How long a SYSTEM removal waits for a tick that still runs: first for the state lock, then for
+/// the protected binary to be free.
+const SYSTEM_WAIT: Duration = Duration::from_secs(30);
+const SYSTEM_WAIT_STEP: Duration = Duration::from_millis(250);
+
+fn is_state_in_use(error: &anyhow::Error) -> bool {
+    format!("{error:#}").contains("SYSTEM job state is in use")
+}
+
+/// Runs `attempt` again after `step` while it fails with "SYSTEM job state is in use", for at
+/// most `budget`. The last error stays unchanged when the budget runs out or the error differs.
+fn retry_while_state_in_use<T>(
+    budget: Duration,
+    step: Duration,
+    mut sleep: impl FnMut(Duration),
+    mut attempt: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    let mut waited = Duration::ZERO;
+    loop {
+        match attempt() {
+            Err(error) if is_state_in_use(&error) && waited < budget => {
+                let pause = step.min(budget - waited);
+                sleep(pause);
+                waited += pause;
+            }
+            other => return other,
+        }
+    }
+}
+
 fn save<T: Serialize>(home: &Home, name: &str, value: &T) -> Result<()> {
     let temp = home.file(&format!("{name}.tmp"));
     remove_if_exists(&temp)?;
@@ -1381,6 +1411,23 @@ throw 'scheduled task remains: {name}'
     )
 }
 
+fn windows_end_task_script(job: &Job) -> String {
+    let query = windows_task_query_script(job);
+    format!(
+        r#"{query}
+if ($null -ne $task -and (IsSystemTask $task)) {{
+    try {{ $task.Stop(0) }} catch {{}}
+}}
+"#
+    )
+}
+
+/// Ends a running tick of the SYSTEM task so it releases the state lock and the binary. A task
+/// that is not running, or cannot be ended, is not an error: the lock wait decides.
+fn windows_end_task(job: &Job) {
+    let _ = windows_powershell(&windows_end_task_script(job));
+}
+
 fn windows_uninstall(job: &Job, system: bool) -> Result<()> {
     windows_powershell(&windows_uninstall_script(job, system))
         .context("run `schedule on` or `schedule off` from an elevated prompt")?;
@@ -1441,8 +1488,17 @@ try {{
     $binary = Join-Path $install 'open-pact-client.exe'
     if (Test-Path -LiteralPath $binary) {{
         AssertProtected $binary
-        QueueBinaryRemoval $binary
-        Write-Output 'The SYSTEM client binary is queued for removal at the next reboot.'
+        $removed = $false
+        $deadline = [DateTime]::UtcNow.AddSeconds({wait})
+        while ($true) {{
+            try {{ Remove-Item -LiteralPath $binary -Force -ErrorAction Stop; $removed = $true; break }} catch {{}}
+            if ([DateTime]::UtcNow -ge $deadline) {{ break }}
+            Start-Sleep -Milliseconds {step}
+        }}
+        if (-not $removed) {{
+            QueueBinaryRemoval $binary
+            Write-Output 'The SYSTEM client binary is queued for removal at the next reboot.'
+        }}
     }}
 }} catch {{ $failure = $_.Exception.Message }}
 $leftovers = @(Get-ChildItem -LiteralPath $install -Filter 'open-pact-client.exe*' -File -Force -ErrorAction Stop)
@@ -1450,15 +1506,22 @@ if ($leftovers.Count -gt 0) {{
     throw "SYSTEM files remain: $($leftovers.FullName -join ', '). $failure Retry the schedule command, or reboot for queued files."
 }}
 if ($null -ne $failure) {{ throw $failure }}
-"#
+"#,
+        wait = SYSTEM_WAIT.as_secs(),
+        step = SYSTEM_WAIT_STEP.as_millis(),
     )
 }
 
 fn windows_system_uninstall(job: &Job, home: &Home) -> Result<()> {
     let state = windows_existing_system_state(&home.0)?;
+    windows_end_task(job);
     let _state_lock = state
         .as_ref()
-        .map(|path| lock_system_state(&Home(path.clone())))
+        .map(|path| {
+            retry_while_state_in_use(SYSTEM_WAIT, SYSTEM_WAIT_STEP, std::thread::sleep, || {
+                lock_system_state(&Home(path.clone()))
+            })
+        })
         .transpose()
         .context("SYSTEM uninstall stopped before task or binary cleanup")?;
     let mut failures = Vec::new();
@@ -5200,6 +5263,82 @@ Write-Output 'refused'
         drop(guard);
         assert!(!state.exists());
         assert!(dir.path().join("state/fictional-hash.lock").exists());
+    }
+
+    #[test]
+    fn a_state_lock_held_by_a_tick_is_awaited_and_then_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().join("state").join("fictional-hash"));
+        let mut tick = Some(lock_system_state(&home).unwrap());
+        let mut sleeps = Vec::new();
+        let taken = retry_while_state_in_use(
+            SYSTEM_WAIT,
+            SYSTEM_WAIT_STEP,
+            |pause| {
+                sleeps.push(pause);
+                if sleeps.len() == 3 {
+                    tick = None;
+                }
+            },
+            || lock_system_state(&home),
+        );
+        assert!(taken.is_ok());
+        assert_eq!(sleeps, vec![SYSTEM_WAIT_STEP; 3]);
+        assert!(tick.is_none());
+    }
+
+    #[test]
+    fn the_state_lock_wait_ends_at_its_budget_with_the_same_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().join("state").join("fictional-hash"));
+        let _tick = lock_system_state(&home).unwrap();
+        let mut slept = Duration::ZERO;
+        let error = retry_while_state_in_use(
+            SYSTEM_WAIT,
+            SYSTEM_WAIT_STEP,
+            |pause| slept += pause,
+            || lock_system_state(&home),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(slept, SYSTEM_WAIT);
+        assert!(
+            error
+                .to_string()
+                .contains("SYSTEM job state is in use; retry this command")
+        );
+    }
+
+    #[test]
+    fn another_lock_error_is_not_retried() {
+        let mut calls = 0;
+        let error = retry_while_state_in_use(
+            SYSTEM_WAIT,
+            SYSTEM_WAIT_STEP,
+            |_| panic!("no wait for another error"),
+            || -> Result<()> {
+                calls += 1;
+                bail!("cannot lock SYSTEM job state")
+            },
+        )
+        .err()
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert!(error.to_string().contains("cannot lock"));
+    }
+
+    #[test]
+    fn the_system_removal_ends_the_task_and_waits_for_the_binary_before_queueing_it() {
+        let job = Job::new(Path::new("client.exe"), Path::new("fixture-home")).unwrap();
+        let end = windows_end_task_script(&job);
+        assert!(end.contains("IsSystemTask $task") && end.contains("$task.Stop(0)"));
+        let cleanup = windows_cleanup_binary_script(&job);
+        let remove = cleanup.find("Remove-Item -LiteralPath $binary").unwrap();
+        let queue = cleanup.find("QueueBinaryRemoval $binary").unwrap();
+        assert!(remove < queue);
+        assert!(
+            cleanup.contains("AddSeconds(30)") && cleanup.contains("Start-Sleep -Milliseconds 250")
+        );
     }
 
     #[test]
