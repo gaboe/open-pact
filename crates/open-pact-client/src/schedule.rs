@@ -1170,16 +1170,21 @@ fn powershell_literal(value: &str) -> String {
 fn windows_powershell(script: &str) -> Result<String> {
     let script =
         format!("[Console]::OutputEncoding = New-Object Text.UTF8Encoding($false);\n{script}");
-    let output = std::process::Command::new("powershell.exe")
-        .args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            &script,
-        ])
-        .output()
-        .context("start Windows scheduler helper")?;
+    let mut command = std::process::Command::new("powershell.exe");
+    command.args([
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        &script,
+    ]);
+    // A GUI caller has no console: without this flag each probe flashes a PowerShell window.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    let output = command.output().context("start Windows scheduler helper")?;
     if !output.status.success() {
         bail!(
             "Windows scheduler helper failed with code {:?}; run from an elevated prompt. {} {}",
@@ -2489,6 +2494,33 @@ pub(crate) fn inspect_job(
     )
 }
 
+/// The job is current except that it runs another copy of the client (the desktop app's CLI copy
+/// and a Homebrew one, for example). `schedule on` from this copy would only swap the path, and
+/// the other copy is the one that keeps the job, so `check` stays silent.
+fn is_current_in_another_copy(home: &Home, executable: &Path) -> bool {
+    let Ok(schedule_home) = schedule_home(&home.0, true).map(Home) else {
+        return false;
+    };
+    let Ok(Some(applied)) = read_applied(&schedule_home) else {
+        return false;
+    };
+    runs_another_current_copy(executable, &applied, |recorded| {
+        observe(&schedule_home, Some(recorded), false, &recorded.executable)
+    })
+}
+
+fn runs_another_current_copy(
+    executable: &Path,
+    applied: &Applied,
+    observe_recorded: impl FnOnce(&Applied) -> Result<Observed>,
+) -> bool {
+    applied.run_as == RunAs::User
+        && applied.executable != executable
+        && observe_recorded(applied).is_ok_and(|observed| {
+            reconcile(Some(applied), Some(applied), &observed) == Change::None
+        })
+}
+
 /// The one line `check` prints when the job runs an older definition than this client would
 /// install, with the exact command that fixes it.
 fn outdated_job_line(job: JobStatus, system: bool, command: &str) -> Option<String> {
@@ -2514,6 +2546,12 @@ pub(crate) fn outdated_job_notice(
         return None;
     }
     let job = inspect_job(home, config, executable).ok()?;
+    if job == JobStatus::Outdated
+        && config.run_as == RunAs::User
+        && is_current_in_another_copy(home, executable)
+    {
+        return None;
+    }
     outdated_job_line(
         job,
         config.run_as == RunAs::System,
@@ -2727,8 +2765,15 @@ fn refresh_job_with(
         executable: executable.to_path_buf(),
         user_home: None,
     };
-    let observed = observe_job(&desired)?;
-    let applied = read_applied(home)?;
+    let checked = observe_job(&desired).and_then(|observed| Ok((observed, read_applied(home)?)));
+    let (observed, applied) = match checked {
+        Ok(read) => read,
+        Err(error) => {
+            // A blocked PowerShell must not retry and log every minute: the caller logs this once.
+            save(home, JOB_REFRESH, &known)?;
+            return Err(error);
+        }
+    };
     let stale =
         observed.exists && reconcile(Some(&desired), applied.as_ref(), &observed) == Change::Update;
     // A failed rewrite is not retried every minute: `status` and `check` keep reporting the job.
@@ -2783,7 +2828,10 @@ fn macos_rewrite(
         domain = shell_quote(domain),
         helper = shell_quote(&helper),
     );
-    submit(&["submit", "-l", &helper, "--", "/bin/sh", "-c", &script])?;
+    // The helper's own output goes to the job log, so a failed bootout or bootstrap is visible.
+    submit(&[
+        "submit", "-l", &helper, "-o", &job.log, "-e", &job.log, "--", "/bin/sh", "-c", &script,
+    ])?;
     std::fs::write(path, job.plist()).with_context(|| format!("write {}", path.display()))
 }
 
@@ -4249,6 +4297,86 @@ esac
             !wake(&home, &plist, &job, &submitted).unwrap(),
             "one attempt for each client version"
         );
+    }
+
+    #[test]
+    fn a_failed_look_at_the_job_is_not_repeated_every_minute() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, plist, job) = stale_launch_agent(dir.path());
+        let executable = Path::new("/opt/open-pact/open-pact-client");
+        let first = refresh_job_with(
+            &home,
+            executable,
+            |_| bail!("PowerShell is blocked"),
+            |_| unreachable!("a job that was not read is not rewritten"),
+        );
+        assert!(
+            first.is_err(),
+            "the first failure reaches the caller to log"
+        );
+        let looked = std::cell::Cell::new(false);
+        let second = refresh_job_with(
+            &home,
+            executable,
+            |_| {
+                looked.set(true);
+                observed_file(&plist, &job)
+            },
+            |_| unreachable!(),
+        );
+        assert!(!second.unwrap());
+        assert!(!looked.get(), "one attempt for each client version");
+    }
+
+    #[test]
+    fn the_reload_helper_writes_its_output_to_the_job_log() {
+        let job = Job::new(Path::new("/opt/o/client"), Path::new("/tmp/pact")).unwrap();
+        let submitted = std::cell::RefCell::new(Vec::new());
+        let dir = tempfile::tempdir().unwrap();
+        let plist = dir.path().join("a.plist");
+        macos_rewrite(&job, &plist, "gui/501", |args| {
+            submitted
+                .borrow_mut()
+                .extend(args.iter().map(|a| a.to_string()));
+            Ok(())
+        })
+        .unwrap();
+        let args = submitted.borrow();
+        for flag in ["-o", "-e"] {
+            let at = args.iter().position(|arg| arg == flag).unwrap();
+            assert_eq!(args[at + 1], job.log);
+        }
+    }
+
+    #[test]
+    fn check_stays_silent_when_the_job_is_current_in_another_copy_of_the_client() {
+        let other = Applied {
+            run_as: RunAs::User,
+            executable: PathBuf::from("/opt/homebrew/bin/open-pact-client"),
+            user_home: None,
+        };
+        let here = Path::new("/Applications/Open Pact.app/open-pact-client");
+        let current = |_: &Applied| {
+            Ok(Observed {
+                exists: true,
+                matches: true,
+                ..Observed::default()
+            })
+        };
+        assert!(runs_another_current_copy(here, &other, current));
+        // The other copy's own job is stale or unreadable: say nothing different from `status`.
+        assert!(!runs_another_current_copy(here, &other, |_| Ok(Observed {
+            exists: true,
+            matches: false,
+            ..Observed::default()
+        })));
+        assert!(!runs_another_current_copy(here, &other, |_| bail!("no")));
+        // The recorded copy is this one: nothing is "another copy".
+        assert!(!runs_another_current_copy(
+            &other.executable,
+            &other,
+            current
+        ));
     }
 
     #[test]
