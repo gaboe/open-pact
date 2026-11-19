@@ -145,7 +145,8 @@ pub fn parse_saver_idle(out: &str) -> Lock {
 }
 
 /// What `defaults read com.apple.screensaver idleTime` says. `None` only when the key is truly
-/// unset: the command ran and reported that the pair does not exist. A command that cannot start,
+/// unset: the command ran and reported that the pair does not exist, or that its domain was never
+/// written. A command that cannot start,
 /// times out, fails for another reason, or prints something else is `Some(Lock::Unknown)`,
 /// because the user's setting may exist and must not be replaced by a default.
 pub fn saver_setting(ran: Option<Ran>) -> Option<Lock> {
@@ -153,13 +154,19 @@ pub fn saver_setting(ran: Option<Ran>) -> Option<Lock> {
         Some(Ran {
             success: false,
             text,
-        }) if text.contains("does not exist") => None,
+        }) if is_unset_message(&text) => None,
         Some(Ran {
             success: true,
             text,
         }) => Some(parse_saver_idle(&text)),
         Some(_) | None => Some(Lock::Unknown),
     }
+}
+
+/// The text `defaults` prints for a key that was never set. macOS 27 names the domain instead of the
+/// pair when the domain was never written.
+fn is_unset_message(text: &str) -> bool {
+    text.contains("does not exist") || (text.contains("Domain") && text.contains("not found"))
 }
 
 /// The screen saver idle time that applies: the one the user or a profile set, else the default of
@@ -332,6 +339,18 @@ mod tests {
         );
         assert_eq!(total, Lock::Seconds(600));
         assert_eq!(total.minutes(), open_pact_core::ControlValue::from(10));
+    }
+
+    #[test]
+    fn a_saver_domain_that_was_never_written_is_unset_too() {
+        // macOS 27 prints this for a domain that has never been written.
+        let never_written = saver_setting(ran(false, "Domain 'com.apple.screensaver' not found."));
+        assert_eq!(never_written, None);
+        let engine_default = || parse_saver_idle("1200\n");
+        assert_eq!(
+            saver_idle(never_written, engine_default),
+            Lock::Seconds(1200)
+        );
     }
 
     /// A read that fails is not an unset key: the user's setting may be 60 minutes, so the
