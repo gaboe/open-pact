@@ -277,9 +277,10 @@ fn parse_xprotect(disabled: &str, service: Option<&str>) -> &'static str {
             if text.contains(SCAN_SERVICE)
                 && text.contains("program = ")
                 && !text.lines().map(str::trim).any(|line| {
-                    line.strip_prefix("last exit code = ")
-                        .is_some_and(|code| code.parse::<i32>() != Ok(0))
-                        || line == "state = spawn scheduled"
+                    // A daemon that is running has not exited yet, so it has no exit code to fail.
+                    line.strip_prefix("last exit code = ").is_some_and(|code| {
+                        code != "(never exited)" && code.parse::<i32>() != Ok(0)
+                    }) || line == "state = spawn scheduled"
                 }) =>
         {
             "yes"
@@ -384,6 +385,15 @@ mod tests {
         assert_eq!(
             parse_xprotect("Operation not permitted", Some(service)),
             "unknown"
+        );
+    }
+
+    #[test]
+    fn running_xprotect_that_never_exited_is_healthy() {
+        let service = "system/com.apple.XProtect.daemon.scan = {\n state = running\n program = /Library/Apple/System/Library/CoreServices/XProtect.app/Contents/MacOS/XProtect\n last exit code = (never exited)\n}";
+        assert_eq!(
+            parse_xprotect("disabled services = {\n}\n", Some(service)),
+            "yes"
         );
     }
 
