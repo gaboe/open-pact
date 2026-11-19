@@ -563,6 +563,7 @@ async fn try_enroll(
     .fetch_optional(&mut *tx)
     .await
     .map_err(internal)?;
+    let mut auto_approved = false;
     let (salt, state, log_index) = match existing {
         Some((existing_owner, salt, state, stored_invitation)) => {
             if existing_owner != owner_key {
@@ -620,6 +621,7 @@ async fn try_enroll(
             } else {
                 DeviceState::Pending
             };
+            auto_approved = state == DeviceState::Approved;
             sqlx::query(
                 "INSERT INTO devices (pseudonym, manifest_hash, owner_key, owner_signature, salt, state, invitation, \
                  enrol_owner_signature, enrol_device_signature) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
@@ -650,6 +652,23 @@ async fn try_enroll(
         }
     };
     tx.commit().await.map_err(internal)?;
+    if auto_approved && let Some(exporter) = &app.siem {
+        // The enrolment is committed. A failed note read must not fail it, so it only warns.
+        match device_state_event(
+            &app.db,
+            &device,
+            app.manifest.hash().as_str(),
+            DeviceState::Approved,
+        )
+        .await
+        {
+            Ok(event) => exporter.submit(event),
+            Err(error) => eprintln!(
+                "WARNING: {} is approved, but the SIEM event was not queued: {error:#}",
+                device.as_str()
+            ),
+        }
+    }
     let manifest_index: i64 = sqlx::query_scalar(
         "SELECT idx FROM log_entries WHERE kind = 'manifest_published' AND data->>'manifest' = $1",
     )
@@ -1451,9 +1470,24 @@ async fn announce_state(
         return Ok(());
     };
     let pseudonym = Pseudonym::try_from(device.to_owned()).map_err(anyhow::Error::msg)?;
-    let note = devices::note(&mut *db.acquire().await?, &pseudonym, manifest).await?;
-    let event = siem::state_event(&pseudonym, &note, state.as_str(), OffsetDateTime::now_utc());
+    let event = device_state_event(db, &pseudonym, manifest, state).await?;
     tokio::task::spawn_blocking(move || sink.send(&event)).await?
+}
+
+/// The `device_state` event for `device` under `manifest`, with the note of its invitation.
+async fn device_state_event(
+    db: &PgPool,
+    device: &Pseudonym,
+    manifest: &str,
+    state: devices::State,
+) -> anyhow::Result<Value> {
+    let note = devices::note(&mut *db.acquire().await?, device, manifest).await?;
+    Ok(siem::state_event(
+        device,
+        &note,
+        state.as_str(),
+        OffsetDateTime::now_utc(),
+    ))
 }
 
 fn router(app: App) -> Router {
@@ -1948,6 +1982,82 @@ mod tests {
         );
     }
 
+    /// An enrolment that the gateway approves by itself sends one approved `device_state` event
+    /// after it commits, with the note of the invitation it used.
+    #[tokio::test]
+    #[ignore = "needs TEST_DATABASE_URL"]
+    async fn an_auto_approved_enrolment_sends_one_approved_event() {
+        let sink = std::env::temp_dir().join(format!(
+            "open-pact-auto-approve-{:032x}.ndjson",
+            rand::random::<u128>()
+        ));
+        let (app, db) = test_app_configured(
+            DEMO,
+            100,
+            100,
+            10,
+            true,
+            Some(siem::Exporter::file_for_test(sink.clone())),
+        )
+        .await;
+        let manifest = Manifest::parse(DEMO.as_bytes()).unwrap();
+        let mut tx = db.begin().await.unwrap();
+        translog::append(
+            &mut tx,
+            EntryKind::ManifestPublished,
+            json!({"manifest": manifest.hash().as_str()}),
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        let keys = Keys::load_or_create(&db, &SealingKey::new(&TEST_KEK))
+            .await
+            .unwrap();
+        let owner = open_pact_core::dev_key::generate();
+        let device_key = open_pact_core::dev_key::generate();
+        let note = "Laptop, Example Person";
+        let (code, _) = invitations::create(&db, time::Duration::hours(1), note)
+            .await
+            .unwrap();
+        let signed = open_pact_core::SignedManifest {
+            toml: DEMO.into(),
+            company: Endorsement::sign(&keys.manifest, manifest.hash()),
+            owner: Endorsement::sign(&owner, manifest.hash()),
+        };
+        let request = EnrolRequest::sign(signed, code, &owner, &device_key).unwrap();
+        let (status, body) =
+            post_json(&app, "/v1/enroll", &serde_json::to_value(request).unwrap()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["state"], "approved");
+
+        // The exporter delivers on its own thread, so wait for the whole first line.
+        let text = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let text = std::fs::read_to_string(&sink).unwrap_or_default();
+                if text.ends_with('\n') {
+                    return text;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the SIEM exporter delivers the event");
+        let _ = std::fs::remove_file(&sink);
+        let sent: Vec<Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        let event = &sent[0]["open_pact"];
+        assert_eq!(event["event"], "device_state");
+        assert_eq!(event["state"], "approved");
+        assert_eq!(
+            event["device_pseudonym"],
+            Pseudonym::of(&PublicKey::from(&device_key)).as_str()
+        );
+        assert_eq!(event["device_note"], note);
+    }
+
     /// `devices approve` and `devices revoke` send one `device_state` event for a change and none for
     /// an action that changes nothing. The child process reads `GATEWAY_SIEM_FILE` as the CLI does.
     #[tokio::test]
@@ -2216,6 +2326,17 @@ mod tests {
         nonce_limit: u32,
         max_connections: u32,
     ) -> (Router, PgPool) {
+        test_app_configured(toml, enrol_limit, nonce_limit, max_connections, false, None).await
+    }
+
+    async fn test_app_configured(
+        toml: &str,
+        enrol_limit: u32,
+        nonce_limit: u32,
+        max_connections: u32,
+        auto_approve: bool,
+        siem: Option<siem::Exporter>,
+    ) -> (Router, PgPool) {
         let db = testdb::fresh_with_max_connections(max_connections).await;
         let kek = SealingKey::new(&TEST_KEK);
         let keys = Keys::load_or_create(&db, &kek).await.unwrap();
@@ -2228,7 +2349,7 @@ mod tests {
         };
         let minute = Duration::from_secs(60);
         let enforced = Arc::new(Enforced {
-            siem: None,
+            siem,
             company: Endorsement::sign(&keys.manifest, manifest.hash()),
             manifest: Arc::new(manifest),
             toml: toml.into(),
@@ -2240,7 +2361,7 @@ mod tests {
             current: Arc::new(RwLock::new(enforced)),
             db: db.clone(),
             keys: Arc::new(keys),
-            auto_approve: false,
+            auto_approve,
             limiter: Arc::new(Limiter::new(enrol_limit, minute, 100)),
             nonce_limiter: Arc::new(Limiter::new(nonce_limit, minute, 100)),
             max_nonces: 10_000,
