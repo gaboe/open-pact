@@ -69,6 +69,7 @@ fn base() -> Report {
             policy_defined: true,
             job: "OS job not checked".into(),
             job_status: None,
+            system_job: false,
             vpn: "not checked".into(),
             last_scheduled_claim: Some(ScheduledClaim {
                 answered_at: "2026-11-16T10:53:00Z".into(),

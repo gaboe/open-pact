@@ -1973,10 +1973,62 @@ struct WindowsTaskState {
     protected_binary: Option<ProtectedBinaryState>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct ProtectedBinaryState {
     exists: bool,
     matches_source: bool,
+}
+
+/// What the PowerShell probe printed about the protected copy of the client in Program Files.
+/// Nothing when the probe printed no complete answer.
+fn protected_binary(output: &str) -> Option<ProtectedBinaryState> {
+    let field = |name: &str| {
+        output
+            .lines()
+            .find_map(|line| line.strip_prefix(name))
+            .and_then(|value| value.trim().parse::<i32>().ok())
+    };
+    Some(ProtectedBinaryState {
+        exists: field("protected_exists=")? == 1,
+        matches_source: field("protected_matches=")? == 1,
+    })
+}
+
+/// What a SYSTEM job reads as without elevation. The job cannot update itself: copying a client
+/// that any user can write into Program Files as SYSTEM would hand that user SYSTEM. So the
+/// owner updates it with `schedule on --system`, and this tells the owner when to. A protected
+/// copy that is not this client is out of date. Every other answer stays unconfirmed.
+fn system_job_status(protected: Option<&ProtectedBinaryState>) -> JobStatus {
+    match protected {
+        Some(binary) if binary.exists && !binary.matches_source => JobStatus::Outdated,
+        _ => JobStatus::SystemUnconfirmed,
+    }
+}
+
+fn windows_protected_binary_probe(source: &str) -> String {
+    format!(
+        r#"$protected = Join-Path (Join-Path (ProgramFilesPath) 'open-pact') 'open-pact-client.exe'
+$protectedExists = Test-Path -LiteralPath $protected -PathType Leaf
+Write-Output ("protected_exists=" + [int]$protectedExists)
+$protectedMatches = $protectedExists -and (Get-FileHash -LiteralPath $protected -Algorithm SHA256).Hash -eq (Get-FileHash -LiteralPath {source} -Algorithm SHA256).Hash
+Write-Output ("protected_matches=" + [int]$protectedMatches)"#
+    )
+}
+
+/// Compares the protected copy of the client with `executable`. It reads Program Files only, so it
+/// needs no elevation. `None` when the OS is not Windows or the probe fails.
+fn read_protected_binary(executable: &Path) -> Option<ProtectedBinaryState> {
+    if crate::current_os().ok()? != open_pact_core::Os::Windows {
+        return None;
+    }
+    protected_binary(&windows_powershell(&windows_protected_binary_script(executable).ok()?).ok()?)
+}
+
+fn windows_protected_binary_script(executable: &Path) -> Result<String> {
+    let probe = windows_protected_binary_probe(&powershell_literal(text(executable)?));
+    Ok(format!(
+        "function ProgramFilesPath {{ [Environment]::GetFolderPath('ProgramFiles') }}\n$ErrorActionPreference = 'Stop'\ntry {{\n{probe}\n}} catch {{ return }}"
+    ))
 }
 
 impl WindowsTaskState {
@@ -2047,17 +2099,13 @@ if ($triggers.Count -eq 1) {{
     Write-Output ("repetition=" + $triggers[0].Repetition.Interval)
 }}
 if (IsSystemTask $task) {{
-    $protected = Join-Path (Join-Path (ProgramFilesPath) 'open-pact') 'open-pact-client.exe'
-    $protectedExists = Test-Path -LiteralPath $protected -PathType Leaf
-    Write-Output ("protected_exists=" + [int]$protectedExists)
-    $protectedMatches = $protectedExists -and (Get-FileHash -LiteralPath $protected -Algorithm SHA256).Hash -eq (Get-FileHash -LiteralPath {source} -Algorithm SHA256).Hash
-    Write-Output ("protected_matches=" + [int]$protectedMatches)
+{probe}
 }}
 if ($action.Count -eq 1 -and $action[0].Path -eq {binary} -and $action[0].Arguments -eq {args} -and $task.Enabled -and $triggers.Count -eq 1 -and $triggers[0].Enabled -and $triggers[0].Type -eq 1 -and $triggers[0].Repetition.Interval -eq '{WAKE_ISO}') {{ Write-Output 'matches' }}
 "#,
         binary = powershell_literal(text(executable)?),
         args = powershell_literal(expected_args),
-        source = powershell_literal(text(source_executable)?),
+        probe = windows_protected_binary_probe(&powershell_literal(text(source_executable)?)),
     ))
 }
 
@@ -2160,10 +2208,7 @@ fn observe(
                         .lines()
                         .find_map(|line| line.strip_prefix("repetition="))
                         .map(|value| value.trim().to_owned()),
-                    protected_binary: system.then(|| ProtectedBinaryState {
-                        exists: field("protected_exists=") == Some(1),
-                        matches_source: field("protected_matches=") == Some(1),
-                    }),
+                    protected_binary: system.then(|| protected_binary(&output).unwrap_or_default()),
                 });
             let protected_leftovers = inspect_protected
                 && (windows_existing_system_state(&home.0)?.is_some()
@@ -2416,7 +2461,9 @@ pub(crate) fn inspect_job(
     executable: &Path,
 ) -> Result<JobStatus> {
     if config.auto_send && config.run_as == RunAs::System {
-        return Ok(JobStatus::SystemUnconfirmed);
+        return Ok(system_job_status(
+            read_protected_binary(executable).as_ref(),
+        ));
     }
     let desired = config.auto_send.then(|| Applied {
         run_as: config.run_as,
@@ -2479,6 +2526,12 @@ async fn status(home: &Home, executable: &Path) -> Result<()> {
         println!(
             "The job runs as SYSTEM. Run `schedule on --system` from an elevated prompt to change it."
         );
+        if system_job_status(read_protected_binary(executable).as_ref()) == JobStatus::Outdated {
+            println!(
+                "The job is out of date: the client it runs in Program Files is not this client. Run `{} schedule on --system` from an elevated prompt.",
+                crate::client_command(&home.0)
+            );
+        }
         print_next_due();
         return Ok(());
     }
@@ -2806,6 +2859,7 @@ mod tests {
             windows_cleanup_binary_script(&job, true),
             windows_orphaned_binary_script(&job),
             windows_system_executable_script(),
+            windows_protected_binary_script(Path::new("client.exe")).unwrap(),
             windows_observation_script(
                 &job,
                 Path::new("fixture.exe"),
@@ -3867,6 +3921,41 @@ esac
             reconcile(Some(&settings), Some(&settings), &task(Some("PT1M"))),
             Change::None
         );
+    }
+
+    #[test]
+    fn a_system_job_with_another_protected_client_is_outdated() {
+        let probe = |exists: i32, matches: i32| {
+            protected_binary(&format!(
+                "protected_exists={exists}\nprotected_matches={matches}"
+            ))
+        };
+        assert_eq!(system_job_status(probe(1, 0).as_ref()), JobStatus::Outdated);
+        for unconfirmed in [probe(1, 1), probe(0, 0), None] {
+            assert_eq!(
+                system_job_status(unconfirmed.as_ref()),
+                JobStatus::SystemUnconfirmed,
+                "{unconfirmed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_incomplete_protected_client_answer_proves_nothing() {
+        assert!(protected_binary("").is_none());
+        assert!(protected_binary("protected_exists=1").is_none());
+        assert!(protected_binary("protected_exists=1\nprotected_matches=").is_none());
+        let both =
+            protected_binary("system\nprotected_exists=1\nprotected_matches=1\nmatches").unwrap();
+        assert!(both.exists && both.matches_source);
+    }
+
+    #[test]
+    fn the_unelevated_protected_client_probe_defines_its_helper_and_reads_one_file() {
+        let probe = windows_protected_binary_probe("'client.exe'");
+        assert!(probe.contains("protected_exists=") && probe.contains("protected_matches="));
+        assert!(probe.contains("Get-FileHash -LiteralPath 'client.exe'"));
+        assert!(probe.contains("ProgramFilesPath"));
     }
 
     #[test]

@@ -445,8 +445,7 @@ impl AppView {
     }
 
     fn show_status(&mut self, status: Report) {
-        self.system_job =
-            status.schedule.job_status == Some(open_pact_client::JobStatus::SystemUnconfirmed);
+        self.system_job = status.schedule.system_job;
         self.screen = if status.approval.state.is_none() && status.manifest.is_none() {
             Screen::Invitation
         } else {
