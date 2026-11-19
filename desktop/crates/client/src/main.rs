@@ -648,7 +648,9 @@ impl AppView {
                 });
                 let signed = status.manifest.as_ref().map(|m| m.signed.to_string());
                 let agreement = status.manifest.as_ref().and_then(|m| agreement_text(&m.agreement));
-                if let Some(check) = self.last_check.as_ref().filter(|check| !check.accepted) {
+                // A check that the status has overtaken is not shown: the status holds the last claim.
+                let last_check = self.last_check.as_ref().filter(|check| !check_is_superseded(&check.sent_at, status.last_claim.as_ref()));
+                if let Some(check) = last_check.filter(|check| !check.accepted) {
                     view = view.child(rejection_panel(check));
                 }
                 view = view
@@ -675,7 +677,7 @@ impl AppView {
                 if self.all_controls {
                     view = view.child(label("Every check"));
                     let mut every = table();
-                    if let Some(check) = &self.last_check {
+                    if let Some(check) = last_check {
                         for control in &check.controls {
                             let (name, value, ok) = result_control(control);
                             every = every.child(row(name, div().text_color(rgb(if ok { 0x2e7d4f } else { BAD })).child(value)));
