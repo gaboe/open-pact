@@ -397,13 +397,14 @@ pub fn parse_last_update(value: &str) -> Option<Date> {
 
 /// The Shell property has no official value table, so unrecognized values stay unknown.
 /// Measured as an administrator on Windows 11 24H2: 1 is protection on, 2 is a volume with no
-/// encryption, 5 is an encrypted volume whose protectors are off, and 6 is a locked volume.
+/// encryption, 5 is an encrypted volume whose protectors are off, 6 is a locked volume, and 8 is
+/// a fully encrypted volume waiting for activation: its key is stored in the clear.
 /// A standard-user token reads 0 for every state.
 pub fn parse_bitlocker(out: &str) -> &'static str {
     match out.trim() {
         "1" => "full",
-        "3" | "4" | "8" => "partial",
-        "2" | "5" | "7" => "none",
+        "3" | "4" => "partial",
+        "2" | "5" | "7" | "8" => "none",
         _ => "unknown",
     }
 }
@@ -1062,7 +1063,7 @@ mod tests {
         assert_eq!(parse_bitlocker("5"), "none");
         assert_eq!(parse_bitlocker("6"), "unknown");
         assert_eq!(parse_bitlocker("7"), "none");
-        assert_eq!(parse_bitlocker("8"), "partial");
+        assert_eq!(parse_bitlocker("8"), "none");
         assert_eq!(parse_bitlocker("0"), "unknown");
         assert_eq!(parse_bitlocker(""), "unknown");
     }
