@@ -1411,21 +1411,32 @@ throw 'scheduled task remains: {name}'
     )
 }
 
-fn windows_end_task_script(job: &Job) -> String {
+fn windows_end_task_script(job: &Job, enabled: bool) -> String {
     let query = windows_task_query_script(job);
+    let stop = if enabled {
+        ""
+    } else {
+        "\n    try { $task.Stop(0) } catch {}"
+    };
     format!(
         r#"{query}
 if ($null -ne $task -and (IsSystemTask $task)) {{
-    try {{ $task.Stop(0) }} catch {{}}
+    try {{ $task.Enabled = ${enabled} }} catch {{}}{stop}
 }}
 "#
     )
 }
 
-/// Ends a running tick of the SYSTEM task so it releases the state lock and the binary. A task
-/// that is not running, or cannot be ended, is not an error: the lock wait decides.
+/// Disables the SYSTEM task, so the scheduler starts no new tick, then ends a running tick so it
+/// releases the state lock and the binary. A task that is not running, or cannot be changed, is
+/// not an error: the lock wait decides.
 fn windows_end_task(job: &Job) {
-    let _ = windows_powershell(&windows_end_task_script(job));
+    let _ = windows_powershell(&windows_end_task_script(job, false));
+}
+
+/// Undoes `windows_end_task` when the removal did not finish and the task still exists.
+fn windows_resume_task(job: &Job) {
+    let _ = windows_powershell(&windows_end_task_script(job, true));
 }
 
 fn windows_uninstall(job: &Job, system: bool) -> Result<()> {
@@ -1515,7 +1526,7 @@ if ($null -ne $failure) {{ throw $failure }}
 fn windows_system_uninstall(job: &Job, home: &Home) -> Result<()> {
     let state = windows_existing_system_state(&home.0)?;
     windows_end_task(job);
-    let _state_lock = state
+    let _state_lock = match state
         .as_ref()
         .map(|path| {
             retry_while_state_in_use(SYSTEM_WAIT, SYSTEM_WAIT_STEP, std::thread::sleep, || {
@@ -1523,7 +1534,14 @@ fn windows_system_uninstall(job: &Job, home: &Home) -> Result<()> {
             })
         })
         .transpose()
-        .context("SYSTEM uninstall stopped before task or binary cleanup")?;
+        .context("SYSTEM uninstall stopped before task or binary cleanup")
+    {
+        Ok(lock) => lock,
+        Err(error) => {
+            windows_resume_task(job);
+            return Err(error);
+        }
+    };
     let mut failures = Vec::new();
     if let Err(error) = windows_uninstall(job, true) {
         failures.push(format!("task {}: {error:#}", job.id));
@@ -1540,6 +1558,7 @@ fn windows_system_uninstall(job: &Job, home: &Home) -> Result<()> {
         failures.push(format!("{error:#}"));
     }
     if !failures.is_empty() {
+        windows_resume_task(job);
         bail!("SYSTEM cleanup incomplete:\n{}", failures.join("\n"));
     }
     Ok(())
@@ -5330,8 +5349,10 @@ Write-Output 'refused'
     #[test]
     fn the_system_removal_ends_the_task_and_waits_for_the_binary_before_queueing_it() {
         let job = Job::new(Path::new("client.exe"), Path::new("fixture-home")).unwrap();
-        let end = windows_end_task_script(&job);
-        assert!(end.contains("IsSystemTask $task") && end.contains("$task.Stop(0)"));
+        let end = windows_end_task_script(&job, false);
+        assert!(end.contains("IsSystemTask $task"));
+        assert!(end.find("$task.Enabled = $false").unwrap() < end.find("$task.Stop(0)").unwrap());
+        assert!(!windows_end_task_script(&job, true).contains("$task.Stop"));
         let cleanup = windows_cleanup_binary_script(&job);
         let remove = cleanup.find("Remove-Item -LiteralPath $binary").unwrap();
         let queue = cleanup.find("QueueBinaryRemoval $binary").unwrap();
