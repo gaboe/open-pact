@@ -2036,6 +2036,22 @@ async fn after_approval(
     first_claim(home, insecure_dev, executable).await
 }
 
+/// The last valid claim got the gateway's signed denial (403 with a reasons list).
+fn last_claim_denied(home: &Home) -> bool {
+    let Ok((records, _)) = locallog::read_lenient(&home.file("claims.jsonl")) else {
+        return false;
+    };
+    records.last().is_some_and(|record| {
+        record.status == Some(403)
+            && record.response().is_ok_and(|response| {
+                matches!(
+                    serde_json::from_slice::<Response>(&response),
+                    Ok(Response::Denied { .. })
+                )
+            })
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WizardResume {
     Setup,
@@ -3810,9 +3826,12 @@ async fn check_run(
             WizardResume::Setup => {
                 println!("Wizard step [5/6] is unfinished. Continue with: {command} join");
             }
-            WizardResume::FirstCheck => {
+            // A denied claim already answered the first check: the report above lists what to fix,
+            // and join would only send the same claim again.
+            WizardResume::FirstCheck if !last_claim_denied(home) => {
                 println!("Wizard step [6/6] is unfinished. Continue with: {command} join");
             }
+            WizardResume::FirstCheck => {}
             WizardResume::Complete => {}
         }
     }
@@ -5180,6 +5199,24 @@ mod tests {
         assert_eq!(wizard_resume(&home).unwrap(), WizardResume::FirstCheck);
         locallog::append(&home.file("claims.jsonl"), b"sent", b"upstream unavailable").unwrap();
         assert_eq!(wizard_resume(&home).unwrap(), WizardResume::FirstCheck);
+        assert!(!last_claim_denied(&home), "a lost response is not a denial");
+        let denied = serde_json::to_vec(&json!({
+            "status": "denied",
+            "reasons": ["screen_lock = none, le_5min required, grace 1d ended"]
+        }))
+        .unwrap();
+        locallog::append_with_status(
+            &home.file("claims.jsonl"),
+            b"denied claim",
+            &denied,
+            Some(403),
+        )
+        .unwrap();
+        assert_eq!(wizard_resume(&home).unwrap(), WizardResume::FirstCheck);
+        assert!(
+            last_claim_denied(&home),
+            "check leaves out the join hint after a denial"
+        );
 
         let certificate = "fictional certificate";
         let ca = "fictional certificate authority";
