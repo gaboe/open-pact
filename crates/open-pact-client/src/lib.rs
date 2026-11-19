@@ -692,8 +692,17 @@ impl Home {
         VPN_FILES
             .iter()
             .any(|name| home_fs::exists(&self.file(name)))
-            || home_fs::list(&self.file(VPN_DIR))
-                .is_ok_and(|entries| entries.iter().any(|entry| entry.name != "write.lock"))
+            || {
+                let vpn = self.file(VPN_DIR);
+                match home_fs::list(&vpn) {
+                    Ok(entries) => entries.iter().any(|entry| entry.name != "write.lock"),
+                    // Under a protection a refused listing, such as a link, is not proof of an
+                    // empty folder: count the pair as present so the removal fails loudly.
+                    Err(error) => {
+                        error.kind() != std::io::ErrorKind::NotFound && home_fs::is_protected(&vpn)
+                    }
+                }
+            }
     }
 
     /// Records the intent to delete, durably: the file and then its directory entry reach disk
@@ -907,7 +916,7 @@ impl Home {
 
     #[cfg(windows)]
     fn recover_vpn_at_startup(&self) -> Result<bool> {
-        if !self.file(VPN_DIR).exists() && !self.vpn_removal_pending() {
+        if !home_fs::exists(&self.file(VPN_DIR)) && !self.vpn_removal_pending() {
             return Ok(true);
         }
         let Some(_lock) = self.try_lock_vpn()? else {
@@ -920,7 +929,7 @@ impl Home {
     #[cfg(windows)]
     fn recover_vpn(&self) -> Result<()> {
         // A command such as uninstall must not recreate a missing home.
-        if !self.file(VPN_DIR).exists() && !self.vpn_removal_pending() {
+        if !home_fs::exists(&self.file(VPN_DIR)) && !self.vpn_removal_pending() {
             return Ok(());
         }
         let _lock = self.lock_vpn()?;
@@ -4887,11 +4896,15 @@ pub async fn run(cli: Invocation, executable: &Path) -> Result<ExitCode> {
 }
 
 /// Whether the command repairs an interrupted VPN installation before it runs. A command that only
-/// reads, or that promises to write no file, does not.
+/// reads, or that promises to write no file, does not. The SYSTEM job does not either: its tick
+/// recovers under the protection of the home, and nothing may open the user home before that.
 pub fn recovers_vpn_first(command: &Command) -> bool {
     !matches!(
         command,
         Command::Status(_)
+            | Command::Schedule {
+                command: schedule::Command::Run { system: true, .. }
+            }
             | Command::Manifest {
                 command: ManifestCommand::Show | ManifestCommand::Check { .. }
             }
@@ -9229,6 +9242,43 @@ grace = "1d"
         });
         assert_eq!(selected_windows_vpn_pair(&home).unwrap()[0], b"CA two");
         home.recover_vpn().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_system_run_never_recovers_through_a_junction_at_the_vpn_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let home = root.join("home");
+        let target = root.join("target");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir_all(target.join("generation-1")).unwrap();
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(home.join(VPN_DIR))
+            .arg(&target)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "mklink /J failed");
+        let cli = Invocation {
+            home: Some(home),
+            insecure_dev: false,
+            command: Command::Schedule {
+                command: schedule::Command::Run {
+                    system: true,
+                    user_home: Some(root.join("user")),
+                },
+            },
+        };
+        // The run may fail; the rule is that it never writes through the link.
+        let _ = run(cli, Path::new("open-pact-client.exe")).await;
+        assert!(
+            !target.join("write.lock").exists(),
+            "the run locked through the junction"
+        );
+        assert!(target.join("generation-1").is_dir());
+        assert_eq!(std::fs::read_dir(&target).unwrap().count(), 1);
     }
 
     #[cfg(windows)]

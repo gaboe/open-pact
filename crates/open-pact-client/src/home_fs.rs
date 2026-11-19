@@ -104,6 +104,13 @@ fn protected(path: &Path) -> Option<io::Result<(Arc<File>, Vec<std::ffi::OsStrin
     })
 }
 
+/// Whether `path` is in a protected home.
+pub(crate) fn is_protected(path: &Path) -> bool {
+    protected_homes()
+        .iter()
+        .any(|protected| names_below(&protected.home, path).is_some())
+}
+
 /// What an open handle says about the name it opened, without following a link.
 #[cfg_attr(not(windows), allow(dead_code))]
 #[derive(Clone, Copy, Debug)]
