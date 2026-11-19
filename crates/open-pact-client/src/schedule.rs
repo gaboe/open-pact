@@ -2089,12 +2089,7 @@ fn read_text_if_exists(path: &Path) -> Result<Option<String>> {
     }
 }
 
-fn windows_observation_script(
-    job: &Job,
-    executable: &Path,
-    source_executable: &Path,
-    expected_args: &str,
-) -> Result<String> {
+fn windows_observation_script(job: &Job, source_executable: &Path) -> Result<String> {
     let query = windows_task_query_script(job);
     Ok(format!(
         r#"function ProgramFilesPath {{ [Environment]::GetFolderPath('ProgramFiles') }}
@@ -2111,10 +2106,12 @@ if ($triggers.Count -eq 1) {{
 if (IsSystemTask $task) {{
 {probe}
 }}
-if ($action.Count -eq 1 -and $action[0].Path -eq {binary} -and $action[0].Arguments -eq {args} -and $task.Enabled -and $triggers.Count -eq 1 -and $triggers[0].Enabled -and $triggers[0].Type -eq 1 -and $triggers[0].Repetition.Interval -eq '{WAKE_ISO}') {{ Write-Output 'matches' }}
+if ($action.Count -eq 1) {{
+    Write-Output ("action_path=" + $action[0].Path)
+    Write-Output ("action_args=" + $action[0].Arguments)
+}}
+if ($action.Count -eq 1 -and $task.Enabled -and $triggers.Count -eq 1 -and $triggers[0].Enabled -and $triggers[0].Type -eq 1 -and $triggers[0].Repetition.Interval -eq '{WAKE_ISO}') {{ Write-Output 'matches' }}
 "#,
-        binary = powershell_literal(text(executable)?),
-        args = powershell_literal(expected_args),
         probe = windows_protected_binary_probe(&powershell_literal(text(source_executable)?)),
     ))
 }
@@ -2198,8 +2195,7 @@ fn observe(
                 .map(|arg| windows_arg(arg))
                 .collect::<Vec<_>>()
                 .join(" ");
-            let script =
-                windows_observation_script(&job, &executable, &source_executable, &expected_args)?;
+            let script = windows_observation_script(&job, &source_executable)?;
             let output = windows_powershell(&script)?;
             let system = output.lines().any(|line| line == "system");
             let field = |name: &str| {
@@ -2226,6 +2222,7 @@ fn observe(
             Observed {
                 exists: output.lines().next() != Some("missing"),
                 matches: output.lines().any(|line| line == "matches")
+                    && windows_action_matches(&output, text(&executable)?, &expected_args)
                     && system == desired.is_some_and(|settings| settings.run_as == RunAs::System),
                 system,
                 leftovers: leftovers || protected_leftovers,
@@ -2234,6 +2231,21 @@ fn observe(
             }
         }
     })
+}
+
+/// Task Scheduler stores the command exactly as `schtasks /TR` got it, so the program comes back
+/// with its quotes (`"C:\\client.exe"`). The paths of Windows ignore case.
+fn windows_action_matches(output: &str, executable: &str, expected_args: &str) -> bool {
+    let field = |name: &str| output.lines().find_map(|line| line.strip_prefix(name));
+    let (Some(path), Some(args)) = (field("action_path="), field("action_args=")) else {
+        return false;
+    };
+    let path = path.trim();
+    let path = path
+        .strip_prefix('"')
+        .and_then(|inner| inner.strip_suffix('"'))
+        .unwrap_or(path);
+    path.eq_ignore_ascii_case(executable) && args.trim().eq_ignore_ascii_case(expected_args)
 }
 
 /// The exact command that makes `change` (such as `schedule off`) from an elevated prompt.
@@ -3062,13 +3074,7 @@ mod tests {
             windows_orphaned_binary_script(&job),
             windows_system_executable_script(),
             windows_protected_binary_script(Path::new("client.exe")).unwrap(),
-            windows_observation_script(
-                &job,
-                Path::new("fixture.exe"),
-                Path::new("source.exe"),
-                "--system",
-            )
-            .unwrap(),
+            windows_observation_script(&job, Path::new("source.exe")).unwrap(),
             windows_require_elevation_script().to_owned(),
         ];
         let helpers = scripts
@@ -4444,19 +4450,57 @@ esac
     #[test]
     fn the_windows_observation_asks_for_the_one_minute_repeat() {
         let job = Job::new(Path::new("client.exe"), Path::new("fixture-home")).unwrap();
-        let script = windows_observation_script(
-            &job,
-            Path::new("client.exe"),
-            Path::new("client.exe"),
-            "--home",
-        )
-        .unwrap();
+        let script = windows_observation_script(&job, Path::new("client.exe")).unwrap();
         assert!(
             script.contains("Repetition.Interval -eq 'PT1M'"),
             "{script}"
         );
         assert!(!script.contains("PT5M"));
         assert!(script.contains("repetition="));
+    }
+
+    #[test]
+    fn a_task_that_schtasks_just_created_matches_its_own_definition() {
+        // What Task Scheduler returns for `schtasks /Create /TR` with the quoted command that
+        // `schtasks_install` sends: the program keeps its quotes.
+        let job = Job::new(
+            Path::new("C:\\work\\open-pact-client.exe"),
+            Path::new("C:\\Users\\a b\\pact"),
+        )
+        .unwrap();
+        let expected = job
+            .argv
+            .iter()
+            .skip(1)
+            .map(|arg| windows_arg(arg))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let output =
+            |path: &str, args: &str| format!("user\naction_path={path}\naction_args={args}\n");
+        let exe = "C:\\work\\open-pact-client.exe";
+        let quoted = output(&format!("\"{exe}\""), &expected);
+        assert!(windows_action_matches(&quoted, exe, &expected));
+        assert!(windows_action_matches(
+            &output(exe, &expected),
+            exe,
+            &expected
+        ));
+        assert!(windows_action_matches(
+            &output("\"c:\\WORK\\open-pact-client.exe\"", &expected),
+            exe,
+            &expected
+        ));
+        assert!(!windows_action_matches(
+            &quoted,
+            "C:\\other\\client.exe",
+            &expected
+        ));
+        assert!(!windows_action_matches(
+            &output(exe, "\"--home\" \"x\""),
+            exe,
+            &expected
+        ));
+        assert!(!windows_action_matches("user\n", exe, &expected));
     }
 
     #[test]
