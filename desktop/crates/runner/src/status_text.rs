@@ -3,7 +3,7 @@
 use crate::text::{Headline, Tone, humanize, readable_local};
 use crate::zone;
 use open_pact_client::ControlReport;
-use open_pact_client::status::{Issue, Report, Verdict};
+use open_pact_client::status::{ClaimEvidence, Issue, Report, Verdict};
 use open_pact_core::timestamp::{parse_rfc3339, seconds};
 use open_pact_core::{ControlValue, DeviceStatus};
 use time::macros::format_description;
@@ -337,6 +337,19 @@ pub fn approval_word(state: DeviceStatus) -> &'static str {
     }
 }
 
+/// Whether the status reports a claim sent after `check_sent_at`, so the check the app kept is
+/// old. A status claim with no sent time, or none at all, supersedes nothing, and an older status
+/// claim does not supersede a newer check.
+pub fn check_is_superseded(check_sent_at: &str, status_claim: Option<&ClaimEvidence>) -> bool {
+    let Some(status_sent) = status_claim.and_then(|claim| claim.sent_at.as_deref()) else {
+        return false;
+    };
+    match (parse_rfc3339(status_sent), parse_rfc3339(check_sent_at)) {
+        (Some(status_at), Some(check_at)) => status_at > check_at,
+        _ => status_sent != check_sent_at,
+    }
+}
+
 /// The join resumes when IT approves a device while the app is closed. A saved "pending" or a
 /// live "approved" with no claim yet means the wizard steps for the first claim are still open.
 /// Returns the automatic-sending choice to resume with.
@@ -420,6 +433,35 @@ mod tests {
             result_control(&unrequired),
             ("Disk encryption".into(), "on".into(), true)
         );
+    }
+
+    #[test]
+    fn a_check_is_superseded_only_by_a_later_status_claim() {
+        let claim = |sent: Option<&str>| {
+            let mut claim = samples::report_good().last_claim.unwrap();
+            claim.sent_at = sent.map(str::to_owned);
+            claim
+        };
+        let kept = "2026-11-16T10:53:00Z";
+        // The same instant written with another offset is the same claim.
+        assert!(!check_is_superseded(kept, Some(&claim(Some(kept)))));
+        assert!(!check_is_superseded(
+            "2026-11-16T11:53:00+01:00",
+            Some(&claim(Some(kept)))
+        ));
+        // A status claim from before the check does not supersede it.
+        assert!(!check_is_superseded(
+            "2026-11-16T11:48:00Z",
+            Some(&claim(Some(kept)))
+        ));
+        // A later status claim supersedes the check.
+        assert!(check_is_superseded(
+            kept,
+            Some(&claim(Some("2026-11-16T14:10:35Z")))
+        ));
+        // Without a status claim, or without its sent time, nothing is superseded.
+        assert!(!check_is_superseded(kept, None));
+        assert!(!check_is_superseded(kept, Some(&claim(None))));
     }
 
     fn issue(message: &str, command: Option<&str>) -> Issue {
