@@ -34,6 +34,7 @@ const HOME_REMOVE_FILES: &[&str] = &[
     "reports.jsonl.tmp",
     JOB_LOG,
     "schedule.log.1",
+    JOB_REFRESH,
 ];
 /// How often the OS wakes the job. Each wake costs one process start and one probe; the check and
 /// send periods come from the signed manifest, and a wake with nothing due exits at once.
@@ -43,6 +44,8 @@ const WAKE_SECS: u32 = WAKE_MINUTES * 60;
 const WAKE_ISO: &str = "PT1M";
 const REPO_SCAN_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const LOCK: &str = "report-schedule.lock";
+/// The client version and path that last compared the job with its own definition.
+const JOB_REFRESH: &str = "job-refresh.json";
 
 /// The `schedule` commands of the CLI, without the parser.
 #[derive(Clone, Debug)]
@@ -1120,6 +1123,8 @@ fn register(job: &Job, action: RegistrationAction) -> Result<()> {
                 std::fs::write(&timer, job.timer())?;
                 execute("systemctl", &["--user", "daemon-reload"])?;
                 execute("systemctl", &["--user", "enable", "--now", &timer_name])?;
+                // `enable --now` leaves a running timer on its old period.
+                execute("systemctl", &["--user", "restart", &timer_name])?;
             } else if timer.exists()
                 || service.exists()
                 || systemd_status(&timer_name, "is-active")?
@@ -2676,6 +2681,112 @@ async fn run_tick(
     .await
 }
 
+/// A client update leaves the OS job on the definition the old client wrote. The wake run
+/// compares the job with the definition this client would install, as `schedule on` does, and
+/// rewrites it when they differ. It only follows the owner's choice: nothing happens while
+/// automatic sending is off, for a SYSTEM job, without a signed schedule, or when the job is gone.
+/// The check runs once for each client version and path, so a wake costs no extra process start.
+/// `true` when it rewrote the job.
+fn refresh_job(home: &Home, executable: &Path) -> Result<bool> {
+    refresh_job_with(
+        home,
+        executable,
+        |desired| observe(home, Some(desired), false, executable),
+        rewrite_job,
+    )
+}
+
+fn refresh_job_with(
+    home: &Home,
+    executable: &Path,
+    observe_job: impl FnOnce(&Applied) -> Result<Observed>,
+    rewrite: impl FnOnce(&Job) -> Result<()>,
+) -> Result<bool> {
+    let config = DeviceConfig::load(home)?;
+    if !config.auto_send || config.run_as != RunAs::User {
+        return Ok(false);
+    }
+    if !home
+        .signed_manifest()
+        .is_ok_and(|manifest| manifest.body().schedule.is_some())
+    {
+        return Ok(false);
+    }
+    let known = format!("{} {}", env!("CARGO_PKG_VERSION"), executable.display());
+    if home
+        .read_json::<String>(JOB_REFRESH)
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some(known.as_str())
+    {
+        return Ok(false);
+    }
+    let desired = Applied {
+        run_as: RunAs::User,
+        executable: executable.to_path_buf(),
+        user_home: None,
+    };
+    let observed = observe_job(&desired)?;
+    let applied = read_applied(home)?;
+    let stale =
+        observed.exists && reconcile(Some(&desired), applied.as_ref(), &observed) == Change::Update;
+    // A failed rewrite is not retried every minute: `status` and `check` keep reporting the job.
+    save(home, JOB_REFRESH, &known)?;
+    if !stale {
+        return Ok(false);
+    }
+    rewrite(&Job::new(executable, &home.0)?)?;
+    save(home, APPLIED, &desired)?;
+    Ok(true)
+}
+
+fn rewrite_job(job: &Job) -> Result<()> {
+    if crate::current_os()? != open_pact_core::Os::Macos {
+        return register(job, RegistrationAction::Install(TaskRunAs::CurrentUser));
+    }
+    let path = user_home()?
+        .join("Library/LaunchAgents")
+        .join(format!("{}.plist", job.id));
+    let domain = launch_domain()?;
+    macos_rewrite(job, &path, &domain, |args| {
+        // A helper that an earlier failed rewrite left behind would make `submit` fail.
+        let _ = std::process::Command::new("launchctl")
+            .args(["remove", args[2]])
+            .output();
+        execute("launchctl", args)
+    })
+}
+
+fn shell_quote(raw: &str) -> String {
+    format!("'{}'", raw.replace('\'', "'\"'\"'"))
+}
+
+/// launchd stops the running job when it boots the job out, and that would stop this process
+/// before it boots the job in again. So a separate launchd job (`launchctl submit`, which a job
+/// that exits does not take down) waits for this run to end, boots out the old definition and
+/// boots in the new one. The file is written after the helper is queued: if the helper cannot
+/// be queued, the job keeps its old file and the next version tries again.
+fn macos_rewrite(
+    job: &Job,
+    path: &Path,
+    domain: &str,
+    submit: impl FnOnce(&[&str]) -> Result<()>,
+) -> Result<()> {
+    let target = format!("{domain}/{}", job.id);
+    let helper = format!("{}.refresh", job.id);
+    let plist = text(path)?;
+    let script = format!(
+        "sleep 2; launchctl bootout {target}; test -f {plist} && launchctl bootstrap {domain} {plist}; launchctl remove {helper}",
+        target = shell_quote(&target),
+        plist = shell_quote(plist),
+        domain = shell_quote(domain),
+        helper = shell_quote(&helper),
+    );
+    submit(&["submit", "-l", &helper, "--", "/bin/sh", "-c", &script])?;
+    std::fs::write(path, job.plist()).with_context(|| format!("write {}", path.display()))
+}
+
 async fn operate(
     home: &Home,
     command: Operation,
@@ -2765,6 +2876,17 @@ async fn operate(
             let result = run_tick(&home, &state_home, user_home.as_deref(), executable).await;
             if let Err(error) = &result {
                 job_log(&home, &format!("error: {error:#}"));
+            }
+            // Last, because the macOS reload ends this process.
+            if !system_run {
+                match refresh_job(&home, executable) {
+                    Ok(true) => job_log(
+                        &home,
+                        "The job ran an older definition. This client rewrote it.",
+                    ),
+                    Ok(false) => {}
+                    Err(error) => job_log(&home, &format!("error: job refresh: {error:#}")),
+                }
             }
             result?;
         }
@@ -2969,6 +3091,8 @@ case "$1" in
   print) test -f "$OPEN_PACT_MOCK/loaded" ;;
   bootstrap) echo bootstrap >> "$OPEN_PACT_MOCK/changes"; touch "$OPEN_PACT_MOCK/loaded" ;;
   bootout) echo bootout >> "$OPEN_PACT_MOCK/changes"; rm -f "$OPEN_PACT_MOCK/loaded" ;;
+  submit) echo submit >> "$OPEN_PACT_MOCK/changes" ;;
+  remove) ;;
   *) exit 99 ;;
 esac
 "#,
@@ -3073,6 +3197,34 @@ esac
         run(&["finish"], false, "unrecognized subcommand");
         run(&["config", "example"], false, "unrecognized subcommand");
         assert_eq!(std::fs::read(root.path().join("changes")).unwrap(), changes);
+        // The wake of a job that an older client wrote: five minutes, rewritten once.
+        let plist_path = user
+            .join("Library/LaunchAgents")
+            .read_dir()
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let current = std::fs::read_to_string(&plist_path).unwrap();
+        assert!(current.contains(NEW_WAKE));
+        let old = current.replace(NEW_WAKE, OLD_WAKE);
+        std::fs::write(&plist_path, &old).unwrap();
+        let submits = |changes: &[u8]| String::from_utf8_lossy(changes).matches("submit").count();
+        let before = std::fs::read(root.path().join("changes")).unwrap();
+        run(&["schedule", "run"], true, "");
+        assert_eq!(std::fs::read_to_string(&plist_path).unwrap(), current);
+        let after = std::fs::read(root.path().join("changes")).unwrap();
+        assert_eq!(submits(&after), submits(&before) + 1);
+        run(&["schedule", "run"], true, "");
+        assert_eq!(std::fs::read_to_string(&plist_path).unwrap(), current);
+        assert_eq!(std::fs::read(root.path().join("changes")).unwrap(), after);
+        // A job the owner turned off stays as it is.
+        run(&["schedule", "off"], true, "schedule: remove");
+        std::fs::write(&plist_path, &old).unwrap();
+        run(&["schedule", "run"], true, "");
+        assert_eq!(std::fs::read_to_string(&plist_path).unwrap(), old);
+        assert!(!home.file(JOB_REFRESH).exists());
         std::fs::remove_dir_all(&path).unwrap();
         run(&["schedule", "off"], true, "schedule: remove");
         assert!(
@@ -3970,6 +4122,154 @@ esac
                 "{unconfirmed:?}"
             );
         }
+    }
+
+    const OLD_WAKE: &str = "<integer>300</integer>";
+    const NEW_WAKE: &str = "<integer>60</integer>";
+
+    /// A home that agreed to the signed schedule and a LaunchAgent file in `dir` that still has
+    /// the five-minute wake an older client wrote.
+    fn stale_launch_agent(dir: &Path) -> (Home, PathBuf, Job) {
+        let home = enrolled_home_with_schedule(dir, Some(&vpn_table("127.0.0.1:1")));
+        agree(&home);
+        let job = Job::new(Path::new("/opt/open-pact/open-pact-client"), &home.0).unwrap();
+        let plist = dir.join("agent.plist");
+        std::fs::write(&plist, job.plist().replace(NEW_WAKE, OLD_WAKE)).unwrap();
+        (home, plist, job)
+    }
+
+    /// What `observe` reads from the file on macOS, without `launchctl`.
+    fn observed_file(plist: &Path, job: &Job) -> Result<Observed> {
+        let stored = read_text_if_exists(plist)?;
+        Ok(Observed {
+            exists: stored.is_some(),
+            matches: stored.as_deref() == Some(job.plist().as_str()),
+            ..Observed::default()
+        })
+    }
+
+    fn wake(
+        home: &Home,
+        plist: &Path,
+        job: &Job,
+        submitted: &std::cell::RefCell<Vec<String>>,
+    ) -> Result<bool> {
+        refresh_job_with(
+            home,
+            Path::new("/opt/open-pact/open-pact-client"),
+            |_| observed_file(plist, job),
+            |job| {
+                macos_rewrite(job, plist, "gui/501", |args| {
+                    submitted.borrow_mut().push(args.join(" "));
+                    Ok(())
+                })
+            },
+        )
+    }
+
+    #[test]
+    fn a_wake_rewrites_a_five_minute_launch_agent_to_one_minute_and_twice_is_the_same_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, plist, job) = stale_launch_agent(dir.path());
+        let submitted = std::cell::RefCell::new(Vec::new());
+        assert!(wake(&home, &plist, &job, &submitted).unwrap());
+        let rewritten = std::fs::read_to_string(&plist).unwrap();
+        assert!(rewritten.contains(NEW_WAKE) && !rewritten.contains(OLD_WAKE));
+        assert_eq!(rewritten, job.plist());
+        assert_eq!(submitted.borrow().len(), 1);
+        assert!(
+            submitted.borrow()[0].contains(&format!("bootout 'gui/501/{}'", job.id)),
+            "{:?}",
+            submitted.borrow()
+        );
+        assert_eq!(read_applied(&home).unwrap().unwrap().run_as, RunAs::User);
+        // The same version does not look again; a forgotten mark still finds nothing to change.
+        assert!(!wake(&home, &plist, &job, &submitted).unwrap());
+        remove_if_exists(&home.file(JOB_REFRESH)).unwrap();
+        assert!(!wake(&home, &plist, &job, &submitted).unwrap());
+        assert_eq!(std::fs::read_to_string(&plist).unwrap(), rewritten);
+        assert_eq!(submitted.borrow().len(), 1);
+    }
+
+    #[test]
+    fn a_wake_leaves_a_job_the_owner_turned_off_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, plist, job) = stale_launch_agent(dir.path());
+        let mut config = DeviceConfig::load(&home).unwrap();
+        config.auto_send = false;
+        config.save(&home).unwrap();
+        let submitted = std::cell::RefCell::new(Vec::new());
+        assert!(!wake(&home, &plist, &job, &submitted).unwrap());
+        assert!(std::fs::read_to_string(&plist).unwrap().contains(OLD_WAKE));
+        assert!(submitted.borrow().is_empty());
+        assert!(!home.file(JOB_REFRESH).exists());
+        assert!(!home.file(APPLIED).exists());
+    }
+
+    #[test]
+    fn a_wake_does_not_widen_what_the_owner_agreed_to() {
+        // No signed schedule, a SYSTEM choice and a vanished job all leave the file as it is.
+        let submitted = std::cell::RefCell::new(Vec::new());
+        let dir = tempfile::tempdir().unwrap();
+        let (home, plist, job) = stale_launch_agent(dir.path());
+        enrolled_home_with_schedule(dir.path(), Some(""));
+        assert!(!wake(&home, &plist, &job, &submitted).unwrap());
+
+        let dir = tempfile::tempdir().unwrap();
+        let (home, plist, job) = stale_launch_agent(dir.path());
+        let mut config = DeviceConfig::load(&home).unwrap();
+        config.run_as = RunAs::System;
+        config.save(&home).unwrap();
+        assert!(!wake(&home, &plist, &job, &submitted).unwrap());
+
+        let dir = tempfile::tempdir().unwrap();
+        let (home, plist, job) = stale_launch_agent(dir.path());
+        std::fs::remove_file(&plist).unwrap();
+        assert!(!wake(&home, &plist, &job, &submitted).unwrap());
+        assert!(!plist.exists(), "a missing job is not installed by a wake");
+
+        assert!(submitted.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_launch_agent_keeps_its_old_file_when_the_reload_cannot_be_queued() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, plist, job) = stale_launch_agent(dir.path());
+        let old = std::fs::read_to_string(&plist).unwrap();
+        let failed = refresh_job_with(
+            &home,
+            Path::new("/opt/open-pact/open-pact-client"),
+            |_| observed_file(&plist, &job),
+            |job| macos_rewrite(job, &plist, "gui/501", |_| bail!("launchd refused")),
+        );
+        assert!(failed.is_err());
+        assert_eq!(std::fs::read_to_string(&plist).unwrap(), old);
+        let submitted = std::cell::RefCell::new(Vec::new());
+        assert!(
+            !wake(&home, &plist, &job, &submitted).unwrap(),
+            "one attempt for each client version"
+        );
+    }
+
+    #[test]
+    fn the_reload_script_quotes_paths_for_the_shell() {
+        assert_eq!(shell_quote("a'b c"), "'a'\"'\"'b c'");
+        let job = Job::new(Path::new("/opt/o p/client"), Path::new("/tmp/it's home")).unwrap();
+        let submitted = std::cell::RefCell::new(Vec::new());
+        let dir = tempfile::tempdir().unwrap();
+        let plist = dir.path().join("it's.plist");
+        macos_rewrite(&job, &plist, "gui/501", |args| {
+            submitted
+                .borrow_mut()
+                .extend(args.iter().map(|a| a.to_string()));
+            Ok(())
+        })
+        .unwrap();
+        let args = submitted.borrow();
+        assert_eq!(&args[..2], ["submit", "-l"]);
+        let script = args.last().unwrap();
+        assert!(script.contains("it'\"'\"'s.plist"), "{script}");
+        assert!(script.ends_with(&format!("launchctl remove '{}.refresh'", job.id)));
     }
 
     #[test]
