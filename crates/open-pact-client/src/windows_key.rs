@@ -312,7 +312,7 @@ impl WindowsKey {
     fn delete_with_provider(home: &Path, name: &str) -> Result<()> {
         let result = (|| {
             let marker = home.join(super::TPM_FILE);
-            let id = String::from_utf8(crate::read_home_file(&marker)?)?;
+            let id = String::from_utf8(crate::home_fs::read(&marker)?)?;
             ensure!(
                 !id.contains('\0') && id.starts_with("open-pact-"),
                 "invalid TPM key name"
@@ -343,7 +343,7 @@ impl WindowsKey {
     }
 
     fn load_with_provider(home: &Path, name: &str) -> Result<Self> {
-        let id = String::from_utf8(crate::read_home_file(&home.join(super::TPM_FILE))?)?;
+        let id = String::from_utf8(crate::home_fs::read(&home.join(super::TPM_FILE))?)?;
         ensure!(
             !id.contains('\0') && id.starts_with("open-pact-"),
             "invalid TPM key name"

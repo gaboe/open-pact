@@ -145,7 +145,7 @@ pub(crate) fn absolute_folder(raw: &Path, user_home: Option<&Path>) -> Result<Pa
 }
 
 fn legacy_value(home: &Home) -> Option<toml::Value> {
-    let bytes = crate::read_home_file(&home.file(LEGACY_FILE)).ok()?;
+    let bytes = crate::home_fs::read(&home.file(LEGACY_FILE)).ok()?;
     Some(toml::Value::Table(
         String::from_utf8(bytes)
             .ok()

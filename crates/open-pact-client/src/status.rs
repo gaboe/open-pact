@@ -257,7 +257,7 @@ async fn collect_with(
         );
     }
     let (enrolment, manifest) =
-        match read_generation(|file| match crate::read_home_file(&home.file(file)) {
+        match read_generation(|file| match crate::home_fs::read(&home.file(file)) {
             Ok(bytes) => Ok(Some(bytes)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error.into()),

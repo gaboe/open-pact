@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -43,12 +43,7 @@ fn open(home: &Home) -> Result<Option<File>> {
     }
     let path = home.file(LOCK);
     Ok(Some(
-        OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&path)
+        crate::home_fs::open(&path, crate::home_fs::Open::Lock)
             .with_context(|| path.display().to_string())?,
     ))
 }
@@ -173,7 +168,7 @@ pub(crate) async fn prepare(
     if home.has_legacy_log_head() {
         return Err(LegacyLogHead.into());
     }
-    let manifest_toml = String::from_utf8(std::fs::read(home.file("manifest.toml"))?)
+    let manifest_toml = String::from_utf8(crate::home_fs::read(&home.file("manifest.toml"))?)
         .context("manifest.toml is not UTF-8")?;
     let manifest = Manifest::parse(manifest_toml.as_bytes())?;
     if manifest.hash() != &enrolment.manifest {
@@ -272,7 +267,7 @@ pub(crate) async fn scan_if_due(
     user_home: Option<&Path>,
     age: Duration,
 ) -> Result<()> {
-    let Ok(text) = std::fs::read(home.file("manifest.toml")) else {
+    let Ok(text) = crate::home_fs::read(&home.file("manifest.toml")) else {
         return Ok(());
     };
     let Ok(manifest) = Manifest::parse(&text) else {
@@ -666,8 +661,9 @@ impl Prepared {
                     println!("  warning: {w}");
                 }
                 crate::print_hints(manifest, &claim.results, os);
-                let vpn_key =
-                    KeyPair::from_pem(&std::fs::read_to_string(home.file("vpn-key.pem"))?)?;
+                let vpn_key = KeyPair::from_pem(std::str::from_utf8(&crate::home_fs::read(
+                    &home.file("vpn-key.pem"),
+                )?)?)?;
                 let certificate_pem = certificate_pem.context(
                     "the accepted response carries no VPN certificate for the request this check sent; the installed ones are kept",
                 )?;
