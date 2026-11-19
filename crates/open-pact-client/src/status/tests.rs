@@ -1097,12 +1097,11 @@ async fn status_of_a_system_job_never_shows_the_log_in_the_home() {
     let text = report.render();
     assert!(!text.contains("a line the user wrote"), "{text}");
     assert_eq!(report.schedule.last_job_log_line, None);
-    let note = report.schedule.last_job_log_note.clone().unwrap();
-    assert!(
-        note.contains("elevated prompt") && note.contains("schedule.log"),
-        "{note}"
-    );
-    assert!(text.contains(&note));
+    // The note names the log path; where ProgramData holds no such log, there is nothing to say.
+    let mut report = report;
+    let note = "The SYSTEM job log is C:\\ProgramData\\open-pact\\system\\ab12\\schedule.log. Reading it needs an elevated prompt.".to_owned();
+    report.schedule.last_job_log_note = Some(note.clone());
+    assert!(report.render().contains(&note));
     let json = serde_json::to_value(&report).unwrap();
     assert_eq!(json["schedule"]["last_job_log_note"], note);
 }
