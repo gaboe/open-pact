@@ -372,8 +372,8 @@ mod sys {
         FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
         FileDispositionInfo, FileDispositionInfoEx, FileFullDirectoryInfo,
         FileFullDirectoryRestartInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
-        GetFinalPathNameByHandleW, OPEN_EXISTING, SYNCHRONIZE, SetFileInformationByHandle,
-        VOLUME_NAME_DOS,
+        GetFinalPathNameByHandleW, GetLongPathNameW, OPEN_EXISTING, SYNCHRONIZE,
+        SetFileInformationByHandle, VOLUME_NAME_DOS,
     };
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -445,6 +445,27 @@ mod sys {
         }
     }
 
+    /// The path with every short 8.3 name written in full. It looks up names only and resolves no
+    /// link, so a junction in the path stays in the answer.
+    fn long_path(path: &Path) -> io::Result<String> {
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        let mut buffer = vec![0u16; 512];
+        loop {
+            // SAFETY: `wide` is NUL-terminated and the buffer holds `buffer.len()` UTF-16 units.
+            let length = unsafe {
+                GetLongPathNameW(wide.as_ptr(), buffer.as_mut_ptr(), buffer.len() as u32)
+            } as usize;
+            if length == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if length < buffer.len() {
+                return String::from_utf16(&buffer[..length])
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "path is not UTF-16"));
+            }
+            buffer.resize(length + 1, 0);
+        }
+    }
+
     /// Opens the home by its path and checks that neither it nor any folder above it is a link:
     /// the path Windows resolved must be the path the job was given.
     pub(super) fn open_root(path: &Path) -> io::Result<File> {
@@ -467,10 +488,9 @@ mod sys {
         // SAFETY: `handle` is a new open handle that only this `File` owns.
         let root = unsafe { File::from_raw_handle(handle as _) };
         check(opened(&root)?, Kind::Directory)?;
-        let expected = path
-            .to_str()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "home path is not UTF-8"))?;
-        if !same_path(&final_path(&root)?, expected) {
+        // A short 8.3 name, such as RUNNER~1 in a temporary folder, is not a link.
+        let expected = long_path(path)?;
+        if !same_path(&final_path(&root)?, &expected) {
             return Err(refused("a link leads to the client home"));
         }
         Ok(root)
