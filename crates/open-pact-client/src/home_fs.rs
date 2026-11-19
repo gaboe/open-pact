@@ -9,12 +9,13 @@
 //! and a folder where a file belongs, before it reads or changes anything. The job's own log goes
 //! to the protected state folder instead (`job_log_home`).
 //!
-//! Without a protection, each operation is the one of `std::fs`, and a read still refuses a
-//! reparse point on Windows.
+//! Without a protection, each operation is the one of `std::fs`: a user run follows a link as
+//! `std::fs` does.
 
 use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::fs::File;
-use std::io::{self, Read};
+use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -174,32 +175,56 @@ pub(crate) enum Open {
 pub(crate) fn read(path: &Path) -> io::Result<Vec<u8>> {
     #[cfg(windows)]
     if let Some(target) = protected(path) {
+        use std::io::Read;
         let (root, names) = target?;
         let mut file = sys::open_file(&root, &names, sys::Access::Read)?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
         return Ok(bytes);
     }
+    std::fs::read(path)
+}
+
+/// One name in a folder, and whether it is a folder. A link is no folder.
+#[derive(Debug)]
+pub(crate) struct Entry {
+    pub(crate) name: OsString,
+    pub(crate) directory: bool,
+}
+
+/// The names in a folder of the home. In a protected home they come through the checked folder
+/// handle, so a link at the folder or above it stops the listing; a link inside is no folder.
+pub(crate) fn list(path: &Path) -> io::Result<Vec<Entry>> {
     #[cfg(windows)]
-    {
-        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(0x00200000) // FILE_FLAG_OPEN_REPARSE_POINT
-            .open(path)?;
-        if file.metadata()?.file_attributes() & 0x400 != 0 {
-            return Err(refused("home file is a reparse point"));
-        }
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
-        Ok(bytes)
+    if let Some(target) = protected(path) {
+        let (root, names) = target?;
+        let folder = sys::open_dir(&root, &names, sys::Folder::Open)?;
+        return Ok(sys::entries(&folder)?
+            .into_iter()
+            .map(|(name, directory)| Entry { name, directory })
+            .collect());
     }
-    #[cfg(not(windows))]
-    {
-        let mut bytes = Vec::new();
-        File::open(path)?.read_to_end(&mut bytes)?;
-        Ok(bytes)
+    std::fs::read_dir(path)?
+        .map(|entry| {
+            let entry = entry?;
+            Ok(Entry {
+                name: entry.file_name(),
+                directory: entry.file_type()?.is_dir(),
+            })
+        })
+        .collect()
+}
+
+/// Whether a name exists in the home, a link counting as itself. In a protected home an answer
+/// that cannot be proved, such as a link above the name, counts as existing.
+pub(crate) fn exists(path: &Path) -> bool {
+    #[cfg(windows)]
+    if let Some(target) = protected(path) {
+        return target
+            .and_then(|(root, names)| sys::exists(&root, &names))
+            .unwrap_or(true);
     }
+    std::fs::symlink_metadata(path).is_ok()
 }
 
 /// Opens a file of the home as `how` says.
@@ -326,8 +351,9 @@ mod sys {
         NtSetInformationFile,
     };
     use windows_sys::Win32::Foundation::{
-        ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED, HANDLE, INVALID_HANDLE_VALUE, NTSTATUS,
-        OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING,
+        ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED, ERROR_PATH_NOT_FOUND,
+        HANDLE, INVALID_HANDLE_VALUE, NTSTATUS, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError,
+        UNICODE_STRING,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, CreateFileW, DELETE, FILE_APPEND_DATA,
@@ -524,7 +550,11 @@ mod sys {
         let (name, folders) = names
             .split_last()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "the home is no file"))?;
-        let parent = open_dir(root, folders, Folder::Open)?;
+        open_file_in(&open_dir(root, folders, Folder::Open)?, name, access)
+    }
+
+    /// Opens the file `name` of the open folder `parent`, and checks it before any use.
+    fn open_file_in(parent: &File, name: &OsStr, access: Access) -> io::Result<File> {
         let (rights, disposition) = match access {
             Access::Read => (FILE_GENERIC_READ, FILE_OPEN),
             Access::Delete => (DELETE | FILE_READ_ATTRIBUTES, FILE_OPEN),
@@ -535,7 +565,7 @@ mod sys {
         };
         // The check below reads the attributes, which needs `FILE_READ_ATTRIBUTES`.
         let file = open_at(
-            &parent,
+            parent,
             name,
             rights | FILE_READ_ATTRIBUTES,
             disposition,
@@ -545,12 +575,36 @@ mod sys {
         Ok(file)
     }
 
+    /// Whether `names` lead to an item. The folders on the way are checked; the item is not
+    /// followed, so a link at the last name exists as itself.
+    pub(super) fn exists(root: &File, names: &[OsString]) -> io::Result<bool> {
+        let Some((name, folders)) = names.split_last() else {
+            return Ok(true);
+        };
+        let parent = open_dir(root, folders, Folder::Open)?;
+        match open_at(&parent, name, FILE_READ_ATTRIBUTES, FILE_OPEN, 0) {
+            Ok(_) => Ok(true),
+            Err(error)
+                if matches!(
+                    error.raw_os_error().map(|code| code as u32),
+                    Some(ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND)
+                ) =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Renames the checked file at `names` to `new_name` in the same open folder, replacing a
     /// file there. A folder at `new_name` is never replaced.
     pub(super) fn rename(root: &File, names: &[OsString], new_name: &OsStr) -> io::Result<()> {
-        let folders = &names[..names.len().saturating_sub(1)];
+        let (name, folders) = names
+            .split_last()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "the home is no file"))?;
+        // The file opens from the folder handle that the rename uses: no second walk from the root.
         let parent = open_dir(root, folders, Folder::Open)?;
-        let file = open_file(root, names, Access::Delete)?;
+        let file = open_file_in(&parent, name, Access::Delete)?;
         let name: Vec<u16> = new_name.encode_wide().collect();
         if name.is_empty()
             || name
@@ -1052,5 +1106,98 @@ mod tests {
         assert!(protect(&home, &state).is_err());
         assert!(protect(&home.join("inner"), &state).is_err());
         assert!(protect(&target, &state).is_ok());
+    }
+
+    #[test]
+    fn a_listing_names_each_entry_and_whether_it_is_a_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("generation")).unwrap();
+        std::fs::write(dir.path().join("ca.pem"), b"fictional").unwrap();
+        let mut entries: Vec<_> = list(dir.path())
+            .unwrap()
+            .into_iter()
+            .map(|entry| (entry.name, entry.directory))
+            .collect();
+        entries.sort();
+        assert_eq!(
+            entries,
+            [
+                (OsString::from("ca.pem"), false),
+                (OsString::from("generation"), true)
+            ]
+        );
+        assert_eq!(
+            list(&dir.path().join("missing")).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert!(exists(&dir.path().join("ca.pem")));
+        assert!(!exists(&dir.path().join("missing")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_listing_in_a_protected_home_stops_at_a_junction_and_names_a_link_as_no_folder() {
+        let planted = planted();
+        let vpn = planted.home.join("vpn");
+        junction(&vpn, &planted.outside);
+        assert_refused(list(&vpn).map(drop), "reparse point");
+        assert_refused(list(&vpn.join("nested")).map(drop), "reparse point");
+        assert!(exists(&vpn), "a junction exists as itself");
+        assert!(
+            exists(&vpn.join("secret.txt")),
+            "no proof of absence through a link"
+        );
+        std::fs::remove_dir(&vpn).unwrap();
+
+        create_dir_all(&vpn).unwrap();
+        junction(&vpn.join("nested"), &planted.outside);
+        std::fs::write(vpn.join("write.lock"), b"").unwrap();
+        let mut entries: Vec<_> = list(&vpn)
+            .unwrap()
+            .into_iter()
+            .map(|entry| (entry.name, entry.directory))
+            .collect();
+        entries.sort();
+        assert_eq!(
+            entries,
+            [
+                (OsString::from("nested"), false),
+                (OsString::from("write.lock"), false)
+            ]
+        );
+        assert!(exists(&vpn.join("write.lock")));
+        assert!(!exists(&vpn.join("missing")));
+        assert_untouched(&planted);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_rename_opens_its_source_from_the_open_folder_and_refuses_a_link_there() {
+        let planted = planted();
+        let folder = planted.home.join("vpn");
+        create_dir_all(&folder).unwrap();
+        let source = folder.join(".ca.pem.tmp");
+        std::io::Write::write_all(&mut open(&source, Open::CreateNew).unwrap(), b"new").unwrap();
+        rename(&source, &folder.join("ca.pem")).unwrap();
+        assert_eq!(read(&folder.join("ca.pem")).unwrap(), b"new");
+        assert_eq!(
+            rename(&source, &folder.join("other.pem"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_untouched(&planted);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_vpn_sweep_of_a_system_job_stops_at_a_junction_instead_of_listing_through_it() {
+        let planted = planted();
+        let home = crate::Home(planted.home.clone());
+        let vpn = planted.home.join("vpn");
+        junction(&vpn, &planted.outside);
+        let error = home.remove_vpn_leftovers(&vpn).unwrap_err();
+        assert!(format!("{error:#}").contains("reparse point"), "{error:#}");
+        assert_untouched(&planted);
     }
 }

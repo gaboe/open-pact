@@ -272,15 +272,14 @@ pub(crate) fn store(home: &Path, scan: &RepoScan) -> Result<()> {
 }
 
 fn remove_stale_cache_temps(home: &Path) -> Result<()> {
-    let entries = match fs::read_dir(home) {
+    let entries = match crate::home_fs::list(home) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error).with_context(|| home.display().to_string()),
     };
     let prefix = format!(".{FILE}.");
     for entry in entries {
-        let entry = entry?;
-        let name = entry.file_name();
+        let name = entry.name;
         let Some(name) = name.to_str() else {
             continue;
         };
@@ -296,7 +295,7 @@ fn remove_stale_cache_temps(home: &Path) -> Result<()> {
         if uuid.hyphenated().to_string() != name[prefix.len()..name.len() - 4] {
             continue;
         }
-        let path = entry.path();
+        let path = home.join(name);
         let Ok(metadata) = fs::symlink_metadata(&path) else {
             continue;
         };

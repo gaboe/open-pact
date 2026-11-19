@@ -7,7 +7,7 @@ use open_pact_core::{DeviceStatus, Manifest, ManifestHash, verify_claim};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-use crate::device_config::DeviceConfig;
+use crate::device_config::{DeviceConfig, RunAs};
 use crate::schedule::JobStatus;
 use crate::{Enrolment, Home, Pins, PublishedManifest, Response, locallog};
 
@@ -84,6 +84,9 @@ pub struct ScheduleEvidence {
     pub last_scheduled_claim: Option<ScheduledClaim>,
     pub last_job_note: Option<String>,
     pub last_job_log_line: Option<String>,
+    /// Why `last_job_log_line` is empty although a SYSTEM job writes a log: only an elevated
+    /// prompt reads it.
+    pub last_job_log_note: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -152,6 +155,27 @@ pub(crate) async fn run(
     Ok(ExitCode::from(report.exit_code))
 }
 
+/// The SYSTEM job log and, when it cannot be read, the one line that says where it is.
+fn read_system_job_log(path: Result<std::path::PathBuf>) -> (Option<String>, Option<String>) {
+    let note = |place: String| {
+        format!("The SYSTEM job log is {place}. Reading it needs an elevated prompt.")
+    };
+    match path {
+        Ok(path) => match std::fs::read_to_string(&path) {
+            Ok(text) => (Some(text), None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (None, None),
+            Err(_) => (None, Some(note(path.display().to_string()))),
+        },
+        Err(_) => (
+            None,
+            Some(note(
+                r"schedule.log in the SYSTEM state folder below C:\ProgramData\open-pact\system"
+                    .into(),
+            )),
+        ),
+    }
+}
+
 async fn collect(
     home: &Home,
     online: bool,
@@ -189,10 +213,17 @@ async fn collect_with(
             None
         })
         .unwrap_or_default();
-    let job_log = home.read_text("schedule.log").unwrap_or_else(|error| {
-        damaged.push(("schedule.log", error));
-        None
-    });
+    // A SYSTEM job writes its log to a folder that only administrators read. The log in the home is
+    // not its log: a user can write there.
+    let (job_log, job_log_note) = if config.run_as == RunAs::System {
+        read_system_job_log(crate::schedule::system_job_log_path(home))
+    } else {
+        let log = home.read_text("schedule.log").unwrap_or_else(|error| {
+            damaged.push(("schedule.log", error));
+            None
+        });
+        (log, None)
+    };
     let config_damaged = damaged.iter().any(|(file, _)| *file == "device.json");
     let tick_damaged = damaged.iter().any(|(file, _)| *file == "report-state.json");
     let mut report = Report {
@@ -222,6 +253,7 @@ async fn collect_with(
                 .and_then(|time| OffsetDateTime::from_unix_timestamp(time).ok())
                 .map(|time| ScheduledClaim { answered_at: timestamp(time), response: None }),
             last_job_note: tick.last_note.clone(),
+            last_job_log_note: job_log_note,
             last_job_log_line: job_log.and_then(|text| text.lines().rev().find(|line| !line.trim().is_empty()).map(|line| line.chars().take(512).collect())),
         },
         log: "not verified by status; manual alarms are not saved".into(),
@@ -1048,6 +1080,9 @@ impl Report {
         }
         if let Some(line) = &self.schedule.last_job_log_line {
             lines.push(format!("Last job log line (saved): {line}"));
+        }
+        if let Some(note) = &self.schedule.last_job_log_note {
+            lines.push(note.clone());
         }
         lines.join("\n")
     }

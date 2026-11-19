@@ -965,6 +965,29 @@ fn schedule_home(path: &Path, allow_missing: bool) -> Result<PathBuf> {
     }
 }
 
+/// Fails closed when a link leads to the `--home` of a SYSTEM run. Install stored the resolved
+/// path, so a home that resolves elsewhere now is a junction or symbolic link that a user planted
+/// in the home or above it. Nothing may open the target, not even to create a lock.
+fn require_home_without_link(given: &Path, resolved: &Path) -> Result<()> {
+    if home_resolves_to_itself(given, resolved) {
+        return Ok(());
+    }
+    bail!(
+        "refuse the client home {}: a link leads to {}",
+        given.display(),
+        resolved.display()
+    )
+}
+
+/// Whether `resolved`, from `std::fs::canonicalize`, names `given`. Windows paths ignore case, and
+/// the `\\?\` prefix does not count, so the form that install stored passes.
+fn home_resolves_to_itself(given: &Path, resolved: &Path) -> bool {
+    match (given.to_str(), resolved.to_str()) {
+        (Some(given), Some(resolved)) => crate::home_fs::same_path(resolved, given),
+        _ => false,
+    }
+}
+
 fn normalize_absolute_path(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {
@@ -1226,6 +1249,23 @@ public static class OpenPactNative {
     }
 }
 "#;
+
+/// The job log of the SYSTEM job of `home`, in its protected state folder. It is computed from
+/// `ProgramData` and the home, so no process starts and no elevation is needed to name it.
+pub(crate) fn system_job_log_path(home: &Home) -> Result<PathBuf> {
+    let absolute = schedule_home(&home.0, true)?;
+    let program_data = std::env::var_os("ProgramData").context("ProgramData is not set")?;
+    system_job_log_in(Path::new(&program_data), &absolute)
+}
+
+fn system_job_log_in(program_data: &Path, absolute: &Path) -> Result<PathBuf> {
+    let hash = hex::encode(Sha256::digest(text(absolute)?.as_bytes()));
+    Ok(program_data
+        .join("open-pact")
+        .join("system")
+        .join(hash)
+        .join(JOB_LOG))
+}
 
 fn windows_protected_paths(
     home: &Home,
@@ -2449,6 +2489,9 @@ async fn operate(
     }
     let uninstall = matches!(&command, Operation::Uninstall { .. });
     let absolute = schedule_home(&home.0, uninstall)?;
+    if system_run {
+        require_home_without_link(&home.0, &absolute)?;
+    }
     let home = Home(absolute);
     let system_install = matches!(&command, Operation::Install { system: true, .. });
     if let Operation::Install {
@@ -5418,6 +5461,67 @@ Write-Output 'refused'
             JOB_LOG_LIMIT + 1,
             "a small log keeps the old copy as it is"
         );
+    }
+
+    #[test]
+    fn a_system_run_accepts_only_a_home_that_resolves_to_itself() {
+        let stored = Path::new(r"\\?\C:\Users\Example\pact");
+        assert!(home_resolves_to_itself(stored, stored));
+        assert!(home_resolves_to_itself(
+            Path::new(r"C:\Users\Example\pact"),
+            stored
+        ));
+        assert!(home_resolves_to_itself(
+            stored,
+            Path::new(r"\\?\c:\users\example\pact")
+        ));
+        for target in [
+            r"\\?\C:\Windows\System32",
+            r"\\?\C:\Users\Example\pact-other",
+            r"\\?\C:\Users\Example\pact\inner",
+        ] {
+            assert!(
+                !home_resolves_to_itself(stored, Path::new(target)),
+                "{target}"
+            );
+            let error = require_home_without_link(stored, Path::new(target)).unwrap_err();
+            assert!(error.to_string().contains("a link leads to"), "{error}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_system_run_in_a_home_that_is_a_junction_fails_before_any_lock_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let target = root.join("target");
+        let home = root.join("home");
+        std::fs::create_dir(&target).unwrap();
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&home)
+            .arg(&target)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "mklink /J failed");
+        let error = run(
+            &Home(home.clone()),
+            Command::Run {
+                system: true,
+                user_home: Some(root.join("user")),
+            },
+            Path::new("open-pact-client.exe"),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("a link leads to"), "{error:#}");
+        assert_eq!(
+            std::fs::read_dir(&target).unwrap().count(),
+            0,
+            "the run created a file in the junction target"
+        );
+        assert!(!home.join("claim.lock").exists());
     }
 
     #[tokio::test]

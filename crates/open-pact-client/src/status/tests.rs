@@ -1039,3 +1039,70 @@ async fn an_update_notice_is_the_last_text_line_and_a_json_field() {
     assert_eq!(json["update"]["latest"], "0.6.1");
     assert_eq!(json["update"]["command"], "brew upgrade open-pact");
 }
+
+#[test]
+fn a_system_job_log_that_is_readable_gives_its_last_line_and_no_note() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("schedule.log");
+    std::fs::write(
+        &path,
+        "2026-11-16T09:50:00Z first\n2026-11-16T09:51:00Z last\n",
+    )
+    .unwrap();
+    let (log, note) = read_system_job_log(Ok(path));
+    assert!(log.unwrap().ends_with("last\n"));
+    assert_eq!(note, None);
+    let (log, note) = read_system_job_log(Ok(dir.path().join("missing.log")));
+    assert_eq!((log, note), (None, None));
+}
+
+#[test]
+fn a_system_job_log_that_cannot_be_read_names_its_path_and_asks_for_an_elevated_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    // A folder where the file belongs cannot be read, as a file of administrators cannot.
+    let path = dir.path().join("schedule.log");
+    std::fs::create_dir(&path).unwrap();
+    let (log, note) = read_system_job_log(Ok(path.clone()));
+    assert_eq!(log, None);
+    let note = note.unwrap();
+    assert!(note.contains(&path.display().to_string()), "{note}");
+    assert!(note.contains("elevated prompt"), "{note}");
+    let (log, note) = read_system_job_log(Err(anyhow::anyhow!("ProgramData is not set")));
+    assert_eq!(log, None);
+    assert!(note.unwrap().contains("elevated prompt"));
+}
+
+#[tokio::test]
+async fn status_of_a_system_job_never_shows_the_log_in_the_home() {
+    let fixture = Fixture::new("approved_ok").await;
+    fixture
+        .home
+        .write(
+            "schedule.log",
+            b"2026-11-16T09:50:00Z a line the user wrote\n",
+        )
+        .unwrap();
+    let report = fixture.report(false).await;
+    assert!(report.render().contains("a line the user wrote"));
+    assert_eq!(report.schedule.last_job_log_note, None);
+    DeviceConfig {
+        auto_send: true,
+        setup_answered: true,
+        run_as: RunAs::System,
+        ..Default::default()
+    }
+    .save(&fixture.home)
+    .unwrap();
+    let report = fixture.report(false).await;
+    let text = report.render();
+    assert!(!text.contains("a line the user wrote"), "{text}");
+    assert_eq!(report.schedule.last_job_log_line, None);
+    let note = report.schedule.last_job_log_note.clone().unwrap();
+    assert!(
+        note.contains("elevated prompt") && note.contains("schedule.log"),
+        "{note}"
+    );
+    assert!(text.contains(&note));
+    let json = serde_json::to_value(&report).unwrap();
+    assert_eq!(json["schedule"]["last_job_log_note"], note);
+}
