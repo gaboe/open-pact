@@ -1,4 +1,3 @@
-use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
@@ -56,16 +55,12 @@ pub fn append_with_status(
     status: Option<u16>,
 ) -> io::Result<()> {
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-        fs::create_dir_all(dir)?;
+        crate::home_fs::create_dir_all(dir)?;
     }
     let record = make_record(sent_bytes, response_bytes, status);
     let mut line = serde_json::to_vec(&record).map_err(io::Error::other)?;
     line.push(b'\n');
-    let mut file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .append(true)
-        .open(path)?;
+    let mut file = crate::home_fs::open(path, crate::home_fs::Open::Append)?;
     if file.metadata()?.len() > 0 {
         file.seek(SeekFrom::End(-1))?;
         let mut last = [0];
@@ -98,7 +93,7 @@ pub fn read(path: &Path) -> io::Result<Vec<Record>> {
 }
 
 pub fn read_lenient(path: &Path) -> io::Result<(Vec<Record>, usize)> {
-    let bytes = match fs::read(path) {
+    let bytes = match crate::home_fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
         Err(error) => return Err(error),
@@ -121,7 +116,9 @@ pub fn read_lenient(path: &Path) -> io::Result<(Vec<Record>, usize)> {
 }
 
 pub fn read_with_lines(path: &Path) -> io::Result<Vec<(usize, Record)>> {
-    let text = match fs::read_to_string(path) {
+    let text = match crate::home_fs::read(path).and_then(|bytes| {
+        String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    }) {
         Ok(t) => t,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e),
@@ -145,6 +142,7 @@ pub fn read_with_lines(path: &Path) -> io::Result<Vec<(usize, Record)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn append_then_read_returns_exact_bytes() {

@@ -145,7 +145,7 @@ pub(crate) fn load(home: &Path, now: i64) -> Result<Option<RepoScan>> {
 
 pub(crate) fn load_attempt(home: &Path) -> Result<Option<RepoScan>> {
     let path = home.join(FILE);
-    let bytes = match fs::read(&path) {
+    let bytes = match crate::home_fs::read(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).with_context(|| path.display().to_string()),
@@ -251,29 +251,21 @@ pub(crate) fn forget(home: &Path) -> Result<()> {
 }
 
 pub(crate) fn store(home: &Path, scan: &RepoScan) -> Result<()> {
-    fs::create_dir_all(home)?;
+    crate::home_fs::create_dir_all(home)?;
     remove_stale_cache_temps(home)?;
     let path = home.join(FILE);
     let temporary = home.join(format!(".{FILE}.{}.tmp", uuid::Uuid::new_v4()));
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
     let write_result = (|| -> Result<()> {
-        let mut file = options
-            .open(&temporary)
+        let mut file = crate::home_fs::open(&temporary, crate::home_fs::Open::CreateNew)
             .with_context(|| temporary.display().to_string())?;
         file.write_all(&serde_json::to_vec(scan)?)?;
         file.sync_all()?;
         drop(file);
-        fs::rename(&temporary, &path).with_context(|| path.display().to_string())?;
+        crate::home_fs::rename(&temporary, &path).with_context(|| path.display().to_string())?;
         Ok(())
     })();
     if write_result.is_err() {
-        let _ = fs::remove_file(&temporary);
+        let _ = crate::home_fs::remove_file(&temporary);
     }
     write_result?;
     Ok(())
@@ -327,7 +319,7 @@ fn remove_stale_cache_temps(home: &Path) -> Result<()> {
         {
             continue;
         }
-        match fs::remove_file(&path) {
+        match crate::home_fs::remove_file(&path) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error).with_context(|| path.display().to_string()),

@@ -1730,11 +1730,17 @@ fn note_outcome(home: &Home, state: &mut State, trigger: Trigger, outcome: &Outc
 
 /// Appends a dated line to the job log. The log keeps the last two files of at most
 /// `JOB_LOG_LIMIT` bytes each. A failed write is only reported: it must not stop the job.
+/// A SYSTEM job writes it to its protected state folder, never to the home the user controls.
 pub(crate) fn job_log(home: &Home, line: &str) {
-    if let Err(error) = append_job_log(home, line) {
+    write_job_log(&Home(crate::home_fs::job_log_home(&home.0)), line);
+}
+
+/// `job_log` into the folder `log`.
+fn write_job_log(log: &Home, line: &str) {
+    if let Err(error) = append_job_log(log, line) {
         eprintln!(
             "warning: could not write {}: {error}",
-            home.file(JOB_LOG).display()
+            log.file(JOB_LOG).display()
         );
     }
 }
@@ -2489,10 +2495,23 @@ async fn operate(
     };
     match command {
         Operation::Run { user_home, .. } => {
-            if let Err(error) = rotate_job_log(&home) {
+            // From here on, no link the user puts in the home can redirect what SYSTEM does there.
+            let _protection = if system_run {
+                match crate::home_fs::protect(&home.0, &state_home.0) {
+                    Ok(protection) => Some(protection),
+                    Err(error) => {
+                        write_job_log(&state_home, &format!("error: {error:#}"));
+                        return Err(error);
+                    }
+                }
+            } else {
+                None
+            };
+            let log = Home(crate::home_fs::job_log_home(&home.0));
+            if let Err(error) = rotate_job_log(&log) {
                 eprintln!(
                     "warning: could not rotate {}: {error}",
-                    home.file(JOB_LOG).display()
+                    log.file(JOB_LOG).display()
                 );
             }
             let result = run_tick(&home, &state_home, user_home.as_deref(), executable).await;
@@ -2525,6 +2544,7 @@ async fn operate(
                         .as_deref()
                         .context("a SYSTEM install needs the user home")?,
                 )?;
+                job.log = text(&install_state.file(JOB_LOG))?.into();
             }
             save(&install_state, STATE, &State::default())?;
             let run_as = if system {

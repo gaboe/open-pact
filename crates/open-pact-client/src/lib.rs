@@ -51,6 +51,7 @@ mod device_config;
 mod device_key;
 #[cfg(test)]
 mod fake_gateway;
+mod home_fs;
 mod host;
 mod json_out;
 mod locallog;
@@ -506,29 +507,6 @@ fn interruption_point() {
     });
 }
 
-fn read_home_file(path: &Path) -> std::io::Result<Vec<u8>> {
-    #[cfg(windows)]
-    {
-        use std::io::Read;
-        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(0x00200000) // FILE_FLAG_OPEN_REPARSE_POINT
-            .open(path)?;
-        if file.metadata()?.file_attributes() & 0x400 != 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "home file is a reparse point",
-            ));
-        }
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
-        Ok(bytes)
-    }
-    #[cfg(not(windows))]
-    std::fs::read(path)
-}
-
 #[cfg(windows)]
 struct VpnLock(std::fs::File);
 
@@ -541,7 +519,7 @@ impl Drop for VpnLock {
 
 /// Removes a file or a link. Returns whether there was one.
 fn remove_file_if_exists(path: &Path) -> Result<bool> {
-    match std::fs::remove_file(path) {
+    match home_fs::remove_file(path) {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(e).with_context(|| path.display().to_string()),
@@ -562,7 +540,7 @@ impl Home {
 
     fn read_json<T: for<'de> Deserialize<'de>>(&self, name: &str) -> Result<Option<T>> {
         let path = self.file(name);
-        match read_home_file(&path) {
+        match home_fs::read(&path) {
             Ok(bytes) => Ok(Some(
                 serde_json::from_slice(&bytes).with_context(|| format!("{}", path.display()))?,
             )),
@@ -576,8 +554,8 @@ impl Home {
     fn write(&self, name: &str, bytes: &[u8]) -> Result<PathBuf> {
         let path = self.file(name);
         let temp = write_temporary(&path, bytes, None)?;
-        if let Err(error) = std::fs::rename(&temp, &path) {
-            let _ = std::fs::remove_file(&temp);
+        if let Err(error) = home_fs::rename(&temp, &path) {
+            let _ = home_fs::remove_file(&temp);
             return Err(error).with_context(|| format!("{}", path.display()));
         }
         Ok(path)
@@ -601,8 +579,8 @@ impl Home {
             let vpn = self.file(VPN_DIR);
             if self.vpn_generation(VPN_CURRENT)?.is_none()
                 && let (Ok(old_ca), Ok(old_cert)) = (
-                    read_home_file(&self.file(VPN_FILES[0])),
-                    read_home_file(&self.file(VPN_FILES[1])),
+                    home_fs::read(&self.file(VPN_FILES[0])),
+                    home_fs::read(&self.file(VPN_FILES[1])),
                 )
             {
                 let baseline = self.write_windows_vpn_generation(&old_ca, &old_cert)?;
@@ -727,7 +705,8 @@ impl Home {
             return Ok(());
         }
         let path = self.file(VPN_REMOVAL_MARKER);
-        let mut file = std::fs::File::create(&path).with_context(|| path.display().to_string())?;
+        let mut file = home_fs::open(&path, home_fs::Open::Truncate)
+            .with_context(|| path.display().to_string())?;
         file.write_all(b"removing\n")?;
         file.sync_all()?;
         drop(file);
@@ -790,9 +769,9 @@ impl Home {
             }
             let path = entry.path();
             if entry.file_type()?.is_dir() {
-                std::fs::remove_dir_all(&path)
+                home_fs::remove_dir_all(&path)
             } else {
-                std::fs::remove_file(&path)
+                home_fs::remove_file(&path)
             }
             .with_context(|| path.display().to_string())?;
             removed = true;
@@ -866,12 +845,9 @@ impl Home {
             std::process::id()
         );
         let dir = vpn.join(&generation);
-        std::fs::create_dir(&dir)?;
+        home_fs::create_dir(&dir)?;
         for (name, bytes) in VPN_FILES.iter().zip([ca, cert]) {
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(dir.join(name))?;
+            let mut file = home_fs::open(&dir.join(name), home_fs::Open::CreateNew)?;
             file.write_all(bytes)?;
             file.sync_all()?;
             interruption_point();
@@ -888,10 +864,7 @@ impl Home {
             i64::try_from(time::OffsetDateTime::now_utc().unix_timestamp_nanos())
                 .context("clock")?
         ));
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)?;
+        let mut file = home_fs::open(&temp, home_fs::Open::CreateNew)?;
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
@@ -905,7 +878,7 @@ impl Home {
             }
             Ok(())
         })?;
-        std::fs::rename(&temp, path).with_context(|| path.display().to_string())?;
+        home_fs::rename(&temp, path).with_context(|| path.display().to_string())?;
         interruption_point();
         Ok(())
     }
@@ -930,13 +903,8 @@ impl Home {
     #[cfg(windows)]
     fn open_vpn_lock(&self) -> Result<std::fs::File> {
         let vpn = self.file(VPN_DIR);
-        std::fs::create_dir_all(&vpn)?;
-        Ok(std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(vpn.join("write.lock"))?)
+        home_fs::create_dir_all(&vpn)?;
+        Ok(home_fs::open(&vpn.join("write.lock"), home_fs::Open::Lock)?)
     }
 
     #[cfg(windows)]
@@ -963,7 +931,7 @@ impl Home {
 
     #[cfg(windows)]
     fn vpn_generation(&self, pointer: &str) -> Result<Option<String>> {
-        match read_home_file(&self.file(VPN_DIR).join(pointer)) {
+        match home_fs::read(&self.file(VPN_DIR).join(pointer)) {
             Ok(bytes) => {
                 let name = String::from_utf8(bytes).context("VPN generation is not UTF-8")?;
                 if name.is_empty() || !name.bytes().all(|b| b.is_ascii_digit() || b == b'-') {
@@ -991,8 +959,8 @@ impl Home {
             .map(|name| -> Result<_> {
                 let dir = vpn.join(name);
                 Ok([
-                    read_home_file(&dir.join(VPN_FILES[0]))?,
-                    read_home_file(&dir.join(VPN_FILES[1]))?,
+                    home_fs::read(&dir.join(VPN_FILES[0]))?,
+                    home_fs::read(&dir.join(VPN_FILES[1]))?,
                 ])
             })
             .transpose()?;
@@ -1000,7 +968,7 @@ impl Home {
             for (name, bytes) in VPN_FILES.iter().zip(pair) {
                 let path = self.file(name);
                 let refresh = (|| -> Result<()> {
-                    match read_home_file(&path) {
+                    match home_fs::read(&path) {
                         Ok(existing) if existing == bytes => return Ok(()),
                         Ok(_) => {}
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1010,7 +978,9 @@ impl Home {
                 })();
                 if let Err(error) = refresh {
                     let marker = vpn.join(VPN_FLAT_STALE);
-                    let marker_error = std::fs::write(&marker, b"stale").err();
+                    let marker_error = home_fs::open(&marker, home_fs::Open::Truncate)
+                        .and_then(|mut file| file.write_all(b"stale"))
+                        .err();
                     return Err(error).with_context(|| {
                         let message = format!(
                             "cannot replace {}; close the program that holds it and run check again",
@@ -1026,7 +996,7 @@ impl Home {
                     });
                 }
             }
-            std::fs::remove_file(vpn.join(VPN_FLAT_STALE)).or_else(|error| {
+            home_fs::remove_file(&vpn.join(VPN_FLAT_STALE)).or_else(|error| {
                 if error.kind() == std::io::ErrorKind::NotFound {
                     Ok(())
                 } else {
@@ -1058,9 +1028,9 @@ impl Home {
                     && current.as_deref() != Some(name.as_ref())
                     && previous.as_deref() != Some(name.as_ref());
                 if old_generation {
-                    std::fs::remove_dir_all(entry.path())?;
+                    home_fs::remove_dir_all(&entry.path())?;
                 } else if temporary {
-                    std::fs::remove_file(entry.path())?;
+                    home_fs::remove_file(&entry.path())?;
                 }
             }
         }
@@ -1074,7 +1044,11 @@ impl Home {
 
     fn read_text(&self, name: &str) -> Result<Option<String>> {
         let path = self.file(name);
-        match std::fs::read_to_string(&path) {
+        let text = home_fs::read(&path).and_then(|bytes| {
+            String::from_utf8(bytes)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+        });
+        match text {
             Ok(text) => Ok(Some(text)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e).with_context(|| format!("{}", path.display())),
@@ -1100,7 +1074,7 @@ impl Home {
     /// The manifest this owner signed: the stored text, checked against the signed hash.
     fn signed_manifest(&self) -> Result<Manifest> {
         let enrolment = self.enrolment()?;
-        let manifest = Manifest::parse(&read_home_file(&self.file("manifest.toml"))?)?;
+        let manifest = Manifest::parse(&home_fs::read(&self.file("manifest.toml"))?)?;
         if manifest.hash() != &enrolment.manifest {
             return Err(stored_manifest_mismatch(
                 self,
@@ -1600,7 +1574,7 @@ fn alarm(e: impl std::fmt::Display) -> LogSync {
 }
 
 fn read_optional_file(path: &Path) -> Result<Option<Vec<u8>>> {
-    match read_home_file(path) {
+    match home_fs::read(path) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
@@ -1612,25 +1586,15 @@ fn write_temporary(
     bytes: &[u8],
     permissions: Option<std::fs::Permissions>,
 ) -> Result<PathBuf> {
-    use std::fs::OpenOptions;
-
     let parent = path.parent().context("file has no parent directory")?;
-    std::fs::create_dir_all(parent)?;
+    home_fs::create_dir_all(parent)?;
     let name = path
         .file_name()
         .context("file has no name")?
         .to_string_lossy();
     let temporary = parent.join(format!("{name}.{}.tmp", uuid::Uuid::new_v4()));
     let result = (|| -> Result<PathBuf> {
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options
-            .open(&temporary)
+        let mut file = home_fs::open(&temporary, home_fs::Open::CreateNew)
             .with_context(|| format!("create {}", temporary.display()))?;
         if let Some(permissions) = permissions {
             file.set_permissions(permissions)?;
@@ -1641,7 +1605,7 @@ fn write_temporary(
         Ok(temporary.clone())
     })();
     if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
+        let _ = home_fs::remove_file(&temporary);
     }
     result
 }
@@ -2554,7 +2518,7 @@ async fn check_own_entries_with(
 ) -> Result<Result<OwnEntries, OwnEntriesError>> {
     let response = fetch_my_entries(http, home, enrolment).await?;
     let pins = Pins::load(home)?;
-    let manifest = Manifest::parse(&read_home_file(&home.file("manifest.toml"))?)?;
+    let manifest = Manifest::parse(&home_fs::read(&home.file("manifest.toml"))?)?;
     let checked = if store {
         verify_checkpoint(
             http,
@@ -3223,7 +3187,7 @@ async fn resume_join(
     if manifest.hash() != &enrolment.manifest {
         bail!("the gateway manifest no longer matches this device's enrolment");
     }
-    let stored_manifest = Manifest::parse(&read_home_file(&home.file("manifest.toml"))?)?;
+    let stored_manifest = Manifest::parse(&home_fs::read(&home.file("manifest.toml"))?)?;
     if stored_manifest.hash() != &enrolment.manifest {
         bail!("manifest.toml no longer matches the hash you signed");
     }
@@ -3576,16 +3540,11 @@ fn shell_quote_arg(argument: &str) -> String {
 fn vpn_csr(home: &Home) -> Result<(String, Vec<u8>)> {
     let path = home.file("vpn-key.pem");
     let key = if path.exists() {
-        KeyPair::from_pem(&std::fs::read_to_string(&path)?)?
+        KeyPair::from_pem(std::str::from_utf8(&home_fs::read(&path)?)?)?
     } else {
         let key = KeyPair::generate()?;
-        std::fs::create_dir_all(&home.0)?;
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-        options
-            .open(&path)?
+        home_fs::create_dir_all(&home.0)?;
+        home_fs::open(&path, home_fs::Open::CreateNew)?
             .write_all(key.serialize_pem().as_bytes())?;
         key
     };
@@ -4115,7 +4074,7 @@ async fn accept(home: &Home, yes: bool, insecure_dev: bool, executable: &Path) -
         return Ok(ExitCode::from(2));
     }
     if new.hash() == &enrolment.manifest {
-        if read_home_file(&home.file("manifest.toml"))
+        if home_fs::read(&home.file("manifest.toml"))
             .map_or(true, |bytes| ManifestHash::of(&bytes) != enrolment.manifest)
         {
             home.write("manifest.toml", published.toml.as_bytes())?;
@@ -4128,7 +4087,7 @@ async fn accept(home: &Home, yes: bool, insecure_dev: bool, executable: &Path) -
         );
         return Ok(ExitCode::SUCCESS);
     }
-    let old = Manifest::parse(&read_home_file(&home.file("manifest.toml"))?)?;
+    let old = Manifest::parse(&home_fs::read(&home.file("manifest.toml"))?)?;
     // A stored new manifest means an earlier accept stopped after the gateway confirmed it.
     let resumed = old.hash() == new.hash();
     if old.hash() != &enrolment.manifest && !resumed {
@@ -4283,7 +4242,7 @@ async fn accept_preview(home: &Home, insecure_dev: bool) -> Result<AcceptPreview
     if new.hash() == &enrolment.manifest {
         return Ok(unchanged(Vec::new()));
     }
-    let old = Manifest::parse(&read_home_file(&home.file("manifest.toml"))?)?;
+    let old = Manifest::parse(&home_fs::read(&home.file("manifest.toml"))?)?;
     if old.hash() == new.hash() {
         // An earlier accept stopped after the gateway confirmed it. Nothing is left to compare.
         return Ok(unchanged(Vec::new()));
@@ -5603,9 +5562,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("data");
         std::fs::write(&path, b"fixture").unwrap();
-        assert_eq!(read_home_file(&path).unwrap(), b"fixture");
+        assert_eq!(home_fs::read(&path).unwrap(), b"fixture");
         assert_eq!(
-            read_home_file(&dir.path().join("missing"))
+            home_fs::read(&dir.path().join("missing"))
                 .unwrap_err()
                 .kind(),
             std::io::ErrorKind::NotFound
@@ -5701,7 +5660,7 @@ mod tests {
         std::fs::write(&file, b"fixture").unwrap();
         std::os::windows::fs::symlink_file(&file, &link).unwrap();
         assert_eq!(
-            read_home_file(&link).unwrap_err().kind(),
+            home_fs::read(&link).unwrap_err().kind(),
             std::io::ErrorKind::PermissionDenied
         );
     }
