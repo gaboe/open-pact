@@ -481,6 +481,7 @@ mod tests {
             &["manifest", "show"],
             &["join", "--preview", "opi1:fictional"],
             &["accept", "--preview"],
+            &["schedule", "run", "--system", "--user-home", "fictional"],
         ] {
             assert!(
                 !client::recovers_vpn_first(&parse(skipped).into_invocation().command),
@@ -492,6 +493,7 @@ mod tests {
             &["check", "--json"],
             &["join", "opi1:fictional"],
             &["accept"],
+            &["schedule", "run"],
         ] {
             assert!(
                 client::recovers_vpn_first(&parse(recovering).into_invocation().command),

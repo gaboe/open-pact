@@ -76,6 +76,7 @@ fn base() -> Report {
             }),
             last_job_note: None,
             last_job_log_line: None,
+            last_job_log_note: None,
         },
         log: "not verified by status".into(),
         issues: vec![
