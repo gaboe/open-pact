@@ -216,6 +216,8 @@ When IT approves or revokes a device with `devices approve` or `devices revoke`,
 
 The command sends the event only when the state really changes. A repeated `devices revoke` sends nothing. It sends the event after the database change is committed, waits at most 15 seconds, and does not retry or queue. When the event cannot be sent, the state change stands. The command prints `WARNING: ... the SIEM event was not sent` with the reason on stderr and exits 0. A second `devices revoke` does not resend it, because it changes nothing. Add the missing event at the SIEM by hand.
 
+With `AUTO_APPROVE=true`, the server sends the `device_state` event `approved` itself when it approves an enrolment, through the same queued exporter as claim events.
+
 The event has the same top-level key `open_pact` and `schema_version` as a claim event. A claim event has no `event` field.
 
 | Field under `open_pact` | Type and meaning |
