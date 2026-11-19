@@ -2484,6 +2484,38 @@ pub(crate) fn inspect_job(
     )
 }
 
+/// The one line `check` prints when the job runs an older definition than this client would
+/// install, with the exact command that fixes it.
+fn outdated_job_line(job: JobStatus, system: bool, command: &str) -> Option<String> {
+    (job == JobStatus::Outdated).then(|| {
+        if system {
+            format!(
+                "The scheduled job is out of date. Run `{command} schedule on --system` from an elevated prompt."
+            )
+        } else {
+            format!("The scheduled job is out of date. Run `{command} schedule on`.")
+        }
+    })
+}
+
+/// The notice for `check`. It says nothing while automatic sending is off or when the OS cannot
+/// be inspected: `status` reports those.
+pub(crate) fn outdated_job_notice(
+    home: &Home,
+    config: &DeviceConfig,
+    executable: &Path,
+) -> Option<String> {
+    if !config.auto_send {
+        return None;
+    }
+    let job = inspect_job(home, config, executable).ok()?;
+    outdated_job_line(
+        job,
+        config.run_as == RunAs::System,
+        &crate::client_command(&home.0),
+    )
+}
+
 /// `schedule status`: the owner's choice, the company's policy and the state of the job.
 async fn status(home: &Home, executable: &Path) -> Result<()> {
     let config = DeviceConfig::load_or_migrate(home, crate::user_profile().as_deref(), false)?;
@@ -3937,6 +3969,29 @@ esac
                 JobStatus::SystemUnconfirmed,
                 "{unconfirmed:?}"
             );
+        }
+    }
+
+    #[test]
+    fn check_names_the_command_that_fixes_an_outdated_job() {
+        let user = outdated_job_line(JobStatus::Outdated, false, "open-pact-client").unwrap();
+        assert!(
+            user.ends_with("Run `open-pact-client schedule on`."),
+            "{user}"
+        );
+        let system = outdated_job_line(JobStatus::Outdated, true, "open-pact-client").unwrap();
+        assert!(
+            system.contains("`open-pact-client schedule on --system` from an elevated prompt"),
+            "{system}"
+        );
+        for quiet in [
+            JobStatus::Current,
+            JobStatus::Missing,
+            JobStatus::Absent,
+            JobStatus::Leftover,
+            JobStatus::SystemUnconfirmed,
+        ] {
+            assert_eq!(outdated_job_line(quiet, false, "open-pact-client"), None);
         }
     }
 

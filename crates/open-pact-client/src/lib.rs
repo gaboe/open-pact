@@ -3785,6 +3785,10 @@ async fn check_run(
     }
     prepared.print_local_report();
     if show_resume_hint {
+        let config = device_config::DeviceConfig::load(home).unwrap_or_default();
+        if let Some(line) = schedule::outdated_job_notice(home, &config, executable) {
+            println!("{line}");
+        }
         let command = client_command(&home.0);
         match wizard_resume(home)? {
             WizardResume::Setup => {
