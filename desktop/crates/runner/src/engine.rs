@@ -338,7 +338,7 @@ pub async fn inspect(
     let mut status = session.status(true).await.map_err(|e| format!("{e:#}"))?;
     let job = session.job_executable().ok().flatten();
     let consented = status.schedule.owner_consented == Some(true);
-    let system = status.schedule.job_status == Some(open_pact_client::JobStatus::SystemUnconfirmed);
+    let system = status.schedule.system_job;
     if ownership::job_needs_rewrite(job.as_deref(), &installed, consented, system) {
         let was = job
             .as_deref()

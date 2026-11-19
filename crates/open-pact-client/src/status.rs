@@ -80,6 +80,8 @@ pub struct ScheduleEvidence {
     pub policy_defined: bool,
     pub job: String,
     pub job_status: Option<JobStatus>,
+    /// The owner chose a SYSTEM job. Only an elevated prompt can install or update it.
+    pub system_job: bool,
     pub vpn: String,
     pub last_scheduled_claim: Option<ScheduledClaim>,
     pub last_job_note: Option<String>,
@@ -247,6 +249,9 @@ async fn collect_with(
                 "no installation record; OS job not checked".into()
             },
             job_status: None,
+            system_job: !config_damaged
+                && config.auto_send
+                && config.run_as == crate::device_config::RunAs::System,
             vpn: "not probed".into(),
             last_scheduled_claim: tick
                 .last_success
@@ -983,6 +988,8 @@ impl Report {
         }
         .into();
         match job {
+            JobStatus::Missing | JobStatus::Outdated if self.schedule.system_job => self.issue(Urgency::Action, "Automatic sending is on, but its job needs installation or update.",
+                "From an elevated prompt, install the job for the signed schedule.", command, "schedule on --system", "Before the next automatic claim can run."),
             JobStatus::Missing | JobStatus::Outdated => self.issue(Urgency::Action, "Automatic sending is on, but its job needs installation or update.",
                 "Install the job for the signed schedule.", command, "schedule on", "Before the next automatic claim can run."),
             JobStatus::Leftover => self.issue(Urgency::Action, "A job or saved state remains while automatic sending is off.",

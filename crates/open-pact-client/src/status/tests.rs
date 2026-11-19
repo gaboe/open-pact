@@ -996,6 +996,42 @@ async fn a_system_job_without_inspection_cannot_produce_ok() {
 }
 
 #[tokio::test]
+async fn an_outdated_system_job_tells_the_owner_to_update_it_from_an_elevated_prompt() {
+    let fixture = Fixture::new("auto_on").await;
+    let mut config = DeviceConfig::load(&fixture.home).unwrap();
+    config.auto_send = true;
+    config.run_as = crate::device_config::RunAs::System;
+    config.save(&fixture.home).unwrap();
+    let report = collect_with(
+        &fixture.home,
+        true,
+        false,
+        &std::env::current_exe().unwrap(),
+        fixture.now,
+        |_, _| Ok(JobStatus::Outdated),
+    )
+    .await
+    .unwrap();
+    assert!(report.schedule.system_job);
+    assert_eq!(report.schedule.job_status, Some(JobStatus::Outdated));
+    let issue = report
+        .issues
+        .iter()
+        .find(|issue| {
+            issue.message == "Automatic sending is on, but its job needs installation or update."
+        })
+        .expect("the outdated job is listed");
+    assert!(
+        issue
+            .command
+            .as_deref()
+            .is_some_and(|command| command.ends_with("schedule on --system")),
+        "{:?}",
+        issue.command
+    );
+}
+
+#[tokio::test]
 async fn a_changed_company_key_stops_before_device_authentication() {
     let fixture = Fixture::new("approved_ok").await;
     let attacker = Company::new();
