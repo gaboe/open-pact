@@ -4896,8 +4896,8 @@ pub async fn run(cli: Invocation, executable: &Path) -> Result<ExitCode> {
 }
 
 /// Whether the command repairs an interrupted VPN installation before it runs. A command that only
-/// reads, or that promises to write no file, does not. The SYSTEM job does not either: its tick
-/// recovers under the protection of the home, and nothing may open the user home before that.
+/// reads, or that promises to write no file, does not. The SYSTEM job does not either: the claim it
+/// sends recovers under the protection of the home, and nothing may open the user home before that.
 pub fn recovers_vpn_first(command: &Command) -> bool {
     !matches!(
         command,
@@ -9262,7 +9262,7 @@ grace = "1d"
             .unwrap();
         assert!(status.success(), "mklink /J failed");
         let cli = Invocation {
-            home: Some(home),
+            home: Some(home.clone()),
             insecure_dev: false,
             command: Command::Schedule {
                 command: schedule::Command::Run {
@@ -9273,6 +9273,12 @@ grace = "1d"
         };
         // The run may fail; the rule is that it never writes through the link.
         let _ = run(cli, Path::new("open-pact-client.exe")).await;
+        // From an elevated prompt the run creates a state folder for this temporary home.
+        if let Ok(log) = schedule::system_job_log_path(&Home(home)) {
+            let state = log.parent().unwrap();
+            let _ = std::fs::remove_dir_all(state);
+            let _ = std::fs::remove_file(state.with_extension("lock"));
+        }
         assert!(
             !target.join("write.lock").exists(),
             "the run locked through the junction"
