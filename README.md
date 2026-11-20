@@ -89,13 +89,13 @@ scoop install gaboe/open-pact
 For Debian or Ubuntu, download the `.deb` from the [client releases](https://github.com/gaboe/open-pact/releases) and install it:
 
 ```sh
-sudo apt install ./open-pact-client_0.8.3_amd64.deb
+sudo apt install ./open-pact-client_0.8.4_amd64.deb
 ```
 
 For Fedora, download the `.rpm` from the [client releases](https://github.com/gaboe/open-pact/releases) and install it:
 
 ```sh
-sudo dnf install ./open-pact-client-0.8.3-1.x86_64.rpm
+sudo dnf install ./open-pact-client-0.8.4-1.x86_64.rpm
 ```
 
 Homebrew and Scoop check release SHA-256 hashes. The Linux commands install local files. Verify those packages with the release verification steps below before installation. These tools do not update the client automatically. Run `brew upgrade` or `scoop update open-pact` to update an installed client. For APT or DNF, download and install each new release when you choose to update.
@@ -107,7 +107,7 @@ The release also ships two desktop apps: `open-pact` for the employee whose devi
 On macOS, run the installer of a release tag. It installs the latest release into `~/Applications`:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/gaboe/open-pact/v0.8.3/desktop/scripts/install-desktop.sh | sh
+curl -fsSL https://raw.githubusercontent.com/gaboe/open-pact/v0.8.4/desktop/scripts/install-desktop.sh | sh
 ```
 
 On Windows, use Scoop, or the PowerShell installer when you do not use Scoop. The installer puts the apps in `%LOCALAPPDATA%\open-pact-desktop`:
@@ -118,16 +118,16 @@ scoop install gaboe/open-pact-desktop
 ```
 
 ```powershell
-irm https://raw.githubusercontent.com/gaboe/open-pact/v0.8.3/desktop/scripts/install-desktop.ps1 | iex
+irm https://raw.githubusercontent.com/gaboe/open-pact/v0.8.4/desktop/scripts/install-desktop.ps1 | iex
 ```
 
-"Latest" skips prereleases. To install a prerelease or one fixed version, set `OPEN_PACT_DESKTOP_VERSION` first, for example `OPEN_PACT_DESKTOP_VERSION=0.8.3` on macOS or `$env:OPEN_PACT_DESKTOP_VERSION = '0.8.3'` on Windows. The Scoop manifest exists only for stable releases. Run the same command again to update.
+"Latest" skips prereleases. To install a prerelease or one fixed version, set `OPEN_PACT_DESKTOP_VERSION` first, for example `OPEN_PACT_DESKTOP_VERSION=0.8.4` on macOS or `$env:OPEN_PACT_DESKTOP_VERSION = '0.8.4'` on Windows. The Scoop manifest exists only for stable releases. Run the same command again to update.
 
 Both installers check the zip against its line in `SHA256SUMS` before they replace anything. The macOS installer also checks each app's signature. The apps are not notarized by Apple and not Authenticode-signed, so a browser download can be blocked: install with the commands above instead. On Windows, SmartScreen may warn the first time. For Smart App Control and App Control for Business, see [Run the Windows client under app control](docs/client.md#run-the-windows-client-under-app-control). To also check the Cosign signature of `SHA256SUMS`, run `scripts/verify-client-release.sh` first; it checks the desktop zips too.
 
 ## Verify a release
 
-Client releases include binaries for macOS, Linux, and Windows, plus `.deb` and `.rpm` packages. They also include `NOTICE`, `SHA256SUMS`, and Sigstore bundles for each binary, package, `NOTICE`, and `SHA256SUMS`. Verify a client release with `scripts/verify-client-release.sh v0.8.3`. The script downloads these files from the GitHub release, checks their hashes, and verifies their signatures against the tagged release workflow. It needs GitHub CLI, Cosign, and `sha256sum` or `shasum`. Set `GH_REPO` to check a release from a fork. See the [client release verification procedure](docs/client.md#verify-a-release) to save and install a verified binary or Linux package.
+Client releases include binaries for macOS, Linux, and Windows, plus `.deb` and `.rpm` packages. They also include `NOTICE`, `SHA256SUMS`, and Sigstore bundles for each binary, package, `NOTICE`, and `SHA256SUMS`. Verify a client release with `scripts/verify-client-release.sh v0.8.4`. The script downloads these files from the GitHub release, checks their hashes, and verifies their signatures against the tagged release workflow. It needs GitHub CLI, Cosign, and `sha256sum` or `shasum`. Set `GH_REPO` to check a release from a fork. See the [client release verification procedure](docs/client.md#verify-a-release) to save and install a verified binary or Linux package.
 
 The gateway image is reproducible: a pinned toolchain and builder, a static musl binary, `FROM scratch`, and timestamps fixed to the commit time. CI builds each release twice on separate runners and fails when the digests differ. The witness image (`ghcr.io/<owner>/open-pact-witness`, the Dockerfile `witness` target) is built and checked the same way. To check a release yourself, run `scripts/verify-release.sh v0.0.1 ghcr.io/<owner>/open-pact-gateway@sha256:<digest>`, or add `--target witness` and the witness image reference. It rebuilds the tag from the public source, prints the digest, and exits nonzero on a mismatch. It needs Docker with buildx and takes several minutes. The image carries no system CA bundle. Optional SIEM TLS uses its explicitly mounted CA file. Do not use `sslmode=verify-full` for PostgreSQL without providing its CA.
 
