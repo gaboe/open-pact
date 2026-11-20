@@ -1596,8 +1596,9 @@ if ($null -ne $failure) {{ throw $failure }}
 /// Set by the console handler while a `ConsoleInterruptHold` lives.
 static CONSOLE_INTERRUPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// The console handler of a `ConsoleInterruptHold`: it records Ctrl-C, Ctrl-Break and a console
-/// close, and returns TRUE so the system does not end the process.
+/// The console handler of a `ConsoleInterruptHold`: it records Ctrl-C and Ctrl-Break and returns
+/// TRUE, so the system does not end the process for them. A console close, a logoff and a shutdown
+/// still end the process, whatever the handler returns.
 #[cfg(windows)]
 unsafe extern "system" fn hold_console_interrupt(_event: u32) -> i32 {
     CONSOLE_INTERRUPT.store(true, std::sync::atomic::Ordering::SeqCst);
