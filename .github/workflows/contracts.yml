@@ -21,6 +21,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: true
       - name: Test all platform contracts
         run: cargo test -p open-pact-client checks::contracts -- --show-output
