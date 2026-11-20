@@ -1992,6 +1992,15 @@ mod tests {
         );
     }
 
+    /// The index of the one log entry of `kind`.
+    async fn log_index_of(db: &sqlx::PgPool, kind: &str) -> i64 {
+        sqlx::query_scalar("SELECT idx FROM log_entries WHERE kind = $1")
+            .bind(kind)
+            .fetch_one(db)
+            .await
+            .unwrap()
+    }
+
     /// An enrolment that the gateway approves by itself sends one approved `device_state` event
     /// after it commits, with the note of the invitation it used.
     #[tokio::test]
@@ -2066,6 +2075,11 @@ mod tests {
             Pseudonym::of(&PublicKey::from(&device_key)).as_str()
         );
         assert_eq!(event["device_note"], note);
+        // The event names the DeviceApproved entry that the enrolment wrote.
+        assert_eq!(
+            event["log_index"],
+            log_index_of(&db, "device_approved").await
+        );
     }
 
     /// `devices approve` and `devices revoke` send one `device_state` event for a change and none for
@@ -2138,6 +2152,8 @@ mod tests {
         assert_eq!(body["state"], "approved");
         assert_eq!(body["device_pseudonym"], device);
         assert_eq!(body["device_note"], "Laptop, Example Person");
+        let approved_index = log_index_of(&db, "device_approved").await;
+        assert_eq!(body["log_index"], approved_index);
 
         // The command refuses a device that is no longer pending. The change itself is a no-op.
         assert!(admin_devices(&db, approve()).await.is_err());
@@ -2149,6 +2165,13 @@ mod tests {
         let sent = events();
         assert_eq!(sent.len(), 2, "{sent:?}");
         assert_eq!(sent[1]["open_pact"]["state"], "revoked");
+        // Revocation is logged after approval, so its event orders after the approval's.
+        let revoked_index = log_index_of(&db, "device_revoked").await;
+        assert_eq!(sent[1]["open_pact"]["log_index"], revoked_index);
+        assert!(
+            revoked_index > approved_index,
+            "{revoked_index} <= {approved_index}"
+        );
 
         admin_devices(&db, revoke()).await.unwrap();
         assert_eq!(events().len(), 2);
