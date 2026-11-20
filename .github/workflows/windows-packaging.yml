@@ -20,7 +20,7 @@ jobs:
           targets: x86_64-pc-windows-msvc
       - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
         with:
-          save-if: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build client
         run: cargo build --locked --release --package open-pact-client --target x86_64-pc-windows-msvc
       - name: Check the Windows client imports no Visual C++ runtime
