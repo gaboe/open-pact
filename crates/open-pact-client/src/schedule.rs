@@ -3026,6 +3026,17 @@ async fn operate(
             } else {
                 None
             };
+            // The checks of the job read the user's own files, where a link is as easy to plant.
+            let _user_protection = match user_home.as_deref().filter(|_| system_run) {
+                Some(user_home) => match crate::home_fs::protect(user_home, &state_home.0) {
+                    Ok(protection) => Some(protection),
+                    Err(error) => {
+                        write_job_log(&state_home, &format!("error: {error:#}"));
+                        return Err(error);
+                    }
+                },
+                None => None,
+            };
             let log = Home(crate::home_fs::job_log_home(&home.0));
             if let Err(error) = rotate_job_log(&log) {
                 eprintln!(
