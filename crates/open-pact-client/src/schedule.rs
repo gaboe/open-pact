@@ -1290,6 +1290,31 @@ public static class OpenPactNative {
 }
 "#;
 
+/// Lets standard users read the install folder of the SYSTEM client, and nothing else. A standard
+/// user then reads the protected binary, so `status` can tell that the SYSTEM job is outdated. It
+/// is only for the install folder: the state folders under ProgramData stay SYSTEM and
+/// Administrators only. It adds the rule when it is missing, removes no rule, and ends with
+/// `AssertProtected`, which still rejects write rights of non-admins (ReadAndExecute is outside its
+/// 0xD0156 mask).
+const USERS_READ_DIRECTORY: &str = r#"
+function AllowUsersRead($path) {
+    AssertProtected $path
+    $users = New-Object Security.Principal.SecurityIdentifier('S-1-5-32-545')
+    $read = [int][Security.AccessControl.FileSystemRights]::ReadAndExecute
+    $acl = [IO.Directory]::GetAccessControl($path)
+    $present = $false
+    foreach ($rule in $acl.GetAccessRules($true,$false,[Security.Principal.SecurityIdentifier])) {
+        if ($rule.AccessControlType -eq 'Allow' -and $rule.IdentityReference.Value -eq 'S-1-5-32-545' -and (([int]$rule.FileSystemRights -band $read) -eq $read) -and [int]$rule.InheritanceFlags -eq 3 -and [int]$rule.PropagationFlags -eq 0) { $present = $true }
+    }
+    if (-not $present) {
+        $rule = New-Object Security.AccessControl.FileSystemAccessRule($users,'ReadAndExecute','ContainerInherit,ObjectInherit','None','Allow')
+        $acl.AddAccessRule($rule)
+        [IO.Directory]::SetAccessControl($path,$acl)
+    }
+    AssertProtected $path
+}
+"#;
+
 /// The job log of the SYSTEM job of `home`, in its protected state folder. It is computed from
 /// `ProgramData` and the home, so no process starts and no elevation is needed to name it.
 pub(crate) fn system_job_log_path(home: &Home) -> Result<PathBuf> {
@@ -1329,7 +1354,7 @@ fn windows_protected_paths(
 
 fn windows_protected_paths_script(hash: &str, source: &str, copy_binary: bool) -> String {
     format!(
-        r#"{PROTECTED_DIRECTORY}
+        r#"{PROTECTED_DIRECTORY}{USERS_READ_DIRECTORY}
 $program = ProgramFilesPath
 AssertProtected $program
 $install = Join-Path $program 'open-pact'
@@ -1340,6 +1365,7 @@ if ({copy}) {{
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = New-Object Security.Principal.WindowsPrincipal($identity)
     if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {{ exit 5 }}
+    AllowUsersRead $install
     RemovePendingDeletes $install
     if ([IO.Path]::GetFullPath({source}) -ne $binary) {{ Copy-Item -LiteralPath {source} -Destination $binary -Force }}
     AssertProtected $binary
@@ -4814,6 +4840,63 @@ Write-Output 'limited_uninstall_removed_task_without_protected_access'
             windows_powershell(&script).unwrap(),
             "limited_uninstall_removed_task_without_protected_access"
         );
+    }
+
+    #[test]
+    fn only_the_install_directory_script_lets_standard_users_read() {
+        let job = Job::new(Path::new("client.exe"), Path::new("fixture-home")).unwrap();
+        let install = windows_protected_paths_script("fixture-hash", "'source.exe'", true);
+        assert!(install.contains("S-1-5-32-545"));
+        assert!(
+            install.contains("'ReadAndExecute','ContainerInherit,ObjectInherit','None','Allow'")
+        );
+        // The rule is added to the install directory only, after the elevation check.
+        assert_eq!(install.matches("AllowUsersRead $").count(), 1);
+        assert!(install.contains("AllowUsersRead $install"));
+        assert!(install.find("exit 5").unwrap() < install.find("AllowUsersRead $install").unwrap());
+        assert!(
+            install.find("AllowUsersRead $install").unwrap() < install.find("Copy-Item").unwrap()
+        );
+        // The state directory helpers and the other scripts never name the Users group.
+        assert!(!PROTECTED_DIRECTORY.contains("S-1-5-32-545"));
+        for script in [
+            windows_existing_system_state_script("fixture-hash"),
+            windows_cleanup_binary_script(&job, false),
+            windows_orphaned_binary_script(&job),
+            windows_system_executable_script(),
+        ] {
+            assert!(!script.contains("S-1-5-32-545"));
+            assert!(!script.contains("AllowUsersRead"));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn standard_users_read_the_install_directory_and_still_cannot_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = powershell_literal(dir.path().join("install").to_str().unwrap());
+        let script = format!(
+            r#"{PROTECTED_DIRECTORY}{USERS_READ_DIRECTORY}
+ProtectedDirectory {path}
+AllowUsersRead {path}
+AllowUsersRead {path}
+AssertProtected {path}
+$acl = [IO.Directory]::GetAccessControl({path})
+$users = @($acl.GetAccessRules($true,$false,[Security.Principal.SecurityIdentifier]) | Where-Object {{ $_.IdentityReference.Value -eq 'S-1-5-32-545' }})
+if ($users.Count -ne 1) {{ throw "expected one Users rule, found $($users.Count)" }}
+if ([int]$users[0].FileSystemRights -ne [int][Security.AccessControl.FileSystemRights]::ReadAndExecute) {{ throw 'Users rule is not ReadAndExecute' }}
+if ([int]$users[0].InheritanceFlags -ne 3 -or [int]$users[0].PropagationFlags -ne 0) {{ throw 'Users rule does not inherit to children' }}
+$sids = @($acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]) | ForEach-Object {{ $_.IdentityReference.Value }} | Sort-Object -Unique)
+if (($sids -join ',') -ne 'S-1-5-18,S-1-5-32-544,S-1-5-32-545') {{ throw "unexpected install ACL principals: $($sids -join ',')" }}
+$acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier('S-1-5-32-545')),'Write','Allow')))
+[IO.Directory]::SetAccessControl({path},$acl)
+try {{ AssertProtected {path}; throw 'Users write accepted' }} catch {{
+    if ($_.Exception.Message -notlike '*non-admin principal*') {{ throw }}
+}}
+Write-Output 'users_read_only'
+"#
+        );
+        assert_eq!(windows_powershell(&script).unwrap(), "users_read_only");
     }
 
     #[test]
