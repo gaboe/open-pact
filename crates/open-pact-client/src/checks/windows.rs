@@ -2,7 +2,9 @@ use std::collections::BTreeMap;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use super::buckets::{self, Lock};
+#[cfg(test)]
+use super::buckets;
+use super::buckets::Lock;
 use super::exec::capture;
 use open_pact_core::ControlValue;
 use time::Date;
@@ -420,7 +422,8 @@ pub fn parse_firewall(out: &str) -> &'static str {
     }
 }
 
-pub fn parse_screen_saver(
+#[cfg(test)]
+fn parse_screen_saver(
     active: Option<&str>,
     secure: Option<&str>,
     timeout: Option<&str>,

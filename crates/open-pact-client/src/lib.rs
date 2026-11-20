@@ -10958,6 +10958,8 @@ grace = "1d"
             u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp()).unwrap(),
         );
         let checkpoint = checkpoint.to_string();
+        let status_requested = std::sync::Arc::new(tokio::sync::Notify::new());
+        let requested = status_requested.clone();
         let gateway = FakeGateway::start(move |line, nth| match line {
             "GET /v1/manifest" => (200, published.clone()),
             "GET /v1/log/key" => (200, format!("{log}\n")),
@@ -10967,7 +10969,10 @@ grace = "1d"
                 json!({"salt":"11".repeat(32),"state":"pending"}).to_string(),
             ),
             "POST /v1/nonce" => (200, json!({"nonce":format!("wait-{nth}")}).to_string()),
-            "POST /v1/device/status" => (200, r#"{"state":"pending"}"#.into()),
+            "POST /v1/device/status" => {
+                requested.notify_one();
+                (200, r#"{"state":"pending"}"#.into())
+            }
             _ => not_found(),
         })
         .await;
@@ -10982,18 +10987,22 @@ grace = "1d"
         let session = session_of(&Home(dir.path().to_path_buf()));
         let (steps, on_step) = step_log();
 
-        let error = session
-            .join(
+        // Cancels at the first status request. The join logs step 4 Waiting before it sends that request.
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            session.join(
                 &invitation,
                 JoinChoices {
                     software_key: true,
                     ..JoinChoices::default()
                 },
-                tokio::time::sleep(Duration::from_millis(500)),
+                async move { status_requested.notified().await },
                 on_step,
-            )
-            .await
-            .unwrap_err();
+            ),
+        )
+        .await
+        .expect("the join did not end within 30 seconds after its cancel future completed")
+        .unwrap_err();
 
         assert!(error.is::<Cancelled>(), "{error:#}");
         assert!(
@@ -11126,12 +11135,25 @@ grace = "1d"
         )
         .await;
         let session = session_of(&fixture.home);
-        let (steps, on_step) = step_log();
+        let (steps, mut on_step) = step_log();
         let job = claim::try_lock(&fixture.home).unwrap().unwrap();
+        let waiting = std::sync::Arc::new(tokio::sync::Notify::new());
+        let says_waiting = waiting.clone();
 
-        let call = session.check_with(on_step);
+        let call = session.check_with(move |step| {
+            if step.title == json_out::WAITING_FOR_JOB {
+                says_waiting.notify_one();
+            }
+            on_step(step);
+        });
         assert_send(&call);
         tokio::pin!(call);
+        tokio::select! {
+            _ = &mut call => panic!("check must wait while the job holds the lock"),
+            waited = tokio::time::timeout(Duration::from_secs(10), waiting.notified()) => {
+                waited.expect("check says when it waits for the job");
+            }
+        }
         tokio::select! {
             _ = &mut call => panic!("check must wait while the job holds the lock"),
             () = tokio::time::sleep(Duration::from_millis(600)) => {}

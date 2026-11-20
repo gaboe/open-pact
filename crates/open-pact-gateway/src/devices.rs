@@ -156,12 +156,22 @@ pub async fn revoked_anywhere(conn: &mut PgConnection, device: &Pseudonym) -> an
     .await?)
 }
 
-/// What `apply` left: the state of each enrolment, and the state the device moved to when at
-/// least one enrolment changed. `None` means the action changed nothing.
+/// The first log entry that an action wrote. `at` is the time the transaction was about to commit:
+/// no table keeps the time of a state change, so the gateway takes it right before the commit.
+#[derive(Debug, Clone)]
+pub struct Change {
+    pub manifest: String,
+    pub state: State,
+    pub log_index: u64,
+    pub at: OffsetDateTime,
+}
+
+/// What `apply` left: the state of each enrolment, and the first change when at least one
+/// enrolment changed. `None` means the action changed nothing.
 #[derive(Debug)]
 pub struct Applied {
     pub states: Vec<(String, State)>,
-    pub changed_to: Option<State>,
+    pub change: Option<Change>,
 }
 
 /// Applies `action` to every enrolment of `device` and logs each change.
@@ -178,14 +188,13 @@ pub async fn apply(db: &PgPool, device: &str, action: Action) -> anyhow::Result<
         bail!("no device {device}");
     }
     let mut result = vec![];
-    let mut changed_to = None;
+    let mut first = None;
     for (manifest, state, salt) in rows {
         let state = State::parse(&state)?;
         let Some(next) = state.after(action).map_err(anyhow::Error::msg)? else {
             result.push((manifest, state));
             continue;
         };
-        changed_to = Some(next);
         sqlx::query("UPDATE devices SET state = $1 WHERE pseudonym = $2 AND manifest_hash = $3")
             .bind(next.as_str())
             .bind(device)
@@ -199,12 +208,19 @@ pub async fn apply(db: &PgPool, device: &str, action: Action) -> anyhow::Result<
         )
         .await?;
         eprintln!("log entry {}: {}", entry.index, entry.kind.as_str());
+        first.get_or_insert_with(|| (manifest.clone(), next, entry.index));
         result.push((manifest, next));
     }
+    let at = OffsetDateTime::now_utc();
     tx.commit().await?;
     Ok(Applied {
         states: result,
-        changed_to,
+        change: first.map(|(manifest, state, log_index)| Change {
+            manifest,
+            state,
+            log_index,
+            at,
+        }),
     })
 }
 

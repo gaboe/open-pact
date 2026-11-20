@@ -111,11 +111,28 @@ pub(crate) fn is_protected(path: &Path) -> bool {
         .any(|protected| names_below(&protected.home, path).is_some())
 }
 
+/// The reparse point bit of the file attributes.
+#[cfg_attr(not(windows), allow(dead_code))]
+const ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+
+/// The name surrogate bit of a reparse tag: the item stands for another name in the name space.
+#[cfg_attr(not(windows), allow(dead_code))]
+const TAG_NAME_SURROGATE: u32 = 0x2000_0000;
+
+/// Whether an item with these file attributes and reparse tag is a link: a reparse point whose tag
+/// is a name surrogate (junction, symbolic link, mount point). Other reparse points, such as the
+/// cloud tags of OneDrive Files On-Demand, keep their own content and are no link.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn is_link(attributes: u32, tag: u32) -> bool {
+    attributes & ATTRIBUTE_REPARSE_POINT != 0 && tag & TAG_NAME_SURROGATE != 0
+}
+
 /// What an open handle says about the name it opened, without following a link.
 #[cfg_attr(not(windows), allow(dead_code))]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Opened {
-    pub(crate) reparse_point: bool,
+    /// A reparse point that is a link, see `is_link`.
+    pub(crate) link: bool,
     pub(crate) directory: bool,
     pub(crate) links: u32,
 }
@@ -132,11 +149,11 @@ fn refused(what: &str) -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, what.to_owned())
 }
 
-/// Fails closed unless `opened` is a plain item of `kind`: no reparse point (junction, symbolic
-/// link, mount point), and a file with no other hard link.
+/// Fails closed unless `opened` is a plain item of `kind`: no link (junction, symbolic link,
+/// mount point), and a file with no other hard link.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn check(opened: Opened, kind: Kind) -> io::Result<()> {
-    if opened.reparse_point {
+    if opened.link {
         return Err(refused("home file is a reparse point"));
     }
     match kind {
@@ -190,6 +207,49 @@ pub(crate) fn read(path: &Path) -> io::Result<Vec<u8>> {
         return Ok(bytes);
     }
     std::fs::read(path)
+}
+
+/// Reads a whole text file of the home.
+pub(crate) fn read_to_string(path: &Path) -> io::Result<String> {
+    if is_protected(path) {
+        return String::from_utf8(read(path)?)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error));
+    }
+    std::fs::read_to_string(path)
+}
+
+/// `std::fs::canonicalize` for a folder. In a protected home a link at the folder or above it
+/// fails the call, and the answer is the final path of the checked handle, so the job never opens
+/// the folder a second time by path.
+pub(crate) fn canonicalize_dir(path: &Path) -> io::Result<PathBuf> {
+    #[cfg(windows)]
+    if let Some(target) = protected(path) {
+        let (root, names) = target?;
+        // The path comes from the handle that passed the check, so a link planted after it
+        // is never followed by a second open.
+        let folder = sys::open_dir(&root, &names, sys::Folder::Open)?;
+        return sys::final_path(&folder).map(PathBuf::from);
+    }
+    std::fs::canonicalize(path)
+}
+
+/// `path` with every `.` and `..` resolved by name alone. In a protected home the result is the
+/// path the names reach, because every operation there refuses a link on the way.
+pub(crate) fn lexical(path: &Path) -> PathBuf {
+    let mut resolved = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match resolved.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    resolved.pop();
+                }
+                _ => resolved.push(".."),
+            },
+            other => resolved.push(other),
+        }
+    }
+    resolved
 }
 
 /// One name in a folder, and whether it is a folder. A link is no folder.
@@ -365,11 +425,12 @@ mod sys {
     use windows_sys::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, CreateFileW, DELETE, FILE_APPEND_DATA,
         FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
-        FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
-        FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO, FILE_DISPOSITION_INFO_EX,
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FULL_DIR_INFO,
-        FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY, FILE_NAME_NORMALIZED,
-        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
+        FILE_ATTRIBUTE_TAG_INFO, FILE_DISPOSITION_FLAG_DELETE,
+        FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+        FILE_DISPOSITION_INFO, FILE_DISPOSITION_INFO_EX, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_FULL_DIR_INFO, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+        FILE_LIST_DIRECTORY, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FileAttributeTagInfo,
         FileDispositionInfo, FileDispositionInfoEx, FileFullDirectoryInfo,
         FileFullDirectoryRestartInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
         GetFinalPathNameByHandleW, GetLongPathNameW, OPEN_EXISTING, SYNCHRONIZE,
@@ -377,7 +438,7 @@ mod sys {
     };
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
-    use super::{Kind, Open, Opened, check, refused, same_path};
+    use super::{Kind, Open, Opened, check, is_link, refused, same_path};
 
     const SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
     const FOLDER_ACCESS: u32 = FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES;
@@ -415,14 +476,39 @@ mod sys {
         if unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info) } == 0 {
             return Err(io::Error::last_os_error());
         }
+        // The tag says what kind of reparse point it is; a plain item has none to read.
+        let tag = if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            reparse_tag(file)?
+        } else {
+            0
+        };
         Ok(Opened {
-            reparse_point: info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0,
+            link: is_link(info.dwFileAttributes, tag),
             directory: info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0,
             links: info.nNumberOfLinks,
         })
     }
 
-    fn final_path(file: &File) -> io::Result<String> {
+    /// The reparse tag of the item behind an open handle.
+    fn reparse_tag(file: &File) -> io::Result<u32> {
+        let mut info = FILE_ATTRIBUTE_TAG_INFO::default();
+        // SAFETY: the handle is open for the life of `file`, and `info` is writable.
+        if unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle() as HANDLE,
+                FileAttributeTagInfo,
+                (&raw mut info).cast(),
+                size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(info.ReparseTag)
+    }
+
+    /// The path Windows reports for an open handle.
+    pub(super) fn final_path(file: &File) -> io::Result<String> {
         let mut buffer = vec![0u16; 512];
         loop {
             // SAFETY: the buffer holds `buffer.len()` UTF-16 units.
@@ -764,7 +850,7 @@ mod sys {
             loop {
                 // SAFETY: Windows wrote whole records into the buffer, linked by
                 // `NextEntryOffset` and each aligned for its struct.
-                let (next, attributes, name) = unsafe {
+                let (next, attributes, tag, name) = unsafe {
                     let entry = buffer
                         .as_ptr()
                         .cast::<u8>()
@@ -778,14 +864,15 @@ mod sys {
                     (
                         (*entry).NextEntryOffset as usize,
                         (*entry).FileAttributes,
+                        // For a reparse point the listing keeps the tag in `EaSize`.
+                        (*entry).EaSize,
                         OsString::from_wide(name),
                     )
                 };
                 if name != "." && name != ".." {
                     entries.push((
                         name,
-                        attributes & FILE_ATTRIBUTE_DIRECTORY != 0
-                            && attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+                        attributes & FILE_ATTRIBUTE_DIRECTORY != 0 && !is_link(attributes, tag),
                     ));
                 }
                 if next == 0 {
@@ -803,10 +890,26 @@ mod tests {
 
     fn plain() -> Opened {
         Opened {
-            reparse_point: false,
+            link: false,
             directory: false,
             links: 1,
         }
+    }
+
+    #[test]
+    fn only_a_name_surrogate_reparse_point_is_a_link() {
+        const REPARSE: u32 = 0x400;
+        const DIRECTORY: u32 = 0x10;
+        let junction = 0xA000_0003;
+        let symlink = 0xA000_000C;
+        let cloud = 0x9000_601A;
+        assert!(is_link(REPARSE | DIRECTORY, junction));
+        assert!(is_link(REPARSE, symlink));
+        // A OneDrive Files On-Demand folder is a reparse point with a cloud tag: no link.
+        assert!(!is_link(REPARSE | DIRECTORY, cloud));
+        // Without the reparse attribute the tag field means nothing.
+        assert!(!is_link(DIRECTORY, 0));
+        assert!(!is_link(DIRECTORY, junction));
     }
 
     #[test]
@@ -820,7 +923,7 @@ mod tests {
         for (opened, kind, why) in [
             (
                 Opened {
-                    reparse_point: true,
+                    link: true,
                     ..plain()
                 },
                 Kind::File,
@@ -828,7 +931,7 @@ mod tests {
             ),
             (
                 Opened {
-                    reparse_point: true,
+                    link: true,
                     ..folder
                 },
                 Kind::Directory,
@@ -1225,6 +1328,67 @@ mod tests {
         junction(&vpn, &planted.outside);
         let error = home.remove_vpn_leftovers(&vpn).unwrap_err();
         assert!(format!("{error:#}").contains("reparse point"), "{error:#}");
+        assert_untouched(&planted);
+    }
+
+    #[test]
+    fn a_path_is_resolved_by_name_without_touching_the_disk() {
+        let home = Path::new("/home/example/repo");
+        assert_eq!(
+            lexical(&home.join("sub/../.git")),
+            Path::new("/home/example/repo/.git")
+        );
+        assert_eq!(
+            lexical(&home.join("./a/./b")),
+            Path::new("/home/example/repo/a/b")
+        );
+        assert_eq!(lexical(&home.join("../../x")), Path::new("/home/x"));
+        assert_eq!(lexical(Path::new("../../a")), Path::new("../../a"));
+    }
+
+    #[test]
+    fn a_text_file_reads_like_std_and_rejects_text_that_is_not_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config"), "fictional text").unwrap();
+        std::fs::write(dir.path().join("binary"), [0xff, 0xfe]).unwrap();
+        assert_eq!(
+            read_to_string(&dir.path().join("config")).unwrap(),
+            "fictional text"
+        );
+        assert_eq!(
+            read_to_string(&dir.path().join("binary"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            read_to_string(&dir.path().join("missing"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            canonicalize_dir(dir.path()).unwrap(),
+            std::fs::canonicalize(dir.path()).unwrap()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_junction_in_a_protected_home_stops_a_text_read_and_a_folder_resolution() {
+        let planted = planted();
+        let link = planted.home.join("linked");
+        junction(&link, &planted.outside);
+        assert_refused(read_to_string(&link.join("secret.txt")), "reparse point");
+        assert_refused(canonicalize_dir(&link), "reparse point");
+        assert_refused(canonicalize_dir(&link.join("deeper")), "reparse point");
+        std::fs::create_dir(planted.home.join("plain")).unwrap();
+        std::fs::write(planted.home.join("plain").join("text"), "fictional").unwrap();
+        assert_eq!(
+            read_to_string(&planted.home.join("plain").join("text")).unwrap(),
+            "fictional"
+        );
+        assert!(canonicalize_dir(&planted.home.join("plain")).is_ok());
         assert_untouched(&planted);
     }
 }
