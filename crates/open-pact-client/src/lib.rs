@@ -10988,8 +10988,9 @@ grace = "1d"
         let (steps, on_step) = step_log();
 
         // Cancels at the first status request. The join logs step 4 Waiting before it sends that request.
-        let error = session
-            .join(
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            session.join(
                 &invitation,
                 JoinChoices {
                     software_key: true,
@@ -10997,9 +10998,11 @@ grace = "1d"
                 },
                 async move { status_requested.notified().await },
                 on_step,
-            )
-            .await
-            .unwrap_err();
+            ),
+        )
+        .await
+        .expect("the join did not end within 30 seconds after its cancel future completed")
+        .unwrap_err();
 
         assert!(error.is::<Cancelled>(), "{error:#}");
         assert!(
