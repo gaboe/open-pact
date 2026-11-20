@@ -1567,9 +1567,83 @@ if ($null -ne $failure) {{ throw $failure }}
     )
 }
 
+/// Set by the console handler while a `ConsoleInterruptHold` lives.
+static CONSOLE_INTERRUPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The console handler of a `ConsoleInterruptHold`: it records Ctrl-C, Ctrl-Break and a console
+/// close, and returns TRUE so the system does not end the process.
+#[cfg(windows)]
+unsafe extern "system" fn hold_console_interrupt(_event: u32) -> i32 {
+    CONSOLE_INTERRUPT.store(true, std::sync::atomic::Ordering::SeqCst);
+    1
+}
+
+/// Keeps a console Ctrl-C from ending the process while it lives, and remembers that it came.
+/// The PowerShell children run with `CREATE_NO_WINDOW`, so they have their own console and never
+/// see the user's Ctrl-C. It does nothing outside Windows.
+struct ConsoleInterruptHold;
+
+/// Adds or removes `hold_console_interrupt` in the console handler list of the process.
+#[cfg(windows)]
+fn set_console_handler(add: bool) {
+    // SAFETY: the handler is a `'static` function that only stores to an atomic.
+    unsafe {
+        windows_sys::Win32::System::Console::SetConsoleCtrlHandler(
+            Some(hold_console_interrupt),
+            i32::from(add),
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn set_console_handler(_add: bool) {}
+
+impl ConsoleInterruptHold {
+    fn new() -> Self {
+        CONSOLE_INTERRUPT.store(false, std::sync::atomic::Ordering::SeqCst);
+        set_console_handler(true);
+        Self
+    }
+
+    fn interrupted(&self) -> bool {
+        CONSOLE_INTERRUPT.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for ConsoleInterruptHold {
+    fn drop(&mut self) {
+        set_console_handler(false);
+    }
+}
+
+/// A command that held off Ctrl-C ends as interrupted once it has restored the task state. The CLI
+/// maps [`crate::Interrupted`] to exit code 130. The failure that the command had is printed first.
+fn end_after_held_interrupt(interrupted: bool, result: Result<()>) -> Result<()> {
+    if !interrupted {
+        return result;
+    }
+    if let Err(error) = result {
+        eprintln!("{error:#}");
+    }
+    Err(crate::Interrupted.into())
+}
+
 fn windows_system_uninstall(job: &Job, home: &Home) -> Result<()> {
     let state = windows_existing_system_state(&home.0)?;
+    // Held until the task is resumed or removed: a Ctrl-C in the wait must not leave it disabled.
+    let hold = ConsoleInterruptHold::new();
+    let result = windows_system_uninstall_held(job, state);
+    let interrupted = hold.interrupted();
+    drop(hold);
+    end_after_held_interrupt(interrupted, result)
+}
+
+fn windows_system_uninstall_held(job: &Job, state: Option<PathBuf>) -> Result<()> {
     let was_enabled = windows_end_task(job);
+    println!(
+        "Waiting up to {} s for the running SYSTEM tick to end. Ctrl-C waits until the task state is restored.",
+        SYSTEM_WAIT.as_secs()
+    );
     let _state_lock = match state
         .as_ref()
         .map(|path| {
@@ -4740,6 +4814,29 @@ Write-Output 'limited_uninstall_removed_task_without_protected_access'
             windows_powershell(&script).unwrap(),
             "limited_uninstall_removed_task_without_protected_access"
         );
+    }
+
+    #[test]
+    fn a_held_interrupt_ends_the_command_as_interrupted_and_nothing_else_does() {
+        assert!(end_after_held_interrupt(false, Ok(())).is_ok());
+        let failure = end_after_held_interrupt(false, Err(anyhow::anyhow!("fictional failure")));
+        assert_eq!(failure.unwrap_err().to_string(), "fictional failure");
+        for result in [Ok(()), Err(anyhow::anyhow!("fictional failure"))] {
+            let error = end_after_held_interrupt(true, result).unwrap_err();
+            assert!(error.is::<crate::Interrupted>());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_console_handler_records_the_event_and_keeps_the_process_alive() {
+        let hold = ConsoleInterruptHold::new();
+        assert!(!hold.interrupted());
+        // SAFETY: the handler only stores to an atomic.
+        assert_eq!(unsafe { hold_console_interrupt(0) }, 1);
+        assert!(hold.interrupted());
+        drop(hold);
+        assert!(!ConsoleInterruptHold::new().interrupted());
     }
 
     #[cfg(windows)]
