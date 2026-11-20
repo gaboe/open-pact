@@ -224,10 +224,11 @@ The event has the same top-level key `open_pact` and `schema_version` as a claim
 | --- | --- |
 | `schema_version` | Integer, currently `1`. |
 | `event` | String, `device_state`. |
-| `time` | RFC 3339 UTC time of the change. |
+| `time` | RFC 3339 UTC time of the change, taken just before the gateway commits it. |
 | `device_pseudonym` | String, the pseudonym of the device. |
 | `device_note` | String, the note of the invitation the device enrolled with, or `null` when it had none. |
 | `state` | `approved` or `revoked`. |
+| `log_index` | Integer, the index of the transparency-log entry that recorded the change: a `device_approved` or `device_revoked` entry. Order one device's `device_state` events by it, not by arrival. |
 
 The event carries no verdict, reasons or control results. Rule 100507 in the sample rules raises level 8 for `state` `revoked`. Rule 100500 also matches the event at level 3, because it matches `schema_version`.
 
