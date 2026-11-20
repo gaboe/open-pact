@@ -563,7 +563,8 @@ async fn try_enroll(
     .fetch_optional(&mut *tx)
     .await
     .map_err(internal)?;
-    let mut auto_approved = false;
+    // The index of the DeviceApproved entry that this enrolment wrote when the gateway approves it.
+    let mut approved_index: Option<u64> = None;
     let (salt, state, log_index) = match existing {
         Some((existing_owner, salt, state, stored_invitation)) => {
             if existing_owner != owner_key {
@@ -621,7 +622,6 @@ async fn try_enroll(
             } else {
                 DeviceState::Pending
             };
-            auto_approved = state == DeviceState::Approved;
             sqlx::query(
                 "INSERT INTO devices (pseudonym, manifest_hash, owner_key, owner_signature, salt, state, invitation, \
                  enrol_owner_signature, enrol_device_signature) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
@@ -644,21 +644,28 @@ async fn try_enroll(
                 .await
                 .map_err(internal)?;
             if state == DeviceState::Approved {
-                translog::append(&mut tx, EntryKind::DeviceApproved, committed)
+                let approved = translog::append(&mut tx, EntryKind::DeviceApproved, committed)
                     .await
                     .map_err(internal)?;
+                approved_index = Some(approved.index);
             }
             (salt, state, entry.index)
         }
     };
+    // The time of the approval, taken right before the commit.
+    let approved_at = OffsetDateTime::now_utc();
     tx.commit().await.map_err(internal)?;
-    if auto_approved && let Some(exporter) = &app.siem {
+    if let Some(index) = approved_index
+        && let Some(exporter) = &app.siem
+    {
         // The enrolment is committed. A failed note read must not fail it, so it only warns.
         match device_state_event(
             &app.db,
             &device,
             app.manifest.hash().as_str(),
             DeviceState::Approved,
+            index,
+            approved_at,
         )
         .await
         {
@@ -1443,16 +1450,12 @@ async fn admin_devices(db: &PgPool, command: DevicesCommand) -> anyhow::Result<(
     for (manifest, state) in &applied.states {
         println!("{} {device} for {manifest}", state.as_str());
     }
-    if let Some(state) = applied.changed_to {
+    if let Some(change) = &applied.change {
         // The change is committed. A SIEM that cannot be reached must not make the command fail.
-        let manifest = applied
-            .states
-            .first()
-            .map(|(manifest, _)| manifest.as_str());
-        if let Err(error) = announce_state(db, &device, manifest.unwrap_or_default(), state).await {
+        if let Err(error) = announce_state(db, &device, change).await {
             eprintln!(
                 "WARNING: {device} is {state}, but the SIEM event was not sent: {error:#}",
-                state = state.as_str()
+                state = change.state.as_str()
             );
         }
     }
@@ -1460,33 +1463,40 @@ async fn admin_devices(db: &PgPool, command: DevicesCommand) -> anyhow::Result<(
 }
 
 /// Sends one `device_state` event to the SIEM the server is configured with, if there is one.
-async fn announce_state(
-    db: &PgPool,
-    device: &str,
-    manifest: &str,
-    state: devices::State,
-) -> anyhow::Result<()> {
+async fn announce_state(db: &PgPool, device: &str, change: &devices::Change) -> anyhow::Result<()> {
     let Some(sink) = siem::OneShot::from_env()? else {
         return Ok(());
     };
     let pseudonym = Pseudonym::try_from(device.to_owned()).map_err(anyhow::Error::msg)?;
-    let event = device_state_event(db, &pseudonym, manifest, state).await?;
+    let event = device_state_event(
+        db,
+        &pseudonym,
+        &change.manifest,
+        change.state,
+        change.log_index,
+        change.at,
+    )
+    .await?;
     tokio::task::spawn_blocking(move || sink.send(&event)).await?
 }
 
-/// The `device_state` event for `device` under `manifest`, with the note of its invitation.
+/// The `device_state` event for `device` under `manifest`, with the note of its invitation. It
+/// carries the log entry `log_index` that recorded the change, and the time `at` of the change.
 async fn device_state_event(
     db: &PgPool,
     device: &Pseudonym,
     manifest: &str,
     state: devices::State,
+    log_index: u64,
+    at: OffsetDateTime,
 ) -> anyhow::Result<Value> {
     let note = devices::note(&mut *db.acquire().await?, device, manifest).await?;
     Ok(siem::state_event(
         device,
         &note,
         state.as_str(),
-        OffsetDateTime::now_utc(),
+        log_index,
+        at,
     ))
 }
 
@@ -2132,7 +2142,7 @@ mod tests {
         // The command refuses a device that is no longer pending. The change itself is a no-op.
         assert!(admin_devices(&db, approve()).await.is_err());
         let again = devices::apply(&db, &device, Action::Approve).await.unwrap();
-        assert!(again.changed_to.is_none());
+        assert!(again.change.is_none());
         assert_eq!(events().len(), 1);
 
         admin_devices(&db, revoke()).await.unwrap();

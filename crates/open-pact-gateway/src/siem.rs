@@ -84,10 +84,14 @@ pub fn event(
 /// The event IT's approval or revocation of a device produces. It shares the `open_pact` key and
 /// `schema_version` with the claim event, so rule 100500 matches it too. Unlike a claim event it has
 /// an `event` field, `device_state`; a claim event has no `event` field.
+/// `at` is the time of the change, and `log_index` is the index of the transparency-log entry that
+/// recorded it. Order one device's `device_state` events by `log_index`: the send time and the
+/// arrival order do not follow the change.
 pub fn state_event(
     device: &Pseudonym,
     device_note: &str,
     state: &str,
+    log_index: u64,
     at: OffsetDateTime,
 ) -> Value {
     json!({"open_pact": {
@@ -97,6 +101,7 @@ pub fn state_event(
         "device_pseudonym": device,
         "device_note": (!device_note.is_empty()).then_some(device_note),
         "state": state,
+        "log_index": log_index,
     }})
 }
 
@@ -589,7 +594,7 @@ mod tests {
     fn state_event_names_the_device_its_note_and_the_new_state() {
         let device = Pseudonym::of(&PublicKey::from(&dev_key::generate()));
         let at = OffsetDateTime::from_unix_timestamp(1_792_000_000).unwrap();
-        let named = state_event(&device, "Laptop, Example Person", "revoked", at);
+        let named = state_event(&device, "Laptop, Example Person", "revoked", 7, at);
         assert_eq!(
             named,
             json!({"open_pact": {
@@ -599,9 +604,11 @@ mod tests {
                 "device_pseudonym": device,
                 "device_note": "Laptop, Example Person",
                 "state": "revoked",
+                "log_index": 7,
             }})
         );
-        let unnamed = state_event(&device, "", "approved", at);
+        let unnamed = state_event(&device, "", "approved", 3, at);
+        assert_eq!(unnamed["open_pact"]["log_index"], 3);
         assert_eq!(unnamed["open_pact"]["device_note"], Value::Null);
         assert_eq!(unnamed["open_pact"]["state"], "approved");
     }
@@ -610,7 +617,7 @@ mod tests {
     fn one_shot_writes_one_line_to_a_file_sink() {
         let path = temporary();
         let device = Pseudonym::of(&PublicKey::from(&dev_key::generate()));
-        let event = state_event(&device, "", "revoked", OffsetDateTime::UNIX_EPOCH);
+        let event = state_event(&device, "", "revoked", 0, OffsetDateTime::UNIX_EPOCH);
         OneShot::file_for_test(path.clone()).send(&event).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
