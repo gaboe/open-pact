@@ -4896,7 +4896,10 @@ AssertProtected {path}
 $acl = [IO.Directory]::GetAccessControl({path})
 $users = @($acl.GetAccessRules($true,$false,[Security.Principal.SecurityIdentifier]) | Where-Object {{ $_.IdentityReference.Value -eq 'S-1-5-32-545' }})
 if ($users.Count -ne 1) {{ throw "expected one Users rule, found $($users.Count)" }}
-if ([int]$users[0].FileSystemRights -ne [int][Security.AccessControl.FileSystemRights]::ReadAndExecute) {{ throw 'Users rule is not ReadAndExecute' }}
+$readExecute = [int][Security.AccessControl.FileSystemRights]::ReadAndExecute
+# .NET adds Synchronize to an Allow rule, so the rights read back as ReadAndExecute plus Synchronize.
+if (([int]$users[0].FileSystemRights -band $readExecute) -ne $readExecute) {{ throw 'Users rule is not ReadAndExecute' }}
+if ([int]$users[0].FileSystemRights -band 0xD0156) {{ throw 'Users rule grants write rights' }}
 if ([int]$users[0].InheritanceFlags -ne 3 -or [int]$users[0].PropagationFlags -ne 0) {{ throw 'Users rule does not inherit to children' }}
 $sids = @($acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]) | ForEach-Object {{ $_.IdentityReference.Value }} | Sort-Object -Unique)
 if (($sids -join ',') -ne 'S-1-5-18,S-1-5-32-544,S-1-5-32-545') {{ throw "unexpected install ACL principals: $($sids -join ',')" }}
