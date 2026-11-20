@@ -10958,6 +10958,8 @@ grace = "1d"
             u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp()).unwrap(),
         );
         let checkpoint = checkpoint.to_string();
+        let status_requested = std::sync::Arc::new(tokio::sync::Notify::new());
+        let requested = status_requested.clone();
         let gateway = FakeGateway::start(move |line, nth| match line {
             "GET /v1/manifest" => (200, published.clone()),
             "GET /v1/log/key" => (200, format!("{log}\n")),
@@ -10967,7 +10969,10 @@ grace = "1d"
                 json!({"salt":"11".repeat(32),"state":"pending"}).to_string(),
             ),
             "POST /v1/nonce" => (200, json!({"nonce":format!("wait-{nth}")}).to_string()),
-            "POST /v1/device/status" => (200, r#"{"state":"pending"}"#.into()),
+            "POST /v1/device/status" => {
+                requested.notify_one();
+                (200, r#"{"state":"pending"}"#.into())
+            }
             _ => not_found(),
         })
         .await;
@@ -10982,6 +10987,7 @@ grace = "1d"
         let session = session_of(&Home(dir.path().to_path_buf()));
         let (steps, on_step) = step_log();
 
+        // Cancels at the first status request. The join logs step 4 Waiting before it sends that request.
         let error = session
             .join(
                 &invitation,
@@ -10989,7 +10995,7 @@ grace = "1d"
                     software_key: true,
                     ..JoinChoices::default()
                 },
-                tokio::time::sleep(Duration::from_millis(500)),
+                async move { status_requested.notified().await },
                 on_step,
             )
             .await
