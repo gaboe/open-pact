@@ -219,12 +219,16 @@ pub(crate) fn read_to_string(path: &Path) -> io::Result<String> {
 }
 
 /// `std::fs::canonicalize` for a folder. In a protected home a link at the folder or above it
-/// fails the call before `std` resolves anything, so the job never follows the link.
+/// fails the call, and the answer is the final path of the checked handle, so the job never opens
+/// the folder a second time by path.
 pub(crate) fn canonicalize_dir(path: &Path) -> io::Result<PathBuf> {
     #[cfg(windows)]
     if let Some(target) = protected(path) {
         let (root, names) = target?;
-        sys::open_dir(&root, &names, sys::Folder::Open)?;
+        // The path comes from the handle that passed the check, so a link planted after it
+        // is never followed by a second open.
+        let folder = sys::open_dir(&root, &names, sys::Folder::Open)?;
+        return sys::final_path(&folder).map(PathBuf::from);
     }
     std::fs::canonicalize(path)
 }
@@ -504,7 +508,7 @@ mod sys {
     }
 
     /// The path Windows reports for an open handle.
-    fn final_path(file: &File) -> io::Result<String> {
+    pub(super) fn final_path(file: &File) -> io::Result<String> {
         let mut buffer = vec![0u16; 512];
         loop {
             // SAFETY: the buffer holds `buffer.len()` UTF-16 units.
