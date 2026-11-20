@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashSet};
+use std::ffi::OsString;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -50,7 +51,7 @@ const TRASH_PRUNED: &[&str] = &[".Trash", ".local/share/Trash"];
 
 pub(crate) fn managed_repo_groups(paths: &[PathBuf], home: &Path) -> Vec<(String, usize)> {
     let mut groups = BTreeMap::<String, usize>::new();
-    let home = fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    let home = crate::home_fs::canonicalize_dir(home).unwrap_or_else(|_| home.to_path_buf());
     for path in paths {
         let Some(relative) = relative_to_home(path, &home) else {
             continue;
@@ -169,12 +170,12 @@ pub(crate) fn scan_and_store(
 }
 
 pub(crate) fn scan(root: &Path, folders: &[PathBuf], patterns: &[String]) -> Result<RepoScan> {
-    let ssh_hosts = fs::read_to_string(root.join(".ssh/config"))
+    let ssh_hosts = crate::home_fs::read_to_string(&root.join(".ssh/config"))
         .map(|text| parse_ssh_hosts(&text))
         .unwrap_or_default();
     let folders = folders
         .iter()
-        .map(|folder| fs::canonicalize(folder).unwrap_or_else(|_| absolute(folder)))
+        .map(|folder| crate::home_fs::canonicalize_dir(folder).unwrap_or_else(|_| absolute(folder)))
         .collect::<Vec<_>>();
     let mut counts = (0_i32, 0_i32);
     let mut outside_paths = Vec::new();
@@ -211,7 +212,8 @@ pub(crate) fn scan(root: &Path, folders: &[PathBuf], patterns: &[String]) -> Res
         }
         progress.borrow_mut().found_repository(repo);
         counts.1 += 1;
-        let repo_path = fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
+        let repo_path =
+            crate::home_fs::canonicalize_dir(repo).unwrap_or_else(|_| repo.to_path_buf());
         managed_paths.push(repo_path.clone());
         if !folders.iter().any(|folder| repo_path.starts_with(folder)) {
             counts.0 += 1;
@@ -424,6 +426,52 @@ struct WalkState {
     causes: Vec<ScanCause>,
 }
 
+/// One name in a scanned folder.
+enum Child {
+    /// A name of the std listing, whose type is read only when the scan needs it.
+    Entry(Box<fs::DirEntry>),
+    /// A name of a listing in a protected home, where a link is no folder.
+    Listed { name: OsString, directory: bool },
+}
+
+impl Child {
+    fn name(&self) -> OsString {
+        match self {
+            Self::Entry(entry) => entry.file_name(),
+            Self::Listed { name, .. } => name.clone(),
+        }
+    }
+
+    /// Whether the name is a folder. A link is no folder.
+    fn is_dir(&self) -> io::Result<bool> {
+        match self {
+            // DirEntry::file_type does not follow symlinks. It reads the type from the directory
+            // listing and falls back to an lstat only where the file system leaves it unknown.
+            Self::Entry(entry) => entry.file_type().map(|kind| kind.is_dir()),
+            Self::Listed { directory, .. } => Ok(*directory),
+        }
+    }
+}
+
+/// The names in `dir`. In a protected home they come through the checked folder handle, so a
+/// link at the folder or above it stops the listing; else they are the ones of `std::fs`.
+fn read_children(dir: &Path) -> io::Result<Vec<io::Result<Child>>> {
+    if crate::home_fs::is_protected(dir) {
+        return Ok(crate::home_fs::list(dir)?
+            .into_iter()
+            .map(|entry| {
+                Ok(Child::Listed {
+                    name: entry.name,
+                    directory: entry.directory,
+                })
+            })
+            .collect());
+    }
+    Ok(fs::read_dir(dir)?
+        .map(|entry| entry.map(|entry| Child::Entry(Box::new(entry))))
+        .collect())
+}
+
 fn walk(
     root: &Path,
     dir: &Path,
@@ -435,16 +483,22 @@ fn walk(
     if depth > MAX_DEPTH {
         return Ok(());
     }
-    match fs::symlink_metadata(dir) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => return Ok(()),
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            mark_partial(state, dir.to_path_buf(), &error);
-            return Ok(());
+    // A protected listing opens every name on the way and refuses a link there, so it needs no
+    // look at the folder first.
+    if !crate::home_fs::is_protected(dir) {
+        match fs::symlink_metadata(dir) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Ok(());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                mark_partial(state, dir.to_path_buf(), &error);
+                return Ok(());
+            }
         }
     }
-    let entries = match fs::read_dir(dir) {
+    let entries = match read_children(dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => {
@@ -463,12 +517,12 @@ fn walk(
                 continue;
             }
         };
-        let name = entry.file_name();
+        let name = entry.name();
         if name == ".git" {
             has_git = true;
             continue;
         }
-        let path = entry.path();
+        let path = dir.join(&name);
         if GENERATED_PRUNED
             .iter()
             .chain(TRASH_PRUNED.iter().filter(|pruned| !pruned.contains('/')))
@@ -485,17 +539,15 @@ fn walk(
         {
             continue;
         }
-        // DirEntry::file_type does not follow symlinks. It reads the type from the directory
-        // listing and falls back to an lstat only where the file system leaves it unknown.
-        match entry.file_type() {
-            Ok(kind) if kind.is_dir() => children.push(path),
-            Ok(_) => {}
+        match entry.is_dir() {
+            Ok(true) => children.push(path),
+            Ok(false) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => mark_partial(state, path, &error),
         }
     }
     if has_git {
-        let canonical = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        let canonical = crate::home_fs::canonicalize_dir(dir).unwrap_or_else(|_| dir.to_path_buf());
         if state.seen.insert(canonical) {
             visit(dir);
         }
@@ -526,16 +578,15 @@ fn is_walk_partial_error(error: &io::Error) -> bool {
 
 fn read_remote_urls(repo: &Path) -> std::io::Result<Vec<String>> {
     let git = repo.join(".git");
-    let (git_dir, is_git_file) = match fs::symlink_metadata(&git) {
-        Ok(metadata) if metadata.is_dir() => (git, false),
-        Ok(metadata) if metadata.file_type().is_symlink() => return Ok(Vec::new()),
-        Ok(_) => {
-            let text = fs::read_to_string(&git)?;
+    let (git_dir, is_git_file) = match git_entry(repo, &git) {
+        Ok(GitEntry::Folder) => (git, false),
+        Ok(GitEntry::Link) => return Ok(Vec::new()),
+        Ok(GitEntry::File) => {
+            let text = crate::home_fs::read_to_string(&git)?;
             let Some(path) = text.trim().strip_prefix("gitdir:") else {
                 return Ok(Vec::new());
             };
-            let path = repo.join(path.trim());
-            (fs::canonicalize(&path).unwrap_or(path), true)
+            (git_path(repo, repo.join(path.trim()))?, true)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error),
@@ -545,14 +596,13 @@ fn read_remote_urls(repo: &Path) -> std::io::Result<Vec<String>> {
     }
     // An unreadable git directory fails this read with an error other than NotFound,
     // so the scan becomes partial instead of reporting a repository without remotes.
-    let commondir = match fs::read_to_string(git_dir.join("commondir")) {
+    let commondir = match crate::home_fs::read_to_string(&git_dir.join("commondir")) {
         Ok(text) => Some(text),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error),
     };
     let common = if let Some(text) = commondir {
-        let path = git_dir.join(text.trim());
-        let common = fs::canonicalize(&path).unwrap_or(path);
+        let common = git_path(repo, git_dir.join(text.trim()))?;
         if is_git_file && missing_or_not_directory(&common)? {
             return Ok(Vec::new());
         }
@@ -563,7 +613,72 @@ fn read_remote_urls(repo: &Path) -> std::io::Result<Vec<String>> {
     parse_config(&common.join("config"))
 }
 
+/// What `.git` is in a repository.
+enum GitEntry {
+    Folder,
+    File,
+    Link,
+}
+
+/// What `git` (the `.git` of `repo`) is, without following a link. In a protected home a link
+/// is a file here, and reading it fails.
+fn git_entry(repo: &Path, git: &Path) -> io::Result<GitEntry> {
+    if crate::home_fs::is_protected(repo) {
+        let entries = crate::home_fs::list(repo)?;
+        return match entries.iter().find(|entry| entry.name == ".git") {
+            Some(entry) if entry.directory => Ok(GitEntry::Folder),
+            Some(_) => Ok(GitEntry::File),
+            None => Err(io::ErrorKind::NotFound.into()),
+        };
+    }
+    let metadata = fs::symlink_metadata(git)?;
+    Ok(if metadata.is_dir() {
+        GitEntry::Folder
+    } else if metadata.file_type().is_symlink() {
+        GitEntry::Link
+    } else {
+        GitEntry::File
+    })
+}
+
+/// The git directory that `path` names inside `repo`. In a protected home the names alone say
+/// where it is, because every read below refuses a link; a path that leaves the home fails.
+fn git_path(repo: &Path, path: PathBuf) -> io::Result<PathBuf> {
+    if !crate::home_fs::is_protected(repo) {
+        return Ok(fs::canonicalize(&path).unwrap_or(path));
+    }
+    let path = crate::home_fs::lexical(&path);
+    if crate::home_fs::is_protected(&path) {
+        Ok(path)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "git directory is outside the home",
+        ))
+    }
+}
+
 fn missing_or_not_directory(path: &Path) -> std::io::Result<bool> {
+    if crate::home_fs::is_protected(path) {
+        // A link is no folder, and a link above the folder fails the listing.
+        let Some((parent, name)) = path.parent().zip(path.file_name()) else {
+            return Ok(true);
+        };
+        return match crate::home_fs::list(parent) {
+            Ok(entries) => Ok(!entries
+                .iter()
+                .any(|entry| entry.name == name && entry.directory)),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                Ok(true)
+            }
+            Err(error) => Err(error),
+        };
+    }
     match fs::metadata(path) {
         Ok(metadata) => Ok(!metadata.is_dir()),
         Err(error)
@@ -579,7 +694,7 @@ fn missing_or_not_directory(path: &Path) -> std::io::Result<bool> {
 }
 
 fn parse_config(path: &Path) -> std::io::Result<Vec<String>> {
-    let text = match fs::read_to_string(path) {
+    let text = match crate::home_fs::read_to_string(path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error),
@@ -1883,5 +1998,137 @@ mod tests {
     #[test]
     fn wildcard_match_accepts_a_trailing_star_after_a_full_match() {
         assert!(wildcard_matches("ab", "ab*"));
+    }
+
+    /// A user home that SYSTEM protects, and a folder outside it that holds what a standard user
+    /// must not make the scan read.
+    #[cfg(windows)]
+    struct Planted {
+        _dir: tempfile::TempDir,
+        home: PathBuf,
+        outside: PathBuf,
+        _protection: crate::home_fs::Protection,
+    }
+
+    #[cfg(windows)]
+    fn planted() -> Planted {
+        let dir = tempfile::tempdir().unwrap();
+        // The final path Windows reports, so a short 8.3 name in TEMP does not count as a link.
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let root = PathBuf::from(root.to_str().unwrap().trim_start_matches(r"\\?\"));
+        let home = root.join("home");
+        let outside = root.join("outside");
+        let state = root.join("state");
+        for folder in [&home, &outside, &state] {
+            fs::create_dir(folder).unwrap();
+        }
+        let protection = crate::home_fs::protect(&home, &state).unwrap();
+        Planted {
+            _dir: dir,
+            home,
+            outside,
+            _protection: protection,
+        }
+    }
+
+    #[cfg(windows)]
+    fn junction(link: &Path, target: &Path) {
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "mklink /J failed");
+    }
+
+    #[cfg(windows)]
+    const FICTIONAL_PATTERN: &str = "git.example.test/example-org/";
+
+    #[cfg(windows)]
+    fn write_git_directory(git: &Path, url: &str) {
+        fs::create_dir_all(git).unwrap();
+        fs::write(
+            git.join("config"),
+            format!("[remote \"origin\"]\n\turl = {url}\n"),
+        )
+        .unwrap();
+    }
+
+    #[cfg(windows)]
+    fn scan_protected(planted: &Planted) -> RepoScan {
+        scan(&planted.home, &[], &[FICTIONAL_PATTERN.to_string()]).unwrap()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_system_scan_reads_the_ssh_config_but_not_through_a_junction() {
+        let url = "git@alias:example-org/app.git";
+        let ssh = "Host alias\n HostName git.example.test\n";
+
+        let plain = planted();
+        fs::create_dir(plain.home.join(".ssh")).unwrap();
+        fs::write(plain.home.join(".ssh").join("config"), ssh).unwrap();
+        write_git_directory(&plain.home.join("work").join("app").join(".git"), url);
+        assert_eq!(scan_protected(&plain).managed_repos_total, 1);
+
+        let planted = planted();
+        fs::create_dir(planted.outside.join("ssh")).unwrap();
+        fs::write(planted.outside.join("ssh").join("config"), ssh).unwrap();
+        junction(&planted.home.join(".ssh"), &planted.outside.join("ssh"));
+        write_git_directory(&planted.home.join("work").join("app").join(".git"), url);
+        // The alias stays unresolved, so no remote matches.
+        assert_eq!(scan_protected(&planted).managed_repos_total, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_system_scan_neither_follows_a_gitdir_out_of_the_home_nor_a_git_link() {
+        let url = "ssh://git@git.example.test/example-org/stolen.git";
+        let planted = planted();
+        let stolen = planted.outside.join("stolen").join(".git");
+        write_git_directory(&stolen, url);
+
+        let trick = planted.home.join("trick");
+        fs::create_dir_all(&trick).unwrap();
+        fs::write(
+            trick.join(".git"),
+            format!("gitdir: {}\n", stolen.display()),
+        )
+        .unwrap();
+        let scan = scan_protected(&planted);
+        assert_eq!(scan.managed_repos_total, 0);
+        assert!(scan.partial && scan.access_denied, "{scan:?}");
+
+        fs::remove_dir_all(&trick).unwrap();
+        let linked = planted.home.join("linked");
+        fs::create_dir_all(&linked).unwrap();
+        junction(&linked.join(".git"), &stolen);
+        let scan = scan_protected(&planted);
+        assert_eq!(scan.managed_repos_total, 0);
+        assert!(scan.partial, "{scan:?}");
+
+        fs::remove_dir(linked.join(".git")).unwrap();
+        junction(&planted.home.join("through"), &planted.outside);
+        let scan = scan_protected(&planted);
+        assert_eq!(scan.managed_repos_total, 0);
+        assert!(!scan.partial, "{scan:?}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_system_scan_follows_a_gitdir_that_stays_in_the_home() {
+        let planted = planted();
+        write_git_directory(
+            &planted.home.join("modules").join("app.git"),
+            "ssh://git@git.example.test/example-org/app.git",
+        );
+        let work = planted.home.join("work").join("sub");
+        fs::create_dir_all(&work).unwrap();
+        fs::write(work.join(".git"), "gitdir: ../../modules/app.git\n").unwrap();
+        let scan = scan_protected(&planted);
+        assert_eq!(scan.managed_repos_total, 1, "{scan:?}");
+        assert!(!scan.partial, "{scan:?}");
     }
 }

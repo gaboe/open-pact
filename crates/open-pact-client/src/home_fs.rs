@@ -192,6 +192,45 @@ pub(crate) fn read(path: &Path) -> io::Result<Vec<u8>> {
     std::fs::read(path)
 }
 
+/// Reads a whole text file of the home.
+pub(crate) fn read_to_string(path: &Path) -> io::Result<String> {
+    if is_protected(path) {
+        return String::from_utf8(read(path)?)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error));
+    }
+    std::fs::read_to_string(path)
+}
+
+/// `std::fs::canonicalize` for a folder. In a protected home a link at the folder or above it
+/// fails the call before `std` resolves anything, so the job never follows the link.
+pub(crate) fn canonicalize_dir(path: &Path) -> io::Result<PathBuf> {
+    #[cfg(windows)]
+    if let Some(target) = protected(path) {
+        let (root, names) = target?;
+        sys::open_dir(&root, &names, sys::Folder::Open)?;
+    }
+    std::fs::canonicalize(path)
+}
+
+/// `path` with every `.` and `..` resolved by name alone. In a protected home the result is the
+/// path the names reach, because every operation there refuses a link on the way.
+pub(crate) fn lexical(path: &Path) -> PathBuf {
+    let mut resolved = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match resolved.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    resolved.pop();
+                }
+                _ => resolved.push(".."),
+            },
+            other => resolved.push(other),
+        }
+    }
+    resolved
+}
+
 /// One name in a folder, and whether it is a folder. A link is no folder.
 #[derive(Debug)]
 pub(crate) struct Entry {
@@ -1225,6 +1264,67 @@ mod tests {
         junction(&vpn, &planted.outside);
         let error = home.remove_vpn_leftovers(&vpn).unwrap_err();
         assert!(format!("{error:#}").contains("reparse point"), "{error:#}");
+        assert_untouched(&planted);
+    }
+
+    #[test]
+    fn a_path_is_resolved_by_name_without_touching_the_disk() {
+        let home = Path::new("/home/example/repo");
+        assert_eq!(
+            lexical(&home.join("sub/../.git")),
+            Path::new("/home/example/repo/.git")
+        );
+        assert_eq!(
+            lexical(&home.join("./a/./b")),
+            Path::new("/home/example/repo/a/b")
+        );
+        assert_eq!(lexical(&home.join("../../x")), Path::new("/home/x"));
+        assert_eq!(lexical(Path::new("../../a")), Path::new("../../a"));
+    }
+
+    #[test]
+    fn a_text_file_reads_like_std_and_rejects_text_that_is_not_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config"), "fictional text").unwrap();
+        std::fs::write(dir.path().join("binary"), [0xff, 0xfe]).unwrap();
+        assert_eq!(
+            read_to_string(&dir.path().join("config")).unwrap(),
+            "fictional text"
+        );
+        assert_eq!(
+            read_to_string(&dir.path().join("binary"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            read_to_string(&dir.path().join("missing"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            canonicalize_dir(dir.path()).unwrap(),
+            std::fs::canonicalize(dir.path()).unwrap()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_junction_in_a_protected_home_stops_a_text_read_and_a_folder_resolution() {
+        let planted = planted();
+        let link = planted.home.join("linked");
+        junction(&link, &planted.outside);
+        assert_refused(read_to_string(&link.join("secret.txt")), "reparse point");
+        assert_refused(canonicalize_dir(&link), "reparse point");
+        assert_refused(canonicalize_dir(&link.join("deeper")), "reparse point");
+        std::fs::create_dir(planted.home.join("plain")).unwrap();
+        std::fs::write(planted.home.join("plain").join("text"), "fictional").unwrap();
+        assert_eq!(
+            read_to_string(&planted.home.join("plain").join("text")).unwrap(),
+            "fictional"
+        );
+        assert!(canonicalize_dir(&planted.home.join("plain")).is_ok());
         assert_untouched(&planted);
     }
 }
