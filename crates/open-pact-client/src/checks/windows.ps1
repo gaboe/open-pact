@@ -353,9 +353,70 @@ public static class PactConsoleToken {
     } catch { Emit 'work_account' 'unknown' }
 }
 
+# SYSTEM reads a user file only when the open handle names the path it was given and the file has one link.
+function ReadUserText($path) {
+    if (-not $identity.IsSystem) { return [IO.File]::ReadAllText($path) }
+    if (-not ('PactUserFile' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+public static class PactUserFile {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct ByHandleInfo {
+        public uint Attributes;
+        public uint CreatedLow; public uint CreatedHigh;
+        public uint AccessedLow; public uint AccessedHigh;
+        public uint WrittenLow; public uint WrittenHigh;
+        public uint Volume;
+        public uint SizeHigh; public uint SizeLow;
+        public uint Links;
+        public uint IndexHigh; public uint IndexLow;
+    }
+    [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+    static extern uint GetFinalPathNameByHandleW(SafeFileHandle file, StringBuilder path, uint size, uint flags);
+    [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+    static extern uint GetLongPathNameW(string path, StringBuilder longPath, uint size);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool GetFileInformationByHandle(SafeFileHandle file, out ByHandleInfo info);
+    public static string FinalPath(SafeFileHandle file) {
+        StringBuilder path = new StringBuilder(32768);
+        uint length = GetFinalPathNameByHandleW(file, path, (uint)path.Capacity, 0);
+        if (length == 0 || length >= path.Capacity) { throw new System.ComponentModel.Win32Exception(); }
+        return path.ToString();
+    }
+    public static string LongPath(string path) {
+        StringBuilder longPath = new StringBuilder(32768);
+        uint length = GetLongPathNameW(path, longPath, (uint)longPath.Capacity);
+        if (length == 0 || length >= longPath.Capacity) { throw new System.ComponentModel.Win32Exception(); }
+        return longPath.ToString();
+    }
+    public static uint Links(SafeFileHandle file) {
+        ByHandleInfo info;
+        if (!GetFileInformationByHandle(file, out info)) { throw new System.ComponentModel.Win32Exception(); }
+        return info.Links;
+    }
+    public static string WithoutPrefix(string path) {
+        if (path.StartsWith(@"\\?\UNC\", StringComparison.OrdinalIgnoreCase)) { return @"\\" + path.Substring(8); }
+        if (path.StartsWith(@"\\?\", StringComparison.Ordinal)) { return path.Substring(4); }
+        return path;
+    }
+}
+'@ -ErrorAction Stop
+    }
+    $stream = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]'ReadWrite, Delete')
+    try {
+        $handle = $stream.SafeFileHandle
+        $opened = [PactUserFile]::WithoutPrefix([PactUserFile]::FinalPath($handle))
+        if (-not [string]::Equals($opened, [PactUserFile]::LongPath($path), [StringComparison]::OrdinalIgnoreCase)) { throw 'Linked user file' }
+        if ([PactUserFile]::Links($handle) -ne 1) { throw 'Linked user file' }
+        return ([IO.StreamReader]::new($stream)).ReadToEnd()
+    } finally { $stream.Dispose() }
+}
 function ReadJson($path) {
     if (-not (Test-Path -LiteralPath $path -ErrorAction Stop)) { return [pscustomobject]@{} }
-    $json = Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    $json = (ReadUserText $path) | ConvertFrom-Json -ErrorAction Stop
     if ($null -eq $json -or $json -isnot [pscustomobject]) { throw 'Invalid JSON object' }
     return $json
 }
@@ -445,7 +506,7 @@ function FirefoxBrowser($homePath, $app, $userRoot) {
         $root = Join-Path $homePath 'AppData\Roaming\Mozilla\Firefox'
         $ini = Join-Path $root 'profiles.ini'
         if (Test-Path -LiteralPath $ini -ErrorAction Stop) {
-            foreach ($line in Get-Content -LiteralPath $ini -ErrorAction Stop) {
+            foreach ($line in (ReadUserText $ini) -split "\r?\n") {
                 if ($line.Trim() -match '^Path=(.*)$') {
                     $relative = $Matches[1].Replace('\', '/')
                     if (-not $relative.StartsWith('Profiles/') -or $relative.Split('/') -contains '..') { throw 'External Firefox profile' }
@@ -460,7 +521,7 @@ function FirefoxBrowser($homePath, $app, $userRoot) {
             foreach ($file in @('prefs.js', 'user.js')) {
                 $path = Join-Path $dir $file
                 if (Test-Path -LiteralPath $path -ErrorAction Stop) {
-                    $lines += @(Get-Content -LiteralPath $path -ErrorAction Stop | Where-Object { $_ -match 'browser\.safebrowsing\.(malware|phishing)\.enabled' })
+                    $lines += @((ReadUserText $path) -split "\r?\n" | Where-Object { $_ -match 'browser\.safebrowsing\.(malware|phishing)\.enabled' })
                 }
             }
             @{kind='firefox'; policy=$policy; prefs=($lines -join "`n")}
