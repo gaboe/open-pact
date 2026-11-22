@@ -285,6 +285,8 @@ open-pact-client --home 'C:\Example User\pact' schedule on --system
 
 Without elevation, the command prints the exact elevated command and changes nothing. Other operating systems reject `--system`. The installer copies the client into `%ProgramFiles%\open-pact\open-pact-client.exe` and refuses a directory that non-administrators can write. The SYSTEM job runs with `--system --user-home <profile>`. It reads the selected absolute client home, uses the repository folders from `device.json`, and keeps its state under protected `%ProgramData%`. Choose a home path without `%`. The task reads Windows settings and does not change them. See [platform support](platform-support.md) for checks that need SYSTEM access.
 
+A SYSTEM job reads repositories only below the user profile. A worktree whose repository lies outside it, for example on `D:\`, makes the repository counts unknown. Keep the repository below the profile, or run the job as you with `schedule on --user`.
+
 ### Stop the scheduled claims and remove the client
 
 Run `open-pact-client schedule off` with the same absolute `--home` before deleting the binary or client home. It removes the job, the applied-settings receipt, and the job state, and it records your no in `device.json`. Run `stop` to print these instructions. On Windows it prints the full path of the client and says that a SYSTEM job needs an elevated PowerShell prompt.
