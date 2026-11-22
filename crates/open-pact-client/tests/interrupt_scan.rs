@@ -1,12 +1,13 @@
-//! The real binary, interrupted while a repository scan waits on a FIFO. Ctrl-C ends the process
+//! The real binary, interrupted while a repository scan reads a FIFO. Ctrl-C ends the process
 //! with exit 130 at once: the blocked scan thread does not keep it alive.
 #![cfg(unix)]
 
 use std::ffi::CString;
+use std::os::fd::FromRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use open_pact_core::{
     Checkpoint, Endorsement, Invitation, InvitationCode, LogHash, LogKey, Manifest, PublicKey,
@@ -118,7 +119,8 @@ async fn ctrl_c_during_a_blocked_repository_scan_exits_130_at_once() {
     });
 
     // The device home holds the device state. The child's HOME holds a FIFO where the SSH config
-    // should be: the repository scan opens it first, and blocks until a writer appears.
+    // should be: the repository scan opens it first. The test is the writer, and it writes nothing,
+    // so the scan blocks reading the FIFO.
     let device_home = tempfile::tempdir().unwrap();
     let user_home = tempfile::tempdir().unwrap();
     let ssh = user_home.path().join(".ssh");
@@ -143,8 +145,29 @@ async fn ctrl_c_during_a_blocked_repository_scan_exits_130_at_once() {
     tokio::time::timeout(Duration::from_secs(30), enrolled.notified())
         .await
         .expect("the join enrols the device and starts the repository scan");
-    // The enrolment reply is sent. The wizard then waits for IT, and the scan blocks on the FIFO.
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // The enrolment reply is sent. The wizard then waits for IT, and the scan opens the FIFO. A
+    // non-blocking writer open fails with ENXIO until a reader exists. When it succeeds, the scan
+    // thread is inside its open of the FIFO. The writer stays open until the child has exited, so
+    // the scan then blocks on its read.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let _writer = loop {
+        let fd = unsafe {
+            libc::open(
+                fifo.as_ptr(),
+                libc::O_WRONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        if fd >= 0 {
+            break unsafe { std::fs::File::from_raw_fd(fd) };
+        }
+        let error = std::io::Error::last_os_error();
+        assert_eq!(error.raw_os_error(), Some(libc::ENXIO), "{error}");
+        assert!(
+            Instant::now() < deadline,
+            "the repository scan never opened the FIFO"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
     assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGINT) }, 0);
 
     // On timeout the child is dropped, and kill_on_drop ends it along with its blocked scan.
