@@ -1391,4 +1391,30 @@ mod tests {
         assert!(canonicalize_dir(&planted.home.join("plain")).is_ok());
         assert_untouched(&planted);
     }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_protected_folder_resolves_to_the_path_std_gives() {
+        let planted = planted();
+        std::fs::create_dir_all(planted.home.join("plain").join("deeper")).unwrap();
+        for folder in [
+            planted.home.clone(),
+            planted.home.join("plain"),
+            planted.home.join("plain").join("deeper"),
+            planted.home.join("plain").join(".").join("deeper"),
+        ] {
+            let resolved = canonicalize_dir(&folder).unwrap();
+            assert_eq!(
+                resolved,
+                std::fs::canonicalize(&folder).unwrap(),
+                "{}",
+                folder.display()
+            );
+            assert!(
+                resolved.to_str().unwrap().starts_with(r"\\?\"),
+                "{}",
+                resolved.display()
+            );
+        }
+    }
 }
