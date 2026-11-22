@@ -70,6 +70,13 @@ try {
     Set-Content -LiteralPath $systemPlainPrefs -Value '{"safebrowsing":{"enabled":false},"fictional_unrelated":"excluded"}'
     $systemPlain = ChromiumPrefs $systemPlainPrefs $false
     Assert ($systemPlain.safebrowsing.enabled -eq $false) 'SYSTEM run lost a plain profile preference'
+    $shortPrefs = (New-Object -ComObject Scripting.FileSystemObject).GetFile($systemPlainPrefs).ShortPath
+    if ($shortPrefs -notmatch '~\d') {
+        Write-Output 'Skipped the SYSTEM read through an 8.3 path: 8.3 names are disabled on this volume'
+    } else {
+        $shortPlain = ChromiumPrefs $shortPrefs $false
+        Assert ($shortPlain.safebrowsing.enabled -eq $false) 'SYSTEM run lost a preference read through an 8.3 path'
+    }
     $outsideAppData = Join-Path $root 'outside-appdata'
     $outsidePrefs = Join-Path $outsideAppData 'Local\Google\Chrome\User Data\Default\Preferences'
     New-Item -ItemType Directory -Path (Split-Path $outsidePrefs) -Force | Out-Null
@@ -80,9 +87,9 @@ try {
     $junctionHome = Join-Path $root 'system-junction'
     New-Item -ItemType Directory -Path $junctionHome -Force | Out-Null
     New-Item -ItemType Junction -Path (Join-Path $junctionHome 'AppData') -Target $outsideAppData | Out-Null
-    $failed = $false
-    try { ChromiumPrefs (Join-Path $junctionHome 'AppData\Local\Google\Chrome\User Data\Default\Preferences') $false | Out-Null } catch { $failed = $true }
-    Assert $failed 'SYSTEM run followed a junction at AppData'
+    $reason = ''
+    try { ChromiumPrefs (Join-Path $junctionHome 'AppData\Local\Google\Chrome\User Data\Default\Preferences') $false | Out-Null } catch { $reason = $_.Exception.Message }
+    Assert ($reason -eq 'Linked user file') "SYSTEM run followed a junction at AppData: $reason"
     $junctionFirefox = @(FirefoxBrowser $junctionHome $app 'HKCU:')
     Assert ($junctionFirefox[0].unreadable -eq $true) 'SYSTEM run read Firefox through a junction at AppData'
     Assert ($junctionFirefox[0].policy.policies.Preferences['browser.safebrowsing.phishing.enabled'] -eq 0) 'Junction at AppData hid mandatory Firefox policy'
@@ -93,18 +100,18 @@ try {
     New-Item -ItemType Directory -Path (Split-Path $vendorPrefs) -Force | Out-Null
     Set-Content -LiteralPath $vendorPrefs -Value '{"safebrowsing":{"enabled":false}}'
     New-Item -ItemType Junction -Path (Join-Path $vendorHome 'AppData\Local\Google') -Target $outsideGoogle | Out-Null
-    $failed = $false
-    try { ChromiumPrefs (Join-Path $vendorHome 'AppData\Local\Google\Chrome\User Data\Default\Preferences') $false | Out-Null } catch { $failed = $true }
-    Assert $failed 'SYSTEM run followed a junction at the vendor folder'
+    $reason = ''
+    try { ChromiumPrefs (Join-Path $vendorHome 'AppData\Local\Google\Chrome\User Data\Default\Preferences') $false | Out-Null } catch { $reason = $_.Exception.Message }
+    Assert ($reason -eq 'Linked user file') "SYSTEM run followed a junction at the vendor folder: $reason"
     $linkHome = Join-Path $root 'system-symlink'
     $linkPrefs = Join-Path $linkHome 'AppData\Local\Google\Chrome\User Data\Default\Preferences'
     New-Item -ItemType Directory -Path (Split-Path $linkPrefs) -Force | Out-Null
     $linkTarget = Join-Path $root 'symlink-target.json'
     Set-Content -LiteralPath $linkTarget -Value '{"safebrowsing":{"enabled":false}}'
     New-Item -ItemType SymbolicLink -Path $linkPrefs -Target $linkTarget | Out-Null
-    $failed = $false
-    try { ChromiumPrefs $linkPrefs $false | Out-Null } catch { $failed = $true }
-    Assert $failed 'SYSTEM run followed a symbolic link at Preferences'
+    $reason = ''
+    try { ChromiumPrefs $linkPrefs $false | Out-Null } catch { $reason = $_.Exception.Message }
+    Assert ($reason -eq 'Linked user file') "SYSTEM run followed a symbolic link at Preferences: $reason"
     $hardHome = Join-Path $root 'system-hardlink'
     $hardFirefox = Join-Path $hardHome 'AppData\Roaming\Mozilla\Firefox'
     $hardProfile = Join-Path $hardFirefox 'Profiles\fictional.default'
@@ -122,6 +129,15 @@ try {
     New-Item -ItemType HardLink -Path (Join-Path $hardProfile 'prefs.js') -Target $outsidePrefsJs | Out-Null
     $hardPrefsItems = @(FirefoxBrowser $hardHome $app 'HKCU:')
     Assert ($hardPrefsItems[0].unreadable -eq $true) 'SYSTEM run read a hard-linked prefs.js'
+    $userJsTarget = Join-Path $root 'outside-user-js'
+    New-Item -ItemType Directory -Path $userJsTarget -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $userJsTarget 'user.js') -Value 'user_pref("browser.safebrowsing.phishing.enabled", false);'
+    $userJsProfile = Join-Path $root 'system-userjs\Profiles\fictional.default'
+    New-Item -ItemType Directory -Path (Split-Path $userJsProfile) -Force | Out-Null
+    New-Item -ItemType Junction -Path $userJsProfile -Target $userJsTarget | Out-Null
+    $reason = ''
+    try { ReadUserText (Join-Path $userJsProfile 'user.js') | Out-Null } catch { $reason = $_.Exception.Message }
+    Assert ($reason -eq 'Linked user file') "SYSTEM run read user.js through a junction: $reason"
     $identity = [pscustomobject]@{IsSystem=$false}
     $userThroughJunction = ChromiumPrefs (Join-Path $junctionHome 'AppData\Local\Google\Chrome\User Data\Default\Preferences') $false
     Assert ($userThroughJunction.safebrowsing.enabled -eq $false) 'User run refused a junction that the user can read'
