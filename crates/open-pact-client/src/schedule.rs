@@ -1681,7 +1681,7 @@ fn finish_system_removal(
         if home_exists {
             remove_protected_home_schedule_files(home).map_err(|error| {
                 anyhow::anyhow!(
-                    "the SYSTEM task is already removed, but the home files were not all removed: {error:#}. `open-pact-client schedule off` without --system removes the home files."
+                    "the SYSTEM task is already removed, but the home files were not all removed: {error:#}. Run `open-pact-client schedule off` again, with the same --home, to remove them."
                 )
             })?;
         }
@@ -5061,7 +5061,7 @@ Write-Output 'users_read_only'
         );
         assert!(
             text.contains(
-                "`open-pact-client schedule off` without --system removes the home files."
+                "Run `open-pact-client schedule off` again, with the same --home, to remove them."
             ),
             "{text}"
         );
