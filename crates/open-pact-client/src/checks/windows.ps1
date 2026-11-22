@@ -353,10 +353,9 @@ public static class PactConsoleToken {
     } catch { Emit 'work_account' 'unknown' }
 }
 
-# SYSTEM reads a user file only when the open handle names the path it was given and the file has one link.
+# Reads a user file. A SYSTEM run reads it only when the open handle names the path it was given and the file has one link.
 function ReadUserText($path) {
-    if (-not $identity.IsSystem) { return [IO.File]::ReadAllText($path) }
-    if (-not ('PactUserFile' -as [type])) {
+    if ($identity.IsSystem -and -not ('PactUserFile' -as [type])) {
         Add-Type -TypeDefinition @'
 using System;
 using System.Text;
@@ -386,9 +385,12 @@ public static class PactUserFile {
         if (length == 0 || length >= path.Capacity) { throw new System.ComponentModel.Win32Exception(); }
         return path.ToString();
     }
+    public static string Normal(string path) {
+        return System.IO.Path.GetFullPath(path.Replace('/', '\\')).TrimEnd('\\');
+    }
     public static string LongPath(string path) {
         StringBuilder longPath = new StringBuilder(32768);
-        uint length = GetLongPathNameW(path, longPath, (uint)longPath.Capacity);
+        uint length = GetLongPathNameW(Normal(path), longPath, (uint)longPath.Capacity);
         if (length == 0 || length >= longPath.Capacity) { throw new System.ComponentModel.Win32Exception(); }
         return longPath.ToString();
     }
@@ -407,10 +409,12 @@ public static class PactUserFile {
     }
     $stream = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]'ReadWrite, Delete')
     try {
-        $handle = $stream.SafeFileHandle
-        $opened = [PactUserFile]::WithoutPrefix([PactUserFile]::FinalPath($handle))
-        if (-not [string]::Equals($opened, [PactUserFile]::LongPath($path), [StringComparison]::OrdinalIgnoreCase)) { throw 'Linked user file' }
-        if ([PactUserFile]::Links($handle) -ne 1) { throw 'Linked user file' }
+        if ($identity.IsSystem) {
+            $handle = $stream.SafeFileHandle
+            $opened = [PactUserFile]::Normal([PactUserFile]::WithoutPrefix([PactUserFile]::FinalPath($handle)))
+            if (-not [string]::Equals($opened, [PactUserFile]::LongPath($path), [StringComparison]::OrdinalIgnoreCase)) { throw 'Linked user file' }
+            if ([PactUserFile]::Links($handle) -ne 1) { throw 'Linked user file' }
+        }
         return ([IO.StreamReader]::new($stream)).ReadToEnd()
     } finally { $stream.Dispose() }
 }
