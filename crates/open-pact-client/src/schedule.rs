@@ -1679,7 +1679,11 @@ fn finish_system_removal(
     let hold = ConsoleInterruptHold::new();
     let result = remove().and_then(|()| {
         if home_exists {
-            remove_protected_home_schedule_files(home)?;
+            remove_protected_home_schedule_files(home).map_err(|error| {
+                anyhow::anyhow!(
+                    "the SYSTEM task is already removed, but the home files were not all removed: {error:#}. `open-pact-client schedule off` without --system removes the home files."
+                )
+            })?;
         }
         Ok(())
     });
@@ -5036,6 +5040,30 @@ Write-Output 'users_read_only'
         assert_eq!(
             removable_files_remaining(&home).len(),
             HOME_REMOVE_FILES.len()
+        );
+    }
+
+    #[test]
+    fn a_home_refusal_after_the_system_task_is_gone_names_the_plain_schedule_off() {
+        let _console = CONSOLE_TEST
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let (_dir, home) = home_with_removable_files();
+        // A folder under a listed name fails its removal on every OS.
+        let blocked = home.file(HOME_REMOVE_FILES[0]);
+        std::fs::remove_file(&blocked).unwrap();
+        std::fs::create_dir(&blocked).unwrap();
+        let error = finish_system_removal(&home, true, || Ok(())).unwrap_err();
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("the SYSTEM task is already removed"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "`open-pact-client schedule off` without --system removes the home files."
+            ),
+            "{text}"
         );
     }
 
