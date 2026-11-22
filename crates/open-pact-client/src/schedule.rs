@@ -2467,10 +2467,16 @@ pub(crate) async fn change_job(
     let home_exists = home.0.try_exists()?;
     let requested_system = wanted == Wanted::On(RunAs::System);
     let retry = wanted.command();
+    let given = home.0.clone();
     let home = Home(schedule_home(&home.0, true)?);
     let desired = desired_job(wanted, executable)?;
     let elevated =
         crate::current_os()? == open_pact_core::Os::Windows && windows_require_elevation().is_ok();
+    if elevated {
+        // Resolving the home replaced the path that was given with the link target, so the link
+        // check runs here, before any file of the home is locked, read or written.
+        require_home_without_link(&given, &home.0)?;
+    }
     if requested_system && !elevated {
         bail!(
             "Run this exact command from an elevated PowerShell prompt:\n{}",
@@ -6691,6 +6697,45 @@ Write-Output 'refused'
             std::fs::read_dir(&target).unwrap().count(),
             0,
             "the run created a file in the junction target"
+        );
+        assert!(!home.join("claim.lock").exists());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn an_elevated_schedule_off_in_a_home_that_is_a_junction_fails_before_any_lock_exists() {
+        if windows_require_elevation().is_err() {
+            // The link check of change_job runs only in an elevated process, the only one that
+            // can reach SYSTEM state.
+            eprintln!("skipped: change_job checks the home link only when elevated");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let target = root.join("target");
+        let home = root.join("home");
+        std::fs::create_dir(&target).unwrap();
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&home)
+            .arg(&target)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "mklink /J failed");
+        let error = change_job(
+            &Home(home.clone()),
+            Wanted::Off,
+            false,
+            Path::new("open-pact-client.exe"),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("a link leads to"), "{error:#}");
+        assert_eq!(
+            std::fs::read_dir(&target).unwrap().count(),
+            0,
+            "schedule off created a file in the junction target"
         );
         assert!(!home.join("claim.lock").exists());
     }
