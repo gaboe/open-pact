@@ -1667,11 +1667,22 @@ fn end_after_held_interrupt(interrupted: bool, result: Result<()>) -> Result<()>
     Err(crate::Interrupted.into())
 }
 
-fn windows_system_uninstall(job: &Job, home: &Home) -> Result<()> {
-    let state = windows_existing_system_state(&home.0)?;
+/// Runs the removal of a SYSTEM job under a held Ctrl-C. When the removal succeeds, the home files
+/// go too, even after a Ctrl-C: the task is gone, so its leftovers must not stay. A failed removal
+/// keeps the home files.
+fn finish_system_removal(
+    home: &Home,
+    home_exists: bool,
+    remove: impl FnOnce() -> Result<()>,
+) -> Result<()> {
     // Held until the task is resumed or removed: a Ctrl-C in the wait must not leave it disabled.
     let hold = ConsoleInterruptHold::new();
-    let result = windows_system_uninstall_held(job, state);
+    let result = remove().and_then(|()| {
+        if home_exists {
+            remove_protected_home_schedule_files(home)?;
+        }
+        Ok(())
+    });
     let interrupted = hold.interrupted();
     drop(hold);
     end_after_held_interrupt(interrupted, result)
@@ -3114,22 +3125,21 @@ async fn operate(
         }
         Operation::Uninstall { system } => {
             let job = Job::new(executable, &home.0)?;
-            if os == open_pact_core::Os::Windows {
-                if system {
-                    windows_system_uninstall(&job, &home)?;
-                } else {
+            if os == open_pact_core::Os::Windows && system {
+                let state = windows_existing_system_state(&home.0)?;
+                finish_system_removal(&home, home_exists, || {
+                    windows_system_uninstall_held(&job, state)
+                })?;
+            } else {
+                if os == open_pact_core::Os::Windows {
                     windows_uninstall(&job, false)?;
                     println!(
                         "SYSTEM leftovers, if any, are removed with `schedule off` from an elevated prompt."
                     );
-                }
-            } else {
-                register(&job, RegistrationAction::Uninstall)?;
-            }
-            if home_exists {
-                if system {
-                    remove_protected_home_schedule_files(&home)?;
                 } else {
+                    register(&job, RegistrationAction::Uninstall)?;
+                }
+                if home_exists {
                     remove_home_schedule_files(&home)?;
                 }
             }
@@ -4960,6 +4970,83 @@ Write-Output 'users_read_only'
         assert_eq!(windows_powershell(&script).unwrap(), "users_read_only");
     }
 
+    /// The tests that set the console interrupt flag take this lock, so they never overlap.
+    static CONSOLE_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A home with every file that a removal deletes.
+    fn home_with_removable_files() -> (tempfile::TempDir, Home) {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+        for name in HOME_REMOVE_FILES {
+            std::fs::write(home.file(name), b"fictional\n").unwrap();
+        }
+        (dir, home)
+    }
+
+    fn removable_files_remaining(home: &Home) -> Vec<&'static str> {
+        HOME_REMOVE_FILES
+            .iter()
+            .copied()
+            .filter(|name| home.file(name).exists())
+            .collect()
+    }
+
+    #[test]
+    fn a_ctrl_c_during_a_successful_system_removal_still_cleans_the_home() {
+        let _console = CONSOLE_TEST
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let (_dir, home) = home_with_removable_files();
+        let error = finish_system_removal(&home, true, || {
+            CONSOLE_INTERRUPT.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(error.is::<crate::Interrupted>());
+        assert_eq!(removable_files_remaining(&home), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn a_failed_system_removal_keeps_the_home_files() {
+        let _console = CONSOLE_TEST
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let (_dir, home) = home_with_removable_files();
+        let error = finish_system_removal(&home, true, || {
+            CONSOLE_INTERRUPT.store(true, std::sync::atomic::Ordering::SeqCst);
+            Err(anyhow::anyhow!("fictional failure"))
+        })
+        .unwrap_err();
+        assert!(error.is::<crate::Interrupted>());
+        assert_eq!(
+            removable_files_remaining(&home).len(),
+            HOME_REMOVE_FILES.len()
+        );
+
+        let error =
+            finish_system_removal(&home, true, || Err(anyhow::anyhow!("fictional failure")))
+                .unwrap_err();
+        assert_eq!(error.to_string(), "fictional failure");
+        assert_eq!(
+            removable_files_remaining(&home).len(),
+            HOME_REMOVE_FILES.len()
+        );
+    }
+
+    #[test]
+    fn a_system_removal_without_ctrl_c_cleans_the_home_and_succeeds() {
+        let _console = CONSOLE_TEST
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let (_dir, home) = home_with_removable_files();
+        finish_system_removal(&home, true, || Ok(())).unwrap();
+        assert_eq!(removable_files_remaining(&home), Vec::<&str>::new());
+
+        let missing = Home(home.0.join("missing"));
+        finish_system_removal(&missing, false, || Ok(())).unwrap();
+        assert!(!missing.0.exists());
+    }
+
     #[test]
     fn a_held_interrupt_ends_the_command_as_interrupted_and_nothing_else_does() {
         assert!(end_after_held_interrupt(false, Ok(())).is_ok());
@@ -4974,6 +5061,9 @@ Write-Output 'users_read_only'
     #[cfg(windows)]
     #[test]
     fn the_console_handler_records_the_event_and_keeps_the_process_alive() {
+        let _console = CONSOLE_TEST
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let hold = ConsoleInterruptHold::new();
         assert!(!hold.interrupted());
         // SAFETY: the handler only stores to an atomic.
