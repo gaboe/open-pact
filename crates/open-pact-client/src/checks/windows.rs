@@ -5,11 +5,24 @@ use std::time::Duration;
 #[cfg(test)]
 use super::buckets;
 use super::buckets::Lock;
-use super::exec::capture;
+use super::exec::capture_with_stdin;
 use open_pact_core::ControlValue;
 use time::Date;
 const POWERSHELL: &str = include_str!("windows.ps1");
 const BATCH_TIMEOUT: Duration = Duration::from_secs(60);
+/// The script goes to stdin, because Windows limits a command line to 32767 characters and the
+/// script is longer. Dot-sourcing keeps its script-level variables, as -Command did.
+const BATCH_BOOTSTRAP: &str = "$r = New-Object IO.StreamReader([Console]::OpenStandardInput(), (New-Object Text.UTF8Encoding $false)); . ([scriptblock]::Create($r.ReadToEnd()))";
+
+fn batch_args() -> [&'static str; 5] {
+    [
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        BATCH_BOOTSTRAP,
+    ]
+}
 
 struct Batch {
     values: BTreeMap<String, String>,
@@ -337,15 +350,10 @@ fn batch() -> &'static Batch {
     }
     VALUES.get_or_init(|| {
         let start = std::time::Instant::now();
-        let output = capture(
+        let output = capture_with_stdin(
             "powershell.exe",
-            &[
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                POWERSHELL,
-            ],
+            &batch_args(),
+            POWERSHELL.as_bytes(),
             BATCH_TIMEOUT,
         );
         let (values, diagnostics, completed) = match output {
@@ -810,6 +818,12 @@ mod tests {
                 batch.values.keys().collect::<Vec<_>>()
             );
         }
+    }
+
+    #[test]
+    fn batch_command_line_stays_far_below_the_windows_limit() {
+        let line = format!("powershell.exe {}", batch_args().join(" "));
+        assert!(line.len() < 8000, "{} characters", line.len());
     }
 
     #[test]

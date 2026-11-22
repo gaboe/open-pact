@@ -1,4 +1,4 @@
-use std::io::Read;
+use std::io::{Read, Write};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -86,23 +86,58 @@ fn default_search_path() -> std::ffi::OsString {
 fn spawn(
     program: impl AsRef<std::ffi::OsStr>,
     args: &[&str],
+    piped_stdin: bool,
 ) -> std::io::Result<std::process::Child> {
     Command::new(program)
         .args(args)
         .env("LC_ALL", "C")
-        .stdin(Stdio::null())
+        .stdin(if piped_stdin {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 pub fn capture(program: &str, args: &[&str], timeout: Duration) -> std::io::Result<CapturedOutput> {
+    capture_input(program, args, None, timeout)
+}
+
+/// Like [`capture`], and writes `input` to the child's stdin, then closes it. A script sent this
+/// way does not count against the command line limit of the platform.
+#[cfg(any(windows, test))]
+pub fn capture_with_stdin(
+    program: &str,
+    args: &[&str],
+    input: &[u8],
+    timeout: Duration,
+) -> std::io::Result<CapturedOutput> {
+    capture_input(program, args, Some(input), timeout)
+}
+
+fn capture_input(
+    program: &str,
+    args: &[&str],
+    input: Option<&[u8]>,
+    timeout: Duration,
+) -> std::io::Result<CapturedOutput> {
     let start = Instant::now();
     #[cfg(unix)]
     if !program_exists(program, std::env::var_os("PATH").as_deref()) {
         return Err(std::io::ErrorKind::NotFound.into());
     }
-    let mut child = spawn(program, args)?;
+    let mut child = spawn(program, args, input.is_some())?;
+    // A thread writes, so that a child that does not read cannot block the timeout below. The
+    // write fails once the child exits or is killed, and the thread ends with it.
+    if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+        let input = input.to_vec();
+        thread::spawn(move || {
+            let _ = stdin.write_all(&input);
+        });
+    }
     let readers = [
         child.stdout.take().map(drain),
         child.stderr.take().map(drain),
@@ -200,6 +235,31 @@ mod tests {
         assert!(!output.status.unwrap().success());
         assert_eq!(output.stdout, "bitlocker\t1\nsecure_boot\t1");
         assert_eq!(output.stderr, "diagnostic");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn stdin_input_reaches_the_child_and_is_closed() {
+        let input = "x".repeat(1 << 20);
+        let output =
+            capture_with_stdin("cat", &[], input.as_bytes(), Duration::from_secs(20)).unwrap();
+        assert!(!output.timed_out, "{output:?}");
+        assert!(output.status.unwrap().success());
+        assert_eq!(output.stdout, input);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_child_that_ignores_stdin_still_times_out() {
+        let input = vec![b'x'; 1 << 20];
+        let output = capture_with_stdin(
+            "sh",
+            &["-c", "exec sleep 30"],
+            &input,
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        assert!(output.timed_out, "{output:?}");
     }
 
     #[test]
@@ -327,7 +387,7 @@ mod unix_resolution_tests {
         let Ok(program) = std::env::var("FICTIONAL_LOOKUP_PROGRAM") else {
             return;
         };
-        let expected = spawn(&program, &["-c", "printf default-path"])
+        let expected = spawn(&program, &["-c", "printf default-path"], false)
             .and_then(|child| child.wait_with_output());
         let actual = capture(&program, &["-c", "printf default-path"], TIMEOUT);
         match (expected, actual) {
