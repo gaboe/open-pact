@@ -1079,9 +1079,21 @@ fn home_schedule_has_leftovers(home: &Home) -> bool {
 
 fn remove_home_schedule_files(home: &Home) -> Result<()> {
     for name in HOME_REMOVE_FILES {
-        remove_if_exists(&home.file(name))?;
+        let path = home.file(name);
+        match crate::home_fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).with_context(|| format!("remove {}", path.display())),
+        }
     }
     Ok(())
+}
+
+/// Removes the home files of a SYSTEM job. The home is protected while they go, so a link at the
+/// home or above it stops the removal before anything is deleted.
+fn remove_protected_home_schedule_files(home: &Home) -> Result<()> {
+    let _protection = crate::home_fs::protect(&home.0, &home.0)?;
+    remove_home_schedule_files(home)
 }
 
 fn remove_system_state_directory(path: &Path) -> std::io::Result<()> {
@@ -3115,7 +3127,11 @@ async fn operate(
                 register(&job, RegistrationAction::Uninstall)?;
             }
             if home_exists {
-                remove_home_schedule_files(&home)?;
+                if system {
+                    remove_protected_home_schedule_files(&home)?;
+                } else {
+                    remove_home_schedule_files(&home)?;
+                }
             }
             if home_exists {
                 println!("Removed {} and its schedule state and log.", job.id);
@@ -4664,6 +4680,36 @@ esac
 
         assert!(!home.file("reports.jsonl").exists());
         assert!(!home.file("reports.jsonl.tmp").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_system_removal_does_not_delete_through_a_junction_at_the_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let root = PathBuf::from(root.to_str().unwrap().trim_start_matches(r"\\?\"));
+        let outside = root.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join(JOB_LOG), b"fictional log\n").unwrap();
+        let home = root.join("home");
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&home)
+            .arg(&outside)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "mklink /J failed");
+
+        let error = remove_protected_home_schedule_files(&Home(home)).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("refuse the client home"),
+            "{error:#}"
+        );
+        assert!(
+            outside.join(JOB_LOG).exists(),
+            "a file outside the home was deleted"
+        );
     }
 
     #[test]
