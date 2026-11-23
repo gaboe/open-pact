@@ -5,6 +5,7 @@ use open_pact_core::{
 use time::OffsetDateTime;
 mod devices;
 mod grace;
+mod hooks;
 mod invitations;
 mod keys;
 mod manifests;
@@ -13,21 +14,26 @@ mod nonces;
 mod ratelimit;
 mod results;
 mod seal;
+mod served;
 mod siem;
 mod standing;
 #[cfg(test)]
 mod testdb;
+#[cfg(test)]
+mod testwitness;
 mod translog;
 mod witness;
 
+use std::collections::VecDeque;
 use std::fmt::Display;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use axum::{
     Extension, Json, Router,
-    extract::{ConnectInfo, Query, State, rejection::JsonRejection},
+    extract::{ConnectInfo, Query, RawQuery, State, rejection::JsonRejection},
     http::{StatusCode, header},
     response::{Html, IntoResponse},
     routing::{get, post},
@@ -35,9 +41,9 @@ use axum::{
 use clap::{Parser, Subcommand};
 use open_pact_core::{
     Checkpoint, Claim, CsrHash, Decision, Endorsement, EnrolRequest, Entry, EntryKind, Evaluation,
-    FirstFailures, Invitation, LogCheckpoint, LogHash, LogKey, Manifest, Note, NoteSignature,
-    Pseudonym, PublicKey, Reason, SigningKey, consistency_proof, inclusion_proof, root,
-    verified_trust_level, verify_claim,
+    FirstFailures, Frontier, Invitation, LogCheckpoint, LogHash, LogKey, LogPolicy, Manifest, Note,
+    NoteSignature, Pseudonym, PublicKey, Reason, SigningKey, WitnessKey, consistency_proof,
+    inclusion_proof, root, verified_trust_level, verify_claim,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -47,7 +53,8 @@ use devices::{Action, State as DeviceState, commitment};
 use keys::Keys;
 use ratelimit::Limiter;
 use seal::SealingKey;
-use witness::Witnesses;
+use translog::RowBatch;
+use witness::{Outcome, Owners, Witnesses, db_step};
 
 #[derive(Parser)]
 #[command(
@@ -169,6 +176,10 @@ struct App {
     kek: Arc<SealingKey>,
     /// None unless metrics or the slow-request log are on.
     observe: Option<Arc<metrics::Observation>>,
+    /// One owner task per witness; a manifest reload keeps it.
+    owners: Arc<Owners>,
+    /// How long a read route waits for a witnessed note before it answers 503.
+    wait: Duration,
 }
 
 struct Enforced {
@@ -178,6 +189,8 @@ struct Enforced {
     company: Endorsement,
     log: Arc<Log>,
     version: Option<i64>,
+    /// Counts the snapshots this process has enforced; published with the snapshot in one write.
+    revision: u64,
 }
 
 impl std::ops::Deref for App {
@@ -191,29 +204,208 @@ struct Log {
     signer: SigningKey,
     key: LogKey,
     witnesses: Witnesses,
+    /// Only the fresh decision of `App::signed`.
     cache: Mutex<LogCache>,
+    /// The perfect-subtree hashes of the published size. Only a tree step takes it, never a reader.
+    grow: tokio::sync::Mutex<Frontier>,
+    /// The published view. The lock covers one `Arc` clone or one swap.
+    view: Mutex<Arc<LogView>>,
+    /// Tree steps that started a fetch, and the highest fetch number whose view is published. Both
+    /// change only under `grow`.
+    fetches: AtomicU64,
+    covered: AtomicU64,
 }
 
-/// Rows are append-only, so leaf hashes are read from the database once, and the checkpoint is
-/// signed once per tree size.
+impl Log {
+    fn new(signer: SigningKey, key: LogKey, witnesses: Witnesses) -> Log {
+        Log {
+            signer,
+            key,
+            witnesses,
+            cache: Mutex::default(),
+            grow: tokio::sync::Mutex::default(),
+            view: Mutex::default(),
+            fetches: AtomicU64::new(0),
+            covered: AtomicU64::new(0),
+        }
+    }
+}
+
+/// The checkpoint is signed once per tree size.
 #[derive(Default)]
 struct LogCache {
-    leaves: Vec<LogHash>,
     signed: Option<(Checkpoint, Note)>,
 }
 
-struct Tree {
+/// How many of the latest sizes keep their root, so a candidate size costs O(1) to check.
+const ROOT_WINDOW: usize = 4096;
+
+/// The leaves, the root and the root of each of the last `ROOT_WINDOW` sizes, published together
+/// and never changed after.
+struct LogView {
     leaves: Vec<LogHash>,
+    root: LogHash,
+    /// Contiguous sizes up to `leaves.len()`, oldest first.
+    roots: VecDeque<(u64, LogHash)>,
+}
+
+impl Default for LogView {
+    fn default() -> LogView {
+        LogView {
+            leaves: vec![],
+            root: root(&[]),
+            roots: VecDeque::new(),
+        }
+    }
+}
+
+/// The committed log as one tree step saw it, with the revision of the snapshot that read it.
+#[derive(Clone)]
+struct Tree {
+    view: Arc<LogView>,
+    revision: u64,
 }
 
 impl Tree {
     fn size(&self) -> u64 {
-        self.leaves.len() as u64
+        self.view.leaves.len() as u64
+    }
+
+    fn root(&self) -> LogHash {
+        self.view.root
     }
 
     fn prefix(&self, size: u64) -> &[LogHash] {
-        &self.leaves[..usize::try_from(size).expect("size was checked against the tree")]
+        &self.view.leaves[..usize::try_from(size).expect("size was checked against the tree")]
     }
+}
+
+/// How the SQL of a tree step runs: with the 2 s step limit of the owners and readers, or on a
+/// plain pool connection with the base limits.
+#[derive(Clone, Copy)]
+enum TreeSql {
+    Step,
+    Base,
+}
+
+/// Catches the cache up to the committed log. One step at a time per log cache: a step takes
+/// `grow` before its SQL, and returns the view of a fetch that started after it began, so at most
+/// one raw batch exists. The CPU of the catch-up runs on the blocking pool.
+fn tree_step(
+    db: sqlx::PgPool,
+    snap: Arc<Enforced>,
+    sql: TreeSql,
+    hooks: Arc<hooks::Hooks>,
+) -> tokio::task::JoinHandle<anyhow::Result<Tree>> {
+    tokio::spawn(async move {
+        let log = &snap.log;
+        let start = log.fetches.load(Ordering::SeqCst);
+        hooks.hit("tree_start_captured").await;
+        let mut frontier = log.grow.lock().await;
+        let view = log.view.lock().expect("log view").clone();
+        if log.covered.load(Ordering::SeqCst) > start {
+            return Ok(Tree {
+                view,
+                revision: snap.revision,
+            });
+        }
+        if frontier.len() != view.leaves.len() as u64 {
+            // A failed catch-up lost the frontier; rebuild it from the published leaves.
+            let mut rebuilt = Frontier::default();
+            view.leaves.iter().for_each(|leaf| rebuilt.push(*leaf));
+            *frontier = rebuilt;
+        }
+        let number = log.fetches.fetch_add(1, Ordering::SeqCst);
+        let from = view.leaves.len() as u64;
+        let (freed, freed_rx) = tokio::sync::oneshot::channel();
+        let batch = RowBatch::new(Some(freed));
+        let fetched = match sql {
+            TreeSql::Step => db_step(db, move |conn| {
+                Box::pin(translog::since_raw(conn, from, batch))
+            })
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|result| result),
+            TreeSql::Base => {
+                let fetch = async {
+                    let mut conn = db.acquire().await?;
+                    translog::since_raw(&mut conn, from, batch).await
+                };
+                fetch.await
+            }
+        };
+        let batch = match fetched {
+            Ok(batch) => batch,
+            Err(error) => {
+                // Release `grow` only after a failed batch is freed, so no second fetch starts
+                // while it is still live.
+                let _ = freed_rx.await;
+                return Err(error);
+            }
+        };
+        if batch.is_empty() {
+            log.covered.fetch_max(number + 1, Ordering::SeqCst);
+            return Ok(Tree {
+                view,
+                revision: snap.revision,
+            });
+        }
+        let taken = std::mem::take(&mut *frontier);
+        let published = snap.clone();
+        let built = tokio::task::spawn_blocking(move || {
+            catch_up(&published.log, &view, taken, from, batch)
+        })
+        .await?;
+        let (grown, view) = built;
+        *frontier = grown;
+        let view = view?;
+        log.covered.fetch_max(number + 1, Ordering::SeqCst);
+        Ok(Tree {
+            view,
+            revision: snap.revision,
+        })
+    })
+}
+
+/// The CPU phase of a catch-up: decode, hash, window and publish. Returns the frontier whatever
+/// happens, so a failed decode loses nothing.
+fn catch_up(
+    log: &Log,
+    view: &LogView,
+    mut frontier: Frontier,
+    from: u64,
+    batch: RowBatch,
+) -> (Frontier, anyhow::Result<Arc<LogView>>) {
+    let (rows, freed) = batch.into_parts();
+    let entries = translog::decode(&rows, from);
+    drop(rows);
+    drop(freed);
+    let entries = match entries {
+        Ok(entries) => entries,
+        Err(error) => return (frontier, Err(error)),
+    };
+    let mut leaves = Vec::with_capacity(view.leaves.len() + entries.len());
+    leaves.extend_from_slice(&view.leaves);
+    let mut roots = view.roots.clone();
+    let m = entries.len();
+    for (j, entry) in entries.iter().enumerate() {
+        let leaf = entry.leaf_hash();
+        leaves.push(leaf);
+        frontier.push(leaf);
+        if j + ROOT_WINDOW >= m {
+            roots.push_back((leaves.len() as u64, frontier.root()));
+        }
+    }
+    while roots.len() > ROOT_WINDOW {
+        roots.pop_front();
+    }
+    let next = Arc::new(LogView {
+        root: frontier.root(),
+        leaves,
+        roots,
+    });
+    *log.view.lock().expect("log view") = next.clone();
+    (frontier, Ok(next))
 }
 
 #[derive(Deserialize)]
@@ -282,87 +474,168 @@ fn invalid_invitation() -> Reply {
     denied(vec!["invalid or used invitation".into()])
 }
 
+/// What `App::checkpoint` serves: an enrolment signs the size it read; a claim counts the lines under
+/// the manifest the device signed, and may advance once.
+enum Mode<'a> {
+    Enroll,
+    Claim { policy: Option<&'a LogPolicy> },
+}
+
 impl App {
     fn metrics(&self) -> Option<&metrics::Metrics> {
         self.observe.as_deref()?.metrics()
     }
 
-    /// The committed log. Reads only rows the cache does not hold yet.
+    /// The committed log with base database limits, for the handlers that never waited on a
+    /// witness. It shares the cache and the one-batch bound with every other tree step.
     async fn tree(&self) -> Result<Tree, Reply> {
-        let known = self.log.cache.lock().expect("log cache").leaves.len();
-        let new = translog::since(&mut *self.conn().await?, known as u64)
-            .await
-            .map_err(internal)?;
-        let mut cache = self.log.cache.lock().expect("log cache");
-        let already = cache.leaves.len() - known;
-        if already < new.len() {
-            cache
-                .leaves
-                .extend(new[already..].iter().map(Entry::leaf_hash));
-        }
+        let step = tree_step(
+            self.db.clone(),
+            self.enforced.clone(),
+            TreeSql::Base,
+            self.owners.hooks(),
+        );
+        let tree = step.await.map_err(internal)?.map_err(internal)?;
         if let Some(metrics) = self.metrics() {
-            metrics.log_size(cache.leaves.len() as u64);
+            metrics.log_size(tree.size());
         }
-        Ok(Tree {
-            leaves: cache.leaves.clone(),
-        })
+        Ok(tree)
     }
 
-    /// The checkpoint of `tree` signed by the log key, and whether it was signed just now.
-    fn signed(&self, tree: &Tree) -> (Checkpoint, Note, bool) {
+    /// The checkpoint of `tree` signed by the log key, and, when it is the first call for this
+    /// size, the replies of the Push that this call queued at every owner. The Push is queued
+    /// while the cache lock still decides "fresh", so a later call that sees "not fresh" queues
+    /// its Join after it.
+    fn signed(
+        &self,
+        tree: &Tree,
+        keys: &Arc<[WitnessKey]>,
+    ) -> (
+        Checkpoint,
+        Note,
+        Option<Vec<tokio::sync::oneshot::Receiver<Outcome>>>,
+    ) {
         let mut cache = self.log.cache.lock().expect("log cache");
         if let Some((cp, note)) = cache
             .signed
             .clone()
             .filter(|(cp, _)| cp.size == tree.size())
         {
-            return (cp, note, false);
+            return (cp, note, None);
         }
         let checkpoint = Checkpoint {
             origin: self.log.key.origin().to_string(),
             size: tree.size(),
-            root: root(&tree.leaves),
+            root: tree.root(),
         };
         let note = self.log.key.sign(&self.log.signer, &checkpoint);
         cache.signed = Some((checkpoint.clone(), note.clone()));
-        (checkpoint, note, true)
+        let pending = self.owners.push_all(&checkpoint, &note, tree, keys);
+        (checkpoint, note, Some(pending))
     }
 
-    /// The current checkpoint signed by the log key, with the witness cosignatures stored for it,
-    /// and what the witnesses gave. A new checkpoint goes to the witnesses before any client sees
-    /// it. The handler counts the result with `count_served` once its answer holds the checkpoint.
-    async fn checkpoint(&self) -> Result<(Note, metrics::Served), Reply> {
+    /// The current checkpoint for an enrolment or a claim: the log-signed note, extended with the
+    /// witness lines stored for it, and what the witnesses gave. A new checkpoint goes to the
+    /// witnesses before any client sees it. The handler counts the result with `count_served`.
+    async fn checkpoint(&self, mode: Mode<'_>) -> Result<(Note, metrics::Served), Reply> {
+        let (policy, claim) = match mode {
+            Mode::Enroll => (self.manifest.body().log.as_ref(), false),
+            Mode::Claim { policy } => (policy, true),
+        };
+        let keys: Arc<[WitnessKey]> = policy
+            .map_or(vec![], |p| {
+                p.witnesses.iter().map(|w| w.key.clone()).collect()
+            })
+            .into();
+        let quorum = policy.map_or(0, |p| p.witness_quorum);
         let tree = self.tree().await?;
-        let (checkpoint, mut note, fresh) = self.signed(&tree);
-        let mut cosignatures = self.cosignatures(&checkpoint).await?;
-        let short = cosignatures.len() < self.log.witnesses.quorum;
-        if fresh || (short && self.log.witnesses.retry_due()) {
-            self.witness(&checkpoint, &note, &tree).await?;
-            cosignatures = self.cosignatures(&checkpoint).await?;
+        self.owners.hooks().hit("checkpoint_tree_read").await;
+        let (checkpoint, note, pending) = self.signed(&tree, &keys);
+        let (mut reply, mut count, _) = self.assembled(policy, &checkpoint, &note).await?;
+        let short = count < quorum;
+        if pending.is_some() || (short && self.log.witnesses.retry_due()) {
+            let pending =
+                pending.unwrap_or_else(|| self.owners.push_all(&checkpoint, &note, &tree, &keys));
+            let outcomes = self.pushed(&checkpoint, pending).await?;
+            (reply, count, _) = self.assembled(policy, &checkpoint, &note).await?;
+            let behind = outcomes.iter().find_map(|o| match o {
+                Outcome::Behind { floor } => Some(*floor),
+                _ => None,
+            });
+            if claim
+                && count < quorum
+                && let Some(floor) = behind
+                && let Some(advanced) = self.advance(policy, &keys, floor).await
+            {
+                reply = advanced.0;
+                count = advanced.1;
+            }
         } else if short {
             // Another request may be pushing this checkpoint right now.
-            self.log.witnesses.settled().await;
-            cosignatures = self.cosignatures(&checkpoint).await?;
+            for joined in self.owners.join_all() {
+                let _ = joined.await;
+            }
+            (reply, count, _) = self.assembled(policy, &checkpoint, &note).await?;
         }
-        let served = if self.log.witnesses.quorum == 0 {
+        let served = if quorum == 0 {
             metrics::Served::LogSigned
-        } else if cosignatures.len() < self.log.witnesses.quorum {
+        } else if count < quorum {
             metrics::Served::NotYet
         } else {
             metrics::Served::Witnessed
         };
-        note.signatures.extend(cosignatures);
-        Ok((note, served))
+        Ok((reply, served))
     }
 
-    /// Counts a checkpoint that an answer went out with.
-    fn count_served(&self, caller: metrics::Caller, served: metrics::Served) {
-        if let Some(metrics) = self.metrics() {
-            metrics.checkpoint_served(caller, served);
+    /// Awaits the owners' replies together and writes the lines they returned, as base did: awaited
+    /// on the pool with base limits.
+    async fn pushed(
+        &self,
+        checkpoint: &Checkpoint,
+        pending: Vec<tokio::sync::oneshot::Receiver<Outcome>>,
+    ) -> Result<Vec<Outcome>, Reply> {
+        let mut outcomes = vec![];
+        for reply in pending {
+            outcomes.push(reply.await.unwrap_or(Outcome::Failed));
         }
+        for outcome in &outcomes {
+            let Outcome::Cosigned(lines) = outcome else {
+                continue;
+            };
+            for (key, line) in lines.iter().filter(|_| checkpoint.size > 0) {
+                sqlx::query(witness::UPSERT)
+                    .bind(i64::try_from(checkpoint.size).map_err(internal)?)
+                    .bind(checkpoint.root.to_string())
+                    .bind(key.vkey())
+                    .bind(line.to_string().trim_end())
+                    .execute(&self.db)
+                    .await
+                    .map_err(internal)?;
+            }
+        }
+        Ok(outcomes)
     }
 
-    async fn cosignatures(&self, checkpoint: &Checkpoint) -> Result<Vec<NoteSignature>, Reply> {
+    /// The log-signed note extended with the stored lines that `policy` counts, and their count.
+    async fn assembled(
+        &self,
+        policy: Option<&LogPolicy>,
+        checkpoint: &Checkpoint,
+        note: &Note,
+    ) -> Result<(Note, usize, Vec<served::Kept>), Reply> {
+        let lines = self.stored_lines(checkpoint).await?;
+        Ok(served::assemble(
+            &self.log.key,
+            policy,
+            checkpoint,
+            note.clone(),
+            &lines,
+            served::now_secs(),
+        ))
+    }
+
+    async fn stored_lines(&self, checkpoint: &Checkpoint) -> Result<Vec<NoteSignature>, Reply> {
+        self.owners.hooks().hit("stored_lines_read").await;
         let lines: Vec<String> = sqlx::query_scalar(
             "SELECT signature FROM log_cosignatures WHERE size = $1 AND root = $2 ORDER BY witness",
         )
@@ -374,49 +647,37 @@ impl App {
         lines
             .iter()
             .map(|l| NoteSignature::parse(l).map_err(internal))
-            .filter(|signature| match signature {
-                Ok(signature) => self
-                    .log
-                    .witnesses
-                    .keys()
-                    .iter()
-                    .any(|key| matches!(key.verify(checkpoint, signature), Some(Ok(_)))),
-                Err(_) => true,
-            })
             .collect()
     }
 
-    /// Asks the witnesses to cosign and stores what they return, newest per witness.
-    async fn witness(
+    /// A claim whose Push was answered `Behind` advances once to the newer tree. It answers the
+    /// advanced note only when the client would accept it; any failure answers none, and the caller
+    /// keeps the note of the size it read.
+    async fn advance(
         &self,
-        checkpoint: &Checkpoint,
-        note: &Note,
-        tree: &Tree,
-    ) -> Result<(), Reply> {
-        let cosigned = self
-            .log
-            .witnesses
-            .cosign(
-                note,
-                checkpoint,
-                tree.prefix(checkpoint.size),
-                self.metrics(),
-            )
-            .await;
-        for (name, sig) in cosigned {
-            sqlx::query(
-                "INSERT INTO log_cosignatures (size, root, witness, signature) VALUES ($1, $2, $3, $4) \
-                 ON CONFLICT (size, root, witness) DO UPDATE SET signature = EXCLUDED.signature, received_at = now()",
-            )
-            .bind(i64::try_from(checkpoint.size).map_err(internal)?)
-            .bind(checkpoint.root.to_string())
-            .bind(name)
-            .bind(sig.to_string().trim_end())
-            .execute(&self.db)
-            .await
-            .map_err(internal)?;
+        policy: Option<&LogPolicy>,
+        keys: &Arc<[WitnessKey]>,
+        floor: u64,
+    ) -> Option<(Note, usize)> {
+        let tree = self.tree().await.ok()?;
+        self.owners.hooks().hit("checkpoint_advance_read").await;
+        if tree.size() < floor {
+            return None;
         }
-        Ok(())
+        let (checkpoint, note, pending) = self.signed(&tree, keys);
+        let pending =
+            pending.unwrap_or_else(|| self.owners.push_all(&checkpoint, &note, &tree, keys));
+        self.pushed(&checkpoint, pending).await.ok()?;
+        let (reply, count, kept) = self.assembled(policy, &checkpoint, &note).await.ok()?;
+        served::usable(&self.log.key, policy, &reply, &kept, served::now_secs())
+            .then_some((reply, count))
+    }
+
+    /// Counts a checkpoint that an answer went out with.
+    fn count_served(&self, caller: metrics::Caller, served: metrics::Served) {
+        if let Some(metrics) = self.metrics() {
+            metrics.checkpoint_served(caller, served);
+        }
     }
 
     /// A transaction on the pool, with the time it took to get a connection.
@@ -472,13 +733,55 @@ async fn log_key_text(Extension(app): Extension<App>) -> impl IntoResponse {
     )
 }
 
-async fn log_checkpoint(Extension(app): Extension<App>) -> Result<impl IntoResponse, Reply> {
-    let (note, served) = app.checkpoint().await?;
-    app.count_served(metrics::Caller::Checkpoint, served);
-    Ok((
-        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-        note.to_string(),
-    ))
+/// The 503 of both read routes. The client retries it once, after the delay it names.
+fn unavailable(why: served::Why) -> axum::response::Response {
+    eprintln!("checkpoint not served: {why:?}");
+    let headers = [(header::RETRY_AFTER, "5")];
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        headers,
+        Json(json!({"status": "error", "reason": served::UNAVAILABLE})),
+    )
+        .into_response()
+}
+
+async fn log_checkpoint(
+    Extension(app): Extension<App>,
+    RawQuery(query): RawQuery,
+) -> Result<axum::response::Response, Reply> {
+    let deadline = Instant::now() + app.wait;
+    let requested = served::request_policy(query.as_deref())?;
+    let policy = requested.as_ref().or(app.manifest.body().log.as_ref());
+    let has_witnesses = policy.is_some_and(|p| !p.witnesses.is_empty());
+    match app.served(policy, deadline).await {
+        served::Answer::Witnessed { note, .. } => {
+            let served = if has_witnesses {
+                metrics::Served::Witnessed
+            } else {
+                metrics::Served::LogSigned
+            };
+            app.count_served(metrics::Caller::Checkpoint, served);
+            Ok((
+                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                note.to_string(),
+            )
+                .into_response())
+        }
+        served::Answer::Unavailable(why) => {
+            app.count_served(metrics::Caller::Checkpoint, metrics::Served::NotYet);
+            let headers = [
+                (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+                (header::RETRY_AFTER, "5"),
+            ];
+            eprintln!("checkpoint not served: {why:?}");
+            Ok((
+                StatusCode::SERVICE_UNAVAILABLE,
+                headers,
+                format!("{}\n", served::UNAVAILABLE),
+            )
+                .into_response())
+        }
+    }
 }
 
 async fn consistency(
@@ -744,7 +1047,7 @@ async fn try_enroll(
     .fetch_one(&app.db)
     .await
     .map_err(internal)?;
-    let (checkpoint, served) = app.checkpoint().await?;
+    let (checkpoint, served) = app.checkpoint(Mode::Enroll).await?;
     app.count_served(metrics::Caller::Enroll, served);
     Ok(Json(json!({
         "status": "enrolled",
@@ -873,13 +1176,29 @@ async fn accept_manifest(
 
 async fn log_mine(
     Extension(app): Extension<App>,
+    RawQuery(query): RawQuery,
     body: Result<Json<MyEntriesRequest>, JsonRejection>,
-) -> Result<Json<MyEntries>, Reply> {
+) -> Result<axum::response::Response, Reply> {
     let Json(request) = body.map_err(|_| device_denied())?;
     authenticate_device(&app, &request, DeviceAuthPurpose::LogMine).await?;
-    let (checkpoint, served) = app.checkpoint().await?;
-    let cp = Checkpoint::parse(&checkpoint.text).map_err(internal)?;
-    let tree = app.tree().await?;
+    let requested = served::request_policy(query.as_deref())?;
+    let policy = requested.as_ref().or(app.manifest.body().log.as_ref());
+    let has_witnesses = policy.is_some_and(|p| !p.witnesses.is_empty());
+    app.owners.hooks().hit("served_entered").await;
+    let deadline = Instant::now() + app.wait;
+    let (note, tree) = match app.served(policy, deadline).await {
+        served::Answer::Witnessed { note, tree } => (note, tree),
+        served::Answer::Unavailable(why) => {
+            app.count_served(metrics::Caller::Mine, metrics::Served::NotYet);
+            return Ok(unavailable(why));
+        }
+    };
+    let served = if has_witnesses {
+        metrics::Served::Witnessed
+    } else {
+        metrics::Served::LogSigned
+    };
+    let cp = Checkpoint::parse(&note.text).map_err(internal)?;
     let mut conn = app.conn().await?;
     let enrolment = devices::bound(&mut conn, &request.pseudonym, app.manifest.hash().as_str())
         .await
@@ -907,10 +1226,11 @@ async fn log_mine(
     let manifest = manifest.ok_or_else(|| internal("manifest log entry missing"))?;
     app.count_served(metrics::Caller::Mine, served);
     Ok(Json(MyEntries {
-        checkpoint: checkpoint.to_string(),
+        checkpoint: note.to_string(),
         manifest,
         device,
-    }))
+    })
+    .into_response())
 }
 
 async fn claim(
@@ -1093,6 +1413,7 @@ async fn claim(
     clock.mark(metrics::Stage::Store);
     tx.commit().await.map_err(internal)?;
     clock.mark(metrics::Stage::Commit);
+    app.owners.hooks().hit("claim_committed").await;
     if enrolled
         && !oversharing
         && let Some(exporter) = &app.siem
@@ -1111,7 +1432,8 @@ async fn claim(
     if !reasons.is_empty() {
         return Err(denied(reasons));
     }
-    let (checkpoint, served) = app.checkpoint().await?;
+    let policy = consented.body().log.as_ref();
+    let (checkpoint, served) = app.checkpoint(Mode::Claim { policy }).await?;
     clock.mark(metrics::Stage::Checkpoint);
     app.count_served(metrics::Caller::Claim, served);
     Ok(Json(json!({
@@ -1228,7 +1550,7 @@ async fn index(Extension(app): Extension<App>) -> Result<Html<String>, Reply> {
         log_size = tree.size(),
         log_root = {
             use base64::Engine;
-            base64::engine::general_purpose::STANDARD.encode(root(&tree.leaves).0)
+            base64::engine::general_purpose::STANDARD.encode(tree.root().0)
         },
         log_witnesses = app.log.witnesses.keys().len(),
         ca = app.keys.ca.fingerprint,
@@ -1303,14 +1625,14 @@ fn witness_urls() -> Vec<String> {
 
 /// Re-sends the current checkpoint so the cosignatures stay younger than checkpoint_max_age
 /// while the log does not grow.
-fn witness_refresh(manifest: &Manifest, witnesses: &Witnesses) -> anyhow::Result<Option<Duration>> {
+fn witness_refresh(manifest: &Manifest, has_witnesses: bool) -> anyhow::Result<Option<Duration>> {
     match manifest
         .body()
         .log
         .as_ref()
         .and_then(|p| p.checkpoint_max_age.min_duration())
     {
-        Some(age) if !witnesses.urls().is_empty() => {
+        Some(age) if has_witnesses => {
             let quarter = u64::try_from(age.whole_seconds() / 4).unwrap_or(600);
             Ok(Some(Duration::from_secs(env_number(
                 "WITNESS_REFRESH_SECS",
@@ -1325,7 +1647,7 @@ async fn refresh_cosignatures(mut app: App) {
     let mut last = Instant::now();
     let mut version = app.version;
     loop {
-        let delay = witness_refresh(&app.manifest, &app.log.witnesses)
+        let delay = witness_refresh(&app.manifest, !app.owners.is_empty())
             .ok()
             .flatten()
             .map(|every| every.saturating_sub(last.elapsed()))
@@ -1333,7 +1655,7 @@ async fn refresh_cosignatures(mut app: App) {
             .min(Duration::from_secs(10));
         tokio::time::sleep(delay).await;
         app.enforced = app.current.read().expect("manifest snapshot").clone();
-        let Ok(Some(every)) = witness_refresh(&app.manifest, &app.log.witnesses) else {
+        let Ok(Some(every)) = witness_refresh(&app.manifest, !app.owners.is_empty()) else {
             continue;
         };
         if version == app.version && last.elapsed() < every {
@@ -1341,9 +1663,7 @@ async fn refresh_cosignatures(mut app: App) {
         }
         version = app.version;
         last = Instant::now();
-        let Ok(tree) = app.tree().await else { continue };
-        let (checkpoint, note, _) = app.signed(&tree);
-        let _ = app.witness(&checkpoint, &note, &tree).await;
+        app.owners.refresh_all();
     }
 }
 
@@ -1623,13 +1943,18 @@ async fn reload_manifest(app: &App) -> anyhow::Result<()> {
     }
     let mut enforced = manifests::enforced(&row.toml, &app.keys, Some(row.version))?;
     enforced.siem = current.siem.clone();
+    enforced.revision = current.revision + 1;
     publish_manifest(&app.db, &enforced.manifest).await?;
     eprintln!(
         "enforcing database manifest version {} {}",
         row.version,
         enforced.manifest.hash()
     );
+    // The owners accept a line of the new manifest's witnesses before the snapshot that asks for it.
+    app.owners.add_keys(enforced.log.witnesses.keys());
     *app.current.write().expect("manifest snapshot") = Arc::new(enforced);
+    app.owners.hooks().hit("reload_published").await;
+    app.owners.reload_all();
     Ok(())
 }
 
@@ -1690,27 +2015,29 @@ async fn serve(db: PgPool) -> anyhow::Result<()> {
     let kek = SealingKey::kek_from_env()?;
     let keys = Keys::load_or_create(&db, &kek).await?;
     let policy = manifest.body().log.as_ref();
-    let log = Log {
-        key: log_key(&keys)?,
-        signer: keys.log.clone(),
-        witnesses: Witnesses::new(witness_urls(), policy)?,
-        cache: Mutex::default(),
-    };
+    let wait_ms: u64 = env_number("CHECKPOINT_WAIT_MS", 3000)?;
+    if !(500..=3000).contains(&wait_ms) {
+        anyhow::bail!(
+            "CHECKPOINT_WAIT_MS {wait_ms} is outside 500 to 3000: the client's status timeout is built on the upper end"
+        );
+    }
+    let urls = witness::normalize_urls(witness_urls());
+    let log = Log::new(keys.log.clone(), log_key(&keys)?, Witnesses::new(policy));
     eprintln!("log key {}", log.key.vkey());
     for w in log.witnesses.keys() {
         eprintln!("manifest witness {}", w.vkey());
     }
-    for url in log.witnesses.urls() {
+    for url in &urls {
         eprintln!("pushing checkpoints to {url}");
     }
-    if log.witnesses.urls().len() < log.witnesses.quorum {
+    if urls.len() < log.witnesses.quorum {
         eprintln!(
             "WARNING: the manifest requires {} witness cosignatures but WITNESS_URLS lists {} witnesses; clients will raise a log alarm",
             log.witnesses.quorum,
-            log.witnesses.urls().len()
+            urls.len()
         );
     }
-    witness_refresh(&manifest, &log.witnesses)?;
+    witness_refresh(&manifest, !urls.is_empty())?;
     publish_manifest(&db, &manifest).await?;
     let company = Endorsement::sign(&keys.manifest, manifest.hash());
     eprintln!("company key {}", company.key.fingerprint());
@@ -1744,10 +2071,21 @@ async fn serve(db: PgPool) -> anyhow::Result<()> {
         company,
         log: Arc::new(log),
         version: active.map(|row| row.version),
+        revision: 0,
     });
+    let current = Arc::new(RwLock::new(enforced.clone()));
+    let owners = Owners::start(
+        urls,
+        enforced.log.witnesses.keys().to_vec(),
+        current.clone(),
+        db.clone(),
+        observe.clone(),
+    )?;
     let app = App {
-        enforced: enforced.clone(),
-        current: Arc::new(RwLock::new(enforced)),
+        enforced,
+        current,
+        owners: Arc::new(owners),
+        wait: Duration::from_millis(wait_ms),
         db,
         keys: Arc::new(keys),
         auto_approve,
@@ -1945,15 +2283,40 @@ mod tests {
     const DEMO: &str = include_str!("../../../examples/manifest.toml");
     const TEST_KEK: [u8; 32] = [5; 32];
 
+    /// Owners for `urls`, enforcing the keys of the snapshot in `current`.
+    fn owners_for(
+        current: &Arc<RwLock<Arc<Enforced>>>,
+        db: &PgPool,
+        urls: Vec<String>,
+        observe: Option<Arc<metrics::Observation>>,
+    ) -> Arc<Owners> {
+        let keys = current.read().unwrap().log.witnesses.keys().to_vec();
+        Arc::new(Owners::start(urls, keys, current.clone(), db.clone(), observe).unwrap())
+    }
+
+    fn tree_of(leaves: Vec<LogHash>) -> Tree {
+        Tree {
+            view: Arc::new(LogView {
+                root: root(&leaves),
+                leaves,
+                roots: VecDeque::new(),
+            }),
+            revision: 0,
+        }
+    }
+
     async fn manifest_app(toml: &str) -> App {
         let db = testdb::fresh().await;
         let kek = SealingKey::new(&TEST_KEK);
         let keys = Keys::load_or_create(&db, &kek).await.unwrap();
         let enforced = Arc::new(manifests::enforced(toml, &keys, None).unwrap());
+        let current = Arc::new(RwLock::new(enforced.clone()));
         App {
+            owners: owners_for(&current, &db, vec![], None),
+            wait: Duration::from_secs(3),
             db,
-            enforced: enforced.clone(),
-            current: Arc::new(RwLock::new(enforced)),
+            enforced,
+            current,
             keys: Arc::new(keys),
             auto_approve: false,
             limiter: Arc::new(Limiter::new(100, Duration::from_secs(60), 100)),
@@ -2070,11 +2433,7 @@ mod tests {
         let url = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, witness).await.unwrap() });
         let mut app = manifest_app(DEMO).await;
-        let mut enforced = manifests::enforced(DEMO, &app.keys, None).unwrap();
-        Arc::get_mut(&mut enforced.log).unwrap().witnesses =
-            Witnesses::new(vec![url], enforced.manifest.body().log.as_ref()).unwrap();
-        app.enforced = Arc::new(enforced);
-        *app.current.write().unwrap() = app.enforced.clone();
+        app.owners = owners_for(&app.current, &app.db, vec![url], None);
         let refresh = tokio::spawn(refresh_cosignatures(app));
         let result = tokio::time::timeout(Duration::from_secs(4), async {
             while pushes.load(std::sync::atomic::Ordering::Relaxed) < 2 {
@@ -2115,12 +2474,9 @@ mod tests {
         let base = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, witness).await.unwrap() });
         let mut app = manifest_app(DEMO).await;
-        app.observe = observe;
-        let mut enforced = manifests::enforced(DEMO, &app.keys, None).unwrap();
+        app.observe = observe.clone();
         let urls = ["failing", "refusing", "ahead", "empty"].map(|name| format!("{base}/{name}"));
-        Arc::get_mut(&mut enforced.log).unwrap().witnesses =
-            Witnesses::new(urls.to_vec(), enforced.manifest.body().log.as_ref()).unwrap();
-        app.enforced = Arc::new(enforced);
+        app.owners = owners_for(&app.current, &app.db, urls.to_vec(), observe);
         (app, server)
     }
 
@@ -2131,7 +2487,7 @@ mod tests {
         let metrics = Arc::new(metrics::Metrics::new());
         let observation = metrics::Observation::new(Some(metrics.clone()), None);
         let (app, server) = app_with_broken_witnesses(observation).await;
-        app.checkpoint().await.unwrap();
+        app.checkpoint(Mode::Enroll).await.unwrap();
         server.abort();
         let text = metrics.scrape(&app.db);
         for result in ["error", "refused", "conflict", "invalid"] {
@@ -2147,7 +2503,7 @@ mod tests {
     async fn witness_pushes_read_no_clock_when_observation_is_off() {
         let (app, server) = app_with_broken_witnesses(None).await;
         let before = metrics::clock_reads();
-        app.checkpoint().await.unwrap();
+        app.checkpoint(Mode::Enroll).await.unwrap();
         server.abort();
         assert_eq!(metrics::clock_reads(), before);
     }
@@ -2378,10 +2734,13 @@ mod tests {
         let keys = Keys::load_or_create(&db, &kek).await.unwrap();
         let old = manifest_a();
         let enforced = Arc::new(manifests::enforced(&old, &keys, None).unwrap());
+        let current = Arc::new(RwLock::new(enforced.clone()));
         let app = App {
+            owners: owners_for(&current, &db, vec![], None),
+            wait: Duration::from_secs(3),
             db: db.clone(),
-            enforced: enforced.clone(),
-            current: Arc::new(RwLock::new(enforced)),
+            enforced,
+            current,
             keys: Arc::new(keys),
             auto_approve: false,
             limiter: Arc::new(Limiter::new(100, Duration::from_secs(60), 100)),
@@ -2568,12 +2927,24 @@ mod tests {
         let kek = SealingKey::new(&TEST_KEK);
         let keys = Keys::load_or_create(&db, &kek).await.unwrap();
         let manifest = Manifest::parse(toml.as_bytes()).unwrap();
-        let log = Log {
-            key: LogKey::new("log.example.org/test", &PublicKey::from(&keys.log)),
-            signer: keys.log.clone(),
-            witnesses: Witnesses::new(vec![], manifest.body().log.as_ref()).unwrap(),
-            cache: Mutex::default(),
-        };
+        let log_key = LogKey::new("log.example.org/test", &PublicKey::from(&keys.log));
+        // A manifest that lists the demo witness gets a healthy fake one for the whole test.
+        let mut urls = vec![];
+        if manifest
+            .body()
+            .log
+            .as_ref()
+            .is_some_and(|p| p.witnesses.iter().any(|w| w.name == testwitness::DEMO_NAME))
+        {
+            let witness = testwitness::FakeWitness::demo(&log_key).await;
+            urls.push(witness.url.clone());
+            std::mem::forget(witness);
+        }
+        let log = Log::new(
+            keys.log.clone(),
+            log_key,
+            Witnesses::new(manifest.body().log.as_ref()),
+        );
         let minute = Duration::from_secs(60);
         let enforced = Arc::new(Enforced {
             siem,
@@ -2582,10 +2953,14 @@ mod tests {
             toml: toml.into(),
             log: Arc::new(log),
             version: None,
+            revision: 0,
         });
+        let current = Arc::new(RwLock::new(enforced.clone()));
         let app = router(App {
-            enforced: enforced.clone(),
-            current: Arc::new(RwLock::new(enforced)),
+            owners: owners_for(&current, &db, urls, observe.clone()),
+            wait: Duration::from_secs(3),
+            enforced,
+            current,
             db: db.clone(),
             keys: Arc::new(keys),
             auto_approve,
@@ -4047,9 +4422,7 @@ grace = "1d"
 
     #[test]
     fn a_claim_checkpoint_must_be_a_state_of_this_log() {
-        let tree = Tree {
-            leaves: (0u8..5).map(|i| open_pact_core::leaf_hash(&[i])).collect(),
-        };
+        let tree = tree_of((0u8..5).map(|i| open_pact_core::leaf_hash(&[i])).collect());
         let at = |size: u64| LogCheckpoint {
             size,
             root: root(tree.prefix(size)),

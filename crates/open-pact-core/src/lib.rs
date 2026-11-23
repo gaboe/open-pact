@@ -31,7 +31,7 @@ pub use evaluate::{
 pub use invitation::{InvalidInvitation, Invitation, InvitationCode, InvitationHash};
 pub use lease::vpn_lease;
 pub use log::{
-    Entry, EntryKind, LogHash, consistency_proof, inclusion_proof, leaf_hash, root,
+    Entry, EntryKind, Frontier, LogHash, consistency_proof, inclusion_proof, leaf_hash, root,
     verify_consistency, verify_inclusion,
 };
 pub use manifest::{
@@ -47,7 +47,10 @@ pub use own_entries::{
     device_auth_statement,
 };
 pub use p256::ecdsa::SigningKey;
-pub use witness::{AddCheckpoint, CLOCK_SKEW_SECS, Refusal, add_checkpoint, verify_cosignatures};
+pub use witness::{
+    AddCheckpoint, CLOCK_SKEW_SECS, Refusal, add_checkpoint, cosign_time_usable,
+    verify_cosignatures,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

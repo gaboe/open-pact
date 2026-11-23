@@ -1386,7 +1386,8 @@ pub struct Witness {
 }
 
 impl LogPolicy {
-    fn validate(&self) -> Result<(), String> {
+    /// The checks a signed manifest passes. The gateway runs them on a policy a client sends.
+    pub fn validate(&self) -> Result<(), String> {
         let mut names = BTreeSet::new();
         for w in &self.witnesses {
             if w.key.name() != w.name {
@@ -1415,7 +1416,7 @@ impl LogPolicy {
             }
             // Two sets of more than half the witnesses share one, and an honest witness cosigns one
             // history only, so no two accepted checkpoints can belong to different histories.
-            (_, false) if 2 * quorum <= listed || quorum > listed => {
+            (_, false) if quorum <= listed / 2 || quorum > listed => {
                 return Err(format!(
                     "log.witness_quorum {quorum} must be more than half of the {listed} witnesses \
                      listed and at most {listed}"
@@ -1758,6 +1759,29 @@ mod tests {
                 .unwrap_or_else(|| panic!("accepted {quorum} of {count}"));
             assert!(err.to_string().contains("more than half"), "{err}");
         }
+    }
+
+    #[test]
+    fn validate_rejects_out_of_range_quorum() {
+        let witnesses: Vec<Witness> = (1..=3u8)
+            .map(|seed| {
+                let signer = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+                let name = format!("witness.example.org/w{seed}");
+                let key = WitnessKey::new(&name, signer.verifying_key());
+                Witness { name, key }
+            })
+            .collect();
+        let with = |quorum: usize| LogPolicy {
+            allow_split_views: false,
+            witnesses: witnesses.clone(),
+            witness_quorum: quorum,
+            checkpoint_max_age: Span::try_from("1h".to_string()).unwrap(),
+        };
+        // No overflow panic in the debug profile, and the same answers as the old test.
+        let answers: Vec<bool> = [usize::MAX, 1, 2, 3, 4]
+            .map(|quorum| with(quorum).validate().is_ok())
+            .to_vec();
+        assert_eq!(answers, [false, false, true, true, false]);
     }
 
     #[test]

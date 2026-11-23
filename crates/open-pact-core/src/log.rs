@@ -111,6 +111,47 @@ fn split(n: usize) -> usize {
     k
 }
 
+/// The perfect-subtree hashes of a tree prefix. A push costs amortized O(1) and the root of the
+/// prefix costs O(log n), so a cache can hold the root of every recent size.
+#[derive(Debug, Clone, Default)]
+pub struct Frontier {
+    hashes: Vec<(u32, LogHash)>,
+    len: u64,
+}
+
+impl Frontier {
+    /// The number of leaves pushed.
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn push(&mut self, leaf: LogHash) {
+        let (mut height, mut hash) = (0, leaf);
+        while let Some((top, left)) = self.hashes.last()
+            && *top == height
+        {
+            hash = node_hash(left, &hash);
+            height += 1;
+            self.hashes.pop();
+        }
+        self.hashes.push((height, hash));
+        self.len += 1;
+    }
+
+    /// The root of the leaves pushed so far, equal to `root` of them.
+    pub fn root(&self) -> LogHash {
+        let mut parts = self.hashes.iter().rev().map(|(_, hash)| *hash);
+        match parts.next() {
+            None => root(&[]),
+            Some(last) => parts.fold(last, |right, left| node_hash(&left, &right)),
+        }
+    }
+}
+
 /// MTH(D[n]), RFC 9162 section 2.1.1.
 pub fn root(leaves: &[LogHash]) -> LogHash {
     match leaves.len() {
@@ -280,6 +321,18 @@ pub fn verify_consistency(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_frontier_gives_the_root_of_every_prefix() {
+        let leaves: Vec<LogHash> = (0..70u8).map(|i| leaf_hash(&[i])).collect();
+        let mut frontier = Frontier::default();
+        assert_eq!(frontier.root(), root(&[]));
+        for (n, leaf) in leaves.iter().enumerate() {
+            frontier.push(*leaf);
+            assert_eq!(frontier.root(), root(&leaves[..=n]), "size {}", n + 1);
+            assert_eq!(frontier.len(), n as u64 + 1);
+        }
+    }
+
     use super::*;
 
     fn h(s: &str) -> LogHash {
