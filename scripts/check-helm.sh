@@ -66,6 +66,13 @@ created="$(helm template t "$chart" "${kek[@]}" --set-string "postgres.password=
 grep -q -F "  password: \"$password\"" <<< "$created" || { echo "FAIL: the Secret must hold the raw password"; exit 1; }
 database_env "$created" t-postgres
 database_env "$(helm template t "$chart" "${kek[@]}" --set postgres.existingSecret=pact-postgres)" pact-postgres
+# An unset database.maxConnections (a release upgraded with --reuse-values) renders no env entry, so the binary default applies.
+unset_max="$(helm template t "$chart" "${kek[@]}" --set postgres.password=example-only --set database.maxConnections=null)"
+! grep -q 'name: DATABASE_MAX_CONNECTIONS' <<< "$unset_max" || { echo "FAIL: rendered DATABASE_MAX_CONNECTIONS without a value"; exit 1; }
+echo "omits DATABASE_MAX_CONNECTIONS when database.maxConnections is unset"
+set_max="$(helm template t "$chart" "${kek[@]}" --set postgres.password=example-only --set database.maxConnections=25)"
+grep -A1 'name: DATABASE_MAX_CONNECTIONS' <<< "$set_max" | grep -q 'value: "25"' || { echo "FAIL: database.maxConnections=25 did not render as \"25\""; exit 1; }
+echo "renders DATABASE_MAX_CONNECTIONS as \"25\" when database.maxConnections is 25"
 echo "the gateway reads a database password with @:/?#% as PGPASSWORD from the Secret postgres uses"
 echo "the witness needs its own key secret and the log keys it witnesses"
 echo "renders with the KEK secret and a chosen database password, existing secret or external database"
