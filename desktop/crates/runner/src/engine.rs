@@ -262,13 +262,21 @@ pub fn find_other_copies(runner: &Runner, installed: &Path, bundled: &Path) -> V
     )
 }
 
+/// The executable that the user job records now, read from its live receipt. `None` when the job
+/// is gone or its receipt cannot be read.
+pub fn live_active(installed: &Path) -> Option<PathBuf> {
+    session(installed).ok()?.job_executable().ok().flatten()
+}
+
 /// Runs the removal command of `copy` and gives what it printed. Only the user's click calls it.
+/// `read_active` reads the live receipt of the user job at this moment: a job that changed since
+/// the window opened changes what is protected.
 pub fn remove_copy(
     runner: &Runner,
     copy: &OtherCopy,
-    active: Option<&Path>,
+    read_active: impl FnOnce() -> Option<PathBuf>,
 ) -> Result<String, String> {
-    if ownership::is_active(copy, active) {
+    if ownership::is_active(copy, read_active().as_deref()) {
         return Err(format!(
             "{} is the copy that the scheduled job runs, so it is not removed.",
             copy.path.display()
@@ -572,9 +580,25 @@ mod tests {
     fn removing_the_active_user_job_copy_is_refused_before_any_command_runs() {
         let active = Path::new("/opt/fictional/bin/open-pact-client");
         let copy = OtherCopy::new(active.to_path_buf(), ownership::Source::Other);
-        let error = remove_copy(&Runner::default(), &copy, Some(active)).unwrap_err();
+        let error =
+            remove_copy(&Runner::default(), &copy, || Some(active.to_path_buf())).unwrap_err();
         assert!(error.contains("/opt/fictional/bin/open-pact-client"));
         assert!(error.contains("scheduled job runs"));
+    }
+
+    #[test]
+    fn the_removal_guard_reads_the_active_path_when_it_runs() {
+        let path = Path::new("/opt/fictional/bin/open-pact-client");
+        // The machine client has no removal command, so nothing runs past the guard.
+        let copy = OtherCopy::new(path.to_path_buf(), ownership::Source::MachineClient);
+        // The job was rewritten or removed after the window opened: no copy is protected now.
+        let read = std::cell::Cell::new(false);
+        let outcome = remove_copy(&Runner::default(), &copy, || {
+            read.set(true);
+            None
+        });
+        assert!(read.get());
+        assert!(outcome.unwrap_err().contains("managed by an administrator"));
     }
 
     #[test]
