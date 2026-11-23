@@ -9,6 +9,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -126,6 +127,100 @@ class GeneratorTest(unittest.TestCase):
         bucket = self.generate(SUMS)
         self.assertTrue((bucket / "open-pact.json").exists())
         self.assertTrue((self.dir / "Formula" / "open-pact.rb").exists())
+
+
+class WingetTest(unittest.TestCase):
+    MSI_HASH = "9" * 64
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.dir = Path(self._tmp.name)
+        self.sums = write_sums(self.dir, {"open-pact-client-x86_64-pc-windows-msvc.msi": self.MSI_HASH})
+
+    def upgrade_code(self) -> str:
+        wxs = (HERE.parent.parent / "packaging" / "windows" / "open-pact-client.wxs").read_text()
+        return re.search(r'UpgradeCode="(\{[0-9A-F-]{36}\})"', wxs).group(1)
+
+    def test_stable_manifests_name_the_msi_hash_product_code_and_display_version(self):
+        winget = self.dir / "winget"
+        run_generator(VERSION, str(self.sums), "--winget-only", "--winget-dir", str(winget))
+        names = sorted(path.name for path in winget.iterdir())
+        self.assertEqual(
+            names,
+            [
+                "gaboe.open-pact.installer.yaml",
+                "gaboe.open-pact.locale.en-US.yaml",
+                "gaboe.open-pact.yaml",
+            ],
+        )
+        installer = (winget / "gaboe.open-pact.installer.yaml").read_text()
+        product_code = gate.msi_product_code(self.upgrade_code(), VERSION)
+        self.assertIn(
+            f'InstallerUrl: "https://github.com/gaboe/open-pact/releases/download/v{VERSION}/open-pact-client-x86_64-pc-windows-msvc.msi"',
+            installer,
+        )
+        self.assertIn(f'InstallerSha256: "{self.MSI_HASH}"', installer)
+        self.assertIn(f'ProductCode: "{product_code}"', installer)
+        self.assertIn(f'UpgradeCode: "{self.upgrade_code()}"', installer)
+        self.assertIn('DisplayVersion: "1.2.399"', installer)
+        self.assertIn("InstallerType: wix", installer)
+        self.assertIn("Scope: machine", installer)
+        self.assertIn("Architecture: x64", installer)
+        version = (winget / "gaboe.open-pact.yaml").read_text()
+        self.assertIn('PackageIdentifier: gaboe.open-pact\n', version)
+        self.assertIn(f'PackageVersion: "{VERSION}"', version)
+
+    def test_stable_winget_needs_the_msi_checksum(self):
+        sums = write_sums(self.dir, {"open-pact-client-x86_64-pc-windows-msvc.exe": "d" * 64})
+        with self.assertRaisesRegex(ValueError, "open-pact-client-x86_64-pc-windows-msvc.msi"):
+            run_generator(VERSION, str(sums), "--winget-only", "--winget-dir", str(self.dir / "w"))
+
+    def test_winget_is_refused_for_a_prerelease_without_the_test_flag(self):
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            run_generator("1.2.3-rc.1", str(self.sums), "--winget-only", "--winget-dir", str(self.dir / "w"))
+        self.assertFalse((self.dir / "w").exists())
+
+    def test_the_test_flag_writes_the_test_identifier_for_a_prerelease(self):
+        winget = self.dir / "winget"
+        run_generator("1.2.3-rc.1", str(self.sums), "--winget-only", "--winget-test", "--winget-dir", str(winget))
+        self.assertTrue((winget / "gaboe.open-pact.test.installer.yaml").exists())
+        installer = (winget / "gaboe.open-pact.test.installer.yaml").read_text()
+        self.assertIn('PackageIdentifier: gaboe.open-pact.test\n', installer)
+        self.assertIn(
+            'InstallerUrl: "https://github.com/gaboe/open-pact/releases/download/v1.2.3-rc.1/open-pact-client-x86_64-pc-windows-msvc.msi"',
+            installer,
+        )
+        self.assertIn('DisplayVersion: "1.2.301"', installer)
+
+    def test_the_test_flag_needs_a_winget_directory(self):
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            run_generator("1.2.3-rc.1", str(self.sums), "--winget-test")
+
+    def test_winget_only_writes_no_scoop_or_formula_files(self):
+        run_generator(VERSION, str(self.sums), "--winget-only", "--winget-dir", str(self.dir / "w"))
+        self.assertFalse((self.dir / "bucket").exists())
+        self.assertFalse((self.dir / "Formula").exists())
+
+    def test_the_full_run_adds_the_winget_files_beside_the_other_metadata(self):
+        sums = write_sums(
+            self.dir,
+            {**SUMS, "open-pact-client-x86_64-pc-windows-msvc.msi": self.MSI_HASH},
+        )
+        run_generator(
+            VERSION,
+            str(sums),
+            "--homebrew-dir",
+            str(self.dir / "Formula"),
+            "--scoop-dir",
+            str(self.dir / "bucket"),
+            "--desktop",
+            "--winget-dir",
+            str(self.dir / "winget"),
+        )
+        self.assertTrue((self.dir / "Formula" / "open-pact.rb").exists())
+        self.assertTrue((self.dir / "bucket" / "open-pact-desktop.json").exists())
+        self.assertTrue((self.dir / "winget" / "gaboe.open-pact.yaml").exists())
 
 
 class VersionGateTest(unittest.TestCase):

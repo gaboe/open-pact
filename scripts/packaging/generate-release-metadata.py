@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import re
 from pathlib import Path
@@ -14,6 +15,24 @@ RELEASE_FILES = {
     "mac_x86_64": "open-pact-client-x86_64-apple-darwin",
     "windows_x86_64": "open-pact-client-x86_64-pc-windows-msvc.exe",
 }
+
+MSI_FILE = "open-pact-client-x86_64-pc-windows-msvc.msi"
+WINGET_ID = "gaboe.open-pact"
+WINGET_TEST_ID = "gaboe.open-pact.test"
+ROOT = Path(__file__).resolve().parents[2]
+RELEASE_URL = "https://github.com/gaboe/open-pact/releases/download"
+
+
+def _load_version_gate():
+    spec = importlib.util.spec_from_file_location(
+        "check_release_version", Path(__file__).resolve().parent / "check-release-version.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+version_gate = _load_version_gate()
 
 
 def desktop_zip(version: str) -> str:
@@ -162,12 +181,74 @@ def desktop_scoop_manifest(version: str, digest: str) -> str:
     return json.dumps(manifest, indent=2) + "\n"
 
 
+def upgrade_code() -> str:
+    """The MSI UpgradeCode, read from the .wxs the same way build-msi.ps1 reads it."""
+    wxs = (ROOT / "packaging" / "windows" / "open-pact-client.wxs").read_text(encoding="utf-8")
+    match = re.search(r'UpgradeCode="(\{[0-9A-F-]{36}\})"', wxs)
+    if match is None:
+        raise ValueError("packaging/windows/open-pact-client.wxs has no UpgradeCode")
+    return match.group(1)
+
+
+def winget_manifests(version: str, msi_hash: str, identifier: str) -> dict[str, str]:
+    """The three winget manifests (schema 1.10.0) of the machine MSI for one version."""
+    upgrade = upgrade_code()
+    product_code = version_gate.msi_product_code(upgrade, version)
+    display_version = version_gate.msi_version(version)
+    url = f"{RELEASE_URL}/v{version}/{MSI_FILE}"
+    head = f'PackageIdentifier: {identifier}\nPackageVersion: "{version}"\n'
+    return {
+        f"{identifier}.yaml": f"""# yaml-language-server: $schema=https://aka.ms/winget-manifest.version.1.10.0.schema.json
+{head}DefaultLocale: en-US
+ManifestType: version
+ManifestVersion: 1.10.0
+""",
+        f"{identifier}.installer.yaml": f"""# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.10.0.schema.json
+{head}Installers:
+  - Architecture: x64
+    InstallerType: wix
+    Scope: machine
+    InstallerUrl: "{url}"
+    InstallerSha256: "{msi_hash}"
+    ProductCode: "{product_code}"
+    AppsAndFeaturesEntries:
+      - ProductCode: "{product_code}"
+        UpgradeCode: "{upgrade}"
+        DisplayVersion: "{display_version}"
+ManifestType: installer
+ManifestVersion: 1.10.0
+""",
+        f"{identifier}.locale.en-US.yaml": f"""# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.10.0.schema.json
+{head}PackageLocale: en-US
+Publisher: gaboe
+PublisherUrl: https://github.com/gaboe
+PackageName: open-pact client
+PackageUrl: https://github.com/gaboe/open-pact
+License: MIT
+ShortDescription: "Verifiable security checks for personally owned devices"
+ManifestType: defaultLocale
+ManifestVersion: 1.10.0
+""",
+    }
+
+
+def write_winget(directory: Path, version: str, msi_hash: str, test: bool) -> list[Path]:
+    identifier = WINGET_TEST_ID if test else WINGET_ID
+    directory.mkdir(parents=True, exist_ok=True)
+    paths = []
+    for name, text in winget_manifests(version, msi_hash, identifier).items():
+        path = directory / name
+        path.write_text(text, encoding="utf-8")
+        paths.append(path)
+    return paths
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("version", help="release version without the v prefix")
     parser.add_argument("checksums", type=Path, help="release SHA256SUMS file")
     parser.add_argument("--homebrew-dir", type=Path)
-    parser.add_argument("--scoop-dir", type=Path, required=True)
+    parser.add_argument("--scoop-dir", type=Path)
     parser.add_argument("--scoop-url", help="override the Scoop download URL")
     parser.add_argument("--scoop-only", action="store_true", help="write only the Scoop manifest")
     parser.add_argument(
@@ -180,17 +261,57 @@ def main() -> None:
         action="store_true",
         help="write clearly marked seed metadata before the release exists",
     )
+    parser.add_argument(
+        "--winget-dir",
+        type=Path,
+        help="also write the winget manifests here; the checksums must list the machine MSI",
+    )
+    parser.add_argument(
+        "--winget-only", action="store_true", help="write only the winget manifests"
+    )
+    parser.add_argument(
+        "--winget-test",
+        action="store_true",
+        help="write gaboe.open-pact.test manifests for any version, for the VM tests only",
+    )
     args = parser.parse_args()
     if not re.fullmatch(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?", args.version):
         parser.error("version must be a semantic version without a v prefix")
-    if not args.scoop_only and args.homebrew_dir is None:
-        parser.error("--homebrew-dir is required unless --scoop-only is set")
-    required_files = (
-        {RELEASE_FILES["windows_x86_64"]} if args.scoop_only else set(RELEASE_FILES.values())
-    )
+    stable = "-" not in args.version
+    if args.winget_test and args.winget_dir is None:
+        parser.error("--winget-test needs --winget-dir")
+    if args.winget_only and args.winget_dir is None:
+        parser.error("--winget-only needs --winget-dir")
+    if args.winget_only and (args.scoop_only or args.desktop or args.placeholder_hashes):
+        parser.error("--winget-only writes only the winget manifests")
+    if args.winget_dir is not None and args.placeholder_hashes:
+        parser.error("winget manifests need the real checksums, not placeholders")
+    if args.winget_dir is not None and not args.winget_test and not stable:
+        parser.error("winget manifests are for stable releases; use --winget-test for a prerelease")
+    if not args.winget_only and args.scoop_dir is None:
+        parser.error("--scoop-dir is required unless --winget-only is set")
+    if not (args.scoop_only or args.winget_only) and args.homebrew_dir is None:
+        parser.error("--homebrew-dir is required unless --scoop-only or --winget-only is set")
+    if args.winget_only:
+        required_files = {MSI_FILE}
+    else:
+        required_files = (
+            {RELEASE_FILES["windows_x86_64"]} if args.scoop_only else set(RELEASE_FILES.values())
+        )
     if args.desktop:
         required_files.add(desktop_zip(args.version))
+    if args.winget_dir is not None:
+        required_files.add(MSI_FILE)
     checksums = read_checksums(args.checksums, required_files)
+    winget_paths: list[Path] = []
+    if args.winget_dir is not None:
+        winget_paths = write_winget(
+            args.winget_dir, args.version, checksums[MSI_FILE], args.winget_test
+        )
+    if args.winget_only:
+        for path in winget_paths:
+            print(path)
+        return
     if args.homebrew_dir is not None:
         args.homebrew_dir.mkdir(parents=True, exist_ok=True)
     args.scoop_dir.mkdir(parents=True, exist_ok=True)
@@ -227,6 +348,8 @@ def main() -> None:
     print(manifest_path)
     if args.desktop:
         print(desktop_path)
+    for path in winget_paths:
+        print(path)
 
 
 if __name__ == "__main__":
