@@ -126,6 +126,7 @@ async fn a_reader_does_not_wait_on_a_cache_catch_up() {
     assert!(hold.holding(), "the readers answered only after the hold");
     let catcher_reply = catcher.await.unwrap();
     expect_unavailable(&catcher_reply, BOUND);
+    assert_eq!(hold.hits(), 1, "one catch-up held");
     hold.release();
     f.witnesses[0].open_gate();
     let size = f.size().await;

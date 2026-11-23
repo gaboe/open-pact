@@ -38,7 +38,7 @@ impl Device {
     /// The `log_checkpoint` of the newest reply the client kept, if it kept one.
     pub fn reply_note(&self) -> Option<String> {
         let text = std::fs::read_to_string(self.home.path().join("claims.jsonl")).ok()?;
-        text.lines().filter_map(find_note).last()
+        text.lines().filter_map(find_note).next_back()
     }
 }
 

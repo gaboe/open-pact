@@ -6,6 +6,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
 };
 
+#[derive(Default)]
 pub struct Hooks {
     #[cfg(test)]
     points: Mutex<std::collections::HashMap<&'static str, Arc<Point>>>,
@@ -17,7 +18,18 @@ pub struct Hooks {
     stamps: Mutex<std::collections::HashMap<&'static str, Vec<std::time::Instant>>>,
     /// Database steps of a claim fail once this many stored-line reads happened (usize::MAX: never).
     #[cfg(test)]
-    fault_after_reads: AtomicUsize,
+    fault_after_reads: Threshold,
+}
+
+/// A stored-line read count; the default is never reached.
+#[cfg(test)]
+pub struct Threshold(AtomicUsize);
+
+#[cfg(test)]
+impl Default for Threshold {
+    fn default() -> Self {
+        Threshold(AtomicUsize::new(usize::MAX))
+    }
 }
 
 /// One named pause. While armed, a code path that reaches it signals `reached` and waits for
@@ -64,23 +76,6 @@ impl BlockPoint {
     /// True while a thread waits at this point.
     pub fn holding(&self) -> bool {
         self.holding.load(Ordering::SeqCst)
-    }
-}
-
-impl Default for Hooks {
-    fn default() -> Self {
-        Hooks {
-            #[cfg(test)]
-            points: Mutex::default(),
-            #[cfg(test)]
-            counts: Mutex::default(),
-            #[cfg(test)]
-            blocks: Mutex::default(),
-            #[cfg(test)]
-            stamps: Mutex::default(),
-            #[cfg(test)]
-            fault_after_reads: AtomicUsize::new(usize::MAX),
-        }
     }
 }
 
@@ -186,21 +181,22 @@ impl Hooks {
     /// From now on every claim database step fails once `reads` more stored-line reads ran.
     pub fn fail_after_reads(&self, reads: usize) {
         self.fault_after_reads
+            .0
             .store(self.count("stored_lines_read") + reads, Ordering::SeqCst);
     }
 
     pub fn clear_fault(&self) {
-        self.fault_after_reads.store(usize::MAX, Ordering::SeqCst);
+        self.fault_after_reads.0.store(usize::MAX, Ordering::SeqCst);
     }
 
     /// True when a database step that follows the latest stored-line read must fail.
     pub fn fault_after_read(&self) -> bool {
-        self.count("stored_lines_read") >= self.fault_after_reads.load(Ordering::SeqCst)
+        self.count("stored_lines_read") >= self.fault_after_reads.0.load(Ordering::SeqCst)
     }
 
     /// True when the stored-line read that just counted itself must fail.
     pub fn fault_in_read(&self) -> bool {
-        self.count("stored_lines_read") > self.fault_after_reads.load(Ordering::SeqCst)
+        self.count("stored_lines_read") > self.fault_after_reads.0.load(Ordering::SeqCst)
     }
 
     /// When each path reached `name`, in order.
