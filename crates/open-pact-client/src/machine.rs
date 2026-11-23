@@ -576,8 +576,13 @@ pub(crate) fn removal_block(home: &Path, task_id: &str, machine: Option<&Path>) 
       throw ('Could not query the task. ' + $_)
     }}
   }}
-  if (Test-TaskRegistered) {{
+  function End-TaskQuietly {{
+    # /End fails for a task that is not running. That does not matter here: /Delete decides.
+    $ErrorActionPreference = 'Continue'
     & $schtasks /End /TN {id} 2>$null | Out-Null
+  }}
+  if (Test-TaskRegistered) {{
+    End-TaskQuietly
     & $schtasks /Delete /TN {id} /F
     if ($LASTEXITCODE -ne 0) {{ throw 'The task was not removed. Run this block again from an elevated prompt.' }}
   }}
@@ -1023,10 +1028,16 @@ mod tests {
         assert_eq!(block.matches("Test-TaskRegistered").count(), 3);
         // The check asks the Task Scheduler COM API, not schtasks text, so it works in every language.
         assert!(block.contains("New-Object -ComObject Schedule.Service"));
-        assert!(block.contains(r"GetFolder('\').GetTask('\org.open-pact.report.0123456789abcdef')"));
+        assert!(
+            block.contains(r"GetFolder('\').GetTask('\org.open-pact.report.0123456789abcdef')")
+        );
         assert!(block.contains("if ($e.HResult -eq -2147024894) { return $false }"));
         // Only HRESULT 0x80070002 (file not found) means absent; any other error still throws.
         assert!(block.contains("throw ('Could not query the task. ' + $_)"));
+        // Only /End runs with Continue, inside its own function, and it ignores its exit code.
+        let scope = block.find("$ErrorActionPreference = 'Continue'").unwrap();
+        assert!(block.find("function End-TaskQuietly").unwrap() < scope);
+        assert!(scope < block.find("& $schtasks /End /TN").unwrap());
         assert!(!block.contains("cannot find the file specified"));
         assert!(!block.contains("$text -match"));
         assert!(!block.contains("$LASTEXITCODE -eq 0) { return $true"));
@@ -1049,9 +1060,8 @@ mod tests {
         let block = removal_block(home, id, Some(machine));
         assert!(block.contains("Join-Path ([Environment]::SystemDirectory) 'schtasks.exe'"));
         assert!(!block.contains("Remove-Item") && !block.contains("powershell.exe"));
-        let end = block
-            .find("/End /TN 'org.open-pact.report.0123456789abcdef'")
-            .unwrap();
+        let end_fn = block.find("function End-TaskQuietly").unwrap();
+        let end = block.find("    End-TaskQuietly\n").unwrap();
         let delete = block
             .find("/Delete /TN 'org.open-pact.report.0123456789abcdef' /F")
             .unwrap();
@@ -1062,7 +1072,11 @@ mod tests {
         // way; the last query still fails the block when the task survives.
         let probe = block.find("if (Test-TaskRegistered)").unwrap();
         let query = block.rfind("if (Test-TaskRegistered)").unwrap();
-        assert!(probe < end && end < delete && delete < check && check < query);
+        assert!(end_fn < probe && probe < end && end < delete && delete < check && check < query);
+        // /Delete stays under the caller's Stop: the End function closes before it.
+        assert!(block.contains(
+            "  }\n  if (Test-TaskRegistered) {\n    End-TaskQuietly\n    & $schtasks /Delete"
+        ));
         assert!(block.contains("{ throw 'The task is still registered."));
         // With the machine client, the last line of the block removes the state through it.
         let last = block.find("schedule off").unwrap();
