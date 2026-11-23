@@ -3174,6 +3174,12 @@ impl JobInspection {
     /// block for a task that is not ours, or what a standard user cannot confirm. For a user job it
     /// is the line `check` prints for an outdated job.
     pub(crate) fn job_fix(&self, home: &Path) -> Option<String> {
+        self.task_fix(home, true)
+    }
+
+    /// `job_fix` for a screen that shows `machine_fix` on its own: the removal block of a task
+    /// that is not ours then leaves out the package fix it would repeat.
+    pub(crate) fn task_fix(&self, home: &Path, with_package_fix: bool) -> Option<String> {
         let Some(system) = &self.system else {
             return (self.job == JobStatus::Outdated).then(|| {
                 format!(
@@ -3215,7 +3221,7 @@ impl JobInspection {
                     machine.display(),
                     crate::machine::removal_block(home, &system.task_id, usable.then_some(machine.as_path()))
                 );
-                if let Some(fix) = self.machine_fix() {
+                if with_package_fix && let Some(fix) = self.machine_fix() {
                     text.push_str(&format!("\nThen:\n{fix}"));
                 }
                 if system.machine_state.usable_after_fix() {
@@ -3471,7 +3477,7 @@ pub(crate) fn outdated_job_notice(
         return None;
     }
     let task = matches!(inspection.job, JobStatus::Outdated | JobStatus::NotOurs)
-        .then(|| inspection.job_fix(&home.0))
+        .then(|| inspection.task_fix(&home.0, false))
         .flatten();
     let lines: Vec<String> = inspection.machine_fix().into_iter().chain(task).collect();
     (!lines.is_empty()).then(|| lines.join("\n"))
@@ -3542,7 +3548,7 @@ async fn status(home: &Home, executable: &Path) -> Result<()> {
                     JobStatus::NotOurs => println!("The job is not the machine client's."),
                     _ => {}
                 }
-                if let Some(fix) = inspection.job_fix(&home.0) {
+                if let Some(fix) = inspection.task_fix(&home.0, false) {
                     println!("{fix}");
                 }
             }

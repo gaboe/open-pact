@@ -1058,7 +1058,7 @@ impl Report {
         self.schedule.machine_fix = inspection.machine_fix();
         self.schedule.job_fix = inspection
             .is_system()
-            .then(|| inspection.job_fix(&home.0))
+            .then(|| inspection.task_fix(&home.0, false))
             .flatten();
         // The package and the task are two facts: each has its own issue and its own fix, and
         // neither hides the other.
