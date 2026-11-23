@@ -245,9 +245,31 @@ The chart restarts the gateway when the manifest changes. Confirm that the gatew
 
 ### Migration 0013 and its rollback
 
-Migration 0013 adds two partial indexes on `log_entries`. The gateway runs it when it starts. The index build holds a lock that blocks log appends (enrolment, approval, purge, manifest publish) until the build ends. The migration waits at most 5 seconds for that lock. If a writer holds it longer, the migration fails and the gateway does not start.
+Migration 0013 adds two partial indexes on `log_entries`. The gateway runs it when it starts, before it opens its HTTP listener. The index build holds a lock that blocks log appends (enrolment, approval, purge, manifest publish) until the build ends. The migration waits at most 5 seconds for that lock. If a writer holds it longer, the migration fails and the gateway does not start.
 
-To go back to the gateway from before 0013, stop every gateway first. Then run this block against the gateway database with `psql`. It runs in one transaction, so a failure changes nothing:
+A plain Helm upgrade is supported when the log has about 200,000 entries or fewer and no long transaction holds a lock on `log_entries`. The gate in [`scripts/log-lookup-migration-gate.ts`](../scripts/log-lookup-migration-gate.ts) tests that size with appends running. It fails when the migration transaction takes 2 seconds or more, or when startup takes more than 5 seconds. The chart's liveness probe starts 10 seconds after the container starts. With the Kubernetes default period and failure threshold, the kubelet restarts a container that still does not answer about 30 seconds after it starts. A restart stops the build and rolls it back, so the next start builds again from the beginning.
+
+For a larger log, or a database that writers keep busy, run the migration before the probes apply. Check that the one-off command exits 0 before you roll out:
+
+```sh
+kubectl scale deployment/pact-gateway --replicas=0
+kubectl wait --for=delete pod -l app=pact-gateway --timeout=10m
+# One-off pod with the Deployment's environment (DATABASE_URL and the KEK Secret).
+# Copy that environment from: kubectl get deployment pact-gateway -o yaml
+kubectl run pact-migrate --rm -i --restart=Never --image=registry.example.com/open-pact-gateway:<new-tag> -- open-pact-gateway status --json
+helm upgrade --install pact deploy/helm/open-pact -f gateway-values.yaml --set image.tag=<new-tag>
+```
+
+To go back to the gateway from before 0013, stop every gateway and every command that migrates first. Then run the rollback block, then start the earlier image.
+
+```sh
+kubectl scale deployment/pact-gateway --replicas=0
+kubectl wait --for=delete pod -l app=pact-gateway --timeout=10m
+```
+
+Pause anything that can recreate a pod or run a new-image gateway command, such as a CI deploy, a GitOps sync or a CronJob. Each new-image CLI command, such as `status`, `devices list` or `log entries`, migrates the database when it runs. It applies 0013 again after the rollback.
+
+Run this block against the gateway database with `psql`. It runs in one transaction, so a failure changes nothing:
 
 ```sql
 BEGIN;
@@ -257,7 +279,13 @@ DELETE FROM _sqlx_migrations WHERE version = 13;
 COMMIT;
 ```
 
-Then start the earlier gateway image. It refuses a database that has version 13 applied, so start it only after the block. Do not start the new gateway again before the earlier one has run on the database: the new gateway applies 0013 on start.
+Then deploy the earlier image and keep it selected. The chart's default tag is `latest`, so set the tag in the values file:
+
+```sh
+helm upgrade --install pact deploy/helm/open-pact -f gateway-values.yaml --set image.tag=<earlier-tag>
+```
+
+The earlier gateway refuses a database that has version 13 applied, so run it only after the block. Keep `<earlier-tag>` in the values file until a planned upgrade. An upgrade that picks up the new image applies 0013 again.
 
 ## Nonce durability and database connections
 
