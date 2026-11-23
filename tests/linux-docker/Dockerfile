@@ -3,7 +3,7 @@ RUN rustup component add rustfmt clippy
 
 FROM tools AS build
 WORKDIR /src
-COPY Cargo.toml Cargo.lock PAPER.md ./
+COPY Cargo.toml Cargo.lock PAPER.md README.md ./
 COPY crates crates
 COPY docs docs
 COPY examples examples
