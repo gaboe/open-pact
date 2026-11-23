@@ -183,8 +183,11 @@ jobs:
           $admin = ([Security.Principal.WindowsPrincipal]::new($identity)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
           Write-Output "runner_is_administrator=$admin"
 
+      # The packaging scripts start with `#Requires -Version 7`, so they run in pwsh. The fixture step
+      # below stays in Windows PowerShell 5.1, which the machine client and its install block target,
+      # and starts the build script through pwsh.
       - name: Install WiX
-        shell: powershell
+        shell: pwsh
         run: ./scripts/packaging/install-wix.ps1
 
       - name: Verify the machine client, native uninstall modes, a task that is not ours and a planted user task
@@ -204,7 +207,8 @@ jobs:
           # The machine client Q is the package build of this same client, at its own version.
           $version = ((& $client --version) -split '\s+')[-1]
           $msi = Join-Path $root 'open-pact-client.msi'
-          & ./scripts/packaging/build-msi.ps1 -Exe (Resolve-Path target/debug/open-pact-client.exe).Path -Version $version -Out $msi
+          $exe = (Resolve-Path target/debug/open-pact-client.exe).Path
+          pwsh -NoProfile -NonInteractive -File ./scripts/packaging/build-msi.ps1 -Exe $exe -Version $version -Out $msi
           if ($LASTEXITCODE -ne 0 -or -not (Test-Path $msi)) { throw 'the machine package was not built' }
           $Q = Join-Path $env:ProgramFiles 'open-pact-client\open-pact-client.exe'
           $user = 'op_fixture_' + [Guid]::NewGuid().ToString('N').Substring(0,8)
@@ -275,9 +279,12 @@ jobs:
             if ($result[-1] -ne 0) { throw "SYSTEM retry failed: $result" }
             Assert-Clean $homePath
           }
-          function Get-Status($homePath) {
-            $lines = & $client --home $homePath status --json
-            return ($lines -join "`n") | ConvertFrom-Json
+          # `schedule status` looks at the task itself, whatever the mode. `status --json` without
+          # `--online` makes no OS query and leaves the job fields empty.
+          function Get-ScheduleStatus($homePath) {
+            $ErrorActionPreference = 'Continue'
+            $lines = & $client --home $homePath schedule status 2>&1 | ForEach-Object { "$_" }
+            return ($lines -join "`n")
           }
           function Get-Block($text) {
             $lines = $text -split "`r?`n"
@@ -352,11 +359,15 @@ jobs:
               if ($name -eq 'missing') { Remove-Item $homePath -Recurse -Force }
               if ($name -eq 'retry') {
                 $state = State-Path $homePath
+                $enabledBefore = (Get-ScheduledTask -TaskName (Task-Name $homePath)).Settings.Enabled
                 $guard = [IO.File]::Open(($state + '.lock'),[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
                 try {
                   $result = Invoke-Client $homePath @('schedule', 'off')
                   if ($result[-1] -eq 0) { throw 'held state lock reported success' }
-                  if (-not (Get-ScheduledTask -TaskName (Task-Name $homePath) -ErrorAction SilentlyContinue)) { throw 'held state lock did not preserve task' }
+                  $kept = Get-ScheduledTask -TaskName (Task-Name $homePath) -ErrorAction SilentlyContinue
+                  if (-not $kept) { throw 'held state lock did not preserve task' }
+                  # A disable without a delete is a change too: the task is as enabled as before.
+                  if ($kept.Settings.Enabled -ne $enabledBefore) { throw 'a failed removal left the task disabled' }
                   Assert-Q
                 } finally { $guard.Dispose() }
                 $held = [IO.File]::Open((Join-Path $state 'held-fixture'),[IO.FileMode]::Create,[IO.FileAccess]::ReadWrite,[IO.FileShare]::Read)
@@ -381,15 +392,18 @@ jobs:
             $at = New-ScheduledTaskTrigger -Once -At (Get-Date).AddYears(1)
             $system = New-ScheduledTaskPrincipal -UserId SYSTEM -LogonType ServiceAccount -RunLevel Highest
             Register-ScheduledTask -TaskName $id -Action $foreign -Trigger $at -Principal $system | Out-Null
+            $definition = (Export-ScheduledTask -TaskName $id)
             $refusals = @()
             foreach ($change in @(@('schedule','on','--system'), @('schedule','on','--user'), @('schedule','off'))) {
               $refusals += Assert-Refused $limited $change ($change -join ' ')
               $now = @((Get-ScheduledTask -TaskName $id).Actions)
               if ($now.Count -ne 1 -or $now[0].Execute -ine $other) { throw "$($change -join ' ') changed the foreign task" }
+              # The whole definition stays, so a disabled task or a changed trigger shows too.
+              if ((Export-ScheduledTask -TaskName $id) -ne $definition) { throw "$($change -join ' ') changed the definition of the foreign task" }
             }
             Assert-Q
-            $status = Get-Status $limited
-            if ($status.schedule.job_status -ne 'not_ours') { throw "elevated status says $($status.schedule.job_status), not not_ours" }
+            $status = Get-ScheduleStatus $limited
+            if ($status -notmatch "The job is not the machine client's\.") { throw "elevated schedule status does not say that the task is not ours: $status" }
             $block = Get-Block $refusals[2].Text
             foreach ($attempt in 1..2) {
               & ([scriptblock]::Create($block))
@@ -400,27 +414,59 @@ jobs:
             Assert-Clean $limited
             # A task with the home's id that runs as a user is a user job. It is never not-ours and never
             # the source of the profile: the replacement reads the elevated profile, not the planted one.
-            Install-System $limited
-            Unregister-ScheduledTask -TaskName $id -Confirm:$false
+            # The decoy is the real profile of another account (the fixture user's), so the profile
+            # check cannot be what refuses it. Only the principal can. The second round plants a task
+            # whose arguments end in a line that says "system".
+            $decoy = (Get-CimInstance Win32_UserProfile | Where-Object { $_.SID -eq $sid }).LocalPath
+            if (-not $decoy -or -not (Test-Path -LiteralPath $decoy)) { throw 'the fixture user has no profile folder' }
+            if ($decoy -ieq $env:USERPROFILE) { throw 'the decoy profile is the elevated profile' }
             $planted = Join-Path $root 'planted-user-task.ps1'
             @'
-          param($q,$homePath,$taskName)
+          param($q,$homePath,$taskName,$decoy,$injected)
           $ErrorActionPreference = 'Stop'
-          $action = New-ScheduledTaskAction -Execute $q -Argument "--home `"$homePath`" schedule run --system --user-home C:\decoy"
+          $arguments = "--home `"$homePath`" schedule run --system --user-home `"$decoy`""
+          if ($injected -eq '1') { $arguments += "`nsystem" }
+          $action = New-ScheduledTaskAction -Execute $q -Argument $arguments
           $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddYears(1) -RepetitionInterval (New-TimeSpan -Minutes 1)
           Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger | Out-Null
           '@ | Set-Content $planted
-            $plantedArguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$planted`" -q `"$Q`" -homePath `"$limited`" -taskName `"$id`""
-            $process = Start-Process powershell.exe -Credential $credential -LoadUserProfile -ArgumentList $plantedArguments -Wait -PassThru
-            if ($process.ExitCode -ne 0) { throw 'the standard user could not register the planted task' }
-            $status = Get-Status $limited
-            if ($status.schedule.job_status -ne 'outdated') { throw "a user task with the home's id reports $($status.schedule.job_status), not outdated" }
-            Install-System $limited
-            $replaced = @((Get-ScheduledTask -TaskName $id).Actions)
-            if ($replaced[0].Arguments -match 'decoy') { throw 'the replacement kept the planted profile' }
-            if ($replaced[0].Arguments -notlike "*--user-home*$env:USERPROFILE*") { throw "the replacement does not read the elevated profile: $($replaced[0].Arguments)" }
-            Assert-Q
-            Remove-System $limited
+            $disable = Join-Path $root 'disable-attempt.ps1'
+            @'
+          param($taskName)
+          $schtasks = Join-Path ([Environment]::SystemDirectory) 'schtasks.exe'
+          & $schtasks /Change /TN $taskName /DISABLE | Out-Null
+          if ($LASTEXITCODE -eq 0) { exit 7 }
+          & $schtasks /Delete /TN $taskName /F | Out-Null
+          if ($LASTEXITCODE -eq 0) { exit 8 }
+          exit 0
+          '@ | Set-Content $disable
+            foreach ($injected in @('0','1')) {
+              Install-System $limited
+              Unregister-ScheduledTask -TaskName $id -Confirm:$false
+              $plantedArguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$planted`" -q `"$Q`" -homePath `"$limited`" -taskName `"$id`" -decoy `"$decoy`" -injected $injected"
+              $process = Start-Process powershell.exe -Credential $credential -LoadUserProfile -ArgumentList $plantedArguments -Wait -PassThru
+              if ($process.ExitCode -ne 0) { throw 'the standard user could not register the planted task' }
+              $stored = Get-ScheduledTask -TaskName $id
+              if ($stored.Principal.UserId -eq 'SYSTEM') { throw 'the planted task runs as SYSTEM' }
+              $storedArguments = @($stored.Actions)[0].Arguments
+              Write-Output ("injected=$injected stored arguments: " + ($storedArguments -replace "`n", '<LF>'))
+              if ($storedArguments -notlike "*$decoy*") { throw "Task Scheduler did not store the planted profile: $storedArguments" }
+              $text = Get-ScheduleStatus $limited
+              if ($text -notmatch 'The job is out of date\.') { throw "a user task with the home's id is not reported as out of date: $text" }
+              Install-System $limited
+              $replaced = @((Get-ScheduledTask -TaskName $id).Actions)
+              if ($replaced[0].Arguments -like "*$decoy*") { throw 'the replacement kept the planted profile' }
+              if ($replaced[0].Arguments -match "`n") { throw 'the replacement carries a line break' }
+              if ($replaced[0].Arguments -notlike "*--user-home*$env:USERPROFILE*") { throw "the replacement does not read the elevated profile: $($replaced[0].Arguments)" }
+              # The planted task is deleted and the SYSTEM task is created new, so the standard user
+              # keeps no right on it: it can neither disable nor delete the job.
+              $process = Start-Process powershell.exe -Credential $credential -LoadUserProfile -ArgumentList "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$disable`" -taskName `"$id`"" -Wait -PassThru
+              if ($process.ExitCode -ne 0) { throw "the standard user changed the SYSTEM task (code $($process.ExitCode))" }
+              $after = Get-ScheduledTask -TaskName $id
+              if ($after.State -eq 'Disabled') { throw 'the standard user disabled the SYSTEM task' }
+              Assert-Q
+              Remove-System $limited
+            }
             Write-Output 'native_system_uninstall_retry_replacement_task_not_ours_planted_and_missing_home_passed'
           } finally {
             Get-ScheduledTask -TaskName 'org.open-pact.report.*' -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false
