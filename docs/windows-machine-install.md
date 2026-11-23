@@ -4,7 +4,7 @@ This page is for IT. It shows how to install the open-pact client for every user
 
 ## What the package installs
 
-The package installs the client at `C:\Program Files\open-pact-client\open-pact-client.exe` on 64-bit Windows. This file is the machine client. The SYSTEM job runs only this file. The package does not copy the file to another folder.
+The package installs the client in the 64-bit Program Files folder. By default this is `C:\Program Files\open-pact-client\open-pact-client.exe`. This file is the machine client. The SYSTEM job runs only this file. The package does not copy the file to another folder.
 
 ## Install with the block
 
@@ -69,7 +69,17 @@ elseif ($install.ExitCode -ne 0) { throw ('The install failed. See ' + $log) }
 
 The block installs exactly version 0.9.0. It upgrades an older package. It does not change a newer package. It checks the Cosign signature and the SHA-256 hash of the package before it installs. It keeps its folder, because Windows Installer repairs from it. Each failed check stops the block. Exit code 3010 means that Windows needs a restart to finish the install. Then do the next section.
 
-To repair a package of the same version, run `msiexec.exe /fa "<msi>" /qn /norestart` with the verified MSI that the block leaves in its folder under `%ProgramData%`.
+To repair a package of the same version, run these commands in an elevated Windows PowerShell 5.1 prompt. Write the full path of the verified MSI between `@'` and `'@`. The block leaves that MSI in its folder under `%ProgramData%`. The commands wait for `msiexec` and stop when it fails.
+
+```powershell
+$msi = @'
+<the full path of the verified MSI>
+'@
+$msiexec = Join-Path ([Environment]::SystemDirectory) 'msiexec.exe'
+$repair = Start-Process -FilePath $msiexec -ArgumentList ('/fa "' + $msi + '" /qn /norestart') -Wait -PassThru
+if ($repair.ExitCode -eq 3010) { Write-Output 'Restart Windows to finish the repair.' }
+elseif ($repair.ExitCode -ne 0) { throw ('The repair failed. Exit code: ' + $repair.ExitCode) }
+```
 
 ## Choose a deployment method
 
@@ -81,14 +91,27 @@ To repair a package of the same version, run `msiexec.exe /fa "<msi>" /qn /nores
 
 ## Start the SYSTEM job for each home
 
-After the package is installed, run these commands once for each user home. Run them in an elevated Windows PowerShell 5.1 prompt. They resolve the client by its full path, so an older client on PATH never runs:
+After the package is installed, run these commands once for each user home. Run them in an elevated Windows PowerShell 5.1 prompt. They resolve the client by its full path, so an older client on PATH never runs. They stop when the client file is missing or when the command fails.
+
+1. Replace the line `<the absolute client home>` with the absolute client home of the user.
+2. Replace the line `<the profile folder of the user>` with the profile folder of the user, for example `C:\Users\example`.
+3. Keep each value on its own line, between `@'` and `'@`. Do not add quotes. A path with an apostrophe then needs no escape.
 
 ```powershell
 $q = Join-Path $env:ProgramW6432 'open-pact-client\open-pact-client.exe'
-& $q --home '<home>' schedule on --system --user-home '<profile>'
+$clientHome = @'
+<the absolute client home>
+'@
+$userHome = @'
+<the profile folder of the user>
+'@
+if (-not (Test-Path -LiteralPath $q -PathType Leaf)) { throw 'The machine client is missing. Install the package, then run this command again.' }
+$global:LASTEXITCODE = $null
+& $q --home $clientHome schedule on --system --user-home $userHome
+if ($LASTEXITCODE -ne 0) { throw 'schedule on failed. Fix the error, then run this command again.' }
 ```
 
-Replace `<home>` with the absolute client home of the user. Replace `<profile>` with the profile folder of the user, for example `C:\Users\example`. The SYSTEM job reads the repositories below that profile. Without `--user-home`, the client uses the profile of the account that runs the elevated prompt. It fails when that account has no registered profile.
+The SYSTEM job reads the repositories below that profile. Without `--user-home`, the client uses the profile that the existing SYSTEM task of this home names. When that task names none, it uses the registered profile of the account that runs the elevated prompt. It fails when it finds neither.
 
 For a device that ran a SYSTEM job before 0.9.0, take both values from the old task. The [release notes](release-notes/v0.9.0.md) show how.
 
@@ -116,15 +139,29 @@ Run every command in an elevated Windows PowerShell 5.1 prompt. Uninstalling the
 }
 ```
 
-2. A task whose program is the machine client, `open-pact-client\open-pact-client.exe`, needs one command. It removes the task, the job state and the record of the owner's choice. Replace `<home>` with the `--home` value of the task:
+2. A task whose program is the machine client, `open-pact-client\open-pact-client.exe`, needs one command. It removes the task, the job state and the record of the owner's choice. The command stops when the client file is missing or when `schedule off` fails.
+   - Replace the line `<the absolute client home>` with the `--home` value of the task.
+   - Keep the value on its own line, between `@'` and `'@`. Do not add quotes.
 
 ```powershell
 $q = Join-Path $env:ProgramW6432 'open-pact-client\open-pact-client.exe'
-& $q --home '<home>' schedule off
+$clientHome = @'
+<the absolute client home>
+'@
+if (-not (Test-Path -LiteralPath $q -PathType Leaf)) { throw 'The machine client is missing. Install the package, then run this command again.' }
+$global:LASTEXITCODE = $null
+& $q --home $clientHome schedule off
 if ($LASTEXITCODE -ne 0) { throw 'schedule off failed. Do not uninstall the package. Fix the error, then run this command again.' }
 ```
 
-3. A task whose program is the old copy, `open-pact\open-pact-client.exe`, needs the removal block. Replace three samples in the block: the task name `org.open-pact.report.0123abcd` (in every place where it appears), the home `C:\Users\example\pact`, and the folder `C:\Program Files`. Use the `--home` value of the task for the home. Use the output of `$env:ProgramW6432` for the folder. The block deletes the task and then runs `schedule off`. When `schedule off` fails, the block throws. Do not uninstall the package then. Fix the error and run the block again.
+   A task with more than one action is not a task of the client. The list shows every program of the task. `schedule off` refuses such a task. Check it in Task Scheduler. Then use the block of step 3 for it.
+
+3. A task whose program is the old copy, `open-pact\open-pact-client.exe`, needs the removal block. Replace three samples in the block:
+   - The task name `org.open-pact.report.0123abcd`, in every place where it appears.
+   - The home line `C:\Users\example\pact`, between `@'` and `'@`. Use the `--home` value of the task. Do not add quotes.
+   - The folder `C:\Program Files`. Use the output of `$env:ProgramW6432`.
+
+   The block deletes the task. It then checks that the machine client exists and runs `schedule off`. When the file is missing or `schedule off` fails, the block throws. Do not uninstall the package then. Fix the error and run the block again.
 
 ```powershell
 & {
@@ -154,7 +191,13 @@ if ($LASTEXITCODE -ne 0) { throw 'schedule off failed. Do not uninstall the pack
     if ($LASTEXITCODE -ne 0) { throw 'The task was not removed. Run this block again from an elevated prompt.' }
   }
   if (Test-TaskRegistered) { throw 'The task is still registered. Run this block again.' }
-  & 'C:\Program Files\open-pact-client\open-pact-client.exe' --home 'C:\Users\example\pact' schedule off
+  $q = 'C:\Program Files\open-pact-client\open-pact-client.exe'
+  if (-not (Test-Path -LiteralPath $q -PathType Leaf)) { throw 'The machine client is missing. Install the package, then run this block again.' }
+  $clientHome = @'
+C:\Users\example\pact
+'@
+  $global:LASTEXITCODE = $null
+  & $q --home $clientHome schedule off
   if ($LASTEXITCODE -ne 0) { throw 'schedule off failed. Do not uninstall the package. Fix the error, then run this block again.' }
 }
 ```
@@ -162,4 +205,4 @@ if ($LASTEXITCODE -ne 0) { throw 'schedule off failed. Do not uninstall the pack
 4. Run the command of step 1 again. It must print nothing.
 5. Uninstall the open-pact client package. Use Settings, Apps, or your deployment tool.
 
-The command of step 1 lists only tasks that run as SYSTEM and run the old copy or the machine client. A SYSTEM task that runs another program can come from an older open-pact client. The removal block can remove it without the package, but the client does not change it. The block deletes the task name that you give it. Check the action of the task in Task Scheduler before you run the block for it.
+The command of step 1 lists only tasks that run as SYSTEM and run the old copy or the machine client. A SYSTEM task that runs another program can come from an older open-pact client. The client does not change it. To remove it without the package, use the block in step 1 of the [0.9.0 release notes](release-notes/v0.9.0.md#step-1-find-and-remove-the-old-system-task). That block uses Windows tools only. The block of step 3 deletes the task name that you give it. Check the action of the task in Task Scheduler before you run the block for it.
