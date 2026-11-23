@@ -9,6 +9,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -121,6 +122,7 @@ pub enum Stage {
     Certificate,
     Store,
     Commit,
+    Siem,
     Checkpoint,
 }
 
@@ -136,6 +138,7 @@ impl Stage {
             Stage::Certificate => "certificate",
             Stage::Store => "store",
             Stage::Commit => "commit",
+            Stage::Siem => "siem",
             Stage::Checkpoint => "checkpoint",
         }
     }
@@ -180,14 +183,13 @@ pub enum Caller {
     Claim,
 }
 
-/// What a checkpoint request got. `NotYet` means the note had fewer witness cosignatures than
+/// What a checkpoint answer held. `NotYet` means the note had fewer witness cosignatures than
 /// the manifest's quorum.
 #[derive(Clone, Copy)]
 pub enum Served {
     Witnessed,
     NotYet,
     LogSigned,
-    Database,
 }
 
 pub struct Metrics {
@@ -202,7 +204,8 @@ pub struct Metrics {
     claim_stage: Family<StageLabel, Histogram>,
     witness_push: Family<ResultLabel, Histogram>,
     checkpoint_served: Family<ServedLabels, Counter>,
-    log_size: Gauge,
+    /// NaN until the first read of the log.
+    log_size: Gauge<f64, AtomicU64>,
 }
 
 fn histogram() -> Histogram {
@@ -253,7 +256,7 @@ impl Metrics {
         let db_acquire = Family::<SiteLabel, Histogram>::new_with_constructor(histogram);
         registry.register_with_unit(
             "openpact_db_acquire",
-            "Time to take a pool connection at the sites that time it; queries on the pool itself acquire without a timer",
+            "Time to take a pool connection at the sites that time it. At a transaction site it also covers BEGIN. Queries on the pool itself acquire without a timer",
             Unit::Seconds,
             db_acquire.clone(),
         );
@@ -277,10 +280,11 @@ impl Metrics {
             "Checkpoints handed out, by caller and by whether the witness quorum was met",
             checkpoint_served.clone(),
         );
-        let log_size = Gauge::default();
+        let log_size = Gauge::<f64, AtomicU64>::default();
+        log_size.set(f64::NAN);
         registry.register(
             "openpact_log_size",
-            "Entries in the transparency log, as of the last read",
+            "Entries in the transparency log as of the last read; NaN until the first read",
             log_size.clone(),
         );
         Metrics {
@@ -366,7 +370,6 @@ impl Metrics {
             Served::Witnessed => "witnessed",
             Served::NotYet => "not_yet",
             Served::LogSigned => "log_signed",
-            Served::Database => "database",
         };
         self.checkpoint_served
             .get_or_create(&ServedLabels { caller, result })
@@ -374,7 +377,7 @@ impl Metrics {
     }
 
     pub fn log_size(&self, size: u64) {
-        self.log_size.set(i64::try_from(size).unwrap_or(i64::MAX));
+        self.log_size.set(size as f64);
     }
 
     /// The text of a scrape. The pool gauges are read now.
@@ -1339,6 +1342,15 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_log_size_is_unknown_until_the_first_read() {
+        let metrics = Metrics::new();
+        let has = |text: &str, line: &str| text.lines().any(|l| l == line);
+        assert!(has(&metrics.scrape(&lazy_pool()), "openpact_log_size NaN"));
+        metrics.log_size(3);
+        assert!(has(&metrics.scrape(&lazy_pool()), "openpact_log_size 3.0"));
+    }
+
+    #[tokio::test]
     async fn timers_record_only_when_metrics_are_on() {
         let metrics = Metrics::new();
         let value = timed(Some(&metrics), |m, s| m.db_acquire(Site::Conn, s), async {
@@ -1359,7 +1371,7 @@ mod tests {
             "openpact_nonce_issue_total{result=\"cap_reached\"} 1",
             "openpact_witness_push_seconds_count{result=\"conflict\"} 1",
             "openpact_checkpoint_served_total{caller=\"claim\",result=\"not_yet\"} 1",
-            "openpact_log_size 3",
+            "openpact_log_size 3.0",
             "openpact_db_pool_connections{state=\"idle\"} 0",
         ] {
             assert!(text.contains(expected), "{expected} missing: {text}");
