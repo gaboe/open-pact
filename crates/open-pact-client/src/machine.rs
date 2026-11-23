@@ -1045,9 +1045,9 @@ mod tests {
 
     #[test]
     fn schtasks_starts_from_the_system_folder_by_its_full_path() {
-        let path = system_schtasks().to_string_lossy().into_owned();
+        let path = system_schtasks().to_string_lossy().to_ascii_lowercase();
         assert!(
-            path.ends_with("System32\\schtasks.exe") || path.ends_with("System32/schtasks.exe"),
+            path.ends_with("system32\\schtasks.exe") || path.ends_with("system32/schtasks.exe"),
             "{path}"
         );
     }
