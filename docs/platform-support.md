@@ -30,7 +30,7 @@ This page lists the built-in controls. The catalog is in `crates/open-pact-core/
 | `log_cleared` | `n/a` | RFC 3339 UTC time, JSON null, or `unknown` from Security and System logs | `n/a` | Windows needs administrator or SYSTEM access to read both logs. |
 | VPN certificate installation | Supported | Supported; `vpn\current` pointer, flat copies can lag while another program holds them open | Supported | Device user. |
 | Device key protection | `secure_enclave` or `os_permissions` | `tpm` or `os_permissions` | `os_permissions` | Joining user and SYSTEM on Windows. |
-| Claim scheduler | launchd LaunchAgent, wakes every minute | Task Scheduler, wakes every minute; limited user or SYSTEM | systemd user timer, wakes every minute | The signed manifest must define `[schedule]`, and the owner turns the job on with `schedule on`. Windows SYSTEM install and uninstall need an elevated prompt and the machine client from the package. Linux needs a running user manager. |
+| Claim scheduler | launchd LaunchAgent, wakes every minute | Task Scheduler, wakes every minute; limited user or SYSTEM | systemd user timer, wakes every minute | The signed manifest must define `[schedule]`, and the owner turns the job on with `schedule on`. Windows SYSTEM install needs an elevated prompt and the machine client from the package. Windows SYSTEM removal needs an elevated prompt. Linux needs a running user manager. |
 
 When a control returns `n/a`, the client sends `n/a` only if the manifest allows that value. Otherwise, it sends `unknown` when the manifest allows `unknown`. If neither value is allowed, the client omits the result. An omitted required result can cause the gateway to deny the claim.
 
