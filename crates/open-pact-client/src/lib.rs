@@ -55,6 +55,7 @@ mod home_fs;
 mod host;
 mod json_out;
 mod locallog;
+pub mod machine;
 mod manifest_check;
 pub mod release_verify;
 mod schedule;
@@ -1814,16 +1815,23 @@ async fn apply_setup(home: &Home, choices: SetupChoices, executable: &Path) -> R
             device_config::DeviceConfig::load_or_migrate(home, user_profile().as_deref(), true)?;
         let was_on = config.auto_send;
         config.folders = choices.folders;
-        config.run_as = choices.run_as;
+        // A SYSTEM job needs the machine client, which can be missing. `run_as` changes only when
+        // the job is installed, so an active user job keeps running while the owner fixes it.
+        let system = choices.auto_send && choices.run_as == device_config::RunAs::System;
+        config.system_job_pending = system;
+        if !system {
+            config.run_as = choices.run_as;
+        }
         config.setup_answered = true;
         config.save(home)?;
         was_on
     };
     if choices.auto_send {
-        if let Err(error) = schedule::turn_on(home, Some(choices.run_as), false, executable).await {
+        if let Err(error) =
+            schedule::turn_on(home, Some(choices.run_as), false, executable, None).await
+        {
             println!(
-                "The job was not installed: {error:#}\nRun `{} schedule on` when you can.",
-                client_command(&home.0)
+                "The job was not installed: {error:#}\nThe wizard goes on. Status shows what is left to fix.",
             );
         }
     } else if was_on {
@@ -3619,7 +3627,14 @@ fn device_code(device: &Pseudonym) -> String {
 /// How to stop the scheduled claims. On Windows the command carries the full path of this
 /// program, because the elevated prompt a SYSTEM job needs may not find it by name.
 fn stop_instructions(home: &Path, windows: bool, executable: &Path) -> String {
-    if windows {
+    let system = device_config::DeviceConfig::load(&Home(home.to_path_buf()))
+        .is_ok_and(|config| config.auto_send && config.run_as == device_config::RunAs::System);
+    if windows && system {
+        format!(
+            "Run this from an elevated PowerShell prompt to stop the scheduled claims:\n  {}",
+            schedule::system_stop_text(home)
+        )
+    } else if windows {
         format!(
             "Run this from PowerShell to stop the scheduled claims:\n  {}\nA job that runs as SYSTEM needs an elevated PowerShell prompt.",
             schedule::apply_command(home, "schedule off", executable)
@@ -3892,7 +3907,6 @@ async fn check_run(
         device_config::Surface::Check,
         &client_command(&home.0),
         &device_config::DeviceConfig::load(home).unwrap_or_default(),
-        executable,
     ) {
         println!("{notice}\n");
     }
@@ -4309,7 +4323,8 @@ async fn accept(home: &Home, yes: bool, insecure_dev: bool, executable: &Path) -
         }
         match run_as {
             device_config::RunAs::System => println!(
-                "Automatic sending is off. Run `{command} schedule on --system` from an elevated prompt to agree to this schedule."
+                "Automatic sending is off. Run this from an elevated PowerShell prompt to agree to this schedule:\n{}",
+                schedule::system_on_text(&home.0)
             ),
             device_config::RunAs::User => println!(
                 "Automatic sending is off. Run `{command} schedule on` to agree to this schedule."
@@ -5263,6 +5278,69 @@ mod tests {
             .unwrap();
         assert_eq!(scan.managed_repos_total, 1);
         assert!(home.file("repo-scan.json").is_file());
+    }
+
+    #[tokio::test]
+    async fn a_system_choice_that_cannot_be_installed_waits_and_keeps_the_user_job() {
+        let company = Company::new();
+        let dir = tempfile::tempdir().unwrap();
+        let home = enrolled_home_with(dir.path(), "", &company, &always_schedule());
+        // An active user job is on while the owner switches to SYSTEM.
+        home.write(
+            device_config::FILE,
+            br#"{"auto_send": true, "run_as": "user"}"#,
+        )
+        .unwrap();
+        let choices = SetupChoices {
+            auto_send: true,
+            run_as: device_config::RunAs::System,
+            folders: Vec::new(),
+        };
+        // Only Windows can install a SYSTEM job, so the install fails here. The wizard does not.
+        apply_setup(&home, choices, &std::env::current_exe().unwrap())
+            .await
+            .unwrap();
+        let config = device_config::DeviceConfig::load(&home).unwrap();
+        assert!(config.system_job_pending && config.setup_answered);
+        assert!(config.auto_send);
+        assert_eq!(config.run_as, device_config::RunAs::User);
+        // The resumed wizard skips step 5: the pending state carries the fix.
+        assert_eq!(wizard_resume(&home).unwrap(), WizardResume::FirstCheck);
+        // A choice that is not SYSTEM clears the pending state.
+        let choices = SetupChoices {
+            auto_send: false,
+            run_as: device_config::RunAs::User,
+            folders: Vec::new(),
+        };
+        let _ = apply_setup(&home, choices, &std::env::current_exe().unwrap()).await;
+        assert!(
+            !device_config::DeviceConfig::load(&home)
+                .unwrap()
+                .system_job_pending
+        );
+        let saved = std::fs::read_to_string(home.file(device_config::FILE)).unwrap();
+        assert!(!saved.contains("system_job_pending"), "{saved}");
+    }
+
+    #[test]
+    fn the_stop_text_of_a_system_job_never_names_the_caller() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home(dir.path().to_path_buf());
+        let caller = std::env::current_exe().unwrap();
+        let user = stop_instructions(&home.0, true, &caller);
+        if cfg!(windows) {
+            assert!(user.contains(caller.to_str().unwrap()), "{user}");
+        }
+        home.write(
+            device_config::FILE,
+            br#"{"auto_send": true, "run_as": "system"}"#,
+        )
+        .unwrap();
+        let system = stop_instructions(&home.0, true, &caller);
+        assert!(system.contains("elevated PowerShell prompt"), "{system}");
+        assert!(system.contains("schtasks.exe") || system.contains("schedule off"));
+        assert!(!system.contains(caller.to_str().unwrap()), "{system}");
+        assert!(stop_instructions(&home.0, false, &caller).contains("schedule off"));
     }
 
     #[test]

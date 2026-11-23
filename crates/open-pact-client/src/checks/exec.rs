@@ -470,7 +470,7 @@ mod tests {
         let start = Instant::now();
         assert_eq!(
             run_with_timeout(
-                "powershell.exe",
+                &crate::machine::system_powershell().to_string_lossy(),
                 &["-NoProfile", "-Command", "Start-Sleep -Seconds 30"],
                 timeout
             ),

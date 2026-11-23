@@ -351,7 +351,7 @@ fn batch() -> &'static Batch {
     VALUES.get_or_init(|| {
         let start = std::time::Instant::now();
         let output = capture_with_stdin(
-            "powershell.exe",
+            &crate::machine::system_powershell().to_string_lossy(),
             &batch_args(),
             POWERSHELL.as_bytes(),
             BATCH_TIMEOUT,
@@ -762,7 +762,7 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn automatic_update_pause_source_fixtures() {
-        let output = std::process::Command::new("powershell.exe")
+        let output = std::process::Command::new(crate::machine::system_powershell())
             .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
             .arg(concat!(
                 env!("CARGO_MANIFEST_DIR"),

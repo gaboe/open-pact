@@ -30,9 +30,31 @@ impl Notice {
                 "open-pact-client {} is available. Update: {command}",
                 self.latest
             ),
-            None => format!("open-pact-client {} is available.", self.latest),
+            None => {
+                let mut line = format!("open-pact-client {} is available.", self.latest);
+                let running = std::env::current_exe().ok();
+                if let Some(block) = running.and_then(|exe| {
+                    machine_upgrade(&exe, &crate::machine::machine_path(), &self.latest)
+                }) {
+                    line.push_str(&format!(
+                        "\nUpgrade the machine client from an elevated PowerShell prompt:\n{block}"
+                    ));
+                }
+                line
+            }
         }
     }
+}
+
+/// The upgrade block when `exe` is the machine client at `machine`: an administrator or IT
+/// channel owns that copy, so the block is the one install block for the newer version.
+fn machine_upgrade(exe: &Path, machine: &Path, latest: &str) -> Option<String> {
+    if !crate::machine::same_windows_path(exe, machine) {
+        return None;
+    }
+    Some(crate::machine::install_block(
+        &semver::Version::parse(latest).ok()?,
+    ))
 }
 
 pub(crate) fn latest_notice() -> Option<Notice> {
@@ -351,6 +373,26 @@ mod tests {
             install_command(r"C:\Program Files\Open Pact\open-pact-client.exe"),
             None
         );
+    }
+
+    #[test]
+    fn only_the_machine_client_gets_the_install_block() {
+        let machine = Path::new(r"C:\Program Files\open-pact-client\open-pact-client.exe");
+        let block = machine_upgrade(machine, machine, "0.9.1").unwrap();
+        assert_eq!(
+            block,
+            crate::machine::install_block(&semver::Version::new(0, 9, 1))
+        );
+        assert!(block.contains("releases/download/v0.9.1"));
+        assert!(
+            machine_upgrade(
+                Path::new(r"C:\Users\me\open-pact-client.exe"),
+                machine,
+                "0.9.1"
+            )
+            .is_none()
+        );
+        assert!(machine_upgrade(machine, machine, "latest").is_none());
     }
 
     #[test]
