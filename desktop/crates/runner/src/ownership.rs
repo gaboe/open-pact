@@ -224,10 +224,26 @@ pub fn other_copies(
 
 /// The copy that the app offers to remove: the first one with a removal command, in PATH order.
 /// The machine client can come first, and it never hides a copy behind it.
-pub fn first_removable(copies: &[OtherCopy], platform: Platform) -> Option<(&OtherCopy, Removal)> {
+/// The copy that the active user job runs is never offered: removing it stops the job.
+pub fn first_removable<'a>(
+    copies: &'a [OtherCopy],
+    platform: Platform,
+    active: Option<&Path>,
+) -> Option<(&'a OtherCopy, Removal)> {
     copies
         .iter()
+        .filter(|copy| !is_active(copy, active))
         .find_map(|copy| removal(copy, platform).map(|removal| (copy, removal)))
+}
+
+/// Whether `copy` is the executable that the active user job records.
+pub fn is_active(copy: &OtherCopy, active: Option<&Path>) -> bool {
+    active.is_some_and(|active| same_path(&copy.path, active))
+}
+
+/// The copy that the active user job runs, when it is among the copies.
+pub fn active_copy<'a>(copies: &'a [OtherCopy], active: Option<&Path>) -> Option<&'a OtherCopy> {
+    copies.iter().find(|copy| is_active(copy, active))
 }
 
 /// The machine client among the copies, which the app names but never removes.
@@ -515,14 +531,41 @@ mod tests {
             copy(machine, Source::MachineClient),
             copy(scoop, Source::Scoop),
         ];
-        let (first, removal) = first_removable(&copies, Platform::Windows).unwrap();
+        let (first, removal) = first_removable(&copies, Platform::Windows, None).unwrap();
         assert_eq!(first.path, Path::new(scoop));
         assert_eq!(removal.shown, "scoop uninstall open-pact");
         assert_eq!(machine_copy(&copies).unwrap().path, Path::new(machine));
         // The machine client is no other copy in the count.
         assert_eq!(other_count(&copies), 1);
-        assert!(first_removable(&copies[..1], Platform::Windows).is_none());
+        assert!(first_removable(&copies[..1], Platform::Windows, None).is_none());
         assert_eq!(other_count(&copies[..1]), 0);
+    }
+
+    #[test]
+    fn the_copy_that_the_active_user_job_runs_is_never_offered_for_removal() {
+        let active = "/opt/fictional/bin/open-pact-client";
+        let unrelated = "/usr/local/fictional/open-pact-client";
+        let copies = vec![copy(active, Source::Other), copy(unrelated, Source::Other)];
+        let active_path = Some(Path::new(active));
+        // The first copy on PATH is the active one: the offer moves to the unrelated copy.
+        let (offered, _) = first_removable(&copies, Platform::Mac, active_path).unwrap();
+        assert_eq!(offered.path, Path::new(unrelated));
+        assert_eq!(
+            active_copy(&copies, active_path).unwrap().path,
+            Path::new(active)
+        );
+        assert!(is_active(&copies[0], active_path));
+        assert!(!is_active(&copies[1], active_path));
+        // With only the active copy there is nothing to offer.
+        assert!(first_removable(&copies[..1], Platform::Mac, active_path).is_none());
+        // Without an active job executable nothing changes.
+        assert_eq!(
+            first_removable(&copies, Platform::Mac, None)
+                .unwrap()
+                .0
+                .path,
+            Path::new(active)
+        );
     }
 
     #[test]
@@ -557,7 +600,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            first_removable(&found, Platform::Mac).unwrap().0.path,
+            first_removable(&found, Platform::Mac, None).unwrap().0.path,
             loose
         );
         // A shim that names the machine client comes first, then its own folder: one entry, and
