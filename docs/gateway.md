@@ -221,13 +221,46 @@ The gateway exports one event after each committed claim evaluation from an enro
 
 `devices approve` and `devices revoke` send one `device_state` event when they change a device, as the README describes. The CLI process needs the same `GATEWAY_SIEM_*` variables as the server. It waits at most 15 seconds and does not retry. When the send fails, the database change stands: the command prints a warning on stderr and exits 0. A command that changes nothing sends nothing. With `AUTO_APPROVE=true`, the server sends the `approved` event itself for each enrolment it approves, through its queued exporter. Each `device_state` event carries `log_index`, the index of the log entry that recorded the change. Order one device's `device_state` events by it.
 
-TLS output uses RFC 5424 syslog with RFC 5425 octet counting. File output is one JSON object per line. The queue holds at most 1024 events. It drops the oldest event on overflow and logs a change in the drop count once per minute. Check gateway logs for drop warnings. No metrics endpoint exposes the drop count. The queue is in memory, so a restart loses queued events. Retries can create duplicate events. A successful TLS write does not confirm SIEM ingestion.
+TLS output uses RFC 5424 syslog with RFC 5425 octet counting. File output is one JSON object per line. The queue holds at most 1024 events. It drops the oldest event on overflow and logs a change in the drop count once per minute. Check gateway logs for drop warnings. The metrics endpoint does not expose the drop count. The queue is in memory, so a restart loses queued events. Retries can create duplicate events. A successful TLS write does not confirm SIEM ingestion.
 
 The sample Wazuh files are in [`deploy/wazuh`](../deploy/wazuh/README.md). For TLS syslog, install the rsyslog GnuTLS module. Place the receiver CA, certificate, and private key at the paths in [`rsyslog.conf`](../deploy/wazuh/rsyslog.conf). The sample authenticates the receiver to the gateway. It does not require a client certificate from the gateway. Restrict port 6514 to the gateway. Validate the receiver config with `rsyslogd -N1`. Give the JSON output file to a Wazuh agent with [`agent-localfile.xml`](../deploy/wazuh/agent-localfile.xml). For a direct file sink, set `GATEWAY_SIEM_FILE` on the gateway host. Grant the Wazuh agent group read access to the file. Do not send both sinks to the same file.
 
 Install [`rules.xml`](../deploy/wazuh/rules.xml) in the Wazuh manager's local rules directory. Reserve rule IDs 100500 through 100507 or change them to avoid conflicts. The optional [`decoder.xml`](../deploy/wazuh/decoder.xml) shows a JSON decoder for a custom decoder chain. The rules use numeric control values. They do not match bucketed strings such as `gt_30d`. Test the rules with `/var/ossec/bin/wazuh-logtest` on the target manager. Test the receiver with `rsyslogd -N1`. The samples have not been tested against a live manager.
 
 Set SIEM retention at least as short as `claim_retention`. `GATEWAY_SIEM_RETENTION_DAYS` logs a warning when the configured SIEM retention exceeds the manifest value. The gateway cannot enforce retention at the SIEM.
+
+## Observe the gateway
+
+Two switches show what the gateway does. Both are off in the binary. The Helm chart turns the slow-request log on at 1000 ms and leaves metrics off.
+
+**Slow-request log.** Set `SLOW_REQUEST_MS` (Helm `gateway.slowRequestMs`) to a number of milliseconds. A request that takes longer writes one line to stderr, for example `slow_request route=/v1/claim method=POST status=2xx ms=1234`. At most one line goes out a second. The next line ends with `suppressed=N`, the count of slow requests left out. `0` or unset turns the log off. It needs no metrics listener.
+
+**Metrics.** Set `METRICS_ADDR` to start a listener. Without it there is no listener, no registry and no timing layer. The listener serves only `GET /metrics` in the Prometheus text format, on its own port. The public router has no `/metrics` route. These settings are required with `METRICS_ADDR`, and the gateway refuses to start without them:
+
+| Setting | Meaning |
+| --- | --- |
+| `METRICS_TOKEN` | Bearer token, at least 32 visible ASCII characters, no spaces. Make one with `openssl rand -hex 32`. A blank, short or padded token refuses startup. |
+| `METRICS_TLS_CERT`, `METRICS_TLS_KEY` | PEM files of the listener certificate and its key. A missing or unreadable file, or a key that does not fit the certificate, refuses startup. |
+
+An address on a loopback IP (`127.0.0.1`, `::1`) may run without TLS. The token is still required. Any other address without a certificate refuses startup. A scrape without the token, or with a wrong one, gets 401. The gateway reads the token and the certificate at start. Restart it after you rotate either one.
+
+For Helm, set `metrics.enabled=true`, `metrics.tokenSecret.name` (key `token`) and `metrics.tlsSecret.name` (a `kubernetes.io/tls` Secret, for example from cert-manager). The chart opens container port 9090, adds a separate ClusterIP Service `<release>-gateway-metrics` and keeps the port out of the Ingress. Set `metrics.networkPolicy.from` to also limit the port to your Prometheus with a NetworkPolicy. Prometheus scrapes with `scheme: https`, `tls_config.ca_file`, `tls_config.server_name` and `authorization.credentials_file`.
+
+What a scraper learns: request counts and latency per route, the pool size, and the log size, which the consistency route already shows. Nothing else leaves the pod. Labels come from fixed sets: `route` is the router's route template or `unmatched`, `method` is `GET`, `POST`, `HEAD` or `other`, `status` is `1xx` to `5xx`. No path, address, pseudonym, nonce or hash is in a label or in the slow-request log.
+
+| Metric | Shows |
+| --- | --- |
+| `openpact_http_request_duration_seconds{route,method,status}` | Time inside the gateway until the handler answered |
+| `openpact_http_requests_aborted_total{route,method}` | Requests whose handler stopped before it answered, for example when the client left |
+| `openpact_nonce_lock_wait_seconds`, `openpact_nonce_issue_total{result}` | Wait for the nonce advisory lock; nonce requests as `issued`, `rate_limited` or `cap_reached` |
+| `openpact_db_pool_connections{state}`, `openpact_db_pool_max` | Pool use at scrape time |
+| `openpact_db_acquire_seconds{site}` | Wait for a pool connection at `conn`, `claim_tx`, `nonce_tx` and `other_tx`. Queries on the pool itself acquire without a timer |
+| `openpact_claim_stage_seconds{stage}` | Where a claim spends its time: `verify`, `nonce`, `tree`, `begin`, `lock`, `evaluate`, `certificate`, `store`, `commit`, `checkpoint` |
+| `openpact_witness_push_seconds{result}` | One add-checkpoint call: `cosigned`, `conflict`, `refused`, `error` or `timeout` |
+| `openpact_checkpoint_served_total{caller,result}` | Checkpoints handed out to `checkpoint`, `mine`, `enroll` and `claim`; `not_yet` means fewer witness cosignatures than the manifest's quorum, `log_signed` means the manifest asks for none |
+| `openpact_log_size` | Entries in the log at the last read |
+
+To compare gateway counts with another source, such as a proxy in front of the gateway, count the same thing. A handler completion is not a delivered response: a client that left, a timeout or a reset can lose the answer after the handler finished. Use `openpact_http_request_duration_seconds_count` by status class for the answers the gateway produced, `openpact_http_requests_aborted_total` for the handlers that never answered, and the proxy's upstream responses, read after traffic has drained, for what arrived. Accepted claims (`2xx` on `/v1/claim`) can exceed the claims a client verified and installed, because the client checks the answer after the gateway sent it.
 
 ## Back up and upgrade
 
