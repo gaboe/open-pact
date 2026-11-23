@@ -2471,11 +2471,7 @@ async fn fetch_my_entries_for_wait(
             tokio::time::sleep(delay).await;
             fetch_my_entries_for_wait_once(http, home, enrolment, policy)
                 .await?
-                .map_err(|_| {
-                    WaitError::from_error(anyhow::anyhow!(
-                        "The gateway could not give a checkpoint your policy accepts (503)."
-                    ))
-                })
+                .map_err(|_| WaitError::Network)
         }
     }
 }
@@ -5623,7 +5619,8 @@ mod tests {
     }
 
     use fake_gateway::{
-        Company, DEMO_MANIFEST, FakeGateway, Witness, checkpoint_of, not_found, serve_log, snapshot,
+        Company, DEMO_MANIFEST, FakeGateway, Reply, Witness, checkpoint_of, not_found, serve_log,
+        snapshot,
     };
 
     fn approval_fixture(
@@ -6538,10 +6535,13 @@ mod tests {
         let entries_for_log = entries.clone();
         let published = Company::published(&toml, &company.key);
         let log_key = company.log.vkey();
-        let gateway = FakeGateway::start(move |line, nth| match line {
-            "GET /v1/manifest" => (200, published.clone()),
-            "GET /v1/log/key" => (200, format!("{log_key}\n")),
-            "GET /v1/log/checkpoint" => (
+        // The approved device's first two mine calls answer 503: the wait keeps polling.
+        let gateway = FakeGateway::start_with(move |line, nth| match line {
+            "POST /v1/log/mine" if nth < 2 => Reply::new(503, "{}").header("Retry-After", "1"),
+            "POST /v1/log/mine" => Reply::new(200, response.clone()),
+            "GET /v1/manifest" => Reply::new(200, published.clone()),
+            "GET /v1/log/key" => Reply::new(200, format!("{log_key}\n")),
+            "GET /v1/log/checkpoint" => Reply::new(
                 200,
                 if nth == 0 {
                     before_approval.clone()
@@ -6549,13 +6549,17 @@ mod tests {
                     approved_checkpoint.clone()
                 },
             ),
-            "POST /v1/nonce" => (200, json!({"nonce":format!("approval-{nth}")}).to_string()),
-            "POST /v1/device/status" => (
+            "POST /v1/nonce" => {
+                Reply::new(200, json!({"nonce":format!("approval-{nth}")}).to_string())
+            }
+            "POST /v1/device/status" => Reply::new(
                 200,
                 json!({"state": if nth == 0 { "pending" } else { "approved" }}).to_string(),
             ),
-            "POST /v1/log/mine" => (200, response.clone()),
-            _ => serve_log(&entries_for_log, line).unwrap_or_else(not_found),
+            _ => {
+                let (status, body) = serve_log(&entries_for_log, line).unwrap_or_else(not_found);
+                Reply::new(status, body)
+            }
         })
         .await;
         put_gateway_in_enrolment(&home, &mut enrolment, &gateway.url);
@@ -6595,12 +6599,16 @@ mod tests {
                 .iter()
                 .filter(|request| request.as_str() == "POST /v1/device/status")
                 .count(),
-            2
+            3,
+            "the wait polls the status again after the second mine 503"
         );
         let second_status = requests
             .iter()
-            .rposition(|request| request == "POST /v1/device/status")
-            .unwrap();
+            .enumerate()
+            .filter(|(_, request)| request.as_str() == "POST /v1/device/status")
+            .nth(1)
+            .unwrap()
+            .0;
         let log_read = requests
             .iter()
             .position(|request| request == "POST /v1/log/mine")
@@ -6609,13 +6617,18 @@ mod tests {
             second_status < log_read,
             "approval status precedes private log read"
         );
-        assert_eq!(
-            requests
-                .iter()
-                .filter(|request| request.as_str() == "POST /v1/log/mine")
-                .count(),
-            1
-        );
+        let mines = gateway.bodies("POST /v1/log/mine");
+        assert_eq!(mines.len(), 3, "two 503 answers, then the proof");
+        let nonces: std::collections::BTreeSet<String> = mines
+            .iter()
+            .map(|body| {
+                serde_json::from_str::<serde_json::Value>(body).unwrap()["nonce"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(nonces.len(), 3, "every mine call signs a fresh nonce");
         assert!(
             !requests.iter().any(|request| request == "POST /v1/claim"),
             "a non-terminal join stops before finish and check"

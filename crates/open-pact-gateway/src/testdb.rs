@@ -42,12 +42,18 @@ async fn fresh_with(max_connections: u32, settings: &[(&str, &str)]) -> PgPool {
 }
 
 pub async fn enrolled_device(db: &PgPool, pseudonym: &str, manifest: &str) {
+    device_in_state(db, pseudonym, manifest, "approved").await;
+}
+
+/// A device row in the given state: pending, approved or revoked.
+pub async fn device_in_state(db: &PgPool, pseudonym: &str, manifest: &str, state: &str) {
     sqlx::query(
         "INSERT INTO devices (pseudonym, manifest_hash, owner_key, owner_signature, salt, state) \
-         VALUES ($1, $2, '{}', '', '00', 'approved')",
+         VALUES ($1, $2, '{}', '', '00', $3)",
     )
     .bind(pseudonym)
     .bind(manifest)
+    .bind(state)
     .execute(db)
     .await
     .expect("insert device");

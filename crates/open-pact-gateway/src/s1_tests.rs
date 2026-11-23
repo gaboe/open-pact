@@ -722,7 +722,12 @@ async fn a_repeated_witness_url_gets_one_owner() {
 #[ignore = "needs TEST_DATABASE_URL and LOG_ORIGIN"]
 async fn a_large_valid_policy_is_accepted() {
     let f = Fixture::new(40, 21).await;
-    let reply = f.get(Some(&f.query)).await;
+    // Its query is over 4 KiB: the client sends none then, and the gateway answers 400 to one.
+    assert!(f.query.len() > "policy=".len() + 4096);
+    let refused = f.get(Some(&f.query)).await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{}", refused.body);
+    // With no query the gateway uses the policy of the manifest it enforces: this one.
+    let reply = f.get(None).await;
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
     f.verifies(&reply.body, &f.policy);
     f.append(1).await;
@@ -1226,16 +1231,23 @@ mod blocking;
 
 mod bounds;
 
+mod fix1;
+
 mod order;
 
 mod relay;
 
 /// A device that is approved in the database, and a mine request it signs with a fresh nonce.
 async fn mine_request(router: &Router, db: &PgPool, manifest: &str) -> Value {
+    mine_request_as(router, db, manifest, "approved").await
+}
+
+/// The same for a device whose enrolment is in the given state.
+async fn mine_request_as(router: &Router, db: &PgPool, manifest: &str, state: &str) -> Value {
     let key = open_pact_core::dev_key::generate();
     let device_key = PublicKey::from(&key);
     let pseudonym = Pseudonym::of(&device_key);
-    testdb::enrolled_device(db, pseudonym.as_str(), manifest).await;
+    testdb::device_in_state(db, pseudonym.as_str(), manifest, state).await;
     let mut request = Request::post("/v1/nonce")
         .header("content-type", "application/json")
         .body(Body::from("null"))

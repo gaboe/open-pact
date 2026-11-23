@@ -5,4 +5,5 @@ target
 .agents
 internal
 deploy
+!deploy/compose/demo-witness.key
 scripts

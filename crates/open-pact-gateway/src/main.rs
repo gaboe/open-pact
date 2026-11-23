@@ -1,4 +1,5 @@
 mod claims;
+mod diag;
 use open_pact_core::{
     AcceptRequest, DeviceAuthPurpose, EntryWithProof, MyEntries, MyEntriesRequest, evaluate_under,
 };
@@ -760,8 +761,8 @@ async fn log_key_text(Extension(app): Extension<App>) -> impl IntoResponse {
 }
 
 /// The 503 of both read routes. The client retries it once, after the delay it names.
-fn unavailable(why: served::Why) -> axum::response::Response {
-    eprintln!("checkpoint not served: {why:?}");
+fn unavailable(app: &App, why: served::Why) -> axum::response::Response {
+    app.owners.log(format!("checkpoint not served: {why:?}"));
     let headers = [(header::RETRY_AFTER, "5")];
     (
         StatusCode::SERVICE_UNAVAILABLE,
@@ -799,7 +800,7 @@ async fn log_checkpoint(
                 (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
                 (header::RETRY_AFTER, "5"),
             ];
-            eprintln!("checkpoint not served: {why:?}");
+            app.owners.log(format!("checkpoint not served: {why:?}"));
             Ok((
                 StatusCode::SERVICE_UNAVAILABLE,
                 headers,
@@ -1210,13 +1211,23 @@ async fn log_mine(
     let requested = served::request_policy(query.as_deref())?;
     let policy = requested.as_ref().or(app.manifest.body().log.as_ref());
     let has_witnesses = policy.is_some_and(|p| !p.witnesses.is_empty());
+    // A pending or revoked device gets the base 403 whether or not a checkpoint is ready. The
+    // connection goes back to the pool before any wait for a witness.
+    let enrolment = {
+        let mut conn = app.conn().await?;
+        devices::bound(&mut conn, &request.pseudonym, app.manifest.hash().as_str())
+            .await
+            .map_err(internal)?
+            .filter(|e| e.state == DeviceState::Approved)
+            .ok_or_else(device_denied)?
+    };
     app.owners.hooks().hit("served_entered").await;
     let deadline = Instant::now() + app.wait;
     let (note, tree) = match app.served(policy, deadline).await {
         served::Answer::Witnessed { note, tree } => (note, tree),
         served::Answer::Unavailable(why) => {
             app.count_served(metrics::Caller::Mine, metrics::Served::NotYet);
-            return Ok(unavailable(why));
+            return Ok(unavailable(&app, why));
         }
     };
     let served = if has_witnesses {
@@ -1226,11 +1237,6 @@ async fn log_mine(
     };
     let cp = Checkpoint::parse(&note.text).map_err(internal)?;
     let mut conn = app.conn().await?;
-    let enrolment = devices::bound(&mut conn, &request.pseudonym, app.manifest.hash().as_str())
-        .await
-        .map_err(internal)?
-        .filter(|e| e.state == DeviceState::Approved)
-        .ok_or_else(device_denied)?;
     let commitment =
         devices::commitment(&enrolment.salt, request.pseudonym.as_str()).map_err(internal)?;
     let entries = translog::mine(&mut conn, cp.size, &enrolment.manifest, &commitment)

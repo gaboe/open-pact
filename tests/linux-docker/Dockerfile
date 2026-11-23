@@ -7,6 +7,7 @@ COPY Cargo.toml Cargo.lock PAPER.md ./
 COPY crates crates
 COPY docs docs
 COPY examples examples
+COPY deploy/compose/demo-witness.key deploy/compose/demo-witness.key
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && \
     cargo test --workspace && cargo test -p open-pact-client --lib --no-run 2>/tmp/client-test.log && \
