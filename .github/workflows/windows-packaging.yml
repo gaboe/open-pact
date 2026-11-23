@@ -84,6 +84,33 @@ jobs:
       - name: Build the fixtures and run the install sequence
         shell: pwsh
         run: ./packaging/windows/tests/machine-package.ps1 -Work "$env:RUNNER_TEMP/machine-package"
+      - name: Check the winget manifests against the built MSI
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . (Join-Path $PWD 'scripts/packaging/msi-tools.ps1')
+          $work = Join-Path $env:RUNNER_TEMP 'winget-check'
+          New-Item -ItemType Directory -Force $work | Out-Null
+          $msiName = 'open-pact-client-x86_64-pc-windows-msvc.msi'
+          $msi = Join-Path $work $msiName
+          Copy-Item -LiteralPath (Join-Path $env:RUNNER_TEMP 'machine-package/fixtures/b2.msi') -Destination $msi
+          $hash = (Get-FileHash -LiteralPath $msi -Algorithm SHA256).Hash.ToLowerInvariant()
+          $sums = Join-Path $work 'SHA256SUMS'
+          "$hash  $msiName" | Set-Content -Encoding ascii $sums
+          $winget = Join-Path $work 'winget'
+          python scripts/packaging/generate-release-metadata.py 0.0.2 $sums --winget-only --winget-test --winget-dir $winget
+          if ($LASTEXITCODE -ne 0) { throw "generate-release-metadata exits with $LASTEXITCODE." }
+          $installer = Get-Content -Raw -LiteralPath (Join-Path $winget 'gaboe.open-pact.test.installer.yaml')
+          $expected = @{
+              ProductCode = Get-MsiProperty -Path $msi -Name 'ProductCode'
+              UpgradeCode = Get-UpgradeCode -Wxs (Join-Path $PWD 'packaging/windows/open-pact-client.wxs')
+              DisplayVersion = Get-MsiProperty -Path $msi -Name 'ProductVersion'
+          }
+          foreach ($key in $expected.Keys) {
+              if (-not $installer.Contains("${key}: ""$($expected[$key])""")) { throw "The winget installer manifest does not name $key $($expected[$key])." }
+          }
+          winget validate --manifest $winget
+          if ($LASTEXITCODE -ne 0) { throw "winget validate exits with $LASTEXITCODE." }
       - name: Upload the fixtures
         uses: actions/upload-artifact@v4
         with:
