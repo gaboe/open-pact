@@ -22,13 +22,13 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{MethodFilter, on},
 };
+use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper_util::service::TowerToHyperService;
 use prometheus_client::encoding::{EncodeLabelSet, text::encode};
 use prometheus_client::metrics::{
     counter::Counter, family::Family, gauge::Gauge, histogram::Histogram,
 };
 use prometheus_client::registry::{Registry, Unit};
-use hyper_util::rt::{TokioIo, TokioTimer};
-use hyper_util::service::TowerToHyperService;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use subtle::ConstantTimeEq;
@@ -1099,11 +1099,8 @@ mod tests {
         let listener = settings(&env).unwrap().listener.unwrap();
         let bound = start(listener, recorded(), lazy_pool()).await.unwrap();
         let mut idle = tokio::net::TcpStream::connect(bound).await.unwrap();
-        let closed = tokio::time::timeout(
-            Duration::from_secs(10),
-            idle.read_to_end(&mut Vec::new()),
-        )
-        .await;
+        let closed =
+            tokio::time::timeout(Duration::from_secs(10), idle.read_to_end(&mut Vec::new())).await;
         assert!(matches!(closed, Ok(Ok(_))), "{closed:?}");
     }
 
@@ -1335,7 +1332,11 @@ mod tests {
         let mut off = StageClock::new(None);
         off.mark(Stage::Verify);
         off.mark(Stage::Commit);
-        assert_eq!(clock_reads(), before, "observation read the clock while off");
+        assert_eq!(
+            clock_reads(),
+            before,
+            "observation read the clock while off"
+        );
         let mut on = StageClock::new(Some(&metrics));
         on.mark(Stage::Verify);
         assert!(clock_reads() > before);
