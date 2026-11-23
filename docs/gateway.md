@@ -43,6 +43,8 @@ docker compose up -d --build
 
 Compose uses `DEV_INSECURE_KEK=1`, a local HTTP URL, and a public demo witness seed. Use it only for a local demo. Do not expose that gateway or reuse its keys. `GATEWAY_PORT=8091 docker compose up -d` changes the host port.
 
+Size the nonce limits for the fleet. `nonces.maxPerWindow` (chart default 3000; binary default 600) counts per source address, so behind an ingress all devices share it: at least 2 x devices that run in one minute x 1.5. `nonces.maxOutstanding` (default 10000) needs at least the unused nonces of 5 minutes. A run uses its nonces within seconds, but a burst of failing clients can fill it. At 3000 a minute, 15,000 requests fit in the 5-minute nonce life, so `maxOutstanding` can answer 503 first.
+
 ## Sign and roll out a manifest
 
 Write the manifest as TOML. Include the check IDs and output types that the client supports. Declare the required values, grace periods, `claim_retention`, `claim_recipients`, `data_controller`, and `disclosed_metadata`. The gateway signs and publishes the manifest. During `join`, the owner reviews it and signs its hash.
