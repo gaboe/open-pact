@@ -492,6 +492,7 @@ impl Owner {
             }
             // held and sent are facts about the witness and the wire; they stay.
             Job::Reload => {
+                self.shared.hooks.bump("reload_drained");
                 self.last = None;
                 self.tried = 0;
                 self.failures = 0;

@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use std::sync::atomic::Ordering;
 
 use open_pact_client::{Command, Invocation};
-use open_pact_core::Invitation;
+use open_pact_core::{Checkpoint, Invitation, WitnessKey};
 
 use super::*;
 
@@ -60,8 +60,13 @@ impl Fixture {
 
     /// `count` devices enrolled through the client, then the current size witnessed by a read.
     pub async fn enrolled(&self, live: &Live, count: usize) -> Vec<Arc<Device>> {
+        self.enrolled_under(live, count, &self.query).await
+    }
+
+    /// The same, with the witnessing read made under the policy `query` names.
+    pub async fn enrolled_under(&self, live: &Live, count: usize, query: &str) -> Vec<Arc<Device>> {
         let devices = futures_util::future::join_all((0..count).map(|_| self.enrol(live))).await;
-        let reply = self.get(Some(&self.query)).await;
+        let reply = self.get(Some(query)).await;
         assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
         devices.into_iter().map(Arc::new).collect()
     }
@@ -107,8 +112,24 @@ impl Fixture {
             },
             std::path::Path::new("open-pact-client"),
         )
-        .await
-        .unwrap();
+        .await;
+        let code = match code {
+            Ok(code) => code,
+            Err(e) => {
+                let pushes: Vec<(u64, u64, u16)> = self.witnesses[0]
+                    .received()
+                    .iter()
+                    .map(|r| (r.size, r.old_size, r.status))
+                    .collect();
+                let rows: Vec<(i64, String)> = sqlx::query_as(
+                    "SELECT size, witness FROM log_cosignatures ORDER BY size, witness",
+                )
+                .fetch_all(&self.db)
+                .await
+                .unwrap();
+                panic!("the join failed: {e:#}; witness record {pushes:?}; rows {rows:?}")
+            }
+        };
         assert_eq!(code, ExitCode::SUCCESS, "the join failed");
         device
     }
@@ -132,14 +153,130 @@ impl Fixture {
     }
 }
 
-pub(super) fn spawn_claim(device: &Arc<Device>) -> tokio::task::JoinHandle<ExitCode> {
+impl Fixture {
+    /// Two witnesses; the manifest lists the first (Old). `new_manifest` lists the second.
+    pub async fn two_policies() -> Fixture {
+        let mut options = Options::new(2, 1);
+        options.real_client = true;
+        options.listed = Some(vec![0]);
+        Fixture::build(options).await
+    }
+
+    pub fn manifest_of(&self, keys: &[&WitnessKey], quorum: usize) -> String {
+        let listed: Vec<String> = keys.iter().map(|k| listed_entry(k)).collect();
+        manifest_text(&listed, quorum, false, true)
+    }
+
+    pub fn policy_in(&self, toml: &str) -> LogPolicy {
+        Manifest::parse(toml.as_bytes())
+            .unwrap()
+            .body()
+            .log
+            .clone()
+            .unwrap()
+    }
+
+    /// The gateway enforces `toml` from now on; waits until every owner drained the reload.
+    pub async fn enforce(&self, toml: &str) {
+        let hooks = self.app.owners.hooks();
+        let before = hooks.count("reload_drained");
+        manifests::set_for_test(&self.db, &self.app.keys, toml).await;
+        reload_manifest(&self.app).await.unwrap();
+        let owners = self.app.owners.views().len();
+        until(
+            "the owners drained the reload",
+            Duration::from_secs(10),
+            || hooks.count("reload_drained") >= before + owners,
+        )
+        .await;
+    }
+
+    /// A gateway process started again on the same database: new caches, new owners, and only the
+    /// enforced manifest's keys.
+    pub async fn restarted(&self) -> App {
+        let row = manifests::active(&self.db).await.unwrap().unwrap();
+        let enforced =
+            Arc::new(manifests::enforced(&row.toml, &self.app.keys, Some(row.version)).unwrap());
+        let current = Arc::new(RwLock::new(enforced.clone()));
+        let urls = witness::normalize_urls(self.witnesses.iter().map(|w| w.url.clone()).collect());
+        let owners = Owners::start(
+            urls,
+            enforced.log.witnesses.keys().to_vec(),
+            current.clone(),
+            self.db.clone(),
+            None,
+        )
+        .unwrap();
+        App {
+            enforced,
+            current,
+            owners: Arc::new(owners),
+            ..self.app.clone()
+        }
+    }
+
+    /// Serves `app` on the address `live` had, after `live` stopped.
+    pub async fn live_again(app: App, mut live: Live) -> Live {
+        let addr = live.url.trim_start_matches("http://").to_string();
+        live.task.abort();
+        let _ = live.task_done().await;
+        let mut tries = 0;
+        let listener = loop {
+            match tokio::net::TcpListener::bind(&addr).await {
+                Ok(listener) => break listener,
+                Err(error) => {
+                    tries += 1;
+                    assert!(tries < 100, "{addr}: {error}");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        };
+        let service = router(app).into_make_service_with_connect_info::<SocketAddr>();
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, service).await;
+        });
+        Live {
+            url: format!("http://{addr}"),
+            task,
+        }
+    }
+
+    /// A line of `key` for the tree this gateway holds, stored as an owner would.
+    pub async fn seed_line(&self, key: &(ed25519_dalek::SigningKey, WitnessKey)) {
+        let tree = self.app.tree().await.unwrap();
+        let cp = Checkpoint {
+            origin: self.log.origin().to_string(),
+            size: tree.size(),
+            root: tree.root(),
+        };
+        let line = key.1.cosign(&key.0, &cp, now_secs());
+        sqlx::query(witness::UPSERT)
+            .bind(i64::try_from(cp.size).unwrap())
+            .bind(cp.root.to_string())
+            .bind(key.1.vkey())
+            .bind(line.to_string().trim_end())
+            .execute(&self.db)
+            .await
+            .unwrap();
+    }
+}
+
+impl Live {
+    async fn task_done(&mut self) -> Result<(), tokio::task::JoinError> {
+        (&mut self.task).await
+    }
+}
+
+pub(super) fn spawn_claim(device: &Arc<Device>) -> tokio::task::JoinHandle<()> {
     let device = device.clone();
-    tokio::spawn(async move { Fixture::claim(&device).await })
+    tokio::spawn(async move {
+        let _ = Fixture::claim(&device).await;
+    })
 }
 
 impl Device {
     /// The witness lines of the kept reply: how many, and whether the log's line is first.
-    pub fn reply_lines(&self) -> (usize, bool) {
+    pub fn reply_lines(&self, origin: &str) -> (usize, bool) {
         let note = self.reply_note().expect("the client kept the reply");
         let lines: Vec<&str> = note.lines().filter(|l| l.starts_with("— ")).collect();
         let witnesses = lines
@@ -150,7 +287,7 @@ impl Device {
             witnesses,
             lines
                 .first()
-                .is_some_and(|l| l.starts_with("— log.example.org/")),
+                .is_some_and(|l| l.starts_with(&format!("— {origin}"))),
         )
     }
 }
@@ -176,11 +313,11 @@ async fn an_accepted_claim_reply_keeps_the_log_signature() {
     let f = Fixture::real().await;
     let live = f.live().await;
     let devices = f.enrolled(&live, 1).await;
-    Fixture::claim(&devices[0]).await;
+    let _ = Fixture::claim(&devices[0]).await;
     assert!(devices[0].installed());
     let note = devices[0].reply_note().expect("the client kept the reply");
     f.verifies(&note, &f.policy);
-    assert_eq!(devices[0].reply_lines(), (1, true), "{note}");
+    assert_eq!(devices[0].reply_lines(f.log.origin()), (1, true), "{note}");
     // Case 2: a manifest that allows split views and lists no witness.
     let mut options = Options::new(0, 0);
     options.real_client = true;
@@ -188,11 +325,11 @@ async fn an_accepted_claim_reply_keeps_the_log_signature() {
     let g = Fixture::build(options).await;
     let live = g.live().await;
     let devices = g.enrolled(&live, 1).await;
-    Fixture::claim(&devices[0]).await;
+    let _ = Fixture::claim(&devices[0]).await;
     assert!(devices[0].installed());
     let note = devices[0].reply_note().expect("the client kept the reply");
     assert!(g.log.verify(&Note::parse(&note).unwrap()).is_ok(), "{note}");
-    assert_eq!(devices[0].reply_lines(), (0, true), "{note}");
+    assert_eq!(devices[0].reply_lines(g.log.origin()), (0, true), "{note}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -233,7 +370,7 @@ async fn a_failed_lead_leaves_its_follower_queued() {
         .collect();
     assert_eq!(at_size, [500, 200]);
     assert!(!devices[0].installed(), "the lead has no witness line");
-    assert_eq!(devices[0].reply_lines(), (0, true));
+    assert_eq!(devices[0].reply_lines(f.log.origin()), (0, true));
     assert!(devices[1].installed());
     let note = devices[1].reply_note().unwrap();
     assert_eq!(f.verifies(&note, &f.policy).size, size);
@@ -289,4 +426,180 @@ async fn a_complete_quorum_claim_answers_its_first_read() {
             .count(),
         1
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs TEST_DATABASE_URL and LOG_ORIGIN"]
+async fn a_claim_reply_verifies_under_the_consented_policy() {
+    let f = Fixture::two_policies().await;
+    let old = f.policy.clone();
+    let live = f.live().await;
+    let devices = f.enrolled(&live, 1).await;
+    let new = f.manifest_of(&[&f.witnesses[1].inner.key], 1);
+    f.enforce(&new).await;
+    f.append(1).await;
+    let _ = Fixture::claim(&devices[0]).await;
+    assert!(
+        devices[0].installed(),
+        "the client installs its certificate"
+    );
+    let note = devices[0].reply_note().expect("the client kept the reply");
+    f.verifies(&note, &old);
+    f.assert_no_fork_line().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs TEST_DATABASE_URL and LOG_ORIGIN"]
+async fn a_restarted_gateway_accepts_the_consented_witness_line() {
+    let f = Fixture::two_policies().await;
+    let old = f.policy.clone();
+    let live = f.live().await;
+    let devices = f.enrolled(&live, 1).await;
+    let new = f.manifest_of(&[&f.witnesses[1].inner.key], 1);
+    f.enforce(&new).await;
+    // Process 1 still knows Old's key: it stores a fresh Old quorum at the current size.
+    let stored = f.get(Some(&encode(&old))).await;
+    assert_eq!(stored.status, StatusCode::OK, "{}", stored.body);
+    let size = f.size().await;
+    // Process 2 starts on New with the same database and both URLs: only New's key is enforced.
+    let restarted = f.restarted().await;
+    let owners = restarted.owners.clone();
+    let _live = Fixture::live_again(restarted, live).await;
+    let committed = owners.hooks().arm("claim_committed");
+    let claim = spawn_claim(&devices[0]);
+    committed.reached().await;
+    f.append(1).await;
+    committed.release();
+    claim.await.unwrap();
+    assert!(
+        devices[0].installed(),
+        "the client installs its certificate"
+    );
+    let note = devices[0].reply_note().expect("the client kept the reply");
+    assert_eq!(f.verifies(&note, &old).size, size + 1);
+    // A started owner knows no size: its first push says 0 and gets a 409 with the witness's size,
+    // then the one retry from that size is the accepted push.
+    let statuses: Vec<u16> = f.witnesses[0]
+        .received()
+        .iter()
+        .filter(|r| r.size == size + 1)
+        .map(|r| r.status)
+        .collect();
+    assert_eq!(statuses, [409, 200]);
+    f.assert_no_fork_line().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs TEST_DATABASE_URL and LOG_ORIGIN"]
+async fn a_rotated_witness_key_is_not_reused_for_a_claim() {
+    let f = Fixture::real().await;
+    let live = f.live().await;
+    let new_key = f.witnesses[0].rotated([77; 32]);
+    let new = f.manifest_of(&[&new_key.1], 1);
+    let new_policy = f.policy_in(&new);
+    // New's key signs from the reload on, so no push the reload wakes is signed by Old.
+    f.witnesses[0].script(vec![new_key.clone()]);
+    f.enforce(&new).await;
+    let devices = f.enrolled_under(&live, 1, &encode(&new_policy)).await;
+    let hooks = f.app.owners.hooks();
+    let committed = hooks.arm("claim_committed");
+    let claim = spawn_claim(&devices[0]);
+    committed.reached().await;
+    // An Old replica answers at the same URL: the owner stores its line and keeps it as `last`.
+    f.append(1).await;
+    let size = f.size().await;
+    f.witnesses[0].script(vec![f.witnesses[0].original()]);
+    f.app.owners.refresh_all();
+    until(
+        "the owner stored the Old line",
+        Duration::from_secs(10),
+        || f.witnesses[0].sizes().last() == Some(&size),
+    )
+    .await;
+    until("the owner is idle", Duration::from_secs(5), || {
+        f.app.owners.views().iter().all(|v| v.idle)
+    })
+    .await;
+    f.witnesses[0].script(vec![new_key.clone()]);
+    committed.release();
+    claim.await.unwrap();
+    let at_size: Vec<u16> = f.witnesses[0]
+        .received()
+        .iter()
+        .filter(|r| r.size == size)
+        .map(|r| r.status)
+        .collect();
+    assert_eq!(
+        at_size,
+        [200, 200],
+        "the claim's Push is sent, not answered from the Old line"
+    );
+    assert!(devices[0].installed());
+    let note = devices[0].reply_note().unwrap();
+    assert_eq!(f.verifies(&note, &new_policy).size, size);
+    let read = f.get(Some(&encode(&new_policy))).await;
+    assert_eq!(read.status, StatusCode::OK, "{}", read.body);
+    f.assert_no_fork_line().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs TEST_DATABASE_URL and LOG_ORIGIN"]
+async fn a_same_size_follower_gets_its_own_key() {
+    let f = Fixture::real().await;
+    let live = f.live().await;
+    let old_policy = f.policy.clone();
+    let old_key = f.witnesses[0].original();
+    let new_key = f.witnesses[0].rotated([77; 32]);
+    let d1 = f.enrolled(&live, 1).await;
+    let new = f.manifest_of(&[&new_key.1], 1);
+    let new_policy = f.policy_in(&new);
+    f.witnesses[0].script(vec![new_key.clone()]);
+    f.enforce(&new).await;
+    let d2 = f.enrolled_under(&live, 1, &encode(&new_policy)).await;
+    // Both policies have a quorum at the current size: the preflights pass without the owner.
+    f.seed_line(&old_key).await;
+    f.seed_line(&new_key).await;
+    for (policy, device) in [(&old_policy, &d1), (&new_policy, &d2)] {
+        let _ = device;
+        let reply = f.get(Some(&encode(policy))).await;
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    }
+    let hooks = f.app.owners.hooks();
+    let committed = hooks.arm_always("claim_committed");
+    let c1 = spawn_claim(&d1[0]);
+    committed.reached().await;
+    let c2 = spawn_claim(&d2[0]);
+    committed.reached().await;
+    f.append(1).await;
+    let size = f.size().await;
+    let fanouts = f.app.owners.fanouts.load(Ordering::SeqCst);
+    let commit = hooks.arm("dispatch_commit_entered");
+    committed.release();
+    commit.reached().await;
+    f.app.log.witnesses.force_retry();
+    committed.disarm();
+    until("the New claim's fan-out", Duration::from_secs(60), || {
+        f.app.owners.fanouts.load(Ordering::SeqCst) == fanouts + 2
+    })
+    .await;
+    f.witnesses[0].script(vec![old_key.clone(), new_key.clone()]);
+    commit.release();
+    c1.await.unwrap();
+    c2.await.unwrap();
+    let at_size: Vec<(u16, u64)> = f.witnesses[0]
+        .received()
+        .iter()
+        .filter(|r| r.size == size)
+        .map(|r| (r.status, r.old_size))
+        .collect();
+    assert_eq!(at_size, [(200, size - 1), (200, size)]);
+    assert!(d1[0].installed());
+    let old_note = d1[0].reply_note().unwrap();
+    assert_eq!(f.verifies(&old_note, &old_policy).size, size);
+    assert!(d2[0].installed());
+    let new_note = d2[0].reply_note().unwrap();
+    assert_eq!(f.verifies(&new_note, &new_policy).size, size);
+    let read = f.get(Some(&encode(&new_policy))).await;
+    assert_eq!(read.status, StatusCode::OK, "{}", read.body);
+    f.assert_no_fork_line().await;
 }

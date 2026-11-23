@@ -48,6 +48,8 @@ pub struct Inner {
     arrivals: std::sync::atomic::AtomicUsize,
     /// A decision gate: while set, a push waits for a permit before it decides.
     gate: Mutex<Option<Arc<Notify>>>,
+    /// Keys that sign the next pushes, one per push; the last one stays. Empty: the seed key.
+    keys: Mutex<std::collections::VecDeque<(ed25519_dalek::SigningKey, WitnessKey)>>,
 }
 
 pub struct FakeWitness {
@@ -83,6 +85,7 @@ impl FakeWitness {
             received: Mutex::default(),
             arrivals: std::sync::atomic::AtomicUsize::new(0),
             gate: Mutex::default(),
+            keys: Mutex::default(),
         });
         let router = Router::new()
             .route("/add-checkpoint", post(add))
@@ -93,6 +96,23 @@ impl FakeWitness {
             let _ = axum::serve(listener, router).await;
         });
         FakeWitness { url, inner, server }
+    }
+
+    /// The key and signer this witness was created with.
+    pub fn original(&self) -> (ed25519_dalek::SigningKey, WitnessKey) {
+        (self.inner.signer.clone(), self.inner.key.clone())
+    }
+
+    /// A key of this witness's name made from `seed`, to pass to `script`.
+    pub fn rotated(&self, seed: [u8; 32]) -> (ed25519_dalek::SigningKey, WitnessKey) {
+        let signer = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let key = WitnessKey::new(self.inner.key.name(), signer.verifying_key());
+        (signer, key)
+    }
+
+    /// The next pushes are signed by these keys in turn; the last one signs every later push.
+    pub fn script(&self, keys: Vec<(ed25519_dalek::SigningKey, WitnessKey)>) {
+        *self.inner.keys.lock().unwrap() = keys.into();
     }
 
     pub fn set(&self, behaviour: Behaviour) {
@@ -196,7 +216,15 @@ async fn add(State(w): State<Arc<Inner>>, body: String) -> (StatusCode, String) 
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs();
-            let line = w.key.cosign(&w.signer, &cp, now);
+            let (signer, key) = {
+                let mut keys = w.keys.lock().unwrap();
+                match keys.len() {
+                    0 => (w.signer.clone(), w.key.clone()),
+                    1 => keys[0].clone(),
+                    _ => keys.pop_front().unwrap(),
+                }
+            };
+            let line = key.cosign(&signer, &cp, now);
             latest.insert(cp.origin.clone(), cp);
             if matches!(behaviour, Behaviour::StoreThenFail) {
                 record(500);

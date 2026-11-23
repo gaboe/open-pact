@@ -46,6 +46,8 @@ struct Options {
     real_client: bool,
     /// No witness and `allow_split_views = true` (needs count 0).
     split_views: bool,
+    /// The witnesses the manifest lists, by index (default: all).
+    listed: Option<Vec<usize>>,
 }
 
 impl Options {
@@ -58,6 +60,7 @@ impl Options {
             duplicate_urls: false,
             real_client: false,
             split_views: false,
+            listed: None,
         }
     }
 }
@@ -74,6 +77,44 @@ fn witness_seed(index: usize) -> [u8; 32] {
     [u8::try_from(index + 1).unwrap(); 32]
 }
 
+/// The demo manifest with this witness list ("{ name = .., key = .. }" entries) and quorum.
+/// `split_views`: no witness and `allow_split_views`. `real_client`: one control every host passes.
+fn manifest_text(listed: &[String], quorum: usize, split_views: bool, real_client: bool) -> String {
+    let start = DEMO.find("witnesses = [").unwrap();
+    let end =
+        DEMO[start..].find("witness_quorum = 1").unwrap() + start + "witness_quorum = 1".len();
+    let toml = if split_views {
+        format!(
+            "{}witnesses = []\nwitness_quorum = 0\nallow_split_views = true{}",
+            &DEMO[..start],
+            &DEMO[end..]
+        )
+    } else {
+        format!(
+            "{}witnesses = [{}]\nwitness_quorum = {}{}",
+            &DEMO[..start],
+            listed.join(", "),
+            quorum,
+            &DEMO[end..]
+        )
+    };
+    if !real_client {
+        return toml;
+    }
+    // One control that only reports a value, so every host passes it.
+    let from = toml.find("[[control]]").unwrap();
+    let keep = toml
+        .find("[[control]]\nid = \"managed_repos_total\"")
+        .unwrap();
+    let keep_end = keep + 1 + toml[keep + 1..].find("[[control]]").unwrap();
+    let to = toml.find("[log]").unwrap();
+    format!("{}{}{}", &toml[..from], &toml[keep..keep_end], &toml[to..])
+}
+
+fn listed_entry(key: &open_pact_core::WitnessKey) -> String {
+    format!("{{ name = \"{}\", key = \"{}\" }}", key.name(), key.vkey())
+}
+
 impl Fixture {
     async fn new(count: usize, quorum: usize) -> Fixture {
         Fixture::build(Options::new(count, quorum)).await
@@ -83,7 +124,7 @@ impl Fixture {
         let db = testdb::fresh_with_max_connections(options.pool).await;
         let kek = SealingKey::new(&KEK);
         let keys = Keys::load_or_create(&db, &kek).await.unwrap();
-        let log = LogKey::new("log.example.org/test", &PublicKey::from(&keys.log));
+        let log = log_key(&keys).unwrap();
         let mut witnesses = vec![];
         for index in 0..options.count {
             let name = format!("witness.example.org/w{index}");
@@ -91,45 +132,16 @@ impl Fixture {
         }
         let listed: Vec<String> = witnesses
             .iter()
-            .map(|w| {
-                format!(
-                    "{{ name = \"{}\", key = \"{}\" }}",
-                    w.inner.key.name(),
-                    w.inner.key.vkey()
-                )
-            })
+            .enumerate()
+            .filter(|(i, _)| options.listed.as_ref().is_none_or(|l| l.contains(i)))
+            .map(|(_, w)| listed_entry(&w.inner.key))
             .collect();
-        let start = DEMO.find("witnesses = [").unwrap();
-        let end =
-            DEMO[start..].find("witness_quorum = 1").unwrap() + start + "witness_quorum = 1".len();
-        let toml = format!(
-            "{}witnesses = [{}]\nwitness_quorum = {}{}",
-            &DEMO[..start],
-            listed.join(", "),
+        let toml = manifest_text(
+            &listed,
             options.quorum,
-            &DEMO[end..]
+            options.split_views,
+            options.real_client,
         );
-        let toml = if options.split_views {
-            format!(
-                "{}witnesses = []\nwitness_quorum = 0\nallow_split_views = true{}",
-                &DEMO[..start],
-                &DEMO[end..]
-            )
-        } else {
-            toml
-        };
-        let toml = if options.real_client {
-            // One control that only reports a value, so every host passes it.
-            let from = toml.find("[[control]]").unwrap();
-            let keep = toml
-                .find("[[control]]\nid = \"managed_repos_total\"")
-                .unwrap();
-            let keep_end = keep + 1 + toml[keep + 1..].find("[[control]]").unwrap();
-            let to = toml.find("[log]").unwrap();
-            format!("{}{}{}", &toml[..from], &toml[keep..keep_end], &toml[to..])
-        } else {
-            toml
-        };
         let manifest = Manifest::parse(toml.as_bytes()).unwrap();
         let policy = manifest.body().log.clone().unwrap();
         let log_state = Log::new(keys.log.clone(), log.clone(), Witnesses::new(Some(&policy)));
