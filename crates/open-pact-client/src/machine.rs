@@ -1213,6 +1213,15 @@ mod doc_blocks {
     const WINDOWS_INSTALL: &str = include_str!("../../../docs/windows-machine-install.md");
     const RELEASE_NOTES: &str = include_str!("../../../docs/release-notes/v0.9.0.md");
     const README: &str = include_str!("../../../README.md");
+    const RELEASE_REMOVE: &str = "### Step 1: Find and remove the old SYSTEM task";
+    const RELEASE_INSTALL: &str = "### Step 2: Install the 0.9.0 package";
+    const RELEASE_START: &str = "### Step 3: Start the SYSTEM job";
+    const CLIENT_INSTALL: &str = "### Install the machine client for the SYSTEM job";
+    const CLIENT_START: &str = "### Use Windows SYSTEM checks";
+    const CLIENT_REMOVE: &str = "### Stop the scheduled claims and remove the client";
+    const WINDOWS_INSTALL_HEADING: &str = "## Install with the block";
+    const WINDOWS_START: &str = "## Start the SYSTEM job for each home";
+    const WINDOWS_REMOVE: &str = "## Remove the package";
     const HOME: &str = r"C:\Users\example\pact";
     const TASK: &str = "org.open-pact.report.0123abcd";
     const MACHINE: &str = r"C:\Program Files\open-pact-client\open-pact-client.exe";
@@ -1247,6 +1256,22 @@ $repair = Start-Process -FilePath $msiexec -ArgumentList ('/fa "' + $msi + '" /q
 if ($repair.ExitCode -eq 3010) { Write-Output 'Restart Windows to finish the repair.' }
 elseif ($repair.ExitCode -ne 0) { throw ('The repair failed. Exit code: ' + $repair.ExitCode) }"#;
 
+    /// The commands that check the saved `--user-home` of an old task against the rule of 0.9.0, before
+    /// the task is removed. The reader writes the value into a here-string.
+    const PROFILE_CHECK: &str = r#"$userHome = @'
+<the --user-home value of the task>
+'@
+$list = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'
+$profiles = @(Get-ChildItem -LiteralPath $list | Where-Object { $_.PSChildName -like 'S-1-5-21-*' -or $_.PSChildName -like 'S-1-12-1-*' } | ForEach-Object { [Environment]::ExpandEnvironmentVariables([string]$_.GetValue('ProfileImagePath')) })
+$folder = Get-Item -LiteralPath $userHome -Force -ErrorAction SilentlyContinue
+$reason = $null
+if ($userHome.Contains('%')) { $reason = 'The folder name contains %.' }
+elseif (-not [IO.Path]::IsPathRooted($userHome)) { $reason = 'The folder is not an absolute path.' }
+elseif (-not $folder -or -not $folder.PSIsContainer) { $reason = 'The folder does not exist.' }
+elseif ($folder.Attributes -band [IO.FileAttributes]::ReparsePoint) { $reason = 'The folder is a link.' }
+elseif (-not ($profiles | Where-Object { $_.TrimEnd('\') -eq $userHome.TrimEnd('\') })) { $reason = 'Windows does not list the folder as the profile of a user account.' }
+if ($reason) { 'Not OK: ' + $reason; 'Profiles that Windows lists:'; $profiles } else { 'OK: version 0.9.0 accepts this profile.' }"#;
+
     /// The PowerShell script that lists the SYSTEM tasks that run one of `programs`. It selects by
     /// principal and by action, never by the name prefix alone, and it prints the arguments of
     /// each task, which hold `--home` and `--user-home`.
@@ -1269,7 +1294,7 @@ elseif ($repair.ExitCode -ne 0) { throw ('The repair failed. Exit code: ' + $rep
   Get-ScheduledTask -TaskPath '\' | Where-Object {{
     $_.TaskName -like 'org.open-pact.report.*' -and
     ($system -contains $_.Principal.UserId) -and
-    @($_.Actions | Where-Object {{ $_.Execute -and ($programs -contains $_.Execute.Trim('"')) }}).Count -gt 0
+    @($_.Actions | Where-Object {{ $_.Execute -and ($programs -contains ($_.Execute.Trim('"') -replace '^\\\\\?\\', '')) }}).Count -gt 0
   }} | ForEach-Object {{
     'Task: ' + $_.TaskName
     'Program: ' + (($_.Actions | ForEach-Object {{ $_.Execute }}) -join ' ')
@@ -1321,9 +1346,41 @@ elseif ($repair.ExitCode -ne 0) { throw ('The repair failed. Exit code: ' + $rep
         found
     }
 
-    /// True when exactly one fence of `doc` is `script`.
-    fn shows(doc: &str, script: &str) -> bool {
-        fences(doc).iter().filter(|fence| *fence == script).count() == 1
+    /// The lines of `doc` from the line `heading` to the next heading of the same or a higher level.
+    /// A line inside a fence is never a heading.
+    fn section(doc: &str, heading: &str) -> String {
+        let depth = heading.chars().take_while(|c| *c == '#').count();
+        let mut found = false;
+        let mut in_fence = false;
+        let mut lines = Vec::new();
+        for line in doc.lines() {
+            if line.starts_with("```") {
+                in_fence = !in_fence;
+            } else if !in_fence && line.starts_with('#') {
+                let level = line.chars().take_while(|c| *c == '#').count();
+                if found && level <= depth {
+                    break;
+                }
+                if line == heading {
+                    found = true;
+                }
+            }
+            if found {
+                lines.push(line);
+            }
+        }
+        assert!(found, "the heading `{heading}` is missing");
+        lines.join("\n")
+    }
+
+    /// True when exactly one fence under the heading `heading` of `doc` is `script`. The same
+    /// script under another heading does not count.
+    fn shows(doc: &str, heading: &str, script: &str) -> bool {
+        fences(&section(doc, heading))
+            .iter()
+            .filter(|fence| *fence == script)
+            .count()
+            == 1
     }
 
     fn install_text() -> String {
@@ -1347,14 +1404,22 @@ elseif ($repair.ExitCode -ne 0) { throw ('The repair failed. Exit code: ' + $rep
     #[test]
     fn every_doc_shows_the_install_block_that_the_client_prints() {
         let block = install_text();
-        for (name, doc) in [
-            ("docs/client.md", CLIENT),
-            ("docs/windows-machine-install.md", WINDOWS_INSTALL),
-            ("docs/release-notes/v0.9.0.md", RELEASE_NOTES),
+        for (name, doc, heading) in [
+            ("docs/client.md", CLIENT, CLIENT_INSTALL),
+            (
+                "docs/windows-machine-install.md",
+                WINDOWS_INSTALL,
+                WINDOWS_INSTALL_HEADING,
+            ),
+            (
+                "docs/release-notes/v0.9.0.md",
+                RELEASE_NOTES,
+                RELEASE_INSTALL,
+            ),
         ] {
             assert!(
-                shows(doc, &block),
-                "{name} must show exactly the install block for 0.9.0"
+                shows(doc, heading, &block),
+                "{name} must show exactly the install block for 0.9.0 under `{heading}`"
             );
         }
     }
@@ -1362,13 +1427,17 @@ elseif ($repair.ExitCode -ne 0) { throw ('The repair failed. Exit code: ' + $rep
     #[test]
     fn the_docs_show_the_removal_block_with_the_machine_client() {
         let block = removal_with_machine();
-        for (name, doc) in [
-            ("docs/client.md", CLIENT),
-            ("docs/windows-machine-install.md", WINDOWS_INSTALL),
+        for (name, doc, heading) in [
+            ("docs/client.md", CLIENT, CLIENT_REMOVE),
+            (
+                "docs/windows-machine-install.md",
+                WINDOWS_INSTALL,
+                WINDOWS_REMOVE,
+            ),
         ] {
             assert!(
-                shows(doc, &block),
-                "{name} must show exactly the removal block with the machine client"
+                shows(doc, heading, &block),
+                "{name} must show exactly the removal block with the machine client under `{heading}`"
             );
         }
     }
@@ -1376,7 +1445,7 @@ elseif ($repair.ExitCode -ne 0) { throw ('The repair failed. Exit code: ' + $rep
     #[test]
     fn the_release_notes_show_the_removal_block_without_the_machine_client() {
         assert!(
-            shows(RELEASE_NOTES, &removal_text(None)),
+            shows(RELEASE_NOTES, RELEASE_REMOVE, &removal_text(None)),
             "the release notes must show exactly the removal block without the machine client"
         );
     }
@@ -1401,34 +1470,112 @@ elseif ($repair.ExitCode -ne 0) { throw ('The repair failed. Exit code: ' + $rep
             assert!(script.contains("$env:ProgramW6432"));
             assert!(script.contains("$_.Arguments"));
         }
-        assert!(shows(RELEASE_NOTES, &legacy_list()));
-        assert!(shows(WINDOWS_INSTALL, &both_list()));
-        assert!(shows(CLIENT, &both_list()));
+        assert!(shows(RELEASE_NOTES, RELEASE_REMOVE, &legacy_list()));
+        assert!(shows(WINDOWS_INSTALL, WINDOWS_REMOVE, &both_list()));
+        assert!(shows(CLIENT, CLIENT_REMOVE, &both_list()));
+    }
+
+    #[test]
+    fn the_filters_accept_the_long_path_prefix_of_an_action() {
+        for script in [legacy_list(), both_list()] {
+            assert!(script.contains(r"-replace '^\\\\\?\\', ''"));
+        }
+    }
+
+    #[test]
+    fn the_release_notes_check_the_profile_before_they_remove_the_task() {
+        assert!(shows(RELEASE_NOTES, RELEASE_REMOVE, PROFILE_CHECK));
+        let step = section(RELEASE_NOTES, RELEASE_REMOVE);
+        let check = step.find("ProfileList").unwrap();
+        let removal = step.find("/Delete").unwrap();
+        assert!(
+            check < removal,
+            "the profile check comes before the removal"
+        );
+        // The rule of 0.9.0: no %, an absolute folder that exists, not a link, listed as a profile.
+        for part in [
+            "Contains('%')",
+            "IsPathRooted",
+            "PSIsContainer",
+            "ReparsePoint",
+            "S-1-5-21-*",
+            "S-1-12-1-*",
+            "ProfileImagePath",
+            "'OK: ",
+            "'Not OK: ",
+        ] {
+            assert!(PROFILE_CHECK.contains(part), "the check lacks {part}");
+        }
+        assert!(PROFILE_LIST_SCRIPT.contains("ProfileList"));
+        assert!(PROFILE_LIST_SCRIPT.contains("S-1-5-21-*"));
+        assert!(PROFILE_LIST_SCRIPT.contains("S-1-12-1-*"));
+        assert!(PROFILE_LIST_SCRIPT.contains("ProfileImagePath"));
+    }
+
+    #[test]
+    fn a_block_under_the_wrong_heading_does_not_count() {
+        let doc =
+            "## Install\n\n```powershell\nstart\n```\n\n## Start\n\n```powershell\ninstall\n```\n";
+        assert!(shows(doc, "## Install", "start"));
+        assert!(shows(doc, "## Start", "install"));
+        assert!(!shows(doc, "## Install", "install"));
+        assert!(!shows(doc, "## Start", "start"));
+        // A line that starts with # inside a fence ends no section.
+        let doc = "## Install\n\n```powershell\n# note\ninstall\n```\n";
+        assert!(shows(doc, "## Install", "# note\ninstall"));
+    }
+
+    #[test]
+    fn the_install_and_start_blocks_stay_under_their_own_steps() {
+        assert!(!shows(RELEASE_NOTES, RELEASE_START, &install_text()));
+        assert!(!shows(RELEASE_NOTES, RELEASE_INSTALL, START_COMMANDS));
+        assert!(!shows(CLIENT, CLIENT_START, &install_text()));
+        assert!(!shows(CLIENT, CLIENT_INSTALL, START_COMMANDS));
+        assert!(!shows(WINDOWS_INSTALL, WINDOWS_START, &install_text()));
+        assert!(!shows(
+            WINDOWS_INSTALL,
+            WINDOWS_INSTALL_HEADING,
+            START_COMMANDS
+        ));
     }
 
     #[test]
     fn the_start_and_repair_commands_are_the_same_in_every_guide() {
-        for (name, doc) in [
-            ("docs/client.md", CLIENT),
-            ("docs/windows-machine-install.md", WINDOWS_INSTALL),
-            ("docs/release-notes/v0.9.0.md", RELEASE_NOTES),
+        for (name, doc, start, repair) in [
+            ("docs/client.md", CLIENT, CLIENT_START, CLIENT_INSTALL),
+            (
+                "docs/windows-machine-install.md",
+                WINDOWS_INSTALL,
+                WINDOWS_START,
+                WINDOWS_INSTALL_HEADING,
+            ),
+            (
+                "docs/release-notes/v0.9.0.md",
+                RELEASE_NOTES,
+                RELEASE_START,
+                RELEASE_INSTALL,
+            ),
         ] {
             assert!(
-                shows(doc, START_COMMANDS),
-                "{name} must show the start commands"
+                shows(doc, start, START_COMMANDS),
+                "{name} must show the start commands under `{start}`"
             );
             assert!(
-                shows(doc, REPAIR_COMMANDS),
-                "{name} must show the repair commands"
+                shows(doc, repair, REPAIR_COMMANDS),
+                "{name} must show the repair commands under `{repair}`"
             );
         }
-        for (name, doc) in [
-            ("docs/client.md", CLIENT),
-            ("docs/windows-machine-install.md", WINDOWS_INSTALL),
+        for (name, doc, heading) in [
+            ("docs/client.md", CLIENT, CLIENT_REMOVE),
+            (
+                "docs/windows-machine-install.md",
+                WINDOWS_INSTALL,
+                WINDOWS_REMOVE,
+            ),
         ] {
             assert!(
-                shows(doc, OFF_COMMANDS),
-                "{name} must show the removal commands"
+                shows(doc, heading, OFF_COMMANDS),
+                "{name} must show the removal commands under `{heading}`"
             );
         }
     }
@@ -1441,6 +1588,7 @@ elseif ($repair.ExitCode -ne 0) { throw ('The repair failed. Exit code: ' + $rep
             removal_text(None),
             legacy_list(),
             both_list(),
+            PROFILE_CHECK.to_owned(),
             START_COMMANDS.to_owned(),
             OFF_COMMANDS.to_owned(),
             REPAIR_COMMANDS.to_owned(),
