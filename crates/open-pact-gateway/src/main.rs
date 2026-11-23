@@ -904,10 +904,11 @@ async fn log_mine(
             device.push(with_proof(entry)?);
         }
     }
+    let manifest = manifest.ok_or_else(|| internal("manifest log entry missing"))?;
     app.count_served(metrics::Caller::Mine, served);
     Ok(Json(MyEntries {
         checkpoint: checkpoint.to_string(),
-        manifest: manifest.ok_or_else(|| internal("manifest log entry missing"))?,
+        manifest,
         device,
     }))
 }
