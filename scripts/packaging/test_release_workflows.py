@@ -61,6 +61,14 @@ class ReleaseVerifyGateTest(unittest.TestCase):
         self.assertLess(verify, release.index("gh release create"))
         self.assertLess(verify, release.index("gh release upload"))
 
+    def test_the_release_job_does_not_keep_the_checkout_token(self):
+        release = jobs("client-release.yml")["release"]
+        self.assertEqual(release.count("actions/checkout@v6"), 1)
+        self.assertIn(
+            "      - uses: actions/checkout@v6\n        with:\n          persist-credentials: false\n",
+            release,
+        )
+
 
 class ImageVersionGateTest(unittest.TestCase):
     def test_each_image_push_job_checks_the_tag_version_before_it_pushes(self):
