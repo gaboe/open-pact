@@ -655,6 +655,62 @@ mod tests {
     /// Run with TEST_DATABASE_URL set, as the other database tests.
     #[tokio::test]
     #[ignore = "needs TEST_DATABASE_URL"]
+    async fn a_proof_reads_approval_and_entries_from_one_snapshot() {
+        let db = crate::testdb::fresh().await;
+        let manifest = format!("sha256:{}", "ab".repeat(32));
+        let device = format!("pseudonym:{}", hex::encode([7u8; 32]));
+        crate::testdb::enrolled_device(&db, &device, &manifest).await;
+        let commitment = commitment("00", &device).unwrap();
+        {
+            let mut conn = db.acquire().await.unwrap();
+            translog::append(
+                &mut conn,
+                EntryKind::DeviceEnrolled,
+                json!({ "commitment": commitment }),
+            )
+            .await
+            .unwrap();
+        }
+        let pseudonym = Pseudonym::try_from(device.clone()).unwrap();
+        let mut tx = translog::begin_proof(&db).await.unwrap();
+        let read = bound(&mut tx, &pseudonym, &manifest)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.state, State::Approved);
+        // Another connection revokes the device and commits while the proof transaction is open.
+        apply(&db, &device, Action::Revoke).await.unwrap();
+        let again = bound(&mut tx, &pseudonym, &manifest)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            again.state,
+            State::Approved,
+            "the proof transaction saw a revocation that came after its snapshot"
+        );
+        let entries = translog::mine(&mut tx, 1, &manifest, &commitment)
+            .await
+            .unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "the entries were read from a later snapshot"
+        );
+        tx.commit().await.unwrap();
+        // A proof that starts after the revocation reads it: the handler answers 403 here.
+        let mut tx = translog::begin_proof(&db).await.unwrap();
+        let later = bound(&mut tx, &pseudonym, &manifest)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(later.state, State::Revoked);
+        tx.commit().await.unwrap();
+    }
+
+    /// Run with TEST_DATABASE_URL set, as the other database tests.
+    #[tokio::test]
+    #[ignore = "needs TEST_DATABASE_URL"]
     async fn the_note_comes_from_the_invitation_the_device_used() {
         let db = crate::testdb::fresh().await;
         let manifest = format!("sha256:{}", "ab".repeat(32));

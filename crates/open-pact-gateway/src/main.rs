@@ -1247,7 +1247,13 @@ async fn log_mine(
     let cp = Checkpoint::parse(&note.text).map_err(internal)?;
     // The wait above can last seconds, so the approval is read again on the connection that reads
     // the entries: a device revoked during the wait gets the 403, not its entries.
-    let mut tx = app.begin(metrics::Site::OtherTx).await?;
+    let mut tx = metrics::timed(
+        app.metrics(),
+        |m, secs| m.db_acquire(metrics::Site::OtherTx, secs),
+        translog::begin_proof(&app.db),
+    )
+    .await
+    .map_err(internal)?;
     let enrolment = approved_enrolment(&app, &mut tx, &request.pseudonym).await?;
     let commitment =
         devices::commitment(&enrolment.salt, request.pseudonym.as_str()).map_err(internal)?;
@@ -2018,6 +2024,8 @@ async fn serve(db: PgPool) -> anyhow::Result<()> {
     let addr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
     // Checked first: a bad token or certificate refuses startup before any other work.
     let observation = metrics::Settings::from_env()?;
+    // The diagnostic writer starts before the listener, so its start failure is reported here.
+    diag::start();
     let registry = observation
         .listener
         .is_some()
@@ -2316,8 +2324,8 @@ async fn shutdown_signal() {
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .expect("install SIGTERM handler");
     tokio::select! {
-        _ = term.recv() => diag::line("SIGTERM: finishing open requests".into()),
-        _ = tokio::signal::ctrl_c() => diag::line("SIGINT: finishing open requests".into()),
+        _ = term.recv() => eprintln!("SIGTERM: finishing open requests"),
+        _ = tokio::signal::ctrl_c() => eprintln!("SIGINT: finishing open requests"),
     }
 }
 

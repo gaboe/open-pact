@@ -89,6 +89,12 @@ impl Diag {
 
 static PROCESS: LazyLock<Diag> = LazyLock::new(|| Diag::start(stderr()));
 
+/// Starts the writer thread now. A failed start is reported on stderr by this call, not by the
+/// first request that queues a line.
+pub fn start() {
+    LazyLock::force(&PROCESS);
+}
+
 /// Queues a diagnostic line from a request path. It never waits and never writes stderr.
 pub fn line(line: String) {
     PROCESS.line(line);
