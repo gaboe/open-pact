@@ -540,13 +540,14 @@ elseif ($install.ExitCode -ne 0) { throw ('The install failed. See ' + $log) }
 /// The winget line for IT deployments, once the package is published there.
 fn winget_line() -> Option<&'static str> {
     WINGET_PUBLISHED.then_some(
-        "For IT deployment that runs as SYSTEM (Intune, GPO): winget install --exact --id gaboe.open-pact --source winget --scope machine. Winget in a user session downloads into that user's temp folder first, so use the block above there.",
+        "For IT deployment, deploy the verified MSI with your deployment tool. Microsoft does not support the winget command-line tool as SYSTEM, even when Intune or Group Policy starts it.",
     )
 }
 
 /// The block that removes the SYSTEM task of `home` with Windows tools, for an elevated prompt. It
-/// has no `Remove-Item`. With the machine client at `machine`, its last line runs `schedule off`,
-/// which waits for the state lock and removes the state folder. The client never runs these lines
+/// has no `Remove-Item`. With the machine client at `machine`, its last lines run `schedule off`,
+/// which waits for the state lock and removes the state folder, and throw when it fails, so the
+/// reader never uninstalls the package after a failed cleanup. The client never runs these lines
 /// itself.
 pub(crate) fn removal_block(home: &Path, task_id: &str, machine: Option<&Path>) -> String {
     let id = powershell_literal(task_id);
@@ -557,7 +558,12 @@ pub(crate) fn removal_block(home: &Path, task_id: &str, machine: Option<&Path>) 
     };
     let path = powershell_literal(&task_path);
     let last = machine
-        .map(|machine| format!("\n  {}", apply_command(home, "schedule off", machine)))
+        .map(|machine| {
+            format!(
+                "\n  {}\n  if ($LASTEXITCODE -ne 0) {{ throw 'schedule off failed. Do not uninstall the package. Fix the error, then run this block again.' }}",
+                apply_command(home, "schedule off", machine)
+            )
+        })
         .unwrap_or_default();
     let mut text = format!(
         r#"& {{
@@ -1082,6 +1088,13 @@ mod tests {
         let last = block.find("schedule off").unwrap();
         assert!(query < last);
         assert!(block.contains(&apply_command(home, "schedule off", machine)));
+        // A failed cleanup stops the block, so the next step never uninstalls the package.
+        let off = block
+            .find(&apply_command(home, "schedule off", machine))
+            .unwrap();
+        let exit = block.find("\n  if ($LASTEXITCODE -ne 0) { throw 'schedule off failed. Do not uninstall the package.").unwrap();
+        assert!(off < exit && exit < block.find("\n}").unwrap());
+        assert_eq!(block.matches("$LASTEXITCODE").count(), 2);
         #[cfg(windows)]
         assert!(block.contains(r"& 'C:\Program Files\open-pact-client\open-pact-client.exe' --home 'C:\Users\it''s a\pact' schedule off"));
         assert!(block.contains("Remove that folder after you removed every open-pact SYSTEM task"));
@@ -1185,12 +1198,81 @@ mod doc_blocks {
     const CLIENT: &str = include_str!("../../../docs/client.md");
     const WINDOWS_INSTALL: &str = include_str!("../../../docs/windows-machine-install.md");
     const RELEASE_NOTES: &str = include_str!("../../../docs/release-notes/v0.9.0.md");
+    const README: &str = include_str!("../../../README.md");
     const HOME: &str = r"C:\Users\example\pact";
     const TASK: &str = "org.open-pact.report.0123abcd";
     const MACHINE: &str = r"C:\Program Files\open-pact-client\open-pact-client.exe";
-    /// The last line of the removal block with the machine client. Windows builds print it, so
-    /// the docs show this text. Other builds print a bare command name there.
+    /// The line that runs `schedule off` in the removal block with the machine client. Windows
+    /// builds print it, so the docs show this text. Other builds print a bare command name there.
     const OFF_LINE: &str = r"& 'C:\Program Files\open-pact-client\open-pact-client.exe' --home 'C:\Users\example\pact' schedule off";
+    const NOT_WINDOWS_OFF_LINE: &str =
+        r"open-pact-client --home 'C:\Users\example\pact' schedule off";
+
+    /// The PowerShell script that lists the SYSTEM tasks that run one of `programs`. It selects by
+    /// principal and by action, never by the name prefix alone, and it prints the arguments of
+    /// each task, which hold `--home` and `--user-home`.
+    fn task_list(programs: &[(&str, &str)]) -> String {
+        let mut text = String::from("& {\n");
+        for (name, relative) in programs {
+            text.push_str(&format!(
+                "  ${} = Join-Path $env:ProgramW6432 '{}'\n",
+                name, relative
+            ));
+        }
+        let names = programs
+            .iter()
+            .map(|(name, _)| format!("${}", name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        text.push_str(&format!(
+            r#"  $system = @('SYSTEM', 'NT AUTHORITY\SYSTEM', 'S-1-5-18')
+  $programs = @({names})
+  Get-ScheduledTask -TaskPath '\' | Where-Object {{
+    $_.TaskName -like 'org.open-pact.report.*' -and
+    ($system -contains $_.Principal.UserId) -and
+    @($_.Actions | Where-Object {{ $_.Execute -and ($programs -contains $_.Execute.Trim('"')) }}).Count -gt 0
+  }} | ForEach-Object {{
+    'Task: ' + $_.TaskName
+    'Program: ' + (($_.Actions | ForEach-Object {{ $_.Execute }}) -join ' ')
+    'Arguments: ' + (($_.Actions | ForEach-Object {{ $_.Arguments }}) -join ' ')
+  }}
+}}"#
+        ));
+        text
+    }
+
+    fn legacy_list() -> String {
+        task_list(&[("legacy", r"open-pact\open-pact-client.exe")])
+    }
+
+    fn both_list() -> String {
+        task_list(&[
+            ("legacy", r"open-pact\open-pact-client.exe"),
+            ("machine", r"open-pact-client\open-pact-client.exe"),
+        ])
+    }
+
+    /// The contents of each ````powershell` fence of `doc`, without the fence lines.
+    fn fences(doc: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        let mut current: Option<Vec<&str>> = None;
+        for line in doc.lines() {
+            match (&mut current, line.trim_end()) {
+                (None, "```powershell") => current = Some(Vec::new()),
+                (Some(lines), "```") => {
+                    found.push(lines.join("\n"));
+                    current = None;
+                }
+                (Some(lines), _) => lines.push(line),
+                (None, _) => {}
+            }
+        }
+        found
+    }
+
+    fn shows(doc: &str, script: &str) -> bool {
+        fences(doc).iter().any(|fence| fence == script)
+    }
 
     fn install_text() -> String {
         install_block(&Version::parse("0.9.0").unwrap())
@@ -1205,10 +1287,15 @@ mod doc_blocks {
             .to_owned()
     }
 
-    /// The removal block with the machine client, up to its last line, which only Windows prints as OFF_LINE.
-    fn removal_head() -> String {
+    /// The removal block with the machine client, in the form that Windows prints.
+    fn removal_with_machine() -> String {
         let text = removal_text(Some(Path::new(MACHINE)));
-        text.rsplit_once("\n  ").unwrap().0.to_owned()
+        if cfg!(windows) {
+            text
+        } else {
+            assert_eq!(text.matches(NOT_WINDOWS_OFF_LINE).count(), 1);
+            text.replace(NOT_WINDOWS_OFF_LINE, OFF_LINE)
+        }
     }
 
     #[test]
@@ -1220,22 +1307,22 @@ mod doc_blocks {
             ("docs/release-notes/v0.9.0.md", RELEASE_NOTES),
         ] {
             assert!(
-                doc.contains(&block),
-                "{name} must show the install block for 0.9.0"
+                shows(doc, &block),
+                "{name} must show exactly the install block for 0.9.0"
             );
         }
     }
 
     #[test]
     fn the_docs_show_the_removal_block_with_the_machine_client() {
-        let head = removal_head();
+        let block = removal_with_machine();
         for (name, doc) in [
             ("docs/client.md", CLIENT),
             ("docs/windows-machine-install.md", WINDOWS_INSTALL),
         ] {
             assert!(
-                doc.contains(&format!("{head}\n  {OFF_LINE}\n}}")),
-                "{name} must show the removal block with the machine client"
+                shows(doc, &block),
+                "{name} must show exactly the removal block with the machine client"
             );
         }
     }
@@ -1243,29 +1330,60 @@ mod doc_blocks {
     #[test]
     fn the_release_notes_show_the_removal_block_without_the_machine_client() {
         assert!(
-            RELEASE_NOTES.contains(&removal_text(None)),
-            "the release notes must show the removal block without the machine client"
+            shows(RELEASE_NOTES, &removal_text(None)),
+            "the release notes must show exactly the removal block without the machine client"
         );
+    }
+
+    #[test]
+    fn the_removal_block_stops_when_schedule_off_fails() {
+        let block = removal_with_machine();
+        assert!(block.ends_with(
+            "\n  if ($LASTEXITCODE -ne 0) { throw 'schedule off failed. Do not uninstall the package. Fix the error, then run this block again.' }\n}"
+        ));
+        for doc in [CLIENT, WINDOWS_INSTALL] {
+            assert!(doc.contains("Do not uninstall the package"));
+        }
+    }
+
+    #[test]
+    fn the_legacy_tasks_are_selected_by_principal_and_action() {
+        for script in [legacy_list(), both_list()] {
+            assert!(script.contains("$_.Principal.UserId"));
+            assert!(script.contains("$_.Actions"));
+            assert!(script.contains("$_.Execute"));
+            assert!(script.contains("$env:ProgramW6432"));
+            assert!(script.contains("$_.Arguments"));
+        }
+        assert!(shows(RELEASE_NOTES, &legacy_list()));
+        assert!(shows(WINDOWS_INSTALL, &both_list()));
+    }
+
+    #[test]
+    fn no_elevated_example_runs_the_client_by_its_bare_name() {
+        for (name, doc) in [
+            ("README.md", README),
+            ("docs/client.md", CLIENT),
+            ("docs/windows-machine-install.md", WINDOWS_INSTALL),
+            ("docs/release-notes/v0.9.0.md", RELEASE_NOTES),
+        ] {
+            for fence in fences(doc) {
+                if fence.contains("--system") || fence.contains("schedule off") {
+                    assert!(
+                        !fence
+                            .lines()
+                            .any(|line| line.starts_with("open-pact-client")),
+                        "{name} runs the client by name in an elevated example:\n{fence}"
+                    );
+                }
+            }
+        }
     }
 
     #[cfg(windows)]
     #[test]
     fn the_windows_removal_block_ends_with_the_documented_line() {
         let text = removal_block(Path::new(HOME), TASK, Some(Path::new(MACHINE)));
-        assert!(text.contains(&format!("\n  {OFF_LINE}\n}}")));
-    }
-
-    #[test]
-    fn no_doc_names_the_old_client_copy_under_program_files() {
-        for (name, doc) in [
-            ("docs/client.md", CLIENT),
-            ("docs/windows-machine-install.md", WINDOWS_INSTALL),
-            ("docs/release-notes/v0.9.0.md", RELEASE_NOTES),
-        ] {
-            assert!(
-                !doc.contains(r"open-pact\open-pact-client.exe"),
-                "{name} names the old copy"
-            );
-        }
+        assert!(text.contains(&format!("\n  {OFF_LINE}\n  if ($LASTEXITCODE")));
     }
 }
