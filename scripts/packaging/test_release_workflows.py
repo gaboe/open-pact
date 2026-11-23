@@ -50,6 +50,18 @@ class OneCreatorTest(unittest.TestCase):
         self.assertIn("actions/checkout", note)
 
 
+class ReleaseVerifyGateTest(unittest.TestCase):
+    def test_the_release_job_verifies_the_signed_sums_before_it_generates_or_uploads(self):
+        release = jobs("client-release.yml")["release"]
+        self.assertIn("dtolnay/rust-toolchain@1.100.0", release)
+        self.assertIn("--example verify_release", release)
+        self.assertIn("dist/SHA256SUMS.sigstore.json", release)
+        verify = release.index("--example verify_release")
+        self.assertLess(verify, release.index("generate-release-metadata.py"))
+        self.assertLess(verify, release.index("gh release create"))
+        self.assertLess(verify, release.index("gh release upload"))
+
+
 class ImageVersionGateTest(unittest.TestCase):
     def test_each_image_push_job_checks_the_tag_version_before_it_pushes(self):
         all_jobs = jobs("image.yml")
