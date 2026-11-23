@@ -599,4 +599,35 @@ mod tests {
         };
         assert_eq!(moved.leaf_hash(), e.leaf_hash());
     }
+
+    /// S6.2 timing: one run is one root of the whole prefix and three inclusion proofs over it, the
+    /// hashing the gateway does per request. Run it in release, with the output shown:
+    /// `rtk proxy cargo test --release -p open-pact-core timing_one_run -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing run: release build only"]
+    fn timing_one_run_of_prefix_root_and_three_proofs() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        const RUNS: usize = 5;
+        for n in [1_000usize, 20_000, 100_000] {
+            let leaves: Vec<LogHash> = (0..n as u64).map(|i| leaf_hash(&i.to_be_bytes())).collect();
+            let indices = [0u64, (n / 2) as u64, (n - 1) as u64];
+            let one_run = || {
+                let started = Instant::now();
+                black_box(root(black_box(&leaves[..n])));
+                for m in indices {
+                    black_box(inclusion_proof(black_box(&leaves[..n]), m).unwrap());
+                }
+                started.elapsed().as_secs_f64() * 1e3
+            };
+            one_run();
+            let times: Vec<f64> = (0..RUNS).map(|_| one_run()).collect();
+            let min = times.iter().copied().fold(f64::INFINITY, f64::min);
+            let max = times.iter().copied().fold(0.0, f64::max);
+            println!(
+                "TIMING leaves={n} runs={RUNS} min_ms={min:.3} max_ms={max:.3} spread_pct={:.1}",
+                (max - min) / min * 100.0
+            );
+        }
+    }
 }
