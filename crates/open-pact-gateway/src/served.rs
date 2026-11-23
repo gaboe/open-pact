@@ -271,11 +271,10 @@ impl App {
             if past() {
                 return Answer::Unavailable(Why::NotYet);
             }
-            let exhausted = self
-                .owners
-                .views()
-                .iter()
-                .all(|v| v.idle && (v.cooling || (v.tried >= tree.size() && v.failures == 0)));
+            let exhausted =
+                self.owners.views().iter().all(|v| {
+                    v.idle && (v.cooling() || (v.tried >= tree.size() && v.failures == 0))
+                });
             if exhausted {
                 return match self
                     .final_read(policy, &tree, floor, deadline, &mut uncached)

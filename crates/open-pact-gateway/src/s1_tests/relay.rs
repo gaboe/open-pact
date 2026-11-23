@@ -194,7 +194,7 @@ async fn a_lost_database_reply_ends_the_attempt() {
     let first = line_time(&f, size, root, &rows[0].1);
     let _ = reader.await.unwrap();
     until("the cooldown passed", Duration::from_secs(5), || {
-        f.app.owners.views().iter().all(|v| !v.cooling)
+        f.app.owners.views().iter().all(|v| !v.cooling())
     })
     .await;
     // The witness signs with a new time (whole seconds), so L2 differs from L1.

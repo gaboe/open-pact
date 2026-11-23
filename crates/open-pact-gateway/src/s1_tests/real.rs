@@ -811,7 +811,7 @@ async fn a_claim_push_ignores_the_cooldown() {
     f.witnesses[0].set(Behaviour::Answer(500));
     f.app.owners.refresh_all();
     until("the renewal failed", Duration::from_secs(5), || {
-        f.app.owners.views().iter().all(|v| v.cooling)
+        f.app.owners.views().iter().all(|v| v.cooling())
     })
     .await;
     f.witnesses[0].set(Behaviour::Healthy);
