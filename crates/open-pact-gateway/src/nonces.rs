@@ -1,10 +1,13 @@
 //! Durability contract. Issuing a nonce commits with `synchronous_commit = off`, so the advisory
 //! lock below is held for no WAL flush. A database crash can lose an issued, unused nonce (the
-//! last 0.6 s of commits at most, three times `wal_writer_delay`). The client then gets
-//! "unknown or used nonce" and asks for a new one. Consuming a nonce always commits with
-//! `synchronous_commit = on`: a consumed nonce never comes back after a crash, and that flush
-//! also covers every earlier issue. This holds for a single primary with `fsync` on. A promoted
-//! asynchronous replica can lose consumes as well; use synchronous replication where that matters.
+//! last 0.6 s of commits at most, three times `wal_writer_delay`, which is 200 ms by default). The
+//! client then gets "unknown or used nonce" and asks for a new one. Consuming a nonce raises an
+//! `off` session default to `local`, so the primary flushes the delete to durable storage before
+//! the commit returns (`fsync` on). A consumed nonce never comes back after a crash of that
+//! primary, and that flush also covers every earlier issue. A session that already sets `local`,
+//! `on` or `remote_apply` keeps that setting. Standby acknowledgement follows the session setting
+//! as on base. A promoted asynchronous replica can lose consumes as well; use synchronous
+//! replication where that matters.
 
 use sqlx::{PgConnection, PgPool};
 
@@ -49,7 +52,8 @@ async fn issue_in(tx: &mut PgConnection, cap: i64) -> sqlx::Result<Option<String
 }
 
 /// Removes a nonce. `Some(true)`: it was live and is consumed. `Some(false)`: it had expired.
-/// `None`: unknown or already used. The commit is durable whatever the server or session default.
+/// `None`: unknown or already used. The commit flushes to the primary's disk before it returns: an
+/// `off` session default is raised to `local`, and the other settings already flush.
 pub async fn consume(db: &PgPool, nonce: &str) -> sqlx::Result<Option<bool>> {
     let mut tx = db.begin().await?;
     let live = consume_in(&mut tx, nonce).await?;
@@ -58,13 +62,20 @@ pub async fn consume(db: &PgPool, nonce: &str) -> sqlx::Result<Option<bool>> {
 }
 
 async fn consume_in(tx: &mut PgConnection, nonce: &str) -> sqlx::Result<Option<bool>> {
-    sqlx::query("SET LOCAL synchronous_commit = on")
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query_scalar("DELETE FROM nonces WHERE nonce = $1 RETURNING expires_at > now()")
-        .bind(nonce)
-        .fetch_optional(&mut *tx)
-        .await
+    // Raises only `off` to `local`. `on`, `local` and `remote_apply` stay as the session set them.
+    sqlx::query(
+        "SELECT set_config('synchronous_commit', \
+         CASE WHEN current_setting('synchronous_commit') = 'off' THEN 'local' \
+         ELSE current_setting('synchronous_commit') END, true)",
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query_scalar(
+        "DELETE FROM nonces WHERE nonce = $1 RETURNING expires_at > now()",
+    )
+    .bind(nonce)
+    .fetch_optional(&mut *tx)
+    .await
 }
 
 pub async fn delete_expired(db: &PgPool) -> sqlx::Result<u64> {
@@ -159,18 +170,48 @@ mod tests {
 
         let mut tx = conn.begin().await.unwrap();
         assert_eq!(consume_in(&mut tx, &nonce).await.unwrap(), Some(true));
-        assert_eq!(show(&mut tx, "synchronous_commit").await, "on");
+        assert_eq!(show(&mut tx, "synchronous_commit").await, "local");
         tx.commit().await.unwrap();
         assert_eq!(show(&mut conn, "synchronous_commit").await, "local");
     }
 
-    /// The consume commit has to reach disk at its own commit, not at a later write. The pool has
-    /// an asynchronous session default, checked first. `marker` is read inside the transaction,
-    /// before its commit record, so a synchronous commit has flushed at least up to it. Without
-    /// the override in `consume_in` the flush trails by up to the WAL writer delay.
     #[tokio::test]
     #[ignore = "needs TEST_DATABASE_URL"]
-    async fn a_consume_is_flushed_at_its_own_commit_under_an_async_session_default() {
+    async fn consume_raises_only_an_off_session_default_to_local() {
+        let db = testdb::fresh().await;
+        for (session, inside) in [
+            ("off", "local"),
+            ("local", "local"),
+            ("on", "on"),
+            ("remote_apply", "remote_apply"),
+        ] {
+            let mut conn = db.acquire().await.unwrap();
+            sqlx::query(&format!("SET synchronous_commit = {session}"))
+                .execute(&mut *conn)
+                .await
+                .unwrap();
+            let nonce = issue(&db, 10).await.unwrap().unwrap();
+            let mut tx = conn.begin().await.unwrap();
+            assert_eq!(consume_in(&mut tx, &nonce).await.unwrap(), Some(true));
+            assert_eq!(
+                show(&mut tx, "synchronous_commit").await,
+                inside,
+                "session default {session}"
+            );
+            tx.commit().await.unwrap();
+            assert_eq!(show(&mut conn, "synchronous_commit").await, session);
+        }
+    }
+
+    /// Evidence, not proof, that a consume flushes through its own delete record. The pool has an
+    /// asynchronous session default, checked first. `marker` is read inside the transaction,
+    /// before its commit record exists, so a flush at or past it covers the delete record. Another
+    /// write can advance the flush position too, so a pass does not show that the commit record
+    /// was flushed. The settings test above pins the override; the crash check in
+    /// `scripts/check-nonce-durability.sh` is the other evidence.
+    #[tokio::test]
+    #[ignore = "needs TEST_DATABASE_URL"]
+    async fn a_consume_flushes_through_its_delete_record_under_an_async_session_default() {
         let db = testdb::fresh_with_session_settings(&[("synchronous_commit", "off")]).await;
         let mut conn = db.acquire().await.unwrap();
         assert_eq!(show(&mut conn, "synchronous_commit").await, "off");
@@ -192,7 +233,7 @@ mod tests {
                     .unwrap();
             assert!(
                 flushed,
-                "round {round}: the consume commit was not flushed at its commit"
+                "round {round}: the consume's delete record was not flushed at its commit"
             );
             assert_eq!(consume(&db, &nonce).await.unwrap(), None);
         }
