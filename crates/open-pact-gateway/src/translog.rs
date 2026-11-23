@@ -20,6 +20,8 @@ pub async fn lock(conn: &mut PgConnection) -> sqlx::Result<()> {
         .map(drop)
 }
 
+/// The partial indexes `log_entries_manifest` and `log_entries_commitment` (migration 0013) serve
+/// this query. Each `kind` list here must equal the `kind` predicate of its index in that migration.
 pub async fn mine(
     conn: &mut PgConnection,
     size: u64,
