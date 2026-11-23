@@ -61,6 +61,24 @@ class ReleaseVerifyGateTest(unittest.TestCase):
         self.assertLess(verify, release.index("gh release create"))
         self.assertLess(verify, release.index("gh release upload"))
 
+    def test_the_verify_step_checks_the_exact_files_and_cannot_be_skipped(self):
+        release = jobs("client-release.yml")["release"]
+        step = re.search(
+            r"^      - name: Verify that the release workflow signed SHA256SUMS\n(.*?)(?=^      - |\Z)",
+            release,
+            flags=re.M | re.S,
+        )
+        self.assertIsNotNone(step)
+        step = step.group(1)
+        self.assertRegex(
+            step,
+            r'(?m)^        run: cargo run --locked --release -p open-pact-client --example verify_release'
+            r' -- "\$TAG" "\$GITHUB_REPOSITORY" dist/SHA256SUMS dist/SHA256SUMS\.sigstore\.json$',
+        )
+        self.assertNotIn("continue-on-error", step)
+        self.assertNotIn("always()", step)
+        self.assertNotIn("if:", step)
+
     def test_the_release_job_does_not_keep_the_checkout_token(self):
         release = jobs("client-release.yml")["release"]
         self.assertEqual(release.count("actions/checkout@v6"), 1)
