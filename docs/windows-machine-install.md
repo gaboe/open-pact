@@ -119,7 +119,7 @@ For a device that ran a SYSTEM job before 0.9.0, take both values from the old t
 
 Run every command in an elevated Windows PowerShell 5.1 prompt. Uninstalling the package does not remove SYSTEM tasks. Remove each task first.
 
-1. List the SYSTEM tasks. The command selects tasks by their principal and by the program that they run. It never selects a limited user task by the name prefix alone. Write down the task name, the program and the `--home` value of each task:
+1. List the SYSTEM tasks. The command selects tasks by their principal and by the program that they run. It never selects a limited user task by the name prefix alone. Write down the task name, the number of actions, the program and the `--home` value of each task:
 
 ```powershell
 & {
@@ -133,6 +133,7 @@ Run every command in an elevated Windows PowerShell 5.1 prompt. Uninstalling the
     @($_.Actions | Where-Object { $_.Execute -and ($programs -contains ($_.Execute.Trim('"') -replace '^\\\\\?\\', '')) }).Count -gt 0
   } | ForEach-Object {
     'Task: ' + $_.TaskName
+    'Actions: ' + @($_.Actions).Count
     'Program: ' + (($_.Actions | ForEach-Object { $_.Execute }) -join ' ')
     'Arguments: ' + (($_.Actions | ForEach-Object { $_.Arguments }) -join ' ')
   }
@@ -154,9 +155,9 @@ $global:LASTEXITCODE = $null
 if ($LASTEXITCODE -ne 0) { throw 'schedule off failed. Do not uninstall the package. Fix the error, then run this command again.' }
 ```
 
-   A task with more than one action is not a task of the client. The list shows every program of the task. `schedule off` refuses such a task. Open it in Task Scheduler and read every action. When you know each action, remove the task with the block of step 3 or in Task Scheduler.
+   A task whose Actions line is not 1 is not a task of the client. `schedule off` refuses such a task. Open it in Task Scheduler and read every action. When you know each action, remove the task in Task Scheduler.
 
-3. A task whose program is the old copy, `open-pact\open-pact-client.exe`, needs the removal block. The list can show the program with a `\\?\` prefix. It is the same file. Replace three samples in the block:
+3. A task whose program is the old copy, `open-pact\open-pact-client.exe`, and whose Actions line is 1, needs the removal block. The list can show the program with a `\\?\` prefix. It is the same file. Replace three samples in the block:
    - The task name `org.open-pact.report.0123abcd`, in every place where it appears.
    - The home line `C:\Users\example\pact`, between `@'` and `'@`. Use the `--home` value of the task. Do not add quotes.
    - The folder `C:\Program Files`. Use the output of `$env:ProgramW6432`.
@@ -205,4 +206,49 @@ C:\Users\example\pact
 4. Run the command of step 1 again. It must print nothing.
 5. Uninstall the open-pact client package. Use Settings, Apps, or your deployment tool.
 
-The command of step 1 lists only tasks that run as SYSTEM and run the old copy or the machine client. A SYSTEM task that runs another program can come from an older open-pact client. The client does not change it. To remove it without the package, open the task in Task Scheduler and read every action. Then use the block in step 1 of the [0.9.0 release notes](release-notes/v0.9.0.md#step-1-find-and-remove-the-old-system-task). That block uses Windows tools only. The block of step 3 and that block delete the task name that you give them and do not check the program.
+The command of step 1 lists only tasks that run as SYSTEM and run the old copy or the machine client. A SYSTEM task that runs another program can come from an older open-pact client. The client does not change it.
+
+## Remove a task without the package
+
+Use this section when the machine client is not installed, or when a task has more than one action. The block uses Windows tools only.
+
+1. Open the task in Task Scheduler.
+2. Read every action of the task.
+3. Run the block below in an elevated Windows PowerShell 5.1 prompt, only when you know each action.
+4. Replace the task name `org.open-pact.report.0123abcd` in every place where it appears.
+5. Replace the home line `C:\Users\example\pact`, between `@'` and `'@`, with the `--home` value of the task. Do not add quotes.
+
+The block deletes the task name that you give it. It does not check the program.
+
+```powershell
+& {
+  $schtasks = Join-Path ([Environment]::SystemDirectory) 'schtasks.exe'
+  function Test-TaskRegistered {
+    # The Task Scheduler COM API reports a missing task as HRESULT 0x80070002, in every display language.
+    $service = New-Object -ComObject Schedule.Service
+    $service.Connect()
+    try {
+      [void]$service.GetFolder('\').GetTask('\org.open-pact.report.0123abcd')
+      return $true
+    } catch {
+      $e = $_.Exception
+      while ($e.InnerException) { $e = $e.InnerException }
+      if ($e.HResult -eq -2147024894) { return $false }
+      throw ('Could not query the task. ' + $_)
+    }
+  }
+  function End-TaskQuietly {
+    # /End fails for a task that is not running. That does not matter here: /Delete decides.
+    $ErrorActionPreference = 'Continue'
+    & $schtasks /End /TN 'org.open-pact.report.0123abcd' 2>$null | Out-Null
+  }
+  if (Test-TaskRegistered) {
+    End-TaskQuietly
+    & $schtasks /Delete /TN 'org.open-pact.report.0123abcd' /F
+    if ($LASTEXITCODE -ne 0) { throw 'The task was not removed. Run this block again from an elevated prompt.' }
+  }
+  if (Test-TaskRegistered) { throw 'The task is still registered. Run this block again.' }
+}
+```
+
+The block leaves the state folder in `%ProgramData%\open-pact\system`. The next `schedule on --system` writes new job state in that folder and sets its permissions again.
