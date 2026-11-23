@@ -235,7 +235,7 @@ Two switches show what the gateway does. Both are off in the binary. The Helm ch
 
 **Slow-request log.** Set `SLOW_REQUEST_MS` (Helm `gateway.slowRequestMs`) to a number of milliseconds. A request that takes longer writes one line to stderr, for example `slow_request route=/v1/claim method=POST status=2xx ms=1234`. At most one line goes out a second. The next line ends with `suppressed=N`, the count of slow requests left out. `0` or unset turns the log off. It needs no metrics listener.
 
-**Metrics.** Set `METRICS_ADDR` to start a listener. Without it there is no listener, no registry and no timing layer. The listener serves only `GET /metrics` in the Prometheus text format, on its own port. The public router has no `/metrics` route. These settings are required with `METRICS_ADDR`, and the gateway refuses to start without them:
+**Metrics.** Set `METRICS_ADDR` to start a listener. Without it there is no listener and no registry. The timing layer runs when `METRICS_ADDR` or the slow-request log is set, and with neither no request is timed. The listener serves only `GET /metrics` in the Prometheus text format, on its own port. The public router has no `/metrics` route. These settings are required with `METRICS_ADDR`, and the gateway refuses to start without them:
 
 | Setting | Meaning |
 | --- | --- |
@@ -244,7 +244,7 @@ Two switches show what the gateway does. Both are off in the binary. The Helm ch
 
 An address on a loopback IP (`127.0.0.1`, `::1`) may run without TLS. The token is still required. Any other address without a certificate refuses startup. A scrape without the token, or with a wrong one, gets 401. The gateway reads the token and the certificate at start, so a rotated one takes effect after a restart. Helm restarts the gateway when you change `metrics.rotation`.
 
-The listener takes at most 16 connections at a time, and each one closes after its answer. A client must send its request headers within 5 seconds, and finish its TLS handshake within 5 seconds. A new connection waits up to 10 seconds for a free slot, then the listener drops it. `HEAD` gets 405.
+The listener takes at most 16 connections at a time, and each one closes after its answer. A client must send its request headers within 5 seconds, and finish its TLS handshake within 5 seconds. A new connection waits up to 10 seconds for a free slot, then the listener drops it. Each connection gets 10 seconds in all, from accept to close, so a response that the client never reads frees its slot. `HEAD` and every other method except `GET` get 405 with `Allow: GET`.
 
 For Helm, set `metrics.enabled=true`, `metrics.tokenSecret.name` (key `token`) and `metrics.tlsSecret.name` (a `kubernetes.io/tls` Secret, for example from cert-manager). The chart opens container port 9090, adds a separate ClusterIP Service `<release>-metrics` and keeps the port out of the Ingress. The certificate must be valid for `<release>-metrics.<namespace>.svc`. Set `metrics.networkPolicy.from` to limit the port to your Prometheus. Without it, every pod in the cluster can reach the metrics port. After each renewal of the certificate or the token, run `helm upgrade --set metrics.rotation=<new value>`. cert-manager renews the Secret without a restart, so the gateway keeps the old certificate until you change the value. Prometheus scrapes with `scheme: https`, `tls_config.ca_file`, `tls_config.server_name` and `authorization.credentials_file`.
 
