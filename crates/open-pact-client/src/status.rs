@@ -558,7 +558,7 @@ async fn collect_with(
         }
     }
     if !config_damaged && config.system_job_pending {
-        report.pending_system_job(home, online);
+        report.pending_system_job(home, online, &command);
     }
     if let Some(note) = changed_note
         && !report
@@ -590,8 +590,11 @@ async fn collect_with(
             fix: None,
             command: None,
             stop_job_command: config.auto_send.then(|| {
-                if config.run_as == RunAs::System {
+                if config.run_as == RunAs::System && online {
                     crate::schedule::system_stop_text(&home.0)
+                } else if config.run_as == RunAs::System {
+                    // Local mode starts no process, so the package state is not known here.
+                    crate::schedule::system_stop_text_unprobed(&home.0)
                 } else {
                     format!("{command} schedule off")
                 }
@@ -1095,15 +1098,14 @@ impl Report {
     }
 
     /// Automatic sending waits for the SYSTEM job that the wizard could not install.
-    fn pending_system_job(&mut self, home: &Home, online: bool) {
+    fn pending_system_job(&mut self, home: &Home, online: bool, command: &str) {
+        // Local mode probes nothing, so it cannot know that the machine client passed its
+        // protection check. It names no line that runs it and points at the online report.
         let fix = if online {
             crate::schedule::system_on_text(&home.0)
         } else {
-            crate::machine::machine_command(
-                &home.0,
-                "schedule on --system",
-                &crate::machine::machine_path(),
-                None,
+            format!(
+                "Run `{command} status --online` to check the machine client. Install or repair it first when it is missing. Then run its `schedule on --system` from an elevated PowerShell prompt."
             )
         };
         self.issue_text(

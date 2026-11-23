@@ -51,6 +51,21 @@ pub enum MachineState {
     Current,
 }
 
+impl MachineState {
+    /// The protection check passed and `--version` answered. Only then may a text name the machine
+    /// client in a line that an administrator runs.
+    pub(crate) fn usable(self) -> bool {
+        matches!(self, Self::Current | Self::Outdated)
+    }
+
+    /// Whether an administrator can run the machine client after the package fix of this state: the
+    /// machine client is usable, or the fix is an install block that puts a verified one in place.
+    /// An unprotected or unreadable one stays unusable after a fix that only describes it.
+    pub(crate) fn usable_after_fix(self) -> bool {
+        self.usable() || self == Self::Missing
+    }
+}
+
 /// The machine client compared with the running client. A running client older than the machine
 /// client is no problem: the job runs the newer one.
 pub(crate) fn machine_state(machine: &MachineClient, running: &Version) -> MachineState {
@@ -222,8 +237,17 @@ fn parse_version(output: &str) -> Result<Version> {
     Ok(Version::parse(word)?)
 }
 
+// How many times this thread read the machine client, for the tests that must show that a local
+// report starts no process.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Reads the machine client. One PowerShell start for the protection, then `Q --version`.
 pub(crate) fn read_machine_client() -> MachineClient {
+    #[cfg(test)]
+    PROBES.with(|probes| probes.set(probes.get() + 1));
     let machine = match machine_executable() {
         Ok(machine) => machine,
         Err(error) => {
@@ -251,8 +275,16 @@ pub(crate) fn read_machine_client() -> MachineClient {
 }
 
 /// The owner's profile that a SYSTEM job reads: an absolute path to a folder that exists, with no
-/// `%` and no control character.
+/// `%` and no control character, that is not a link, and that Windows lists as the profile of a
+/// user account. A user chooses `USERPROFILE` and the arguments of a task, so neither is a source.
 pub(crate) fn validate_user_home(path: &Path) -> Result<PathBuf> {
+    validate_user_home_in(path, registered_profiles)
+}
+
+fn validate_user_home_in(
+    path: &Path,
+    profiles: impl FnOnce() -> Result<Option<Vec<PathBuf>>>,
+) -> Result<PathBuf> {
     let text = path_text(path)?;
     if text.contains('%') {
         bail!("the user home must not contain %");
@@ -260,13 +292,63 @@ pub(crate) fn validate_user_home(path: &Path) -> Result<PathBuf> {
     if !path.is_absolute() {
         bail!("the user home must be an absolute path");
     }
-    if !path.is_dir() {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|_| anyhow::anyhow!("the user home is not a folder that exists"))?;
+    if metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
+        bail!("the user home must not be a link");
+    }
+    if !metadata.is_dir() {
         bail!("the user home is not a folder that exists");
+    }
+    if let Some(profiles) = profiles()?
+        && !profiles
+            .iter()
+            .any(|profile| same_windows_path(profile, path))
+    {
+        bail!("the user home is not the profile of a user account");
     }
     Ok(path.to_path_buf())
 }
 
-/// The install block, for an elevated Windows PowerShell. It makes an administrator-only folder
+#[cfg(windows)]
+fn is_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    metadata.file_attributes() & 0x400 != 0
+}
+
+#[cfg(not(windows))]
+fn is_reparse_point(_metadata: &std::fs::Metadata) -> bool {
+    false
+}
+
+/// The profile folders of the user accounts, from `HKLM\...\ProfileList`. Only a local, domain or
+/// Entra account counts, not SYSTEM or a service account. `None` where Windows keeps no such list.
+#[cfg(windows)]
+fn registered_profiles() -> Result<Option<Vec<PathBuf>>> {
+    let output = crate::schedule::windows_powershell(
+        r#"$ErrorActionPreference = 'Stop'
+Get-ChildItem -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList' |
+    Where-Object { $_.PSChildName -like 'S-1-5-21-*' -or $_.PSChildName -like 'S-1-12-1-*' } |
+    ForEach-Object { $path = [string]$_.GetValue('ProfileImagePath'); if ($path) { Write-Output ([Environment]::ExpandEnvironmentVariables($path)) } }"#,
+    )?;
+    Ok(Some(
+        output
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(PathBuf::from)
+            .collect(),
+    ))
+}
+
+#[cfg(not(windows))]
+fn registered_profiles() -> Result<Option<Vec<PathBuf>>> {
+    Ok(None)
+}
+
+/// The install block, for an elevated Windows PowerShell 5.1 (`powershell.exe`). The .NET Framework
+/// overloads that it uses do not exist in PowerShell 7, so the block stops there before it does
+/// anything, and every text that offers it says so. It makes an administrator-only folder
 /// with a name that no text predicts, checks that folder, downloads the package and a pinned Cosign
 /// into it, verifies the signature and the hash, and installs with System32 `msiexec.exe`. The
 /// folder stays, because Windows Installer repairs from it. The same block installs, upgrades and
@@ -288,12 +370,13 @@ pub(crate) fn install_block(version: &Version) -> String {
 }
 
 const INSTALL_TEMPLATE: &str = r#"& {
+if ($PSVersionTable.PSEdition -eq 'Core') { throw 'Run this block in Windows PowerShell 5.1: start powershell.exe as administrator, not pwsh.' }
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 @ASSERT_PROTECTED@
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-if (-not (New-Object Security.Principal.WindowsPrincipal($identity)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Run this block from an elevated PowerShell prompt.' }
+if (-not (New-Object Security.Principal.WindowsPrincipal($identity)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Run this block from an elevated Windows PowerShell 5.1 prompt (powershell.exe).' }
 $base = @BASE@
 $msiName = @MSI@
 $folder = Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) ('open-pact-install-' + [guid]::NewGuid())
@@ -426,7 +509,7 @@ pub(crate) fn machine_fix(
     match (state, machine) {
         (MachineState::Current, _) => None,
         (MachineState::Missing, _) => Some(format!(
-            "The machine client is not installed at {}. Install it from an elevated PowerShell prompt:\n{}",
+            "The machine client is not installed at {}. Install it from an elevated Windows PowerShell 5.1 prompt (powershell.exe, not pwsh):\n{}",
             path.display(),
             block()
         )),
@@ -436,7 +519,7 @@ pub(crate) fn machine_fix(
             block()
         )),
         (MachineState::Outdated, MachineClient::Present { version }) => Some(format!(
-            "The machine client at {} is version {version}, and this client is version {running}. Upgrade it from an elevated PowerShell prompt:\n{}\nIf you just installed an update, restart Windows.",
+            "The machine client at {} is version {version}, and this client is version {running}. Upgrade it from an elevated Windows PowerShell 5.1 prompt (powershell.exe, not pwsh):\n{}\nIf you just installed an update, restart Windows.",
             path.display(),
             block()
         )),
@@ -612,6 +695,64 @@ mod tests {
     }
 
     #[test]
+    fn a_profile_is_one_that_windows_lists_for_a_user_account_and_is_no_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("user");
+        std::fs::create_dir(&profile).unwrap();
+        let listed = |paths: Vec<PathBuf>| move || Ok(Some(paths));
+        assert_eq!(
+            validate_user_home_in(&profile, listed(vec![profile.clone()])).unwrap(),
+            profile
+        );
+        // Windows compares the paths without case.
+        let loud = PathBuf::from(profile.to_string_lossy().to_uppercase());
+        assert!(validate_user_home_in(&profile, listed(vec![loud])).is_ok());
+        // USERPROFILE and a task argument are the caller's words: a folder that is no listed
+        // profile is refused, and so is a registry that cannot be read.
+        let error =
+            validate_user_home_in(&profile, listed(vec![dir.path().join("other")])).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("not the profile of a user account")
+        );
+        assert!(validate_user_home_in(&profile, || bail!("registry")).is_err());
+        // A system without the list (not Windows) has no second source.
+        assert!(validate_user_home_in(&profile, || Ok(None)).is_ok());
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("link");
+            std::os::unix::fs::symlink(&profile, &link).unwrap();
+            let error = validate_user_home_in(&link, || Ok(None)).unwrap_err();
+            assert!(error.to_string().contains("must not be a link"), "{error}");
+        }
+    }
+
+    #[test]
+    fn only_a_machine_client_that_passed_its_protection_check_is_usable() {
+        let usable: Vec<_> = [
+            MachineState::Missing,
+            MachineState::Unprotected,
+            MachineState::Unknown,
+            MachineState::Outdated,
+            MachineState::Current,
+        ]
+        .into_iter()
+        .map(|state| (state.usable(), state.usable_after_fix()))
+        .collect();
+        assert_eq!(
+            usable,
+            [
+                (false, true),
+                (false, false),
+                (false, false),
+                (true, true),
+                (true, true)
+            ]
+        );
+    }
+
+    #[test]
     fn the_install_block_uses_full_path_tools_and_checks_before_it_trusts() {
         let block = install_block(&version("0.9.0"));
         // The folder name comes from a run-time GUID, in an administrator-only folder that is checked
@@ -648,7 +789,17 @@ mod tests {
         // msiexec and every other tool start by full path; nothing starts by bare name.
         assert!(block.contains("Join-Path ([Environment]::SystemDirectory) 'msiexec.exe'"));
         assert!(block.contains("/qn /norestart /l*v"));
-        assert!(!block.contains("& msiexec") && !block.contains("powershell.exe"));
+        assert!(!block.contains("& msiexec") && !block.contains("& powershell"));
+        // PowerShell 7 lacks the .NET overloads of the block, so the block stops there at its
+        // first line and names the program to start instead.
+        assert!(
+            block
+                .lines()
+                .nth(1)
+                .unwrap()
+                .contains("PSEdition -eq 'Core'")
+        );
+        assert!(block.contains("start powershell.exe as administrator, not pwsh"));
         assert!(block.contains("-eq 3010") && block.contains("Restart Windows"));
         assert!(block.starts_with("& {") && block.ends_with('}'));
         // It never installs from a folder that a name predicts.

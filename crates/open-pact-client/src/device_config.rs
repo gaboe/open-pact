@@ -595,7 +595,7 @@ mod tests {
     }
 
     #[test]
-    fn the_notice_names_the_elevated_command_for_a_system_job() {
+    fn the_notice_names_no_line_that_runs_a_machine_client_that_cannot_be_read() {
         let (_dir, home) = home();
         std::fs::write(
             home.file(LEGACY_FILE),
@@ -607,10 +607,12 @@ mod tests {
             ..DeviceConfig::default()
         };
         let notice = legacy_notice(&home, Surface::Job, "client", &config).unwrap();
+        // This machine has no machine client to read, so the notice offers the package fix
+        // alone. `schedule::tests` covers the line that a usable machine client gets.
         assert!(
-            notice.contains("elevated")
-                && notice.contains("schedule on --system")
-                && notice.contains(&home.0.to_string_lossy().into_owned()),
+            notice.contains("elevated PowerShell prompt run")
+                && notice.contains("Cannot read the machine client")
+                && !notice.contains("schedule on --system"),
             "{notice}"
         );
     }
