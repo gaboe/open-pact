@@ -386,6 +386,20 @@ jobs:
             # and leaves it, and status says so. The printed removal block removes it with Windows tools.
             Install-System $limited
             $id = Task-Name $limited
+            # The same task with Q in its extended spelling (\\?\ in front) is still the machine
+            # client's own: status and every change use one path rule and accept it.
+            $oursArguments = @((Get-ScheduledTask -TaskName $id).Actions)[0].Arguments
+            Unregister-ScheduledTask -TaskName $id -Confirm:$false
+            $extendedAction = New-ScheduledTaskAction -Execute ('\\?\' + $Q) -Argument $oursArguments
+            $extendedAt = New-ScheduledTaskTrigger -Once -At (Get-Date).AddYears(1)
+            $extendedPrincipal = New-ScheduledTaskPrincipal -UserId SYSTEM -LogonType ServiceAccount -RunLevel Highest
+            Register-ScheduledTask -TaskName $id -Action $extendedAction -Trigger $extendedAt -Principal $extendedPrincipal | Out-Null
+            $status = Get-ScheduleStatus $limited
+            if ($status -match "The job is not the machine client's\.") { throw "status calls the extended spelling of Q not ours: $status" }
+            $result = Invoke-Client $limited @('schedule', 'off')
+            if ($result[-1] -ne 0) { throw "schedule off refused the extended spelling of Q: $result" }
+            if (Get-ScheduledTask -TaskName $id -ErrorAction SilentlyContinue) { throw 'schedule off left the task with the extended spelling of Q' }
+            Install-System $limited
             Unregister-ScheduledTask -TaskName $id -Confirm:$false
             $other = Join-Path ([Environment]::SystemDirectory) 'cmd.exe'
             $foreign = New-ScheduledTaskAction -Execute $other -Argument '/c exit 0'

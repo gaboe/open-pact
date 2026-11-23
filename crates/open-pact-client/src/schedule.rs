@@ -786,6 +786,14 @@ fn systemd_arg(raw: &str) -> String {
     )
 }
 
+/// One argument of a command line, quoted only where Windows needs it, as Rust's own spawn does.
+fn windows_command_line_arg(raw: &str) -> String {
+    if !raw.is_empty() && !raw.contains([' ', '\t', '"']) {
+        return raw.to_owned();
+    }
+    windows_arg(raw)
+}
+
 fn windows_arg(raw: &str) -> String {
     let mut out = String::from("\"");
     let mut slashes = 0;
@@ -1170,17 +1178,23 @@ fn register(job: &Job, action: RegistrationAction) -> Result<()> {
         }
         open_pact_core::Os::Windows => match action {
             RegistrationAction::Install(run_as) => {
-                if run_as == TaskRunAs::System {
-                    windows_powershell(&windows_clear_for_system_script(
-                        job,
-                        &crate::machine::machine_path(),
-                    ))?;
-                }
                 let args = job.schtasks_install(run_as);
-                execute(
-                    "schtasks.exe",
-                    &args.iter().map(String::as_str).collect::<Vec<_>>(),
-                )?;
+                match run_as {
+                    TaskRunAs::System => {
+                        windows_powershell(&windows_clear_for_system_script(
+                            job,
+                            &crate::machine::machine_path(),
+                        ))?;
+                        execute(
+                            "schtasks.exe",
+                            &args.iter().map(String::as_str).collect::<Vec<_>>(),
+                        )?;
+                    }
+                    // The check and the create run in one PowerShell call.
+                    TaskRunAs::CurrentUser => {
+                        windows_powershell(&windows_register_user_script(job, &args))?;
+                    }
+                }
             }
             RegistrationAction::Uninstall => {
                 windows_uninstall(job, false, &crate::machine::machine_path())?;
@@ -1370,13 +1384,20 @@ function IsSystemTask($task) {{
     if (-not $user) {{ return $false }}
     return @('SYSTEM','NT AUTHORITY\SYSTEM','S-1-5-18') -contains $user.ToUpperInvariant()
 }}
+function NormalPath($value) {{
+    $text = ([string]$value).Trim().Trim('"')
+    if ($text.StartsWith('\\?\', [StringComparison]::OrdinalIgnoreCase)) {{ $text = $text.Substring(4) }}
+    return $text
+}}
 function IsOurs($task, $machine) {{
     $actions = @($task.Definition.Actions)
     if ($actions.Count -ne 1 -or -not $machine) {{ return $false }}
-    $path = ([string]$actions[0].Path).Trim().Trim('"')
+    $path = [string]$actions[0].Path
     $arguments = [string]$actions[0].Arguments
     if ($path -match '[\x00-\x1f\x7f]' -or $arguments -match '[\x00-\x1f\x7f]') {{ return $false }}
-    return $path -eq $machine
+    # One path rule for Rust and PowerShell (`same_windows_path`): a leading \\?\ and the case of
+    # the letters do not tell two paths apart.
+    return (NormalPath $path) -ieq (NormalPath $machine)
 }}
 $service = New-Object -ComObject 'Schedule.Service'
 $service.Connect()
@@ -1403,6 +1424,39 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 fn windows_require_elevation() -> Result<()> {
     windows_powershell(windows_require_elevation_script())?;
     Ok(())
+}
+
+/// The script that registers the task of `job` for the current user, with the `schtasks` `args`
+/// that `schtasks_install` made. It queries the task again in this same call and stops at a SYSTEM
+/// task, ours or not, before it creates anything: a user job never replaces a SYSTEM task, and an
+/// elevated switch to user mode has removed the machine client's own task before it comes here.
+/// `/Create /F` has no compare-and-create, so a SYSTEM task that an administrator adds between this
+/// check and the create is the one race that stays. A command that a standard user runs cannot
+/// replace a SYSTEM task in any case.
+fn windows_register_user_script(job: &Job, args: &[String]) -> String {
+    let query = windows_task_query_script(job);
+    let line = args
+        .iter()
+        .map(|arg| windows_command_line_arg(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        r#"{query}
+if ($null -ne $task -and (IsSystemTask $task)) {{ throw 'a SYSTEM task for this home exists, so a user job does not replace it. Run `schedule off` from an elevated prompt first' }}
+$info = New-Object Diagnostics.ProcessStartInfo
+$info.FileName = Join-Path ([Environment]::SystemDirectory) 'schtasks.exe'
+$info.Arguments = {line}
+$info.UseShellExecute = $false
+$info.RedirectStandardOutput = $true
+$info.RedirectStandardError = $true
+$info.CreateNoWindow = $true
+$process = [Diagnostics.Process]::Start($info)
+$printed = $process.StandardOutput.ReadToEnd() + $process.StandardError.ReadToEnd()
+$process.WaitForExit()
+if ($process.ExitCode -ne 0) {{ throw ('schtasks.exe failed with code ' + $process.ExitCode + ': ' + $printed.Trim()) }}
+"#,
+        line = powershell_literal(&line)
+    )
 }
 
 /// The script that removes the task of `job`. It deletes a task only after it checked, in this same
@@ -8013,6 +8067,75 @@ Write-Output 'refused'
         // The same line of ownership holds the action: one action, the machine path, no control character.
         assert!(query.contains("$actions.Count -ne 1"));
         assert!(query.contains(r"[\x00-\x1f\x7f]"));
+        // One path rule for both boundaries: the action and the machine path both lose a leading
+        // \\?\ and compare without case, as `same_windows_path` does in Rust.
+        assert!(query.contains(r"StartsWith('\\?\', [StringComparison]::OrdinalIgnoreCase)"));
+        assert!(query.contains("(NormalPath $path) -ieq (NormalPath $machine)"));
+        assert!(!query.contains("$path -eq $machine"));
+    }
+
+    #[test]
+    fn the_extended_spelling_of_the_machine_path_reaches_every_system_mutation() {
+        let job = Job::new(Path::new("client.exe"), Path::new("fixture-home")).unwrap();
+        // A task that Task Scheduler returns with the extended prefix is the machine client's own
+        // for the classifier (`a_task_is_classified_by_its_principal_and_its_actions`). Each
+        // script that changes a SYSTEM task applies the same rule to the action and to Q, whichever
+        // of the two carries the prefix.
+        for machine in [MACHINE.to_owned(), format!(r"\\?\{MACHINE}")] {
+            let machine = Path::new(&machine);
+            let literal = powershell_literal(&machine.to_string_lossy());
+            for script in [
+                windows_uninstall_script(&job, true, machine),
+                windows_clear_for_system_script(&job, machine),
+                windows_end_task_script(&job, false, machine),
+            ] {
+                assert!(
+                    script.contains(&format!("$machine = {literal}")),
+                    "{script}"
+                );
+                assert!(script.contains("(NormalPath $path) -ieq (NormalPath $machine)"));
+                assert!(script.contains("function NormalPath"));
+                assert!(
+                    script.find("function NormalPath").unwrap()
+                        < script.find("function IsOurs").unwrap()
+                );
+            }
+        }
+        assert!(same_windows_path(
+            Path::new(&format!(r"\\?\{MACHINE}")),
+            Path::new(MACHINE)
+        ));
+    }
+
+    #[test]
+    fn a_user_job_is_registered_in_the_call_that_checks_for_a_system_task() {
+        let job = Job::new(
+            Path::new(r"C:\Users\a b\open-pact-client.exe"),
+            Path::new(r"C:\Users\a b\pact"),
+        )
+        .unwrap();
+        let args = job.schtasks_install(TaskRunAs::CurrentUser);
+        let script = windows_register_user_script(&job, &args);
+        // The query, the refusal and the create are one script: the refusal comes first.
+        let query = script.find("$folder.GetTask(").unwrap();
+        let refusal = script
+            .find("if ($null -ne $task -and (IsSystemTask $task))")
+            .unwrap();
+        let create = script.find("[Diagnostics.Process]::Start($info)").unwrap();
+        assert!(query < refusal && refusal < create);
+        assert!(script.contains("a SYSTEM task for this home exists"));
+        assert!(script.contains("schtasks.exe"));
+        // The line that the script gives `schtasks` holds the same arguments, with the `/F` of a
+        // user task, and parses back to them.
+        let line = args
+            .iter()
+            .map(|arg| windows_command_line_arg(arg))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(split_windows_args(&line), args);
+        assert!(script.contains(&format!("$info.Arguments = {}", powershell_literal(&line))));
+        assert!(args.contains(&"/F".to_owned()) && args.contains(&"LIMITED".to_owned()));
+        assert!(!script.contains("/RU"), "no principal is set: {script}");
     }
 
     #[test]
