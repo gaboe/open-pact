@@ -1559,6 +1559,8 @@ dependencies = [
  "base64 0.23.1",
  "clap",
  "hex",
+ "hyper",
+ "hyper-util",
  "open-pact-core",
  "prometheus-client",
  "rand 0.9.5",
