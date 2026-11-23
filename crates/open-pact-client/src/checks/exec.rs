@@ -62,7 +62,7 @@ pub(super) fn run_stdout_with_limit(
     max_stdout: usize,
 ) -> Option<Ran> {
     let output = capture_limited(program, args, timeout, Some(max_stdout), POLL).ok()?;
-    if output.timed_out || output.stdout_overflowed {
+    if output.timed_out || output.stdout_overflowed || output.stdout_invalid_utf8 {
         return None;
     }
     Some(Ran {
@@ -74,11 +74,14 @@ pub(super) fn run_stdout_with_limit(
 #[derive(Debug)]
 pub struct CapturedOutput {
     pub status: Option<ExitStatus>,
-    /// The child did not exit before the deadline. A child that exits after it counts too.
+    /// The child did not exit before the deadline. With a stdout limit, a child that exits after it counts too.
     pub timed_out: bool,
     /// The child printed more than the stdout limit. `stdout` holds only the bytes before it.
     #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
     pub stdout_overflowed: bool,
+    /// The child's stdout was not valid UTF-8. `stdout` then has U+FFFD in place of those bytes.
+    #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+    pub stdout_invalid_utf8: bool,
     #[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
     pub elapsed: Duration,
     pub stdout: String,
@@ -210,9 +213,10 @@ fn capture_with(
             break child.wait().ok();
         }
         match child.try_wait() {
-            // An exit that this loop sees after the deadline is a timeout, as if it had been killed.
+            // With a stdout limit, an exit that this loop sees after the deadline is a timeout, as if
+            // it had been killed.
             Ok(Some(status)) => {
-                timed_out = Instant::now() >= deadline;
+                timed_out = max_stdout.is_some() && Instant::now() >= deadline;
                 break Some(status);
             }
             Ok(None) if Instant::now() < deadline => thread::sleep(poll),
@@ -229,7 +233,8 @@ fn capture_with(
     crate::timings::note_child(&child);
     let grace = Instant::now() + Duration::from_millis(250);
     let mut streams = [String::new(), String::new()];
-    for (stream, reader) in streams.iter_mut().zip(readers) {
+    let mut stdout_invalid_utf8 = false;
+    for (index, (stream, reader)) in streams.iter_mut().zip(readers).enumerate() {
         let Some((buf, reader)) = reader else {
             continue;
         };
@@ -239,6 +244,9 @@ fn capture_with(
         let bytes = buf
             .lock()
             .map_err(|_| std::io::Error::other("output reader panicked"))?;
+        if index == 0 {
+            stdout_invalid_utf8 = std::str::from_utf8(&bytes).is_err();
+        }
         *stream = String::from_utf8_lossy(&bytes).into_owned();
     }
     let [stdout, stderr] = streams;
@@ -246,6 +254,7 @@ fn capture_with(
         status,
         timed_out,
         stdout_overflowed: overflow.load(Ordering::Relaxed),
+        stdout_invalid_utf8,
         elapsed: start.elapsed(),
         stdout,
         stderr,
@@ -386,11 +395,40 @@ mod tests {
             "sh",
             &["-c", "printf late; sleep 0.15"],
             Duration::from_millis(100),
+            Some(1024),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        // The status is a success, so the late exit set the timeout, not a kill.
+        assert!(output.timed_out, "{output:?}");
+        assert!(output.status.unwrap().success(), "{output:?}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn an_exit_seen_after_the_deadline_is_kept_without_a_stdout_limit() {
+        let output = capture_limited(
+            "sh",
+            &["-c", "printf late; sleep 0.15"],
+            Duration::from_millis(100),
             None,
             Duration::from_millis(200),
         )
         .unwrap();
-        assert!(output.timed_out, "{output:?}");
+        assert!(!output.timed_out, "{output:?}");
+        assert!(output.status.unwrap().success(), "{output:?}");
+        assert_eq!(output.stdout, "late");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn stdout_that_is_not_utf8_is_none_with_a_limit() {
+        let script = "printf '\\377'";
+        let limited = run_stdout_with_limit("sh", &["-c", script], Duration::from_secs(5), 1024);
+        assert!(limited.is_none(), "invalid UTF-8 was accepted");
+        // Without a limit, the same byte comes back as U+FFFD.
+        let output = capture("sh", &["-c", script], Duration::from_secs(5)).unwrap();
+        assert_eq!(output.stdout, "\u{FFFD}");
     }
 
     #[test]
