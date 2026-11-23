@@ -12,9 +12,14 @@ spec:
     metadata:
       labels:
         app: {{ .Release.Name }}-gateway
-      {{- if .Values.manifest }}
+      {{- if or .Values.manifest .Values.metrics.enabled }}
       annotations:
+        {{- if .Values.manifest }}
         checksum/manifest: {{ .Values.manifest | sha256sum }}
+        {{- end }}
+        {{- if .Values.metrics.enabled }}
+        open-pact.io/metrics-rotation: {{ .Values.metrics.rotation | quote }}
+        {{- end }}
       {{- end }}
     spec:
       {{- with .Values.gateway.podSecurityContext }}
@@ -95,8 +100,8 @@ spec:
             - name: METRICS_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: {{ required "metrics.tokenSecret.name: create a Secret holding a random scrape token (openssl rand -hex 32) and name it here" .Values.metrics.tokenSecret.name }}
-                  key: {{ .Values.metrics.tokenSecret.key }}
+                  name: {{ required "metrics.tokenSecret.name: create a Secret holding a random scrape token (openssl rand -hex 32) and name it here" .Values.metrics.tokenSecret.name | quote }}
+                  key: {{ .Values.metrics.tokenSecret.key | quote }}
             - name: METRICS_TLS_CERT
               value: /etc/open-pact/metrics-tls/tls.crt
             - name: METRICS_TLS_KEY
@@ -147,7 +152,7 @@ spec:
         {{- if .Values.metrics.enabled }}
         - name: metrics-tls
           secret:
-            secretName: {{ required "metrics.tlsSecret.name: name a kubernetes.io/tls Secret (for example from cert-manager) for the metrics listener" .Values.metrics.tlsSecret.name }}
+            secretName: {{ required "metrics.tlsSecret.name: name a kubernetes.io/tls Secret (for example from cert-manager) for the metrics listener" .Values.metrics.tlsSecret.name | quote }}
             items:
               - key: tls.crt
                 path: tls.crt
@@ -186,7 +191,7 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ .Release.Name }}-gateway-metrics
+  name: {{ .Release.Name }}-metrics
 spec:
   type: ClusterIP
   selector:

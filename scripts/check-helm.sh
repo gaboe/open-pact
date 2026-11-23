@@ -76,7 +76,7 @@ echo "renders DATABASE_MAX_CONNECTIONS as \"25\" when database.maxConnections is
 echo "the gateway reads a database password with @:/?#% as PGPASSWORD from the Secret postgres uses"
 # Metrics are off by default. On, they need a token and a certificate, get their own port and
 # Service, and never reach the Ingress.
-! grep -q -E 'METRICS_|9090|gateway-metrics' <<< "$plain" || { echo "FAIL: metrics rendered while off"; exit 1; }
+! grep -q -E 'METRICS_|9090|-metrics|metrics-rotation' <<< "$plain" || { echo "FAIL: metrics rendered while off"; exit 1; }
 grep -q -A1 'name: SLOW_REQUEST_MS' <<< "$plain" || { echo "FAIL: the slow request log has no value"; exit 1; }
 metrics_on=("${kek[@]}" --set postgres.password=example-only --set metrics.enabled=true)
 refuses "metrics.tokenSecret.name" "${metrics_on[@]}" --set metrics.tlsSecret.name=pact-metrics-tls
@@ -84,7 +84,7 @@ refuses "metrics.tlsSecret.name" "${metrics_on[@]}" --set metrics.tokenSecret.na
 metrics_args=("${metrics_on[@]}" --set metrics.tokenSecret.name=pact-metrics-token --set metrics.tlsSecret.name=pact-metrics-tls --set ingress.enabled=true)
 with_metrics="$(helm template t "$chart" "${metrics_args[@]}")"
 document() { awk -v kind="$1" 'BEGIN { RS = "\n---\n" } $0 ~ ("\nkind: " kind "\n") { print }' <<< "$2"; }
-metrics_service="$(document Service "$with_metrics" | grep -A12 'name: t-gateway-metrics')"
+metrics_service="$(document Service "$with_metrics" | grep -A12 'name: t-metrics')"
 grep -q 'port: 9090' <<< "$metrics_service" && grep -q 'targetPort: metrics' <<< "$metrics_service" && grep -q 'type: ClusterIP' <<< "$metrics_service" \
   || { echo "FAIL: no separate ClusterIP Service for the metrics port: $metrics_service"; exit 1; }
 public_service="$(awk 'BEGIN { RS = "\n---\n" } /\nkind: Service\n/ && /\n  name: t-gateway\n/ { print }' <<< "$with_metrics")"
@@ -92,10 +92,19 @@ grep -q 'port: 80$' <<< "$public_service" || { echo "FAIL: found no public Servi
 ! grep -q -E '9090|metrics' <<< "$public_service" || { echo "FAIL: the public Service exposes the metrics port"; exit 1; }
 ! document Ingress "$with_metrics" | grep -q -i -E 'metrics|9090' || { echo "FAIL: the Ingress reaches the metrics port"; exit 1; }
 grep -q 'containerPort: 9090' <<< "$with_metrics"
+quoted="$(helm template t "$chart" "${metrics_on[@]}" --set-string metrics.tokenSecret.name=true \
+  --set-string metrics.tokenSecret.key=false --set-string metrics.tlsSecret.name=null)"
+grep -q 'name: "true"' <<< "$quoted" && grep -q 'key: "false"' <<< "$quoted" && grep -q 'secretName: "null"' <<< "$quoted" \
+  || { echo "FAIL: a Secret name or key renders as a YAML scalar of another type"; exit 1; }
+long_release="$(printf 'a%.0s' {1..53})"
+long_render="$(helm template "$long_release" "$chart" "${metrics_args[@]}")"
+grep -q "name: $long_release-metrics\$" <<< "$long_render" \
+  || { echo "FAIL: a 53-character release gets no metrics Service name of 61 characters"; exit 1; }
+grep -q 'open-pact.io/metrics-rotation: "1"' <<< "$with_metrics" || { echo "FAIL: no rotation annotation on the pod"; exit 1; }
 grep -q -A1 'name: METRICS_ADDR' <<< "$with_metrics"
-grep -A5 'name: METRICS_TOKEN' <<< "$with_metrics" | tr -d ' \n' | grep -q 'secretKeyRef:name:pact-metrics-tokenkey:token' \
+grep -A5 'name: METRICS_TOKEN' <<< "$with_metrics" | tr -d ' \n' | grep -q 'secretKeyRef:name:"pact-metrics-token"key:"token"' \
   || { echo "FAIL: METRICS_TOKEN must come from the token Secret"; exit 1; }
-grep -A3 'name: metrics-tls' <<< "$with_metrics" | grep -q 'secretName: pact-metrics-tls'
+grep -A3 'name: metrics-tls' <<< "$with_metrics" | grep -q 'secretName: "pact-metrics-tls"'
 grep -B1 -A2 'mountPath: /etc/open-pact/metrics-tls' <<< "$with_metrics" | grep -q 'readOnly: true' \
   || { echo "FAIL: the TLS Secret is not mounted read-only"; exit 1; }
 ! grep -q 'kind: NetworkPolicy' <<< "$with_metrics" || { echo "FAIL: a NetworkPolicy without sources"; exit 1; }
