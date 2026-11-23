@@ -969,7 +969,7 @@ fn command_result(program: &str, output: std::process::Output) -> Result<()> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        if program == "schtasks.exe" {
+        if program.rsplit(['\\', '/']).next() == Some("schtasks.exe") {
             bail!(
                 "schtasks.exe failed with code {:?}; run from an elevated prompt. {stderr} {stdout}",
                 output.status.code()
@@ -1185,8 +1185,9 @@ fn register(job: &Job, action: RegistrationAction) -> Result<()> {
                             job,
                             &crate::machine::machine_path(),
                         ))?;
+                        let schtasks = crate::machine::system_schtasks();
                         execute(
-                            "schtasks.exe",
+                            &schtasks.to_string_lossy(),
                             &args.iter().map(String::as_str).collect::<Vec<_>>(),
                         )?;
                     }
