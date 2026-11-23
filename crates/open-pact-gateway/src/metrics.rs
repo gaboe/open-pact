@@ -153,6 +153,8 @@ pub enum Push {
     Cosigned,
     Conflict,
     Refused,
+    /// The witness answered 200 without a cosignature from a manifest witness key.
+    Invalid,
     Error,
     Timeout,
 }
@@ -163,6 +165,7 @@ impl Push {
             Push::Cosigned => "cosigned",
             Push::Conflict => "conflict",
             Push::Refused => "refused",
+            Push::Invalid => "invalid",
             Push::Error => "error",
             Push::Timeout => "timeout",
         }

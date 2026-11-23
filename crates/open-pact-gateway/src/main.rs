@@ -2109,6 +2109,10 @@ mod tests {
             .route(
                 "/ahead/add-checkpoint",
                 post(|| async { (StatusCode::CONFLICT, "0") }),
+            )
+            .route(
+                "/empty/add-checkpoint",
+                post(|| async { StatusCode::OK }),
             );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -2116,7 +2120,7 @@ mod tests {
         let mut app = manifest_app(DEMO).await;
         app.observe = observe;
         let mut enforced = manifests::enforced(DEMO, &app.keys, None).unwrap();
-        let urls = ["failing", "refusing", "ahead"].map(|name| format!("{base}/{name}"));
+        let urls = ["failing", "refusing", "ahead", "empty"].map(|name| format!("{base}/{name}"));
         Arc::get_mut(&mut enforced.log).unwrap().witnesses =
             Witnesses::new(urls.to_vec(), enforced.manifest.body().log.as_ref()).unwrap();
         app.enforced = Arc::new(enforced);
@@ -2133,7 +2137,7 @@ mod tests {
         app.checkpoint(metrics::Caller::Checkpoint).await.unwrap();
         server.abort();
         let text = metrics.scrape(&app.db);
-        for result in ["error", "refused", "conflict"] {
+        for result in ["error", "refused", "conflict", "invalid"] {
             let line = format!("openpact_witness_push_seconds_count{{result=\"{result}\"}} 1");
             assert!(text.contains(&line), "{result} missing: {text}");
         }
