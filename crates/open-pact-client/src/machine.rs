@@ -1176,3 +1176,96 @@ mod tests {
         assert!(!missing.contains("winget"));
     }
 }
+
+#[cfg(test)]
+mod doc_blocks {
+    use super::*;
+    use std::path::Path;
+
+    const CLIENT: &str = include_str!("../../../docs/client.md");
+    const WINDOWS_INSTALL: &str = include_str!("../../../docs/windows-machine-install.md");
+    const RELEASE_NOTES: &str = include_str!("../../../docs/release-notes/v0.9.0.md");
+    const HOME: &str = r"C:\Users\example\pact";
+    const TASK: &str = "org.open-pact.report.0123abcd";
+    const MACHINE: &str = r"C:\Program Files\open-pact-client\open-pact-client.exe";
+    /// The last line of the removal block with the machine client. Windows builds print it, so
+    /// the docs show this text. Other builds print a bare command name there.
+    const OFF_LINE: &str = r"& 'C:\Program Files\open-pact-client\open-pact-client.exe' --home 'C:\Users\example\pact' schedule off";
+
+    fn install_text() -> String {
+        install_block(&Version::parse("0.9.0").unwrap())
+    }
+
+    /// The removal block without the prose lines after it. Those lines name folders of this machine.
+    fn removal_text(machine: Option<&Path>) -> String {
+        removal_block(Path::new(HOME), TASK, machine)
+            .split("\nThe ")
+            .next()
+            .unwrap()
+            .to_owned()
+    }
+
+    /// The removal block with the machine client, up to its last line, which only Windows prints as OFF_LINE.
+    fn removal_head() -> String {
+        let text = removal_text(Some(Path::new(MACHINE)));
+        text.rsplit_once("\n  ").unwrap().0.to_owned()
+    }
+
+    #[test]
+    fn every_doc_shows_the_install_block_that_the_client_prints() {
+        let block = install_text();
+        for (name, doc) in [
+            ("docs/client.md", CLIENT),
+            ("docs/windows-machine-install.md", WINDOWS_INSTALL),
+            ("docs/release-notes/v0.9.0.md", RELEASE_NOTES),
+        ] {
+            assert!(
+                doc.contains(&block),
+                "{name} must show the install block for 0.9.0"
+            );
+        }
+    }
+
+    #[test]
+    fn the_docs_show_the_removal_block_with_the_machine_client() {
+        let head = removal_head();
+        for (name, doc) in [
+            ("docs/client.md", CLIENT),
+            ("docs/windows-machine-install.md", WINDOWS_INSTALL),
+        ] {
+            assert!(
+                doc.contains(&format!("{head}\n  {OFF_LINE}\n}}")),
+                "{name} must show the removal block with the machine client"
+            );
+        }
+    }
+
+    #[test]
+    fn the_release_notes_show_the_removal_block_without_the_machine_client() {
+        assert!(
+            RELEASE_NOTES.contains(&removal_text(None)),
+            "the release notes must show the removal block without the machine client"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_windows_removal_block_ends_with_the_documented_line() {
+        let text = removal_block(Path::new(HOME), TASK, Some(Path::new(MACHINE)));
+        assert!(text.contains(&format!("\n  {OFF_LINE}\n}}")));
+    }
+
+    #[test]
+    fn no_doc_names_the_old_client_copy_under_program_files() {
+        for (name, doc) in [
+            ("docs/client.md", CLIENT),
+            ("docs/windows-machine-install.md", WINDOWS_INSTALL),
+            ("docs/release-notes/v0.9.0.md", RELEASE_NOTES),
+        ] {
+            assert!(
+                !doc.contains(r"open-pact\open-pact-client.exe"),
+                "{name} names the old copy"
+            );
+        }
+    }
+}

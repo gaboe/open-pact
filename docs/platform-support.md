@@ -30,13 +30,13 @@ This page lists the built-in controls. The catalog is in `crates/open-pact-core/
 | `log_cleared` | `n/a` | RFC 3339 UTC time, JSON null, or `unknown` from Security and System logs | `n/a` | Windows needs administrator or SYSTEM access to read both logs. |
 | VPN certificate installation | Supported | Supported; `vpn\current` pointer, flat copies can lag while another program holds them open | Supported | Device user. |
 | Device key protection | `secure_enclave` or `os_permissions` | `tpm` or `os_permissions` | `os_permissions` | Joining user and SYSTEM on Windows. |
-| Claim scheduler | launchd LaunchAgent, wakes every minute | Task Scheduler, wakes every minute; limited user or SYSTEM | systemd user timer, wakes every minute | The signed manifest must define `[schedule]`, and the owner turns the job on with `schedule on`. Windows SYSTEM install and uninstall need an elevated prompt. Linux needs a running user manager. |
+| Claim scheduler | launchd LaunchAgent, wakes every minute | Task Scheduler, wakes every minute; limited user or SYSTEM | systemd user timer, wakes every minute | The signed manifest must define `[schedule]`, and the owner turns the job on with `schedule on`. Windows SYSTEM install and uninstall need an elevated prompt and the machine client from the package. Linux needs a running user manager. |
 
 When a control returns `n/a`, the client sends `n/a` only if the manifest allows that value. Otherwise, it sends `unknown` when the manifest allows `unknown`. If neither value is allowed, the client omits the result. An omitted required result can cause the gateway to deny the claim.
 
 ## Windows access limits
 
-Run `schedule on --system` from an elevated PowerShell prompt, or answer yes to the SYSTEM question in the join wizard, to read machine-wide Windows settings. The SYSTEM task can read `preboot_auth`, `os_patch_age_days`, `log_oldest_record_days`, `process_audit`, and `log_cleared`. It can also inspect browser settings in other user profiles. The task reads settings. It does not change them.
+Install the package, then run `schedule on --system` from an elevated PowerShell prompt, or answer yes to the SYSTEM question in the join wizard, to read machine-wide Windows settings. The SYSTEM task can read `preboot_auth`, `os_patch_age_days`, `log_oldest_record_days`, `process_audit`, and `log_cleared`. It can also inspect browser settings in other user profiles. The task reads settings. It does not change them.
 
 The limited Windows task runs as the current user. It may report `unknown` when Windows denies access. To trigger an extra claim after a Security log clear, add the task user to the built-in `Event Log Readers` group. SYSTEM can read the Security log without that group. Without either access, the Security log clear trigger is unavailable.
 
@@ -70,7 +70,7 @@ unverified until `windows_tpm_roundtrip` runs on a TPM machine.
 
 ## Schedule support
 
-The SYSTEM task is available only on Windows. It reads the selected user's absolute `--home` path and stores its job state under `%ProgramData%`. The job runs with `--system --user-home <profile>`, so the repository folders of `device.json` and `~` expand against the selected user's profile. It uses a shared client binary under `%ProgramFiles%`. The installer rejects a Windows home path that contains `%`.
+The SYSTEM task is available only on Windows. It reads the selected user's absolute `--home` path and stores its job state under `%ProgramData%`. The job runs with `--system --user-home <profile>`, so the repository folders of `device.json` and `~` expand against the selected user's profile. It runs the machine client that the package installs in `%ProgramFiles%\open-pact-client`. Nothing is copied. The installer rejects a Windows home path that contains `%`.
 
 ## Log-clearing output
 
