@@ -33,6 +33,6 @@ hyper-util = { version = "0.1", features = ["tokio", "service"] }
 
 [dev-dependencies]
 ed25519-dalek = "2.2.0"
-open-pact-client = { path = "../open-pact-client" }
+open-pact-client.workspace = true
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
