@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::Ordering;
 
-use open_pact_client::{Command, Invocation};
+use open_pact_client::{Command, Invocation, LogCommand};
 use open_pact_core::{Checkpoint, Invitation, WitnessKey};
 
 use super::*;
@@ -700,4 +700,98 @@ async fn a_base_tree_read_keeps_base_limits() {
     let after = f.get(Some(&f.query)).await;
     assert_eq!(after.status, StatusCode::OK, "{}", after.body);
     f.verifies(&after.body, &f.policy);
+}
+
+/// Rounds of the burst. Each real client command takes seconds in a test build.
+const BURST_ROUNDS: usize = 3;
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs TEST_DATABASE_URL and LOG_ORIGIN"]
+async fn checkpoints_during_a_join_burst_are_witnessed() {
+    let mut options = Options::new(2, 2);
+    options.real_client = true;
+    let f = Fixture::build(options).await;
+    let live = f.live().await;
+    // Four devices claim every round and four others prove their enrolment (a mine request).
+    let devices = f.enrolled(&live, 8).await;
+    for round in 0..BURST_ROUNDS {
+        f.append(1).await;
+        let mut invitations = vec![];
+        for _ in 0..4 {
+            invitations.push(f.invitation(&live.url).await);
+        }
+        let enrolments = invitations
+            .into_iter()
+            .map(|invitation| tokio::spawn(async move { join_with(invitation).await.1.unwrap() }))
+            .collect::<Vec<_>>();
+        let claims = devices[..4].iter().map(spawn_claim).collect::<Vec<_>>();
+        let proves = devices[4..]
+            .iter()
+            .map(|device| {
+                let device = device.clone();
+                tokio::spawn(async move {
+                    let mut codes = vec![];
+                    for _ in 0..2 {
+                        let code = open_pact_client::run(
+                            Invocation {
+                                home: Some(device.home.path().to_path_buf()),
+                                insecure_dev: true,
+                                command: Command::Log {
+                                    command: LogCommand::Prove { index: None },
+                                },
+                            },
+                            std::path::Path::new("open-pact-client"),
+                        )
+                        .await
+                        .unwrap();
+                        codes.push(code);
+                    }
+                    codes
+                })
+            })
+            .collect::<Vec<_>>();
+        let reads = futures_util::future::join_all(
+            (0..32).map(|_| Fixture::get_with(f.router.clone(), Some(f.query.clone()))),
+        );
+        let (reads, enrolments, claims, proves) = tokio::join!(
+            reads,
+            futures_util::future::join_all(enrolments),
+            futures_util::future::join_all(claims),
+            futures_util::future::join_all(proves),
+        );
+        for reply in reads {
+            assert_eq!(
+                reply.status,
+                StatusCode::OK,
+                "round {round}: {}",
+                reply.body
+            );
+            f.verifies(&reply.body, &f.policy);
+        }
+        for code in enrolments {
+            assert_eq!(
+                code.unwrap(),
+                ExitCode::SUCCESS,
+                "round {round}: an enrolment failed"
+            );
+        }
+        for claim in claims {
+            claim.unwrap();
+        }
+        for device in &devices[..4] {
+            assert!(
+                device.installed(),
+                "round {round}: a claim installed no certificate"
+            );
+            let note = device.reply_note().expect("the client kept the reply");
+            f.verifies(&note, &f.policy);
+        }
+        for codes in proves {
+            for code in codes.unwrap() {
+                assert_eq!(code, ExitCode::SUCCESS, "round {round}: a mine failed");
+            }
+        }
+    }
+    f.sizes_are_non_decreasing();
+    f.assert_no_fork_line().await;
 }

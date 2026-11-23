@@ -178,7 +178,11 @@ impl Fixture {
             keys: Arc::new(keys),
             auto_approve: options.real_client,
             limiter: Arc::new(Limiter::new(100, Duration::from_secs(60), 100)),
-            nonce_limiter: Arc::new(Limiter::new(100, Duration::from_secs(60), 100)),
+            nonce_limiter: Arc::new(Limiter::new(
+                if options.real_client { 100_000 } else { 100 },
+                Duration::from_secs(60),
+                if options.real_client { 100_000 } else { 100 },
+            )),
             max_nonces: 10_000,
             kek: Arc::new(kek),
             observe: None,
@@ -679,40 +683,6 @@ async fn a_large_valid_policy_is_accepted() {
         let at_size = witness.sizes().iter().filter(|s| **s == size).count();
         assert_eq!(at_size, 1, "{:?}", witness.sizes());
     }
-}
-
-#[tokio::test]
-#[ignore = "needs TEST_DATABASE_URL and LOG_ORIGIN"]
-async fn checkpoints_during_a_join_burst_are_witnessed() {
-    let f = Fixture::new(2, 2).await;
-    for round in 0..20 {
-        f.append(1).await;
-        let enrols = (0..4).map(|_| {
-            let app = f.app.clone();
-            async move { app.checkpoint(Mode::Enroll).await }
-        });
-        let reads = (0..8).map(|_| Fixture::get_with(f.router.clone(), Some(f.query.clone())));
-        let (enrolled, read) = tokio::join!(
-            futures_util::future::join_all(enrols),
-            futures_util::future::join_all(reads)
-        );
-        for reply in enrolled {
-            let (note, _) = reply.unwrap_or_else(|_| panic!("round {round}: enrolment failed"));
-            let cp = f.log.verify(&note).unwrap();
-            verify_cosignatures(Some(&f.policy), &cp, &note, now_secs())
-                .unwrap_or_else(|e| panic!("round {round}: {e}"));
-        }
-        for reply in read {
-            assert_eq!(
-                reply.status,
-                StatusCode::OK,
-                "round {round}: {}",
-                reply.body
-            );
-            f.verifies(&reply.body, &f.policy);
-        }
-    }
-    f.sizes_are_non_decreasing();
 }
 
 #[tokio::test]
