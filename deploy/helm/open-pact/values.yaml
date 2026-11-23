@@ -65,6 +65,9 @@ postgres:
 
 database:
   externalUrl: ""
+  # Connections the gateway keeps open to PostgreSQL, per pod. Keep the sum over all pods below the
+  # server's max_connections.
+  maxConnections: 10
 
 # URL the clients use, written into invitations. Defaults to https://<ingress.host>.
 publicUrl: ""
