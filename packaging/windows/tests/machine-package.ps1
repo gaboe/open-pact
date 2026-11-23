@@ -52,8 +52,10 @@ function Build-Client {
 function Invoke-Msiexec {
     param([Parameter(Mandatory)][string[]]$Arguments, [Parameter(Mandatory)][string]$LogName)
     $log = Join-Path $logs "$LogName.log"
-    & $msiexec @Arguments /qn /norestart '/l*v' $log
-    return $LASTEXITCODE
+    # msiexec is a GUI program, so the call operator does not wait for it.
+    $quoted = @($Arguments | ForEach-Object { if ($_ -match '\s') { "`"$_`"" } else { $_ } })
+    $run = Start-Process -FilePath $msiexec -ArgumentList ($quoted + @('/qn', '/norestart', '/l*v', "`"$log`"")) -Wait -PassThru
+    return $run.ExitCode
 }
 
 function Expect-Exit {
@@ -213,6 +215,6 @@ try {
 finally {
     Set-Content -LiteralPath $cargoToml -Value $manifest -NoNewline
     if ($packages.ContainsKey('b2') -and (Test-Path -LiteralPath $client)) {
-        & $msiexec /x $packages['b2'].Msi /qn /norestart | Out-Null
+        Start-Process -FilePath $msiexec -ArgumentList @('/x', "`"$($packages['b2'].Msi)`"", '/qn', '/norestart') -Wait | Out-Null
     }
 }
