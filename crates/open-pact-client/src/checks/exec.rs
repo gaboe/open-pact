@@ -390,13 +390,14 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn an_exit_seen_after_the_deadline_is_a_timeout() {
-        // The child exits at about 150 ms. The loop looks again only at 200 ms, past the 100 ms deadline.
+        // The child exits at about 500 ms. The loop looks again only at 2 s, well past the 100 ms deadline
+        // and the exit, so a slow runner still sees an exited child on that second look.
         let output = capture_limited(
             "sh",
-            &["-c", "printf late; sleep 0.15"],
+            &["-c", "printf late; sleep 0.5"],
             Duration::from_millis(100),
             Some(1024),
-            Duration::from_millis(200),
+            Duration::from_secs(2),
         )
         .unwrap();
         // The status is a success, so the late exit set the timeout, not a kill.
@@ -409,10 +410,10 @@ mod tests {
     fn an_exit_seen_after_the_deadline_is_kept_without_a_stdout_limit() {
         let output = capture_limited(
             "sh",
-            &["-c", "printf late; sleep 0.15"],
+            &["-c", "printf late; sleep 0.5"],
             Duration::from_millis(100),
             None,
-            Duration::from_millis(200),
+            Duration::from_secs(2),
         )
         .unwrap();
         assert!(!output.timed_out, "{output:?}");
