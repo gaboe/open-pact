@@ -39,8 +39,8 @@ gateway:
 
 # Prometheus metrics of the gateway: request latency per route, nonce lock waits, database pool,
 # witness pushes. Off by default. On, the gateway serves GET /metrics over TLS on its own port and
-# its own ClusterIP Service, behind a bearer token. The port is never in the Ingress. A restart is
-# needed after the token or the certificate changes.
+# its own ClusterIP Service, behind a bearer token. The port is never in the Ingress. The gateway
+# reads the token and the certificate at start: after either one changes, change metrics.rotation.
 metrics:
   enabled: false
   port: 9090
@@ -51,10 +51,14 @@ metrics:
     name: ""
     key: token
   # Required when enabled. A kubernetes.io/tls Secret (tls.crt, tls.key), for example from
-  # cert-manager, valid for the name Prometheus connects to
-  # (<release>-gateway-metrics.<namespace>.svc). Prometheus checks it with tls_config.ca_file.
+  # cert-manager, valid for the name Prometheus connects to (<release>-metrics.<namespace>.svc).
+  # Prometheus checks it with tls_config.ca_file.
   tlsSecret:
     name: ""
+  # Change this value after each renewal of the TLS Secret or the token, for example with
+  # helm upgrade --set metrics.rotation=2. The pod template changes, so the gateway restarts and
+  # reads both again.
+  rotation: "1"
   networkPolicy:
     # Optional. A list of NetworkPolicy "from" entries, such as
     # [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: monitoring}}}]. When set, a
