@@ -561,10 +561,9 @@ pub(crate) fn removal_block(home: &Path, task_id: &str, machine: Option<&Path>) 
     // The home goes in a single-quoted here-string, so an apostrophe in it needs no escape. The
     // check for the file and the reset of the exit code keep a missing client from passing as success.
     let last = machine
-        .map(|machine| {
+        .map(|_| {
             format!(
-                "\n  $q = {}\n  if (-not (Test-Path -LiteralPath $q -PathType Leaf)) {{ throw 'The machine client is missing. Install the package, then run this block again.' }}\n  $clientHome = @'\n{}\n'@\n  $global:LASTEXITCODE = $null\n  & $q --home $clientHome schedule off\n  if ($LASTEXITCODE -ne 0) {{ throw 'schedule off failed. Do not uninstall the package. Fix the error, then run this block again.' }}",
-                powershell_literal(&machine.to_string_lossy()),
+                "\n  $q = Join-Path $env:ProgramW6432 'open-pact-client\\open-pact-client.exe'\n  if (-not (Test-Path -LiteralPath $q -PathType Leaf)) {{ throw 'The machine client is missing. Install the package, then run this block again.' }}\n  $clientHome = @'\n{}\n'@\n  $global:LASTEXITCODE = $null\n  & $q --home $clientHome schedule off\n  if ($LASTEXITCODE -ne 0) {{ throw 'schedule off failed. Do not uninstall the package. Fix the error, then run this block again.' }}",
                 home.to_string_lossy()
             )
         })
@@ -1102,9 +1101,9 @@ mod tests {
             .find("\n  & $q --home $clientHome schedule off")
             .unwrap();
         assert!(reset < off);
-        assert!(
-            block.contains("$q = 'C:\\Program Files\\open-pact-client\\open-pact-client.exe'\n")
-        );
+        assert!(block.contains(
+            "$q = Join-Path $env:ProgramW6432 'open-pact-client\\open-pact-client.exe'\n"
+        ));
         // A failed cleanup stops the block, so the next step never uninstalls the package.
         let exit = block.find("\n  if ($LASTEXITCODE -ne 0) { throw 'schedule off failed. Do not uninstall the package.").unwrap();
         assert!(off < exit && exit < block.find("\n}").unwrap());
@@ -1321,47 +1320,74 @@ elseif ($repair.ExitCode -ne 0) { throw ('The repair failed. Exit code: ' + $rep
         ])
     }
 
-    /// The contents of each ````powershell` fence of `doc`, without the fence lines. A fence inside an
-    /// HTML comment is not an instruction, so it does not count.
-    fn fences(doc: &str) -> Vec<String> {
+    /// Each code fence of doc with its info string and its body, in order. A fence opens with three
+    /// or more backticks and closes with a line of at least as many backticks, as Markdown does. A
+    /// fence inside an HTML comment is not an instruction, so it does not count.
+    fn code_fences(doc: &str) -> Vec<(String, String)> {
         let mut found = Vec::new();
-        let mut current: Option<Vec<&str>> = None;
+        let mut open: Option<(usize, String)> = None;
+        let mut body: Vec<&str> = Vec::new();
         let mut comment = false;
         for line in doc.lines() {
-            if current.is_none() {
-                if comment {
-                    comment = !line.contains("-->");
-                    continue;
+            let trimmed = line.trim_end();
+            let text = trimmed.trim_start_matches('`');
+            let ticks = trimmed.len() - text.len();
+            if let Some((width, info)) = open.take() {
+                if ticks >= width && text.is_empty() {
+                    found.push((info, body.join("\n")));
+                    body.clear();
+                } else {
+                    open = Some((width, info));
+                    body.push(line);
                 }
-                if line.contains("<!--") && !line.contains("-->") {
-                    comment = true;
-                    continue;
-                }
-            }
-            match (&mut current, line.trim_end()) {
-                (None, "```powershell") => current = Some(Vec::new()),
-                (Some(lines), "```") => {
-                    found.push(lines.join("\n"));
-                    current = None;
-                }
-                (Some(lines), _) => lines.push(line),
-                (None, _) => {}
+            } else if comment {
+                comment = !line.contains("-->");
+            } else if ticks >= 3 {
+                open = Some((ticks, text.trim().to_owned()));
+            } else if line.contains("<!--") && !line.contains("-->") {
+                comment = true;
             }
         }
         found
     }
 
-    /// The lines of `doc` from the line `heading` to the next heading of the same or a higher level.
-    /// A line inside a fence is never a heading.
+    /// The body of each code fence of doc, in order, without the fence lines.
+    fn fences(doc: &str) -> Vec<String> {
+        code_fences(doc).into_iter().map(|(_, body)| body).collect()
+    }
+
+    /// The body of each PowerShell code fence of doc, in order.
+    fn powershell_fences(doc: &str) -> Vec<String> {
+        code_fences(doc)
+            .into_iter()
+            .filter(|(info, _)| info == "powershell" || info == "pwsh")
+            .map(|(_, body)| body)
+            .collect()
+    }
+
+    /// The lines of doc from the line heading to the next heading of the same or a higher level.
+    /// A line inside a fence or an HTML comment is never a heading.
     fn section(doc: &str, heading: &str) -> String {
         let depth = heading.chars().take_while(|c| *c == '#').count();
         let mut found = false;
-        let mut in_fence = false;
+        let mut fence: Option<usize> = None;
+        let mut comment = false;
         let mut lines = Vec::new();
         for line in doc.lines() {
-            if line.starts_with("```") {
-                in_fence = !in_fence;
-            } else if !in_fence && line.starts_with('#') {
+            let trimmed = line.trim_end();
+            let text = trimmed.trim_start_matches('`');
+            let ticks = trimmed.len() - text.len();
+            if let Some(width) = fence {
+                if ticks >= width && text.is_empty() {
+                    fence = None;
+                }
+            } else if comment {
+                comment = !line.contains("-->");
+            } else if ticks >= 3 {
+                fence = Some(ticks);
+            } else if line.contains("<!--") && !line.contains("-->") {
+                comment = true;
+            } else if line.starts_with('#') {
                 let level = line.chars().take_while(|c| *c == '#').count();
                 if found && level <= depth {
                     break;
@@ -1374,7 +1400,7 @@ elseif ($repair.ExitCode -ne 0) { throw ('The repair failed. Exit code: ' + $rep
                 lines.push(line);
             }
         }
-        assert!(found, "the heading `{heading}` is missing");
+        assert!(found, "the heading {heading} is missing");
         lines.join("\n")
     }
 
@@ -1634,7 +1660,7 @@ elseif ($repair.ExitCode -ne 0) { throw ('The repair failed. Exit code: ' + $rep
             ("docs/windows-machine-install.md", WINDOWS_INSTALL),
             ("docs/release-notes/v0.9.0.md", RELEASE_NOTES),
         ] {
-            for fence in fences(doc) {
+            for fence in powershell_fences(doc) {
                 // A value that the reader writes goes in a here-string, never between quotes.
                 assert!(
                     !fence.contains("'<"),
@@ -1656,6 +1682,27 @@ elseif ($repair.ExitCode -ne 0) { throw ('The repair failed. Exit code: ' + $rep
     }
 
     #[test]
+    fn a_fence_in_a_longer_fence_or_a_comment_is_not_a_block() {
+        let nested = "## Install\n\n````text\n```powershell\ninstall\n```\n````\n";
+        assert!(!shows(nested, "## Install", "install"));
+        let commented = "<!--\n```powershell\ninstall\n```\n-->\n\n## Install\n";
+        assert!(fences(commented).is_empty());
+        let heading_in_comment = "<!--\n## Install\n-->\n\n## Start\n\n```powershell\nstart\n```\n";
+        assert!(!section(heading_in_comment, "## Start").contains("## Install"));
+    }
+
+    #[test]
+    fn every_fence_of_the_release_notes_counts_for_the_live_commands() {
+        let all = fences(RELEASE_NOTES);
+        let count = |needle: &str| all.iter().filter(|fence| fence.contains(needle)).count();
+        // The dry run and the start are the only fences that run schedule on --system.
+        assert_eq!(count("schedule on --system"), 2);
+        // The removal block is the only fence that runs schedule off or schtasks.
+        assert_eq!(count("schedule off"), 1);
+        assert_eq!(count("schtasks"), 1);
+    }
+
+    #[test]
     fn no_elevated_example_runs_the_client_by_its_bare_name() {
         for (name, doc) in [
             ("README.md", README),
@@ -1663,7 +1710,7 @@ elseif ($repair.ExitCode -ne 0) { throw ('The repair failed. Exit code: ' + $rep
             ("docs/windows-machine-install.md", WINDOWS_INSTALL),
             ("docs/release-notes/v0.9.0.md", RELEASE_NOTES),
         ] {
-            for fence in fences(doc) {
+            for fence in powershell_fences(doc) {
                 if fence.contains("--system") || fence.contains("schedule off") {
                     assert!(
                         !fence

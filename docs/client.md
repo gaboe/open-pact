@@ -364,7 +364,10 @@ For a deployment with Intune or Group Policy, see [Windows machine install](wind
 
 The wizard asks whether the job runs as SYSTEM. Later, choose SYSTEM with `schedule on --system`. Run it from an elevated Windows PowerShell 5.1 prompt. Call the machine client by its full path, so that an older client on PATH never runs. Pass the profile of the user. The commands stop when the client file is missing or when the command fails.
 
-To go back to a job that runs as you, do two steps. First, remove the SYSTEM task from an elevated prompt. Follow [Stop the scheduled claims and remove the client](#stop-the-scheduled-claims-and-remove-the-client). Second, run `open-pact-client schedule on --user` in your own prompt, not an elevated one.
+To go back to a job that runs as you, do two steps for this one home. Do not uninstall the package.
+
+- In an elevated prompt, remove the SYSTEM task of this home. Use the command for a task of the machine client, or the removal block for a task of the old copy, in [Stop the scheduled claims and remove the client](#stop-the-scheduled-claims-and-remove-the-client). Use the `--home` value of the task.
+- In your own prompt, not an elevated one, run `open-pact-client --home <the same absolute client home> schedule on --user`.
 
 1. Replace the line `<the absolute client home>` with the absolute client home of the user.
 2. Replace the line `<the profile folder of the user>` with the profile folder of the user.
@@ -388,7 +391,7 @@ Without elevation, `schedule on --system` prints the exact elevated command and 
 
 The SYSTEM job runs with `--system --user-home <profile>`. It reads the selected absolute client home. It uses the repository folders from `device.json`. It keeps its state under protected `%ProgramData%`. Choose a home path without `%`. `--user-home` must be the profile folder of a user account that Windows lists in its profile registry, and not a link. The client ignores `USERPROFILE` and the arguments of a task that a user can write. The install block that the client prints runs in an elevated Windows PowerShell 5.1 prompt (`powershell.exe`), not in `pwsh`. The task reads Windows settings and does not change them. See [platform support](platform-support.md) for checks that need SYSTEM access.
 
-A SYSTEM job reads repositories only below the user profile. A worktree whose repository lies outside it, for example on `D:\`, makes the repository counts unknown. Keep the repository below the profile, or run the job as you with `schedule on --user`.
+A SYSTEM job reads repositories only below the user profile. A worktree whose repository lies outside it, for example on `D:\`, makes the repository counts unknown. Keep the repository below the profile. To run the job as you instead, follow the two steps above, and remove the SYSTEM task first.
 
 ### Stop the scheduled claims and remove the client
 
@@ -439,11 +442,10 @@ if ($LASTEXITCODE -ne 0) { throw 'schedule off failed. Do not uninstall the pack
 
 A task whose Actions line is not 1 is not a task of the client. `schedule off` refuses such a task. Open it in Task Scheduler and read every action. When you know each action, remove the task in Task Scheduler.
 
-A task whose program is the old copy, `open-pact\open-pact-client.exe`, and whose Actions line is 1, needs the removal block. The list can show the program with a `\\?\` prefix. It is the same file. The block shows three samples.
+A task whose program is the old copy, `open-pact\open-pact-client.exe`, and whose Actions line is 1, needs the removal block. The list can show the program with a `\\?\` prefix. It is the same file. The block shows two samples.
 
 1. Replace the task name `org.open-pact.report.0123abcd` in every place where it appears.
 2. Replace the home line `C:\Users\example\pact`, between `@'` and `'@`, with the `--home` value of the task. Do not add quotes.
-3. Replace the folder `C:\Program Files` with the output of `$env:ProgramW6432`.
 
  The client prints this block with the values of your device when it refuses to change an old task.
 
@@ -475,7 +477,7 @@ A task whose program is the old copy, `open-pact\open-pact-client.exe`, and whos
     if ($LASTEXITCODE -ne 0) { throw 'The task was not removed. Run this block again from an elevated prompt.' }
   }
   if (Test-TaskRegistered) { throw 'The task is still registered. Run this block again.' }
-  $q = 'C:\Program Files\open-pact-client\open-pact-client.exe'
+  $q = Join-Path $env:ProgramW6432 'open-pact-client\open-pact-client.exe'
   if (-not (Test-Path -LiteralPath $q -PathType Leaf)) { throw 'The machine client is missing. Install the package, then run this block again.' }
   $clientHome = @'
 C:\Users\example\pact
@@ -620,7 +622,7 @@ The exit code tells a script what to do:
 | `join` refuses the gateway | Confirm the invitation URL, company key fingerprint, HTTPS certificate, and pinned log key with the gateway operator. |
 | `check` reports that the manifest changed | Run `open-pact-client accept`. Review the changes and sign the new manifest. You need no new invitation or approval. |
 | `check` says the device is pending | Give the device code to the gateway operator. Wait for approval. |
-| A check returns `unknown` on Windows | Run the task as an elevated administrator when the control needs machine-wide access. To start a SYSTEM job, follow [Use Windows SYSTEM checks](#use-windows-system-checks). Use its full-path commands in an elevated PowerShell 5.1 prompt. |
+| A check returns `unknown` on Windows | Run the task as an elevated administrator when the control needs machine-wide access. For a SYSTEM job, follow [Use Windows SYSTEM checks](#use-windows-system-checks). Run its full-path commands in an elevated PowerShell 5.1 prompt. |
 | Windows event claims do not trigger | Check Event Log Readers access for the limited task user. Check that Defender history can be read. |
 | Linux `schedule on` cannot reach systemd | Start the user systemd manager. Run `schedule on` again. |
 | `schedule on` says the company did not define automatic sending | The signed manifest has no `[schedule]`. Send claims by hand with `check`, or ask the company to add the table. |
@@ -630,7 +632,7 @@ The exit code tells a script what to do:
 
 ## Remove the device key
 
-To rotate or remove the device key, remove the schedule first. For a job that runs as you, run `open-pact-client schedule off`. For a Windows SYSTEM job, follow [Stop the scheduled claims and remove the client](#stop-the-scheduled-claims-and-remove-the-client). Then run `open-pact-client --home <home> delete-device-key` before you delete the home or binary. Schedule removal alone keeps the key.
+To rotate or remove the device key, remove the schedule first. For a job that runs as you, run `open-pact-client schedule off`. For a Windows SYSTEM job, remove the task of this home only, as [Stop the scheduled claims and remove the client](#stop-the-scheduled-claims-and-remove-the-client) describes. Do not uninstall the package. Then run `open-pact-client --home <home> delete-device-key` before you delete the home or binary. Schedule removal alone keeps the key.
 
 On Windows, use the account that created the CNG key or SYSTEM. A different administrator has no explicit access to the key. Windows CI tests deletion with the software CNG provider. Hosted runners do not verify deletion from a real TPM.
 
