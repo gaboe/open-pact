@@ -700,13 +700,7 @@ fn device_denied() -> Reply {
 }
 
 async fn consume_nonce(app: &App, nonce: &str) -> Result<(), Reply> {
-    let live: Option<bool> =
-        sqlx::query_scalar("DELETE FROM nonces WHERE nonce = $1 RETURNING expires_at > now()")
-            .bind(nonce)
-            .fetch_optional(&app.db)
-            .await
-            .map_err(internal)?;
-    match live {
+    match nonces::consume(&app.db, nonce).await.map_err(internal)? {
         Some(true) => Ok(()),
         Some(false) => Err(denied(vec!["expired nonce".into()])),
         None => Err(denied(vec!["unknown or used nonce".into()])),
@@ -1199,9 +1193,18 @@ async fn publish_manifest_in(
 }
 
 async fn connect(url: &str) -> anyhow::Result<PgPool> {
+    let max_connections: u32 = env_number("DATABASE_MAX_CONNECTIONS", 10)?;
+    anyhow::ensure!(
+        max_connections > 0,
+        "DATABASE_MAX_CONNECTIONS must be at least 1"
+    );
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
     loop {
-        match PgPoolOptions::new().max_connections(10).connect(url).await {
+        match PgPoolOptions::new()
+            .max_connections(max_connections)
+            .connect(url)
+            .await
+        {
             Ok(db) => return Ok(db),
             Err(e) if tokio::time::Instant::now() < deadline => {
                 eprintln!("database not ready, retrying: {e}");
