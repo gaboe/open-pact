@@ -104,10 +104,12 @@ function Expect-UserCannotWrite {
     $inheritOnly = [int][System.Security.AccessControl.PropagationFlags]::InheritOnly
     $broad = @('S-1-5-32-545', 'S-1-5-11', 'S-1-1-0')
     foreach ($path in $installDir, $client) {
-        foreach ($rule in (Get-Acl -LiteralPath $path).Access) {
+        # Read the rules as SIDs: some built-in principals, such as app package
+        # capabilities, have no account name to translate.
+        foreach ($rule in (Get-Acl -LiteralPath $path).GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
             if ($rule.AccessControlType -ne 'Allow') { continue }
             if (([int]$rule.PropagationFlags -band $inheritOnly) -ne 0) { continue }
-            $sid = $rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
+            $sid = $rule.IdentityReference.Value
             if ($broad -notcontains $sid) { continue }
             if (([int]$rule.FileSystemRights -band $denied) -ne 0) {
                 throw "$path grants $($rule.IdentityReference) a write right: $($rule.FileSystemRights)."
