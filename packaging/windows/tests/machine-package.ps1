@@ -52,9 +52,11 @@ function Build-Client {
 function Invoke-Msiexec {
     param([Parameter(Mandatory)][string[]]$Arguments, [Parameter(Mandatory)][string]$LogName)
     $log = Join-Path $logs "$LogName.log"
+    $before = @(Get-MachinePathSegments)
     # msiexec is a GUI program, so the call operator does not wait for it.
     $quoted = @($Arguments | ForEach-Object { if ($_ -match '\s') { "`"$_`"" } else { $_ } })
     $run = Start-Process -FilePath $msiexec -ArgumentList ($quoted + @('/qn', '/norestart', '/l*v', "`"$log`"")) -Wait -PassThru
+    Expect-OtherPathKept -Before $before
     return $run.ExitCode
 }
 
@@ -67,6 +69,17 @@ function Get-MachinePathSegments {
     return @(([Environment]::GetEnvironmentVariable('Path', 'Machine')) -split ';' | Where-Object { $_ -ne '' })
 }
 
+function Expect-OtherPathKept {
+    # Each installer operation leaves the other machine PATH entries as they
+    # were, in the same order. Only the client folder entry may change.
+    param([Parameter(Mandatory)][string[]]$Before)
+    $others = @(Get-MachinePathSegments | Where-Object { $_.TrimEnd('\') -ine $installDir })
+    $was = @($Before | Where-Object { $_.TrimEnd('\') -ine $installDir })
+    if (($others -join ';') -ine ($was -join ';')) {
+        throw "The machine PATH entries other than $installDir changed: [$($was -join ';')] became [$($others -join ';')]."
+    }
+}
+
 function Get-RelatedProducts {
     $installer = New-Object -ComObject WindowsInstaller.Installer
     $codes = @()
@@ -75,22 +88,30 @@ function Get-RelatedProducts {
 }
 
 function Expect-UserCannotWrite {
-    # No allowed rule that applies to the folder itself gives Users,
-    # Authenticated Users or Everyone a write, delete or permission right.
-    $denied = [int]([System.Security.AccessControl.FileSystemRights]::Write -bor
-        [System.Security.AccessControl.FileSystemRights]::Modify -bor
+    # Users, Authenticated Users and Everyone may read and run the client, but
+    # no allowed rule gives them a write, append, delete or permission right on
+    # the folder or on the client file. Read and execute rights pass.
+    $denied = [int]([System.Security.AccessControl.FileSystemRights]::WriteData -bor
+        [System.Security.AccessControl.FileSystemRights]::CreateFiles -bor
+        [System.Security.AccessControl.FileSystemRights]::AppendData -bor
+        [System.Security.AccessControl.FileSystemRights]::CreateDirectories -bor
+        [System.Security.AccessControl.FileSystemRights]::WriteExtendedAttributes -bor
+        [System.Security.AccessControl.FileSystemRights]::WriteAttributes -bor
         [System.Security.AccessControl.FileSystemRights]::Delete -bor
+        [System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor
         [System.Security.AccessControl.FileSystemRights]::ChangePermissions -bor
         [System.Security.AccessControl.FileSystemRights]::TakeOwnership)
     $inheritOnly = [int][System.Security.AccessControl.PropagationFlags]::InheritOnly
     $broad = @('S-1-5-32-545', 'S-1-5-11', 'S-1-1-0')
-    foreach ($rule in (Get-Acl -LiteralPath $installDir).Access) {
-        if ($rule.AccessControlType -ne 'Allow') { continue }
-        if (([int]$rule.PropagationFlags -band $inheritOnly) -ne 0) { continue }
-        $sid = $rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
-        if ($broad -notcontains $sid) { continue }
-        if (([int]$rule.FileSystemRights -band $denied) -ne 0) {
-            throw "$installDir grants $($rule.IdentityReference) a write right: $($rule.FileSystemRights)."
+    foreach ($path in $installDir, $client) {
+        foreach ($rule in (Get-Acl -LiteralPath $path).Access) {
+            if ($rule.AccessControlType -ne 'Allow') { continue }
+            if (([int]$rule.PropagationFlags -band $inheritOnly) -ne 0) { continue }
+            $sid = $rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
+            if ($broad -notcontains $sid) { continue }
+            if (([int]$rule.FileSystemRights -band $denied) -ne 0) {
+                throw "$path grants $($rule.IdentityReference) a write right: $($rule.FileSystemRights)."
+            }
         }
     }
 }
@@ -179,8 +200,22 @@ try {
     Expect-Exit (Invoke-Msiexec -Arguments @('/i', $packages['fixture-fail-late'].Msi) -LogName $failed) 1603 'step 3: failing upgrade'
     $failLog = Join-Path $logs "$failed.log"
     $text = [IO.File]::ReadAllText($failLog) + [IO.File]::ReadAllText($failLog, [Text.Encoding]::Unicode)
-    foreach ($marker in 'FailLate', 'Return value 3') {
-        if (-not $text.Contains($marker)) { throw "The step 3 log lacks '$marker'." }
+    $lines = @($text -split '\r?\n')
+    # FailLate is deferred: the script copies the file, the action fails, and
+    # InstallFinalize then ends with 3 and rolls back.
+    $copied = -1
+    $lateFailed = -1
+    $finalized = -1
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($copied -lt 0 -and $lines[$i] -cmatch 'Executing op: FileCopy\(.*Name=open-pact-client\.exe') { $copied = $i }
+        if ($lateFailed -lt 0 -and $lines[$i] -cmatch 'CustomAction FailLate returned actual error code') { $lateFailed = $i }
+        if ($finalized -lt 0 -and $lines[$i] -cmatch 'Action ended .*: InstallFinalize\. Return value 3\.') { $finalized = $i }
+    }
+    if ($copied -lt 0) { throw 'The step 3 log lacks the file copy of the client.' }
+    if ($lateFailed -lt 0) { throw 'The step 3 log lacks the failure of FailLate.' }
+    if ($finalized -lt 0) { throw 'The step 3 log lacks InstallFinalize ending with return value 3.' }
+    if (-not ($copied -lt $lateFailed -and $lateFailed -lt $finalized)) {
+        throw 'The step 3 log does not show the copy, then the FailLate failure, then the failed InstallFinalize.'
     }
     Expect-Installed $b2
 
@@ -207,14 +242,16 @@ try {
     if (Test-Path -LiteralPath "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\$($b2.ProductCode)") {
         throw 'The uninstall key is still there after uninstall.'
     }
-    if (Compare-Object -ReferenceObject $baseline -DifferenceObject (Get-MachinePathSegments)) {
-        throw 'The machine PATH differs from its baseline after uninstall.'
+    if ((@(Get-MachinePathSegments) -join ';') -ine ($baseline -join ';')) {
+        throw 'The machine PATH differs in order or content from its baseline after uninstall.'
     }
     Write-Host 'The machine package install sequence passed all seven steps.'
 }
 finally {
     Set-Content -LiteralPath $cargoToml -Value $manifest -NoNewline
-    if ($packages.ContainsKey('b2') -and (Test-Path -LiteralPath $client)) {
-        Start-Process -FilePath $msiexec -ArgumentList @('/x', "`"$($packages['b2'].Msi)`"", '/qn', '/norestart') -Wait | Out-Null
+    # Remove whichever fixture product is installed, a1, rc or b2, and check the result.
+    foreach ($code in @(Get-RelatedProducts)) {
+        $run = Start-Process -FilePath $msiexec -ArgumentList @('/x', $code, '/qn', '/norestart') -Wait -PassThru
+        if ($run.ExitCode -ne 0) { throw "Cleanup uninstall of $code exits with $($run.ExitCode)." }
     }
 }
