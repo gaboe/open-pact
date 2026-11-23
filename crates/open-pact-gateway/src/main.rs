@@ -44,9 +44,9 @@ use axum::{
 use clap::{Parser, Subcommand};
 use open_pact_core::{
     Checkpoint, Claim, CsrHash, Decision, Endorsement, EnrolRequest, Entry, EntryKind, Evaluation,
-    FirstFailures, Frontier, Invitation, LogCheckpoint, LogHash, LogKey, LogPolicy, Manifest, Note,
-    NoteSignature, Pseudonym, PublicKey, Reason, SigningKey, WitnessKey, consistency_proof,
-    inclusion_proof, root, verified_trust_level, verify_claim,
+    FirstFailures, Frontier, Invitation, LogCheckpoint, LogHash, LogKey, LogPolicy, Manifest,
+    MerkleCache, Note, NoteSignature, Pseudonym, PublicKey, Reason, SigningKey, WitnessKey, root,
+    verified_trust_level, verify_claim,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -243,19 +243,19 @@ struct LogCache {
 /// How many of the latest sizes keep their root, so a candidate size costs O(1) to check.
 const ROOT_WINDOW: usize = 4096;
 
-/// The leaves, the root and the root of each of the last `ROOT_WINDOW` sizes, published together
-/// and never changed after.
+/// The Merkle cache (the leaves and their subtree hashes), the root and the root of each of the last
+/// `ROOT_WINDOW` sizes, published together and never changed after.
 struct LogView {
-    leaves: Vec<LogHash>,
+    cache: MerkleCache,
     root: LogHash,
-    /// Contiguous sizes up to `leaves.len()`, oldest first.
+    /// Contiguous sizes up to `cache.len()`, oldest first.
     roots: VecDeque<(u64, LogHash)>,
 }
 
 impl Default for LogView {
     fn default() -> LogView {
         LogView {
-            leaves: vec![],
+            cache: MerkleCache::default(),
             root: root(&[]),
             roots: VecDeque::new(),
         }
@@ -271,15 +271,23 @@ struct Tree {
 
 impl Tree {
     fn size(&self) -> u64 {
-        self.view.leaves.len() as u64
+        self.view.cache.len()
     }
 
     fn root(&self) -> LogHash {
         self.view.root
     }
 
-    fn prefix(&self, size: u64) -> &[LogHash] {
-        &self.view.leaves[..usize::try_from(size).expect("size was checked against the tree")]
+    /// The root of the first `size` leaves, in O(log n) hashes.
+    fn root_at(&self, size: u64) -> LogHash {
+        self.view
+            .cache
+            .root(size)
+            .expect("size was checked against the tree")
+    }
+
+    fn cache(&self) -> &MerkleCache {
+        &self.view.cache
     }
 }
 
@@ -312,14 +320,17 @@ fn tree_step(
                 revision: snap.revision,
             });
         }
-        if frontier.len() != view.leaves.len() as u64 {
+        if frontier.len() != view.cache.len() {
             // A failed catch-up lost the frontier; rebuild it from the published leaves.
             let mut rebuilt = Frontier::default();
-            view.leaves.iter().for_each(|leaf| rebuilt.push(*leaf));
+            view.cache
+                .leaves()
+                .iter()
+                .for_each(|leaf| rebuilt.push(*leaf));
             *frontier = rebuilt;
         }
         let number = log.fetches.fetch_add(1, Ordering::SeqCst);
-        let from = view.leaves.len() as u64;
+        let from = view.cache.len();
         let (freed, freed_rx) = tokio::sync::oneshot::channel();
         let batch = RowBatch::new(Some(freed), hooks.clone());
         let fetched = match sql {
@@ -390,16 +401,15 @@ fn catch_up(
         Ok(entries) => entries,
         Err(error) => return (frontier, Err(error)),
     };
-    let mut leaves = Vec::with_capacity(view.leaves.len() + entries.len());
-    leaves.extend_from_slice(&view.leaves);
+    let mut cache = view.cache.clone();
     let mut roots = view.roots.clone();
     let m = entries.len();
     for (j, entry) in entries.iter().enumerate() {
         let leaf = entry.leaf_hash();
-        leaves.push(leaf);
+        cache.push(leaf);
         frontier.push(leaf);
         if j + ROOT_WINDOW >= m {
-            roots.push_back((leaves.len() as u64, frontier.root()));
+            roots.push_back((cache.len(), frontier.root()));
         }
     }
     while roots.len() > ROOT_WINDOW {
@@ -407,7 +417,7 @@ fn catch_up(
     }
     let next = Arc::new(LogView {
         root: frontier.root(),
-        leaves,
+        cache,
         roots,
     });
     *log.view.lock().expect("log view") = next.clone();
@@ -822,7 +832,10 @@ async fn consistency(
     if to > tree.size() {
         return Err(bad_request(format!("the log has {} entries", tree.size())));
     }
-    let proof = consistency_proof(tree.prefix(to), from).map_err(bad_request)?;
+    let proof = tree
+        .cache()
+        .consistency_proof(from, to)
+        .map_err(bad_request)?;
     Ok(Json(json!({"from": from, "to": to, "proof": proof})))
 }
 
@@ -1262,7 +1275,10 @@ async fn log_mine(
         .map_err(internal)?;
     tx.commit().await.map_err(internal)?;
     let with_proof = |entry: Entry| -> Result<EntryWithProof, Reply> {
-        let proof = inclusion_proof(tree.prefix(cp.size), entry.index).map_err(internal)?;
+        let proof = tree
+            .cache()
+            .inclusion_proof(cp.size, entry.index)
+            .map_err(internal)?;
         Ok(EntryWithProof { entry, proof })
     };
     let mut manifest = None;
@@ -1721,7 +1737,7 @@ async fn refresh_cosignatures(mut app: App) {
 
 /// Denies a claim whose checkpoint is not a state of this gateway's log.
 fn foreign_checkpoint(tree: &Tree, cp: &LogCheckpoint) -> Option<String> {
-    let known = cp.size > 0 && cp.size <= tree.size() && root(tree.prefix(cp.size)) == cp.root;
+    let known = cp.size > 0 && cp.size <= tree.size() && tree.root_at(cp.size) == cp.root;
     (!known).then(|| {
         format!(
             "the claim's log checkpoint (size {}) is not a state of this gateway's log (size {})",
@@ -2355,7 +2371,7 @@ mod tests {
         Tree {
             view: Arc::new(LogView {
                 root: root(&leaves),
-                leaves,
+                cache: leaves.into_iter().collect(),
                 roots: VecDeque::new(),
             }),
             revision: 0,
@@ -4482,7 +4498,7 @@ grace = "1d"
         let tree = tree_of((0u8..5).map(|i| open_pact_core::leaf_hash(&[i])).collect());
         let at = |size: u64| LogCheckpoint {
             size,
-            root: root(tree.prefix(size)),
+            root: tree.root_at(size),
         };
         assert_eq!(foreign_checkpoint(&tree, &at(3)), None);
         assert_eq!(foreign_checkpoint(&tree, &at(5)), None);

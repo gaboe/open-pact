@@ -10,9 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use open_pact_core::{
-    AddCheckpoint, Checkpoint, LogPolicy, Note, NoteSignature, WitnessKey, consistency_proof,
-};
+use open_pact_core::{AddCheckpoint, Checkpoint, LogPolicy, Note, NoteSignature, WitnessKey};
 use reqwest::StatusCode;
 use sqlx::{PgConnection, PgPool};
 use tokio::sync::{Notify, mpsc, oneshot, watch};
@@ -1110,7 +1108,7 @@ async fn send_push(
         let (tree, size, hooks) = (tree.clone(), cp.size, hooks.clone());
         tokio::task::spawn_blocking(move || {
             hooks.block("push_proof");
-            consistency_proof(tree.prefix(size), old)
+            tree.cache().consistency_proof(old, size)
         })
         .await??
     };

@@ -248,7 +248,7 @@ async fn seed_quorum(f: &Fixture, tree: &Tree, from: u64) -> usize {
         let cp = Checkpoint {
             origin: f.log.origin().to_string(),
             size,
-            root: open_pact_core::root(tree.prefix(size)),
+            root: tree.root_at(size),
         };
         for i in 0..3 {
             rows.push((

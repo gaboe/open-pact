@@ -152,6 +152,148 @@ impl Frontier {
     }
 }
 
+/// The complete-subtree hashes of every level of an append-only tree: `levels[h][j]` is the hash of
+/// the leaves `j * 2^h .. (j + 1) * 2^h`, stored once those leaves exist. A push hashes amortized
+/// O(1) nodes. The root of any prefix, an inclusion proof and a consistency proof each hash O(log n)
+/// nodes, where the free functions hash O(n). The answers and the errors equal those of `root`,
+/// `inclusion_proof` and `consistency_proof` over the same leaves. It holds about 2n hashes.
+#[derive(Debug, Clone, Default)]
+pub struct MerkleCache {
+    levels: Vec<Vec<LogHash>>,
+}
+
+impl MerkleCache {
+    /// The number of leaves pushed.
+    pub fn len(&self) -> u64 {
+        self.leaves().len() as u64
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.leaves().is_empty()
+    }
+
+    /// The leaves pushed so far, oldest first.
+    pub fn leaves(&self) -> &[LogHash] {
+        self.levels.first().map_or(&[], Vec::as_slice)
+    }
+
+    pub fn push(&mut self, leaf: LogHash) {
+        let (mut height, mut hash) = (0, leaf);
+        loop {
+            if self.levels.len() == height {
+                self.levels.push(vec![]);
+            }
+            let level = &mut self.levels[height];
+            level.push(hash);
+            let n = level.len();
+            if n % 2 == 1 {
+                return;
+            }
+            hash = node_hash(&level[n - 2], &level[n - 1]);
+            height += 1;
+        }
+    }
+
+    fn checked_size(&self, size: u64) -> Result<usize, Error> {
+        match usize::try_from(size) {
+            Ok(size) if size as u64 <= self.len() => Ok(size),
+            _ => Err(broken(format!(
+                "tree size {size} is beyond the {} leaves held",
+                self.len()
+            ))),
+        }
+    }
+
+    /// MTH of `len` leaves from `lo`, with `lo + len <= self.len()`. A range the recursion of RFC
+    /// 9162 reaches is a complete aligned subtree or splits into one and a shorter range.
+    fn range_root(&self, lo: usize, len: usize) -> LogHash {
+        if len.is_power_of_two() && lo.is_multiple_of(len) {
+            return self.levels[len.trailing_zeros() as usize][lo / len];
+        }
+        let k = split(len);
+        node_hash(&self.range_root(lo, k), &self.range_root(lo + k, len - k))
+    }
+
+    /// MTH(D[size]) of the first `size` leaves.
+    pub fn root(&self, size: u64) -> Result<LogHash, Error> {
+        match self.checked_size(size)? {
+            0 => Ok(root(&[])),
+            size => Ok(self.range_root(0, size)),
+        }
+    }
+
+    /// PATH(index, D[size]) over the first `size` leaves.
+    pub fn inclusion_proof(&self, size: u64, index: u64) -> Result<Vec<LogHash>, Error> {
+        let n = self.checked_size(size)?;
+        let m = match usize::try_from(index) {
+            Ok(m) if m < n => m,
+            _ => {
+                return Err(broken(format!(
+                    "index {index} is outside a tree of size {size}"
+                )));
+            }
+        };
+        let mut proof = vec![];
+        self.path(m, 0, n, &mut proof);
+        Ok(proof)
+    }
+
+    fn path(&self, m: usize, lo: usize, len: usize, proof: &mut Vec<LogHash>) {
+        if len <= 1 {
+            return;
+        }
+        let k = split(len);
+        if m < k {
+            self.path(m, lo, k, proof);
+            proof.push(self.range_root(lo + k, len - k));
+        } else {
+            self.path(m - k, lo + k, len - k, proof);
+            proof.push(self.range_root(lo, k));
+        }
+    }
+
+    /// PROOF(old, D[new]) over the first `new` leaves. Empty when `old == new`.
+    pub fn consistency_proof(&self, old: u64, new: u64) -> Result<Vec<LogHash>, Error> {
+        let n = self.checked_size(new)?;
+        let m = match usize::try_from(old) {
+            Ok(m) if 0 < m && m <= n => m,
+            _ => {
+                return Err(broken(format!(
+                    "no consistency proof from size {old} to size {new}"
+                )));
+            }
+        };
+        let mut proof = vec![];
+        self.subproof(m, 0, n, true, &mut proof);
+        Ok(proof)
+    }
+
+    fn subproof(&self, m: usize, lo: usize, len: usize, complete: bool, proof: &mut Vec<LogHash>) {
+        if m == len {
+            if !complete {
+                proof.push(self.range_root(lo, len));
+            }
+            return;
+        }
+        let k = split(len);
+        if m <= k {
+            self.subproof(m, lo, k, complete, proof);
+            proof.push(self.range_root(lo + k, len - k));
+        } else {
+            self.subproof(m - k, lo + k, len - k, false, proof);
+            proof.push(self.range_root(lo, k));
+        }
+    }
+}
+
+impl FromIterator<LogHash> for MerkleCache {
+    fn from_iter<I: IntoIterator<Item = LogHash>>(leaves: I) -> MerkleCache {
+        let mut cache = MerkleCache::default();
+        leaves.into_iter().for_each(|leaf| cache.push(leaf));
+        cache
+    }
+}
+
 /// MTH(D[n]), RFC 9162 section 2.1.1.
 pub fn root(leaves: &[LogHash]) -> LogHash {
     match leaves.len() {
@@ -600,8 +742,124 @@ mod tests {
         assert_eq!(moved.leaf_hash(), e.leaf_hash());
     }
 
+    fn sample(i: u32) -> LogHash {
+        leaf_hash(&i.to_be_bytes())
+    }
+
+    fn same<T: PartialEq + fmt::Debug>(cache: Result<T, Error>, free: Result<T, Error>) {
+        match (cache, free) {
+            (Ok(cache), Ok(free)) => assert_eq!(cache, free),
+            (Err(cache), Err(free)) => assert_eq!(cache.to_string(), free.to_string()),
+            (cache, free) => panic!("cache {cache:?} differs from free function {free:?}"),
+        }
+    }
+
+    #[test]
+    fn a_merkle_cache_equals_the_free_functions_at_every_size() {
+        let leaves: Vec<LogHash> = (0..300).map(sample).collect();
+        let mut cache = MerkleCache::default();
+        for (n, leaf) in leaves.iter().enumerate() {
+            cache.push(*leaf);
+            let len = n + 1;
+            assert_eq!(cache.len(), len as u64);
+            assert_eq!(cache.leaves(), &leaves[..len]);
+            let size = len as u64;
+            same(cache.root(size), Ok(root(&leaves[..len])));
+            for m in 0..size {
+                same(
+                    cache.inclusion_proof(size, m),
+                    inclusion_proof(&leaves[..len], m),
+                );
+            }
+            for old in 1..=size {
+                same(
+                    cache.consistency_proof(old, size),
+                    consistency_proof(&leaves[..len], old),
+                );
+            }
+            // Earlier prefixes after the append: the stored subtrees do not change.
+            if len.is_power_of_two() || len % 37 == 0 || len == 300 {
+                for p in 0..=len {
+                    let prefix = &leaves[..p];
+                    same(cache.root(p as u64), Ok(root(prefix)));
+                    let p = p as u64;
+                    for m in [0, p / 2, p.saturating_sub(1)] {
+                        same(cache.inclusion_proof(p, m), inclusion_proof(prefix, m));
+                    }
+                    for old in [0, 1, p / 2, p] {
+                        same(
+                            cache.consistency_proof(old, p),
+                            consistency_proof(prefix, old),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_merkle_cache_gives_the_errors_of_the_free_functions() {
+        let leaves: Vec<LogHash> = (0..11).map(sample).collect();
+        let empty = MerkleCache::default();
+        assert!(empty.is_empty());
+        assert_eq!(empty.leaves(), &[] as &[LogHash]);
+        same(empty.root(0), Ok(root(&[])));
+        same(empty.inclusion_proof(0, 0), inclusion_proof(&[], 0));
+        same(empty.consistency_proof(0, 0), consistency_proof(&[], 0));
+        same(empty.consistency_proof(1, 0), consistency_proof(&[], 1));
+        let cache: MerkleCache = leaves.iter().copied().collect();
+        for (size, index) in [
+            (11u64, 11u64),
+            (11, 12),
+            (11, u64::MAX),
+            (5, 5),
+            (5, 10),
+            (0, 0),
+        ] {
+            same(
+                cache.inclusion_proof(size, index),
+                inclusion_proof(&leaves[..size as usize], index),
+            );
+        }
+        for (old, new) in [
+            (0u64, 11u64),
+            (6, 5),
+            (12, 11),
+            (u64::MAX, 11),
+            (11, 11),
+            (7, 11),
+        ] {
+            same(
+                cache.consistency_proof(old, new),
+                consistency_proof(&leaves[..new as usize], old),
+            );
+        }
+        // A size beyond the leaves held has no free-function twin: the cache refuses it.
+        assert!(cache.root(12).is_err());
+        assert!(cache.root(u64::MAX).is_err());
+        assert!(cache.inclusion_proof(12, 0).is_err());
+        assert!(cache.consistency_proof(1, 12).is_err());
+    }
+
+    #[test]
+    fn a_merkle_cache_clone_grows_apart_from_its_source() {
+        let leaves: Vec<LogHash> = (0..9).map(sample).collect();
+        let source: MerkleCache = leaves[..5].iter().copied().collect();
+        let mut grown = source.clone();
+        leaves[5..].iter().for_each(|leaf| grown.push(*leaf));
+        assert_eq!(source.len(), 5);
+        assert_eq!(source.root(5).unwrap(), root(&leaves[..5]));
+        assert_eq!(grown.root(9).unwrap(), root(&leaves));
+        assert_eq!(grown.root(5).unwrap(), source.root(5).unwrap());
+        let proof = grown.consistency_proof(5, 9).unwrap();
+        verify_consistency(5, 9, &root(&leaves[..5]), &root(&leaves), &proof).unwrap();
+        let proof = grown.inclusion_proof(9, 7).unwrap();
+        verify_inclusion(&leaves[7], 7, 9, &proof, &root(&leaves)).unwrap();
+    }
+
     /// S6.2 timing: one run is one root of the whole prefix and three inclusion proofs over it, the
-    /// hashing the gateway does per request. Run it in release, with the output shown:
+    /// hashing the gateway does per request, once with the free functions and once with a
+    /// `MerkleCache`. Run it in release, with the output shown:
     /// `rtk proxy cargo test --release -p open-pact-core timing_one_run -- --ignored --nocapture`.
     #[test]
     #[ignore = "timing run: release build only"]
@@ -609,25 +867,40 @@ mod tests {
         use std::hint::black_box;
         use std::time::Instant;
         const RUNS: usize = 5;
-        for n in [1_000usize, 20_000, 100_000] {
-            let leaves: Vec<LogHash> = (0..n as u64).map(|i| leaf_hash(&i.to_be_bytes())).collect();
-            let indices = [0u64, (n / 2) as u64, (n - 1) as u64];
-            let one_run = || {
+        fn measure(one_run: impl Fn()) -> (f64, f64) {
+            let timed = || {
                 let started = Instant::now();
+                one_run();
+                started.elapsed().as_secs_f64() * 1e3
+            };
+            timed();
+            let times: Vec<f64> = (0..RUNS).map(|_| timed()).collect();
+            let min = times.iter().copied().fold(f64::INFINITY, f64::min);
+            let max = times.iter().copied().fold(0.0, f64::max);
+            (min, max)
+        }
+        for n in [1_000usize, 20_000, 100_000] {
+            let leaves: Vec<LogHash> = (0..n as u32).map(sample).collect();
+            let cache: MerkleCache = leaves.iter().copied().collect();
+            let indices = [0u64, (n / 2) as u64, (n - 1) as u64];
+            let free = measure(|| {
                 black_box(root(black_box(&leaves[..n])));
                 for m in indices {
                     black_box(inclusion_proof(black_box(&leaves[..n]), m).unwrap());
                 }
-                started.elapsed().as_secs_f64() * 1e3
-            };
-            one_run();
-            let times: Vec<f64> = (0..RUNS).map(|_| one_run()).collect();
-            let min = times.iter().copied().fold(f64::INFINITY, f64::min);
-            let max = times.iter().copied().fold(0.0, f64::max);
-            println!(
-                "TIMING leaves={n} runs={RUNS} min_ms={min:.3} max_ms={max:.3} spread_pct={:.1}",
-                (max - min) / min * 100.0
-            );
+            });
+            let cached = measure(|| {
+                black_box(black_box(&cache).root(n as u64).unwrap());
+                for m in indices {
+                    black_box(black_box(&cache).inclusion_proof(n as u64, m).unwrap());
+                }
+            });
+            for (name, (min, max)) in [("free", free), ("cache", cached)] {
+                println!(
+                    "TIMING leaves={n} impl={name} runs={RUNS} min_ms={min:.4} max_ms={max:.4} spread_pct={:.1}",
+                    (max - min) / min * 100.0
+                );
+            }
         }
     }
 }

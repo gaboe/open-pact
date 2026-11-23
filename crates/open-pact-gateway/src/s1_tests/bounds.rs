@@ -205,7 +205,7 @@ async fn case(f: &Fixture, query: String, seeded: &[Seeded], hold: bool) -> Run 
     let wait = f.app.wait;
     let base = f.app.tree().await.unwrap();
     let (s, t) = (base.size(), base.size() + GROWTH);
-    let mut leaves = base.view.leaves.clone();
+    let mut leaves = base.view.cache.leaves().to_vec();
     for g in s..t {
         leaves.push(
             Entry {
