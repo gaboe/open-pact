@@ -71,6 +71,7 @@ fn base() -> Report {
             job_status: None,
             system_job: false,
             system_job_pending: false,
+            pending_job_status: None,
             machine_client: None,
             machine_fix: None,
             job_fix: None,
