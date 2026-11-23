@@ -39,7 +39,7 @@ Run the verification script with a release tag:
 scripts/verify-client-release.sh v0.8.5
 ```
 
-The script checks every checksum and Sigstore bundle. For a release that has them, it also checks the desktop app zips (`open-pact-desktop-<version>-macos.zip` and `open-pact-desktop-<version>-windows-x64.zip`). The desktop installers, `desktop/scripts/install-desktop.sh` and `install-desktop.ps1`, check the zip against its line in `SHA256SUMS` but do not verify the Cosign signature. It keeps the verified files in a private temporary directory when verification succeeds. It removes the directory if verification fails. It prints the directory path on the last line. Copy that path for the install command.
+The script checks every checksum and Sigstore bundle. For a release that has them, it also checks the desktop app zips (`open-pact-desktop-<version>-macos.zip` and `open-pact-desktop-<version>-windows-x64.zip`). The desktop installers, `desktop/scripts/install-desktop.sh` and `install-desktop.ps1`, check the zip against its line in `SHA256SUMS` but do not verify the Cosign signature. It keeps the verified files in a private temporary directory when verification succeeds. It removes the directory if verification fails. It prints the directory path on the last line. Copy that path for the install command. A release can also include the Windows package `open-pact-client-x86_64-pc-windows-msvc.msi`. Install it with the block in [Install the machine client](#install-the-machine-client-for-the-system-job).
 
 Set `verified_dir` to the printed path:
 
@@ -72,7 +72,7 @@ Set `$verifiedDir` to the printed path in PowerShell:
 $verifiedDir = 'C:\path\printed\by\script'
 ```
 
-For Windows x86-64, run:
+For Windows x86-64, run this copy for your own user. The SYSTEM job does not use it:
 
 ```powershell
 New-Item -ItemType Directory -Force "$env:USERPROFILE\bin" | Out-Null
@@ -244,7 +244,7 @@ open-pact-client schedule status
 open-pact-client schedule off
 ```
 
-`schedule on` prints the policy line, then `schedule: install`, then `Your choice: automatic sending is on.` A second run prints `no changes` and the same choice line, and a changed executable path prints `schedule: update`. A job that client 0.7 installed wakes every five minutes: `schedule on` prints `schedule: update` and rewrites it to wake every minute on macOS, Linux and Windows. After a client update, a job that you run as your own user rewrites itself to the new definition on its first wake, once for each client version, and only while automatic sending is on and the signed manifest defines `[schedule]`; on macOS a short helper job reloads the LaunchAgent after the run ends. A SYSTEM job on Windows never updates itself, because a client that any user can write must not be copied into Program Files as SYSTEM. When the client in Program Files is not the client you run, `status`, `schedule status` and `check` say that the job is out of date, and `schedule on --system` from an elevated prompt updates it. Dry run prints the planned change and writes nothing. `schedule status` shows the consent line, your choice, the state of the job, the last claim that the gateway answered, the last check, and when the next check and the next claim fall due. For a SYSTEM job on Windows it reads that job's protected state: run it from an elevated prompt. When the state cannot be read, `schedule status` and `accept` say that the times are unknown and why. It derives the due times from the same rules as the job, and it assumes that the device stays where the last run found it (on the VPN or not). Keep the client binary at its installed path. Use the same absolute `--home` for each command. If the entire client home is already missing, `schedule off` removes the remaining job without recreating that home. The job reads the policy from the manifest you signed. A manifest change that keeps or narrows the schedule needs no new `schedule on`. After `accept` signs a manifest that widens it, run `schedule on` again. A change that only checks more often counts as widening.
+`schedule on` prints the policy line, then `schedule: install`, then `Your choice: automatic sending is on.` A second run prints `no changes` and the same choice line, and a changed executable path prints `schedule: update`. A job that client 0.7 installed wakes every five minutes: `schedule on` prints `schedule: update` and rewrites it to wake every minute on macOS, Linux and Windows. After a client update, a job that you run as your own user rewrites itself to the new definition on its first wake, once for each client version, and only while automatic sending is on and the signed manifest defines `[schedule]`; on macOS a short helper job reloads the LaunchAgent after the run ends. A SYSTEM job on Windows runs the machine client in Program Files. To upgrade it, run the install block in [Install the machine client](#install-the-machine-client-for-the-system-job). When the machine client is not the client you run, `status`, `schedule status` and `check` say so. Dry run prints the planned change and writes nothing. `schedule status` shows the consent line, your choice, the state of the job, the last claim that the gateway answered, the last check, and when the next check and the next claim fall due. For a SYSTEM job on Windows it reads that job's protected state: run it from an elevated prompt. When the state cannot be read, `schedule status` and `accept` say that the times are unknown and why. It derives the due times from the same rules as the job, and it assumes that the device stays where the last run found it (on the VPN or not). Keep the client binary at its installed path. Use the same absolute `--home` for each command. If the entire client home is already missing, `schedule off` removes the remaining job without recreating that home. The job reads the policy from the manifest you signed. A manifest change that keeps or narrows the schedule needs no new `schedule on`. After `accept` signs a manifest that widens it, run `schedule on` again. A change that only checks more often counts as widening.
 
 ### What one wake does
 
@@ -275,6 +275,69 @@ macOS uses a launchd LaunchAgent. Linux uses a systemd user timer and needs a ru
 
 A `[report]` table in an old `open-pact.toml` has no effect. The client sends no separate report to a collector.
 
+### Install the machine client for the SYSTEM job
+
+The SYSTEM job runs the machine client, which the package installs at `C:\Program Files\open-pact-client\open-pact-client.exe`. Install the package before you run `schedule on --system`. Run this block in an elevated Windows PowerShell 5.1 prompt (`powershell.exe`, not `pwsh`). The same block upgrades and reinstalls the package:
+
+```powershell
+& {
+if ($PSVersionTable.PSEdition -eq 'Core') { throw 'Run this block in Windows PowerShell 5.1: start powershell.exe as administrator, not pwsh.' }
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$ErrorActionPreference = 'Stop'
+function AssertProtected($path) {
+    $item = Get-Item -LiteralPath $path -Force
+    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Protected path is a reparse point' }
+    $acl = if ($item.PSIsContainer) { [IO.Directory]::GetAccessControl($path) } else { [IO.File]::GetAccessControl($path) }
+    $allowed = @('S-1-5-18','S-1-5-32-544','S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
+    $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+    if ($allowed -notcontains $owner) { throw 'Protected path has a non-admin owner' }
+    foreach ($rule in $acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])) {
+        if ($rule.AccessControlType -eq 'Allow' -and -not ($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) -and ($rule.FileSystemRights -band 0xD0156) -and $allowed -notcontains $rule.IdentityReference.Value) {
+            throw 'Protected path ACL grants write or modify to a non-admin principal'
+        }
+    }
+}
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+if (-not (New-Object Security.Principal.WindowsPrincipal($identity)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Run this block from an elevated Windows PowerShell 5.1 prompt (powershell.exe).' }
+$base = 'https://github.com/gaboe/open-pact/releases/download/v0.9.0'
+$msiName = 'open-pact-client-x86_64-pc-windows-msvc.msi'
+$folder = Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) ('open-pact-install-' + [guid]::NewGuid())
+if (Test-Path -LiteralPath $folder) { throw 'The install folder exists. Run this block again.' }
+$security = New-Object Security.AccessControl.DirectorySecurity
+$security.SetAccessRuleProtection($true, $false)
+$security.SetOwner((New-Object Security.Principal.SecurityIdentifier('S-1-5-32-544')))
+foreach ($sid in @('S-1-5-18', 'S-1-5-32-544')) {
+    $account = New-Object Security.Principal.SecurityIdentifier($sid)
+    $security.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($account, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+}
+[void][IO.Directory]::CreateDirectory($folder, $security)
+AssertProtected $folder
+foreach ($name in @($msiName, 'SHA256SUMS', 'SHA256SUMS.sigstore.json')) {
+    Invoke-WebRequest -UseBasicParsing -Uri "$base/$name" -OutFile (Join-Path $folder $name)
+}
+$cosign = Join-Path $folder 'cosign.exe'
+Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/sigstore/cosign/releases/download/v3.0.6/cosign-windows-amd64.exe' -OutFile $cosign
+if ((Get-FileHash -LiteralPath $cosign -Algorithm SHA256).Hash -ne '9b85a88ebff2d9dd30ff4984a6f61f2cedc232dd87d81fa7f2ff3c0ed96c241c') { throw 'cosign.exe does not match its pinned hash.' }
+$sums = Join-Path $folder 'SHA256SUMS'
+& $cosign verify-blob --bundle (Join-Path $folder 'SHA256SUMS.sigstore.json') --certificate-identity 'https://github.com/gaboe/open-pact/.github/workflows/client-release.yml@refs/tags/v0.9.0' --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' $sums
+if ($LASTEXITCODE -ne 0) { throw 'Cosign could not verify SHA256SUMS.' }
+$lines = @(Get-Content -LiteralPath $sums | Where-Object { $_ -match '\S' -and (($_ -split '\s+', 2)[1].TrimStart('*') -eq $msiName) })
+if ($lines.Count -ne 1) { throw 'SHA256SUMS must list the package once.' }
+$msi = Join-Path $folder $msiName
+if ((Get-FileHash -LiteralPath $msi -Algorithm SHA256).Hash -ne ($lines[0] -split '\s+')[0]) { throw 'The package does not match SHA256SUMS.' }
+$log = Join-Path $folder 'install.log'
+$msiexec = Join-Path ([Environment]::SystemDirectory) 'msiexec.exe'
+$install = Start-Process -FilePath $msiexec -ArgumentList ('/i "' + $msi + '" /qn /norestart /l*v "' + $log + '"') -Wait -PassThru
+Write-Output ('msiexec exit code: ' + $install.ExitCode)
+if ($install.ExitCode -eq 3010) { Write-Output 'Restart Windows to finish the install.' }
+elseif ($install.ExitCode -ne 0) { throw ('The install failed. See ' + $log) }
+}
+```
+
+Exit code 3010 means that Windows needs a restart to finish the install. For a deployment with Intune or Group Policy, see [Windows machine install](windows-machine-install.md).
+
 ### Use Windows SYSTEM checks
 
 The wizard asks whether the job runs as SYSTEM. Later, choose it with `schedule on --system`, and go back with `schedule on --user`. Run `schedule on --system` from an elevated PowerShell prompt:
@@ -283,7 +346,7 @@ The wizard asks whether the job runs as SYSTEM. Later, choose it with `schedule 
 open-pact-client --home 'C:\Example User\pact' schedule on --system
 ```
 
-Without elevation, the command prints the exact elevated command and changes nothing. Other operating systems reject `--system`. The installer copies the client into `%ProgramFiles%\open-pact\open-pact-client.exe` and refuses a directory that non-administrators can write. The SYSTEM job runs with `--system --user-home <profile>`. It reads the selected absolute client home, uses the repository folders from `device.json`, and keeps its state under protected `%ProgramData%`. Choose a home path without `%`. `--user-home` must be the profile folder of a user account that Windows lists in its profile registry, and not a link; the client ignores `USERPROFILE` and the arguments of a task that a user can write. The install block that the client prints runs in an elevated Windows PowerShell 5.1 prompt (`powershell.exe`), not in `pwsh`. The task reads Windows settings and does not change them. See [platform support](platform-support.md) for checks that need SYSTEM access.
+Without elevation, the command prints the exact elevated command and changes nothing. Other operating systems reject `--system`. The package installs the machine client at `%ProgramFiles%\open-pact-client\open-pact-client.exe`, in a folder that non-administrators cannot write. The SYSTEM job runs only that file, and nothing is copied. The SYSTEM job runs with `--system --user-home <profile>`. It reads the selected absolute client home, uses the repository folders from `device.json`, and keeps its state under protected `%ProgramData%`. Choose a home path without `%`. `--user-home` must be the profile folder of a user account that Windows lists in its profile registry, and not a link; the client ignores `USERPROFILE` and the arguments of a task that a user can write. The install block that the client prints runs in an elevated Windows PowerShell 5.1 prompt (`powershell.exe`), not in `pwsh`. The task reads Windows settings and does not change them. See [platform support](platform-support.md) for checks that need SYSTEM access.
 
 A SYSTEM job reads repositories only below the user profile. A worktree whose repository lies outside it, for example on `D:\`, makes the repository counts unknown. Keep the repository below the profile, or run the job as you with `schedule on --user`.
 
@@ -291,7 +354,41 @@ A SYSTEM job reads repositories only below the user profile. A worktree whose re
 
 Run `open-pact-client schedule off` with the same absolute `--home` before deleting the binary or client home. It removes the job, the applied-settings receipt, and the job state, and it records your no in `device.json`. Run `stop` to print these instructions. On Windows it prints the full path of the client and says that a SYSTEM job needs an elevated PowerShell prompt.
 
-Limited Windows operations leave orphaned protected state and the shared binary unchanged. To remove those leftovers, run `schedule off` from an elevated PowerShell prompt. SYSTEM removal needs elevation and uses the existing protected state lock. A held lock stops task removal and asks you to retry. Removal cleans up the shared binary only when no SYSTEM task uses it. If cleanup fails, retry `schedule off` after the client stops or Windows restarts.
+On Windows, remove each SYSTEM task before you uninstall the package. Run this block in an elevated Windows PowerShell 5.1 prompt, once for each task. Find the task names with `schtasks.exe /Query /FO CSV /NH`:
+
+```powershell
+& {
+  $schtasks = Join-Path ([Environment]::SystemDirectory) 'schtasks.exe'
+  function Test-TaskRegistered {
+    # The Task Scheduler COM API reports a missing task as HRESULT 0x80070002, in every display language.
+    $service = New-Object -ComObject Schedule.Service
+    $service.Connect()
+    try {
+      [void]$service.GetFolder('\').GetTask('\org.open-pact.report.0123abcd')
+      return $true
+    } catch {
+      $e = $_.Exception
+      while ($e.InnerException) { $e = $e.InnerException }
+      if ($e.HResult -eq -2147024894) { return $false }
+      throw ('Could not query the task. ' + $_)
+    }
+  }
+  function End-TaskQuietly {
+    # /End fails for a task that is not running. That does not matter here: /Delete decides.
+    $ErrorActionPreference = 'Continue'
+    & $schtasks /End /TN 'org.open-pact.report.0123abcd' 2>$null | Out-Null
+  }
+  if (Test-TaskRegistered) {
+    End-TaskQuietly
+    & $schtasks /Delete /TN 'org.open-pact.report.0123abcd' /F
+    if ($LASTEXITCODE -ne 0) { throw 'The task was not removed. Run this block again from an elevated prompt.' }
+  }
+  if (Test-TaskRegistered) { throw 'The task is still registered. Run this block again.' }
+  & 'C:\Program Files\open-pact-client\open-pact-client.exe' --home 'C:\Users\example\pact' schedule off
+}
+```
+
+The last line runs `schedule off` with the machine client. It waits for the state lock, then removes the job state. A held lock stops the block. Run the block again after the lock is free. Then uninstall the package. Uninstalling the package does not remove SYSTEM tasks. A task that runs another program was not made by the client. The client does not change it, and the block deletes any task with the name that you give it. Check the task in Task Scheduler first.
 
 ## Read the output as JSON
 
