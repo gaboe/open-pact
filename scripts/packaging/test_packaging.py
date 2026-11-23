@@ -9,9 +9,11 @@ import contextlib
 import importlib.util
 import io
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -169,6 +171,108 @@ class VersionGateTest(unittest.TestCase):
         root = HERE.parents[1]
         version = gate.workspace_version(root / "Cargo.toml")
         self.assertEqual(gate.check(f"v{version}", root), version)
+
+
+class MsiVersionTest(unittest.TestCase):
+    def test_each_row_of_the_scheme(self):
+        cases = {
+            "0.9.0-rc.1": "0.9.1",
+            "0.9.0-rc.2": "0.9.2",
+            "0.9.0": "0.9.99",
+            "0.9.1-rc.1": "0.9.101",
+            "0.9.1": "0.9.199",
+            "0.0.1": "0.0.199",
+            "0.0.2-rc.1": "0.0.201",
+            "0.0.2": "0.0.299",
+            "0.0.3": "0.0.399",
+        }
+        for version, product in cases.items():
+            with self.subTest(version=version):
+                self.assertEqual(gate.msi_version(version), product)
+
+    def test_the_releases_sort_in_release_order(self):
+        releases = []
+        for patch in range(4):
+            releases += [f"1.2.{patch}-rc.{number}" for number in range(1, 99)]
+            releases.append(f"1.2.{patch}")
+        keys = [tuple(int(part) for part in gate.msi_version(version).split(".")) for version in releases]
+        self.assertEqual(keys, sorted(keys))
+        self.assertEqual(len(set(keys)), len(keys))
+
+    def test_the_largest_values_fit_the_build_field(self):
+        self.assertEqual(gate.msi_version("255.255.654"), "255.255.65499")
+        self.assertEqual(gate.msi_version("255.255.654-rc.98"), "255.255.65498")
+
+    def test_values_outside_the_scheme_are_refused(self):
+        for version in (
+            "256.0.0", "0.256.0", "0.0.655", "0.0.654-rc.99", "0.0.0-rc.0",
+            "0.0.1-beta.1", "1.2", "01.2.3", "1.2.3-rc.01",
+        ):
+            with self.subTest(version=version), self.assertRaises(SystemExit):
+                gate.msi_version(version)
+
+
+class MsiProductCodeTest(unittest.TestCase):
+    UPGRADE = "{E1B7C572-13D3-4628-AFF3-453C870603F6}"
+
+    def test_the_product_code_follows_the_version(self):
+        code = gate.msi_product_code(self.UPGRADE, "0.9.0")
+        self.assertEqual(code, gate.msi_product_code(self.UPGRADE, "0.9.0"))
+        self.assertNotEqual(code, gate.msi_product_code(self.UPGRADE, "0.9.0-rc.1"))
+        self.assertRegex(code, r"^\{[0-9A-F]{8}-[0-9A-F]{4}-5[0-9A-F]{3}-[89AB][0-9A-F]{3}-[0-9A-F]{12}\}$")
+
+    def test_the_command_prints_the_product_version_and_code(self):
+        out = subprocess.run(
+            [sys.executable, str(HERE / "check-release-version.py"), "--msi", "0.9.0-rc.1", self.UPGRADE],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        version, code = out.split()
+        self.assertEqual(version, "0.9.1")
+        self.assertEqual(code, gate.msi_product_code(self.UPGRADE, "0.9.0-rc.1"))
+
+
+class TagSchemeTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        for path, version in ((self.root / "Cargo.toml", "1.2.3-beta.1"), (self.root / "desktop" / "Cargo.toml", "1.2.3-beta.1")):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f'[workspace]\nmembers = []\n\n[workspace.package]\nversion = "{version}"\n')
+
+    def test_a_tag_the_msi_scheme_cannot_order_fails_before_any_build(self):
+        with self.assertRaises(SystemExit):
+            gate.check("v1.2.3-beta.1", self.root)
+
+
+class WixSourceTest(unittest.TestCase):
+    WIX = HERE.parents[1] / "packaging" / "windows"
+    NS = "{http://wixtoolset.org/schemas/v4/wxs}"
+
+    def test_both_sources_are_well_formed_and_share_one_upgrade_code(self):
+        codes = set()
+        for path in (self.WIX / "open-pact-client.wxs", self.WIX / "tests" / "fail-late.wxs"):
+            package = ET.parse(path).getroot().find(self.NS + "Package")
+            codes.add(package.get("UpgradeCode"))
+        self.assertEqual(len(codes), 1)
+        self.assertRegex(codes.pop(), r"^\{[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}\}$")
+
+    def test_the_release_source_has_one_file_and_no_custom_action(self):
+        text = (self.WIX / "open-pact-client.wxs").read_text()
+        self.assertEqual(text.count("<File "), 1)
+        for forbidden in ("CustomAction", "Binary", "InstallExecuteSequence"):
+            self.assertNotIn(forbidden, text)
+        self.assertIn('Name="PATH"', text)
+
+    def test_the_fail_late_fixture_is_the_release_source_plus_its_failing_action(self):
+        release = (self.WIX / "open-pact-client.wxs").read_text().splitlines()
+        fixture = (self.WIX / "tests" / "fail-late.wxs").read_text().splitlines()
+        self.assertEqual([line for line in release if line not in fixture], [])
+        added = [line for line in fixture if line not in release]
+        self.assertTrue(any('Id="FailLate"' in line for line in added))
+        self.assertTrue(all(line.strip().startswith(("<", "Execute", "Impersonate")) or line.strip() == "" for line in added))
 
 
 if __name__ == "__main__":
