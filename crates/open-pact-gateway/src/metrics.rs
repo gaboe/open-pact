@@ -386,6 +386,25 @@ impl Metrics {
     }
 }
 
+/// The clock an observation point reads. Only points that run with observation on call it, so a
+/// test can count the reads and show that the off path makes none.
+pub fn now() -> Instant {
+    #[cfg(test)]
+    CLOCK_READS.with(|reads| reads.set(reads.get() + 1));
+    Instant::now()
+}
+
+#[cfg(test)]
+thread_local! {
+    static CLOCK_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The clock reads that observation points made on this thread.
+#[cfg(test)]
+pub(crate) fn clock_reads() -> u64 {
+    CLOCK_READS.with(std::cell::Cell::get)
+}
+
 /// Times a future into a metric when metrics are on. Off, it only awaits the future.
 pub async fn timed<T>(
     metrics: Option<&Metrics>,
@@ -395,31 +414,32 @@ pub async fn timed<T>(
     let Some(metrics) = metrics else {
         return future.await;
     };
-    let start = Instant::now();
+    let start = now();
     let output = future.await;
     record(metrics, start.elapsed().as_secs_f64());
     output
 }
 
-/// Records the time since the previous mark as one claim stage. Off, a mark does nothing.
+/// Records the time since the previous mark as one claim stage. Off, it reads no clock and a mark
+/// does nothing.
 pub struct StageClock<'a> {
     metrics: Option<&'a Metrics>,
-    last: Instant,
+    last: Option<Instant>,
 }
 
 impl<'a> StageClock<'a> {
     pub fn new(metrics: Option<&'a Metrics>) -> StageClock<'a> {
         StageClock {
             metrics,
-            last: Instant::now(),
+            last: metrics.map(|_| now()),
         }
     }
 
     pub fn mark(&mut self, stage: Stage) {
-        if let Some(metrics) = self.metrics {
-            let now = Instant::now();
-            metrics.claim_stage(stage, (now - self.last).as_secs_f64());
-            self.last = now;
+        if let (Some(metrics), Some(last)) = (self.metrics, self.last) {
+            let at = now();
+            metrics.claim_stage(stage, (at - last).as_secs_f64());
+            self.last = Some(at);
         }
     }
 }
@@ -1243,6 +1263,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_off_path_reads_no_clock() {
+        let metrics = Metrics::new();
+        let before = clock_reads();
+        assert_eq!(
+            timed(None, |m, s| m.db_acquire(Site::Conn, s), async { 8 }).await,
+            8
+        );
+        let mut off = StageClock::new(None);
+        off.mark(Stage::Verify);
+        off.mark(Stage::Commit);
+        assert_eq!(clock_reads(), before, "observation read the clock while off");
+        let mut on = StageClock::new(Some(&metrics));
+        on.mark(Stage::Verify);
+        assert!(clock_reads() > before);
+    }
+
+    #[tokio::test]
     async fn timers_record_only_when_metrics_are_on() {
         let metrics = Metrics::new();
         let value = timed(Some(&metrics), |m, s| m.db_acquire(Site::Conn, s), async {
@@ -1250,13 +1287,8 @@ mod tests {
         })
         .await;
         assert_eq!(value, 7);
-        assert_eq!(
-            timed(None, |m, s| m.db_acquire(Site::Conn, s), async { 8 }).await,
-            8
-        );
         let mut clock = StageClock::new(Some(&metrics));
         clock.mark(Stage::Verify);
-        StageClock::new(None).mark(Stage::Verify);
         metrics.nonce_issue(NonceResult::CapReached);
         metrics.witness_push(Push::Conflict, 0.01);
         metrics.checkpoint_served(Caller::Claim, Served::NotYet);
