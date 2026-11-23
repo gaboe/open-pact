@@ -212,7 +212,7 @@ impl Session {
     pub async fn schedule(&self, on: bool) -> Result<()> {
         json_out::scope(Json::observed(Answers::default(), |_| {}), async {
             if on {
-                crate::schedule::turn_on(&self.home, None, false, &self.cli).await
+                crate::schedule::turn_on(&self.home, None, false, &self.cli, None).await
             } else {
                 crate::schedule::turn_off(&self.home, false, &self.cli).await
             }

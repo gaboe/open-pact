@@ -285,7 +285,7 @@ impl Fixture {
             false,
             &std::env::current_exe().unwrap(),
             self.now,
-            |_, _| Ok(self.job),
+            |_, _| Ok(self.job.into()),
         )
         .await
         .unwrap();
@@ -494,7 +494,7 @@ async fn a_deadline_in_the_past_is_reported_as_passed() {
         false,
         &std::env::current_exe().unwrap(),
         later,
-        |_, _| Ok(fixture.job),
+        |_, _| Ok(fixture.job.into()),
     )
     .await
     .unwrap();
@@ -982,7 +982,7 @@ async fn a_system_job_without_inspection_cannot_produce_ok() {
         false,
         &std::env::current_exe().unwrap(),
         fixture.now,
-        |_, _| Ok(JobStatus::SystemUnconfirmed),
+        |_, _| Ok(JobStatus::SystemUnconfirmed.into()),
     )
     .await
     .unwrap();
@@ -1008,7 +1008,7 @@ async fn an_outdated_system_job_tells_the_owner_to_update_it_from_an_elevated_pr
         false,
         &std::env::current_exe().unwrap(),
         fixture.now,
-        |_, _| Ok(JobStatus::Outdated),
+        |_, _| Ok(JobStatus::Outdated.into()),
     )
     .await
     .unwrap();
@@ -1028,6 +1028,201 @@ async fn an_outdated_system_job_tells_the_owner_to_update_it_from_an_elevated_pr
             .is_some_and(|command| command.ends_with("schedule on --system")),
         "{:?}",
         issue.command
+    );
+}
+
+async fn system_report(fixture: &Fixture, inspection: JobInspection) -> Report {
+    let mut config = DeviceConfig::load(&fixture.home).unwrap();
+    config.auto_send = true;
+    config.run_as = crate::device_config::RunAs::System;
+    config.save(&fixture.home).unwrap();
+    collect_with(
+        &fixture.home,
+        true,
+        false,
+        &std::env::current_exe().unwrap(),
+        fixture.now,
+        |_, _| Ok(inspection),
+    )
+    .await
+    .unwrap()
+}
+
+fn package(version: &str) -> crate::machine::MachineClient {
+    crate::machine::MachineClient::Present {
+        version: semver::Version::parse(version).unwrap(),
+    }
+}
+
+#[tokio::test]
+async fn an_outdated_package_and_a_missing_task_show_as_two_issues_with_their_own_fixes() {
+    let fixture = Fixture::new("auto_on").await;
+    let report = system_report(
+        &fixture,
+        JobInspection::system_fixture(package("0.0.1"), "missing"),
+    )
+    .await;
+    assert_eq!(report.schedule.machine_client, Some(MachineState::Outdated));
+    assert_eq!(report.schedule.job_status, Some(JobStatus::Missing));
+    let machine = report
+        .issues
+        .iter()
+        .find(|issue| issue.message == "The machine client is older than this client.")
+        .expect("the package issue");
+    assert!(machine.command.is_none());
+    assert!(
+        machine
+            .fix
+            .as_deref()
+            .unwrap()
+            .contains("Upgrade it from an elevated PowerShell prompt")
+    );
+    let task = report
+        .issues
+        .iter()
+        .find(|issue| {
+            issue
+                .message
+                .starts_with("Automatic sending is on, but its job")
+        })
+        .expect("the task issue");
+    assert!(task.command.is_none());
+    assert!(
+        task.fix
+            .as_deref()
+            .unwrap()
+            .contains("schedule on --system")
+    );
+    assert_eq!(
+        report.schedule.machine_fix.as_deref(),
+        machine.fix.as_deref()
+    );
+    assert_eq!(report.schedule.job_fix.as_deref(), task.fix.as_deref());
+}
+
+#[tokio::test]
+async fn a_missing_package_still_shows_the_task_and_a_current_package_shows_only_the_task() {
+    let fixture = Fixture::new("auto_on").await;
+    let report = system_report(
+        &fixture,
+        JobInspection::system_fixture(crate::machine::MachineClient::Missing, "stale"),
+    )
+    .await;
+    assert_eq!(report.schedule.machine_client, Some(MachineState::Missing));
+    assert!(report.issues.iter().any(|issue| {
+        issue.message == "The machine client is not installed."
+            && issue
+                .fix
+                .as_deref()
+                .is_some_and(|fix| fix.contains("msiexec.exe"))
+    }));
+    assert!(report.issues.iter().any(|issue| {
+        issue
+            .message
+            .starts_with("Automatic sending is on, but its job")
+            && issue.command.is_none()
+    }));
+
+    let fixture = Fixture::new("auto_on").await;
+    let report = system_report(
+        &fixture,
+        JobInspection::system_fixture(package(env!("CARGO_PKG_VERSION")), "missing"),
+    )
+    .await;
+    assert_eq!(report.schedule.machine_client, Some(MachineState::Current));
+    assert_eq!(report.schedule.machine_fix, None);
+    assert_eq!(report.issues.len(), 1, "{:?}", report.issues);
+}
+
+#[tokio::test]
+async fn a_task_that_is_not_ours_lists_the_removal_block() {
+    let fixture = Fixture::new("auto_on").await;
+    let report = system_report(
+        &fixture,
+        JobInspection::system_fixture(package(env!("CARGO_PKG_VERSION")), "not_ours"),
+    )
+    .await;
+    assert_eq!(report.schedule.job_status, Some(JobStatus::NotOurs));
+    let issue = report
+        .issues
+        .iter()
+        .find(|issue| issue.message.contains("is not the machine client's"))
+        .expect("the not-ours issue");
+    let fix = issue.fix.as_deref().unwrap();
+    assert!(
+        fix.contains("schtasks.exe") && !fix.contains("Remove-Item"),
+        "{fix}"
+    );
+    assert!(issue.command.is_none());
+    assert_eq!(
+        serde_json::to_value(JobStatus::NotOurs).unwrap(),
+        json!("not_ours")
+    );
+}
+
+#[tokio::test]
+async fn a_pending_system_job_is_one_issue_with_the_machine_clients_command() {
+    let fixture = Fixture::new("auto_off").await;
+    let mut config = DeviceConfig::load(&fixture.home).unwrap();
+    config.system_job_pending = true;
+    config.save(&fixture.home).unwrap();
+    let report = collect_with(
+        &fixture.home,
+        false,
+        false,
+        &std::env::current_exe().unwrap(),
+        fixture.now,
+        |_, _| Ok(JobStatus::Absent.into()),
+    )
+    .await
+    .unwrap();
+    assert!(report.schedule.system_job_pending);
+    let pending: Vec<_> = report
+        .issues
+        .iter()
+        .filter(|issue| issue.message == "Automatic sending waits for the SYSTEM job.")
+        .collect();
+    assert_eq!(pending.len(), 1, "{:?}", report.issues);
+    assert!(
+        pending[0]
+            .fix
+            .as_deref()
+            .unwrap()
+            .contains("schedule on --system")
+    );
+    assert_eq!(report.exit_code, 1);
+}
+
+#[tokio::test]
+async fn a_revoked_device_with_a_system_job_gets_the_system_stop_text() {
+    let fixture = Fixture::new("revoked").await;
+    let mut config = DeviceConfig::load(&fixture.home).unwrap();
+    config.auto_send = true;
+    config.run_as = crate::device_config::RunAs::System;
+    config.save(&fixture.home).unwrap();
+    let report = collect_with(
+        &fixture.home,
+        true,
+        false,
+        &std::env::current_exe().unwrap(),
+        fixture.now,
+        |_, _| Ok(JobStatus::SystemUnconfirmed.into()),
+    )
+    .await
+    .unwrap();
+    let revoked = report
+        .issues
+        .iter()
+        .find(|issue| issue.message.contains("IT revoked this device"))
+        .expect("the revoked issue");
+    let stop = revoked.stop_job_command.as_deref().unwrap();
+    assert!(
+        !stop.contains(std::env::current_exe().unwrap().to_str().unwrap()),
+        "{stop}"
+    );
+    assert!(
+        stop.contains("schtasks.exe") || stop.contains("schedule off"),
+        "{stop}"
     );
 }
 

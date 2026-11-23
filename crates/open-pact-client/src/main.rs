@@ -185,6 +185,9 @@ enum ScheduleCommand {
         /// Show what would change and change nothing
         #[arg(long)]
         dry_run: bool,
+        /// Windows only: the profile whose repositories a SYSTEM job reads. Needs --system
+        #[arg(long, hide = !cfg!(windows), requires = "system")]
+        user_home: Option<PathBuf>,
     },
     /// Remove the job
     Off {
@@ -273,10 +276,12 @@ impl From<Command> for client::Command {
                         system,
                         user,
                         dry_run,
+                        user_home,
                     } => client::ScheduleCommand::On {
                         system,
                         user,
                         dry_run,
+                        user_home,
                     },
                     ScheduleCommand::Off { dry_run } => client::ScheduleCommand::Off { dry_run },
                     ScheduleCommand::Status => client::ScheduleCommand::Status,
