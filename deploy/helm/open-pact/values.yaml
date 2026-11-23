@@ -16,6 +16,9 @@ gateway:
   kekSecret:
     name: ""
     key: kek
+  # A request slower than this many milliseconds writes one "slow_request" line to stderr, at most
+  # one a second. 0 turns the log off. It needs no metrics listener.
+  slowRequestMs: 1000
   resources:
     requests:
       cpu: 100m
@@ -33,6 +36,30 @@ gateway:
     readOnlyRootFilesystem: true
     capabilities:
       drop: [ALL]
+
+# Prometheus metrics of the gateway: request latency per route, nonce lock waits, database pool,
+# witness pushes. Off by default. On, the gateway serves GET /metrics over TLS on its own port and
+# its own ClusterIP Service, behind a bearer token. The port is never in the Ingress. A restart is
+# needed after the token or the certificate changes.
+metrics:
+  enabled: false
+  port: 9090
+  # Required when enabled. A Secret with a random token of at least 32 characters, no spaces:
+  #   kubectl create secret generic pact-metrics-token --from-literal=token="$(openssl rand -hex 32)"
+  # Prometheus: scheme https, authorization.credentials_file with the same token.
+  tokenSecret:
+    name: ""
+    key: token
+  # Required when enabled. A kubernetes.io/tls Secret (tls.crt, tls.key), for example from
+  # cert-manager, valid for the name Prometheus connects to
+  # (<release>-gateway-metrics.<namespace>.svc). Prometheus checks it with tls_config.ca_file.
+  tlsSecret:
+    name: ""
+  networkPolicy:
+    # Optional. A list of NetworkPolicy "from" entries, such as
+    # [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: monitoring}}}]. When set, a
+    # NetworkPolicy opens the public port to all and the metrics port only to these sources.
+    from: []
 
 # The startup manifest as TOML text. An active database version always takes precedence.
 # Without one, an empty value uses the image's example manifest. A supplied value is mounted at
