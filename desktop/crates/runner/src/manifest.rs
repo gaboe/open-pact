@@ -871,12 +871,12 @@ pub const BUILTINS: [Builtin; 29] = [
     Builtin {
         id: "antimalware_full_scan_age_days",
         version: 2,
-        name: "Full scan age",
-        line: "How long ago the last full scan ran",
+        name: "Remediator scan age",
+        line: "Days since the last XProtect Remediator scan",
         scope: "macOS and Windows",
         output: INTEGER_3650,
         max: true,
-        noun: "last full scan",
+        noun: "last XProtect Remediator scan",
         group: Group::MalwareAndNetwork,
     },
     Builtin {
