@@ -32,6 +32,9 @@ pub struct OtherCopy {
     pub brew: Option<PathBuf>,
     /// Scoop: the package that owns this copy. `None` means the standalone package.
     pub package: Option<String>,
+    /// Scoop: the file that the shim at `path` names. The package uninstall removes it together
+    /// with the shim, so it counts as the same copy.
+    pub target: Option<PathBuf>,
 }
 
 impl OtherCopy {
@@ -41,6 +44,7 @@ impl OtherCopy {
             source,
             brew: None,
             package: None,
+            target: None,
         }
     }
 }
@@ -192,9 +196,8 @@ pub fn other_copies(
         if !path.is_file() {
             continue;
         }
-        let shim = std::fs::read_to_string(path.with_extension("shim"))
-            .ok()
-            .and_then(|contents| shim_target(&contents));
+        let shim = read_shim_target(&path);
+        let has_shim = shim.is_some();
         let target = shim.unwrap_or_else(|| path.clone());
         let resolved = resolve(&target);
         if is_own(&path) || is_own(&target) || seen.contains(&resolved) {
@@ -216,6 +219,7 @@ pub fn other_copies(
                 .then(|| scoop_package(&resolved).or_else(|| scoop_package(&target)))
                 .flatten(),
             source,
+            target: has_shim.then_some(target),
             path,
         });
     }
@@ -236,9 +240,54 @@ pub fn first_removable<'a>(
         .find_map(|copy| removal(copy, platform).map(|removal| (copy, removal)))
 }
 
-/// Whether `copy` is the executable that the active user job records.
+fn read_shim_target(path: &Path) -> Option<PathBuf> {
+    std::fs::read_to_string(path.with_extension("shim"))
+        .ok()
+        .and_then(|contents| shim_target(&contents))
+}
+
+/// The words of the Scoop app folder that holds `path`: everything through `scoop/apps/<name>`.
+/// The folder covers `current` and each version folder of the package.
+fn scoop_app_folder(path: &Path) -> Option<Vec<String>> {
+    let parts = words(path);
+    let at = parts
+        .windows(2)
+        .position(|pair| pair == ["scoop", "apps"])?;
+    parts.get(at + 2)?;
+    Some(parts[..=at + 2].to_vec())
+}
+
+/// Whether `copy` is the executable that the active user job records. The job's file is the
+/// copy's PATH entry, the file a shim of that entry names, or any file in the same Scoop app
+/// folder as that target: the package uninstall removes them all. The recorded file can also be a
+/// shim whose target is the copy.
 pub fn is_active(copy: &OtherCopy, active: Option<&Path>) -> bool {
-    active.is_some_and(|active| same_path(&copy.path, active))
+    let Some(active) = active else {
+        return false;
+    };
+    let active_files: Vec<PathBuf> = [Some(active.to_path_buf()), read_shim_target(active)]
+        .into_iter()
+        .flatten()
+        .collect();
+    let copy_files: Vec<&Path> = [Some(copy.path.as_path()), copy.target.as_deref()]
+        .into_iter()
+        .flatten()
+        .collect();
+    if copy_files
+        .iter()
+        .any(|file| active_files.iter().any(|active| same_path(file, active)))
+    {
+        return true;
+    }
+    copy.source == Source::Scoop
+        && copy_files
+            .iter()
+            .filter_map(|file| scoop_app_folder(file))
+            .any(|folder| {
+                active_files
+                    .iter()
+                    .any(|active| words(active).starts_with(&folder))
+            })
 }
 
 /// The copy that the active user job runs, when it is among the copies.
@@ -566,6 +615,111 @@ mod tests {
                 .path,
             Path::new(active)
         );
+    }
+
+    /// A Scoop package with a real shim: the shim folder, the package folder and the shim file.
+    struct ScoopFixture {
+        _temp: tempfile::TempDir,
+        shims: PathBuf,
+        app: PathBuf,
+        shim: PathBuf,
+        target: PathBuf,
+        other_app: PathBuf,
+        version: PathBuf,
+    }
+
+    fn scoop_fixture() -> ScoopFixture {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let make = |relative: &str, text: &str| {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, text).unwrap();
+            path
+        };
+        let target = make("scoop/apps/open-pact/current/open-pact-client", "fictional");
+        let version = make("scoop/apps/open-pact/0.7.1/open-pact-client", "fictional");
+        let other_app = make(
+            "scoop/apps/open-pact-other/current/open-pact-client",
+            "fictional",
+        );
+        let shim = make("scoop/shims/open-pact-client", "shim program");
+        make(
+            "scoop/shims/open-pact-client.shim",
+            &format!("path = \"{}\"\n", target.display()),
+        );
+        ScoopFixture {
+            shims: root.join("scoop/shims"),
+            app: root.join("scoop/apps/open-pact/current"),
+            shim,
+            target,
+            other_app,
+            version,
+            _temp: temp,
+        }
+    }
+
+    fn scoop_copies(path: &[&Path], own: &[PathBuf]) -> Vec<OtherCopy> {
+        let path = std::env::join_paths(path).unwrap();
+        other_copies(&path, "open-pact-client", own, &[], None)
+    }
+
+    #[test]
+    fn a_scoop_copy_is_active_through_its_shim_target_or_its_app_folder() {
+        let fixture = scoop_fixture();
+        let unrelated = tempfile::tempdir().unwrap();
+        let loose = unrelated.path().join("tools/open-pact-client");
+        std::fs::create_dir_all(loose.parent().unwrap()).unwrap();
+        std::fs::write(&loose, "fictional").unwrap();
+        let loose_dir = loose.parent().unwrap();
+
+        // The shim comes first on PATH: the copy keeps the shim, and names its target.
+        let shim_first = scoop_copies(&[&fixture.shims, &fixture.app, loose_dir], &[]);
+        assert_eq!(shim_first.len(), 2);
+        assert_eq!(shim_first[0].path, fixture.shim);
+        assert_eq!(shim_first[0].target.as_ref(), Some(&fixture.target));
+        // The target folder comes first: the later shim is the same copy.
+        let target_first = scoop_copies(&[&fixture.app, &fixture.shims, loose_dir], &[]);
+        assert_eq!(target_first.len(), 2);
+        assert_eq!(target_first[0].path, fixture.target);
+
+        let shim_file = fixture.shim.clone();
+        let receipts = [
+            // The receipt names the shim, the target, or a version folder of the package.
+            shim_file.as_path(),
+            fixture.target.as_path(),
+            fixture.version.as_path(),
+        ];
+        for found in [&shim_first, &target_first] {
+            for receipt in receipts {
+                let active = Some(receipt);
+                assert!(is_active(&found[0], active), "{receipt:?}");
+                assert!(!is_active(&found[1], active));
+                let (offered, _) = first_removable(found, Platform::Windows, active).unwrap();
+                assert_eq!(offered.path, loose);
+                assert!(first_removable(&found[..1], Platform::Windows, active).is_none());
+                assert_eq!(active_copy(found, active).unwrap().path, found[0].path);
+            }
+            // Another package's folder and an unrelated file leave the copy removable.
+            for receipt in [fixture.other_app.as_path(), loose.as_path()] {
+                assert!(!is_active(&found[0], Some(receipt)), "{receipt:?}");
+            }
+            assert!(!is_active(&found[0], None));
+        }
+    }
+
+    #[test]
+    fn removing_a_scoop_copy_that_the_active_job_runs_through_its_shim_is_refused() {
+        use crate::engine::remove_copy;
+        let fixture = scoop_fixture();
+        let found = scoop_copies(&[&fixture.shims], &[]);
+        assert_eq!(found.len(), 1);
+        // The runner would fail on a missing program: only the refusal gives this text.
+        let runner = crate::Runner::default();
+        for active in [&fixture.shim, &fixture.target, &fixture.version] {
+            let error = remove_copy(&runner, &found[0], || Some(active.clone())).unwrap_err();
+            assert!(error.contains("scheduled job runs"), "{error}");
+        }
     }
 
     #[test]
