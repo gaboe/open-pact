@@ -243,9 +243,11 @@ The chart restarts the gateway when the manifest changes. Confirm that the gatew
 
 ## Nonce durability and database connections
 
-The gateway issues a nonce with `synchronous_commit = off`, so issuers do not wait for a disk flush while they hold the issue lock. A database crash can lose an issued nonce that the client has not used yet, from about the last 0.6 s (three times PostgreSQL's `wal_writer_delay`). The client then gets "unknown or used nonce" and asks for a new nonce. The gateway consumes a nonce with `synchronous_commit = on` whatever the server default is, so a consumed nonce does not come back after a crash. The limit on outstanding nonces (`nonces.maxOutstanding`) stays exact, and a nonce works once.
+The gateway issues a nonce with `synchronous_commit = off`, so issuers do not wait for a disk flush while they hold the issue lock. A database crash can lose an issued nonce that the client has not used yet, from about the last 0.6 s of commits (three times the default `wal_writer_delay` of 200 ms). The lost nonce makes that claim run report a denial and end. The next run gets a fresh nonce; the client does not retry on its own.
 
-Replication changes this. A crash of the primary is covered as written. When you fail over to an asynchronous replica, the replica can be behind and can lose consumed nonces too. Replication durability depends on your synchronous standby configuration (`synchronous_standby_names`): use a synchronous standby for a highly available PostgreSQL when a replayed nonce matters to you.
+The gateway consumes a nonce with `synchronous_commit` raised from `off` to `local`, so the primary flushes the consume to durable storage before the commit returns. A session that already sets `local`, `on` or `remote_apply` keeps that setting. This holds on a primary with `fsync` on and durable storage: a consumed nonce does not come back after a crash, and the flush also covers every earlier issue. The limit on outstanding nonces (`nonces.maxOutstanding`) stays exact, and a nonce works once.
+
+Replication changes this. A crash of such a primary is covered as written. When you fail over to an asynchronous replica, the replica can be behind and can lose consumed nonces too. Replication durability depends on your synchronous standby configuration (`synchronous_standby_names`): use a synchronous standby for a highly available PostgreSQL when a replayed nonce matters to you.
 
 Each gateway pod keeps up to `database.maxConnections` connections to PostgreSQL (`DATABASE_MAX_CONNECTIONS`, default 10). Keep the sum over all pods below the server's `max_connections`. A request that needs a connection waits while all of them are busy.
 
