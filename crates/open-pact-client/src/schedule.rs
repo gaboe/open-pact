@@ -2577,6 +2577,7 @@ fn system_retry_text(
     wanted: Wanted,
     machine_client: &MachineClient,
     profile: Option<&Path>,
+    ours: bool,
 ) -> String {
     let machine = crate::machine::machine_path();
     let running = crate::machine::running_version();
@@ -2595,11 +2596,17 @@ fn system_retry_text(
         Wanted::On(RunAs::User) | Wanted::Off => {
             if state.usable() {
                 crate::machine::machine_command(home, "schedule off", &machine, None)
-            } else {
-                task_id(home).map_or_else(
+            } else if wanted == Wanted::Off && ours {
+                // Only a removal of a task that inspection found to be the machine client's own
+                // gets the block. Else the owner has no task to remove, or a task of another
+                // kind, and a block that removes it would be the wrong advice.
+                os_job_id(home).map_or_else(
                     |error| format!("{error:#}"),
                     |id| crate::machine::removal_block(home, &id, None),
                 )
+            } else {
+                crate::machine::machine_fix(machine_client, state, &machine, &running)
+                    .unwrap_or_else(|| "The machine client cannot be used.".into())
             }
         }
     }
@@ -2666,19 +2673,52 @@ fn refuse_not_ours(
     Ok(())
 }
 
-/// What to tell the owner when Task Scheduler could not be queried. Access denied is the usual
-/// cause and says nothing about who runs the task, so the text never offers the program that was
-/// started, which may be a copy that a user can write. It offers the machine client's command when
-/// that passed its protection check, else the removal block or the package fix.
+/// The id of the OS job of `home`, through the one canonical home that install hashes. A text that
+/// names the job of a home as the owner spelled it would name another job where the spellings differ.
+fn os_job_id(home: &Path) -> Result<String> {
+    task_id(&schedule_home(home, true)?)
+}
+
+/// What to tell the owner when the OS job could not be queried: the query error and the platform's
+/// own step to look at the job. The state of the job is unknown, so the text never says to stop or
+/// remove it, never names the program that was started (a copy that a user can write), and never
+/// shows a command of another platform. On Windows the step runs the machine client when it
+/// passed its protection check, else it is the package fix first.
 fn inspect_failure_text(
     home: &Path,
-    wanted: Wanted,
+    os: open_pact_core::Os,
     machine_client: &MachineClient,
-    profile: Option<&Path>,
+    error: &anyhow::Error,
 ) -> String {
+    let id = os_job_id(home).unwrap_or_default();
+    let step = match os {
+        open_pact_core::Os::Windows => {
+            let machine = crate::machine::machine_path();
+            let running = crate::machine::running_version();
+            let state = crate::machine::machine_state(machine_client, &running);
+            let command = crate::machine::machine_command(home, "schedule status", &machine, None);
+            match crate::machine::machine_fix(machine_client, state, &machine, &running) {
+                _ if state.usable() => {
+                    format!(
+                        "If access is denied, run this from an elevated PowerShell prompt to read the job:\n{command}"
+                    )
+                }
+                Some(fix) if state.usable_after_fix() => format!(
+                    "Install the machine client first:\n{fix}\nThen run this from an elevated PowerShell prompt to read the job:\n{command}"
+                ),
+                Some(fix) => fix,
+                None => command,
+            }
+        }
+        open_pact_core::Os::Macos => {
+            format!("Look at the job with:\nlaunchctl print gui/$(id -u)/{id}")
+        }
+        open_pact_core::Os::Linux => {
+            format!("Look at the job with:\nsystemctl --user status {id}.timer")
+        }
+    };
     format!(
-        "Cannot inspect the scheduled job. If access is denied, run this exact command from an elevated prompt:\n{}",
-        system_retry_text(home, wanted, machine_client, profile)
+        "Cannot inspect the scheduled job: {error:#}\nThe state of the job is unknown, so open-pact changed nothing.\n{step}"
     )
 }
 
@@ -2748,7 +2788,13 @@ pub(crate) async fn change_job(
     {
         bail!(
             "Run this exact command from an elevated PowerShell prompt:\n{}",
-            system_retry_text(&home.0, wanted, machine_client, caller_profile.as_deref())
+            system_retry_text(
+                &home.0,
+                wanted,
+                machine_client,
+                caller_profile.as_deref(),
+                false,
+            )
         );
     }
     // The first look finds who owns the task and which profile it carries. Its expected
@@ -2768,15 +2814,14 @@ pub(crate) async fn change_job(
         }),
     )?;
     let observed = observe(&home, provisional.as_ref(), elevated, executable).map_err(|error| {
-        let machine_client = machine_client
-            .clone()
-            .unwrap_or_else(crate::machine::read_machine_client);
-        error.context(inspect_failure_text(
-            &home.0,
-            wanted,
-            &machine_client,
-            caller_profile.as_deref(),
-        ))
+        let Ok(os) = crate::current_os() else {
+            return error;
+        };
+        let machine_client = machine_client.clone().unwrap_or_else(|| match os {
+            open_pact_core::Os::Windows => crate::machine::read_machine_client(),
+            _ => MachineClient::Missing,
+        });
+        anyhow::anyhow!(inspect_failure_text(&home.0, os, &machine_client, &error))
     })?;
     let task = observed.system_task(&machine, &home.0, None);
     refuse_not_ours(&home.0, wanted, &task, explicit_profile.as_deref())?;
@@ -2788,7 +2833,8 @@ pub(crate) async fn change_job(
                 &home.0,
                 wanted,
                 &crate::machine::read_machine_client(),
-                explicit_profile.as_deref()
+                explicit_profile.as_deref(),
+                matches!(task, SystemTask::Ours { .. }),
             )
         );
     }
@@ -3226,6 +3272,12 @@ fn system_job_from(
 /// the machine client's, else the machine client's `schedule off` when it is usable, else the
 /// removal block. Never the caller's own path.
 pub(crate) fn system_stop_text(home: &Path) -> String {
+    // The job is named by the canonical home that install hashes, whatever the spelling given.
+    let home = match schedule_home(home, true) {
+        Ok(home) => home,
+        Err(error) => return format!("{error:#}"),
+    };
+    let home = home.as_path();
     let machine_client = crate::machine::read_machine_client();
     let state = crate::machine::machine_state(&machine_client, &crate::machine::running_version());
     let machine = crate::machine::machine_path();
@@ -3245,9 +3297,14 @@ pub(crate) fn system_stop_text(home: &Path) -> String {
 /// The stop text for a report that probes nothing (local status): the removal block, which uses
 /// Windows tools only and names no copy of the client. The package state is not known there.
 pub(crate) fn system_stop_text_unprobed(home: &Path) -> String {
-    task_id(home).map_or_else(
+    // The same canonical home as install, or the block would name a job that does not exist.
+    let home = match schedule_home(home, true) {
+        Ok(home) => home,
+        Err(error) => return format!("{error:#}"),
+    };
+    task_id(&home).map_or_else(
         |error| format!("{error:#}"),
-        |id| crate::machine::removal_block(home, &id, None),
+        |id| crate::machine::removal_block(&home, &id, None),
     )
 }
 
@@ -5859,7 +5916,7 @@ esac
                 MachineClient::Unprotected { reason: "x".into() },
                 MachineClient::Unknown { reason: "x".into() },
             ] {
-                let text = system_retry_text(home, wanted, &client, None);
+                let text = system_retry_text(home, wanted, &client, None, true);
                 assert!(!text.contains(caller), "{wanted:?} {client:?}: {text}");
                 let usable = matches!(client, MachineClient::Present { .. });
                 match (wanted, usable) {
@@ -5882,8 +5939,19 @@ esac
                         );
                     }
                     (_, true) => assert!(text.contains("schedule off"), "{text}"),
-                    (_, false) => assert!(text.contains("schtasks.exe"), "{text}"),
+                    // Only the removal of a task that inspection found to be ours gets the
+                    // block. A switch to user mode gets the package fix.
+                    (Wanted::Off, false) => assert!(text.contains("schtasks.exe"), "{text}"),
+                    (_, false) => assert!(!text.contains("schtasks.exe"), "{wanted:?}: {text}"),
                 }
+                // Without a task that inspection found, no request gets the removal block.
+                let unfound = system_retry_text(home, wanted, &client, None, false);
+                assert!(
+                    usable
+                        || wanted == Wanted::On(RunAs::System)
+                        || !unfound.contains("schtasks.exe"),
+                    "{wanted:?} {client:?}: {unfound}"
+                );
                 if usable {
                     assert!(text.contains(&machine) || machine.is_empty(), "{text}");
                 }
@@ -5894,6 +5962,7 @@ esac
             Wanted::On(RunAs::System),
             &current,
             Some(Path::new("/owner's profile")),
+            false,
         );
         assert!(
             with_profile.ends_with("--user-home '/owner''s profile'"),
@@ -6026,6 +6095,32 @@ esac
     }
 
     #[test]
+    fn local_revoked_status_and_install_name_the_same_job_for_any_spelling_of_the_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("pact");
+        std::fs::create_dir(&home).unwrap();
+        // The same folder, spelled with a detour. A system temp folder is often a link, so the
+        // canonical spelling differs from the given one too.
+        let detour = dir.path().join("elsewhere").join("..").join("pact");
+        let installed = Job::new(
+            Path::new("open-pact-client.exe"),
+            &schedule_home(&detour, true).unwrap(),
+        )
+        .unwrap()
+        .id;
+        assert_eq!(os_job_id(&detour).unwrap(), installed);
+        assert_eq!(os_job_id(&home).unwrap(), installed);
+        // The raw spelling is a different hash: the bug that this guards.
+        assert_ne!(task_id(&detour).unwrap(), installed);
+        let quoted = format!("'{installed}'");
+        for spelling in [&home, &detour] {
+            let text = system_stop_text_unprobed(spelling);
+            assert!(text.contains(&quoted), "{spelling:?}: {text}");
+            assert_eq!(text, system_stop_text_unprobed(&home));
+        }
+    }
+
+    #[test]
     fn a_failed_task_query_never_offers_the_caller_and_keeps_the_package_check() {
         let home = Path::new("fixture-home");
         let user_install = r"C:\Users\example\scoop\apps\open-pact\current\open-pact-client.exe";
@@ -6035,14 +6130,15 @@ esac
             MachineClient::Unprotected { reason: "x".into() },
             MachineClient::Unknown { reason: "x".into() },
         ] {
-            for wanted in [
-                Wanted::On(RunAs::System),
-                Wanted::On(RunAs::User),
-                Wanted::Off,
+            for os in [
+                open_pact_core::Os::Windows,
+                open_pact_core::Os::Macos,
+                open_pact_core::Os::Linux,
             ] {
-                let text = inspect_failure_text(home, wanted, &client, None);
+                let error = anyhow::anyhow!("access is denied");
+                let text = inspect_failure_text(home, os, &client, &error);
                 assert!(
-                    text.starts_with("Cannot inspect the scheduled job."),
+                    text.starts_with("Cannot inspect the scheduled job: access is denied"),
                     "{text}"
                 );
                 assert!(!text.contains(user_install), "{text}");
@@ -6050,6 +6146,36 @@ esac
                     !text.contains(std::env::current_exe().unwrap().to_str().unwrap()),
                     "{text}"
                 );
+                // The state is unknown: no text says to stop, turn off or remove the job, and no
+                // text offers a command of another platform.
+                assert!(
+                    !text.contains("schedule off") && !text.contains("schedule on"),
+                    "{os:?}: {text}"
+                );
+                assert!(!text.contains("schtasks.exe"), "{os:?}: {text}");
+                let step = |needle: &str| text.contains(needle);
+                match os {
+                    open_pact_core::Os::Macos => {
+                        assert!(step("launchctl print gui/$(id -u)/org.open-pact.report."));
+                        assert!(!step("powershell") && !step("systemctl"), "{text}");
+                    }
+                    open_pact_core::Os::Linux => {
+                        assert!(step("systemctl --user status org.open-pact.report."));
+                        assert!(!step("PowerShell") && !step("launchctl"), "{text}");
+                    }
+                    open_pact_core::Os::Windows => {
+                        assert!(!step("launchctl") && !step("systemctl"), "{text}");
+                        // The machine client reads the job only after its protection check passed.
+                        assert_eq!(
+                            step("schedule status"),
+                            !matches!(
+                                client,
+                                MachineClient::Unprotected { .. } | MachineClient::Unknown { .. }
+                            ),
+                            "{client:?}: {text}"
+                        );
+                    }
+                }
             }
         }
         // The task query failed after the package check: the report keeps the package state and
