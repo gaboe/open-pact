@@ -13,6 +13,8 @@ pub struct Hooks {
     counts: Mutex<std::collections::HashMap<&'static str, usize>>,
     #[cfg(test)]
     blocks: Mutex<std::collections::HashMap<&'static str, Arc<BlockPoint>>>,
+    #[cfg(test)]
+    stamps: Mutex<std::collections::HashMap<&'static str, Vec<std::time::Instant>>>,
     /// Database steps of a claim fail once this many stored-line reads happened (usize::MAX: never).
     #[cfg(test)]
     fault_after_reads: AtomicUsize,
@@ -74,6 +76,8 @@ impl Default for Hooks {
             counts: Mutex::default(),
             #[cfg(test)]
             blocks: Mutex::default(),
+            #[cfg(test)]
+            stamps: Mutex::default(),
             #[cfg(test)]
             fault_after_reads: AtomicUsize::new(usize::MAX),
         }
@@ -199,8 +203,24 @@ impl Hooks {
         self.count("stored_lines_read") > self.fault_after_reads.load(Ordering::SeqCst)
     }
 
+    /// When each path reached `name`, in order.
+    pub fn stamps(&self, name: &'static str) -> Vec<std::time::Instant> {
+        self.stamps
+            .lock()
+            .expect("hooks")
+            .get(name)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     pub async fn hit(&self, name: &'static str) {
         *self.counts.lock().expect("hooks").entry(name).or_default() += 1;
+        self.stamps
+            .lock()
+            .expect("hooks")
+            .entry(name)
+            .or_default()
+            .push(std::time::Instant::now());
         let point = self.points.lock().expect("hooks").get(name).cloned();
         if let Some(point) = point {
             let mode = point.armed.load(Ordering::SeqCst);
