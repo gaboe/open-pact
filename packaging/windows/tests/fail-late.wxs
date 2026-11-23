@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The per-machine open-pact client. The SYSTEM job runs the file this package
+  installs, so the folder is one that no released client names. Build it with
+  scripts/packaging/build-msi.ps1, which passes the three defines.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="open-pact client" Manufacturer="open-pact"
+           Version="$(var.ProductVersion)" ProductCode="$(var.ProductCode)"
+           UpgradeCode="{E1B7C572-13D3-4628-AFF3-453C870603F6}" Scope="perMachine" Compressed="yes"
+           InstallerVersion="500">
+    <MajorUpgrade Schedule="afterInstallInitialize"
+                  DowngradeErrorMessage="A newer open-pact client is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="InstallFolder" Name="open-pact-client">
+        <Component Id="Client" Bitness="always64">
+          <File Id="ClientExe" Source="$(var.Exe)" Name="open-pact-client.exe" KeyPath="yes" />
+          <Environment Id="Path" Name="PATH" Value="[InstallFolder]" Part="last"
+                       Action="set" System="yes" Permanent="no" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+    <!-- Test fixture only: fails the install after the file copy, to prove the rollback. -->
+    <SetProperty Id="FailLateExe" Value="[SystemFolder]cmd.exe" Sequence="execute" Before="FailLate" />
+    <CustomAction Id="FailLate" Property="FailLateExe" ExeCommand="/c exit 1"
+                  Execute="deferred" Impersonate="no" Return="check" />
+    <InstallExecuteSequence>
+      <Custom Action="FailLate" After="InstallFiles" />
+    </InstallExecuteSequence>
+    <Feature Id="Main">
+      <ComponentRef Id="Client" />
+    </Feature>
+  </Package>
+</Wix>
