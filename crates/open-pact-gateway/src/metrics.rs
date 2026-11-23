@@ -19,19 +19,20 @@ use axum::{
     http::{HeaderMap, Method, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{MethodFilter, on},
 };
 use prometheus_client::encoding::{EncodeLabelSet, text::encode};
 use prometheus_client::metrics::{
     counter::Counter, family::Family, gauge::Gauge, histogram::Histogram,
 };
 use prometheus_client::registry::{Registry, Unit};
+use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper_util::service::TowerToHyperService;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use subtle::ConstantTimeEq;
 use tokio::net::TcpStream;
-use tokio::sync::{Semaphore, mpsc};
-use tokio_rustls::server::TlsStream;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Bucket bounds in seconds: from a fast read to a request that waited for the whole timeout.
 const BUCKETS: [f64; 12] = [
@@ -41,9 +42,14 @@ const BUCKETS: [f64; 12] = [
 /// A scrape token shorter than this refuses startup.
 const MIN_TOKEN_BYTES: usize = 32;
 
-/// How long a client may take to finish the TLS handshake, and how many may be in that state.
+/// How long a client may take to finish the TLS handshake, and to send the request headers.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
-const HANDSHAKES_AT_ONCE: usize = 64;
+const HEADER_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a new connection waits for a free slot. Ten seconds outlasts a stalled connection's
+/// handshake or header timeout, so a scrape waits for one instead of failing.
+const SLOT_WAIT: Duration = Duration::from_secs(10);
+/// Connections at once. A connection serves one scrape and then closes.
+const CONNECTIONS_AT_ONCE: usize = 16;
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct HttpLabels {
@@ -682,58 +688,57 @@ fn tls_config(cert: &PathBuf, key: &PathBuf) -> anyhow::Result<Arc<rustls::Serve
     Ok(Arc::new(config))
 }
 
-/// Accepts TCP connections and finishes their TLS handshakes in separate tasks, so a client that
-/// stalls in its handshake never holds up the others. Only finished streams reach `accept`.
-struct TlsListener {
-    local: SocketAddr,
-    ready: mpsc::Receiver<(TlsStream<TcpStream>, SocketAddr)>,
-}
-
-impl TlsListener {
-    async fn bind(addr: SocketAddr, config: Arc<rustls::ServerConfig>) -> anyhow::Result<Self> {
-        let tcp = tokio::net::TcpListener::bind(addr)
-            .await
-            .with_context(|| format!("bind METRICS_ADDR {addr}"))?;
-        let local = tcp.local_addr()?;
-        let acceptor = tokio_rustls::TlsAcceptor::from(config);
-        let (send, ready) = mpsc::channel(HANDSHAKES_AT_ONCE);
-        let slots = Arc::new(Semaphore::new(HANDSHAKES_AT_ONCE));
-        tokio::spawn(async move {
-            loop {
-                let Ok((stream, peer)) = tcp.accept().await else {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    continue;
-                };
-                let Ok(slot) = slots.clone().try_acquire_owned() else {
-                    continue;
-                };
-                let (acceptor, send) = (acceptor.clone(), send.clone());
-                tokio::spawn(async move {
-                    let shaken = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream));
-                    if let Ok(Ok(tls)) = shaken.await {
-                        let _ = send.send((tls, peer)).await;
-                    }
-                    drop(slot);
-                });
-            }
-        });
-        Ok(TlsListener { local, ready })
+/// Accepts connections and serves each one in its own task. Each connection holds one of
+/// `CONNECTIONS_AT_ONCE` slots from accept until it closes. A connection that finds no free slot
+/// waits `SLOT_WAIT` for one, and the listener drops it when none comes.
+async fn accept_connections(
+    tcp: tokio::net::TcpListener,
+    tls: Option<Arc<rustls::ServerConfig>>,
+    router: Router,
+) {
+    let slots = Arc::new(Semaphore::new(CONNECTIONS_AT_ONCE));
+    let acceptor = tls.map(tokio_rustls::TlsAcceptor::from);
+    loop {
+        let Ok((stream, _peer)) = tcp.accept().await else {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
+        };
+        let Ok(Ok(slot)) = tokio::time::timeout(SLOT_WAIT, slots.clone().acquire_owned()).await
+        else {
+            continue;
+        };
+        tokio::spawn(serve_connection(
+            stream,
+            acceptor.clone(),
+            router.clone(),
+            slot,
+        ));
     }
 }
 
-impl axum::serve::Listener for TlsListener {
-    type Io = TlsStream<TcpStream>;
-    type Addr = SocketAddr;
-
-    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
-        match self.ready.recv().await {
-            Some(accepted) => accepted,
-            None => std::future::pending().await,
+/// Serves one connection: the TLS handshake under its own timeout when TLS is on, then one
+/// request. The connection closes after its answer, which frees the slot. HTTP/1 only.
+async fn serve_connection(
+    stream: TcpStream,
+    acceptor: Option<tokio_rustls::TlsAcceptor>,
+    router: Router,
+    _slot: OwnedSemaphorePermit,
+) {
+    let mut http = hyper::server::conn::http1::Builder::new();
+    http.timer(TokioTimer::new())
+        .header_read_timeout(HEADER_TIMEOUT)
+        .keep_alive(false);
+    let service = TowerToHyperService::new(router);
+    match acceptor {
+        None => {
+            let _ = http.serve_connection(TokioIo::new(stream), service).await;
         }
-    }
-
-    fn local_addr(&self) -> std::io::Result<Self::Addr> {
-        Ok(self.local)
+        Some(acceptor) => {
+            let shaken = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await;
+            if let Ok(Ok(tls)) = shaken {
+                let _ = http.serve_connection(TokioIo::new(tls), service).await;
+            }
+        }
     }
 }
 
@@ -745,16 +750,27 @@ struct Scrape {
     token: [u8; 32],
 }
 
+/// Whether the request carries the token. The scheme name is case-insensitive (RFC 9110, 11.1).
 fn authorized(expected: &[u8; 32], headers: &HeaderMap) -> bool {
-    let Some(token) = headers
+    let Some(value) = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
     else {
         return false;
     };
+    let Some((scheme, token)) = value.split_once(' ') else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return false;
+    }
     let digest: [u8; 32] = Sha256::digest(token.as_bytes()).into();
     digest.ct_eq(expected).into()
+}
+
+/// A HEAD request gets no scrape. Axum would otherwise run the GET handler and drop the body.
+async fn head_refused() -> StatusCode {
+    StatusCode::METHOD_NOT_ALLOWED
 }
 
 async fn scrape(State(state): State<Scrape>, headers: HeaderMap) -> Response {
@@ -783,36 +799,26 @@ pub async fn start(
     pool: PgPool,
 ) -> anyhow::Result<SocketAddr> {
     let router = Router::new()
-        .route("/metrics", get(scrape))
+        .route(
+            "/metrics",
+            on(MethodFilter::GET, scrape).on(MethodFilter::HEAD, head_refused),
+        )
         .with_state(Scrape {
             metrics,
             pool,
             token: Sha256::digest(settings.token.as_bytes()).into(),
         });
-    match &settings.tls {
-        Some((cert, key)) => {
-            let listener = TlsListener::bind(settings.addr, tls_config(cert, key)?).await?;
-            let local = listener.local;
-            tokio::spawn(async move {
-                if let Err(error) = axum::serve(listener, router).await {
-                    eprintln!("metrics listener stopped: {error}");
-                }
-            });
-            Ok(local)
-        }
-        None => {
-            let listener = tokio::net::TcpListener::bind(settings.addr)
-                .await
-                .with_context(|| format!("bind METRICS_ADDR {}", settings.addr))?;
-            let local = listener.local_addr()?;
-            tokio::spawn(async move {
-                if let Err(error) = axum::serve(listener, router).await {
-                    eprintln!("metrics listener stopped: {error}");
-                }
-            });
-            Ok(local)
-        }
-    }
+    let tls = settings
+        .tls
+        .as_ref()
+        .map(|(cert, key)| tls_config(cert, key))
+        .transpose()?;
+    let tcp = tokio::net::TcpListener::bind(settings.addr)
+        .await
+        .with_context(|| format!("bind METRICS_ADDR {}", settings.addr))?;
+    let local = tcp.local_addr()?;
+    tokio::spawn(accept_connections(tcp, tls, router));
+    Ok(local)
 }
 
 #[cfg(test)]
@@ -820,8 +826,10 @@ mod tests {
     use std::collections::HashMap;
 
     use axum::body::Body;
+    use axum::routing::get;
     use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
     use sqlx::postgres::PgPoolOptions;
+    use tokio::io::AsyncReadExt;
     use tower::ServiceExt;
 
     use super::*;
@@ -1034,6 +1042,16 @@ mod tests {
         assert_eq!(other_path.status(), 404);
         let post = client.post(&url).bearer_auth(TOKEN).send().await.unwrap();
         assert_eq!(post.status(), 405);
+        let head = client.head(&url).bearer_auth(TOKEN).send().await.unwrap();
+        assert_eq!(head.status(), 405);
+        // The scheme name is case-insensitive.
+        let lowercase = client
+            .get(&url)
+            .header(header::AUTHORIZATION, format!("bearer {TOKEN}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(lowercase.status(), 200);
 
         let plain = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
@@ -1066,6 +1084,43 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ok.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn a_client_that_sends_no_request_is_closed_after_the_header_timeout() {
+        let env = [("METRICS_ADDR", "127.0.0.1:0"), ("METRICS_TOKEN", TOKEN)];
+        let listener = settings(&env).unwrap().listener.unwrap();
+        let bound = start(listener, recorded(), lazy_pool()).await.unwrap();
+        let mut idle = tokio::net::TcpStream::connect(bound).await.unwrap();
+        let closed = tokio::time::timeout(
+            Duration::from_secs(10),
+            idle.read_to_end(&mut Vec::new()),
+        )
+        .await;
+        assert!(matches!(closed, Ok(Ok(_))), "{closed:?}");
+    }
+
+    #[tokio::test]
+    async fn a_scrape_waits_for_a_slot_behind_stalled_connections() {
+        let env = [("METRICS_ADDR", "127.0.0.1:0"), ("METRICS_TOKEN", TOKEN)];
+        let listener = settings(&env).unwrap().listener.unwrap();
+        let bound = start(listener, recorded(), lazy_pool()).await.unwrap();
+        let mut stalled = Vec::new();
+        for _ in 0..CONNECTIONS_AT_ONCE {
+            stalled.push(tokio::net::TcpStream::connect(bound).await.unwrap());
+        }
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(20))
+            .build()
+            .unwrap();
+        let ok = client
+            .get(format!("http://{bound}/metrics"))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), 200);
+        drop(stalled);
     }
 
     #[tokio::test]
