@@ -52,6 +52,12 @@ impl Witnesses {
         &self.keys
     }
 
+    /// The next `retry_due` is true, as if the interval had passed.
+    #[cfg(test)]
+    pub fn force_retry(&self) {
+        *self.last_retry.lock().expect("witness retry time") = None;
+    }
+
     /// Whether a request may retry pushing now; at most once per RETRY_EVERY.
     pub fn retry_due(&self) -> bool {
         let mut last = self.last_retry.lock().expect("witness retry time");

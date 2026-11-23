@@ -6,10 +6,14 @@ use std::sync::{
     atomic::{AtomicU8, AtomicUsize, Ordering},
 };
 
-#[derive(Default)]
 pub struct Hooks {
     #[cfg(test)]
     points: Mutex<std::collections::HashMap<&'static str, Arc<Point>>>,
+    #[cfg(test)]
+    counts: Mutex<std::collections::HashMap<&'static str, usize>>,
+    /// Database steps of a claim fail once this many stored-line reads happened (usize::MAX: never).
+    #[cfg(test)]
+    fault_after_reads: AtomicUsize,
 }
 
 /// One named pause. While armed, a code path that reaches it signals `reached` and waits for
@@ -22,6 +26,19 @@ pub struct Point {
     hits: AtomicUsize,
     reached: tokio::sync::Notify,
     release: tokio::sync::Notify,
+}
+
+impl Default for Hooks {
+    fn default() -> Self {
+        Hooks {
+            #[cfg(test)]
+            points: Mutex::default(),
+            #[cfg(test)]
+            counts: Mutex::default(),
+            #[cfg(test)]
+            fault_after_reads: AtomicUsize::new(usize::MAX),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -68,7 +85,38 @@ impl Hooks {
         point
     }
 
+    /// How often a path reached `name`, armed or not.
+    pub fn count(&self, name: &'static str) -> usize {
+        self.counts
+            .lock()
+            .expect("hooks")
+            .get(name)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// From now on every claim database step fails once `reads` more stored-line reads ran.
+    pub fn fail_after_reads(&self, reads: usize) {
+        self.fault_after_reads
+            .store(self.count("stored_lines_read") + reads, Ordering::SeqCst);
+    }
+
+    pub fn clear_fault(&self) {
+        self.fault_after_reads.store(usize::MAX, Ordering::SeqCst);
+    }
+
+    /// True when a database step that follows the latest stored-line read must fail.
+    pub fn fault_after_read(&self) -> bool {
+        self.count("stored_lines_read") >= self.fault_after_reads.load(Ordering::SeqCst)
+    }
+
+    /// True when the stored-line read that just counted itself must fail.
+    pub fn fault_in_read(&self) -> bool {
+        self.count("stored_lines_read") > self.fault_after_reads.load(Ordering::SeqCst)
+    }
+
     pub async fn hit(&self, name: &'static str) {
+        *self.counts.lock().expect("hooks").entry(name).or_default() += 1;
         let point = self.points.lock().expect("hooks").get(name).cloned();
         if let Some(point) = point {
             let mode = point.armed.load(Ordering::SeqCst);
