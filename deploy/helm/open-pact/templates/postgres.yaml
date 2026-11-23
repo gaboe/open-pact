@@ -20,6 +20,11 @@ spec:
   ports:
     - port: 5432
 ---
+{{- $existing := lookup "apps/v1" "StatefulSet" .Release.Namespace (printf "%s-postgres" .Release.Name) }}
+{{- $storage := .Values.postgres.size }}
+{{- if $existing }}
+{{- $storage = (index $existing.spec.volumeClaimTemplates 0).spec.resources.requests.storage }}
+{{- end }}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -79,5 +84,5 @@ spec:
         {{- end }}
         resources:
           requests:
-            storage: {{ .Values.postgres.size }}
+            storage: {{ $storage }}
 {{- end }}
