@@ -84,10 +84,10 @@ impl Witnesses {
             let mut old = cosigned.get(url).copied().unwrap_or(0);
             // One retry: a 409 tells the size the witness holds.
             for _ in 0..2 {
-                let start = Instant::now();
+                let started = metrics.map(|_| crate::metrics::now());
                 let pushed = self.add_checkpoint(url, note, cp, leaves, old).await;
-                if let Some(metrics) = metrics {
-                    metrics.witness_push(push_result(&pushed), start.elapsed().as_secs_f64());
+                if let (Some(metrics), Some(started)) = (metrics, started) {
+                    metrics.witness_push(push_result(&pushed), started.elapsed().as_secs_f64());
                 }
                 match pushed {
                     Ok(Pushed::Cosigned(sigs)) => {

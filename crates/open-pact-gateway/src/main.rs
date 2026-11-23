@@ -2093,10 +2093,10 @@ mod tests {
         );
     }
 
-    /// Each add-checkpoint answer of a witness is counted under its own result.
-    #[tokio::test]
-    #[ignore = "needs TEST_DATABASE_URL and LOG_ORIGIN"]
-    async fn witness_pushes_are_counted_by_result() {
+    /// Three mock witnesses: one fails, one refuses the proof, one is ahead. The app pushes to them.
+    async fn app_with_broken_witnesses(
+        observe: Option<Arc<metrics::Observation>>,
+    ) -> (App, tokio::task::JoinHandle<()>) {
         let witness = Router::new()
             .route(
                 "/failing/add-checkpoint",
@@ -2113,14 +2113,23 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, witness).await.unwrap() });
-        let metrics = Arc::new(metrics::Metrics::new());
         let mut app = manifest_app(DEMO).await;
-        app.observe = metrics::Observation::new(Some(metrics.clone()), None);
+        app.observe = observe;
         let mut enforced = manifests::enforced(DEMO, &app.keys, None).unwrap();
         let urls = ["failing", "refusing", "ahead"].map(|name| format!("{base}/{name}"));
         Arc::get_mut(&mut enforced.log).unwrap().witnesses =
             Witnesses::new(urls.to_vec(), enforced.manifest.body().log.as_ref()).unwrap();
         app.enforced = Arc::new(enforced);
+        (app, server)
+    }
+
+    /// Each add-checkpoint answer of a witness is counted under its own result.
+    #[tokio::test]
+    #[ignore = "needs TEST_DATABASE_URL and LOG_ORIGIN"]
+    async fn witness_pushes_are_counted_by_result() {
+        let metrics = Arc::new(metrics::Metrics::new());
+        let observation = metrics::Observation::new(Some(metrics.clone()), None);
+        let (app, server) = app_with_broken_witnesses(observation).await;
         app.checkpoint(metrics::Caller::Checkpoint).await.unwrap();
         server.abort();
         let text = metrics.scrape(&app.db);
@@ -2129,6 +2138,29 @@ mod tests {
             assert!(text.contains(&line), "{result} missing: {text}");
         }
         assert!(!text.contains("result=\"cosigned\""), "{text}");
+    }
+
+    /// With observation off, the witness pushes and the checkpoint read no clock.
+    #[tokio::test]
+    #[ignore = "needs TEST_DATABASE_URL and LOG_ORIGIN"]
+    async fn witness_pushes_read_no_clock_when_observation_is_off() {
+        let (app, server) = app_with_broken_witnesses(None).await;
+        let before = metrics::clock_reads();
+        app.checkpoint(metrics::Caller::Checkpoint).await.unwrap();
+        server.abort();
+        assert_eq!(metrics::clock_reads(), before);
+    }
+
+    /// With observation off, a claim, its nonce and its checkpoint read no clock.
+    #[tokio::test]
+    #[ignore = "needs TEST_DATABASE_URL and LOG_ORIGIN"]
+    async fn a_claim_reads_no_clock_when_observation_is_off() {
+        let (app, db) = test_app_with(DEMO, 10, 100).await;
+        let (key, claim) = enrolled_claim(&app, &db, DEMO).await;
+        let before = metrics::clock_reads();
+        let (status, body) = send_claim(&app, &key, &claim, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(metrics::clock_reads(), before);
     }
 
     /// The index of the one log entry of `kind`.
