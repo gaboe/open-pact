@@ -1,0 +1,9 @@
+{{- if and .Values.gateway.enabled .Values.postgres.enabled (not .Values.database.externalUrl) }}
+{{- $existing := lookup "apps/v1" "StatefulSet" .Release.Namespace (printf "%s-postgres" .Release.Name) }}
+{{- if $existing }}
+{{- $current := (index $existing.spec.volumeClaimTemplates 0).spec.resources.requests.storage }}
+{{- if ne $current .Values.postgres.size }}
+The database volume keeps {{ $current }}, not postgres.size {{ .Values.postgres.size }}. See "Grow the database volume" in the README.
+{{- end }}
+{{- end }}
+{{- end }}
