@@ -320,7 +320,7 @@ fn tree_step(
         let number = log.fetches.fetch_add(1, Ordering::SeqCst);
         let from = view.leaves.len() as u64;
         let (freed, freed_rx) = tokio::sync::oneshot::channel();
-        let batch = RowBatch::new(Some(freed));
+        let batch = RowBatch::new(Some(freed), hooks.clone());
         let fetched = match sql {
             TreeSql::Step => db_step(db, move |conn| {
                 Box::pin(translog::since_raw(conn, from, batch))
@@ -495,7 +495,7 @@ impl App {
     /// witness. It shares the cache and the one-batch bound with every other tree step.
     async fn tree(&self) -> Result<Tree, Reply> {
         #[cfg(test)]
-        if self.owners.hooks().fault_after_read() {
+        if self.owners.hooks().fault_in_tree() {
             return Err(internal("a test fault in tree()"));
         }
         let step = tree_step(
@@ -645,6 +645,7 @@ impl App {
             note.clone(),
             &lines,
             served::now_secs(),
+            &self.owners.hooks(),
         ))
     }
 
@@ -687,8 +688,15 @@ impl App {
             pending.unwrap_or_else(|| self.owners.push_all(&checkpoint, &note, &tree, keys));
         self.pushed(&checkpoint, pending).await.ok()?;
         let (reply, count, kept) = self.assembled(policy, &checkpoint, &note).await.ok()?;
-        served::usable(&self.log.key, policy, &reply, &kept, served::now_secs())
-            .then_some((reply, count))
+        served::usable(
+            &self.log.key,
+            policy,
+            &reply,
+            &kept,
+            served::now_secs(),
+            &self.owners.hooks(),
+        )
+        .then_some((reply, count))
     }
 
     /// Counts a checkpoint that an answer went out with.

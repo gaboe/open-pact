@@ -372,6 +372,12 @@ impl Owners {
             .collect()
     }
 
+    /// Test only: wakes every reader, as a store by an owner does.
+    #[cfg(test)]
+    pub fn notify_changed(&self) {
+        self.shared.changed.send_modify(|n| *n += 1);
+    }
+
     pub fn refresh_all(&self) {
         for owner in &self.owners {
             let _ = owner.jobs.send(Job::Refresh);
@@ -537,6 +543,7 @@ impl Owner {
 
     async fn run(mut self) {
         loop {
+            self.shared.hooks.bump("owner_loop");
             let now = Instant::now();
             if self.not_before.is_some_and(|t| t <= now) {
                 self.not_before = None;
@@ -552,6 +559,7 @@ impl Owner {
             if self.not_before.is_none()
                 && self.recheck.is_none()
                 && self.due()
+                && !self.shared.hooks.holding_retries()
                 && self.rule_two(now).await
             {
                 continue;
@@ -867,8 +875,10 @@ impl Owner {
             i64::try_from(cp.size).unwrap_or(i64::MAX),
             cp.root.to_string(),
         );
+        let hooks = self.shared.hooks.clone();
         let stored = db_step(self.shared.db.clone(), move |conn| {
             Box::pin(async move {
+                hooks.hit("store_step").await;
                 for (witness, line) in rows {
                     sqlx::query(UPSERT)
                         .bind(size)

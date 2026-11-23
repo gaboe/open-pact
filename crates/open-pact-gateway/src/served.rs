@@ -16,6 +16,7 @@ use open_pact_core::{
 use serde_json::json;
 use sqlx::Row as _;
 
+use crate::hooks::Hooks;
 use crate::translog::RowBatch;
 use crate::witness::db_step;
 use crate::{App, Reply, Tree, TreeSql, tree_step};
@@ -94,6 +95,7 @@ pub fn assemble(
     mut note: Note,
     lines: &[NoteSignature],
     now: u64,
+    hooks: &Hooks,
 ) -> (Note, usize, Vec<Kept>) {
     let log_id = log_key_id(log_key);
     let mut kept = vec![];
@@ -105,7 +107,11 @@ pub fn assemble(
             {
                 continue;
             }
-            let Some(Ok(time)) = witness.key.verify(cp, line) else {
+            let checked = witness.key.verify(cp, line);
+            if checked.is_some() {
+                hooks.bump("verify_ed25519");
+            }
+            let Some(Ok(time)) = checked else {
                 continue;
             };
             let timely = |t: u64| t <= now.saturating_add(CLOCK_SKEW_SECS);
@@ -139,21 +145,40 @@ pub fn usable(
     note: &Note,
     kept: &[Kept],
     now: u64,
+    hooks: &Hooks,
 ) -> bool {
     let Some(policy) = policy else {
+        hooks.bump("verify_p256");
         return log_key.verify(note).is_ok();
     };
     kept.iter()
         .filter(|k| cosign_time_usable(policy, k.time, now, AGE_MARGIN_SECS))
         .count()
         >= policy.witness_quorum
-        && log_key.verify(note).is_ok()
+        && {
+            hooks.bump("verify_p256");
+            log_key.verify(note).is_ok()
+        }
 }
 
 /// The pure bound of the uncached-size query: never above the captured tree, and none when the
 /// window already covers `floor`.
 pub fn uncached_bound(floor: u64, tree_size: u64, oldest: u64) -> Option<u64> {
     (floor < oldest).then(|| tree_size.min(oldest - 1))
+}
+
+/// How many sizes the rows of a batch hold (they arrive ordered by size).
+fn groups_in(batch: &RowBatch) -> usize {
+    let mut groups = 0;
+    let mut last = None;
+    for row in batch.rows() {
+        let size: i64 = row.get(0);
+        if last != Some(size) {
+            groups += 1;
+            last = Some(size);
+        }
+    }
+    groups
 }
 
 enum Stop {
@@ -173,6 +198,7 @@ impl App {
 
     /// The tree of this request's snapshot, or none when the step failed or the deadline passed.
     async fn tree_until(&self, deadline: Instant) -> Option<Tree> {
+        self.owners.hooks().bump("served_tree_reads");
         let step = tree_step(
             self.db.clone(),
             self.enforced.clone(),
@@ -195,6 +221,7 @@ impl App {
     }
 
     fn sign_tree(&self, tree: &Tree) -> Note {
+        self.owners.hooks().bump("served_signatures");
         let cp = Checkpoint {
             origin: self.log.key.origin().to_string(),
             size: tree.size(),
@@ -239,6 +266,7 @@ impl App {
             if past() {
                 return Answer::Unavailable(Why::NotYet);
             }
+            hooks.bump("kick_calls");
             self.owners.kick(tree.size());
             if past() {
                 return Answer::Unavailable(Why::NotYet);
@@ -322,6 +350,8 @@ impl App {
         uncached: &mut Option<(u64, LogHash)>,
     ) -> Result<Rows, Stop> {
         let past = || Instant::now() >= deadline;
+        let hooks = self.owners.hooks();
+        hooks.bump("read_calls");
         let cols: Vec<String> = policy
             .witnesses
             .iter()
@@ -376,6 +406,7 @@ impl App {
                     known.insert(size, tree.root());
                 } else {
                     if uncached.is_none() && !past() {
+                        hooks.bump("uncached_root");
                         *uncached = Some((size, root(tree.prefix(size))));
                     }
                     if let Some((u, hash)) = uncached.as_ref().filter(|(u, _)| *u == size) {
@@ -395,13 +426,16 @@ impl App {
         }
         if sizes.is_empty() {
             return Ok(Rows {
-                batch: RowBatch::new(None),
+                batch: RowBatch::new(None, hooks),
                 known,
             });
         }
+        let step_hooks = hooks.clone();
         let step = db_step(self.db.clone(), move |conn| {
             Box::pin(async move {
-                let mut batch = RowBatch::new(None);
+                let hooks = step_hooks;
+                let mut batch = RowBatch::new(None, hooks.clone());
+                hooks.hit("row_step_start").await;
                 let mut rows = sqlx::query(
                     "SELECT size, witness, signature FROM log_cosignatures \
                      WHERE (size, root) IN (SELECT * FROM unnest($1::bigint[], $2::text[])) \
@@ -415,6 +449,8 @@ impl App {
                     batch.push(row);
                 }
                 drop(rows);
+                hooks.add("row_groups", groups_in(&batch));
+                hooks.hit("row_step_returned").await;
                 Ok(batch)
             })
         });
@@ -443,8 +479,12 @@ impl App {
             if Instant::now() >= deadline {
                 return None;
             }
+            let hooks = self.owners.hooks();
+            hooks.hold_until_after("candidate_started", deadline);
             let size = u64::try_from(size).ok()?;
             if let Some(hash) = rows.known.get(&size) {
+                hooks.add("candidate_rows", end - start);
+                hooks.bump("served_signatures");
                 let cp = Checkpoint {
                     origin: self.log.key.origin().to_string(),
                     size,
@@ -456,8 +496,9 @@ impl App {
                     .filter_map(|r| NoteSignature::parse(&r.get::<String, _>(2)).ok())
                     .collect();
                 let now = now_secs();
-                let (note, _, kept) = assemble(&self.log.key, Some(policy), &cp, note, &lines, now);
-                if usable(&self.log.key, Some(policy), &note, &kept, now) {
+                let (note, _, kept) =
+                    assemble(&self.log.key, Some(policy), &cp, note, &lines, now, &hooks);
+                if usable(&self.log.key, Some(policy), &note, &kept, now, &hooks) {
                     return Some(note);
                 }
             }
