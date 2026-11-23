@@ -27,7 +27,7 @@ pub struct Hooks {
     hold_retries: AtomicBool,
     /// How long after its deadline the next path that reaches the named point continues.
     #[cfg(test)]
-    past_deadline: Mutex<std::collections::HashMap<&'static str, std::time::Duration>>,
+    past_deadline: Mutex<std::collections::HashMap<&'static str, i64>>,
 }
 
 /// A stored-line read count; the default is never reached.
@@ -65,13 +65,19 @@ pub struct BlockPoint {
     release_rx: Mutex<std::sync::mpsc::Receiver<()>>,
 }
 
+/// How long a test waits for a path to reach a pause point, and a path waits for its release.
+#[cfg(test)]
+pub const REACH_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+
 #[cfg(test)]
 pub const HOLD_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[cfg(test)]
 impl BlockPoint {
     pub async fn reached(&self) {
-        self.reached.notified().await;
+        tokio::time::timeout(REACH_LIMIT, self.reached.notified())
+            .await
+            .expect("a blocking pause point was never reached");
     }
 
     pub fn release(&self) {
@@ -90,8 +96,12 @@ impl BlockPoint {
 
 #[cfg(test)]
 impl Point {
+    /// Waits until a path reaches the point; a test whose path never arrives fails after
+    /// `REACH_LIMIT` and does not hang the run.
     pub async fn reached(&self) {
-        self.reached.notified().await;
+        tokio::time::timeout(REACH_LIMIT, self.reached.notified())
+            .await
+            .expect("a pause point was never reached");
     }
 
     pub fn release(&self) {
@@ -228,10 +238,15 @@ impl Hooks {
     /// The next path that reaches `name` through `hold_until_after` continues `slack` after its
     /// deadline, so its work lies wholly past it.
     pub fn arm_past_deadline(&self, name: &'static str, slack: std::time::Duration) {
+        self.arm_relative_to_deadline(name, i64::try_from(slack.as_millis()).unwrap_or(i64::MAX));
+    }
+
+    /// The same with a signed offset in milliseconds: a negative one releases before the deadline.
+    pub fn arm_relative_to_deadline(&self, name: &'static str, millis: i64) {
         self.past_deadline
             .lock()
             .expect("hooks")
-            .insert(name, slack);
+            .insert(name, millis);
     }
 
     /// A std wait for code that cannot await: counts the pass and, when armed, sleeps until
@@ -239,8 +254,13 @@ impl Hooks {
     pub fn hold_until_after(&self, name: &'static str, deadline: std::time::Instant) {
         self.bump(name);
         let slack = self.past_deadline.lock().expect("hooks").remove(name);
-        if let Some(slack) = slack {
-            let until = deadline + slack;
+        if let Some(millis) = slack {
+            let offset = std::time::Duration::from_millis(millis.unsigned_abs());
+            let until = if millis >= 0 {
+                deadline + offset
+            } else {
+                deadline.checked_sub(offset).unwrap_or(deadline)
+            };
             std::thread::sleep(until.saturating_duration_since(std::time::Instant::now()));
         }
     }
@@ -287,7 +307,8 @@ impl Hooks {
             }
             point.hits.fetch_add(1, Ordering::SeqCst);
             point.reached.notify_one();
-            point.release.notified().await;
+            // A test that never releases the point cannot hang the code under test.
+            let _ = tokio::time::timeout(REACH_LIMIT, point.release.notified()).await;
         }
     }
 }
