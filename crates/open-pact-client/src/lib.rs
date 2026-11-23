@@ -2160,7 +2160,7 @@ async fn sync_checkpoint_with(
         return Ok(Err(changed));
     }
     let prev = home.checkpoint()?;
-    let text = get_text(http, format!("{}/v1/log/checkpoint", base(gateway))).await?;
+    let text = get_checkpoint(http, gateway, policy).await?;
     let checked = if store {
         verify_checkpoint(http, home, gateway, &pins.log, policy, prev.as_ref(), &text).await?
     } else {
@@ -2295,11 +2295,93 @@ fn own_enrolment_entry(commitment: &str) -> impl Fn(&Entry) -> bool + '_ {
     move |e: &Entry| e.kind == EntryKind::DeviceEnrolled && e.data["commitment"] == commitment
 }
 
+/// The gateway answers 503 with Retry-After when it cannot give a note the client's policy would
+/// accept. The wait is the header's whole seconds from 1 to 10, else 5 seconds.
+fn retry_delay(response: &reqwest::Response) -> Duration {
+    parse_retry_after(
+        response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok()),
+    )
+}
+
+fn parse_retry_after(value: Option<&str>) -> Duration {
+    value
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|s| (1..=10).contains(s))
+        .map_or(Duration::from_secs(5), Duration::from_secs)
+}
+
+/// The `?policy=` query that tells the gateway which witness policy this client verifies with:
+/// the policy as JSON in base64url, at most 4 KiB. A larger or missing policy sends no query.
+fn policy_query(policy: Option<&LogPolicy>) -> String {
+    use base64::Engine as _;
+    let Some(policy) = policy else {
+        return String::new();
+    };
+    let Ok(json) = serde_json::to_vec(policy) else {
+        return String::new();
+    };
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json);
+    if encoded.len() > 4096 {
+        return String::new();
+    }
+    format!("?policy={encoded}")
+}
+
+/// Fetches the checkpoint note. On 503 it waits as the gateway says and asks once more.
+async fn get_checkpoint(
+    http: &reqwest::Client,
+    gateway: &str,
+    policy: Option<&LogPolicy>,
+) -> Result<String> {
+    let url = format!("{}/v1/log/checkpoint{}", base(gateway), policy_query(policy));
+    for attempt in 0..2 {
+        let response = http
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?;
+        if response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE && attempt == 0 {
+            tokio::time::sleep(retry_delay(&response)).await;
+            continue;
+        }
+        return response
+            .error_for_status()?
+            .text()
+            .await
+            .with_context(|| format!("GET {url}"));
+    }
+    unreachable!("the second attempt returns")
+}
+
+/// `POST /v1/log/mine`. On 503 it waits as the gateway says and repeats the whole fetch with a
+/// new nonce, once.
 async fn fetch_my_entries(
     http: &reqwest::Client,
     home: &Home,
     enrolment: &Enrolment,
+    policy: Option<&LogPolicy>,
 ) -> Result<MyEntries> {
+    match fetch_my_entries_once(http, home, enrolment, policy).await? {
+        Ok(entries) => Ok(entries),
+        Err(delay) => {
+            tokio::time::sleep(delay).await;
+            fetch_my_entries_once(http, home, enrolment, policy)
+                .await?
+                .map_err(|_| anyhow::anyhow!("The gateway could not give a checkpoint your policy accepts (503). Try again shortly."))
+        }
+    }
+}
+
+/// One fetch; `Ok(Err(delay))` is a 503 with the wait to use.
+async fn fetch_my_entries_once(
+    http: &reqwest::Client,
+    home: &Home,
+    enrolment: &Enrolment,
+    policy: Option<&LogPolicy>,
+) -> Result<std::result::Result<MyEntries, Duration>> {
     let device = DeviceKey::load(&home.0)?;
     let gateway = base(&enrolment.gateway);
     let nonce: Nonce = http
@@ -2318,7 +2400,7 @@ async fn fetch_my_entries(
         signature: device.sign(&statement)?,
     };
     let response = http
-        .post(format!("{gateway}/v1/log/mine"))
+        .post(format!("{gateway}/v1/log/mine{}", policy_query(policy)))
         .json(&request)
         .send()
         .await?;
@@ -2327,7 +2409,10 @@ async fn fetch_my_entries(
             "The gateway does not support this client version. Ask IT to update the gateway to 0.4.0 or later."
         ));
     }
-    Ok(response.error_for_status()?.json().await?)
+    if response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+        return Ok(Err(retry_delay(&response)));
+    }
+    Ok(Ok(response.error_for_status()?.json().await?))
 }
 
 async fn status_after_log_denial(
@@ -2374,7 +2459,29 @@ async fn fetch_my_entries_for_wait(
     http: &reqwest::Client,
     home: &Home,
     enrolment: &Enrolment,
+    policy: Option<&LogPolicy>,
 ) -> std::result::Result<MyEntries, WaitError> {
+    match fetch_my_entries_for_wait_once(http, home, enrolment, policy).await? {
+        Ok(entries) => Ok(entries),
+        Err(delay) => {
+            tokio::time::sleep(delay).await;
+            fetch_my_entries_for_wait_once(http, home, enrolment, policy)
+                .await?
+                .map_err(|_| {
+                    WaitError::from_error(anyhow::anyhow!(
+                        "The gateway could not give a checkpoint your policy accepts (503)."
+                    ))
+                })
+        }
+    }
+}
+
+async fn fetch_my_entries_for_wait_once(
+    http: &reqwest::Client,
+    home: &Home,
+    enrolment: &Enrolment,
+    policy: Option<&LogPolicy>,
+) -> std::result::Result<std::result::Result<MyEntries, Duration>, WaitError> {
     let device = DeviceKey::load(&home.0).map_err(WaitError::Fatal)?;
     let gateway = base(&enrolment.gateway);
     let nonce_bytes = http
@@ -2398,7 +2505,7 @@ async fn fetch_my_entries_for_wait(
         signature: device.sign(&statement).map_err(WaitError::Fatal)?,
     };
     let response = http
-        .post(format!("{gateway}/v1/log/mine"))
+        .post(format!("{gateway}/v1/log/mine{}", policy_query(policy)))
         .json(&request)
         .send()
         .await
@@ -2408,13 +2515,18 @@ async fn fetch_my_entries_for_wait(
             "The gateway does not support this client version. Ask IT to update the gateway to 0.4.0 or later."
         )));
     }
+    if response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+        return Ok(Err(retry_delay(&response)));
+    }
     let bytes = response
         .error_for_status()
         .map_err(|error| WaitError::from_error(error.into()))?
         .bytes()
         .await
         .map_err(WaitError::body_error)?;
-    serde_json::from_slice(&bytes).map_err(|error| WaitError::Fatal(error.into()))
+    serde_json::from_slice(&bytes)
+        .map(Ok)
+        .map_err(|error| WaitError::Fatal(error.into()))
 }
 
 fn verify_my_entries(
@@ -2521,9 +2633,9 @@ async fn check_own_entries_with(
     cp: &mut Checkpoint,
     store: bool,
 ) -> Result<Result<OwnEntries, OwnEntriesError>> {
-    let response = fetch_my_entries(http, home, enrolment).await?;
-    let pins = Pins::load(home)?;
     let manifest = Manifest::parse(&home_fs::read(&home.file("manifest.toml"))?)?;
+    let response = fetch_my_entries(http, home, enrolment, manifest.body().log.as_ref()).await?;
+    let pins = Pins::load(home)?;
     let checked = if store {
         verify_checkpoint(
             http,
@@ -2725,7 +2837,8 @@ async fn verify_approval_entry(
     enrolment: &Enrolment,
     manifest: &Manifest,
 ) -> std::result::Result<bool, WaitError> {
-    let response = fetch_my_entries_for_wait(http, home, enrolment).await?;
+    let response =
+        fetch_my_entries_for_wait(http, home, enrolment, manifest.body().log.as_ref()).await?;
     let pins = Pins::load(home).map_err(WaitError::Fatal)?;
     let prev = home.checkpoint().map_err(WaitError::Fatal)?;
     let checkpoint = match verify_checkpoint(
@@ -4633,7 +4746,8 @@ async fn log_prove(home: &Home, index: Option<u64>, insecure_dev: bool) -> Resul
         return Ok(ExitCode::from(2));
     };
     let index = index.unwrap_or(own.enrolment);
-    let response = fetch_my_entries(&http, home, &enrolment).await?;
+    let response =
+        fetch_my_entries(&http, home, &enrolment, manifest.body().log.as_ref()).await?;
     let pins = Pins::load(home)?;
     let cp = match verify_checkpoint(
         &http,
@@ -5812,6 +5926,161 @@ mod tests {
                     "GET /v1/log/checkpoint"
                 ]
             );
+        }
+    }
+
+    fn decode_policy(query: &str) -> LogPolicy {
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(query)
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[test]
+    fn the_policy_query_round_trips_and_stays_small() {
+        assert_eq!(policy_query(None), "");
+        let toml = witnessed_manifest(&Witness::new());
+        let manifest = Manifest::parse(toml.as_bytes()).unwrap();
+        let policy = manifest.body().log.clone().unwrap();
+        let query = policy_query(Some(&policy));
+        let value = query.strip_prefix("?policy=").unwrap();
+        assert_eq!(
+            serde_json::to_value(decode_policy(value)).unwrap(),
+            serde_json::to_value(&policy).unwrap()
+        );
+        assert!(!value.contains(['+', '/', '=']));
+        let mut big = policy.clone();
+        let witness = big.witnesses[0].clone();
+        big.witnesses = vec![witness; 200];
+        assert_eq!(policy_query(Some(&big)), "");
+    }
+
+    #[test]
+    fn retry_after_is_a_whole_number_of_seconds_from_1_to_10() {
+        for (value, secs) in [
+            (Some("1"), 1),
+            (Some(" 10 "), 10),
+            (Some("0"), 5),
+            (Some("11"), 5),
+            (Some("2.5"), 5),
+            (Some("Wed, 21 Oct 2026 07:28:00 GMT"), 5),
+            (Some("-1"), 5),
+            (None, 5),
+        ] {
+            assert_eq!(parse_retry_after(value), Duration::from_secs(secs), "{value:?}");
+        }
+    }
+
+    /// A gateway whose first checkpoint answer is a 503 with this Retry-After, then `second`.
+    async fn busy_then(note: String, second: u16, retry_after: &str) -> (FakeGateway, std::time::Instant) {
+        let retry_after = retry_after.to_string();
+        let gateway = FakeGateway::start_with(move |line, nth| match line {
+            "GET /v1/log/checkpoint" if nth == 0 => {
+                fake_gateway::Reply::new(503, "busy").header("retry-after", &retry_after)
+            }
+            "GET /v1/log/checkpoint" => fake_gateway::Reply::new(second, note.clone()),
+            _ => fake_gateway::Reply::new(404, "{}"),
+        })
+        .await;
+        (gateway, std::time::Instant::now())
+    }
+
+    #[tokio::test]
+    async fn a_503_checkpoint_is_retried_once_after_retry_after() {
+        let company = Company::new();
+        let note = company.empty_checkpoint();
+        let (gateway, start) = busy_then(note.clone(), 200, "1").await;
+        let text = get_checkpoint(&http_client().unwrap(), &gateway.url, None)
+            .await
+            .unwrap();
+        assert_eq!(text, note);
+        assert!(start.elapsed() >= Duration::from_secs(1));
+        assert_eq!(
+            gateway.requests(),
+            ["GET /v1/log/checkpoint", "GET /v1/log/checkpoint"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_503_checkpoint_is_an_error() {
+        let (gateway, _) = busy_then("x".into(), 503, "1").await;
+        let error = get_checkpoint(&http_client().unwrap(), &gateway.url, None)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("503"), "{error:#}");
+        assert_eq!(gateway.requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn another_error_status_is_not_retried() {
+        let gateway = FakeGateway::start(|_, _| (500, "no".into())).await;
+        get_checkpoint(&http_client().unwrap(), &gateway.url, None)
+            .await
+            .unwrap_err();
+        assert_eq!(gateway.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_checkpoint_request_carries_the_verifying_policy_and_both_tries_agree() {
+        let witness = Witness::new();
+        let toml = witnessed_manifest(&witness);
+        let manifest = Manifest::parse(toml.as_bytes()).unwrap();
+        let policy = manifest.body().log.clone().unwrap();
+        let (gateway, _) = busy_then("x".into(), 200, "1").await;
+        get_checkpoint(&http_client().unwrap(), &gateway.url, Some(&policy))
+            .await
+            .unwrap();
+        let sent = gateway.policies();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0], sent[1]);
+        assert_eq!(
+            serde_json::to_value(decode_policy(&sent[0])).unwrap(),
+            serde_json::to_value(&policy).unwrap()
+        );
+        assert!(gateway.targets()[0].starts_with("GET /v1/log/checkpoint?policy="));
+        assert!(gateway.requests().iter().all(|l| l == "GET /v1/log/checkpoint"));
+    }
+
+    #[tokio::test]
+    async fn a_mine_503_repeats_the_whole_fetch_with_a_new_nonce_once() {
+        let company = Company::new();
+        let witness = Witness::new();
+        let toml = witnessed_manifest(&witness);
+        let manifest = Manifest::parse(toml.as_bytes()).unwrap();
+        let policy = manifest.body().log.clone().unwrap();
+        for (second, expected) in [(404, "does not support"), (503, "503")] {
+            let gateway = FakeGateway::start_with(move |line, nth| match line {
+                "POST /v1/nonce" => {
+                    fake_gateway::Reply::new(200, json!({"nonce": format!("{nth:064x}")}).to_string())
+                }
+                "POST /v1/log/mine" if nth == 0 => {
+                    fake_gateway::Reply::new(503, "busy").header("retry-after", "1")
+                }
+                "POST /v1/log/mine" => fake_gateway::Reply::new(second, "{}"),
+                _ => fake_gateway::Reply::new(404, "{}"),
+            })
+            .await;
+            let dir = tempfile::tempdir().unwrap();
+            let home = enrolled_home_with(dir.path(), &gateway.url, &company, &toml);
+            let enrolment = home.enrolment().unwrap();
+            let error = fetch_my_entries(&http_client().unwrap(), &home, &enrolment, Some(&policy))
+                .await
+                .unwrap_err();
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+            assert_eq!(
+                gateway.requests(),
+                ["POST /v1/nonce", "POST /v1/log/mine", "POST /v1/nonce", "POST /v1/log/mine"]
+            );
+            let sent = gateway.policies();
+            assert_eq!(sent.len(), 2);
+            assert_eq!(sent[0], sent[1]);
+            let nonces: Vec<String> = gateway
+                .bodies("POST /v1/log/mine")
+                .iter()
+                .map(|b| serde_json::from_str::<serde_json::Value>(b).unwrap()["nonce"].to_string())
+                .collect();
+            assert_ne!(nonces[0], nonces[1]);
         }
     }
 

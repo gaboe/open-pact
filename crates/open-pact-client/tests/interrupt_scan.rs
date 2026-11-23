@@ -98,7 +98,8 @@ async fn ctrl_c_during_a_blocked_repository_scan_exits_130_at_once() {
                 published.clone()
             } else if request.starts_with("GET /v1/log/key ") {
                 log.vkey().to_string()
-            } else if request.starts_with("GET /v1/log/checkpoint ") {
+            } else if (request.starts_with("GET /v1/log/checkpoint ")
+                || request.starts_with("GET /v1/log/checkpoint?")) {
                 checkpoint.clone()
             } else if request.starts_with("POST /v1/nonce ") {
                 json!({"nonce": "wait-1"}).to_string()

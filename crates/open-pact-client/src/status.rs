@@ -642,6 +642,10 @@ fn read_generation(mut read: impl FnMut(&str) -> Result<Option<Vec<u8>>>) -> Res
     Ok(Generation::Busy)
 }
 
+/// The checkpoint request may wait for witnesses on the gateway, so it gets a longer limit than
+/// the rest of a refresh.
+const STATUS_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(5);
+
 async fn refresh(
     home: &Home,
     enrolment: &Enrolment,
@@ -674,7 +678,10 @@ async fn refresh(
             .map_or(Ok(()), |text| Err(LogFailure::Alarm(text)))
     };
     if log.is_ok() {
-        let checkpoint = crate::get_text(&http, format!("{gateway}/v1/log/checkpoint")).await?;
+        let checkpoint_http =
+            crate::http_client_with(Duration::from_secs(2), STATUS_CHECKPOINT_TIMEOUT)?;
+        let checkpoint =
+            crate::get_checkpoint(&checkpoint_http, gateway, manifest.body().log.as_ref()).await?;
         log = match home.checkpoint() {
             Err(error) => Err(LogFailure::Damaged(error)),
             Ok(previous) => crate::verify_checkpoint_unstored(

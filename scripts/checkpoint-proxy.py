@@ -25,7 +25,7 @@ class Proxy(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def forward(self):
-        if self.command == "GET" and self.path == "/v1/log/checkpoint":
+        if self.command == "GET" and self.path.split("?", 1)[0] == "/v1/log/checkpoint":
             with open(checkpoint_file, "rb") as f:
                 return self.reply(200, "text/plain; charset=utf-8", f.read())
         length = int(self.headers.get("content-length") or 0)

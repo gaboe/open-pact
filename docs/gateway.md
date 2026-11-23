@@ -207,6 +207,16 @@ helm upgrade --install pact-witness deploy/helm/open-pact \
 
 Replace the verifier-key placeholder with the gateway key that you confirmed out of band. Add the witness verifier key and name to the owner's manifest before the owner signs it. Set `log.witnessUrls` in the gateway release to the witness service URL.
 
+### What a reader gets
+
+`GET /v1/log/checkpoint` and `POST /v1/log/mine` never answer 200 with a note that the client's policy would reject. When the gateway cannot get enough cosignatures in time, it answers 503 with `Retry-After: 5` and the client asks once more. The client sends the policy it verifies with in `?policy=` (base64url JSON, at most 4 KiB). Without it the gateway uses the policy of the manifest it enforces. A policy that does not parse or validate gets 400.
+
+A witness cosignature counts only when its time is inside the client's window: not older than `checkpoint_max_age` and not in the future. The gateway applies the same test with a 300 s margin, so a gateway clock that is more than a few minutes off causes 503. Keep the gateway and witness clocks within a minute of true time.
+
+`CHECKPOINT_WAIT_MS` sets how long a reader waits for witnesses (default 3000, allowed 500 to 3000). Each entry of `WITNESS_URLS` gets one owner task that sends every push in order. The gateway compares the URLs after it removes trailing slashes, so `https://w.example.org` and `https://w.example.org/` get one owner. Other spellings of one address, such as a different case or a default port, get two owners; write each URL one way. List only witnesses that your manifest names and whose operators agreed to receive checkpoints; the gateway never contacts an address from a client's policy.
+
+Rollout: update the gateway before the clients. An older client sends no policy and gets the enforced manifest's policy.
+
 Run one process per witness key and state file. Do not run the same key on two hosts. Back up the witness state. If it is lost, the witness can no longer prevent a gateway rollback from its last saved checkpoint.
 
 ## Export events to a SIEM
