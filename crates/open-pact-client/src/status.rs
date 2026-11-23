@@ -85,6 +85,8 @@ pub struct ScheduleEvidence {
     pub system_job: bool,
     /// The owner chose a SYSTEM job in the wizard and it is not installed yet.
     pub system_job_pending: bool,
+    /// The SYSTEM task that a pending choice waits for. `job_status` stays the job that runs now.
+    pub pending_job_status: Option<JobStatus>,
     /// The machine client of a SYSTEM job, which is a fact of its own beside the task.
     pub machine_client: Option<MachineState>,
     /// The exact text that fixes the machine client, for the desktop to show.
@@ -193,17 +195,19 @@ async fn collect(
     insecure_dev: bool,
     executable: &Path,
 ) -> Result<Report> {
-    collect_with(
+    collect_with_pending(
         home,
         online,
         insecure_dev,
         executable,
         OffsetDateTime::now_utc(),
         |home, config| crate::schedule::inspect_job(home, config, executable),
+        crate::schedule::inspect_system_job,
     )
     .await
 }
 
+#[cfg(test)]
 async fn collect_with(
     home: &Home,
     online: bool,
@@ -211,6 +215,29 @@ async fn collect_with(
     executable: &Path,
     now: OffsetDateTime,
     inspect_job: impl FnOnce(&Home, &DeviceConfig) -> Result<JobInspection>,
+) -> Result<Report> {
+    collect_with_pending(
+        home,
+        online,
+        insecure_dev,
+        executable,
+        now,
+        inspect_job,
+        crate::schedule::inspect_system_job,
+    )
+    .await
+}
+
+/// `inspect_pending` looks at the SYSTEM job that a pending choice waits for. The job that runs
+/// now comes from `inspect_job`.
+async fn collect_with_pending(
+    home: &Home,
+    online: bool,
+    insecure_dev: bool,
+    executable: &Path,
+    now: OffsetDateTime,
+    inspect_job: impl FnOnce(&Home, &DeviceConfig) -> Result<JobInspection>,
+    inspect_pending: impl FnOnce(&Home) -> Result<JobInspection>,
 ) -> Result<Report> {
     let mut damaged = Vec::new();
     let config = DeviceConfig::load(home).unwrap_or_else(|error| {
@@ -262,6 +289,7 @@ async fn collect_with(
                 && config.auto_send
                 && config.run_as == crate::device_config::RunAs::System,
             system_job_pending: !config_damaged && config.system_job_pending,
+            pending_job_status: None,
             machine_client: None,
             machine_fix: None,
             job_fix: None,
@@ -558,7 +586,12 @@ async fn collect_with(
         }
     }
     if !config_damaged && config.system_job_pending {
-        report.pending_system_job(home, online, &command);
+        let inspection = if online {
+            inspect_pending(home).ok()
+        } else {
+            None
+        };
+        report.pending_system_job(home, online, &command, inspection.as_ref());
     }
     if let Some(note) = changed_note
         && !report
@@ -1105,10 +1138,27 @@ impl Report {
     }
 
     /// Automatic sending waits for the SYSTEM job that the wizard could not install.
-    fn pending_system_job(&mut self, home: &Home, online: bool, command: &str) {
+    ///
+    /// The online report also says what state the machine client is in and what the SYSTEM task
+    /// is, so that the desktop offers the administrator install only where it can work.
+    fn pending_system_job(
+        &mut self,
+        home: &Home,
+        online: bool,
+        command: &str,
+        inspection: Option<&JobInspection>,
+    ) {
         // Local mode probes nothing, so it cannot know that the machine client passed its
         // protection check. It names no line that runs it and points at the online report.
-        let fix = if online {
+        let fix = if let Some(inspection) = inspection.filter(|_| online) {
+            if inspection.is_system() {
+                self.schedule.machine_client = inspection.machine_state();
+                self.schedule.pending_job_status = Some(inspection.job);
+            }
+            inspection
+                .pending_fix(&home.0)
+                .unwrap_or_else(|| crate::schedule::system_on_text(&home.0))
+        } else if online {
             crate::schedule::system_on_text(&home.0)
         } else {
             format!(
