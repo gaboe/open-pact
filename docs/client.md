@@ -366,8 +366,17 @@ The wizard asks whether the job runs as SYSTEM. Later, choose SYSTEM with `sched
 
 To go back to a job that runs as you, do two steps for this one home. Do not uninstall the package.
 
-- In an elevated prompt, remove the SYSTEM task of this home. Use the command for a task of the machine client, or the removal block for a task of the old copy, in [Stop the scheduled claims and remove the client](#stop-the-scheduled-claims-and-remove-the-client). Use the `--home` value of the task.
-- In your own prompt, not an elevated one, run `open-pact-client --home <the same absolute client home> schedule on --user`.
+- In an elevated prompt, remove the SYSTEM task of this home. Use the `--home` value of the task.
+  - For a task of the machine client, use the command in [Stop the scheduled claims and remove the client](#stop-the-scheduled-claims-and-remove-the-client).
+  - For a task of the old copy, use the removal block in the same section.
+- In your own prompt, not an elevated one, run the command below with the same absolute client home that you used above.
+
+```powershell
+$clientHome = @'
+<the absolute client home>
+'@
+open-pact-client --home $clientHome schedule on --user
+```
 
 1. Replace the line `<the absolute client home>` with the absolute client home of the user.
 2. Replace the line `<the profile folder of the user>` with the profile folder of the user.
@@ -444,7 +453,7 @@ A task whose Actions line is not 1 is not a task of the client. `schedule off` r
 
 A task whose program is the old copy, `open-pact\open-pact-client.exe`, and whose Actions line is 1, needs the removal block. The list can show the program with a `\\?\` prefix. It is the same file. The block shows two samples.
 
-1. Replace the task name `org.open-pact.report.0123abcd` in every place where it appears.
+1. Replace the task name `org.open-pact.report.0123456789abcdef` in every place where it appears.
 2. Replace the home line `C:\Users\example\pact`, between `@'` and `'@`, with the `--home` value of the task. Do not add quotes.
 
  The client prints this block with the values of your device when it refuses to change an old task.
@@ -457,7 +466,7 @@ A task whose program is the old copy, `open-pact\open-pact-client.exe`, and whos
     $service = New-Object -ComObject Schedule.Service
     $service.Connect()
     try {
-      [void]$service.GetFolder('\').GetTask('\org.open-pact.report.0123abcd')
+      [void]$service.GetFolder('\').GetTask('\org.open-pact.report.0123456789abcdef')
       return $true
     } catch {
       $e = $_.Exception
@@ -469,11 +478,11 @@ A task whose program is the old copy, `open-pact\open-pact-client.exe`, and whos
   function End-TaskQuietly {
     # /End fails for a task that is not running. That does not matter here: /Delete decides.
     $ErrorActionPreference = 'Continue'
-    & $schtasks /End /TN 'org.open-pact.report.0123abcd' 2>$null | Out-Null
+    & $schtasks /End /TN 'org.open-pact.report.0123456789abcdef' 2>$null | Out-Null
   }
   if (Test-TaskRegistered) {
     End-TaskQuietly
-    & $schtasks /Delete /TN 'org.open-pact.report.0123abcd' /F
+    & $schtasks /Delete /TN 'org.open-pact.report.0123456789abcdef' /F
     if ($LASTEXITCODE -ne 0) { throw 'The task was not removed. Run this block again from an elevated prompt.' }
   }
   if (Test-TaskRegistered) { throw 'The task is still registered. Run this block again.' }
