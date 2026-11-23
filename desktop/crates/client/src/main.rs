@@ -53,7 +53,7 @@ enum Operation {
     Accept,
     Schedule(bool),
     UpdateCli(String),
-    RemoveCopy(OtherCopy),
+    RemoveCopy(OtherCopy, Option<PathBuf>),
 }
 
 enum Outcome {
@@ -130,6 +130,10 @@ struct AppView {
     steps: Vec<JoinStep>,
     /// Command line tools on PATH that this app did not install, and the output of the removal.
     others: Vec<OtherCopy>,
+    /// The executable of the user job that runs now. The app never removes that copy.
+    active: Option<PathBuf>,
+    /// A SYSTEM choice is saved and not installed yet, so the user job keeps running meanwhile.
+    system_pending: bool,
     removal_output: Option<String>,
     /// The device runs its scheduled job as SYSTEM. Only an elevated process can install it.
     system_job: bool,
@@ -172,6 +176,8 @@ impl AppView {
             last_check: None,
             steps: Vec::new(),
             others: Vec::new(),
+            active: None,
+            system_pending: false,
             removal_output: None,
             system_job: false,
             system_route: false,
@@ -324,11 +330,13 @@ impl AppView {
                         .map(Outcome::Status)
                 },
             ),
-            Operation::RemoveCopy(copy) => {
+            Operation::RemoveCopy(copy, active) => {
                 engine.call("Remove another copy", Outcome::summary, async move {
                     let (run, target) = (runner.clone(), copy);
-                    let output =
-                        engine::blocking(move || engine::remove_copy(&run, &target)).await?;
+                    let output = engine::blocking(move || {
+                        engine::remove_copy(&run, &target, active.as_deref())
+                    })
+                    .await?;
                     let others = engine::blocking(move || {
                         Ok(engine::find_other_copies(&runner, &installed, &bundled))
                     })
@@ -453,12 +461,14 @@ impl AppView {
     /// The device status that the app found when it opened, with the other copies of the tool.
     fn adopt(&mut self, opened: Opened) {
         self.others = opened.others;
+        self.active = opened.active;
         self.error = opened.warning;
         self.show_status(opened.status);
     }
 
     fn show_status(&mut self, status: Report) {
         self.system_job = status.schedule.system_job;
+        self.system_pending = status.schedule.system_job_pending;
         self.system_route = job_install(&status.schedule) == JobInstall::System;
         self.enable_blocked = enable_blocked(&status.schedule);
         self.screen = if status.approval.state.is_none() && status.manifest.is_none() {
@@ -475,13 +485,30 @@ impl AppView {
         }
         let mut view = column().gap_2();
         // The machine client can come first on PATH. It never hides a copy that the app can remove.
-        if let Some((copy, removal)) = ownership::first_removable(&self.others, Platform::current())
+        if let Some(active) = ownership::active_copy(&self.others, self.active.as_deref()) {
+            view = view.child(note(format!(
+                "The scheduled job runs {}. It stays {}.",
+                active.path.display(),
+                if self.system_pending {
+                    "until the SYSTEM switch succeeds"
+                } else {
+                    "while the scheduled job runs it"
+                }
+            )));
+        }
+        if let Some((copy, removal)) =
+            ownership::first_removable(&self.others, Platform::current(), self.active.as_deref())
         {
             let copy = copy.clone();
+            let active = self.active.clone();
             let runs_only = if self.system_job {
                 "the machine client for all users".to_owned()
             } else {
-                self.installed.display().to_string()
+                self.active
+                    .as_deref()
+                    .unwrap_or(&self.installed)
+                    .display()
+                    .to_string()
             };
             view = view
                 .child(banner(
@@ -505,7 +532,10 @@ impl AppView {
                                 .small()
                                 .disabled(self.busy)
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.run(Operation::RemoveCopy(copy.clone()), cx)
+                                    this.run(
+                                        Operation::RemoveCopy(copy.clone(), active.clone()),
+                                        cx,
+                                    )
                                 })),
                         ),
                 );

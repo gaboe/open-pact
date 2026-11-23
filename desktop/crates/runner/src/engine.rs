@@ -186,6 +186,8 @@ pub async fn blocking<T: Send + 'static>(
 pub struct Opened {
     pub status: Report,
     pub others: Vec<OtherCopy>,
+    /// The executable that the user job records and still runs after the open: never removed.
+    pub active: Option<PathBuf>,
     pub warning: Option<String>,
 }
 
@@ -261,7 +263,17 @@ pub fn find_other_copies(runner: &Runner, installed: &Path, bundled: &Path) -> V
 }
 
 /// Runs the removal command of `copy` and gives what it printed. Only the user's click calls it.
-pub fn remove_copy(runner: &Runner, copy: &OtherCopy) -> Result<String, String> {
+pub fn remove_copy(
+    runner: &Runner,
+    copy: &OtherCopy,
+    active: Option<&Path>,
+) -> Result<String, String> {
+    if ownership::is_active(copy, active) {
+        return Err(format!(
+            "{} is the copy that the scheduled job runs, so it is not removed.",
+            copy.path.display()
+        ));
+    }
     let removal =
         ownership::removal(copy, crate::update::Platform::current()).ok_or_else(|| {
             "The machine client is managed by an administrator and is not removed here.".to_owned()
@@ -352,6 +364,7 @@ pub async fn inspect(
 ) -> Result<Opened, String> {
     let session = session(&installed)?;
     let mut warning = None;
+    let mut moved = false;
     let mut status = session.status(true).await.map_err(|e| format!("{e:#}"))?;
     let job = session.job_executable().ok().flatten();
     if rewrite_wanted(job.as_deref(), &installed, &status.schedule) {
@@ -363,6 +376,7 @@ pub async fn inspect(
         match session.schedule(true).await {
             Ok(()) => {
                 log.finish(place, Ok(format!("{was} -> {}", installed.display())));
+                moved = true;
                 status = session.status(true).await.map_err(|e| format!("{e:#}"))?;
             }
             Err(error) => {
@@ -381,6 +395,7 @@ pub async fn inspect(
     Ok(Opened {
         status,
         others,
+        active: job.filter(|_| !moved),
         warning,
     })
 }
@@ -554,6 +569,15 @@ mod tests {
     }
 
     #[test]
+    fn removing_the_active_user_job_copy_is_refused_before_any_command_runs() {
+        let active = Path::new("/opt/fictional/bin/open-pact-client");
+        let copy = OtherCopy::new(active.to_path_buf(), ownership::Source::Other);
+        let error = remove_copy(&Runner::default(), &copy, Some(active)).unwrap_err();
+        assert!(error.contains("/opt/fictional/bin/open-pact-client"));
+        assert!(error.contains("scheduled job runs"));
+    }
+
+    #[test]
     fn the_system_profile_is_the_profile_of_the_app_user_and_never_a_guess() {
         assert_eq!(
             system_profile(Some(PathBuf::from(r"C:\Users\Fictional"))),
@@ -573,12 +597,14 @@ mod tests {
         let opened = Opened {
             status,
             others: Vec::new(),
+            active: None,
             warning: None,
         };
         assert_eq!(opened.resume_join(), Some(true));
         let settled = Opened {
             status: samples::report_good(),
             others: Vec::new(),
+            active: None,
             warning: None,
         };
         assert_eq!(settled.resume_join(), None);
