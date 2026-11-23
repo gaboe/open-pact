@@ -85,6 +85,11 @@ impl Hooks {
         point
     }
 
+    /// Counts a pass through `name` from a path that cannot await.
+    pub fn bump(&self, name: &'static str) {
+        *self.counts.lock().expect("hooks").entry(name).or_default() += 1;
+    }
+
     /// How often a path reached `name`, armed or not.
     pub fn count(&self, name: &'static str) -> usize {
         self.counts
@@ -138,6 +143,9 @@ impl Hooks {
 
 #[cfg(not(test))]
 impl Hooks {
+    #[inline]
+    pub fn bump(&self, _name: &'static str) {}
+
     #[inline]
     pub async fn hit(&self, _name: &'static str) {}
 }
