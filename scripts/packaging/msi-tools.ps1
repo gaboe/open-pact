@@ -10,12 +10,12 @@ function Get-MsiDatabase {
 function Get-MsiTableNames {
     param([Parameter(Mandatory)]$Database)
     $view = $Database.OpenView('SELECT `Name` FROM `_Tables`')
-    $view.Execute()
+    [void]$view.Execute()
     $names = @()
     while ($null -ne ($record = $view.Fetch())) {
         $names += $record.StringData(1)
     }
-    $view.Close()
+    [void]$view.Close()
     return $names
 }
 
@@ -32,14 +32,14 @@ function Get-MsiRows {
         return , @()
     }
     $view = $Database.OpenView("SELECT $Columns FROM ``$Table``$Where")
-    $view.Execute()
+    [void]$view.Execute()
     $count = @($Columns -split ',').Count
     $rows = [System.Collections.Generic.List[object]]::new()
     while ($null -ne ($record = $view.Fetch())) {
         $values = @(for ($i = 1; $i -le $count; $i++) { $record.StringData($i) })
         $rows.Add($values)
     }
-    $view.Close()
+    [void]$view.Close()
     return , $rows.ToArray()
 }
 
