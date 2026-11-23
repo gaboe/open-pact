@@ -939,7 +939,7 @@ async fn push_with_retry(
             .as_ref()
             .and_then(|o| o.metrics())
             .map(|_| crate::metrics::now());
-        let pushed = send_push(&shared.http, &url, &note, &cp, &tree, old).await;
+        let pushed = send_push(&shared.http, &url, &note, &cp, &tree, old, &shared.hooks).await;
         let elapsed = started.map(|started| started.elapsed().as_secs_f64());
         let verifies = match &pushed {
             Ok(Pushed::Cosigned(lines)) => lines
@@ -1042,13 +1042,18 @@ async fn send_push(
     cp: &Checkpoint,
     tree: &Tree,
     old: u64,
+    hooks: &Arc<Hooks>,
 ) -> anyhow::Result<Pushed> {
     let old = if old > cp.size { 0 } else { old };
     let proof = if old == 0 || old == cp.size {
         vec![]
     } else {
-        let (tree, size) = (tree.clone(), cp.size);
-        tokio::task::spawn_blocking(move || consistency_proof(tree.prefix(size), old)).await??
+        let (tree, size, hooks) = (tree.clone(), cp.size, hooks.clone());
+        tokio::task::spawn_blocking(move || {
+            hooks.block("push_proof");
+            consistency_proof(tree.prefix(size), old)
+        })
+        .await??
     };
     let body = AddCheckpoint {
         old_size: old,

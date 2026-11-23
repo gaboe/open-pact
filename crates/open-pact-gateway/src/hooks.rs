@@ -3,7 +3,7 @@
 #[cfg(test)]
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicU8, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
 };
 
 pub struct Hooks {
@@ -11,6 +11,8 @@ pub struct Hooks {
     points: Mutex<std::collections::HashMap<&'static str, Arc<Point>>>,
     #[cfg(test)]
     counts: Mutex<std::collections::HashMap<&'static str, usize>>,
+    #[cfg(test)]
+    blocks: Mutex<std::collections::HashMap<&'static str, Arc<BlockPoint>>>,
     /// Database steps of a claim fail once this many stored-line reads happened (usize::MAX: never).
     #[cfg(test)]
     fault_after_reads: AtomicUsize,
@@ -28,6 +30,41 @@ pub struct Point {
     release: tokio::sync::Notify,
 }
 
+/// A pause for code that runs on a blocking thread: it waits on a std channel, never on an await,
+/// and never longer than `HOLD_LIMIT`, so a test that fails cannot hang the process.
+#[cfg(test)]
+pub struct BlockPoint {
+    armed: AtomicU8,
+    hits: AtomicUsize,
+    holding: AtomicBool,
+    reached: tokio::sync::Notify,
+    release_tx: std::sync::mpsc::Sender<()>,
+    release_rx: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+#[cfg(test)]
+pub const HOLD_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+#[cfg(test)]
+impl BlockPoint {
+    pub async fn reached(&self) {
+        self.reached.notified().await;
+    }
+
+    pub fn release(&self) {
+        let _ = self.release_tx.send(());
+    }
+
+    pub fn hits(&self) -> usize {
+        self.hits.load(Ordering::SeqCst)
+    }
+
+    /// True while a thread waits at this point.
+    pub fn holding(&self) -> bool {
+        self.holding.load(Ordering::SeqCst)
+    }
+}
+
 impl Default for Hooks {
     fn default() -> Self {
         Hooks {
@@ -35,6 +72,8 @@ impl Default for Hooks {
             points: Mutex::default(),
             #[cfg(test)]
             counts: Mutex::default(),
+            #[cfg(test)]
+            blocks: Mutex::default(),
             #[cfg(test)]
             fault_after_reads: AtomicUsize::new(usize::MAX),
         }
@@ -83,6 +122,46 @@ impl Hooks {
             .clone();
         point.armed.store(mode, Ordering::SeqCst);
         point
+    }
+
+    /// The next thread that reaches `name` through `block` waits for `release`.
+    pub fn arm_block(&self, name: &'static str) -> Arc<BlockPoint> {
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let point = Arc::new(BlockPoint {
+            armed: AtomicU8::new(1),
+            hits: AtomicUsize::new(0),
+            holding: AtomicBool::new(false),
+            reached: tokio::sync::Notify::new(),
+            release_tx,
+            release_rx: Mutex::new(release_rx),
+        });
+        self.blocks
+            .lock()
+            .expect("hooks")
+            .insert(name, point.clone());
+        point
+    }
+
+    /// A std blocking pause for a blocking-pool thread; not an await.
+    pub fn block(&self, name: &'static str) {
+        let point = self.blocks.lock().expect("hooks").get(name).cloned();
+        let Some(point) = point else { return };
+        if point
+            .armed
+            .compare_exchange(1, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        point.hits.fetch_add(1, Ordering::SeqCst);
+        point.holding.store(true, Ordering::SeqCst);
+        point.reached.notify_one();
+        let _ = point
+            .release_rx
+            .lock()
+            .expect("hooks")
+            .recv_timeout(HOLD_LIMIT);
+        point.holding.store(false, Ordering::SeqCst);
     }
 
     /// Counts a pass through `name` from a path that cannot await.
@@ -143,6 +222,9 @@ impl Hooks {
 
 #[cfg(not(test))]
 impl Hooks {
+    #[inline]
+    pub fn block(&self, _name: &'static str) {}
+
     #[inline]
     pub fn bump(&self, _name: &'static str) {}
 

@@ -1102,3 +1102,5 @@ async fn a_stalled_store_releases_the_owner() {
 }
 
 mod real;
+
+mod blocking;
