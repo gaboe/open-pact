@@ -33,7 +33,10 @@ async fn unknown_case(case: u8) {
             f.witnesses[0].gate();
         }
         2 => f.witnesses[0].set(Behaviour::DelayAnswer(Duration::from_millis(800), 500)),
-        _ => f.witnesses[0].set(Behaviour::Delay(Duration::from_secs(7))),
+        _ => {
+            f.witnesses[0].detach_decisions();
+            f.witnesses[0].set(Behaviour::Delay(Duration::from_secs(7)));
+        }
     }
     let (router, query) = (f.router.clone(), f.query.clone());
     let reader = tokio::spawn(async move { Fixture::get_with(router, Some(query)).await });
@@ -402,7 +405,7 @@ async fn a_failed_candidate_past_the_deadline_starts_no_read() {
         if case == 2 {
             until("w2 left its cooldown", Duration::from_secs(5), || {
                 let views = f.app.owners.views();
-                views[1].idle && !views[1].cooling && views[1].failures >= 1
+                views[1].idle && !views[1].cooling() && views[1].failures >= 1
             })
             .await;
         }

@@ -46,6 +46,8 @@ pub struct Inner {
     behaviour: Mutex<Behaviour>,
     received: Mutex<Vec<Received>>,
     arrivals: std::sync::atomic::AtomicUsize,
+    /// Decisions survive a client that hung up.
+    detached: std::sync::atomic::AtomicBool,
     /// A decision gate: while set, a push waits for a permit before it decides.
     gate: Mutex<Option<Arc<Notify>>>,
     /// Keys that sign the next pushes, one per push; the last one stays. Empty: the seed key.
@@ -84,6 +86,7 @@ impl FakeWitness {
             behaviour: Mutex::new(Behaviour::Healthy),
             received: Mutex::default(),
             arrivals: std::sync::atomic::AtomicUsize::new(0),
+            detached: std::sync::atomic::AtomicBool::new(false),
             gate: Mutex::default(),
             keys: Mutex::default(),
         });
@@ -113,6 +116,11 @@ impl FakeWitness {
     /// The next pushes are signed by these keys in turn; the last one signs every later push.
     pub fn script(&self, keys: Vec<(ed25519_dalek::SigningKey, WitnessKey)>) {
         *self.inner.keys.lock().unwrap() = keys.into();
+    }
+
+    /// A decision that began keeps running after its client timed out.
+    pub fn detach_decisions(&self) {
+        self.inner.detached.store(true, Ordering::SeqCst);
     }
 
     pub fn set(&self, behaviour: Behaviour) {
@@ -171,12 +179,15 @@ impl FakeWitness {
     }
 }
 
-/// The decision runs in its own task: a client that gave up does not cancel it, so a late
-/// decision is applied as a real witness applies one.
+/// Normally a client that gave up cancels the decision. With `detached` the decision runs in its
+/// own task and a late one is applied as a real witness applies it.
 async fn add(State(w): State<Arc<Inner>>, body: String) -> (StatusCode, String) {
-    tokio::spawn(decide(w, body))
-        .await
-        .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "decision failed".into()))
+    if w.detached.load(Ordering::SeqCst) {
+        return tokio::spawn(decide(w, body))
+            .await
+            .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "decision failed".into()));
+    }
+    decide(w, body).await
 }
 
 async fn decide(w: Arc<Inner>, body: String) -> (StatusCode, String) {

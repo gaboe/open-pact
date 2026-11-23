@@ -346,6 +346,7 @@ async fn served_bounds_the_work_after_the_last_read() {
         one.candidate_rows
     );
     assert_eq!((one.ed25519, one.p256), (10, 1));
+    assert_eq!(one.signatures, 1, "one log signature for one candidate");
     one.within(wait);
     // The leaves the test computed are the log's: the cached root at T matches.
     let tree = f.app.tree().await.unwrap();

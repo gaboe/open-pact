@@ -1159,7 +1159,7 @@ async fn a_stalled_store_releases_the_owner() {
     until(
         "the owner left its cooldown",
         Duration::from_secs(5),
-        || f.app.owners.views().iter().all(|v| !v.cooling),
+        || f.app.owners.views().iter().all(|v| !v.cooling()),
     )
     .await;
     let reply = f.get(Some(&f.query)).await;

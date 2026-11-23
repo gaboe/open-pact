@@ -132,9 +132,17 @@ where
 #[derive(Clone, Debug)]
 pub struct View {
     pub idle: bool,
-    pub cooling: bool,
+    /// When the owner may try again after a failure. A reader asks `cooling()` at its own time,
+    /// because an idle owner publishes nothing when the timer runs out.
+    pub not_before: Option<Instant>,
     pub tried: u64,
     pub failures: u32,
+}
+
+impl View {
+    pub fn cooling(&self) -> bool {
+        self.not_before.is_some_and(|t| t > Instant::now())
+    }
 }
 
 /// The answer to one Push job.
@@ -270,7 +278,7 @@ impl Owners {
                 let wake = Arc::new(Notify::new());
                 let (view_tx, view) = watch::channel(View {
                     idle: true,
-                    cooling: false,
+                    not_before: None,
                     tried: 0,
                     failures: 0,
                 });
@@ -515,10 +523,9 @@ impl Owner {
     }
 
     fn publish(&self, idle: bool) {
-        let cooling = self.not_before.is_some_and(|t| t > Instant::now());
         self.view.send_replace(View {
             idle,
-            cooling,
+            not_before: self.not_before,
             tried: self.tried,
             failures: self.failures,
         });
