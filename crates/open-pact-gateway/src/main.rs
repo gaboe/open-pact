@@ -2109,10 +2109,7 @@ mod tests {
                 "/ahead/add-checkpoint",
                 post(|| async { (StatusCode::CONFLICT, "0") }),
             )
-            .route(
-                "/empty/add-checkpoint",
-                post(|| async { StatusCode::OK }),
-            );
+            .route("/empty/add-checkpoint", post(|| async { StatusCode::OK }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, witness).await.unwrap() });
