@@ -92,27 +92,7 @@ impl Fixture {
     /// Enrols a device through the client. The gateway approves it at once.
     pub async fn enrol(&self, live: &Live) -> Device {
         let invitation = self.invitation(&live.url).await;
-        let device = Device {
-            home: tempfile::tempdir().unwrap(),
-        };
-        let code = open_pact_client::run(
-            Invocation {
-                home: Some(device.home.path().to_path_buf()),
-                insecure_dev: true,
-                command: Command::Join {
-                    invitation: Some(invitation),
-                    yes: true,
-                    software_key: true,
-                    no_wait: false,
-                    preview: false,
-                    json: false,
-                    folders: vec![],
-                    auto_send: None,
-                },
-            },
-            std::path::Path::new("open-pact-client"),
-        )
-        .await;
+        let (device, code) = join_with(invitation).await;
         let code = match code {
             Ok(code) => code,
             Err(e) => {
@@ -121,13 +101,7 @@ impl Fixture {
                     .iter()
                     .map(|r| (r.size, r.old_size, r.status))
                     .collect();
-                let rows: Vec<(i64, String)> = sqlx::query_as(
-                    "SELECT size, witness FROM log_cosignatures ORDER BY size, witness",
-                )
-                .fetch_all(&self.db)
-                .await
-                .unwrap();
-                panic!("the join failed: {e:#}; witness record {pushes:?}; rows {rows:?}")
+                panic!("the join failed: {e:#}; witness record {pushes:?}")
             }
         };
         assert_eq!(code, ExitCode::SUCCESS, "the join failed");
@@ -265,6 +239,32 @@ impl Live {
     async fn task_done(&mut self) -> Result<(), tokio::task::JoinError> {
         (&mut self.task).await
     }
+}
+
+/// The client's join with this invitation, in a new home.
+async fn join_with(invitation: String) -> (Device, anyhow::Result<ExitCode>) {
+    let device = Device {
+        home: tempfile::tempdir().unwrap(),
+    };
+    let code = open_pact_client::run(
+        Invocation {
+            home: Some(device.home.path().to_path_buf()),
+            insecure_dev: true,
+            command: Command::Join {
+                invitation: Some(invitation),
+                yes: true,
+                software_key: true,
+                no_wait: false,
+                preview: false,
+                json: false,
+                folders: vec![],
+                auto_send: None,
+            },
+        },
+        std::path::Path::new("open-pact-client"),
+    )
+    .await;
+    (device, code)
 }
 
 pub(super) fn spawn_claim(device: &Arc<Device>) -> tokio::task::JoinHandle<()> {
@@ -602,4 +602,102 @@ async fn a_same_size_follower_gets_its_own_key() {
     let read = f.get(Some(&encode(&new_policy))).await;
     assert_eq!(read.status, StatusCode::OK, "{}", read.body);
     f.assert_no_fork_line().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs TEST_DATABASE_URL and LOG_ORIGIN"]
+async fn a_base_tree_read_keeps_base_limits() {
+    let mut options = Options::new(1, 1);
+    options.real_client = true;
+    options.wait_ms = 1000;
+    let f = Fixture::build(options).await;
+    let live = f.live().await;
+    let devices = f.enrolled(&live, 1).await;
+    let before = f.size().await;
+    let hooks = f.app.owners.hooks();
+    let committed = hooks.arm("claim_committed");
+    let claim = spawn_claim(&devices[0]);
+    committed.reached().await;
+    // A real enrolment at a fresh size, held at the top of its checkpoint.
+    let entered = hooks.arm("checkpoint_entered");
+    let enrolment = {
+        let live_url = live.url.clone();
+        let invitation = f.invitation(&live_url).await;
+        tokio::spawn(async move { join_with(invitation).await.1.unwrap() })
+    };
+    entered.reached().await;
+    // Every tree SELECT now waits on the table lock.
+    let mut lock = f.db.begin().await.unwrap();
+    sqlx::query("LOCK TABLE log_entries IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+    let locked_at = Instant::now();
+    entered.release();
+    let blocked = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' \
+             AND query ILIKE '%log_entries%' AND query NOT ILIKE '%pg_stat_activity%'",
+        )
+        .fetch_one(&f.db)
+        .await
+        .unwrap()
+    };
+    // The lock transaction holds its own connection; wait on a second one.
+    let started = Instant::now();
+    while blocked().await == 0 {
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "no SELECT waits on the lock"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    committed.release();
+    let router = f.router.clone();
+    let proof = tokio::spawn(async move {
+        router
+            .oneshot(
+                Request::get(format!(
+                    "/v1/log/proof/consistency?from={}&to={}",
+                    before - 1,
+                    before
+                ))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+    });
+    let reader = f.get(Some(&f.query)).await;
+    // The lock is released 3 s after it was taken, inside the client's request limit.
+    tokio::time::sleep(Duration::from_secs(3).saturating_sub(locked_at.elapsed())).await;
+    lock.rollback().await.unwrap();
+    expect_unavailable(&reader, Duration::from_millis(1000 + 500 + 50));
+    let proof = proof.await.unwrap();
+    assert_eq!(proof.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(proof.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    let hashes: Vec<open_pact_core::LogHash> =
+        serde_json::from_value(value["proof"].clone()).unwrap();
+    let tree = f.app.tree().await.unwrap();
+    open_pact_core::verify_consistency(
+        before - 1,
+        before,
+        &open_pact_core::root(tree.prefix(before - 1)),
+        &open_pact_core::root(tree.prefix(before)),
+        &hashes,
+    )
+    .unwrap();
+    claim.await.unwrap();
+    assert!(devices[0].installed());
+    assert_eq!(
+        enrolment.await.unwrap(),
+        ExitCode::SUCCESS,
+        "the enrolment answered 200"
+    );
+    let after = f.get(Some(&f.query)).await;
+    assert_eq!(after.status, StatusCode::OK, "{}", after.body);
+    f.verifies(&after.body, &f.policy);
 }

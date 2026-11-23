@@ -544,6 +544,7 @@ impl App {
     /// witness lines stored for it, and what the witnesses gave. A new checkpoint goes to the
     /// witnesses before any client sees it. The handler counts the result with `count_served`.
     async fn checkpoint(&self, mode: Mode<'_>) -> Result<(Note, metrics::Served), Reply> {
+        self.owners.hooks().hit("checkpoint_entered").await;
         let (policy, claim) = match mode {
             Mode::Enroll => (self.manifest.body().log.as_ref(), false),
             Mode::Claim { policy } => (policy, true),
