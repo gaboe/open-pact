@@ -118,6 +118,7 @@ jobs:
               $warnings = @($out -split "\r?\n" | Where-Object { $_ -match '^Manifest Warning:' })
               $other = @($warnings | Where-Object { $_ -notmatch 'The schema header URL does not match the expected pattern' })
               if ($warnings.Count -eq 0 -or $other.Count -ne 0) { throw "winget validate warns: $($other -join '; ')" }
+              $global:LASTEXITCODE = 0
           } elseif ($code -ne 0) { throw "winget validate exits with $code." }
       - name: Upload the fixtures
         uses: actions/upload-artifact@v4
