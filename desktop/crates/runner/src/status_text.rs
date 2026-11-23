@@ -18,9 +18,10 @@ pub fn headline(status: &Report) -> Headline {
             other => format!("Last result {at}, {other}."),
         }
     });
-    // A VPN probe that failed is not something to fix on this device.
+    // The heading counts every row the screen lists under it. A failed VPN probe alone gets its own heading.
     let off_vpn = status.issues.iter().any(is_vpn_probe);
-    let count = status
+    let count = status.issues.len();
+    let fixes = status
         .issues
         .iter()
         .filter(|issue| !is_vpn_probe(issue))
@@ -34,15 +35,15 @@ pub fn headline(status: &Report) -> Headline {
         Verdict::ActionNeeded => Headline {
             tone: Tone::Warn,
             heading: match (count, off_vpn) {
-                (0, true) => "Not on the company VPN".into(),
-                (0, false) => "Action needed".into(),
-                (1, _) => "Fix 1 thing".into(),
+                (0, _) => "Action needed".into(),
+                (1, true) => "Not on the company VPN".into(),
+                (1, false) => "Fix 1 thing".into(),
                 (n, _) => format!("Fix {n} things"),
             },
             // What happened, what to do, then why the next check may not arrive.
             detail: [
                 last,
-                (count > 0 || !off_vpn)
+                (fixes > 0 || !off_vpn)
                     .then(|| "Fix the items below, then press Check now.".into()),
                 off_vpn.then(|| {
                     "Connect the company VPN, so that the next check reaches the company.".into()
@@ -577,14 +578,14 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_vpn_probe_is_not_counted_as_a_fix() {
+    fn the_heading_counts_every_listed_item_the_vpn_probe_too() {
         let mut shown = report(Verdict::ActionNeeded, 2);
         shown.issues.push(issue(
             "The signed VPN probe failed.",
             Some("open-pact-client check"),
         ));
         let both = headline(&shown);
-        assert_eq!(both.heading, "Fix 2 things");
+        assert_eq!(both.heading, "Fix 3 things");
         assert!(both.detail.contains("then press Check now."));
         assert!(
             both.detail
@@ -599,5 +600,10 @@ mod tests {
         let vpn = headline(&shown);
         assert_eq!(vpn.heading, "Not on the company VPN");
         assert!(!vpn.detail.contains("Check now"));
+        let sample = samples::report_needs_action();
+        assert_eq!(
+            headline(&sample).heading,
+            format!("Fix {} things", sample.issues.len())
+        );
     }
 }
