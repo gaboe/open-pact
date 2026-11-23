@@ -545,9 +545,10 @@ fn winget_line() -> Option<&'static str> {
 }
 
 /// The block that removes the SYSTEM task of `home` with Windows tools, for an elevated prompt. It
-/// has no `Remove-Item`. With the machine client at `machine`, its last lines run `schedule off`,
-/// which waits for the state lock and removes the state folder, and throw when it fails, so the
-/// reader never uninstalls the package after a failed cleanup. The client never runs these lines
+/// has no `Remove-Item`. With the machine client at `machine`, its last lines check that the file
+/// exists, run `schedule off`, which waits for the state lock and removes the state folder, and throw
+/// when the file is missing or the command fails, so the reader never uninstalls the package after a
+/// failed cleanup. The client never runs these lines
 /// itself.
 pub(crate) fn removal_block(home: &Path, task_id: &str, machine: Option<&Path>) -> String {
     let id = powershell_literal(task_id);
@@ -557,11 +558,14 @@ pub(crate) fn removal_block(home: &Path, task_id: &str, machine: Option<&Path>) 
         format!("\\{task_id}")
     };
     let path = powershell_literal(&task_path);
+    // The home goes in a single-quoted here-string, so an apostrophe in it needs no escape. The
+    // check for the file and the reset of the exit code keep a missing client from passing as success.
     let last = machine
         .map(|machine| {
             format!(
-                "\n  {}\n  if ($LASTEXITCODE -ne 0) {{ throw 'schedule off failed. Do not uninstall the package. Fix the error, then run this block again.' }}",
-                apply_command(home, "schedule off", machine)
+                "\n  $q = {}\n  if (-not (Test-Path -LiteralPath $q -PathType Leaf)) {{ throw 'The machine client is missing. Install the package, then run this block again.' }}\n  $clientHome = @'\n{}\n'@\n  $global:LASTEXITCODE = $null\n  & $q --home $clientHome schedule off\n  if ($LASTEXITCODE -ne 0) {{ throw 'schedule off failed. Do not uninstall the package. Fix the error, then run this block again.' }}",
+                powershell_literal(&machine.to_string_lossy()),
+                home.to_string_lossy()
             )
         })
         .unwrap_or_default();
@@ -1087,16 +1091,24 @@ mod tests {
         // With the machine client, the last line of the block removes the state through it.
         let last = block.find("schedule off").unwrap();
         assert!(query < last);
-        assert!(block.contains(&apply_command(home, "schedule off", machine)));
-        // A failed cleanup stops the block, so the next step never uninstalls the package.
-        let off = block
-            .find(&apply_command(home, "schedule off", machine))
+        // The client file must exist, the old exit code is cleared, and the home passes as data.
+        let exists = block
+            .find("if (-not (Test-Path -LiteralPath $q -PathType Leaf)) { throw 'The machine client is missing.")
             .unwrap();
+        let reset = block.find("$global:LASTEXITCODE = $null").unwrap();
+        assert!(query < exists && exists < reset);
+        assert!(block.contains("  $clientHome = @'\nC:\\Users\\it's a\\pact\n'@\n"));
+        let off = block
+            .find("\n  & $q --home $clientHome schedule off")
+            .unwrap();
+        assert!(reset < off);
+        assert!(
+            block.contains("$q = 'C:\\Program Files\\open-pact-client\\open-pact-client.exe'\n")
+        );
+        // A failed cleanup stops the block, so the next step never uninstalls the package.
         let exit = block.find("\n  if ($LASTEXITCODE -ne 0) { throw 'schedule off failed. Do not uninstall the package.").unwrap();
         assert!(off < exit && exit < block.find("\n}").unwrap());
         assert_eq!(block.matches("$LASTEXITCODE").count(), 2);
-        #[cfg(windows)]
-        assert!(block.contains(r"& 'C:\Program Files\open-pact-client\open-pact-client.exe' --home 'C:\Users\it''s a\pact' schedule off"));
         assert!(block.contains("Remove that folder after you removed every open-pact SYSTEM task"));
         assert!(block.contains("open-pact stays."));
         // Without it, the state folder stays for the next install to reset.
@@ -1117,6 +1129,8 @@ mod tests {
                 "/Delete /TN '{}' /F",
                 home.replace(quote, &format!("{quote}{quote}"))
             )));
+            // The home is data in a here-string, never text between quotes.
+            assert!(block.contains(&format!("@'\n{home}\n'@")));
             #[cfg(windows)]
             {
                 let command = machine_command(
@@ -1202,11 +1216,36 @@ mod doc_blocks {
     const HOME: &str = r"C:\Users\example\pact";
     const TASK: &str = "org.open-pact.report.0123abcd";
     const MACHINE: &str = r"C:\Program Files\open-pact-client\open-pact-client.exe";
-    /// The line that runs `schedule off` in the removal block with the machine client. Windows
-    /// builds print it, so the docs show this text. Other builds print a bare command name there.
-    const OFF_LINE: &str = r"& 'C:\Program Files\open-pact-client\open-pact-client.exe' --home 'C:\Users\example\pact' schedule off";
-    const NOT_WINDOWS_OFF_LINE: &str =
-        r"open-pact-client --home 'C:\Users\example\pact' schedule off";
+    /// The commands that start the SYSTEM job. The reader writes each value into a here-string, so an
+    /// apostrophe in a path needs no escape. The commands check the file and the exit code.
+    const START_COMMANDS: &str = r#"$q = Join-Path $env:ProgramW6432 'open-pact-client\open-pact-client.exe'
+$clientHome = @'
+<the absolute client home>
+'@
+$userHome = @'
+<the profile folder of the user>
+'@
+if (-not (Test-Path -LiteralPath $q -PathType Leaf)) { throw 'The machine client is missing. Install the package, then run this command again.' }
+$global:LASTEXITCODE = $null
+& $q --home $clientHome schedule on --system --user-home $userHome
+if ($LASTEXITCODE -ne 0) { throw 'schedule on failed. Fix the error, then run this command again.' }"#;
+    /// The commands that remove a task that the machine client owns.
+    const OFF_COMMANDS: &str = r#"$q = Join-Path $env:ProgramW6432 'open-pact-client\open-pact-client.exe'
+$clientHome = @'
+<the absolute client home>
+'@
+if (-not (Test-Path -LiteralPath $q -PathType Leaf)) { throw 'The machine client is missing. Install the package, then run this command again.' }
+$global:LASTEXITCODE = $null
+& $q --home $clientHome schedule off
+if ($LASTEXITCODE -ne 0) { throw 'schedule off failed. Do not uninstall the package. Fix the error, then run this command again.' }"#;
+    /// The commands that repair a package of the same version, and wait for the result.
+    const REPAIR_COMMANDS: &str = r#"$msi = @'
+<the full path of the verified MSI>
+'@
+$msiexec = Join-Path ([Environment]::SystemDirectory) 'msiexec.exe'
+$repair = Start-Process -FilePath $msiexec -ArgumentList ('/fa "' + $msi + '" /qn /norestart') -Wait -PassThru
+if ($repair.ExitCode -eq 3010) { Write-Output 'Restart Windows to finish the repair.' }
+elseif ($repair.ExitCode -ne 0) { throw ('The repair failed. Exit code: ' + $repair.ExitCode) }"#;
 
     /// The PowerShell script that lists the SYSTEM tasks that run one of `programs`. It selects by
     /// principal and by action, never by the name prefix alone, and it prints the arguments of
@@ -1252,11 +1291,23 @@ mod doc_blocks {
         ])
     }
 
-    /// The contents of each ````powershell` fence of `doc`, without the fence lines.
+    /// The contents of each ````powershell` fence of `doc`, without the fence lines. A fence inside an
+    /// HTML comment is not an instruction, so it does not count.
     fn fences(doc: &str) -> Vec<String> {
         let mut found = Vec::new();
         let mut current: Option<Vec<&str>> = None;
+        let mut comment = false;
         for line in doc.lines() {
+            if current.is_none() {
+                if comment {
+                    comment = !line.contains("-->");
+                    continue;
+                }
+                if line.contains("<!--") && !line.contains("-->") {
+                    comment = true;
+                    continue;
+                }
+            }
             match (&mut current, line.trim_end()) {
                 (None, "```powershell") => current = Some(Vec::new()),
                 (Some(lines), "```") => {
@@ -1270,8 +1321,9 @@ mod doc_blocks {
         found
     }
 
+    /// True when exactly one fence of `doc` is `script`.
     fn shows(doc: &str, script: &str) -> bool {
-        fences(doc).iter().any(|fence| fence == script)
+        fences(doc).iter().filter(|fence| *fence == script).count() == 1
     }
 
     fn install_text() -> String {
@@ -1287,15 +1339,9 @@ mod doc_blocks {
             .to_owned()
     }
 
-    /// The removal block with the machine client, in the form that Windows prints.
+    /// The removal block with the machine client.
     fn removal_with_machine() -> String {
-        let text = removal_text(Some(Path::new(MACHINE)));
-        if cfg!(windows) {
-            text
-        } else {
-            assert_eq!(text.matches(NOT_WINDOWS_OFF_LINE).count(), 1);
-            text.replace(NOT_WINDOWS_OFF_LINE, OFF_LINE)
-        }
+        removal_text(Some(Path::new(MACHINE)))
     }
 
     #[test]
@@ -1357,6 +1403,73 @@ mod doc_blocks {
         }
         assert!(shows(RELEASE_NOTES, &legacy_list()));
         assert!(shows(WINDOWS_INSTALL, &both_list()));
+        assert!(shows(CLIENT, &both_list()));
+    }
+
+    #[test]
+    fn the_start_and_repair_commands_are_the_same_in_every_guide() {
+        for (name, doc) in [
+            ("docs/client.md", CLIENT),
+            ("docs/windows-machine-install.md", WINDOWS_INSTALL),
+            ("docs/release-notes/v0.9.0.md", RELEASE_NOTES),
+        ] {
+            assert!(
+                shows(doc, START_COMMANDS),
+                "{name} must show the start commands"
+            );
+            assert!(
+                shows(doc, REPAIR_COMMANDS),
+                "{name} must show the repair commands"
+            );
+        }
+        for (name, doc) in [
+            ("docs/client.md", CLIENT),
+            ("docs/windows-machine-install.md", WINDOWS_INSTALL),
+        ] {
+            assert!(
+                shows(doc, OFF_COMMANDS),
+                "{name} must show the removal commands"
+            );
+        }
+    }
+
+    #[test]
+    fn no_value_goes_between_quotes_and_every_block_is_a_known_one() {
+        let known = [
+            install_text(),
+            removal_with_machine(),
+            removal_text(None),
+            legacy_list(),
+            both_list(),
+            START_COMMANDS.to_owned(),
+            OFF_COMMANDS.to_owned(),
+            REPAIR_COMMANDS.to_owned(),
+        ];
+        for (name, doc) in [
+            ("README.md", README),
+            ("docs/client.md", CLIENT),
+            ("docs/windows-machine-install.md", WINDOWS_INSTALL),
+            ("docs/release-notes/v0.9.0.md", RELEASE_NOTES),
+        ] {
+            for fence in fences(doc) {
+                // A value that the reader writes goes in a here-string, never between quotes.
+                assert!(
+                    !fence.contains("'<"),
+                    "{name} asks the reader to paste a value between quotes:\n{fence}"
+                );
+                if fence.contains("--system")
+                    || fence.contains("schedule off")
+                    || fence.contains("verify-blob")
+                    || fence.contains("schtasks")
+                    || fence.contains("msiexec")
+                {
+                    assert!(
+                        known.contains(&fence),
+                        "{name} shows a block that no function generates:\n{fence}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -1378,12 +1491,5 @@ mod doc_blocks {
                 }
             }
         }
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn the_windows_removal_block_ends_with_the_documented_line() {
-        let text = removal_block(Path::new(HOME), TASK, Some(Path::new(MACHINE)));
-        assert!(text.contains(&format!("\n  {OFF_LINE}\n  if ($LASTEXITCODE")));
     }
 }
