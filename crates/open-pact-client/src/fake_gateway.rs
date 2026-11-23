@@ -18,6 +18,8 @@ pub struct Reply {
     pub status: u16,
     pub body: String,
     pub headers: Vec<(String, String)>,
+    /// The fake sleeps this long before it writes the answer.
+    pub delay: std::time::Duration,
 }
 
 impl Reply {
@@ -26,7 +28,13 @@ impl Reply {
             status,
             body: body.into(),
             headers: Vec::new(),
+            delay: std::time::Duration::ZERO,
         }
+    }
+
+    pub fn delayed(mut self, delay: std::time::Duration) -> Self {
+        self.delay = delay;
+        self
     }
 
     pub fn header(mut self, name: &str, value: &str) -> Self {
@@ -97,10 +105,12 @@ impl FakeGateway {
                         status,
                         body,
                         headers,
+                        delay,
                     } = respond(&line, nth);
                     if status == 0 {
                         return;
                     }
+                    tokio::time::sleep(delay).await;
                     let extra: String = headers
                         .iter()
                         .map(|(k, v)| format!("{k}: {v}\r\n"))
