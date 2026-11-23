@@ -56,6 +56,10 @@ spec:
                 secretKeyRef:
                   name: {{ include "open-pact.secretName" . }}
                   key: {{ .Values.postgres.existingSecretKey }}
+          {{- with .Values.postgres.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           readinessProbe:
             exec:
               command: ["pg_isready", "-U", {{ .Values.postgres.user | quote }}]
