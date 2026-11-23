@@ -86,13 +86,19 @@ impl Witnesses {
             for _ in 0..2 {
                 let started = metrics.map(|_| crate::metrics::now());
                 let pushed = self.add_checkpoint(url, note, cp, leaves, old).await;
-                if let (Some(metrics), Some(started)) = (metrics, started) {
-                    metrics.witness_push(push_result(&pushed), started.elapsed().as_secs_f64());
+                let elapsed = started.map(|started| started.elapsed().as_secs_f64());
+                // Only a cosignature that verifies counts as cosigned.
+                let verified = match &pushed {
+                    Ok(Pushed::Cosigned(sigs)) => self.verified(url, cp, sigs),
+                    _ => vec![],
+                };
+                if let (Some(metrics), Some(elapsed)) = (metrics, elapsed) {
+                    metrics.witness_push(push_result(&pushed, !verified.is_empty()), elapsed);
                 }
                 match pushed {
-                    Ok(Pushed::Cosigned(sigs)) => {
+                    Ok(Pushed::Cosigned(_)) => {
                         cosigned.insert(url.clone(), cp.size);
-                        valid.extend(self.verified(url, cp, &sigs));
+                        valid.extend(verified);
                         break;
                     }
                     Ok(Pushed::Conflict(size)) if size <= cp.size && size != old => {
@@ -191,9 +197,10 @@ enum Pushed {
     Refused(String),
 }
 
-fn push_result(pushed: &anyhow::Result<Pushed>) -> Push {
+fn push_result(pushed: &anyhow::Result<Pushed>, verified: bool) -> Push {
     match pushed {
-        Ok(Pushed::Cosigned(_)) => Push::Cosigned,
+        Ok(Pushed::Cosigned(_)) if verified => Push::Cosigned,
+        Ok(Pushed::Cosigned(_)) => Push::Invalid,
         Ok(Pushed::Conflict(_)) => Push::Conflict,
         Ok(Pushed::Refused(_)) => Push::Refused,
         Err(e)
