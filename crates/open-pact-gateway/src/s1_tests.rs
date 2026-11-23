@@ -1104,3 +1104,83 @@ async fn a_stalled_store_releases_the_owner() {
 mod real;
 
 mod blocking;
+
+/// A device that is approved in the database, and a mine request it signs with a fresh nonce.
+async fn mine_request(router: &Router, db: &PgPool, manifest: &str) -> Value {
+    let key = open_pact_core::dev_key::generate();
+    let device_key = PublicKey::from(&key);
+    let pseudonym = Pseudonym::of(&device_key);
+    testdb::enrolled_device(db, pseudonym.as_str(), manifest).await;
+    let mut request = Request::post("/v1/nonce")
+        .header("content-type", "application/json")
+        .body(Body::from("null"))
+        .unwrap();
+    request
+        .extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([192, 0, 2, 7], 40000))));
+    let response = router.clone().oneshot(request).await.unwrap();
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let nonce: Value = serde_json::from_slice(&bytes).unwrap();
+    let nonce = nonce["nonce"].as_str().unwrap().to_string();
+    let statement =
+        open_pact_core::device_auth_statement(DeviceAuthPurpose::LogMine, &pseudonym, &nonce);
+    serde_json::to_value(MyEntriesRequest {
+        pseudonym,
+        nonce,
+        device_key,
+        signature: open_pact_core::Signature::sign(&key, &statement),
+    })
+    .unwrap()
+}
+
+#[tokio::test]
+#[ignore = "needs TEST_DATABASE_URL and LOG_ORIGIN"]
+async fn a_timed_out_witness_bounds_the_mine_route() {
+    let mut options = Options::new(1, 1);
+    options.wait_ms = 1000;
+    let f = Fixture::build(options).await;
+    f.witnesses[0].set(Behaviour::Delay(Duration::from_secs(6)));
+    f.append(1).await;
+    let manifest = f.app.manifest.hash().as_str().to_string();
+    let mut requests = vec![];
+    for _ in 0..8 {
+        requests.push(mine_request(&f.router, &f.db, &manifest).await);
+    }
+    let answers = futures_util::future::join_all(requests.into_iter().map(|request| {
+        let router = f.router.clone();
+        async move {
+            let mut request = Request::post("/v1/log/mine")
+                .header("content-type", "application/json")
+                .body(Body::from(request.to_string()))
+                .unwrap();
+            request
+                .extensions_mut()
+                .insert(ConnectInfo(SocketAddr::from(([192, 0, 2, 7], 40000))));
+            let response = router.oneshot(request).await.unwrap();
+            (
+                Instant::now(),
+                response.status(),
+                response
+                    .headers()
+                    .get(header::RETRY_AFTER)
+                    .map(|v| v.to_str().unwrap().to_string()),
+            )
+        }
+    }))
+    .await;
+    let entries = f.app.owners.hooks().stamps("served_entered");
+    assert_eq!(entries.len(), 8, "every mine entered the shared read path");
+    let earliest = entries.iter().min().unwrap();
+    for (at, status, retry) in answers {
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(retry.as_deref(), Some("5"));
+        // The wait, the one-candidate bound, the scheduling margin and the entry spread.
+        assert!(
+            at.duration_since(*earliest) <= Duration::from_millis(1000 + 500 + 50 + 100),
+            "a mine answered after {:?}",
+            at.duration_since(*earliest)
+        );
+    }
+}
