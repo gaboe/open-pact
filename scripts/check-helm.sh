@@ -90,7 +90,10 @@ grep -q 'port: 9090' <<< "$metrics_service" && grep -q 'targetPort: metrics' <<<
 public_service="$(awk 'BEGIN { RS = "\n---\n" } /\nkind: Service\n/ && /\n  name: t-gateway\n/ { print }' <<< "$with_metrics")"
 grep -q 'port: 80$' <<< "$public_service" || { echo "FAIL: found no public Service: $public_service"; exit 1; }
 ! grep -q -E '9090|metrics' <<< "$public_service" || { echo "FAIL: the public Service exposes the metrics port"; exit 1; }
-! document Ingress "$with_metrics" | grep -q -i -E 'metrics|9090' || { echo "FAIL: the Ingress reaches the metrics port"; exit 1; }
+ingress="$(document Ingress "$with_metrics")"
+tr -d ' \n' <<< "$ingress" | grep -q 'backend:service:name:t-gatewayport:name:http' \
+  || { echo "FAIL: no Ingress to the public Service: $ingress"; exit 1; }
+! grep -q -i -E 'metrics|9090' <<< "$ingress" || { echo "FAIL: the Ingress reaches the metrics port"; exit 1; }
 grep -q 'containerPort: 9090' <<< "$with_metrics"
 quoted="$(helm template t "$chart" "${metrics_on[@]}" --set-string metrics.tokenSecret.name=true \
   --set-string metrics.tokenSecret.key=false --set-string metrics.tlsSecret.name=null)"
@@ -107,11 +110,22 @@ grep -A5 'name: METRICS_TOKEN' <<< "$with_metrics" | tr -d ' \n' | grep -q 'secr
 grep -A3 'name: metrics-tls' <<< "$with_metrics" | grep -q 'secretName: "pact-metrics-tls"'
 grep -B1 -A2 'mountPath: /etc/open-pact/metrics-tls' <<< "$with_metrics" | grep -q 'readOnly: true' \
   || { echo "FAIL: the TLS Secret is not mounted read-only"; exit 1; }
+# The listener reads exactly the two mounted files, and the volume projects exactly those two keys.
+env_value() { grep -A1 "name: $1\$" <<< "$2" | tail -1 | sed 's/^ *value: //'; }
+[ "$(env_value METRICS_TLS_CERT "$with_metrics")" = /etc/open-pact/metrics-tls/tls.crt ] \
+  && [ "$(env_value METRICS_TLS_KEY "$with_metrics")" = /etc/open-pact/metrics-tls/tls.key ] \
+  || { echo "FAIL: the listener does not read the mounted TLS files"; exit 1; }
+volumes="$(sed -n '/^      volumes:$/,$p' <<< "$(document Deployment "$with_metrics")")"
+[ "$(tr -d ' \n' <<< "$volumes")" = 'volumes:-name:metrics-tlssecret:secretName:"pact-metrics-tls"items:-key:tls.crtpath:tls.crt-key:tls.keypath:tls.key' ] \
+  || { echo "FAIL: the TLS volume does not project exactly tls.crt and tls.key: $volumes"; exit 1; }
 ! grep -q 'kind: NetworkPolicy' <<< "$with_metrics" || { echo "FAIL: a NetworkPolicy without sources"; exit 1; }
 policy="$(helm template t "$chart" "${metrics_args[@]}" \
   --set 'metrics.networkPolicy.from[0].podSelector.matchLabels.app=prometheus' | awk 'BEGIN { RS = "\n---\n" } /kind: NetworkPolicy/')"
 [ "$(grep -c 'port: ' <<< "$policy")" = 2 ] && grep -q 'app: prometheus' <<< "$policy" \
   || { echo "FAIL: unexpected NetworkPolicy: $policy"; exit 1; }
+[ "$(sed -n 's/^ *- port: //p' <<< "$policy" | tr '\n' ' ')" = "8080 9090 " ] \
+  && tr -d ' \n' <<< "$policy" | grep -q 'from:.*ports:-port:9090' \
+  || { echo "FAIL: the metrics rule does not allow exactly port 9090 from the sources: $policy"; exit 1; }
 # The public rule has no "from": every source reaches 8080. Only the metrics rule is limited.
 [ "$(grep -c 'from:' <<< "$policy")" = 1 ] && grep -B1 -A3 'port: 8080' <<< "$policy" | head -1 | grep -q 'ports:' \
   || { echo "FAIL: the public port is limited: $policy"; exit 1; }
