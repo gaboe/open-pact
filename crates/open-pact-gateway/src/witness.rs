@@ -11,6 +11,8 @@ use open_pact_core::{
 use reqwest::StatusCode;
 use tokio::sync::Mutex;
 
+use crate::metrics::{Metrics, Push};
+
 pub struct Witnesses {
     urls: Vec<String>,
     keys: Vec<WitnessKey>,
@@ -74,6 +76,7 @@ impl Witnesses {
         note: &Note,
         cp: &Checkpoint,
         leaves: &[LogHash],
+        metrics: Option<&Metrics>,
     ) -> Vec<(String, NoteSignature)> {
         let mut cosigned = self.cosigned.lock().await;
         let mut valid = vec![];
@@ -81,7 +84,12 @@ impl Witnesses {
             let mut old = cosigned.get(url).copied().unwrap_or(0);
             // One retry: a 409 tells the size the witness holds.
             for _ in 0..2 {
-                match self.add_checkpoint(url, note, cp, leaves, old).await {
+                let start = Instant::now();
+                let pushed = self.add_checkpoint(url, note, cp, leaves, old).await;
+                if let Some(metrics) = metrics {
+                    metrics.witness_push(push_result(&pushed), start.elapsed().as_secs_f64());
+                }
+                match pushed {
                     Ok(Pushed::Cosigned(sigs)) => {
                         cosigned.insert(url.clone(), cp.size);
                         valid.extend(self.verified(url, cp, &sigs));
@@ -94,6 +102,13 @@ impl Witnesses {
                     Ok(Pushed::Conflict(size)) => {
                         eprintln!(
                             "witness {url} holds size {size}, this log has {}: it saw another history",
+                            cp.size
+                        );
+                        break;
+                    }
+                    Ok(Pushed::Refused(text)) => {
+                        eprintln!(
+                            "witness {url} did not cosign size {}: 422 Unprocessable Entity: {text}",
                             cp.size
                         );
                         break;
@@ -163,6 +178,7 @@ impl Witnesses {
                     .collect::<Result<_, _>>()?,
             )),
             StatusCode::CONFLICT => Ok(Pushed::Conflict(text.trim().parse()?)),
+            StatusCode::UNPROCESSABLE_ENTITY => Ok(Pushed::Refused(text.trim().to_string())),
             _ => anyhow::bail!("{status}: {}", text.trim()),
         }
     }
@@ -171,4 +187,21 @@ impl Witnesses {
 enum Pushed {
     Cosigned(Vec<NoteSignature>),
     Conflict(u64),
+    /// 422: the witness rejected the consistency proof.
+    Refused(String),
+}
+
+fn push_result(pushed: &anyhow::Result<Pushed>) -> Push {
+    match pushed {
+        Ok(Pushed::Cosigned(_)) => Push::Cosigned,
+        Ok(Pushed::Conflict(_)) => Push::Conflict,
+        Ok(Pushed::Refused(_)) => Push::Refused,
+        Err(e)
+            if e.downcast_ref::<reqwest::Error>()
+                .is_some_and(reqwest::Error::is_timeout) =>
+        {
+            Push::Timeout
+        }
+        Err(_) => Push::Error,
+    }
 }

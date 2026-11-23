@@ -11,11 +11,22 @@
 
 use sqlx::{PgConnection, PgPool};
 
+use crate::metrics::{Metrics, Site, timed};
+
 /// A new single-use nonce valid for 5 minutes, or `None` while `cap` unexpired nonces are
 /// outstanding.
-pub async fn issue(db: &PgPool, cap: i64) -> sqlx::Result<Option<String>> {
-    let mut tx = db.begin().await?;
-    let nonce = issue_in(&mut tx, cap).await?;
+pub async fn issue(
+    db: &PgPool,
+    cap: i64,
+    metrics: Option<&Metrics>,
+) -> sqlx::Result<Option<String>> {
+    let mut tx = timed(
+        metrics,
+        |m, secs| m.db_acquire(Site::NonceTx, secs),
+        db.begin(),
+    )
+    .await?;
+    let nonce = issue_in(&mut tx, cap, metrics).await?;
     tx.commit().await?;
     Ok(nonce)
 }
@@ -28,16 +39,23 @@ pub async fn issue(db: &PgPool, cap: i64) -> sqlx::Result<Option<String>> {
 /// statement a new snapshot, which the count needs. `synchronous_commit = off` ends the lock
 /// hold at the commit without waiting for a WAL flush; the commit is still visible to the next
 /// lock holder before the lock is released. `SET LOCAL` ends with the transaction.
-async fn issue_in(tx: &mut PgConnection, cap: i64) -> sqlx::Result<Option<String>> {
+async fn issue_in(
+    tx: &mut PgConnection,
+    cap: i64,
+    metrics: Option<&Metrics>,
+) -> sqlx::Result<Option<String>> {
     sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
         .execute(&mut *tx)
         .await?;
     sqlx::query("SET LOCAL synchronous_commit = off")
         .execute(&mut *tx)
         .await?;
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('open-pact nonces'))")
-        .execute(&mut *tx)
-        .await?;
+    timed(
+        metrics,
+        |m, secs| m.nonce_lock_wait(secs),
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext('open-pact nonces'))").execute(&mut *tx),
+    )
+    .await?;
     let nonce = hex::encode(rand::random::<[u8; 32]>());
     let inserted = sqlx::query(
         "INSERT INTO nonces (nonce, expires_at) SELECT $1, now() + interval '5 minutes' \
@@ -104,16 +122,16 @@ mod tests {
     async fn stops_at_the_cap_of_outstanding_nonces_and_expired_ones_do_not_count() {
         let db = testdb::fresh().await;
         for _ in 0..3 {
-            assert!(issue(&db, 3).await.unwrap().is_some());
+            assert!(issue(&db, 3, None).await.unwrap().is_some());
         }
-        assert_eq!(issue(&db, 3).await.unwrap(), None);
+        assert_eq!(issue(&db, 3, None).await.unwrap(), None);
         assert_eq!(count(&db).await, 3);
 
         sqlx::query("UPDATE nonces SET expires_at = now() - interval '1 second'")
             .execute(&db)
             .await
             .unwrap();
-        assert!(issue(&db, 3).await.unwrap().is_some());
+        assert!(issue(&db, 3, None).await.unwrap().is_some());
     }
 
     #[tokio::test]
@@ -121,10 +139,10 @@ mod tests {
     async fn an_issuer_waits_for_an_uncommitted_one_and_counts_its_nonce() {
         let db = testdb::fresh().await;
         let mut first = db.begin().await.unwrap();
-        assert!(issue_in(&mut first, 1).await.unwrap().is_some());
+        assert!(issue_in(&mut first, 1, None).await.unwrap().is_some());
         let second = tokio::spawn({
             let db = db.clone();
-            async move { issue(&db, 1).await.unwrap() }
+            async move { issue(&db, 1, None).await.unwrap() }
         });
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         assert!(!second.is_finished(), "the second issuer did not wait");
@@ -155,7 +173,7 @@ mod tests {
             .unwrap();
 
         let mut tx = conn.begin().await.unwrap();
-        let nonce = issue_in(&mut tx, 3).await.unwrap().unwrap();
+        let nonce = issue_in(&mut tx, 3, None).await.unwrap().unwrap();
         assert_eq!(show(&mut tx, "synchronous_commit").await, "off");
         assert_eq!(
             show(&mut tx, "transaction_isolation").await,
@@ -190,7 +208,7 @@ mod tests {
                 .execute(&mut *conn)
                 .await
                 .unwrap();
-            let nonce = issue(&db, 10).await.unwrap().unwrap();
+            let nonce = issue(&db, 10, None).await.unwrap().unwrap();
             let mut tx = conn.begin().await.unwrap();
             assert_eq!(consume_in(&mut tx, &nonce).await.unwrap(), Some(true));
             assert_eq!(
@@ -217,7 +235,7 @@ mod tests {
         assert_eq!(show(&mut conn, "synchronous_commit").await, "off");
         drop(conn);
         for round in 0..10 {
-            let nonce = issue(&db, 10).await.unwrap().unwrap();
+            let nonce = issue(&db, 10, None).await.unwrap().unwrap();
             let mut tx = db.begin().await.unwrap();
             assert_eq!(consume_in(&mut tx, &nonce).await.unwrap(), Some(true));
             let marker: String = sqlx::query_scalar("SELECT pg_current_wal_insert_lsn()::text")
@@ -243,11 +261,11 @@ mod tests {
     #[ignore = "needs TEST_DATABASE_URL"]
     async fn a_nonce_is_consumed_once_and_an_expired_one_is_reported_as_expired() {
         let db = testdb::fresh().await;
-        let nonce = issue(&db, 10).await.unwrap().unwrap();
+        let nonce = issue(&db, 10, None).await.unwrap().unwrap();
         assert_eq!(consume(&db, &nonce).await.unwrap(), Some(true));
         assert_eq!(consume(&db, &nonce).await.unwrap(), None);
 
-        let nonce = issue(&db, 10).await.unwrap().unwrap();
+        let nonce = issue(&db, 10, None).await.unwrap().unwrap();
         sqlx::query("UPDATE nonces SET expires_at = now() - interval '1 second'")
             .execute(&db)
             .await
@@ -263,7 +281,7 @@ mod tests {
         let issuers: Vec<_> = (0..40)
             .map(|_| {
                 let db = db.clone();
-                tokio::spawn(async move { issue(&db, 15).await.unwrap() })
+                tokio::spawn(async move { issue(&db, 15, None).await.unwrap() })
             })
             .collect();
         let mut issued = 0;
@@ -320,12 +338,12 @@ mod tests {
         let mut conn = pool.acquire().await.unwrap();
         assert_eq!(show(&mut conn, "synchronous_commit").await, "on");
         drop(conn);
-        issue(&pool, 100_000).await.unwrap().unwrap();
+        issue(&pool, 100_000, None).await.unwrap().unwrap();
         pool.close().await;
         let before = wal_syncs(url).await;
         let pool = probe_pool(url, &[]).await;
         for _ in 0..100 {
-            issue(&pool, 100_000).await.unwrap().unwrap();
+            issue(&pool, 100_000, None).await.unwrap().unwrap();
         }
         pool.close().await;
         let delta = wal_syncs(url).await - before;
@@ -348,11 +366,15 @@ mod tests {
         drop(conn);
         let mut issued = Vec::new();
         for _ in 0..5 {
-            issued.push(issue(&pool, 5).await.unwrap().unwrap());
+            issued.push(issue(&pool, 5, None).await.unwrap().unwrap());
         }
-        assert_eq!(issue(&pool, 5).await.unwrap(), None, "the cap of 5 held");
+        assert_eq!(
+            issue(&pool, 5, None).await.unwrap(),
+            None,
+            "the cap of 5 held"
+        );
         assert_eq!(consume(&pool, &issued[0]).await.unwrap(), Some(true));
-        let late = issue(&pool, 5).await.unwrap().unwrap();
+        let late = issue(&pool, 5, None).await.unwrap().unwrap();
         let mut lines = vec![format!("consumed={}", issued[0]), format!("late={late}")];
         lines.extend(issued[1..].iter().map(|n| format!("kept={n}")));
         std::fs::write(file, lines.join("\n")).unwrap();
@@ -402,7 +424,7 @@ mod tests {
     async fn deletes_only_expired_nonces() {
         let db = testdb::fresh().await;
         for _ in 0..4 {
-            issue(&db, 10).await.unwrap();
+            issue(&db, 10, None).await.unwrap();
         }
         sqlx::query(
             "UPDATE nonces SET expires_at = now() - interval '1 second' \

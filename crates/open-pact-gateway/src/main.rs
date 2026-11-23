@@ -8,6 +8,7 @@ mod grace;
 mod invitations;
 mod keys;
 mod manifests;
+mod metrics;
 mod nonces;
 mod ratelimit;
 mod results;
@@ -166,6 +167,8 @@ struct App {
     nonce_limiter: Arc<Limiter>,
     max_nonces: i64,
     kek: Arc<SealingKey>,
+    /// None unless metrics or the slow-request log are on.
+    observe: Option<Arc<metrics::Observation>>,
 }
 
 struct Enforced {
@@ -280,6 +283,10 @@ fn invalid_invitation() -> Reply {
 }
 
 impl App {
+    fn metrics(&self) -> Option<&metrics::Metrics> {
+        self.observe.as_deref()?.metrics()
+    }
+
     /// The committed log. Reads only rows the cache does not hold yet.
     async fn tree(&self) -> Result<Tree, Reply> {
         let known = self.log.cache.lock().expect("log cache").leaves.len();
@@ -292,6 +299,9 @@ impl App {
             cache
                 .leaves
                 .extend(new[already..].iter().map(Entry::leaf_hash));
+        }
+        if let Some(metrics) = self.metrics() {
+            metrics.log_size(cache.leaves.len() as u64);
         }
         Ok(Tree {
             leaves: cache.leaves.clone(),
@@ -320,7 +330,21 @@ impl App {
 
     /// The current checkpoint signed by the log key, with the witness cosignatures stored for it.
     /// A new checkpoint goes to the witnesses before any client sees it.
-    async fn checkpoint(&self) -> Result<Note, Reply> {
+    async fn checkpoint(&self, caller: metrics::Caller) -> Result<Note, Reply> {
+        let served = self.serve_checkpoint().await;
+        if let Some(metrics) = self.metrics() {
+            metrics.checkpoint_served(
+                caller,
+                match &served {
+                    Ok((_, served)) => *served,
+                    Err(_) => metrics::Served::Database,
+                },
+            );
+        }
+        served.map(|(note, _)| note)
+    }
+
+    async fn serve_checkpoint(&self) -> Result<(Note, metrics::Served), Reply> {
         let tree = self.tree().await?;
         let (checkpoint, mut note, fresh) = self.signed(&tree);
         let mut cosignatures = self.cosignatures(&checkpoint).await?;
@@ -333,8 +357,15 @@ impl App {
             self.log.witnesses.settled().await;
             cosignatures = self.cosignatures(&checkpoint).await?;
         }
+        let served = if self.log.witnesses.quorum == 0 {
+            metrics::Served::LogSigned
+        } else if cosignatures.len() < self.log.witnesses.quorum {
+            metrics::Served::NotYet
+        } else {
+            metrics::Served::Witnessed
+        };
         note.signatures.extend(cosignatures);
-        Ok(note)
+        Ok((note, served))
     }
 
     async fn cosignatures(&self, checkpoint: &Checkpoint) -> Result<Vec<NoteSignature>, Reply> {
@@ -371,7 +402,12 @@ impl App {
         let cosigned = self
             .log
             .witnesses
-            .cosign(note, checkpoint, tree.prefix(checkpoint.size))
+            .cosign(
+                note,
+                checkpoint,
+                tree.prefix(checkpoint.size),
+                self.metrics(),
+            )
             .await;
         for (name, sig) in cosigned {
             sqlx::query(
@@ -389,8 +425,28 @@ impl App {
         Ok(())
     }
 
+    /// A transaction on the pool, with the time it took to get a connection.
+    async fn begin(
+        &self,
+        site: metrics::Site,
+    ) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, Reply> {
+        metrics::timed(
+            self.metrics(),
+            |m, secs| m.db_acquire(site, secs),
+            self.db.begin(),
+        )
+        .await
+        .map_err(internal)
+    }
+
     async fn conn(&self) -> Result<sqlx::pool::PoolConnection<sqlx::Postgres>, Reply> {
-        self.db.acquire().await.map_err(internal)
+        metrics::timed(
+            self.metrics(),
+            |m, secs| m.db_acquire(metrics::Site::Conn, secs),
+            self.db.acquire(),
+        )
+        .await
+        .map_err(internal)
     }
 }
 
@@ -423,7 +479,7 @@ async fn log_key_text(Extension(app): Extension<App>) -> impl IntoResponse {
 }
 
 async fn log_checkpoint(Extension(app): Extension<App>) -> Result<impl IntoResponse, Reply> {
-    let note = app.checkpoint().await?;
+    let note = app.checkpoint(metrics::Caller::Checkpoint).await?;
     Ok((
         [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
         note.to_string(),
@@ -458,15 +514,25 @@ async fn nonce(
 ) -> Result<Json<Value>, Reply> {
     let now = Instant::now();
     if app.nonce_limiter.blocked(peer.ip(), now) {
+        if let Some(metrics) = app.metrics() {
+            metrics.nonce_issue(metrics::NonceResult::RateLimited);
+        }
         return Err(too_many(
             "too many nonces requested from this address; try again later",
         ));
     }
     app.nonce_limiter.record(peer.ip(), now);
-    match nonces::issue(&app.db, app.max_nonces)
+    let issued = nonces::issue(&app.db, app.max_nonces, app.metrics())
         .await
-        .map_err(internal)?
-    {
+        .map_err(internal)?;
+    if let Some(metrics) = app.metrics() {
+        metrics.nonce_issue(if issued.is_some() {
+            metrics::NonceResult::Issued
+        } else {
+            metrics::NonceResult::CapReached
+        });
+    }
+    match issued {
         Some(nonce) => Ok(Json(json!({ "nonce": nonce }))),
         None => Err((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -553,7 +619,7 @@ async fn try_enroll(
     let invitation = req.invitation_code.hash();
     let owner_key = serde_json::to_value(&signed.owner.key).map_err(internal)?;
 
-    let mut tx = app.db.begin().await.map_err(internal)?;
+    let mut tx = app.begin(metrics::Site::OtherTx).await?;
     translog::lock(&mut tx).await.map_err(internal)?;
     let existing: Option<(Value, String, String, Option<String>)> = sqlx::query_as(
         "SELECT owner_key, salt, state, invitation FROM devices WHERE pseudonym = $1 AND manifest_hash = $2 FOR UPDATE",
@@ -683,7 +749,7 @@ async fn try_enroll(
     .fetch_one(&app.db)
     .await
     .map_err(internal)?;
-    let checkpoint = app.checkpoint().await?;
+    let checkpoint = app.checkpoint(metrics::Caller::Enroll).await?;
     Ok(Json(json!({
         "status": "enrolled",
         "device": device,
@@ -753,7 +819,7 @@ async fn accept_manifest(
     }
     consume_nonce(&app, &req.nonce).await?;
     let owner_key = serde_json::to_value(&req.owner.key).map_err(internal)?;
-    let mut tx = app.db.begin().await.map_err(internal)?;
+    let mut tx = app.begin(metrics::Site::OtherTx).await?;
     translog::lock(&mut tx).await.map_err(internal)?;
     let bound = devices::lock_bound(&mut tx, &req.pseudonym, current.as_str())
         .await
@@ -815,7 +881,7 @@ async fn log_mine(
 ) -> Result<Json<MyEntries>, Reply> {
     let Json(request) = body.map_err(|_| device_denied())?;
     authenticate_device(&app, &request, DeviceAuthPurpose::LogMine).await?;
-    let checkpoint = app.checkpoint().await?;
+    let checkpoint = app.checkpoint(metrics::Caller::Mine).await?;
     let cp = Checkpoint::parse(&checkpoint.text).map_err(internal)?;
     let tree = app.tree().await?;
     let mut conn = app.conn().await?;
@@ -864,21 +930,27 @@ async fn claim(
                 .into(),
         ]));
     };
+    let mut clock = metrics::StageClock::new(app.metrics());
     let verified = verify_claim(&jws).map_err(|e| denied(vec![e.to_string()]))?;
     let claim = verified.claim();
+    clock.mark(metrics::Stage::Verify);
     consume_nonce(&app, &claim.nonce).await?;
+    clock.mark(metrics::Stage::Nonce);
     let foreign = match &claim.log_checkpoint {
         Some(cp) => foreign_checkpoint(&app.tree().await?, cp),
         None => None,
     };
+    clock.mark(metrics::Stage::Tree);
     let manifest_hash = claim.manifest.as_str();
-    let mut tx = app.db.begin().await.map_err(internal)?;
+    let mut tx = app.begin(metrics::Site::ClaimTx).await?;
+    clock.mark(metrics::Stage::Begin);
     let bound = devices::lock_bound(&mut tx, &claim.device, app.manifest.hash().as_str())
         .await
         .map_err(internal)?;
     let own = devices::lock(&mut tx, &claim.device, manifest_hash)
         .await
         .map_err(internal)?;
+    clock.mark(metrics::Stage::Lock);
     let enrolled = own.is_some();
     let state = bound.as_ref().filter(|_| enrolled).map(|b| b.state);
     let mut reasons: Vec<String> = match state {
@@ -933,6 +1005,7 @@ async fn claim(
         controls,
         first_failures,
     } = evaluate_under(&consented, &app.manifest, claim, now, &first_failures);
+    clock.mark(metrics::Stage::Evaluate);
     let oversharing = matches!(&decision, Decision::Deny { reasons } if reasons.iter().any(Reason::breaks_disclosure_contract));
     let strings = |rs: &[Reason]| rs.iter().map(ToString::to_string).collect::<Vec<_>>();
     let nearest_deadline = nearest_grace_deadline(&decision, now);
@@ -978,6 +1051,7 @@ async fn claim(
             Err(e) => reasons.push(e),
         }
     }
+    clock.mark(metrics::Stage::Certificate);
     if enrolled {
         grace::save(&mut tx, &claim.device, manifest_hash, &first_failures)
             .await
@@ -1018,7 +1092,9 @@ async fn claim(
     } else {
         String::new()
     };
+    clock.mark(metrics::Stage::Store);
     tx.commit().await.map_err(internal)?;
+    clock.mark(metrics::Stage::Commit);
     if enrolled
         && !oversharing
         && let Some(exporter) = &app.siem
@@ -1036,7 +1112,8 @@ async fn claim(
     if !reasons.is_empty() {
         return Err(denied(reasons));
     }
-    let checkpoint = app.checkpoint().await?;
+    let checkpoint = app.checkpoint(metrics::Caller::Claim).await?;
+    clock.mark(metrics::Stage::Checkpoint);
     Ok(Json(json!({
         "status": "accepted",
         "warnings": warnings,
@@ -1504,7 +1581,8 @@ async fn device_state_event(
 }
 
 fn router(app: App) -> Router {
-    Router::new()
+    let observation = app.observe.clone();
+    let router = Router::new()
         .route("/", get(index))
         .route("/healthz", get(healthz))
         .route("/v1/manifest", get(self::manifest))
@@ -1518,7 +1596,11 @@ fn router(app: App) -> Router {
         .route("/v1/log/mine", post(log_mine))
         .route("/v1/device/status", post(device_status))
         .route("/v1/device/accept", post(accept_manifest))
-        .layer(axum::middleware::from_fn_with_state(app, snapshot))
+        .layer(axum::middleware::from_fn_with_state(app, snapshot));
+    match observation {
+        Some(observation) => metrics::layer(router, observation),
+        None => router,
+    }
 }
 
 async fn snapshot(
@@ -1563,6 +1645,20 @@ async fn poll_manifest(app: App) {
 
 async fn serve(db: PgPool) -> anyhow::Result<()> {
     let addr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
+    // Checked first: a bad token or certificate refuses startup before any other work.
+    let observation = metrics::Settings::from_env()?;
+    let registry = observation
+        .listener
+        .is_some()
+        .then(|| Arc::new(metrics::Metrics::new()));
+    let observe = metrics::Observation::new(registry.clone(), observation.slow_ms);
+    if let (Some(listener), Some(registry)) = (observation.listener, registry) {
+        let bound = metrics::start(listener, registry, db.clone()).await?;
+        eprintln!("metrics on {bound}");
+    }
+    if let Some(ms) = observation.slow_ms {
+        eprintln!("logging requests slower than {ms} ms");
+    }
     let active = manifests::active(&db).await?;
     let (manifest_path, toml, manifest) = match &active {
         Some(row) => (
@@ -1659,6 +1755,7 @@ async fn serve(db: PgPool) -> anyhow::Result<()> {
         nonce_limiter: Arc::new(nonce_limiter),
         max_nonces,
         kek: Arc::new(kek),
+        observe,
     };
     tokio::spawn(enforce_retention(app.clone()));
     tokio::spawn(poll_manifest(app.clone()));
@@ -1863,6 +1960,7 @@ mod tests {
             nonce_limiter: Arc::new(Limiter::new(100, Duration::from_secs(60), 100)),
             max_nonces: 10000,
             kek: Arc::new(kek),
+            observe: None,
         }
     }
 
@@ -1993,6 +2091,44 @@ mod tests {
             "expected two witness pushes within four seconds, saw {}",
             pushes.load(std::sync::atomic::Ordering::Relaxed)
         );
+    }
+
+    /// Each add-checkpoint answer of a witness is counted under its own result.
+    #[tokio::test]
+    #[ignore = "needs TEST_DATABASE_URL and LOG_ORIGIN"]
+    async fn witness_pushes_are_counted_by_result() {
+        let witness = Router::new()
+            .route(
+                "/failing/add-checkpoint",
+                post(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+            )
+            .route(
+                "/refusing/add-checkpoint",
+                post(|| async { (StatusCode::UNPROCESSABLE_ENTITY, "bad proof") }),
+            )
+            .route(
+                "/ahead/add-checkpoint",
+                post(|| async { (StatusCode::CONFLICT, "0") }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, witness).await.unwrap() });
+        let metrics = Arc::new(metrics::Metrics::new());
+        let mut app = manifest_app(DEMO).await;
+        app.observe = metrics::Observation::new(Some(metrics.clone()), None);
+        let mut enforced = manifests::enforced(DEMO, &app.keys, None).unwrap();
+        let urls = ["failing", "refusing", "ahead"].map(|name| format!("{base}/{name}"));
+        Arc::get_mut(&mut enforced.log).unwrap().witnesses =
+            Witnesses::new(urls.to_vec(), enforced.manifest.body().log.as_ref()).unwrap();
+        app.enforced = Arc::new(enforced);
+        app.checkpoint(metrics::Caller::Checkpoint).await.unwrap();
+        server.abort();
+        let text = metrics.scrape(&app.db);
+        for result in ["error", "refused", "conflict"] {
+            let line = format!("openpact_witness_push_seconds_count{{result=\"{result}\"}} 1");
+            assert!(text.contains(&line), "{result} missing: {text}");
+        }
+        assert!(!text.contains("result=\"cosigned\""), "{text}");
     }
 
     /// The index of the one log entry of `kind`.
@@ -2219,6 +2355,7 @@ mod tests {
             nonce_limiter: Arc::new(Limiter::new(100, Duration::from_secs(60), 100)),
             max_nonces: 10000,
             kek: Arc::new(kek),
+            observe: None,
         };
         let router = router(app.clone());
         let (key, _) = enrolled_claim(&router, &db, &old).await;
@@ -2373,6 +2510,27 @@ mod tests {
         auto_approve: bool,
         siem: Option<siem::Exporter>,
     ) -> (Router, PgPool) {
+        test_app_observed(
+            toml,
+            enrol_limit,
+            nonce_limit,
+            max_connections,
+            auto_approve,
+            siem,
+            None,
+        )
+        .await
+    }
+
+    async fn test_app_observed(
+        toml: &str,
+        enrol_limit: u32,
+        nonce_limit: u32,
+        max_connections: u32,
+        auto_approve: bool,
+        siem: Option<siem::Exporter>,
+        observe: Option<Arc<metrics::Observation>>,
+    ) -> (Router, PgPool) {
         let db = testdb::fresh_with_max_connections(max_connections).await;
         let kek = SealingKey::new(&TEST_KEK);
         let keys = Keys::load_or_create(&db, &kek).await.unwrap();
@@ -2402,8 +2560,135 @@ mod tests {
             nonce_limiter: Arc::new(Limiter::new(nonce_limit, minute, 100)),
             max_nonces: 10_000,
             kek: Arc::new(kek),
+            observe,
         });
         (app, db)
+    }
+
+    async fn observed_app(nonce_limit: u32) -> (Router, PgPool, Arc<metrics::Metrics>) {
+        let metrics = Arc::new(metrics::Metrics::new());
+        let observation = metrics::Observation::new(Some(metrics.clone()), None);
+        let (app, db) =
+            test_app_observed(DEMO, 10, nonce_limit, 10, false, None, observation).await;
+        (app, db, metrics)
+    }
+
+    fn class(status: StatusCode) -> String {
+        format!("{}xx", status.as_u16() / 100)
+    }
+
+    #[tokio::test]
+    #[ignore = "needs TEST_DATABASE_URL and LOG_ORIGIN"]
+    async fn a_claim_and_a_reused_nonce_are_counted_by_status_class_and_stage() {
+        let (app, db, metrics) = observed_app(100).await;
+        let (key, claim) = enrolled_claim(&app, &db, DEMO).await;
+        let (first, body) = send_claim(&app, &key, &claim, None).await;
+        assert_eq!(first, StatusCode::OK, "{body}");
+        let (second, _) = send_claim(&app, &key, &claim, None).await;
+        assert_eq!(second, StatusCode::FORBIDDEN);
+        let text = metrics.scrape(&db);
+        let count = |route: &str, status: &str| {
+            format!(
+                "openpact_http_request_duration_seconds_count{{route=\"{route}\",method=\"POST\",status=\"{status}\"}}"
+            )
+        };
+        assert!(
+            text.contains(&format!("{} 1", count("/v1/claim", &class(first)))),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("{} 1", count("/v1/claim", &class(second)))),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("{} 1", count("/v1/nonce", "2xx"))),
+            "{text}"
+        );
+        for stage in [
+            "verify",
+            "nonce",
+            "begin",
+            "lock",
+            "evaluate",
+            "commit",
+            "checkpoint",
+        ] {
+            assert!(
+                text.contains(&format!(
+                    "openpact_claim_stage_seconds_count{{stage=\"{stage}\"}}"
+                )),
+                "stage {stage} missing: {text}"
+            );
+        }
+        // The demo manifest asks for a witness quorum and no witness is configured.
+        assert!(
+            text.contains(
+                "openpact_checkpoint_served_total{caller=\"claim\",result=\"not_yet\"} 1"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("openpact_nonce_issue_total{result=\"issued\"} 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("openpact_nonce_lock_wait_seconds_count 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("openpact_db_acquire_seconds_count{site=\"nonce_tx\"} 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("openpact_db_acquire_seconds_count{site=\"claim_tx\"} 1"),
+            "{text}"
+        );
+        assert!(text.contains("openpact_db_pool_max 10"), "{text}");
+        assert!(text.contains("openpact_log_size "), "{text}");
+        assert!(!text.contains("aborted_total{"), "{text}");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs TEST_DATABASE_URL and LOG_ORIGIN"]
+    async fn a_nonce_request_over_the_limit_is_counted_as_rate_limited() {
+        let (app, db, metrics) = observed_app(1).await;
+        assert_eq!(
+            post_json(&app, "/v1/nonce", &Value::Null).await.0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            post_json(&app, "/v1/nonce", &Value::Null).await.0,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        let text = metrics.scrape(&db);
+        assert!(
+            text.contains("openpact_nonce_issue_total{result=\"issued\"} 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("openpact_nonce_issue_total{result=\"rate_limited\"} 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("route=\"/v1/nonce\",method=\"POST\",status=\"4xx\"} 1"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "needs TEST_DATABASE_URL and LOG_ORIGIN"]
+    async fn the_public_router_has_no_metrics_path_and_without_observation_it_records_nothing() {
+        let (observed, _db, _metrics) = observed_app(100).await;
+        let (plain, _db) = test_app_with(DEMO, 10, 100).await;
+        for app in [&observed, &plain] {
+            let request = Request::get("/metrics").body(Body::empty()).unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+        assert_eq!(
+            post_json(&plain, "/v1/nonce", &Value::Null).await.0,
+            StatusCode::OK
+        );
     }
 
     async fn post_json(app: &Router, path: &str, body: &Value) -> (StatusCode, Value) {
