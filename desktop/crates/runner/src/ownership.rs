@@ -157,7 +157,7 @@ pub fn removal(copy: &OtherCopy, platform: Platform) -> Option<Removal> {
         Source::Other => {
             let file = copy.path.to_string_lossy();
             let line = if platform == Platform::Windows {
-                format!("Remove-Item -LiteralPath '{}'", file.replace('\'', "''"))
+                format!("Remove-Item -LiteralPath {}", powershell_literal(&file))
             } else {
                 format!("rm {}", shell_quote(&file))
             };
@@ -424,6 +424,19 @@ mod tests {
         assert_eq!(
             windows.shown,
             r"Remove-Item -LiteralPath 'C:\Fictional''s\open-pact-client.exe'"
+        );
+        // A typographic quote in the file name cannot end the literal early either.
+        let typographic = removal(
+            &copy(
+                "C:\\Fictional\u{2019}s\\open-pact-client.exe",
+                Source::Other,
+            ),
+            Platform::Windows,
+        )
+        .unwrap();
+        assert_eq!(
+            typographic.shown,
+            "Remove-Item -LiteralPath 'C:\\Fictional\u{2019}\u{2019}s\\open-pact-client.exe'"
         );
     }
 

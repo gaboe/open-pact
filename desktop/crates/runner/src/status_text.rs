@@ -426,6 +426,16 @@ pub fn install_button_shown(schedule: &ScheduleEvidence, job_text: &str) -> bool
     }
 }
 
+/// The button of an issue. While a SYSTEM choice is pending, the issue about the user job that
+/// runs now keeps its text and loses its Install job button: the user install would drop the
+/// choice. The pending issue and the Scheduled job row carry the SYSTEM action.
+pub fn issue_action_shown(
+    schedule: &ScheduleEvidence,
+    action: Option<IssueAction>,
+) -> Option<IssueAction> {
+    action.filter(|action| !(schedule.system_job_pending && *action == IssueAction::InstallJob))
+}
+
 /// The fixes of the schedule that no issue shows already, as (label, text). The client puts the
 /// same block in an issue and in the schedule, and the screen shows each block once.
 pub fn schedule_fix_rows<'a>(
@@ -496,6 +506,33 @@ mod tests {
         assert_eq!(job_install(&schedule), Blocked);
         assert!(!install_button_shown(&schedule, ""));
         assert!(enable_blocked(&schedule));
+    }
+
+    #[test]
+    fn a_pending_system_choice_leaves_no_user_install_button_on_the_job_issue() {
+        use MachineState::*;
+        for machine in [Some(Current), Some(Missing)] {
+            let schedule = system_schedule(true, machine, Some(JobStatus::Missing));
+            assert_eq!(
+                issue_action_shown(&schedule, Some(IssueAction::InstallJob)),
+                None,
+                "{machine:?}"
+            );
+            // The row keeps the one SYSTEM action, only with a usable machine client.
+            assert_eq!(
+                install_button_shown(&schedule, "missing; OS checked now"),
+                machine == Some(Current)
+            );
+            assert_eq!(
+                issue_action_shown(&schedule, Some(IssueAction::Retry)),
+                Some(IssueAction::Retry)
+            );
+        }
+        let user = system_schedule(false, None, None);
+        assert_eq!(
+            issue_action_shown(&user, Some(IssueAction::InstallJob)),
+            Some(IssueAction::InstallJob)
+        );
     }
 
     #[test]
