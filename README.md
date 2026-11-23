@@ -428,7 +428,7 @@ All checks are read-only. macOS and Linux checks run as the device owner. Window
 | `preboot_auth` | FileVault on means `user_secret`, off means `none` | No encryption means `none`; an unverified LUKS unlock method means `unknown` |
 | `antimalware_active` | XProtect bundle and Remediator executable present, scan service registered and enabled | Existing ClamAV service check |
 | `antimalware_signature_age_days` | Whole days since the receipt for the installed XProtect definitions version | Age of the daily ClamAV CVD or CLD embedded timestamp in standard database directories |
-| `antimalware_full_scan_age_days` | `@1`: `n/a`. `@2`: whole days since the newest XProtect Remediator run that was not canceled, not a full-device scan | `unknown`, no reliable clamscan full-scan record |
+| `antimalware_full_scan_age_days` | `@1`: `n/a`. `@2`: whole days since the last XProtect Remediator scan that was not canceled, not a full-device scan | `unknown`, no reliable clamscan full-scan record |
 | `web_protection` | Chrome, Edge, Brave and Firefox profiles and readable managed policies. Safari is not checked because its settings need Full Disk Access. | `unknown` |
 | `log_oldest_record_days` | `n/a`, unified log retention is size-based | Age of the oldest readable system journal entry; permission warnings mean `unknown` |
 | `process_audit`, `powershell_logging` | `n/a` | `n/a` |

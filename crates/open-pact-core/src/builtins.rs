@@ -220,10 +220,10 @@ const BUILTIN_ABOUT: &[(&str, u32, &str)] = &[
         "antimalware_full_scan_age_days",
         2,
         "A full scan can find malware that real-time protection missed. On macOS \
-            the client reports the whole days since the newest XProtect Remediator \
-            run in the unified log that was not only canceled. That run is not a \
+            the client reports the whole days since the last XProtect Remediator \
+            scan in the unified log that was not canceled. That scan is not a \
             full-device scan. The log keeps these events for a short time, so an old \
-            run reads unknown. On Windows and Linux the result is the same as version 1.",
+            scan reads unknown. On Windows and Linux the result is the same as version 1.",
     ),
     (
         "web_protection",
