@@ -192,7 +192,7 @@ const MEASURES: &[(&str, &str)] = &[
     ),
     (
         "antimalware_full_scan_age_days",
-        "The last full malware scan was {} days ago",
+        "The last malware scan was {} days ago",
     ),
     ("log_oldest_record_days", "The event log covers {} days"),
 ];
@@ -213,7 +213,7 @@ const CONTROL_NAMES: &[(&str, &str)] = &[
     ("antimalware_active", "Malware protection"),
     ("preboot_auth", "Boot-time sign-in"),
     ("antimalware_signature_age_days", "Malware signature age"),
-    ("antimalware_full_scan_age_days", "Full malware scan age"),
+    ("antimalware_full_scan_age_days", "Malware scan age"),
     ("web_protection", "Web protection"),
     ("log_oldest_record_days", "Event log history"),
     ("process_audit", "Process auditing"),
