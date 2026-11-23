@@ -69,7 +69,7 @@ On Windows, `vpn/current` is a text pointer, not a directory. A pair reader read
 
 Windows replaces the flat copies sequentially, so they can briefly differ. The selected pair stays complete because readers use `vpn/current` and `vpn/<generation>/`. If a program holds a flat copy open, replacement can fail. The client keeps the new generation selected, marks the flat copies stale, and reports the locked file. Close the program that holds it and run `check` again. Every later start retries the flat-copy refresh. Startup recovery tries the VPN lock without waiting. If another process holds it, recovery warns and continues. `schedule` and `log` never wait for the VPN lock. `install` and `check` take the lock. New Windows files and directories inherit the home ACL. The client does not preserve an explicit ACL from a replaced file.
 
-No scheduled job runs until the signed manifest defines `[schedule]` and you run `open-pact-client schedule on` or answer yes in the join wizard. Before you delete the binary or client home, remove the schedule. For a job that runs as you, run `open-pact-client schedule off`. For a Windows SYSTEM job, follow [Stop the scheduled claims](docs/client.md#stop-the-scheduled-claims-and-remove-the-client). To remove the device key, run `open-pact-client --home <home> delete-device-key` before you delete the home.
+No scheduled job runs until the signed manifest defines `[schedule]` and you run `open-pact-client schedule on` or answer yes in the join wizard. Before you delete the binary or client home, remove the schedule. For a job that runs as you, run `open-pact-client schedule off`. For a Windows SYSTEM job, follow [Stop the scheduled claims](docs/client.md#stop-the-scheduled-claims-and-remove-the-client). To remove the device key, run `open-pact-client --home <home> delete-device-key` before you delete the home or uninstall the package.
 
 ## Install the client
 
@@ -588,7 +588,7 @@ The home stores only the TPM key name in `device-tpm.key`. Keep this marker with
 TPM claims request `L1`, like Secure Enclave claims. The gateway verifies them as `L0`
 until hardware attestation is supported. Real TPM signing is unverified on hosted CI.
 See [platform support](docs/platform-support.md#key-protection) for the test limits.
-For full uninstall, remove the schedule first (for a Windows SYSTEM job, follow [Stop the scheduled claims](docs/client.md#stop-the-scheduled-claims-and-remove-the-client)). Run `open-pact-client --home <home> delete-device-key` before deleting the home or binary.
+For full uninstall, keep this order. First remove the schedule. For a Windows SYSTEM job, remove the task of each home only, as [Stop the scheduled claims](docs/client.md#stop-the-scheduled-claims-and-remove-the-client) describes, and do not uninstall the package yet. Then run `open-pact-client --home <home> delete-device-key` for each home. On Windows, run it with the machine client's full path, from the account that joined the device. Uninstall the package and delete the home only after that.
 Schedule removal keeps the device key. Key deletion removes the persisted CNG key, its marker, and any software device key file.
 On Windows, run key deletion as the user who created the key or as SYSTEM. A different administrator has no explicit key access.
 Windows CI checks creator deletion after removal of administrator membership, SYSTEM deletion, and refusal for a different administrator through the software CNG provider.
