@@ -22,6 +22,7 @@ try:
         (root / "docs").mkdir()
         (root / "docs/controls.md").write_text("fictional build context\n")
         (root / "PAPER.md").touch()
+        (root / "README.md").touch()
         (root / "Cargo.toml").write_text('[workspace]\nmembers = ["crates/open-pact-client"]\nresolver = "2"\n')
         (root / "Cargo.lock").write_text('version = 4\n\n[[package]]\nname = "open-pact-client"\nversion = "0.0.0"\n')
         (source.parent / "lib.rs").write_text("pub fn fixture() {}\n")
