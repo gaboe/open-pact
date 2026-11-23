@@ -249,7 +249,7 @@ Migration 0013 adds two partial indexes on `log_entries`. The gateway runs it wh
 
 A plain Helm upgrade is supported when the log has about 200,000 entries or fewer and no long transaction holds a lock on `log_entries`. The gate in [`scripts/log-lookup-migration-gate.ts`](../scripts/log-lookup-migration-gate.ts) tests that size with appends running. It fails when the migration transaction takes 2 seconds or more, or when startup takes more than 5 seconds. The chart's liveness probe starts 10 seconds after the container starts. With the Kubernetes default period and failure threshold, the kubelet restarts a container that still does not answer about 30 seconds after it starts. A restart stops the build and rolls it back, so the next start builds again from the beginning.
 
-For a larger log, or a database that writers keep busy, run the migration before the probes apply. A one-off Job runs the new image with the `status` command. Its environment and Secret references match the gateway container in the chart, so it reaches the same database. Save this manifest as `migrate-job.yaml`. Replace each `<...>` value with the value from the Deployment (`kubectl get deployment pact-gateway -o yaml`):
+For a larger log, or a database that writers keep busy, run the migration before the probes apply. A one-off Job runs the new image with the `status` command. Its environment and Secret references match the gateway container in the chart, so it reaches the same database. Save this manifest as `migrate-job.yaml`. Replace each `<...>` value with the value from the Deployment (`kubectl get deployment <release>-gateway -o yaml`):
 
 ```yaml
 apiVersion: batch/v1
@@ -261,6 +261,8 @@ spec:
   template:
     spec:
       restartPolicy: Never
+      # Copy imagePullSecrets from the Deployment when the chart sets them.
+      imagePullSecrets: []
       containers:
         - name: migrate
           image: registry.example.com/open-pact-gateway:<new-tag>
@@ -301,8 +303,8 @@ spec:
 Then run these commands. The Job reaches `Complete` only when its container exits 0:
 
 ```sh
-kubectl scale deployment/pact-gateway --replicas=0
-kubectl wait --for=delete pod -l app=pact-gateway --timeout=10m
+kubectl scale deployment/<release>-gateway --replicas=0
+kubectl wait --for=delete pod -l app=<release>-gateway --timeout=10m
 kubectl apply -f migrate-job.yaml
 kubectl wait --for=condition=complete job/<release>-migrate --timeout=10m
 kubectl logs job/<release>-migrate
@@ -317,18 +319,20 @@ To go back to the gateway from before 0013, run these steps in order. Each new-i
 2. Scale the gateway to zero and wait for its pod to stop:
 
    ```sh
-   kubectl scale deployment/pact-gateway --replicas=0
-   kubectl wait --for=delete pod -l app=pact-gateway --timeout=10m
+   kubectl scale deployment/<release>-gateway --replicas=0
+   kubectl wait --for=delete pod -l app=<release>-gateway --timeout=10m
    ```
 
 3. Check that no gateway pod and no active migration Job remain:
 
    ```sh
-   kubectl get pods -l app=pact-gateway
+   kubectl get pods -l app=<release>-gateway
    kubectl get jobs
    ```
 
    The first command prints no pod. The second prints no `<release>-migrate` Job that is still active.
+
+   Also stop or drain every run that can still start a new-image gateway command, such as a CI job already in progress or a standalone pod, and check that none of them runs. Step 4 must start only after the last of them has stopped.
 
 4. Run this block against the gateway database with `psql`. It runs in one transaction, so a failure changes nothing:
 
