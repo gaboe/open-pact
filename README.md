@@ -421,7 +421,7 @@ All checks are read-only. macOS and Linux checks run as the device owner. Window
 | --- | --- | --- |
 | `os_auto_updates` | `AutomaticCheckEnabled`, `ConfigDataInstall` and `CriticalUpdateInstall` all enabled | Enabled and active apt or dnf timer with automatic installation configured |
 | `antimalware_realtime` | XProtect present, registered and enabled | Running `clamonacc` process |
-| `antimalware_active_threats` | `@1`: `n/a`. `@2`: `0` when every XProtect Remediator event of the last 7 days is clean, else `unknown` | `unknown` |
+| `antimalware_active_threats` | `@1`: `n/a`. `@2`: `0` when there is at least one XProtect Remediator event in the last 7 days and every event is clean; an empty log or an unreadable part is `unknown` | `unknown` |
 | `work_account` | Current account membership in `admin` | Current account membership in `sudo` or `wheel` |
 | `uptime_days` | Whole days since `kern.boottime` | Whole days from `/proc/uptime` |
 | `password_min_length` | Largest length rule in `pwpolicy getaccountpolicies`; `none` without a rule | `minlen` from `pwquality.conf` and its drop-in files; `none` without one |
