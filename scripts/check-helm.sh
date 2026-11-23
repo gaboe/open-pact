@@ -81,3 +81,5 @@ grep -q 'storage: 20Gi' <<< "$fresh" || { echo "FAIL: a fresh install does not g
 compact="$(tr -d ' \n' <<< "$fresh")"
 grep -q 'limits:memory:512Mirequests:cpu:100mmemory:256Mi' <<< "$compact" || { echo "FAIL: Postgres resources are not the default"; exit 1; }
 echo "a fresh install gets a 20Gi Postgres volume and the default Postgres resources"
+grep -A1 'name: NONCE_MAX_PER_WINDOW' <<< "$plain" | grep -q '"3000"' || { echo "FAIL: NONCE_MAX_PER_WINDOW is not 3000"; exit 1; }
+echo "a fresh render sets NONCE_MAX_PER_WINDOW to 3000"

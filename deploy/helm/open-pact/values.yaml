@@ -81,9 +81,14 @@ publicUrl: ""
 
 nonces:
   # Per source address and window. Behind the ingress every device shares one address, so size it for the fleet.
-  maxPerWindow: 600
+  # Sizing: at least 2 x devices that run in one minute x 1.5, counted for all devices behind one address.
+  # 3000 serves 1000 devices in one minute. Binary default is 600.
+  maxPerWindow: 3000
   windowSecs: 60
   # POST /v1/nonce answers 503 while this many unexpired nonces exist.
+  # Sizing: at least the unused nonces of 5 minutes. A run uses its nonces within seconds, so the steady
+  # count is small, but a burst of failing clients can fill it. maxPerWindow 3000 allows 15,000 requests
+  # in the 5-minute nonce life, so this limit can answer 503 first.
   maxOutstanding: 10000
 
 # Approve enrolled devices without IT. Off: IT runs `open-pact-gateway devices approve`.
