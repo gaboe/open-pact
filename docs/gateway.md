@@ -35,6 +35,8 @@ Set `image.repository` and `image.tag` to the gateway image that you built or ap
 
 The chart refuses to render without a KEK Secret name and a password for its bundled PostgreSQL. To enforce your own manifest, provide the TOML file with `--set-file manifest=manifest.toml`. Helm puts it in a ConfigMap, mounts it at `/etc/open-pact/custom/manifest.toml`, sets `MANIFEST_PATH`, and restarts the gateway when the file changes.
 
+Size the nonce limits for the fleet. `nonces.maxPerWindow` (chart default 3000; binary default 600) sets `NONCE_MAX_PER_WINDOW`. It counts per gateway process and per source address, so behind an ingress all devices share it: at least 2 x devices that run in one window (`nonces.windowSecs` sets `NONCE_WINDOW_SECS`, chart default 60 s) x 1.5. Count the peak runs in one window. Native IPv6 addresses in one /64 share one count. `nonces.maxOutstanding` (default 10000) sets `NONCE_MAX_OUTSTANDING`. It counts unexpired nonce rows in PostgreSQL, shared by every replica on the same database, and needs at least the unused nonces of 5 minutes. A run uses its nonces within seconds, but a burst of failing clients can fill it. At 3000 a minute, 15,000 requests fit in the 5-minute nonce life, so `maxOutstanding` can answer 503 first. A direct deployment sets these three variables itself. Docker Compose sets none of them, so it uses the binary defaults 600, 60 and 10000.
+
 To run the local demo, use Docker Compose:
 
 ```sh
@@ -42,8 +44,6 @@ docker compose up -d --build
 ```
 
 Compose uses `DEV_INSECURE_KEK=1`, a local HTTP URL, and a public demo witness seed. Use it only for a local demo. Do not expose that gateway or reuse its keys. `GATEWAY_PORT=8091 docker compose up -d` changes the host port.
-
-Size the nonce limits for the fleet. `nonces.maxPerWindow` (chart default 3000; binary default 600) counts per source address, so behind an ingress all devices share it: at least 2 x devices that run in one minute x 1.5. `nonces.maxOutstanding` (default 10000) needs at least the unused nonces of 5 minutes. A run uses its nonces within seconds, but a burst of failing clients can fill it. At 3000 a minute, 15,000 requests fit in the 5-minute nonce life, so `maxOutstanding` can answer 503 first.
 
 ## Sign and roll out a manifest
 

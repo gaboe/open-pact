@@ -81,7 +81,7 @@ publicUrl: ""
 
 nonces:
   # Per source address and window. Behind the ingress every device shares one address, so size it for the fleet.
-  # Sizing: at least 2 x devices that run in one minute x 1.5, counted for all devices behind one address.
+  # Sizing: at least 2 x devices that run in one window x 1.5, counted per gateway process and per source address; all devices behind one address count together, and native IPv6 addresses in one /64 share one count.
   # 3000 serves 1000 devices in one minute. Binary default is 600.
   maxPerWindow: 3000
   windowSecs: 60
