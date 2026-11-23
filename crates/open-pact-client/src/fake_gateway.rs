@@ -16,33 +16,83 @@ pub const DEMO_MANIFEST: &str = include_str!("../../../examples/manifest.toml");
 /// Answers a request line such as `GET /v1/manifest`; `nth` counts earlier requests with the same line.
 pub type Respond = dyn Fn(&str, usize) -> (u16, String) + Send + Sync;
 
+/// A full scripted answer: status, body, extra headers and a delay before it is sent.
+pub struct Reply {
+    pub status: u16,
+    pub body: String,
+    pub headers: Vec<(String, String)>,
+    pub delay: std::time::Duration,
+}
+
+impl Reply {
+    pub fn new(status: u16, body: impl Into<String>) -> Self {
+        Reply {
+            status,
+            body: body.into(),
+            headers: Vec::new(),
+            delay: std::time::Duration::ZERO,
+        }
+    }
+
+    pub fn header(mut self, name: &str, value: &str) -> Self {
+        self.headers.push((name.into(), value.into()));
+        self
+    }
+
+    pub fn after(mut self, delay: std::time::Duration) -> Self {
+        self.delay = delay;
+        self
+    }
+}
+
+type RespondFull = dyn Fn(&str, usize) -> Reply + Send + Sync;
+
 pub struct FakeGateway {
     pub url: String,
     requests: Arc<Mutex<Vec<String>>>,
     bodies: Arc<Mutex<Vec<(String, String)>>>,
+    /// The raw request target of every request, and its `policy` parameter if it had one.
+    targets: Arc<Mutex<Vec<(String, Option<String>)>>>,
 }
 
 impl FakeGateway {
     pub async fn start(
         respond: impl Fn(&str, usize) -> (u16, String) + Send + Sync + 'static,
     ) -> Self {
+        Self::start_with(move |line, nth| {
+            let (status, body) = respond(line, nth);
+            Reply::new(status, body)
+        })
+        .await
+    }
+
+    /// Like `start`, with headers and a delay. The `policy` query parameter is cut from the
+    /// request line the closure sees; `policies` and `targets` keep it.
+    pub async fn start_with(
+        respond: impl Fn(&str, usize) -> Reply + Send + Sync + 'static,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let requests = Arc::new(Mutex::new(Vec::new()));
         let bodies = Arc::new(Mutex::new(Vec::new()));
-        let respond: Arc<Respond> = Arc::new(respond);
+        let targets = Arc::new(Mutex::new(Vec::new()));
+        let respond: Arc<RespondFull> = Arc::new(respond);
         let seen = requests.clone();
         let sent = bodies.clone();
+        let raw = targets.clone();
         tokio::spawn(async move {
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     return;
                 };
-                let (seen, sent, respond) = (seen.clone(), sent.clone(), respond.clone());
+                let (seen, sent, respond, raw) =
+                    (seen.clone(), sent.clone(), respond.clone(), raw.clone());
                 tokio::spawn(async move {
-                    let Some((line, body)) = read_request(&mut stream).await else {
+                    let Some((target, body)) = read_request(&mut stream).await else {
                         return;
                     };
+                    let (line, policy) = split_policy(&target);
+                    raw.lock().unwrap().push((target, policy));
                     sent.lock().unwrap().push((line.clone(), body));
                     let nth = {
                         let mut seen = seen.lock().unwrap();
@@ -50,12 +100,24 @@ impl FakeGateway {
                         seen.push(line.clone());
                         nth
                     };
-                    let (status, body) = respond(&line, nth);
+                    let Reply {
+                        status,
+                        body,
+                        headers,
+                        delay,
+                    } = respond(&line, nth);
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
                     if status == 0 {
                         return;
                     }
+                    let extra: String = headers
+                        .iter()
+                        .map(|(k, v)| format!("{k}: {v}\r\n"))
+                        .collect();
                     let reply = format!(
-                        "HTTP/1.1 {} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        "HTTP/1.1 {} X\r\ncontent-type: application/json\r\n{extra}content-length: {}\r\nconnection: close\r\n\r\n{body}",
                         if status == 598 { 200 } else { status },
                         if status == 598 { 100 } else { body.len() }
                     );
@@ -67,7 +129,28 @@ impl FakeGateway {
             url,
             requests,
             bodies,
+            targets,
         }
+    }
+
+    /// The `policy` parameter of every request that had one, in order.
+    pub fn policies(&self) -> Vec<String> {
+        self.targets
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(_, p)| p.clone())
+            .collect()
+    }
+
+    /// The raw request target (path and query) of every request, in order.
+    pub fn targets(&self) -> Vec<String> {
+        self.targets
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(t, _)| t.clone())
+            .collect()
     }
 
     pub fn requests(&self) -> Vec<String> {
@@ -91,6 +174,29 @@ impl FakeGateway {
             .into_iter()
             .filter(|l| !l.starts_with("GET "))
             .collect()
+    }
+}
+
+/// Cuts the `policy` parameter from `METHOD /path?query`; the rest of the line stays.
+fn split_policy(target: &str) -> (String, Option<String>) {
+    let Some((head, query)) = target.split_once('?') else {
+        return (target.to_string(), None);
+    };
+    let mut policy = None;
+    let rest: Vec<&str> = query
+        .split('&')
+        .filter(|kv| match kv.strip_prefix("policy=") {
+            Some(v) => {
+                policy = Some(v.to_string());
+                false
+            }
+            None => true,
+        })
+        .collect();
+    if rest.is_empty() {
+        (head.to_string(), policy)
+    } else {
+        (format!("{head}?{}", rest.join("&")), policy)
     }
 }
 
