@@ -1807,6 +1807,17 @@ fn setup_answers(context: &SetupContext, answers: &json_out::Answers) -> SetupCh
     }
 }
 
+/// What the wizard says when the job did not install. A failed SYSTEM install leaves a pending marker
+/// that `status` reports. A failed user install leaves nothing, so the retry is named here.
+fn install_failure_text(error: &anyhow::Error, system: bool, command: &str) -> String {
+    let next = if system {
+        "Status shows what is left to fix.".to_owned()
+    } else {
+        format!("Run `{command} schedule on` to try again.")
+    };
+    format!("The job was not installed: {error:#}\nThe wizard goes on. {next}")
+}
+
 /// Saves the choices and installs or removes the job to match.
 async fn apply_setup(home: &Home, choices: SetupChoices, executable: &Path) -> Result<()> {
     let was_on = {
@@ -1831,7 +1842,12 @@ async fn apply_setup(home: &Home, choices: SetupChoices, executable: &Path) -> R
             schedule::turn_on(home, Some(choices.run_as), false, executable, None).await
         {
             println!(
-                "The job was not installed: {error:#}\nThe wizard goes on. Status shows what is left to fix.",
+                "{}",
+                install_failure_text(
+                    &error,
+                    choices.run_as == device_config::RunAs::System,
+                    &client_command(&home.0)
+                )
             );
         }
     } else if was_on {
@@ -5320,6 +5336,27 @@ mod tests {
         );
         let saved = std::fs::read_to_string(home.file(device_config::FILE)).unwrap();
         assert!(!saved.contains("system_job_pending"), "{saved}");
+    }
+
+    #[test]
+    fn a_failed_user_job_install_names_the_retry_and_a_failed_system_install_names_status() {
+        let error = anyhow::anyhow!("access is denied");
+        let user = install_failure_text(&error, false, "open-pact-client");
+        assert!(
+            user.starts_with("The job was not installed: access is denied\n"),
+            "{user}"
+        );
+        assert!(
+            user.ends_with("Run `open-pact-client schedule on` to try again."),
+            "{user}"
+        );
+        assert!(!user.contains("Status shows"), "{user}");
+        let system = install_failure_text(&error, true, "open-pact-client");
+        assert!(
+            system.ends_with("Status shows what is left to fix."),
+            "{system}"
+        );
+        assert!(!system.contains("schedule on"), "{system}");
     }
 
     #[test]

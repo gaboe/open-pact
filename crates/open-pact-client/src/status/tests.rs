@@ -1089,13 +1089,9 @@ async fn an_outdated_package_and_a_missing_task_show_as_two_issues_with_their_ow
         .find(|issue| issue.message == "The machine client is older than this client.")
         .expect("the package issue");
     assert!(machine.command.is_none());
-    assert!(
-        machine
-            .fix
-            .as_deref()
-            .unwrap()
-            .contains("Upgrade it from an elevated PowerShell prompt")
-    );
+    assert!(machine.fix.as_deref().unwrap().contains(
+        "Upgrade it from an elevated Windows PowerShell 5.1 prompt (powershell.exe, not pwsh)"
+    ));
     let task = report
         .issues
         .iter()
@@ -1202,14 +1198,53 @@ async fn a_pending_system_job_is_one_issue_with_the_machine_clients_command() {
         .filter(|issue| issue.message == "Automatic sending waits for the SYSTEM job.")
         .collect();
     assert_eq!(pending.len(), 1, "{:?}", report.issues);
-    assert!(
-        pending[0]
-            .fix
-            .as_deref()
-            .unwrap()
-            .contains("schedule on --system")
-    );
+    // Local mode probes nothing, so it cannot know that the machine client passed its protection
+    // check: the fix points at the online report and offers no line that runs it.
+    let fix = pending[0].fix.as_deref().unwrap();
+    assert!(fix.contains("status --online"), "{fix}");
+    assert!(!fix.contains(&crate::machine::machine_command(
+        &fixture.home.0,
+        "schedule on --system",
+        &crate::machine::machine_path(),
+        None
+    )));
+    assert_eq!(crate::machine::PROBES.with(std::cell::Cell::get), 0);
     assert_eq!(report.exit_code, 1);
+}
+
+#[tokio::test]
+async fn a_local_report_of_a_revoked_system_job_starts_no_machine_probe_and_an_online_one_does() {
+    for online in [false, true] {
+        let fixture = Fixture::new("revoked").await;
+        let mut config = DeviceConfig::load(&fixture.home).unwrap();
+        config.auto_send = true;
+        config.run_as = crate::device_config::RunAs::System;
+        config.save(&fixture.home).unwrap();
+        crate::machine::PROBES.with(|probes| probes.set(0));
+        let report = collect_with(
+            &fixture.home,
+            online,
+            false,
+            &std::env::current_exe().unwrap(),
+            fixture.now,
+            |_, _| Ok(JobStatus::SystemUnconfirmed.into()),
+        )
+        .await
+        .unwrap();
+        let revoked = report
+            .issues
+            .iter()
+            .find(|issue| issue.message.contains("IT revoked this device"))
+            .expect("the revoked issue");
+        let stop = revoked.stop_job_command.as_deref().unwrap();
+        assert!(stop.contains("schtasks.exe"), "{stop}");
+        // The offline answer is the plain removal block: Windows tools only, no machine client.
+        assert_eq!(
+            crate::machine::PROBES.with(std::cell::Cell::get),
+            usize::from(online),
+            "online {online}"
+        );
+    }
 }
 
 #[tokio::test]
