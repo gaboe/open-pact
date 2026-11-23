@@ -40,6 +40,10 @@ spec:
           ports:
             - name: http
               containerPort: 8080
+            {{- if .Values.metrics.enabled }}
+            - name: metrics
+              containerPort: {{ .Values.metrics.port }}
+            {{- end }}
           env:
             {{- if .Values.siem.enabled }}
             {{- if not (has .Values.siem.fileMode (list "0600" "0640")) }}
@@ -83,6 +87,21 @@ spec:
             - name: DATABASE_MAX_CONNECTIONS
               value: {{ .Values.database.maxConnections | quote }}
             {{- end }}
+            - name: SLOW_REQUEST_MS
+              value: {{ .Values.gateway.slowRequestMs | quote }}
+            {{- if .Values.metrics.enabled }}
+            - name: METRICS_ADDR
+              value: 0.0.0.0:{{ .Values.metrics.port }}
+            - name: METRICS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "metrics.tokenSecret.name: create a Secret holding a random scrape token (openssl rand -hex 32) and name it here" .Values.metrics.tokenSecret.name }}
+                  key: {{ .Values.metrics.tokenSecret.key }}
+            - name: METRICS_TLS_CERT
+              value: /etc/open-pact/metrics-tls/tls.crt
+            - name: METRICS_TLS_KEY
+              value: /etc/open-pact/metrics-tls/tls.key
+            {{- end }}
             {{- if .Values.database.externalUrl }}
             - name: DATABASE_URL
               value: {{ .Values.database.externalUrl | quote }}
@@ -105,8 +124,13 @@ spec:
               path: /healthz
               port: http
             initialDelaySeconds: 10
-          {{- if or .Values.manifest .Values.siem.enabled }}
+          {{- if or .Values.manifest .Values.siem.enabled .Values.metrics.enabled }}
           volumeMounts:
+            {{- if .Values.metrics.enabled }}
+            - name: metrics-tls
+              mountPath: /etc/open-pact/metrics-tls
+              readOnly: true
+            {{- end }}
             {{- if .Values.siem.enabled }}
             - name: siem-ca
               mountPath: /etc/open-pact/siem
@@ -118,8 +142,18 @@ spec:
               readOnly: true
             {{- end }}
           {{- end }}
-      {{- if or .Values.manifest .Values.siem.enabled }}
+      {{- if or .Values.manifest .Values.siem.enabled .Values.metrics.enabled }}
       volumes:
+        {{- if .Values.metrics.enabled }}
+        - name: metrics-tls
+          secret:
+            secretName: {{ required "metrics.tlsSecret.name: name a kubernetes.io/tls Secret (for example from cert-manager) for the metrics listener" .Values.metrics.tlsSecret.name }}
+            items:
+              - key: tls.crt
+                path: tls.crt
+              - key: tls.key
+                path: tls.key
+        {{- end }}
         {{- if .Values.siem.enabled }}
         - name: siem-ca
           secret:
@@ -146,6 +180,43 @@ spec:
     - name: http
       port: 80
       targetPort: http
+{{- if .Values.metrics.enabled }}
+---
+# Its own Service: the metrics port is never behind the Ingress.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-gateway-metrics
+spec:
+  type: ClusterIP
+  selector:
+    app: {{ .Release.Name }}-gateway
+  ports:
+    - name: metrics
+      port: {{ .Values.metrics.port }}
+      targetPort: metrics
+{{- with .Values.metrics.networkPolicy.from }}
+---
+# Defence in depth: the public port stays open to all, the metrics port only to these sources.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $.Release.Name }}-gateway-metrics
+spec:
+  podSelector:
+    matchLabels:
+      app: {{ $.Release.Name }}-gateway
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - port: 8080
+    - from:
+        {{- toYaml . | nindent 8 }}
+      ports:
+        - port: {{ $.Values.metrics.port }}
+{{- end }}
+{{- end }}
 {{- if .Values.ingress.enabled }}
 ---
 apiVersion: networking.k8s.io/v1
