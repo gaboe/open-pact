@@ -278,7 +278,8 @@ async fn a_row_batch_is_dropped_off_the_worker() {
         hooks.count("reader_waiting") >= 1
     })
     .await;
-    f.append(199).await;
+    // One statement, so the growth stays far inside A's deadline on a loaded machine.
+    f.append_bulk(199).await;
     let tree = f.app.tree().await.unwrap();
     assert_eq!(tree.size(), start + 199);
     let groups = hooks.count("row_groups");
