@@ -191,19 +191,19 @@ def upgrade_code() -> str:
 
 
 def winget_manifests(version: str, msi_hash: str, identifier: str) -> dict[str, str]:
-    """The three winget manifests (schema 1.10.0) of the machine MSI for one version."""
+    """The three winget manifests (schema 1.28.0) of the machine MSI for one version."""
     upgrade = upgrade_code()
     product_code = version_gate.msi_product_code(upgrade, version)
     display_version = version_gate.msi_version(version)
     url = f"{RELEASE_URL}/v{version}/{MSI_FILE}"
     head = f'PackageIdentifier: {identifier}\nPackageVersion: "{version}"\n'
     return {
-        f"{identifier}.yaml": f"""# yaml-language-server: $schema=https://aka.ms/winget-manifest.version.1.10.0.schema.json
+        f"{identifier}.yaml": f"""# yaml-language-server: $schema=https://aka.ms/winget-manifest.version.1.28.0.schema.json
 {head}DefaultLocale: en-US
 ManifestType: version
-ManifestVersion: 1.10.0
+ManifestVersion: 1.28.0
 """,
-        f"{identifier}.installer.yaml": f"""# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.10.0.schema.json
+        f"{identifier}.installer.yaml": f"""# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.28.0.schema.json
 {head}Installers:
   - Architecture: x64
     InstallerType: wix
@@ -216,9 +216,9 @@ ManifestVersion: 1.10.0
         UpgradeCode: "{upgrade}"
         DisplayVersion: "{display_version}"
 ManifestType: installer
-ManifestVersion: 1.10.0
+ManifestVersion: 1.28.0
 """,
-        f"{identifier}.locale.en-US.yaml": f"""# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.10.0.schema.json
+        f"{identifier}.locale.en-US.yaml": f"""# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.28.0.schema.json
 {head}PackageLocale: en-US
 Publisher: gaboe
 PublisherUrl: https://github.com/gaboe
@@ -227,7 +227,7 @@ PackageUrl: https://github.com/gaboe/open-pact
 License: MIT
 ShortDescription: "Verifiable security checks for personally owned devices"
 ManifestType: defaultLocale
-ManifestVersion: 1.10.0
+ManifestVersion: 1.28.0
 """,
     }
 
