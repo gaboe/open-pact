@@ -52,6 +52,9 @@ const HEADER_TIMEOUT: Duration = Duration::from_secs(5);
 const SLOT_WAIT: Duration = Duration::from_secs(10);
 /// Connections at once. A connection serves one scrape and then closes.
 const CONNECTIONS_AT_ONCE: usize = 16;
+/// Everything one connection may take, from accept to close: the handshake, the request and the
+/// answer. A stalled response write frees its slot when this runs out.
+const CONNECTION_DEADLINE: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct HttpLabels {
@@ -738,34 +741,40 @@ async fn accept_connections(
             acceptor.clone(),
             router.clone(),
             slot,
+            CONNECTION_DEADLINE,
         ));
     }
 }
 
 /// Serves one connection: the TLS handshake under its own timeout when TLS is on, then one
-/// request. The connection closes after its answer, which frees the slot. HTTP/1 only.
+/// request. The connection closes after its answer, which frees the slot. HTTP/1 only. The whole
+/// connection runs under `deadline`, so a response that a client never reads cannot hold the slot.
 async fn serve_connection(
     stream: TcpStream,
     acceptor: Option<tokio_rustls::TlsAcceptor>,
     router: Router,
     _slot: OwnedSemaphorePermit,
+    deadline: Duration,
 ) {
-    let mut http = hyper::server::conn::http1::Builder::new();
-    http.timer(TokioTimer::new())
-        .header_read_timeout(HEADER_TIMEOUT)
-        .keep_alive(false);
-    let service = TowerToHyperService::new(router);
-    match acceptor {
-        None => {
-            let _ = http.serve_connection(TokioIo::new(stream), service).await;
-        }
-        Some(acceptor) => {
-            let shaken = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await;
-            if let Ok(Ok(tls)) = shaken {
-                let _ = http.serve_connection(TokioIo::new(tls), service).await;
+    let serving = async move {
+        let mut http = hyper::server::conn::http1::Builder::new();
+        http.timer(TokioTimer::new())
+            .header_read_timeout(HEADER_TIMEOUT)
+            .keep_alive(false);
+        let service = TowerToHyperService::new(router);
+        match acceptor {
+            None => {
+                let _ = http.serve_connection(TokioIo::new(stream), service).await;
+            }
+            Some(acceptor) => {
+                let shaken = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await;
+                if let Ok(Ok(tls)) = shaken {
+                    let _ = http.serve_connection(TokioIo::new(tls), service).await;
+                }
             }
         }
-    }
+    };
+    let _ = tokio::time::timeout(deadline, serving).await;
 }
 
 #[derive(Clone)]
@@ -858,7 +867,7 @@ mod tests {
     use axum::routing::get;
     use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
     use sqlx::postgres::PgPoolOptions;
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tower::ServiceExt;
 
     use super::*;
@@ -1093,6 +1102,36 @@ mod tests {
             .send()
             .await;
         assert!(plain.is_err(), "plain HTTP got an answer: {plain:?}");
+    }
+
+    #[tokio::test]
+    async fn a_response_the_client_never_reads_frees_its_slot_at_the_deadline() {
+        let router = Router::new().route("/big", get(|| async { vec![0_u8; 64 << 20] }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let slots = Arc::new(Semaphore::new(1));
+        let slot = slots.clone().acquire_owned().await.unwrap();
+        let served = tokio::spawn(serve_connection(
+            server,
+            None,
+            router,
+            slot,
+            Duration::from_millis(300),
+        ));
+        client
+            .write_all(b"GET /big HTTP/1.1\r\nHost: metrics.test\r\n\r\n")
+            .await
+            .unwrap();
+        // The client never reads the 64 MiB answer, so the write stalls until the deadline.
+        let finished = tokio::time::timeout(Duration::from_secs(5), served).await;
+        assert!(
+            finished.is_ok(),
+            "the connection held its slot past the deadline"
+        );
+        assert_eq!(slots.available_permits(), 1);
     }
 
     #[tokio::test]
