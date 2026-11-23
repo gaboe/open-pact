@@ -243,6 +243,22 @@ helm upgrade --install pact deploy/helm/open-pact -f gateway-values.yaml
 
 The chart restarts the gateway when the manifest changes. Confirm that the gateway is ready. Check the transparency checkpoint and SIEM delivery logs.
 
+### Migration 0013 and its rollback
+
+Migration 0013 adds two partial indexes on `log_entries`. The gateway runs it when it starts. The index build holds a lock that blocks log appends (enrolment, approval, purge, manifest publish) until the build ends. The migration waits at most 5 seconds for that lock. If a writer holds it longer, the migration fails and the gateway does not start.
+
+To go back to the gateway from before 0013, stop every gateway first. Then run this block against the gateway database with `psql`. It runs in one transaction, so a failure changes nothing:
+
+```sql
+BEGIN;
+DROP INDEX log_entries_commitment;
+DROP INDEX log_entries_manifest;
+DELETE FROM _sqlx_migrations WHERE version = 13;
+COMMIT;
+```
+
+Then start the earlier gateway image. It refuses a database that has version 13 applied, so start it only after the block. Do not start the new gateway again before the earlier one has run on the database: the new gateway applies 0013 on start.
+
 ## Nonce durability and database connections
 
 The gateway issues a nonce with `synchronous_commit = off`, so issuers do not wait for a disk flush while they hold the issue lock. A database crash can lose an issued nonce that the client has not used yet, from about the last 0.6 s of commits (three times the default `wal_writer_delay` of 200 ms). The lost nonce makes that claim run report a denial and end. The next run gets a fresh nonce; the client does not retry on its own.
