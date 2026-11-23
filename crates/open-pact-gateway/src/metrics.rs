@@ -208,6 +208,7 @@ pub struct Metrics {
     claim_stage: Family<StageLabel, Histogram>,
     witness_push: Family<ResultLabel, Histogram>,
     checkpoint_served: Family<ServedLabels, Counter>,
+    log_lines_dropped: Counter,
     /// NaN until the first read of the log.
     log_size: Gauge<f64, AtomicU64>,
 }
@@ -284,6 +285,12 @@ impl Metrics {
             "Checkpoints handed out, by caller and by whether the witness quorum was met",
             checkpoint_served.clone(),
         );
+        let log_lines_dropped = Counter::default();
+        registry.register(
+            "openpact_log_lines_dropped",
+            "Diagnostic lines a request path dropped because 256 lines already waited for the log writer",
+            log_lines_dropped.clone(),
+        );
         let log_size = Gauge::<f64, AtomicU64>::default();
         log_size.set(f64::NAN);
         registry.register(
@@ -303,6 +310,7 @@ impl Metrics {
             claim_stage,
             witness_push,
             checkpoint_served,
+            log_lines_dropped,
             log_size,
         }
     }
@@ -378,6 +386,10 @@ impl Metrics {
         self.checkpoint_served
             .get_or_create(&ServedLabels { caller, result })
             .inc();
+    }
+
+    pub fn log_line_dropped(&self) {
+        self.log_lines_dropped.inc();
     }
 
     pub fn log_size(&self, size: u64) {

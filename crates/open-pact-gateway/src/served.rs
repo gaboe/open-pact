@@ -21,6 +21,9 @@ use crate::translog::RowBatch;
 use crate::witness::db_step;
 use crate::{App, Reply, Tree, TreeSql, tree_step};
 
+/// The longest `?policy=` value the gateway decodes: the client sends at most this many bytes.
+const MAX_POLICY_QUERY: usize = 4096;
+
 /// A gateway note counts only while it keeps this much of the age the client allows: 60 s for a
 /// client clock ahead of the gateway and 240 s from the gateway's choice to the client's check.
 pub const AGE_MARGIN_SECS: u64 = 300;
@@ -66,6 +69,9 @@ pub fn request_policy(query: Option<&str>) -> Result<Option<LogPolicy>, Reply> {
         }
     }
     let Some(value) = found else { return Ok(None) };
+    if value.len() > MAX_POLICY_QUERY {
+        return Err(invalid_policy());
+    }
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(value)
         .map_err(|_| invalid_policy())?;
@@ -213,7 +219,8 @@ impl App {
                 Some(tree)
             }
             Ok(Ok(Err(error))) => {
-                eprintln!("checkpoint read: the tree step failed: {error:#}");
+                self.owners
+                    .log(format!("checkpoint read: the tree step failed: {error:#}"));
                 None
             }
             _ => None,
@@ -395,7 +402,9 @@ impl App {
             let top = match tokio::time::timeout_at(Self::timeout_at(deadline), step).await {
                 Ok(Ok(Ok(top))) => top,
                 Ok(Ok(Err(error))) => {
-                    eprintln!("checkpoint read: the uncached size query failed: {error:#}");
+                    self.owners.log(format!(
+                        "checkpoint read: the uncached size query failed: {error:#}"
+                    ));
                     return Err(Stop::Database);
                 }
                 _ => return Err(Stop::Database),
@@ -417,6 +426,7 @@ impl App {
         if past() {
             return Err(Stop::NotYet);
         }
+        hooks.hold_until_after("row_step_prepare", deadline);
         let mut sizes = vec![];
         let mut roots = vec![];
         for (size, hash) in &known {
@@ -428,6 +438,10 @@ impl App {
                 batch: RowBatch::new(None, hooks),
                 known,
             });
+        }
+        // The bind arrays above can take the time that is left.
+        if past() {
+            return Err(Stop::NotYet);
         }
         let step_hooks = hooks.clone();
         let step = db_step(self.db.clone(), move |conn| {
@@ -456,7 +470,8 @@ impl App {
         match tokio::time::timeout_at(Self::timeout_at(deadline), step).await {
             Ok(Ok(Ok(batch))) => Ok(Rows { batch, known }),
             Ok(Ok(Err(error))) => {
-                eprintln!("checkpoint read: the row query failed: {error:#}");
+                self.owners
+                    .log(format!("checkpoint read: the row query failed: {error:#}"));
                 Err(Stop::Database)
             }
             Ok(Err(_)) => Err(Stop::Database),
@@ -470,15 +485,16 @@ impl App {
         let batch = rows.batch.rows();
         let mut start = 0;
         while start < batch.len() {
+            if Instant::now() >= deadline {
+                return None;
+            }
+            let hooks = self.owners.hooks();
+            hooks.bump("group_scan");
             let size: i64 = batch[start].get(0);
             let end = batch[start..]
                 .iter()
                 .position(|r| r.get::<i64, _>(0) != size)
                 .map_or(batch.len(), |n| start + n);
-            if Instant::now() >= deadline {
-                return None;
-            }
-            let hooks = self.owners.hooks();
             hooks.hold_until_after("candidate_started", deadline);
             let size = u64::try_from(size).ok()?;
             if let Some(hash) = rows.known.get(&size) {
@@ -504,5 +520,40 @@ impl App {
             start = end;
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::StatusCode;
+    use base64::Engine;
+
+    use super::{MAX_POLICY_QUERY, request_policy};
+
+    /// A policy with no witness, as JSON padded with spaces so that its base64url text has this
+    /// many bytes (a multiple of four, so no remainder).
+    fn padded(encoded_len: usize) -> String {
+        let json = r#"{"witnesses":[],"witness_quorum":0,"allow_split_views":true,"checkpoint_max_age":"1h"}"#;
+        let mut bytes = json.as_bytes().to_vec();
+        bytes.resize(encoded_len / 4 * 3, b' ');
+        format!(
+            "policy={}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+        )
+    }
+
+    #[test]
+    fn a_policy_longer_than_4_kib_is_a_400_before_it_is_decoded() {
+        let at_limit = padded(MAX_POLICY_QUERY);
+        assert_eq!(at_limit.len(), "policy=".len() + MAX_POLICY_QUERY);
+        assert!(
+            request_policy(Some(&at_limit)).unwrap().is_some(),
+            "the client's largest query is accepted"
+        );
+        // The same valid policy with one more block of four characters.
+        let over = padded(MAX_POLICY_QUERY + 4);
+        let (status, body) = request_policy(Some(&over)).unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.0["reason"], "invalid policy");
     }
 }

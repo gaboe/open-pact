@@ -17,6 +17,7 @@ use reqwest::StatusCode;
 use sqlx::{PgConnection, PgPool};
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 
+use crate::diag::Diag;
 use crate::hooks::Hooks;
 use crate::metrics::{Observation, Push};
 use crate::{Enforced, Tree};
@@ -213,6 +214,8 @@ struct Shared {
     observe: Option<Arc<Observation>>,
     events: Mutex<Option<mpsc::UnboundedSender<WitnessEvent>>>,
     hooks: Arc<Hooks>,
+    /// The request paths' diagnostic lines; they never write to stderr themselves.
+    diag: Diag,
 }
 
 impl Shared {
@@ -267,6 +270,7 @@ impl Owners {
             changed: watch::channel(0).0,
             http: reqwest::Client::builder().timeout(PUSH_TIMEOUT).build()?,
             db,
+            diag: Diag::start(observe.clone()),
             observe,
             events: Mutex::default(),
             hooks: Arc::default(),
@@ -301,6 +305,16 @@ impl Owners {
 
     pub fn hooks(&self) -> Arc<Hooks> {
         self.shared.hooks.clone()
+    }
+
+    /// Queues a diagnostic line from a request path. It never waits and never writes stderr.
+    pub fn log(&self, line: String) {
+        self.shared.diag.line(line);
+    }
+
+    #[cfg(test)]
+    pub fn diag(&self) -> &Diag {
+        &self.shared.diag
     }
 
     /// Adds the witness keys of a manifest this process starts to enforce.
@@ -657,13 +671,29 @@ impl Owner {
             .expect("manifest snapshot")
             .clone();
         self.publish(false);
-        let tree = crate::tree_step(
+        let mut step = crate::tree_step(
             self.shared.db.clone(),
             snap.clone(),
             crate::TreeSql::Step,
             self.shared.hooks.clone(),
-        )
-        .await;
+        );
+        // The tree can wait for `grow` behind a read with no deadline. A Push carries its own
+        // tree, so it never waits for this one: the step runs on without the owner.
+        let tree = loop {
+            tokio::select! {
+                done = &mut step => break done,
+                job = self.jobs.recv() => {
+                    let Some(job) = job else { return false };
+                    let push = matches!(job, Job::Push(_));
+                    self.accept(job);
+                    self.answer_joins();
+                    if push {
+                        self.publish(false);
+                        return true;
+                    }
+                }
+            }
+        };
         let tree = match tree {
             Ok(Ok(tree)) => tree,
             failed => {
@@ -1013,7 +1043,7 @@ async fn push_with_retry(
                 return Attempt {
                     ahead: None,
                     staged: Staged::Failed,
-                    observed: observed.or(Some(size)),
+                    observed: Some(size),
                     new_held: None,
                 };
             }

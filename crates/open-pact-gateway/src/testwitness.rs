@@ -26,6 +26,9 @@ pub enum Behaviour {
     DelayAnswer(Duration, u16),
     /// Answers this status once and stores nothing, then behaves as Healthy.
     AnswerOnce(u16),
+    /// Answers 409 with the first size of the list for each push in turn, stores nothing, and
+    /// behaves as Healthy once the list is used up. The list is not empty.
+    Conflicts(Vec<u64>),
 }
 
 #[derive(Clone, Debug)]
@@ -210,6 +213,16 @@ async fn decide(w: Arc<Inner>, body: String) -> (StatusCode, String) {
     if let Behaviour::AnswerOnce(code) = behaviour {
         *w.behaviour.lock().unwrap() = Behaviour::Healthy;
         behaviour = Behaviour::Answer(code);
+    }
+    if let Behaviour::Conflicts(mut sizes) = behaviour {
+        let size = sizes.remove(0);
+        *w.behaviour.lock().unwrap() = if sizes.is_empty() {
+            Behaviour::Healthy
+        } else {
+            Behaviour::Conflicts(sizes)
+        };
+        record(409);
+        return (StatusCode::CONFLICT, size.to_string());
     }
     if let Behaviour::Answer(code) = behaviour {
         record(code);

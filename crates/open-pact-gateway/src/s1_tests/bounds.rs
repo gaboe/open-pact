@@ -193,6 +193,8 @@ struct Run {
     after_deadline: (usize, usize, usize),
     at_answer: (usize, usize, usize),
     reads: usize,
+    /// Row groups the walk of the candidates looked at.
+    group_scans: usize,
     size: u64,
 }
 
@@ -244,6 +246,7 @@ async fn case(f: &Fixture, query: String, seeded: &[Seeded], hold: bool) -> Run 
         before("verify_p256"),
         before("served_signatures"),
         before("read_calls"),
+        before("group_scan"),
     ];
     let waiting = hooks.count("reader_waiting");
     let begin = Instant::now();
@@ -289,6 +292,7 @@ async fn case(f: &Fixture, query: String, seeded: &[Seeded], hold: bool) -> Run 
         p256: delta("verify_p256", counters[4]),
         signatures: delta("served_signatures", counters[5]),
         reads: delta("read_calls", counters[6]),
+        group_scans: delta("group_scan", counters[7]),
         after_deadline,
         at_answer,
         size: t,
@@ -395,6 +399,33 @@ async fn served_bounds_the_work_after_the_last_read() {
         three.after_deadline, three.at_answer,
         "work started after the deadline"
     );
+    // Case 3b: two cached sizes; the larger is below quorum and ends after the deadline. The walk
+    // must not look at the next group.
+    let three_b = case(
+        &f,
+        f.query.clone(),
+        &[
+            Seeded {
+                at: At::Top(10),
+                valid: vec![0, 1],
+            },
+            Seeded {
+                at: At::Top(20),
+                valid: vec![0, 1, 2, 3, 4],
+            },
+        ],
+        true,
+    )
+    .await;
+    expect_unavailable(
+        &three_b.reply,
+        wait + Duration::from_millis(ONE_CANDIDATE_MS + 50),
+    );
+    assert_eq!(three_b.candidates, 1, "one candidate started");
+    assert_eq!(
+        three_b.group_scans, 1,
+        "the walk looked at the next group after the deadline"
+    );
     // Case 4: no rows.
     let four = case(&f, f.query.clone(), &[], false).await;
     expect_unavailable(
@@ -438,6 +469,19 @@ async fn served_bounds_the_work_after_the_last_read() {
         hooks.count("served_signatures"),
         before,
         "no signature after the deadline"
+    );
+    // Case 6: the first read is held after its last check until the deadline has passed; no row
+    // step starts.
+    let steps = hooks.count("row_step_start");
+    hooks.arm_past_deadline("row_step_prepare", Duration::from_millis(1));
+    let six = f.get(Some(&f.query)).await;
+    expect_unavailable(&six, wait + Duration::from_millis(ONE_CANDIDATE_MS + 50));
+    // A step that was spawned would reach its first statement within moments.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        hooks.count("row_step_start"),
+        steps,
+        "a row step started after the deadline"
     );
     f.assert_no_fork_line().await;
 }
