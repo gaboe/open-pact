@@ -55,4 +55,4 @@ if ((Get-FileHash -LiteralPath $extracted[0].FullName -Algorithm SHA256).Hash -n
     throw "The administrative image holds a different client than $Exe."
 }
 Remove-Item -LiteralPath $admin -Recurse -Force
-Write-Host "Built $Out: ProductVersion $($codes.ProductVersion), ProductCode $($codes.ProductCode)."
+Write-Host "Built ${Out}: ProductVersion $($codes.ProductVersion), ProductCode $($codes.ProductCode)."
