@@ -624,22 +624,52 @@ mod tests {
         );
     }
 
+    /// A Remediator event `days` days and an hour before now, as `log show` prints its time.
+    fn remediator_event(days: i64) -> String {
+        let at =
+            time::OffsetDateTime::now_utc() - time::Duration::days(days) - time::Duration::hours(1);
+        format!(
+            r#"{{"processImagePath":"/Library/Apple/System/Library/CoreServices/XProtect.app/Contents/MacOS/XProtectRemediatorSnowBeagle","timestamp":"{:04}-{:02}-{:02} {:02}:{:02}:{:02}.000000+0000","eventMessage":"{{\"status_message\":\"NoThreatDetected\"}}"}}"#,
+            at.year(),
+            u8::from(at.month()),
+            at.day(),
+            at.hour(),
+            at.minute(),
+            at.second()
+        )
+    }
+
     #[test]
     fn antimalware_later_versions_read_on_macos_and_keep_version_one() {
         let manifest =
             Manifest::parse(include_bytes!("../../../../examples/manifest.toml")).unwrap();
-        for id in [
-            "antimalware_active_threats",
-            "antimalware_full_scan_age_days",
+        let complete = format!("{}\n{{\"count\":1,\"finished\":1}}", remediator_event(3));
+        let unreadable = format!(
+            "{}\nnot json\n{{\"count\":2,\"finished\":1}}",
+            remediator_event(3)
+        );
+        for (id, expected) in [
+            ("antimalware_active_threats", ControlValue::Integer(0)),
+            ("antimalware_full_scan_age_days", ControlValue::Integer(3)),
         ] {
             let mut later = manifest.body().control(id).unwrap().clone();
             later.check = format!("builtin:{id}@2");
             let first = manifest.body().control(id).unwrap().clone();
-            // Version 1 stays not applicable on macOS, and version 2 reads the Remediator log.
-            let v1 = run(Os::Macos, std::slice::from_ref(&first), None, None);
+            // Version 2 runs the reader on the log. An `unknown` or `n/a` in place of the reader
+            // cannot read the number from the fixture, and a reader that skips the parse cannot
+            // read `unknown` from the unreadable one.
+            let v2 = |text: &str| {
+                macos_v3::with_log_fixture(text, || {
+                    run(Os::Macos, std::slice::from_ref(&later), None, None)
+                })
+            };
+            assert_eq!(v2(&complete)[id], expected, "{id}");
+            assert_eq!(v2(&unreadable)[id], "unknown", "{id}");
+            // Version 1 stays not applicable on macOS, whatever the log holds.
+            let v1 = macos_v3::with_log_fixture(&complete, || {
+                run(Os::Macos, std::slice::from_ref(&first), None, None)
+            });
             assert_eq!(v1[id], "n/a", "{id}");
-            let v2 = run(Os::Macos, std::slice::from_ref(&later), None, None);
-            assert_ne!(v2[id], "n/a", "{id}");
             // Off macOS both versions run the same check.
             for os in [Os::Linux, Os::Windows] {
                 assert_eq!(

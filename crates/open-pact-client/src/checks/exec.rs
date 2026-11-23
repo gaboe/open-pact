@@ -1,5 +1,6 @@
 use std::io::{Read, Write};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -8,6 +9,9 @@ use std::time::{Duration, Instant};
 pub const TIMEOUT: Duration = Duration::from_secs(3);
 
 type Captured = Arc<Mutex<Vec<u8>>>;
+
+/// How often the wait loop looks at the child.
+const POLL: Duration = Duration::from_millis(10);
 
 /// Output of a command that exited before the timeout, with stdout and stderr together.
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
@@ -48,10 +52,32 @@ pub(super) fn run_status_with_timeout(
     })
 }
 
+/// The stdout of a command that exited before the timeout, and printed at most `max_stdout` bytes.
+/// Stderr is not part of `text`. `None` when it cannot start, times out, or prints more.
+#[cfg(any(target_os = "macos", test))]
+pub(super) fn run_stdout_with_limit(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+    max_stdout: usize,
+) -> Option<Ran> {
+    let output = capture_limited(program, args, timeout, Some(max_stdout), POLL).ok()?;
+    if output.timed_out || output.stdout_overflowed {
+        return None;
+    }
+    Some(Ran {
+        success: output.status?.success(),
+        text: output.stdout,
+    })
+}
+
 #[derive(Debug)]
 pub struct CapturedOutput {
     pub status: Option<ExitStatus>,
+    /// The child did not exit before the deadline. A child that exits after it counts too.
     pub timed_out: bool,
+    /// The child printed more than the stdout limit. `stdout` holds only the bytes before it.
+    pub stdout_overflowed: bool,
     #[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
     pub elapsed: Duration,
     pub stdout: String,
@@ -128,6 +154,28 @@ fn capture_input(
     input: Option<&[u8]>,
     timeout: Duration,
 ) -> std::io::Result<CapturedOutput> {
+    capture_with(program, args, input, timeout, None, POLL)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn capture_limited(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+    max_stdout: Option<usize>,
+    poll: Duration,
+) -> std::io::Result<CapturedOutput> {
+    capture_with(program, args, None, timeout, max_stdout, poll)
+}
+
+fn capture_with(
+    program: &str,
+    args: &[&str],
+    input: Option<&[u8]>,
+    timeout: Duration,
+    max_stdout: Option<usize>,
+    poll: Duration,
+) -> std::io::Result<CapturedOutput> {
     let start = Instant::now();
     #[cfg(unix)]
     if !program_exists(program, std::env::var_os("PATH").as_deref()) {
@@ -142,16 +190,31 @@ fn capture_input(
             let _ = stdin.write_all(&input);
         });
     }
+    let overflow = Arc::new(AtomicBool::new(false));
     let readers = [
-        child.stdout.take().map(drain),
-        child.stderr.take().map(drain),
+        child
+            .stdout
+            .take()
+            .map(|pipe| drain(pipe, max_stdout, Arc::clone(&overflow))),
+        child
+            .stderr
+            .take()
+            .map(|pipe| drain(pipe, None, Arc::default())),
     ];
     let deadline = Instant::now() + timeout;
     let mut timed_out = false;
     let status = loop {
+        if overflow.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            break child.wait().ok();
+        }
         match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            // An exit that this loop sees after the deadline is a timeout, as if it had been killed.
+            Ok(Some(status)) => {
+                timed_out = Instant::now() >= deadline;
+                break Some(status);
+            }
+            Ok(None) if Instant::now() < deadline => thread::sleep(poll),
             result => {
                 timed_out = matches!(result, Ok(None));
                 let _ = child.kill();
@@ -181,6 +244,7 @@ fn capture_input(
     Ok(CapturedOutput {
         status,
         timed_out,
+        stdout_overflowed: overflow.load(Ordering::Relaxed),
         elapsed: start.elapsed(),
         stdout,
         stderr,
@@ -189,7 +253,14 @@ fn capture_input(
 
 /// A background grandchild can keep the pipe open after the child exits, so
 /// the reader fills a shared buffer and the caller stops waiting shortly after the child exits.
-fn drain<R: Read + Send + 'static>(mut pipe: R) -> (Captured, thread::JoinHandle<()>) {
+///
+/// With a `limit`, the reader stops at the first byte past it, keeps the bytes before it, and sets
+/// `overflow`, so a child that prints without end cannot fill memory.
+fn drain<R: Read + Send + 'static>(
+    mut pipe: R,
+    limit: Option<usize>,
+    overflow: Arc<AtomicBool>,
+) -> (Captured, thread::JoinHandle<()>) {
     let buf: Captured = Arc::default();
     let sink = Arc::clone(&buf);
     let handle = thread::spawn(move || {
@@ -198,8 +269,14 @@ fn drain<R: Read + Send + 'static>(mut pipe: R) -> (Captured, thread::JoinHandle
             if n == 0 {
                 break;
             }
-            if let Ok(mut bytes) = sink.lock() {
-                bytes.extend_from_slice(&chunk[..n]);
+            let Ok(mut bytes) = sink.lock() else {
+                break;
+            };
+            let room = limit.map_or(n, |limit| limit.saturating_sub(bytes.len()).min(n));
+            bytes.extend_from_slice(&chunk[..room]);
+            if room < n {
+                overflow.store(true, Ordering::Relaxed);
+                break;
             }
         }
     });
@@ -260,6 +337,55 @@ mod tests {
             "sh",
             &["-c", "exec sleep 30"],
             &input,
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        assert!(output.timed_out, "{output:?}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn stdout_only_read_leaves_stderr_out_of_the_text() {
+        let ran = run_stdout_with_limit(
+            "sh",
+            &["-c", "printf out; printf '{\"finished\":1}' >&2"],
+            Duration::from_secs(5),
+            1024,
+        )
+        .unwrap();
+        assert!(ran.success);
+        assert_eq!(ran.text, "out");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn stdout_over_the_limit_is_none() {
+        let read = |bytes: usize| {
+            run_stdout_with_limit(
+                "sh",
+                &["-c", &format!("head -c {bytes} /dev/zero")],
+                Duration::from_secs(5),
+                1024,
+            )
+        };
+        assert_eq!(read(1024).unwrap().text.len(), 1024);
+        assert!(read(1025).is_none());
+        // A producer that never stops is cut off long before its own timeout.
+        let start = Instant::now();
+        let endless = run_stdout_with_limit("yes", &[], Duration::from_secs(5), 1 << 20);
+        assert!(endless.is_none());
+        assert!(start.elapsed() < Duration::from_secs(4));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn an_exit_seen_after_the_deadline_is_a_timeout() {
+        // The child exits at about 150 ms. The loop looks again only at 200 ms, past the 100 ms deadline.
+        let output = capture_limited(
+            "sh",
+            &["-c", "printf late; sleep 0.15"],
+            Duration::from_millis(100),
+            None,
             Duration::from_millis(200),
         )
         .unwrap();
