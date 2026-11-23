@@ -80,8 +80,39 @@ async function waitHttp(url: string, since: number, timeoutMs: number): Promise<
   throw new Error(`no answer from ${url} within ${timeoutMs} ms`);
 }
 
-const MINE_SQL = (size: number, manifest: string, commitment: string) =>
-  `SELECT idx, kind, data FROM log_entries WHERE idx < ${size} AND ((kind = 'manifest_published' AND data->>'manifest' = '${manifest}') OR (kind IN ('device_enrolled', 'device_approved', 'device_revoked', 'manifest_accepted') AND data->>'commitment' = '${commitment}')) ORDER BY idx`;
+// The SQL of translog::mine, read from the gateway source at run time, so the plan check runs the query the gateway runs.
+const MINE_SQL_TEXT = (() => {
+  const source = readFileSync(join(root, "crates/open-pact-gateway/src/translog.rs"), "utf8");
+  const body = source.slice(source.indexOf("pub async fn mine("));
+  const open = body.indexOf('"', body.indexOf("query_as::<_, Row>(")) + 1;
+  const close = body.indexOf('",', open);
+  if (open <= 0 || close < 0) throw new Error("translog::mine SQL not found");
+  // A Rust string line ends in a backslash: the newline and the next line's indent are skipped.
+  return body.slice(open, close).split("\\\n").map((part, i) => (i === 0 ? part : part.trimStart())).join("");
+})();
+const digest = (text: string) => new Bun.CryptoHasher("sha256").update(text).digest("hex");
+const COMMITMENT = digest("fixture-commitment-42");
+const INDEXED_KINDS = ["device_enrolled", "device_approved", "device_revoked", "manifest_accepted"];
+const WRITER_KINDS = [...INDEXED_KINDS, "retention_purge"];
+const CLOCK_MS = "SELECT (extract(epoch from clock_timestamp()) * 1000)::float8 AS ms";
+let planCounter = 0;
+/** EXPLAIN ANALYZE of translog::mine with its three bind parameters, prepared on one connection. */
+async function minePlan(sql: Bun.SQL, size: number, manifest: string, commitment: string): Promise<string[]> {
+  const name = `mine_plan_${planCounter++}`;
+  return sql.begin(async (tx) => {
+    await tx.unsafe("SET LOCAL plan_cache_mode = force_custom_plan");
+    await tx.unsafe(`PREPARE ${name} (bigint, text, text) AS ${MINE_SQL_TEXT}`);
+    const lines = (await tx.unsafe(`EXPLAIN (ANALYZE, BUFFERS) EXECUTE ${name}(${size}, '${manifest}', '${commitment}')`)).map((r) => r["QUERY PLAN"] as string);
+    await tx.unsafe(`DEALLOCATE ${name}`);
+    return lines;
+  });
+}
+/** Resolves whether cond becomes true within timeoutMs. */
+async function waitUntil(cond: () => boolean, timeoutMs: number): Promise<boolean> {
+  const until = performance.now() + timeoutMs;
+  while (!cond() && performance.now() < until) await Bun.sleep(10);
+  return cond();
+}
 
 const pgPort = freePort();
 const gatewayPort = freePort();
@@ -128,14 +159,19 @@ try {
   expect(applied[0].n === 12 && applied[0].v === 12, "previous gateway did not leave migrations 1 to 12 applied");
 
   // 3. Fixture: the kind mix of the load test at 8,000 devices (16,001 rows: two device entries per
-  //    device, one manifest entry), scaled to ${FIXTURE_ROWS} rows. No retention purge in that run;
-  //    the last row is one purge so the kind mix has all kinds.
+  //    device, one manifest entry), scaled to 200,000 rows. Commitments have the gateway's form, a
+  //    SHA-256 hex digest. Every 500th row is device_revoked and every 1000th is manifest_accepted,
+  //    so each indexed kind is present. The last row is one retention purge.
   // The previous gateway already wrote its startup entry (the manifest), so the fixture fills the rest.
   const existing = (await db.unsafe("SELECT count(*)::int AS n FROM log_entries"))[0].n as number;
   expect(existing >= 1, "the previous gateway wrote no startup entry");
   await db.unsafe(`INSERT INTO log_entries (idx, kind, data)
-    SELECT g, CASE WHEN g % 2 = 1 THEN 'device_enrolled' ELSE 'device_approved' END,
-           jsonb_build_object('commitment', 'fixture-commitment-' || ((g - 1) / 2))
+    SELECT g,
+           CASE WHEN g % 1000 = 0 THEN 'manifest_accepted'
+                WHEN g % 500 = 1 THEN 'device_revoked'
+                WHEN g % 2 = 1 THEN 'device_enrolled'
+                ELSE 'device_approved' END,
+           jsonb_build_object('commitment', encode(sha256(convert_to('fixture-commitment-' || ((g - 1) / 2), 'UTF8')), 'hex'))
     FROM generate_series(${existing}, ${FIXTURE_ROWS - 2}) AS g
     UNION ALL
     SELECT ${FIXTURE_ROWS - 1}, 'retention_purge', '{}'::jsonb`);
@@ -143,30 +179,39 @@ try {
   const rows = await db.unsafe("SELECT count(*)::int AS n FROM log_entries");
   report.fixtureRows = rows[0].n;
   expect(rows[0].n === FIXTURE_ROWS, "fixture row count");
+  const fixtureKinds: Record<string, number> = Object.fromEntries((await db.unsafe("SELECT kind, count(*)::int AS n FROM log_entries GROUP BY kind ORDER BY kind")).map((k) => [k.kind as string, k.n as number]));
+  report.fixtureKinds = fixtureKinds;
+  expect(WRITER_KINDS.every((k) => k in fixtureKinds), "the fixture lacks an indexed kind or the purge");
 
-  const explain = async () => {
-    const lines = (await db!.unsafe(`EXPLAIN (ANALYZE, BUFFERS) ${MINE_SQL(FIXTURE_ROWS, "fixture-manifest", "fixture-commitment-42")}`)).map((r) => r["QUERY PLAN"] as string);
-    return lines;
-  };
+  const explain = () => minePlan(db!, FIXTURE_ROWS, "fixture-manifest", COMMITMENT);
   const before = await explain();
   report.explainBefore = before;
   expect(before.some((l) => l.includes("Seq Scan on log_entries")), "previous schema should scan log_entries");
 
   // 4. The upgrade. A writer appends one entry every 20 ms from before the new gateway starts until
-  //    it answers, so the longest append shows the index build's lock wait.
-  const appends = { count: 0, max: 0, errors: [] as string[] };
+  //    it answers. Each append has the gateway's shape (lock, count, insert) and cycles through the
+  //    indexed kinds and a retention purge. Each append keeps its span on the database clock.
+  const appends = { count: 0, max: 0, errors: [] as string[], kinds: {} as Record<string, number>, spans: [] as { startMs: number; endMs: number }[] };
   let appending = true;
   const appender = (async () => {
     const writer = new Bun.SQL(dbUrl, { max: 1 });
     try {
-      while (appending) {
+      for (let i = 0; appending; i++) {
+        const kind = WRITER_KINDS[i % WRITER_KINDS.length];
+        const data = kind === "retention_purge" ? {} : { commitment: digest(`writer-commitment-${i}`) };
         const s = performance.now();
         try {
-          await writer.begin(async (tx) => {
-            await tx`SELECT pg_advisory_xact_lock(hashtext('open-pact log_entries'))`;
-            await tx.unsafe("INSERT INTO log_entries (idx, kind, data) SELECT coalesce(max(idx), -1) + 1, 'retention_purge', '{}'::jsonb FROM log_entries");
+          const span = await writer.begin(async (tx) => {
+            const [{ ms: startMs }] = await tx.unsafe(CLOCK_MS);
+            await tx.unsafe("SELECT pg_advisory_xact_lock(hashtext('open-pact log_entries'))");
+            const [{ n }] = await tx.unsafe("SELECT count(*)::int AS n FROM log_entries");
+            await tx.unsafe("INSERT INTO log_entries (idx, kind, data) VALUES ($1::bigint, $2, $3::jsonb)", [n, kind, JSON.stringify(data)]);
+            const [{ ms: endMs }] = await tx.unsafe(CLOCK_MS);
+            return { startMs: startMs as number, endMs: endMs as number };
           });
           appends.count += 1;
+          appends.kinds[kind] = (appends.kinds[kind] ?? 0) + 1;
+          appends.spans.push(span);
           appends.max = Math.max(appends.max, performance.now() - s);
         } catch (error) {
           appends.errors.push(String(error));
@@ -177,19 +222,32 @@ try {
       await writer.close();
     }
   })();
+  expect(await waitUntil(() => appends.count >= 1, 10_000), "the writer committed no append before the new gateway started");
   t = performance.now();
   const next = start([join(newDir, "open-pact-gateway")], gatewayEnv, join(work, "new-start.log"));
   const startupMs = await waitHttp(`${gatewayUrl}/healthz`, t, 60_000);
   appending = false;
   await appender;
   report.startupMs = Math.round(startupMs);
-  report.appends = { count: appends.count, maxMs: Math.round(appends.max), errors: appends.errors.length };
+  report.appends = { count: appends.count, maxMs: Math.round(appends.max), errors: appends.errors.length, kinds: appends.kinds };
   expect(startupMs <= STARTUP_BUDGET_MS, `startup ${Math.round(startupMs)} ms over ${STARTUP_BUDGET_MS} ms`);
   expect(appends.max <= STALL_BUDGET_MS, `append stall ${Math.round(appends.max)} ms over ${STALL_BUDGET_MS} ms`);
   expect(appends.errors.length === 0, "appends failed during the upgrade");
+  expect(appends.count > 0, "the writer recorded no append");
+  expect(Object.keys(appends.kinds).some((k) => INDEXED_KINDS.includes(k)), "the timed writer inserted no indexed kind");
 
-  const m13 = await db.unsafe("SELECT success FROM _sqlx_migrations WHERE version = 13");
+  const m13 = await db.unsafe("SELECT success, (extract(epoch from installed_on) * 1000)::float8 AS start_ms, (execution_time::float8 / 1000000)::float8 AS exec_ms FROM _sqlx_migrations WHERE version = 13");
   expect(m13.length === 1 && m13[0].success === true, "migration 13 not applied");
+  // installed_on is now() of the migration transaction, so the transaction runs for exec_ms from it.
+  const m13row = m13[0] ?? { start_ms: 0, exec_ms: 0 };
+  const windowStart = m13row.start_ms as number;
+  const execMs = m13row.exec_ms as number;
+  const windowEnd = windowStart + execMs;
+  const overlapping = appends.spans.filter((s) => s.startMs < windowEnd && s.endMs > windowStart).length;
+  report.migration13 = { transactionMs: Math.round(execMs), overlappingAppends: overlapping };
+  expect(execMs < STALL_BUDGET_MS, `migration 13 transaction ${Math.round(execMs)} ms, not under ${STALL_BUDGET_MS} ms`);
+  expect(overlapping > 0, "no timed append overlaps the migration window");
+
   const indexes = (await db.unsafe("SELECT indexname FROM pg_indexes WHERE tablename = 'log_entries' ORDER BY indexname")).map((r) => r.indexname);
   report.indexes = indexes;
   expect(indexes.includes("log_entries_commitment") && indexes.includes("log_entries_manifest"), "both indexes must exist after the upgrade");
@@ -227,9 +285,10 @@ try {
   const refused = start([join(previousDir, "open-pact-gateway")], gatewayEnv, join(work, "previous-refused.log"));
   const exited = await Promise.race([refused.exited.then((code) => code), Bun.sleep(30_000).then(() => "running")]);
   if (exited === "running") await stop(refused);
-  const refusedLog = readFileSync(join(work, "previous-refused.log"), "utf8").trim().split("\n").slice(-2).join(" | ");
+  const refusedText = readFileSync(join(work, "previous-refused.log"), "utf8");
+  const refusedLog = refusedText.trim().split("\n").slice(-2).join(" | ");
   report.previousRefusesUpgraded = { exit: exited, lastLines: refusedLog };
-  expect(exited !== "running" && exited !== 0, "the earlier gateway must refuse the upgraded database");
+  expect(exited !== "running" && exited !== 0 && refusedText.includes("migration 13 was previously applied but is missing"), `the earlier gateway must refuse the upgraded database with the migration 13 error: ${refusedLog}`);
 
   // 7. The rollback block from docs/gateway.md, run with every gateway stopped.
   const doc = readFileSync(join(root, "docs/gateway.md"), "utf8");
@@ -253,8 +312,8 @@ try {
   const check2 = await run([join(previousDir, "open-pact-client"), "--home", home, "check"]);
   report.mineCheckPrevious = { exit: check2.code, inclusionProofs: /Inclusion proofs verified/.test(check2.out) };
   expect(/Inclusion proofs verified/.test(check2.out), `mine check on the previous gateway: ${check2.out.slice(-400)}${check2.err.slice(-200)}`);
-  const plainAfterRollback = (await explainPlain(db)).some((l) => l.includes("Seq Scan on log_entries"));
-  report.previousPlanScans = plainAfterRollback;
+  const scansAfterRollback = (await minePlan(db!, FIXTURE_ROWS, "fixture-manifest", COMMITMENT)).some((l) => l.includes("Seq Scan on log_entries"));
+  report.previousPlanScans = scansAfterRollback;
   await stop(previous);
 } catch (error) {
   failures.push(`aborted: ${error instanceof Error ? error.message : String(error)}`);
@@ -272,7 +331,3 @@ report.passed = failures.length === 0;
 report.failures = failures;
 console.log(JSON.stringify(report, null, 2));
 process.exit(failures.length === 0 ? 0 : 1);
-
-async function explainPlain(sql: Bun.SQL): Promise<string[]> {
-  return (await sql.unsafe(`EXPLAIN ${MINE_SQL(FIXTURE_ROWS, "fixture-manifest", "fixture-commitment-42")}`)).map((r) => r["QUERY PLAN"] as string);
-}
