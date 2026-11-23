@@ -2336,7 +2336,11 @@ async fn get_checkpoint(
     gateway: &str,
     policy: Option<&LogPolicy>,
 ) -> Result<String> {
-    let url = format!("{}/v1/log/checkpoint{}", base(gateway), policy_query(policy));
+    let url = format!(
+        "{}/v1/log/checkpoint{}",
+        base(gateway),
+        policy_query(policy)
+    );
     for attempt in 0..2 {
         let response = http
             .get(&url)
@@ -4746,8 +4750,7 @@ async fn log_prove(home: &Home, index: Option<u64>, insecure_dev: bool) -> Resul
         return Ok(ExitCode::from(2));
     };
     let index = index.unwrap_or(own.enrolment);
-    let response =
-        fetch_my_entries(&http, home, &enrolment, manifest.body().log.as_ref()).await?;
+    let response = fetch_my_entries(&http, home, &enrolment, manifest.body().log.as_ref()).await?;
     let pins = Pins::load(home)?;
     let cp = match verify_checkpoint(
         &http,
@@ -5968,12 +5971,20 @@ mod tests {
             (Some("-1"), 5),
             (None, 5),
         ] {
-            assert_eq!(parse_retry_after(value), Duration::from_secs(secs), "{value:?}");
+            assert_eq!(
+                parse_retry_after(value),
+                Duration::from_secs(secs),
+                "{value:?}"
+            );
         }
     }
 
     /// A gateway whose first checkpoint answer is a 503 with this Retry-After, then `second`.
-    async fn busy_then(note: String, second: u16, retry_after: &str) -> (FakeGateway, std::time::Instant) {
+    async fn busy_then(
+        note: String,
+        second: u16,
+        retry_after: &str,
+    ) -> (FakeGateway, std::time::Instant) {
         let retry_after = retry_after.to_string();
         let gateway = FakeGateway::start_with(move |line, nth| match line {
             "GET /v1/log/checkpoint" if nth == 0 => {
@@ -6039,7 +6050,12 @@ mod tests {
             serde_json::to_value(&policy).unwrap()
         );
         assert!(gateway.targets()[0].starts_with("GET /v1/log/checkpoint?policy="));
-        assert!(gateway.requests().iter().all(|l| l == "GET /v1/log/checkpoint"));
+        assert!(
+            gateway
+                .requests()
+                .iter()
+                .all(|l| l == "GET /v1/log/checkpoint")
+        );
     }
 
     #[tokio::test]
@@ -6051,9 +6067,10 @@ mod tests {
         let policy = manifest.body().log.clone().unwrap();
         for (second, expected) in [(404, "does not support"), (503, "503")] {
             let gateway = FakeGateway::start_with(move |line, nth| match line {
-                "POST /v1/nonce" => {
-                    fake_gateway::Reply::new(200, json!({"nonce": format!("{nth:064x}")}).to_string())
-                }
+                "POST /v1/nonce" => fake_gateway::Reply::new(
+                    200,
+                    json!({"nonce": format!("{nth:064x}")}).to_string(),
+                ),
                 "POST /v1/log/mine" if nth == 0 => {
                     fake_gateway::Reply::new(503, "busy").header("retry-after", "1")
                 }
@@ -6070,7 +6087,12 @@ mod tests {
             assert!(format!("{error:#}").contains(expected), "{error:#}");
             assert_eq!(
                 gateway.requests(),
-                ["POST /v1/nonce", "POST /v1/log/mine", "POST /v1/nonce", "POST /v1/log/mine"]
+                [
+                    "POST /v1/nonce",
+                    "POST /v1/log/mine",
+                    "POST /v1/nonce",
+                    "POST /v1/log/mine"
+                ]
             );
             let sent = gateway.policies();
             assert_eq!(sent.len(), 2);
