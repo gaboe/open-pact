@@ -1,0 +1,792 @@
+//! The machine client: the one copy of the client that a per-machine package installs under
+//! Program Files. The SYSTEM job runs it, and only it. No client copies itself there.
+//!
+//! The protection boundary is the administrator-only path, not the package. A protected file at
+//! that path counts, whoever installed it, and every text calls it "the machine client at <path>".
+
+use std::path::{Path, PathBuf};
+
+use anyhow::{Result, bail};
+use semver::Version;
+use serde::Serialize;
+
+use crate::schedule::{ASSERT_PROTECTED, apply_command, powershell_literal};
+
+/// The repository whose release workflow signs the package. A constant, never an environment value.
+const REPOSITORY: &str = "gaboe/open-pact";
+const COSIGN_URL: &str =
+    "https://github.com/sigstore/cosign/releases/download/v3.0.6/cosign-windows-amd64.exe";
+/// SHA-256 of `cosign-windows-amd64.exe` of Cosign v3.0.6, as its release checksums list it.
+const COSIGN_SHA256: &str = "9b85a88ebff2d9dd30ff4984a6f61f2cedc232dd87d81fa7f2ff3c0ed96c241c";
+const MSI_NAME: &str = "open-pact-client-x86_64-pc-windows-msvc.msi";
+const OIDC_ISSUER: &str = "https://token.actions.githubusercontent.com";
+/// The release after the first merge flips this, when the package is in the winget community
+/// repository. Until then no text names winget.
+const WINGET_PUBLISHED: bool = false;
+
+const MACHINE_FOLDER: &str = "open-pact-client";
+const MACHINE_FILE: &str = "open-pact-client.exe";
+
+/// The machine client, read without elevation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum MachineClient {
+    /// No file at the machine path.
+    Missing,
+    /// The ACL check failed on Program Files, the folder or the file.
+    Unprotected { reason: String },
+    /// Protected, and `--version` printed a version.
+    Present { version: Version },
+    /// The probe or `--version` failed.
+    Unknown { reason: String },
+}
+
+/// What `status --json` reports as `schedule.machine_client`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MachineState {
+    Missing,
+    Unprotected,
+    Unknown,
+    Outdated,
+    Current,
+}
+
+/// The machine client compared with the running client. A running client older than the machine
+/// client is no problem: the job runs the newer one.
+pub(crate) fn machine_state(machine: &MachineClient, running: &Version) -> MachineState {
+    match machine {
+        MachineClient::Missing => MachineState::Missing,
+        MachineClient::Unprotected { .. } => MachineState::Unprotected,
+        MachineClient::Unknown { .. } => MachineState::Unknown,
+        MachineClient::Present { version } if version.cmp_precedence(running).is_lt() => {
+            MachineState::Outdated
+        }
+        MachineClient::Present { .. } => MachineState::Current,
+    }
+}
+
+/// The version of this client.
+pub(crate) fn running_version() -> Version {
+    Version::parse(env!("CARGO_PKG_VERSION")).expect("the crate version is a semantic version")
+}
+
+/// The path of the machine client in `program_files`.
+pub(crate) fn machine_executable_in(program_files: &Path) -> PathBuf {
+    program_files.join(MACHINE_FOLDER).join(MACHINE_FILE)
+}
+
+/// The path of the machine client: Q, under the Program Files folder that Windows names.
+pub fn machine_executable() -> Result<PathBuf> {
+    Ok(machine_executable_in(&known_folder(Known::ProgramFiles)?))
+}
+
+/// Q, or an empty path where Windows does not say. An empty path never equals a running image.
+pub(crate) fn machine_path() -> PathBuf {
+    machine_executable().unwrap_or_default()
+}
+
+enum Known {
+    ProgramFiles,
+    System,
+}
+
+#[cfg(windows)]
+fn known_folder(which: Known) -> Result<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{
+        FOLDERID_ProgramFiles, FOLDERID_System, KF_FLAG_DEFAULT, SHGetKnownFolderPath,
+    };
+
+    let id = match which {
+        Known::ProgramFiles => &FOLDERID_ProgramFiles,
+        Known::System => &FOLDERID_System,
+    };
+    let mut raw: *mut u16 = std::ptr::null_mut();
+    // SAFETY: `id` points at a constant GUID and `raw` at a local. On success Windows gives back
+    // a NUL-terminated string. This function copies it and frees it with `CoTaskMemFree`.
+    let path = unsafe {
+        let status =
+            SHGetKnownFolderPath(id, KF_FLAG_DEFAULT as u32, std::ptr::null_mut(), &mut raw);
+        if status < 0 {
+            CoTaskMemFree(raw.cast());
+            None
+        } else {
+            let mut length = 0;
+            while *raw.add(length) != 0 {
+                length += 1;
+            }
+            let path = PathBuf::from(std::ffi::OsString::from_wide(std::slice::from_raw_parts(
+                raw, length,
+            )));
+            CoTaskMemFree(raw.cast());
+            Some(path)
+        }
+    };
+    path.ok_or_else(|| anyhow::anyhow!("Windows did not name a known folder"))
+}
+
+#[cfg(not(windows))]
+fn known_folder(which: Known) -> Result<PathBuf> {
+    let _ = which;
+    bail!("the machine client exists only on Windows")
+}
+
+/// The Windows PowerShell of the system folder. Every start of PowerShell uses this path, so a
+/// `powershell.exe` in the current folder or on `PATH` never runs.
+pub(crate) fn system_powershell() -> PathBuf {
+    static PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        known_folder(Known::System)
+            .unwrap_or_else(|_| PathBuf::from(r"C:\Windows\System32"))
+            .join(r"WindowsPowerShell\v1.0\powershell.exe")
+    })
+    .clone()
+}
+
+/// Whether two Windows paths name the same file: ignores case and a `\\?\` prefix.
+pub(crate) fn same_windows_path(left: &Path, right: &Path) -> bool {
+    let normal = |path: &Path| {
+        let text = path.to_string_lossy().to_lowercase();
+        text.strip_prefix(r"\\?\").unwrap_or(&text).to_owned()
+    };
+    normal(left) == normal(right)
+}
+
+/// The PowerShell that checks Program Files, the folder and the file of `machine`, and prints
+/// `missing`, `present` or `unprotected: <reason>`.
+pub(crate) fn machine_probe_script(machine: &Path) -> Result<String> {
+    let literal = powershell_literal(path_text(machine)?);
+    Ok(format!(
+        r#"{ASSERT_PROTECTED}
+$machine = {literal}
+if (-not (Test-Path -LiteralPath $machine -PathType Leaf)) {{ Write-Output 'missing'; return }}
+$folder = Split-Path -Parent $machine
+try {{
+    AssertProtected (Split-Path -Parent $folder)
+    AssertProtected $folder
+    AssertProtected $machine
+    Write-Output 'present'
+}} catch {{ Write-Output ('unprotected: ' + $_.Exception.Message) }}
+"#
+    ))
+}
+
+fn path_text(path: &Path) -> Result<&str> {
+    let text = path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("a Windows path must be UTF-8"))?;
+    if text.chars().any(char::is_control) {
+        bail!("a path must not hold a control character");
+    }
+    Ok(text)
+}
+
+/// The machine client from what the probe printed and what `--version` printed.
+fn machine_client_from(
+    probe: Result<String>,
+    version: impl FnOnce() -> Result<String>,
+) -> MachineClient {
+    let probe = match probe {
+        Ok(probe) => probe,
+        Err(error) => {
+            return MachineClient::Unknown {
+                reason: format!("{error:#}"),
+            };
+        }
+    };
+    match probe.lines().next().map(str::trim) {
+        Some("missing") => MachineClient::Missing,
+        Some("present") => match version().and_then(|output| parse_version(&output)) {
+            Ok(version) => MachineClient::Present { version },
+            Err(error) => MachineClient::Unknown {
+                reason: format!("{error:#}"),
+            },
+        },
+        Some(line) if line.starts_with("unprotected:") => MachineClient::Unprotected {
+            reason: line["unprotected:".len()..].trim().to_owned(),
+        },
+        _ => MachineClient::Unknown {
+            reason: "the check printed no answer".into(),
+        },
+    }
+}
+
+/// The version in the output of `open-pact-client --version`: the last word of its first line.
+fn parse_version(output: &str) -> Result<Version> {
+    let word = output
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().last())
+        .ok_or_else(|| anyhow::anyhow!("`--version` printed nothing"))?;
+    Ok(Version::parse(word)?)
+}
+
+/// Reads the machine client. One PowerShell start for the protection, then `Q --version`.
+pub(crate) fn read_machine_client() -> MachineClient {
+    let machine = match machine_executable() {
+        Ok(machine) => machine,
+        Err(error) => {
+            return MachineClient::Unknown {
+                reason: format!("{error:#}"),
+            };
+        }
+    };
+    let probe = machine_probe_script(&machine)
+        .and_then(|script| crate::schedule::windows_powershell(&script));
+    machine_client_from(probe, || {
+        let mut command = std::process::Command::new(&machine);
+        command.arg("--version");
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000);
+        }
+        let output = command.output()?;
+        if !output.status.success() {
+            bail!("`--version` failed with code {:?}", output.status.code());
+        }
+        Ok(String::from_utf8(output.stdout)?)
+    })
+}
+
+/// The owner's profile that a SYSTEM job reads: an absolute path to a folder that exists, with no
+/// `%` and no control character.
+pub(crate) fn validate_user_home(path: &Path) -> Result<PathBuf> {
+    let text = path_text(path)?;
+    if text.contains('%') {
+        bail!("the user home must not contain %");
+    }
+    if !path.is_absolute() {
+        bail!("the user home must be an absolute path");
+    }
+    if !path.is_dir() {
+        bail!("the user home is not a folder that exists");
+    }
+    Ok(path.to_path_buf())
+}
+
+/// The install block, for an elevated Windows PowerShell. It makes an administrator-only folder
+/// with a name that no text predicts, checks that folder, downloads the package and a pinned Cosign
+/// into it, verifies the signature and the hash, and installs with System32 `msiexec.exe`. The
+/// folder stays, because Windows Installer repairs from it. The same block installs, upgrades and
+/// reinstalls.
+pub(crate) fn install_block(version: &Version) -> String {
+    let tag = format!("v{version}");
+    let base = format!("https://github.com/{REPOSITORY}/releases/download/{tag}");
+    let identity = format!(
+        "https://github.com/{REPOSITORY}/.github/workflows/client-release.yml@refs/tags/{tag}"
+    );
+    INSTALL_TEMPLATE
+        .replace("@ASSERT_PROTECTED@", ASSERT_PROTECTED.trim())
+        .replace("@BASE@", &powershell_literal(&base))
+        .replace("@MSI@", &powershell_literal(MSI_NAME))
+        .replace("@COSIGN_URL@", &powershell_literal(COSIGN_URL))
+        .replace("@COSIGN_SHA256@", &powershell_literal(COSIGN_SHA256))
+        .replace("@IDENTITY@", &powershell_literal(&identity))
+        .replace("@ISSUER@", &powershell_literal(OIDC_ISSUER))
+}
+
+const INSTALL_TEMPLATE: &str = r#"& {
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+@ASSERT_PROTECTED@
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+if (-not (New-Object Security.Principal.WindowsPrincipal($identity)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Run this block from an elevated PowerShell prompt.' }
+$base = @BASE@
+$msiName = @MSI@
+$folder = Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) ('open-pact-install-' + [guid]::NewGuid())
+if (Test-Path -LiteralPath $folder) { throw 'The install folder exists. Run this block again.' }
+$security = New-Object Security.AccessControl.DirectorySecurity
+$security.SetAccessRuleProtection($true, $false)
+$security.SetOwner((New-Object Security.Principal.SecurityIdentifier('S-1-5-32-544')))
+foreach ($sid in @('S-1-5-18', 'S-1-5-32-544')) {
+    $account = New-Object Security.Principal.SecurityIdentifier($sid)
+    $security.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($account, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+}
+[void][IO.Directory]::CreateDirectory($folder, $security)
+AssertProtected $folder
+foreach ($name in @($msiName, 'SHA256SUMS', 'SHA256SUMS.sigstore.json')) {
+    Invoke-WebRequest -UseBasicParsing -Uri "$base/$name" -OutFile (Join-Path $folder $name)
+}
+$cosign = Join-Path $folder 'cosign.exe'
+Invoke-WebRequest -UseBasicParsing -Uri @COSIGN_URL@ -OutFile $cosign
+if ((Get-FileHash -LiteralPath $cosign -Algorithm SHA256).Hash -ne @COSIGN_SHA256@) { throw 'cosign.exe does not match its pinned hash.' }
+$sums = Join-Path $folder 'SHA256SUMS'
+& $cosign verify-blob --bundle (Join-Path $folder 'SHA256SUMS.sigstore.json') --certificate-identity @IDENTITY@ --certificate-oidc-issuer @ISSUER@ $sums
+if ($LASTEXITCODE -ne 0) { throw 'Cosign could not verify SHA256SUMS.' }
+$lines = @(Get-Content -LiteralPath $sums | Where-Object { $_ -match '\S' -and (($_ -split '\s+', 2)[1].TrimStart('*') -eq $msiName) })
+if ($lines.Count -ne 1) { throw 'SHA256SUMS must list the package once.' }
+$msi = Join-Path $folder $msiName
+if ((Get-FileHash -LiteralPath $msi -Algorithm SHA256).Hash -ne ($lines[0] -split '\s+')[0]) { throw 'The package does not match SHA256SUMS.' }
+$log = Join-Path $folder 'install.log'
+$msiexec = Join-Path ([Environment]::SystemDirectory) 'msiexec.exe'
+$install = Start-Process -FilePath $msiexec -ArgumentList ('/i "' + $msi + '" /qn /norestart /l*v "' + $log + '"') -Wait -PassThru
+Write-Output ('msiexec exit code: ' + $install.ExitCode)
+if ($install.ExitCode -eq 3010) { Write-Output 'Restart Windows to finish the install.' }
+elseif ($install.ExitCode -ne 0) { throw ('The install failed. See ' + $log) }
+}"#;
+
+/// The winget line for IT deployments, once the package is published there.
+fn winget_line() -> Option<&'static str> {
+    WINGET_PUBLISHED.then_some(
+        "For IT deployment that runs as SYSTEM (Intune, GPO): winget install --exact --id gaboe.open-pact --source winget --scope machine. Winget in a user session downloads into that user's temp folder first, so use the block above there.",
+    )
+}
+
+/// The block that removes the SYSTEM task of `home` with Windows tools, for an elevated prompt. It
+/// has no `Remove-Item`. With the machine client at `machine`, its last line runs `schedule off`,
+/// which waits for the state lock and removes the state folder. The client never runs these lines
+/// itself.
+pub(crate) fn removal_block(home: &Path, task_id: &str, machine: Option<&Path>) -> String {
+    let id = powershell_literal(task_id);
+    let last = machine
+        .map(|machine| format!("\n  {}", apply_command(home, "schedule off", machine)))
+        .unwrap_or_default();
+    let mut text = format!(
+        r#"& {{
+  $schtasks = Join-Path ([Environment]::SystemDirectory) 'schtasks.exe'
+  & $schtasks /Query /TN {id} 2>$null | Out-Null
+  if ($LASTEXITCODE -eq 0) {{
+    & $schtasks /End /TN {id} 2>$null | Out-Null
+    & $schtasks /Delete /TN {id} /F
+    if ($LASTEXITCODE -ne 0) {{ throw 'The task was not removed. Run this block again from an elevated prompt.' }}
+  }}
+  & $schtasks /Query /TN {id} 2>$null | Out-Null
+  if ($LASTEXITCODE -eq 0) {{ throw 'The task is still registered. Run this block again.' }}{last}
+}}"#
+    );
+    if machine.is_none() {
+        text.push_str(&format!(
+            "\nThe state folder {} stays. The next `schedule on --system` resets it.",
+            system_state_folder(home).display()
+        ));
+    }
+    let program_files = machine
+        .and_then(|machine| machine.parent()?.parent())
+        .map(Path::to_path_buf)
+        .or_else(|| known_folder(Known::ProgramFiles).ok())
+        .unwrap_or_else(|| PathBuf::from(r"C:\Program Files"));
+    text.push_str(&format!(
+        "\nThe old copy in {} stays. Remove that folder after you removed every open-pact SYSTEM task on this device.",
+        program_files.join("open-pact").display()
+    ));
+    text
+}
+
+/// `<ProgramData>\open-pact\system\<sha256(home)>`, where the SYSTEM job keeps its state.
+fn system_state_folder(home: &Path) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let program_data = std::env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+    program_data
+        .join("open-pact")
+        .join("system")
+        .join(hex::encode(Sha256::digest(
+            home.to_string_lossy().as_bytes(),
+        )))
+}
+
+/// The command that runs `change` through the machine client at `machine`. `profile` is the owner's
+/// profile when the caller knows it.
+pub(crate) fn machine_command(
+    home: &Path,
+    change: &str,
+    machine: &Path,
+    profile: Option<&Path>,
+) -> String {
+    let mut command = apply_command(home, change, machine);
+    if let Some(profile) = profile {
+        command.push_str(&format!(
+            " --user-home {}",
+            powershell_literal(&profile.to_string_lossy())
+        ));
+    }
+    command
+}
+
+/// The fix for a machine client that is not current, with the install block first. Nothing when
+/// the machine client is current.
+pub(crate) fn machine_fix(
+    machine: &MachineClient,
+    state: MachineState,
+    path: &Path,
+    running: &Version,
+) -> Option<String> {
+    let block = || {
+        let mut text = install_block(running);
+        if let Some(line) = winget_line() {
+            text.push('\n');
+            text.push_str(line);
+        }
+        text
+    };
+    match (state, machine) {
+        (MachineState::Current, _) => None,
+        (MachineState::Missing, _) => Some(format!(
+            "The machine client is not installed at {}. Install it from an elevated PowerShell prompt:\n{}",
+            path.display(),
+            block()
+        )),
+        (MachineState::Unprotected, MachineClient::Unprotected { reason }) => Some(format!(
+            "{} is not protected ({reason}). Ask IT, or uninstall the machine client and install it again with this block:\n{}",
+            path.display(),
+            block()
+        )),
+        (MachineState::Outdated, MachineClient::Present { version }) => Some(format!(
+            "The machine client at {} is version {version}, and this client is version {running}. Upgrade it from an elevated PowerShell prompt:\n{}\nIf you just installed an update, restart Windows.",
+            path.display(),
+            block()
+        )),
+        (_, MachineClient::Unknown { reason }) => {
+            Some(format!("Cannot read the machine client: {reason}."))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn version(text: &str) -> Version {
+        Version::parse(text).unwrap()
+    }
+
+    fn state(machine: &MachineClient, running: &str) -> MachineState {
+        machine_state(machine, &version(running))
+    }
+
+    #[test]
+    fn the_package_state_follows_the_machine_client_and_the_running_version() {
+        let present = |text: &str| MachineClient::Present {
+            version: version(text),
+        };
+        assert_eq!(
+            state(&MachineClient::Missing, "0.9.0"),
+            MachineState::Missing
+        );
+        assert_eq!(
+            state(&MachineClient::Unprotected { reason: "x".into() }, "0.9.0"),
+            MachineState::Unprotected
+        );
+        assert_eq!(
+            state(&MachineClient::Unknown { reason: "x".into() }, "0.9.0"),
+            MachineState::Unknown
+        );
+        assert_eq!(state(&present("0.8.9"), "0.9.0"), MachineState::Outdated);
+        assert_eq!(state(&present("0.9.0"), "0.9.0"), MachineState::Current);
+        // A running client older than the machine client is no problem.
+        assert_eq!(state(&present("0.9.1"), "0.9.0"), MachineState::Current);
+        // A prerelease is below its release, and build metadata counts for nothing.
+        assert_eq!(
+            state(&present("0.9.0-rc.1"), "0.9.0"),
+            MachineState::Outdated
+        );
+        assert_eq!(
+            state(&present("0.9.0"), "0.9.0-rc.1"),
+            MachineState::Current
+        );
+        assert_eq!(
+            state(&present("0.9.0+build.5"), "0.9.0"),
+            MachineState::Current
+        );
+        assert_eq!(
+            serde_json::to_value(MachineState::Unprotected).unwrap(),
+            serde_json::json!("unprotected")
+        );
+    }
+
+    #[test]
+    fn the_machine_client_is_read_from_the_probe_and_its_version() {
+        let ok = || Ok("open-pact-client 0.9.0\n".to_owned());
+        let from = |probe: &str| machine_client_from(Ok(probe.to_owned()), ok);
+        assert_eq!(from("missing"), MachineClient::Missing);
+        assert_eq!(
+            from("present"),
+            MachineClient::Present {
+                version: version("0.9.0")
+            }
+        );
+        assert_eq!(
+            from("unprotected: Protected path ACL grants write or modify to a non-admin principal"),
+            MachineClient::Unprotected {
+                reason: "Protected path ACL grants write or modify to a non-admin principal".into()
+            }
+        );
+        assert!(matches!(from(""), MachineClient::Unknown { .. }));
+        assert!(matches!(from("garbage"), MachineClient::Unknown { .. }));
+        assert!(matches!(
+            machine_client_from(Err(anyhow::anyhow!("blocked")), ok),
+            MachineClient::Unknown { reason } if reason == "blocked"
+        ));
+        for version_output in ["", "open-pact-client", "open-pact-client not-a-version"] {
+            let client = machine_client_from(Ok("present".into()), || Ok(version_output.into()));
+            assert!(
+                matches!(client, MachineClient::Unknown { .. }),
+                "{version_output}"
+            );
+        }
+        assert!(matches!(
+            machine_client_from(Ok("present".into()), || bail!("did not start")),
+            MachineClient::Unknown { .. }
+        ));
+        // A missing client never starts the version command.
+        assert_eq!(
+            machine_client_from(Ok("missing".into()), || panic!(
+                "no process for a missing file"
+            )),
+            MachineClient::Missing
+        );
+    }
+
+    #[test]
+    fn the_probe_checks_the_three_paths_with_the_literal_machine_path() {
+        let script =
+            machine_probe_script(Path::new(r"C:\Program Files\it's\open-pact-client.exe")).unwrap();
+        assert!(script.contains(r"$machine = 'C:\Program Files\it''s\open-pact-client.exe'"));
+        let program = script
+            .find("AssertProtected (Split-Path -Parent $folder)")
+            .unwrap();
+        let folder = script.find("AssertProtected $folder").unwrap();
+        let file = script.find("AssertProtected $machine").unwrap();
+        assert!(program < folder && folder < file);
+        assert!(
+            script.contains("Write-Output 'missing'") && script.contains("Write-Output 'present'")
+        );
+    }
+
+    #[test]
+    fn the_machine_path_is_the_new_folder_under_program_files() {
+        assert_eq!(
+            machine_executable_in(Path::new(r"C:\Program Files")),
+            Path::new(r"C:\Program Files")
+                .join("open-pact-client")
+                .join("open-pact-client.exe")
+        );
+        assert!(system_powershell().ends_with(r"WindowsPowerShell\v1.0\powershell.exe"));
+        assert!(system_powershell().is_absolute() || !cfg!(windows));
+    }
+
+    #[test]
+    fn version_output_names_the_version_in_its_last_word() {
+        assert_eq!(
+            parse_version("open-pact-client 0.9.0-rc.1\n").unwrap(),
+            version("0.9.0-rc.1")
+        );
+        assert!(parse_version("").is_err());
+    }
+
+    #[test]
+    fn windows_paths_compare_without_case_and_extended_prefix() {
+        let protected = Path::new(r"C:\Program Files\open-pact-client\open-pact-client.exe");
+        assert!(same_windows_path(
+            Path::new(r"\\?\c:\program files\Open-Pact-Client\open-pact-client.exe"),
+            protected
+        ));
+        assert!(!same_windows_path(
+            Path::new(r"C:\Users\a\open-pact-client.exe"),
+            protected
+        ));
+        assert!(!same_windows_path(
+            Path::new(r"C:\Program Files\open-pact\open-pact-client.exe"),
+            protected
+        ));
+    }
+
+    #[test]
+    fn a_profile_must_be_an_absolute_existing_folder_without_percent_or_control_characters() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(validate_user_home(dir.path()).unwrap(), dir.path());
+        assert!(validate_user_home(&dir.path().join("missing")).is_err());
+        assert!(validate_user_home(Path::new("relative")).is_err());
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(validate_user_home(&file).is_err());
+        let percent = dir.path().join("%TEMP%");
+        std::fs::create_dir(&percent).unwrap();
+        assert!(validate_user_home(&percent).is_err());
+        assert!(validate_user_home(Path::new("/tmp/a\nb")).is_err());
+    }
+
+    #[test]
+    fn the_install_block_uses_full_path_tools_and_checks_before_it_trusts() {
+        let block = install_block(&version("0.9.0"));
+        // The folder name comes from a run-time GUID, in an administrator-only folder that is checked
+        // before the first download.
+        assert!(block.contains("[guid]::NewGuid()"));
+        assert!(block.contains("Test-Path -LiteralPath $folder"));
+        assert!(block.contains("[IO.Directory]::CreateDirectory($folder, $security)"));
+        assert!(block.contains("$security.SetAccessRuleProtection($true, $false)"));
+        let check = block.find("AssertProtected $folder").unwrap();
+        assert!(check < block.find("Invoke-WebRequest").unwrap());
+        assert!(block.contains("function AssertProtected"));
+        // Cosign is pinned by hash, then it verifies the sums with the exact identity.
+        assert!(block.contains(&format!("-ne '{COSIGN_SHA256}'")));
+        assert!(block.find(COSIGN_SHA256).unwrap() < block.find("verify-blob").unwrap());
+        assert!(block.contains(
+            "--certificate-identity 'https://github.com/gaboe/open-pact/.github/workflows/client-release.yml@refs/tags/v0.9.0'"
+        ));
+        assert!(
+            block.contains(
+                "--certificate-oidc-issuer 'https://token.actions.githubusercontent.com'"
+            )
+        );
+        assert!(
+            block.contains(
+                "if ($LASTEXITCODE -ne 0) { throw 'Cosign could not verify SHA256SUMS.' }"
+            )
+        );
+        assert!(block.contains("releases/download/v0.9.0'"));
+        // The package hash is checked against its SHA256SUMS line before msiexec runs.
+        assert!(
+            block.find("The package does not match SHA256SUMS").unwrap()
+                < block.find("msiexec").unwrap()
+        );
+        // msiexec and every other tool start by full path; nothing starts by bare name.
+        assert!(block.contains("Join-Path ([Environment]::SystemDirectory) 'msiexec.exe'"));
+        assert!(block.contains("/qn /norestart /l*v"));
+        assert!(!block.contains("& msiexec") && !block.contains("powershell.exe"));
+        assert!(block.contains("-eq 3010") && block.contains("Restart Windows"));
+        assert!(block.starts_with("& {") && block.ends_with('}'));
+        // It never installs from a folder that a name predicts.
+        assert!(!block.contains("open-pact-install-0"));
+        // The upgrade and the reinstall are the same block for the same version.
+        assert_eq!(block, install_block(&version("0.9.0")));
+        assert_ne!(block, install_block(&version("0.9.1")));
+    }
+
+    #[test]
+    fn the_install_block_for_a_prerelease_names_its_tag() {
+        let block = install_block(&version("0.9.0-rc.1"));
+        assert!(block.contains("refs/tags/v0.9.0-rc.1"));
+        assert!(block.contains("releases/download/v0.9.0-rc.1"));
+    }
+
+    #[test]
+    fn the_removal_block_uses_only_system32_task_tools_and_checks_each_step() {
+        let home = Path::new(r"C:\Users\it's a\pact");
+        let machine = Path::new(r"C:\Program Files\open-pact-client\open-pact-client.exe");
+        let id = "org.open-pact.report.0123456789abcdef";
+        let block = removal_block(home, id, Some(machine));
+        assert!(block.contains("Join-Path ([Environment]::SystemDirectory) 'schtasks.exe'"));
+        assert!(!block.contains("Remove-Item") && !block.contains("powershell.exe"));
+        let end = block
+            .find("/End /TN 'org.open-pact.report.0123456789abcdef'")
+            .unwrap();
+        let delete = block
+            .find("/Delete /TN 'org.open-pact.report.0123456789abcdef' /F")
+            .unwrap();
+        let check = block
+            .find("-ne 0) { throw 'The task was not removed")
+            .unwrap();
+        // The delete runs only for a registered task, so a second run of the block ends the same
+        // way; the last query still fails the block when the task survives.
+        let probe = block
+            .find("/Query /TN 'org.open-pact.report.0123456789abcdef'")
+            .unwrap();
+        let query = block
+            .rfind("/Query /TN 'org.open-pact.report.0123456789abcdef'")
+            .unwrap();
+        assert!(probe < end && end < delete && delete < check && check < query);
+        assert!(block.contains("-eq 0) { throw 'The task is still registered."));
+        // With the machine client, the last line of the block removes the state through it.
+        let last = block.find("schedule off").unwrap();
+        assert!(query < last);
+        assert!(block.contains(&apply_command(home, "schedule off", machine)));
+        #[cfg(windows)]
+        assert!(block.contains(r"& 'C:\Program Files\open-pact-client\open-pact-client.exe' --home 'C:\Users\it''s a\pact' schedule off"));
+        assert!(block.contains("Remove that folder after you removed every open-pact SYSTEM task"));
+        assert!(block.contains("open-pact stays."));
+        // Without it, the state folder stays for the next install to reset.
+        let without = removal_block(home, id, None);
+        assert!(!without.contains("schedule off"));
+        assert!(without.contains("The state folder") && without.contains("stays."));
+        assert!(without.contains("resets it"));
+    }
+
+    #[test]
+    fn every_printed_value_is_quoted_with_the_one_literal_function() {
+        for quote in ['\'', '\u{2018}', '\u{2019}', '\u{201a}', '\u{201b}'] {
+            let home = format!("C:\\Users\\a{quote}b");
+            let doubled = format!("a{quote}{quote}b");
+            assert_eq!(powershell_literal(&home), format!("'C:\\Users\\{doubled}'"));
+            let block = removal_block(Path::new(&home), &home, Some(Path::new("q.exe")));
+            assert!(block.contains(&format!(
+                "/Delete /TN '{}' /F",
+                home.replace(quote, &format!("{quote}{quote}"))
+            )));
+            #[cfg(windows)]
+            {
+                let command = machine_command(
+                    Path::new(&home),
+                    "schedule on --system",
+                    Path::new("q.exe"),
+                    Some(Path::new(&home)),
+                );
+                assert_eq!(command.matches(&doubled).count(), 2, "{quote:?}: {command}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_machine_command_adds_the_profile_only_when_it_is_known() {
+        let home = Path::new(r"C:\Users\a\pact");
+        let machine = Path::new(r"C:\Program Files\open-pact-client\open-pact-client.exe");
+        assert_eq!(
+            machine_command(home, "schedule on --system", machine, None),
+            apply_command(home, "schedule on --system", machine)
+        );
+        let with_profile = machine_command(
+            home,
+            "schedule on --system",
+            machine,
+            Some(Path::new(r"C:\Users\a")),
+        );
+        assert!(with_profile.starts_with(&apply_command(home, "schedule on --system", machine)));
+        assert!(with_profile.ends_with(r" --user-home 'C:\Users\a'"));
+    }
+
+    #[test]
+    fn the_package_fix_is_the_install_block_with_the_state_in_front() {
+        let path = Path::new(r"C:\Program Files\open-pact-client\open-pact-client.exe");
+        let running = version("0.9.0");
+        let fix = |machine: &MachineClient| {
+            machine_fix(machine, machine_state(machine, &running), path, &running)
+        };
+        assert_eq!(
+            fix(&MachineClient::Present {
+                version: version("0.9.0")
+            }),
+            None
+        );
+        let missing = fix(&MachineClient::Missing).unwrap();
+        assert!(missing.starts_with("The machine client is not installed at "));
+        assert!(missing.contains(&install_block(&running)));
+        let outdated = fix(&MachineClient::Present {
+            version: version("0.8.5"),
+        })
+        .unwrap();
+        assert!(outdated.contains("is version 0.8.5, and this client is version 0.9.0"));
+        assert!(outdated.ends_with("If you just installed an update, restart Windows."));
+        let unprotected = fix(&MachineClient::Unprotected {
+            reason: "owner".into(),
+        })
+        .unwrap();
+        assert!(unprotected.contains(
+            "is not protected (owner). Ask IT, or uninstall the machine client and install it again"
+        ));
+        assert!(!unprotected.contains("reinstall alone"));
+        assert_eq!(
+            fix(&MachineClient::Unknown {
+                reason: "boom".into()
+            })
+            .unwrap(),
+            "Cannot read the machine client: boom."
+        );
+        // No text names winget until the package is published there.
+        assert!(!missing.contains("winget"));
+    }
+}

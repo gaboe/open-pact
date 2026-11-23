@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use crate::device_config::{DeviceConfig, RunAs};
-use crate::schedule::JobStatus;
+use crate::machine::MachineState;
+use crate::schedule::{JobInspection, JobStatus};
 use crate::{Enrolment, Home, Pins, PublishedManifest, Response, locallog};
 
 /// The options of `status`, without the parser.
@@ -82,6 +83,14 @@ pub struct ScheduleEvidence {
     pub job_status: Option<JobStatus>,
     /// The owner chose a SYSTEM job. Only an elevated prompt can install or update it.
     pub system_job: bool,
+    /// The owner chose a SYSTEM job in the wizard and it is not installed yet.
+    pub system_job_pending: bool,
+    /// The machine client of a SYSTEM job, which is a fact of its own beside the task.
+    pub machine_client: Option<MachineState>,
+    /// The exact text that fixes the machine client, for the desktop to show.
+    pub machine_fix: Option<String>,
+    /// The exact text that fixes the task, for the desktop to show.
+    pub job_fix: Option<String>,
     pub vpn: String,
     pub last_scheduled_claim: Option<ScheduledClaim>,
     pub last_job_note: Option<String>,
@@ -201,7 +210,7 @@ async fn collect_with(
     insecure_dev: bool,
     executable: &Path,
     now: OffsetDateTime,
-    inspect_job: impl FnOnce(&Home, &DeviceConfig) -> Result<JobStatus>,
+    inspect_job: impl FnOnce(&Home, &DeviceConfig) -> Result<JobInspection>,
 ) -> Result<Report> {
     let mut damaged = Vec::new();
     let config = DeviceConfig::load(home).unwrap_or_else(|error| {
@@ -252,6 +261,10 @@ async fn collect_with(
             system_job: !config_damaged
                 && config.auto_send
                 && config.run_as == crate::device_config::RunAs::System,
+            system_job_pending: !config_damaged && config.system_job_pending,
+            machine_client: None,
+            machine_fix: None,
+            job_fix: None,
             vpn: "not probed".into(),
             last_scheduled_claim: tick
                 .last_success
@@ -416,7 +429,7 @@ async fn collect_with(
             inspect_job(home, &config).map(Some)
         } {
             Ok(None) => (),
-            Ok(Some(job)) => report.job(job, &command),
+            Ok(Some(job)) => report.job(&job, home, &command),
             Err(error) => {
                 report.schedule.job = format!("unknown; OS query failed: {error:#}");
                 report.issue(
@@ -544,6 +557,9 @@ async fn collect_with(
             );
         }
     }
+    if !config_damaged && config.system_job_pending {
+        report.pending_system_job(home, online);
+    }
     if let Some(note) = changed_note
         && !report
             .manifest
@@ -573,7 +589,13 @@ async fn collect_with(
             message: "IT revoked this device. It cannot send claims. Contact IT.".into(),
             fix: None,
             command: None,
-            stop_job_command: config.auto_send.then(|| format!("{command} schedule off")),
+            stop_job_command: config.auto_send.then(|| {
+                if config.run_as == RunAs::System {
+                    crate::schedule::system_stop_text(&home.0)
+                } else {
+                    format!("{command} schedule off")
+                }
+            }),
             deadline: if report.approval.live {
                 "Revoked now."
             } else {
@@ -981,7 +1003,8 @@ impl Report {
         Ok(())
     }
 
-    fn job(&mut self, job: JobStatus, command: &str) {
+    fn job(&mut self, inspection: &JobInspection, home: &Home, command: &str) {
+        let job = inspection.job;
         self.schedule.job_status = Some(job);
         self.schedule.job = match job {
             JobStatus::Current => "installed and current; OS checked now",
@@ -992,18 +1015,110 @@ impl Report {
             JobStatus::SystemUnconfirmed => {
                 "SYSTEM job; installation and protected state not inspected"
             }
+            JobStatus::NotOurs => "a SYSTEM task that is not the machine client's; OS checked now",
         }
         .into();
+        self.schedule.machine_client = inspection.machine_state();
+        self.schedule.machine_fix = inspection.machine_fix();
+        self.schedule.job_fix = inspection
+            .is_system()
+            .then(|| inspection.job_fix(&home.0))
+            .flatten();
+        // The package and the task are two facts: each has its own issue and its own fix, and
+        // neither hides the other.
+        if let Some(fix) = self.schedule.machine_fix.clone() {
+            let message = match inspection.machine_state() {
+                Some(MachineState::Missing) => "The machine client is not installed.",
+                Some(MachineState::Unprotected) => "The machine client is not protected.",
+                Some(MachineState::Unknown) => "The machine client cannot be read.",
+                _ => "The machine client is older than this client.",
+            };
+            self.issue_text(
+                Urgency::Action,
+                message,
+                fix,
+                "Before the next automatic claim can run.",
+            );
+        }
         match job {
-            JobStatus::Missing | JobStatus::Outdated if self.schedule.system_job => self.issue(Urgency::Action, "Automatic sending is on, but its job needs installation or update.",
-                "From an elevated prompt, install the job for the signed schedule.", command, "schedule on --system", "Before the next automatic claim can run."),
+            JobStatus::Missing | JobStatus::Outdated | JobStatus::NotOurs
+                if self.schedule.system_job =>
+            {
+                let message = if job == JobStatus::NotOurs {
+                    "A SYSTEM task for this home is not the machine client's. open-pact does not change it."
+                } else {
+                    "Automatic sending is on, but its job needs installation or update."
+                };
+                match self.schedule.job_fix.clone() {
+                    Some(fix) => self.issue_text(
+                        Urgency::Action,
+                        message,
+                        fix,
+                        "Before the next automatic claim can run.",
+                    ),
+                    None if !inspection.is_system() => self.issue(
+                        Urgency::Action,
+                        message,
+                        "From an elevated prompt, install the job for the signed schedule.",
+                        command,
+                        "schedule on --system",
+                        "Before the next automatic claim can run.",
+                    ),
+                    // The machine client line above carries the fix.
+                    None => self.issues.push(Issue {
+                        urgency: Urgency::Action,
+                        message: message.into(),
+                        fix: None,
+                        command: None,
+                        stop_job_command: None,
+                        deadline: "Before the next automatic claim can run.".into(),
+                    }),
+                }
+            }
             JobStatus::Missing | JobStatus::Outdated => self.issue(Urgency::Action, "Automatic sending is on, but its job needs installation or update.",
                 "Install the job for the signed schedule.", command, "schedule on", "Before the next automatic claim can run."),
             JobStatus::Leftover => self.issue(Urgency::Action, "A job or saved state remains while automatic sending is off.",
                 "Remove the job and its saved state.", command, "schedule off", "No grace deadline."),
-            JobStatus::SystemUnconfirmed => self.limitations.push("SYSTEM job installation is unconfirmed. Ask IT to inspect the task from an elevated PowerShell prompt.".into()),
+            JobStatus::SystemUnconfirmed => self.limitations.push(
+                self.schedule
+                    .job_fix
+                    .clone()
+                    .unwrap_or_else(|| "SYSTEM job installation is unconfirmed. Ask IT to inspect the task from an elevated PowerShell prompt.".into()),
+            ),
             _ => (),
         }
+    }
+
+    /// An issue whose fix is a text, such as a block to paste, with no command of its own.
+    fn issue_text(&mut self, urgency: Urgency, message: &str, fix: String, deadline: &str) {
+        self.issues.push(Issue {
+            urgency,
+            message: message.into(),
+            fix: Some(fix),
+            command: None,
+            stop_job_command: None,
+            deadline: deadline.into(),
+        });
+    }
+
+    /// Automatic sending waits for the SYSTEM job that the wizard could not install.
+    fn pending_system_job(&mut self, home: &Home, online: bool) {
+        let fix = if online {
+            crate::schedule::system_on_text(&home.0)
+        } else {
+            crate::machine::machine_command(
+                &home.0,
+                "schedule on --system",
+                &crate::machine::machine_path(),
+                None,
+            )
+        };
+        self.issue_text(
+            Urgency::Action,
+            "Automatic sending waits for the SYSTEM job.",
+            fix,
+            "Before the next automatic claim can run.",
+        );
     }
 
     fn finish(&mut self) {

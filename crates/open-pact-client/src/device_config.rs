@@ -64,6 +64,10 @@ pub(crate) struct DeviceConfig {
     /// or a command created leaves it false.
     #[serde(default)]
     pub(crate) setup_answered: bool,
+    /// The owner chose a SYSTEM job in the wizard and it is not installed yet. `run_as` changes
+    /// only when the install succeeds.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) system_job_pending: bool,
 }
 
 impl DeviceConfig {
@@ -178,7 +182,6 @@ pub(crate) fn legacy_notice(
     surface: Surface,
     command: &str,
     config: &DeviceConfig,
-    executable: &Path,
 ) -> Option<String> {
     let value = legacy_value(home)?;
     let mut given: LegacyNoticeGiven = home
@@ -226,8 +229,8 @@ pub(crate) fn legacy_notice(
     }
     if config.run_as == RunAs::System {
         lines.push(format!(
-            "  An installed SYSTEM job was found. It keeps running the old client copy until you replace it. From an elevated PowerShell prompt run:\n    {}",
-            crate::schedule::apply_command(&home.0, "schedule on --system", executable)
+            "  An installed SYSTEM job was found. A SYSTEM job runs the machine client only, and this client does not change an older task. From an elevated PowerShell prompt run:\n    {}",
+            crate::schedule::system_on_text(&home.0)
         ));
     }
     if value.get("report").is_some() {
@@ -433,13 +436,7 @@ mod tests {
         let (_dir, home) = home();
         let config = DeviceConfig::default();
         assert_eq!(
-            legacy_notice(
-                &home,
-                Surface::Check,
-                "client",
-                &config,
-                &std::env::current_exe().unwrap()
-            ),
+            legacy_notice(&home, Surface::Check, "client", &config,),
             None
         );
         std::fs::write(
@@ -447,14 +444,7 @@ mod tests {
             "[schedule]\nenabled = true\nrun_as = 'user'\nmode = 'vpn'\nvpn_probe = '10.0.0.1:443'\n[managed_repos]\nfolders = ['/work']\n[report]\ncollector = 'https://collector.example.org'\n",
         )
         .unwrap();
-        let notice = legacy_notice(
-            &home,
-            Surface::Check,
-            "client",
-            &config,
-            &std::env::current_exe().unwrap(),
-        )
-        .unwrap();
+        let notice = legacy_notice(&home, Surface::Check, "client", &config).unwrap();
         for expected in [
             "open-pact.toml is ignored now",
             "[schedule] enabled, run_as: turn automatic sending on with `client schedule on`",
@@ -469,35 +459,11 @@ mod tests {
             "`schedule on` takes flags and asks nothing: {notice}"
         );
         assert_eq!(
-            legacy_notice(
-                &home,
-                Surface::Check,
-                "client",
-                &config,
-                &std::env::current_exe().unwrap()
-            ),
+            legacy_notice(&home, Surface::Check, "client", &config,),
             None
         );
-        assert!(
-            legacy_notice(
-                &home,
-                Surface::Job,
-                "client",
-                &config,
-                &std::env::current_exe().unwrap()
-            )
-            .is_some()
-        );
-        assert_eq!(
-            legacy_notice(
-                &home,
-                Surface::Job,
-                "client",
-                &config,
-                &std::env::current_exe().unwrap()
-            ),
-            None
-        );
+        assert!(legacy_notice(&home, Surface::Job, "client", &config,).is_some());
+        assert_eq!(legacy_notice(&home, Surface::Job, "client", &config,), None);
         assert!(home.file(LEGACY_FILE).exists(), "the owner's file stays");
         assert!(
             !home.file(FILE).exists(),
@@ -518,14 +484,7 @@ mod tests {
             folders: vec![PathBuf::from("/work")],
             ..DeviceConfig::default()
         };
-        let notice = legacy_notice(
-            &home,
-            Surface::Check,
-            "client",
-            &config,
-            &std::env::current_exe().unwrap(),
-        )
-        .unwrap();
+        let notice = legacy_notice(&home, Surface::Check, "client", &config).unwrap();
         assert!(
             notice.contains("imported into device.json")
                 && notice.contains("client folders remove <path>")
@@ -538,14 +497,8 @@ mod tests {
     fn an_unparseable_toml_is_still_ignored_with_a_notice() {
         let (_dir, home) = home();
         std::fs::write(home.file(LEGACY_FILE), "[managed_repos\n").unwrap();
-        let notice = legacy_notice(
-            &home,
-            Surface::Check,
-            "client",
-            &DeviceConfig::default(),
-            &std::env::current_exe().unwrap(),
-        )
-        .unwrap();
+        let notice =
+            legacy_notice(&home, Surface::Check, "client", &DeviceConfig::default()).unwrap();
         assert!(notice.contains("ignored now") && !notice.contains("folders add"));
         assert!(legacy_folders(&home, None).is_empty());
     }
@@ -653,14 +606,7 @@ mod tests {
             run_as: RunAs::System,
             ..DeviceConfig::default()
         };
-        let notice = legacy_notice(
-            &home,
-            Surface::Job,
-            "client",
-            &config,
-            &std::env::current_exe().unwrap(),
-        )
-        .unwrap();
+        let notice = legacy_notice(&home, Surface::Job, "client", &config).unwrap();
         assert!(
             notice.contains("elevated")
                 && notice.contains("schedule on --system")

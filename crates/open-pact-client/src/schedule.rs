@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 
 use crate::claim::{self, NotSent, Outcome, ScanPolicy};
 use crate::device_config::{self, DeviceConfig, RunAs};
+use crate::machine::{MachineClient, MachineState, same_windows_path};
 use crate::{Home, checks};
 
 const STATE: &str = "report-state.json";
@@ -54,6 +55,8 @@ pub enum Command {
         system: bool,
         user: bool,
         dry_run: bool,
+        /// The profile a SYSTEM job reads. Only with `system`.
+        user_home: Option<PathBuf>,
     },
     Off {
         dry_run: bool,
@@ -73,6 +76,8 @@ enum Operation {
     Install {
         system: bool,
         user_home: Option<PathBuf>,
+        /// A SYSTEM update keeps the state of the running job.
+        keep_state: bool,
     },
     Uninstall {
         system: bool,
@@ -136,6 +141,9 @@ struct State {
     /// fails the same way does not force another.
     #[serde(default)]
     removal_failed: bool,
+    /// The client version that last ran this job, so the job log names each version once.
+    #[serde(default)]
+    client_version: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -433,12 +441,12 @@ fn next_due_lines(schedule: &Schedule, state: &State, now: i64) -> Vec<String> {
 
 /// The home that holds the job's saved state: the client home for a user job, the protected
 /// directory of the SYSTEM job on Windows.
-fn job_state_home(home: &Home, run_as: RunAs, executable: &Path) -> Result<Home> {
+fn job_state_home(home: &Home, run_as: RunAs, _executable: &Path) -> Result<Home> {
     let absolute = Home(schedule_home(&home.0, true)?);
     match run_as {
         RunAs::User => Ok(absolute),
         RunAs::System if crate::current_os()? == open_pact_core::Os::Windows => Ok(Home(
-            windows_protected_paths(&absolute, false, executable)?.1,
+            windows_protected_paths(&absolute, &crate::machine::machine_path())?,
         )),
         RunAs::System => bail!("a SYSTEM job exists only on Windows"),
     }
@@ -821,14 +829,18 @@ impl RegistrationAction {
     }
 }
 
+/// The id of the OS job of `home`: the first 16 hex digits of the SHA-256 of the home path.
+fn task_id(home: &Path) -> Result<String> {
+    Ok(format!(
+        "org.open-pact.report.{}",
+        &hex::encode(Sha256::digest(text(home)?.as_bytes()))[..16]
+    ))
+}
+
 impl Job {
     fn new(executable: &Path, home: &Path) -> Result<Self> {
-        let id = format!(
-            "org.open-pact.report.{}",
-            &hex::encode(Sha256::digest(text(home)?.as_bytes()))[..16]
-        );
         Ok(Self {
-            id,
+            id: task_id(home)?,
             argv: vec![
                 text(executable)?.into(),
                 "--home".into(),
@@ -1175,14 +1187,28 @@ fn validate_windows_home(home: &Path) -> Result<()> {
     Ok(())
 }
 
-fn powershell_literal(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
+/// A PowerShell string literal. It doubles the ASCII apostrophe and the four typographic single
+/// quotes, which PowerShell reads as quote characters too. It is the one literal function of the
+/// client.
+pub(crate) fn powershell_literal(value: &str) -> String {
+    let mut literal = String::from("'");
+    for character in value.chars() {
+        literal.push(character);
+        if matches!(
+            character,
+            '\'' | '\u{2018}' | '\u{2019}' | '\u{201a}' | '\u{201b}'
+        ) {
+            literal.push(character);
+        }
+    }
+    literal.push('\'');
+    literal
 }
 
-fn windows_powershell(script: &str) -> Result<String> {
+pub(crate) fn windows_powershell(script: &str) -> Result<String> {
     let script =
         format!("[Console]::OutputEncoding = New-Object Text.UTF8Encoding($false);\n{script}");
-    let mut command = std::process::Command::new("powershell.exe");
+    let mut command = std::process::Command::new(crate::machine::system_powershell());
     command.args([
         "-NoLogo",
         "-NoProfile",
@@ -1208,8 +1234,10 @@ fn windows_powershell(script: &str) -> Result<String> {
     Ok(String::from_utf8(output.stdout)?.trim().to_owned())
 }
 
-const PROTECTED_DIRECTORY: &str = r#"
-$ErrorActionPreference = 'Stop'
+/// The check that a path is protected: owned by SYSTEM, the administrators or TrustedInstaller, and
+/// writable by none of the others. The machine client, its folder and Program Files pass it by
+/// inheritance: it skips inherit-only rules.
+pub(crate) const ASSERT_PROTECTED: &str = r#"$ErrorActionPreference = 'Stop'
 function AssertProtected($path) {
     $item = Get-Item -LiteralPath $path -Force
     if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Protected path is a reparse point' }
@@ -1223,7 +1251,10 @@ function AssertProtected($path) {
         }
     }
 }
-function ProgramFilesPath { [Environment]::GetFolderPath('ProgramFiles') }
+"#;
+
+/// The helpers that prepare the protected state folders. They call \`AssertProtected\`.
+const PROTECTED_DIRECTORY: &str = r#"
 function IsAdminOwner($owner) {
     if (@('S-1-5-18','S-1-5-32-544') -contains $owner) { return $true }
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -1267,64 +1298,6 @@ function ResetSystemStateDirectory($path) {
     [IO.Directory]::SetAccessControl($path,$acl)
     AssertProtected $path
 }
-function RemovePendingDeletes($path, $strict = $false) {
-    if (-not [IO.Directory]::Exists($path)) { return }
-    $failed = [Collections.Generic.List[string]]::new()
-    $errorMode = if ($strict) { 'Stop' } else { 'SilentlyContinue' }
-    Get-ChildItem -LiteralPath $path -Filter 'open-pact-client.exe.delete-*' -File -Force -ErrorAction $errorMode | ForEach-Object {
-        try { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop } catch { [void]$failed.Add($_.FullName) }
-    }
-    if ($strict -and $failed.Count -gt 0) { throw "could not remove SYSTEM binary leftovers: $($failed -join ', ')" }
-}
-function IsSystemTask($task) {
-    $user = $task.Definition.Principal.UserId
-    return @('SYSTEM','NT AUTHORITY\SYSTEM','S-1-5-18') -contains $user.ToUpperInvariant()
-}
-function QueueBinaryRemoval($binary) {
-    if (-not ('OpenPactNative' -as [type])) {
-        Add-Type -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-public static class OpenPactNative {
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true, EntryPoint = "MoveFileExW")]
-    private static extern bool MoveFileEx(string existing, string destination, int flags);
-    public static bool QueueDelete(string existing) { return MoveFileEx(existing, null, 4); }
-}
-'@
-    }
-    $pending = "$binary.delete-$([Guid]::NewGuid().ToString('N'))"
-    [IO.File]::Move($binary,$pending)
-    if (-not [OpenPactNative]::QueueDelete($pending)) {
-        $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
-        try { [IO.File]::Move($pending,$binary) } catch {}
-        throw (New-Object ComponentModel.Win32Exception($errorCode))
-    }
-}
-"#;
-
-/// Lets standard users read the install folder of the SYSTEM client, and nothing else. A standard
-/// user then reads the protected binary, so `status` can tell that the SYSTEM job is outdated. It
-/// is only for the install folder: the state folders under ProgramData stay SYSTEM and
-/// Administrators only. It adds the rule when it is missing, removes no rule, and ends with
-/// `AssertProtected`, which still rejects write rights of non-admins (ReadAndExecute is outside its
-/// 0xD0156 mask).
-const USERS_READ_DIRECTORY: &str = r#"
-function AllowUsersRead($path) {
-    AssertProtected $path
-    $users = New-Object Security.Principal.SecurityIdentifier('S-1-5-32-545')
-    $read = [int][Security.AccessControl.FileSystemRights]::ReadAndExecute
-    $acl = [IO.Directory]::GetAccessControl($path)
-    $present = $false
-    foreach ($rule in $acl.GetAccessRules($true,$false,[Security.Principal.SecurityIdentifier])) {
-        if ($rule.AccessControlType -eq 'Allow' -and $rule.IdentityReference.Value -eq 'S-1-5-32-545' -and (([int]$rule.FileSystemRights -band $read) -eq $read) -and [int]$rule.InheritanceFlags -eq 3 -and [int]$rule.PropagationFlags -eq 0) { $present = $true }
-    }
-    if (-not $present) {
-        $rule = New-Object Security.AccessControl.FileSystemAccessRule($users,'ReadAndExecute','ContainerInherit,ObjectInherit','None','Allow')
-        $acl.AddAccessRule($rule)
-        [IO.Directory]::SetAccessControl($path,$acl)
-    }
-    AssertProtected $path
-}
 "#;
 
 /// The job log of the SYSTEM job of `home`, in its protected state folder. It is computed from
@@ -1344,54 +1317,38 @@ fn system_job_log_in(program_data: &Path, absolute: &Path) -> Result<PathBuf> {
         .join(JOB_LOG))
 }
 
-fn windows_protected_paths(
-    home: &Home,
-    copy_binary: bool,
-    executable: &Path,
-) -> Result<(PathBuf, PathBuf)> {
+/// Checks Program Files, the folder and the file of the machine client, and prepares the protected
+/// state folder of the SYSTEM job. Returns the state folder.
+fn windows_protected_paths(home: &Home, machine: &Path) -> Result<PathBuf> {
     let absolute = &home.0;
     validate_windows_home(absolute)?;
     let hash = hex::encode(Sha256::digest(text(absolute)?.as_bytes()));
-    let source = powershell_literal(text(executable)?);
-    let script = windows_protected_paths_script(&hash, &source, copy_binary);
-    let paths = windows_powershell(&script)?;
-    let mut lines = paths.lines();
-    let binary = PathBuf::from(lines.next().context("protected binary path missing")?);
+    let script = windows_protected_paths_script(&hash, &powershell_literal(text(machine)?));
+    let output = windows_powershell(&script)?;
+    let mut lines = output.lines();
     let state = PathBuf::from(lines.next().context("protected state path missing")?);
     if lines.next().is_some() {
         bail!("unexpected protected path output");
     }
-    Ok((binary, state))
+    Ok(state)
 }
 
-fn windows_protected_paths_script(hash: &str, source: &str, copy_binary: bool) -> String {
+fn windows_protected_paths_script(hash: &str, machine: &str) -> String {
     format!(
-        r#"{PROTECTED_DIRECTORY}{USERS_READ_DIRECTORY}
-$program = ProgramFilesPath
-AssertProtected $program
-$install = Join-Path $program 'open-pact'
-ProtectedDirectory $install
-$binary = Join-Path $install 'open-pact-client.exe'
-if (Test-Path -LiteralPath $binary) {{ AssertProtected $binary }}
-if ({copy}) {{
-    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
-    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {{ exit 5 }}
-    AllowUsersRead $install
-    RemovePendingDeletes $install
-    if ([IO.Path]::GetFullPath({source}) -ne $binary) {{ Copy-Item -LiteralPath {source} -Destination $binary -Force }}
-    AssertProtected $binary
-}}
+        r#"{ASSERT_PROTECTED}{PROTECTED_DIRECTORY}
+$machine = {machine}
+$folder = Split-Path -Parent $machine
+AssertProtected (Split-Path -Parent $folder)
+AssertProtected $folder
+AssertProtected $machine
 $data = Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'open-pact'
 ProtectedDirectory $data
 $data = Join-Path $data 'system'
 ProtectedDirectory $data
 $data = Join-Path $data '{hash}'
 ResetSystemStateDirectory $data
-Write-Output $binary
 Write-Output $data
-"#,
-        copy = if copy_binary { "$true" } else { "$false" },
+"#
     )
 }
 
@@ -1422,12 +1379,6 @@ $principal = New-Object Security.Principal.WindowsPrincipal($identity)
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     throw 'run `schedule on` or `schedule off` from an elevated prompt'
 }"#
-}
-
-fn windows_system_executable_script() -> String {
-    format!(
-        "{PROTECTED_DIRECTORY}\nWrite-Output (Join-Path (ProgramFilesPath) 'open-pact\\open-pact-client.exe')"
-    )
 }
 
 fn windows_require_elevation() -> Result<()> {
@@ -1511,7 +1462,7 @@ fn windows_existing_system_state(home: &Path) -> Result<Option<PathBuf>> {
 
 fn windows_existing_system_state_script(hash: &str) -> String {
     format!(
-        r#"{PROTECTED_DIRECTORY}
+        r#"{ASSERT_PROTECTED}
 $data = Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'open-pact'
 $system = Join-Path $data 'system'
 $state = Join-Path $system '{hash}'
@@ -1521,86 +1472,6 @@ if (Test-Path -LiteralPath $state) {{
     AssertProtected $state
     Write-Output $state
 }}
-"#
-    )
-}
-
-/// Whether two Windows paths name the same file: ignores case and a `\\?\` prefix.
-fn same_windows_path(left: &Path, right: &Path) -> bool {
-    let normal = |path: &Path| {
-        let text = path.to_string_lossy().to_lowercase();
-        text.strip_prefix(r"\\?\").unwrap_or(&text).to_owned()
-    };
-    normal(left) == normal(right)
-}
-
-/// Whether the protected SYSTEM binary is the image of this process. It stays locked until this
-/// process ends, so waiting for its removal cannot succeed.
-fn windows_runs_from_protected_binary() -> bool {
-    let Ok(protected) = windows_powershell(&windows_system_executable_script()) else {
-        return false;
-    };
-    std::env::current_exe()
-        .is_ok_and(|current| same_windows_path(&current, Path::new(protected.trim())))
-}
-
-fn windows_cleanup_binary(job: &Job) -> Result<()> {
-    let output = windows_powershell(&windows_cleanup_binary_script(
-        job,
-        windows_runs_from_protected_binary(),
-    ))?;
-    if !output.is_empty() {
-        println!("{output}");
-    }
-    Ok(())
-}
-
-fn windows_cleanup_binary_script(job: &Job, running_image: bool) -> String {
-    let query = windows_task_query_script(job);
-    let attempt = if running_image {
-        String::new()
-    } else {
-        format!(
-            r#"
-        $deadline = [DateTime]::UtcNow.AddSeconds({wait})
-        while ($true) {{
-            try {{ Remove-Item -LiteralPath $binary -Force -ErrorAction Stop; $removed = $true; break }} catch {{}}
-            if ([DateTime]::UtcNow -ge $deadline) {{ break }}
-            Start-Sleep -Milliseconds {step}
-        }}"#,
-            wait = SYSTEM_WAIT.as_secs(),
-            step = SYSTEM_WAIT_STEP.as_millis(),
-        )
-    };
-    format!(
-        r#"{PROTECTED_DIRECTORY}
-{query}
-$install = Join-Path (ProgramFilesPath) 'open-pact'
-if (-not (Test-Path -LiteralPath $install)) {{ return }}
-AssertProtected $install
-$remaining = @($folder.GetTasks(1) | Where-Object {{ $_.Name.StartsWith('org.open-pact.report.') -and (IsSystemTask $_) }})
-if ($remaining.Count -gt 0) {{
-    Write-Output 'Kept the shared SYSTEM binary because another SYSTEM task remains.'
-    return
-}}
-$failure = $null
-try {{
-    RemovePendingDeletes $install $true
-    $binary = Join-Path $install 'open-pact-client.exe'
-    if (Test-Path -LiteralPath $binary) {{
-        AssertProtected $binary
-        $removed = $false{attempt}
-        if (-not $removed) {{
-            QueueBinaryRemoval $binary
-            Write-Output 'The SYSTEM client binary is queued for removal at the next reboot.'
-        }}
-    }}
-}} catch {{ $failure = $_.Exception.Message }}
-$leftovers = @(Get-ChildItem -LiteralPath $install -Filter 'open-pact-client.exe*' -File -Force -ErrorAction Stop)
-if ($leftovers.Count -gt 0) {{
-    throw "SYSTEM files remain: $($leftovers.FullName -join ', '). $failure Retry the schedule command, or reboot for queued files."
-}}
-if ($null -ne $failure) {{ throw $failure }}
 "#
     )
 }
@@ -1727,9 +1598,6 @@ fn windows_system_uninstall_held(job: &Job, state: Option<PathBuf>) -> Result<()
             "SYSTEM job state remains at {}: {error}",
             state.display()
         ));
-    }
-    if let Err(error) = windows_cleanup_binary(job) {
-        failures.push(format!("{error:#}"));
     }
     if !failures.is_empty() {
         if was_enabled {
@@ -2082,6 +1950,16 @@ struct Applied {
     user_home: Option<PathBuf>,
 }
 
+impl Applied {
+    /// Whether `other` asks for the same job. A SYSTEM job runs the machine client, so its action
+    /// path comes from observation and the receipt compares only who runs it and whose profile it reads.
+    fn same_intent(&self, other: &Self) -> bool {
+        self.run_as == other.run_as
+            && self.user_home == other.user_home
+            && (self.run_as == RunAs::System || self.executable == other.executable)
+    }
+}
+
 /// What `schedule-applied.json` records. A file an earlier client wrote has another shape and
 /// reads as nothing, so `schedule on` replaces the job.
 fn read_applied(home: &Home) -> Result<Option<Applied>> {
@@ -2102,83 +1980,209 @@ struct Observed {
     windows_task: Option<WindowsTaskState>,
 }
 
-#[derive(Debug, Default)]
+/// What Task Scheduler says about a Windows task.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct WindowsTaskState {
+    enabled: bool,
+    triggers: usize,
     trigger_enabled: bool,
     trigger_type: Option<i32>,
     /// The repeat interval of the trigger, as Task Scheduler writes it (such as `PT1M`).
     repetition: Option<String>,
-    protected_binary: Option<ProtectedBinaryState>,
+    actions: Vec<ObservedAction>,
 }
 
-#[derive(Debug, Default)]
-struct ProtectedBinaryState {
-    exists: bool,
-    matches_source: bool,
-}
-
-/// What the PowerShell probe printed about the protected copy of the client in Program Files.
-/// Nothing when the probe printed no complete answer.
-fn protected_binary(output: &str) -> Option<ProtectedBinaryState> {
-    let field = |name: &str| {
-        output
-            .lines()
-            .find_map(|line| line.strip_prefix(name))
-            .and_then(|value| value.trim().parse::<i32>().ok())
-    };
-    Some(ProtectedBinaryState {
-        exists: field("protected_exists=")? == 1,
-        matches_source: field("protected_matches=")? == 1,
-    })
-}
-
-/// What a SYSTEM job reads as without elevation. The job cannot update itself: copying a client
-/// that any user can write into Program Files as SYSTEM would hand that user SYSTEM. So the
-/// owner updates it with `schedule on --system`, and this tells the owner when to. A protected
-/// copy that is not this client is out of date. Every other answer stays unconfirmed.
-fn system_job_status(protected: Option<&ProtectedBinaryState>) -> JobStatus {
-    match protected {
-        Some(binary) if binary.exists && !binary.matches_source => JobStatus::Outdated,
-        _ => JobStatus::SystemUnconfirmed,
-    }
-}
-
-fn windows_protected_binary_probe(source: &str) -> String {
-    format!(
-        r#"$protected = Join-Path (Join-Path (ProgramFilesPath) 'open-pact') 'open-pact-client.exe'
-$protectedExists = Test-Path -LiteralPath $protected -PathType Leaf
-Write-Output ("protected_exists=" + [int]$protectedExists)
-$protectedMatches = $protectedExists -and (Get-FileHash -LiteralPath $protected -Algorithm SHA256).Hash -eq (Get-FileHash -LiteralPath {source} -Algorithm SHA256).Hash
-Write-Output ("protected_matches=" + [int]$protectedMatches)"#
-    )
-}
-
-/// Compares the protected copy of the client with `executable`. It reads Program Files only, so it
-/// needs no elevation. `None` when the OS is not Windows or the probe fails.
-fn read_protected_binary(executable: &Path) -> Option<ProtectedBinaryState> {
-    if crate::current_os().ok()? != open_pact_core::Os::Windows {
-        return None;
-    }
-    protected_binary(&windows_powershell(&windows_protected_binary_script(executable).ok()?).ok()?)
-}
-
-fn windows_protected_binary_script(executable: &Path) -> Result<String> {
-    let probe = windows_protected_binary_probe(&powershell_literal(text(executable)?));
-    Ok(format!(
-        "function ProgramFilesPath {{ [Environment]::GetFolderPath('ProgramFiles') }}\n$ErrorActionPreference = 'Stop'\ntry {{\n{probe}\n}} catch {{ return }}"
-    ))
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ObservedAction {
+    path: String,
+    args: String,
 }
 
 impl WindowsTaskState {
-    fn matches_desired(&self, system: bool) -> bool {
-        self.trigger_enabled
+    /// The task is enabled and wakes every minute: one enabled trigger of the right type and
+    /// interval.
+    fn shape_matches(&self) -> bool {
+        self.enabled
+            && self.triggers == 1
+            && self.trigger_enabled
             && self.trigger_type == Some(1)
             && self.repetition.as_deref() == Some(WAKE_ISO)
-            && (!system
-                || self
-                    .protected_binary
-                    .as_ref()
-                    .is_some_and(|binary| binary.exists && binary.matches_source))
+    }
+}
+
+/// What a SYSTEM-mode look at a task finds. Only a task whose principal is SYSTEM is ever `NotOurs`
+/// or reads as ours: a task with the id that runs as a user is a user job.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SystemTask {
+    Missing,
+    User,
+    /// A SYSTEM task whose actions are not the machine client alone.
+    NotOurs {
+        action: String,
+    },
+    /// A SYSTEM task whose one action is the machine client. `profile` is the valid `--user-home` the
+    /// task carries.
+    Ours {
+        profile: Option<PathBuf>,
+        current: bool,
+    },
+}
+
+impl Observed {
+    /// Classifies the observed task against the machine client at `machine`. `fallback` is the
+    /// profile to expect when the task carries no valid one.
+    fn system_task(&self, machine: &Path, home: &Path, fallback: Option<&Path>) -> SystemTask {
+        if !self.exists {
+            return SystemTask::Missing;
+        }
+        if !self.system {
+            return SystemTask::User;
+        }
+        let task = self.windows_task.as_ref();
+        let actions = task.map_or(&[][..], |task| task.actions.as_slice());
+        let [action] = actions else {
+            return SystemTask::NotOurs {
+                action: describe_actions(actions),
+            };
+        };
+        if !same_windows_path(Path::new(unquote(&action.path)), machine) {
+            return SystemTask::NotOurs {
+                action: describe_actions(actions),
+            };
+        }
+        let profile = task_user_home(&action.args)
+            .and_then(|value| crate::machine::validate_user_home(Path::new(&value)).ok());
+        let expected = profile.as_deref().or(fallback);
+        let current = task.is_some_and(WindowsTaskState::shape_matches)
+            && expected
+                .and_then(|profile| system_arguments(machine, home, profile).ok())
+                .is_some_and(|expected| action.args.trim().eq_ignore_ascii_case(&expected));
+        SystemTask::Ours { profile, current }
+    }
+}
+
+fn unquote(path: &str) -> &str {
+    let path = path.trim();
+    path.strip_prefix('"')
+        .and_then(|inner| inner.strip_suffix('"'))
+        .unwrap_or(path)
+}
+
+fn describe_actions(actions: &[ObservedAction]) -> String {
+    if actions.is_empty() {
+        return "no program".into();
+    }
+    actions
+        .iter()
+        .map(|action| unquote(&action.path))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The arguments that `schtasks /TR` stores for the SYSTEM task of `home` that runs `machine`.
+fn system_arguments(machine: &Path, home: &Path, profile: &Path) -> Result<String> {
+    Ok(windows_task_arguments(
+        &Job::new(machine, home)?.for_system(profile)?,
+    ))
+}
+
+/// The command line after the program, as `schtasks /TR` stores it.
+fn windows_task_arguments(job: &Job) -> String {
+    job.argv
+        .iter()
+        .skip(1)
+        .map(|arg| windows_arg(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The words of a Windows command line, by the rules of `CommandLineToArgvW`.
+fn split_windows_args(line: &str) -> Vec<String> {
+    let chars: Vec<char> = line.chars().collect();
+    let mut args = Vec::new();
+    let mut at = 0;
+    loop {
+        while at < chars.len() && matches!(chars[at], ' ' | '\t') {
+            at += 1;
+        }
+        if at >= chars.len() {
+            return args;
+        }
+        let mut arg = String::new();
+        let mut quoted = false;
+        loop {
+            let mut slashes = 0;
+            while at < chars.len() && chars[at] == '\\' {
+                slashes += 1;
+                at += 1;
+            }
+            if at < chars.len() && chars[at] == '"' {
+                arg.push_str(&"\\".repeat(slashes / 2));
+                if slashes % 2 == 1 {
+                    arg.push('"');
+                } else {
+                    quoted = !quoted;
+                }
+                at += 1;
+            } else {
+                arg.push_str(&"\\".repeat(slashes));
+                if at >= chars.len() || (!quoted && matches!(chars[at], ' ' | '\t')) {
+                    break;
+                }
+                arg.push(chars[at]);
+                at += 1;
+            }
+        }
+        args.push(arg);
+    }
+}
+
+/// The value after `--user-home` in the arguments of a task.
+fn task_user_home(args: &str) -> Option<String> {
+    let words = split_windows_args(args);
+    let at = words.iter().position(|word| word == "--user-home")?;
+    words.get(at + 1).cloned()
+}
+
+/// What the observation script printed about one task.
+struct ParsedTask {
+    exists: bool,
+    system: bool,
+    task: Option<WindowsTaskState>,
+    script_matches: bool,
+}
+
+fn parse_windows_task(output: &str) -> ParsedTask {
+    let exists = output.lines().next().map(str::trim) != Some("missing");
+    let mut task = WindowsTaskState::default();
+    for line in output.lines() {
+        let value = |name: &str| line.strip_prefix(name).map(str::trim);
+        if let Some(value) = value("task_enabled=") {
+            task.enabled = value == "1";
+        } else if let Some(value) = value("trigger_count=") {
+            task.triggers = value.parse().unwrap_or(0);
+        } else if let Some(value) = value("trigger_enabled=") {
+            task.trigger_enabled = value == "1";
+        } else if let Some(value) = value("trigger_type=") {
+            task.trigger_type = value.parse().ok();
+        } else if let Some(value) = value("repetition=") {
+            task.repetition = Some(value.to_owned());
+        } else if let Some(value) = value("action_path=") {
+            task.actions.push(ObservedAction {
+                path: value.to_owned(),
+                args: String::new(),
+            });
+        } else if let Some(value) = value("action_args=")
+            && let Some(last) = task.actions.last_mut()
+        {
+            last.args = value.to_owned();
+        }
+    }
+    ParsedTask {
+        exists,
+        system: output.lines().any(|line| line.trim() == "system"),
+        task: exists.then_some(task),
+        script_matches: output.lines().any(|line| line.trim() == "matches"),
     }
 }
 
@@ -2194,12 +2198,12 @@ fn reconcile(desired: Option<&Applied>, applied: Option<&Applied>, observed: &Ob
     match desired {
         Some(_) if !observed.exists => Change::Install,
         Some(desired)
-            if Some(desired) != applied
+            if applied.is_none_or(|applied| !desired.same_intent(applied))
                 || !observed.matches
                 || observed
                     .windows_task
                     .as_ref()
-                    .is_some_and(|task| !task.matches_desired(desired.run_as == RunAs::System)) =>
+                    .is_some_and(|task| !task.shape_matches()) =>
         {
             Change::Update
         }
@@ -2217,31 +2221,28 @@ fn read_text_if_exists(path: &Path) -> Result<Option<String>> {
     }
 }
 
-fn windows_observation_script(job: &Job, source_executable: &Path) -> Result<String> {
+fn windows_observation_script(job: &Job) -> String {
     let query = windows_task_query_script(job);
-    Ok(format!(
-        r#"function ProgramFilesPath {{ [Environment]::GetFolderPath('ProgramFiles') }}
-{query}
+    format!(
+        r#"{query}
 if ($null -eq $task) {{ Write-Output 'missing'; return }}
 if (IsSystemTask $task) {{ Write-Output 'system' }} else {{ Write-Output 'user' }}
 $action = @($task.Definition.Actions)
 $triggers = @($task.Definition.Triggers)
+Write-Output ("task_enabled=" + [int]$task.Enabled)
+Write-Output ("trigger_count=" + $triggers.Count)
 if ($triggers.Count -eq 1) {{
     Write-Output ("trigger_enabled=" + [int]$triggers[0].Enabled)
     Write-Output ("trigger_type=" + $triggers[0].Type)
     Write-Output ("repetition=" + $triggers[0].Repetition.Interval)
 }}
-if (IsSystemTask $task) {{
-{probe}
-}}
-if ($action.Count -eq 1) {{
-    Write-Output ("action_path=" + $action[0].Path)
-    Write-Output ("action_args=" + $action[0].Arguments)
+foreach ($item in $action) {{
+    Write-Output ("action_path=" + $item.Path)
+    Write-Output ("action_args=" + $item.Arguments)
 }}
 if ($action.Count -eq 1 -and $task.Enabled -and $triggers.Count -eq 1 -and $triggers[0].Enabled -and $triggers[0].Type -eq 1 -and $triggers[0].Repetition.Interval -eq '{WAKE_ISO}') {{ Write-Output 'matches' }}
-"#,
-        probe = windows_protected_binary_probe(&powershell_literal(text(source_executable)?)),
-    ))
+"#
+    )
 }
 
 fn observe(
@@ -2250,29 +2251,15 @@ fn observe(
     inspect_protected: bool,
     current_executable: &Path,
 ) -> Result<Observed> {
-    let source_executable = desired
-        .map(|settings| settings.executable.clone())
-        .unwrap_or_else(|| current_executable.to_path_buf());
     let executable = desired
         .map(|settings| settings.executable.clone())
         .unwrap_or_else(|| current_executable.to_path_buf());
-    let executable = if crate::current_os()? == open_pact_core::Os::Windows
-        && desired.is_some_and(|settings| settings.run_as == RunAs::System)
-    {
-        PathBuf::from(windows_powershell(&windows_system_executable_script())?)
-    } else {
-        executable
-    };
     let mut job = Job::new(&executable, &home.0)?;
     if let Some(settings) = desired
         && settings.run_as == RunAs::System
+        && let Some(user_home) = settings.user_home.as_deref()
     {
-        job = job.for_system(
-            settings
-                .user_home
-                .as_deref()
-                .context("a SYSTEM schedule needs the user home it reads")?,
-        )?;
+        job = job.for_system(user_home)?;
     }
     let leftovers = home_schedule_has_leftovers(home);
     Ok(match crate::current_os()? {
@@ -2316,46 +2303,36 @@ fn observe(
             }
         }
         open_pact_core::Os::Windows => {
-            let expected_args = job
-                .argv
-                .iter()
-                .skip(1)
-                .map(|arg| windows_arg(arg))
-                .collect::<Vec<_>>()
-                .join(" ");
-            let script = windows_observation_script(&job, &source_executable)?;
-            let output = windows_powershell(&script)?;
-            let system = output.lines().any(|line| line == "system");
-            let field = |name: &str| {
-                output
-                    .lines()
-                    .find_map(|line| line.strip_prefix(name))
-                    .and_then(|value| value.parse::<i32>().ok())
-            };
-            let windows_task = output
-                .lines()
-                .any(|line| line.starts_with("trigger_enabled="))
-                .then(|| WindowsTaskState {
-                    trigger_enabled: field("trigger_enabled=") == Some(1),
-                    trigger_type: field("trigger_type="),
-                    repetition: output
-                        .lines()
-                        .find_map(|line| line.strip_prefix("repetition="))
-                        .map(|value| value.trim().to_owned()),
-                    protected_binary: system.then(|| protected_binary(&output).unwrap_or_default()),
-                });
-            let protected_leftovers = inspect_protected
-                && (windows_existing_system_state(&home.0)?.is_some()
-                    || windows_orphaned_binary(&job)?);
-            Observed {
-                exists: output.lines().next() != Some("missing"),
-                matches: output.lines().any(|line| line == "matches")
+            let expected_args = windows_task_arguments(&job);
+            let output = windows_powershell(&windows_observation_script(&job))?;
+            let parsed = parse_windows_task(&output);
+            let wants_system = desired.is_some_and(|settings| settings.run_as == RunAs::System);
+            let matches = if wants_system {
+                parsed.system
+                    && desired.is_some_and(|settings| settings.user_home.is_some())
+                    && parsed.task.as_ref().is_some_and(|task| {
+                        task.shape_matches()
+                            && task.actions.len() == 1
+                            && observed_action_matches(
+                                &task.actions[0],
+                                &executable.to_string_lossy(),
+                                &expected_args,
+                            )
+                    })
+            } else {
+                parsed.script_matches
                     && windows_action_matches(&output, text(&executable)?, &expected_args)
-                    && system == desired.is_some_and(|settings| settings.run_as == RunAs::System),
-                system,
+                    && !parsed.system
+            };
+            let protected_leftovers =
+                inspect_protected && windows_existing_system_state(&home.0)?.is_some();
+            Observed {
+                exists: parsed.exists,
+                matches,
+                system: parsed.system,
                 leftovers: leftovers || protected_leftovers,
                 protected_leftovers,
-                windows_task,
+                windows_task: parsed.task,
             }
         }
     })
@@ -2363,17 +2340,23 @@ fn observe(
 
 /// Task Scheduler stores the command exactly as `schtasks /TR` got it, so the program comes back
 /// with its quotes (`"C:\\client.exe"`). The paths of Windows ignore case.
+fn observed_action_matches(action: &ObservedAction, executable: &str, expected_args: &str) -> bool {
+    same_windows_path(Path::new(unquote(&action.path)), Path::new(executable))
+        && action.args.trim().eq_ignore_ascii_case(expected_args)
+}
+
+/// Whether the one action in the observation output runs `executable` with `expected_args`.
 fn windows_action_matches(output: &str, executable: &str, expected_args: &str) -> bool {
-    let field = |name: &str| output.lines().find_map(|line| line.strip_prefix(name));
-    let (Some(path), Some(args)) = (field("action_path="), field("action_args=")) else {
-        return false;
-    };
-    let path = path.trim();
-    let path = path
-        .strip_prefix('"')
-        .and_then(|inner| inner.strip_suffix('"'))
-        .unwrap_or(path);
-    path.eq_ignore_ascii_case(executable) && args.trim().eq_ignore_ascii_case(expected_args)
+    let task = parse_windows_task(output).task.unwrap_or_default();
+    task.actions.len() == 1
+        && same_windows_path(
+            Path::new(unquote(&task.actions[0].path)),
+            Path::new(executable),
+        )
+        && task.actions[0]
+            .args
+            .trim()
+            .eq_ignore_ascii_case(expected_args)
 }
 
 /// The exact command that makes `change` (such as `schedule off`) from an elevated prompt.
@@ -2400,27 +2383,6 @@ fn needs_system_cleanup(requested_system: bool, removing: bool, observed: &Obser
     requested_system || observed.system || (removing && observed.protected_leftovers)
 }
 
-fn windows_orphaned_binary(job: &Job) -> Result<bool> {
-    let output = windows_powershell(&windows_orphaned_binary_script(job))?;
-    Ok(output == "leftovers")
-}
-
-fn windows_orphaned_binary_script(job: &Job) -> String {
-    let query = windows_task_query_script(job);
-    format!(
-        r#"{PROTECTED_DIRECTORY}
-{query}
-$remaining = @($folder.GetTasks(1) | Where-Object {{ $_.Name.StartsWith('org.open-pact.report.') -and (IsSystemTask $_) }})
-if ($remaining.Count -gt 0) {{ return }}
-$install = Join-Path (ProgramFilesPath) 'open-pact'
-if (Test-Path -LiteralPath $install) {{
-    AssertProtected $install
-    if (@(Get-ChildItem -LiteralPath $install -Filter 'open-pact-client.exe*' -File -Force -ErrorAction Stop).Count -gt 0) {{ Write-Output 'leftovers' }}
-}}
-"#
-    )
-}
-
 /// What the owner wants the job to be.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Wanted {
@@ -2439,9 +2401,35 @@ impl Wanted {
     }
 }
 
+/// The profile that a SYSTEM job reads. The `--user-home` argument wins and must be valid. Else
+/// the valid value of the machine client's own task for this home. Else `USERPROFILE` of this
+/// process, which must be valid too. The receipt is no source: a user can write it.
+fn choose_profile(
+    argument: Option<&Path>,
+    task: Option<&Path>,
+    userprofile: Option<PathBuf>,
+) -> Result<PathBuf> {
+    if let Some(argument) = argument {
+        return crate::machine::validate_user_home(argument).context("--user-home is not usable");
+    }
+    if let Some(task) = task {
+        return Ok(task.to_path_buf());
+    }
+    let profile = userprofile.context(
+        "USERPROFILE is not set; a SYSTEM job needs the profile whose repositories it scans. Pass --user-home",
+    )?;
+    crate::machine::validate_user_home(&profile)
+        .context("USERPROFILE is not a usable profile. Pass --user-home")
+}
+
 /// What the job should be when `wanted` is on: it runs `executable`, the installed client, and
-/// never the program that asks for the change. Nothing when `wanted` is off.
-fn desired_job(wanted: Wanted, executable: &Path) -> Result<Option<Applied>> {
+/// never the program that asks for the change. For a SYSTEM job `executable` is the machine client
+/// and `profile` the profile it reads. Nothing when `wanted` is off.
+fn desired_job(
+    wanted: Wanted,
+    executable: &Path,
+    profile: Option<PathBuf>,
+) -> Result<Option<Applied>> {
     let Wanted::On(run_as) = wanted else {
         return Ok(None);
     };
@@ -2451,61 +2439,228 @@ fn desired_job(wanted: Wanted, executable: &Path) -> Result<Option<Applied>> {
     Ok(Some(Applied {
         run_as,
         executable: executable.to_path_buf(),
-        user_home: (run_as == RunAs::System)
-            .then(|| {
-                std::env::var_os("USERPROFILE").map(PathBuf::from).context(
-                    "USERPROFILE is not set; a SYSTEM job needs the profile whose repositories it scans",
-                )
-            })
-            .transpose()?,
+        user_home: (run_as == RunAs::System).then_some(profile).flatten(),
     }))
 }
 
-/// Installs, updates or removes the OS job so it matches `wanted`.
+/// What to run when a SYSTEM job needs an elevated prompt. For `schedule on --system` it is the
+/// machine client's command, with the install block first when the machine client is not there.
+/// For a SYSTEM task found during a removal or a user switch it is `schedule off` through the
+/// machine client, or the removal block when the machine client is not usable.
+fn system_retry_text(
+    home: &Path,
+    wanted: Wanted,
+    machine_client: &MachineClient,
+    profile: Option<&Path>,
+) -> String {
+    let machine = crate::machine::machine_path();
+    let present = matches!(machine_client, MachineClient::Present { .. });
+    match wanted {
+        Wanted::On(RunAs::System) => {
+            let command =
+                crate::machine::machine_command(home, wanted.command(), &machine, profile);
+            let state =
+                crate::machine::machine_state(machine_client, &crate::machine::running_version());
+            match crate::machine::machine_fix(
+                machine_client,
+                state,
+                &machine,
+                &crate::machine::running_version(),
+            ) {
+                Some(fix) if !present => format!("{fix}\nThen run:\n{command}"),
+                _ => command,
+            }
+        }
+        Wanted::On(RunAs::User) | Wanted::Off => {
+            if present {
+                crate::machine::machine_command(home, "schedule off", &machine, None)
+            } else {
+                task_id(home).map_or_else(
+                    |error| format!("{error:#}"),
+                    |id| crate::machine::removal_block(home, &id, None),
+                )
+            }
+        }
+    }
+}
+
+/// The refusal for a SYSTEM task that does not run the machine client alone. open-pact never
+/// changes it: the owner removes it with Windows tools, and then installs the machine client's job.
+fn not_ours_text(
+    home: &Path,
+    wanted: Wanted,
+    action: &str,
+    machine_client: &MachineClient,
+) -> String {
+    let machine = crate::machine::machine_path();
+    let present = matches!(machine_client, MachineClient::Present { .. });
+    let id = task_id(home).unwrap_or_default();
+    let mut text = format!(
+        "A SYSTEM task {id} for this home runs {action}, not the machine client at {}. open-pact does not change it.\nRemove it from an elevated PowerShell prompt:\n{}",
+        machine.display(),
+        crate::machine::removal_block(home, &id, present.then_some(machine.as_path()))
+    );
+    if wanted == Wanted::On(RunAs::System) {
+        let state =
+            crate::machine::machine_state(machine_client, &crate::machine::running_version());
+        if let Some(fix) = crate::machine::machine_fix(
+            machine_client,
+            state,
+            &machine,
+            &crate::machine::running_version(),
+        ) && !present
+        {
+            text.push_str(&format!("\nThen install the machine client:\n{fix}"));
+        }
+        text.push_str(&format!(
+            "\nThen run:\n{}",
+            crate::machine::machine_command(home, wanted.command(), &machine, None)
+        ));
+    }
+    text
+}
+
+/// Refuses a change to a SYSTEM task that the machine client does not own.
+fn refuse_not_ours(home: &Path, wanted: Wanted, task: &SystemTask) -> Result<()> {
+    if let SystemTask::NotOurs { action } = task {
+        bail!(
+            "{}",
+            not_ours_text(home, wanted, action, &crate::machine::read_machine_client())
+        );
+    }
+    Ok(())
+}
+
+/// Installs, updates or removes the OS job so it matches `wanted`. A SYSTEM job runs the machine
+/// client and nothing else: `schedule on --system` refuses when it is missing or unprotected, and
+/// no change touches a SYSTEM task that is not the machine client's. `user_home` is the profile a
+/// SYSTEM job reads, from `--user-home`.
 pub(crate) async fn change_job(
     home: &Home,
     wanted: Wanted,
     dry_run: bool,
     executable: &Path,
+    user_home: Option<&Path>,
 ) -> Result<()> {
     let home_exists = home.0.try_exists()?;
     let requested_system = wanted == Wanted::On(RunAs::System);
+    if user_home.is_some() && !requested_system {
+        bail!("--user-home needs --system");
+    }
     let retry = wanted.command();
     let given = home.0.clone();
     let home = Home(schedule_home(&home.0, true)?);
-    let desired = desired_job(wanted, executable)?;
-    let elevated =
-        crate::current_os()? == open_pact_core::Os::Windows && windows_require_elevation().is_ok();
+    let machine = crate::machine::machine_path();
+    // The package check needs no elevation, so it comes first.
+    let machine_client = requested_system.then(crate::machine::read_machine_client);
+    if let Some(machine_client) = &machine_client
+        && !matches!(machine_client, MachineClient::Present { .. })
+    {
+        let running = crate::machine::running_version();
+        let state = crate::machine::machine_state(machine_client, &running);
+        bail!(
+            "{}",
+            crate::machine::machine_fix(machine_client, state, &machine, &running)
+                .unwrap_or_else(|| "The machine client cannot be used.".into())
+        );
+    }
+    let elevated = crate::current_os()? == open_pact_core::Os::Windows
+        && crate::DeviceKey::process_is_elevated();
     if elevated {
         // Resolving the home replaced the path that was given with the link target, so the link
         // check runs here, before any file of the home is locked, read or written.
         require_home_without_link(&given, &home.0)?;
     }
-    if requested_system && !elevated {
+    let caller_profile = user_home
+        .map(Path::to_path_buf)
+        .or_else(crate::user_profile);
+    if let Some(machine_client) = &machine_client
+        && !elevated
+    {
         bail!(
             "Run this exact command from an elevated PowerShell prompt:\n{}",
-            apply_command(&home.0, retry, executable)
+            system_retry_text(&home.0, wanted, machine_client, caller_profile.as_deref())
         );
     }
-    let observed = observe(&home, desired.as_ref(), elevated, executable)
-        .with_context(|| format!("Cannot inspect the scheduled job. If access is denied, run this exact command from an elevated prompt:\n{}", apply_command(&home.0, retry, executable)))?;
-    let system = needs_system_cleanup(requested_system, desired.is_none(), &observed);
+    // The first look finds who owns the task and which profile it carries. Its expected
+    // arguments use the profile that is known so far.
+    let provisional = desired_job(
+        wanted,
+        if requested_system {
+            &machine
+        } else {
+            executable
+        },
+        requested_system
+            .then(|| {
+                user_home
+                    .and_then(|path| crate::machine::validate_user_home(path).ok())
+                    .or_else(|| {
+                        crate::user_profile()
+                            .and_then(|path| crate::machine::validate_user_home(&path).ok())
+                    })
+            })
+            .flatten(),
+    )?;
+    let observed = observe(&home, provisional.as_ref(), elevated, executable).with_context(|| {
+        let text = match &machine_client {
+            Some(machine_client) => {
+                system_retry_text(&home.0, wanted, machine_client, caller_profile.as_deref())
+            }
+            None => apply_command(&home.0, retry, executable),
+        };
+        format!("Cannot inspect the scheduled job. If access is denied, run this exact command from an elevated prompt:\n{text}")
+    })?;
+    let task = observed.system_task(&machine, &home.0, None);
+    refuse_not_ours(&home.0, wanted, &task)?;
+    let system = needs_system_cleanup(requested_system, wanted == Wanted::Off, &observed);
     if system && !elevated {
         bail!(
             "Run this exact command from an elevated PowerShell prompt:\n{}",
-            apply_command(&home.0, retry, executable)
+            system_retry_text(
+                &home.0,
+                wanted,
+                &crate::machine::read_machine_client(),
+                None
+            )
         );
+    }
+    let profile = if requested_system {
+        let from_task = match &task {
+            SystemTask::Ours { profile, .. } => profile.as_deref(),
+            _ => None,
+        };
+        Some(choose_profile(user_home, from_task, crate::user_profile())?)
+    } else {
+        None
+    };
+    let desired = desired_job(
+        wanted,
+        if requested_system {
+            &machine
+        } else {
+            executable
+        },
+        profile,
+    )?;
+    if let Some(Applied {
+        user_home: Some(profile),
+        ..
+    }) = &desired
+    {
+        println!("The job scans {}.", profile.display());
     }
     let _lock = if dry_run || !home_exists {
         None
     } else {
         Some(lock(&home)?)
     };
-    let observed = if dry_run {
-        observed
-    } else {
-        observe(&home, desired.as_ref(), elevated, executable)?
-    };
+    let observed = observe(&home, desired.as_ref(), elevated, executable)?;
+    refuse_not_ours(
+        &home.0,
+        wanted,
+        &observed.system_task(&machine, &home.0, None),
+    )?;
     let applied = read_applied(&home)?;
     let change = reconcile(desired.as_ref(), applied.as_ref(), &observed);
     match change {
@@ -2526,6 +2681,7 @@ pub(crate) async fn change_job(
                     Operation::Uninstall { system: true },
                     true,
                     executable,
+                    &machine,
                 )
                 .await?;
             }
@@ -2534,18 +2690,35 @@ pub(crate) async fn change_job(
                 Operation::Install {
                     system: desired.run_as == RunAs::System,
                     user_home: desired.user_home.clone(),
+                    keep_state: change == Change::Update,
                 },
                 true,
                 executable,
+                &machine,
             )
             .await?;
             save(&home, APPLIED, desired)?;
         }
         Change::Remove => {
-            operate(&home, Operation::Uninstall { system }, true, executable).await?;
+            operate(
+                &home,
+                Operation::Uninstall { system },
+                true,
+                executable,
+                &machine,
+            )
+            .await?;
             remove_if_exists(&home.file(APPLIED))?;
         }
-        Change::None => {}
+        // A receipt that differs from what the job is now (a stale path from an older client, or
+        // a failed save after a rewrite) converges here.
+        Change::None => {
+            if let Some(desired) = desired.as_ref()
+                && applied.as_ref() != Some(desired)
+            {
+                save(&home, APPLIED, desired)?;
+            }
+        }
     }
     Ok(())
 }
@@ -2556,6 +2729,7 @@ pub(crate) async fn turn_on(
     run_as: Option<RunAs>,
     dry_run: bool,
     executable: &Path,
+    user_home: Option<&Path>,
 ) -> Result<()> {
     let manifest = home.signed_manifest()?;
     let Some(schedule) = &manifest.body().schedule else {
@@ -2568,12 +2742,13 @@ pub(crate) async fn turn_on(
     let run_as = run_as.unwrap_or(config.run_as);
     validate_system_install(run_as == RunAs::System, crate::current_os()?)?;
     println!("{schedule}");
-    change_job(home, Wanted::On(run_as), dry_run, executable).await?;
+    change_job(home, Wanted::On(run_as), dry_run, executable, user_home).await?;
     if !dry_run {
         let _claim_lock = claim::lock(home).await?;
         config = DeviceConfig::load_or_migrate(home, crate::user_profile().as_deref(), true)?;
         config.auto_send = true;
         config.run_as = run_as;
+        config.system_job_pending = false;
         config.save(home)?;
         println!("Your choice: automatic sending is on.");
     }
@@ -2582,12 +2757,13 @@ pub(crate) async fn turn_on(
 
 /// `schedule off`: removes the job and remembers the owner's no.
 pub(crate) async fn turn_off(home: &Home, dry_run: bool, executable: &Path) -> Result<()> {
-    change_job(home, Wanted::Off, dry_run, executable).await?;
+    change_job(home, Wanted::Off, dry_run, executable, None).await?;
     if !dry_run && home.0.is_dir() {
         let _claim_lock = claim::lock(home).await?;
         let mut config = DeviceConfig::load(home)?;
-        if config.auto_send {
+        if config.auto_send || config.system_job_pending {
             config.auto_send = false;
+            config.system_job_pending = false;
             config.save(home)?;
         }
     }
@@ -2603,6 +2779,146 @@ pub enum JobStatus {
     Leftover,
     Absent,
     SystemUnconfirmed,
+    /// A SYSTEM task for this home that does not run the machine client alone. open-pact never
+    /// changes it.
+    NotOurs,
+}
+
+/// What a look at the OS job found. A SYSTEM job also carries what is known about the machine
+/// client, which is a fact of its own: the package and the task each have their own fix.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct JobInspection {
+    pub(crate) job: JobStatus,
+    system: Option<SystemInspection>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct SystemInspection {
+    machine: MachineClient,
+    machine_state: MachineState,
+    /// The task, when an elevated process looked at it. A standard user cannot confirm it.
+    task: Option<SystemTask>,
+    /// The executable the receipt names. A user can write the receipt, so it is a hint only.
+    receipt: Option<PathBuf>,
+    task_id: String,
+}
+
+#[cfg(test)]
+impl JobInspection {
+    /// A SYSTEM job as an elevated process found it, for the status tests: `task` is `missing`,
+    /// `not_ours`, `current` or anything else for a task that is ours and out of date.
+    pub(crate) fn system_fixture(machine: MachineClient, task: &str) -> Self {
+        let task = match task {
+            "missing" => SystemTask::Missing,
+            "not_ours" => SystemTask::NotOurs {
+                action: "cmd.exe".into(),
+            },
+            "current" => SystemTask::Ours {
+                profile: None,
+                current: true,
+            },
+            _ => SystemTask::Ours {
+                profile: None,
+                current: false,
+            },
+        };
+        let job = match &task {
+            SystemTask::Missing => JobStatus::Missing,
+            SystemTask::NotOurs { .. } => JobStatus::NotOurs,
+            SystemTask::Ours { current: true, .. } => JobStatus::Current,
+            _ => JobStatus::Outdated,
+        };
+        Self {
+            job,
+            system: Some(SystemInspection {
+                machine_state: crate::machine::machine_state(
+                    &machine,
+                    &crate::machine::running_version(),
+                ),
+                machine,
+                task: Some(task),
+                receipt: None,
+                task_id: "org.open-pact.report.0123456789abcdef".into(),
+            }),
+        }
+    }
+}
+
+impl From<JobStatus> for JobInspection {
+    fn from(job: JobStatus) -> Self {
+        Self { job, system: None }
+    }
+}
+
+impl JobInspection {
+    /// Whether this is a SYSTEM job, which carries the machine client beside the task.
+    pub(crate) fn is_system(&self) -> bool {
+        self.system.is_some()
+    }
+
+    /// The state of the machine client, for a SYSTEM job.
+    pub(crate) fn machine_state(&self) -> Option<MachineState> {
+        self.system.as_ref().map(|system| system.machine_state)
+    }
+
+    /// The fix for the machine client, with the install block first. Nothing when it is current.
+    pub(crate) fn machine_fix(&self) -> Option<String> {
+        let system = self.system.as_ref()?;
+        crate::machine::machine_fix(
+            &system.machine,
+            system.machine_state,
+            &crate::machine::machine_path(),
+            &crate::machine::running_version(),
+        )
+    }
+
+    /// The fix for the task. For a SYSTEM job it is the machine client's command, or the removal
+    /// block for a task that is not ours, or what a standard user cannot confirm. For a user job it
+    /// is the line `check` prints for an outdated job.
+    pub(crate) fn job_fix(&self, home: &Path) -> Option<String> {
+        let Some(system) = &self.system else {
+            return (self.job == JobStatus::Outdated).then(|| {
+                format!(
+                    "The scheduled job is out of date. Run `{} schedule on`.",
+                    crate::client_command(home)
+                )
+            });
+        };
+        let machine = crate::machine::machine_path();
+        let usable = matches!(
+            system.machine_state,
+            MachineState::Current | MachineState::Outdated
+        );
+        let on = |profile: Option<&Path>| {
+            crate::machine::machine_command(home, "schedule on --system", &machine, profile)
+        };
+        match &system.task {
+            None => Some(match &system.receipt {
+                Some(receipt) if !crate::machine::same_windows_path(receipt, &machine) => format!(
+                    "The job record says the job runs {}, which is not the machine package. This is not confirmed: run status from an elevated prompt to check it.",
+                    receipt.display()
+                ),
+                _ => "SYSTEM job installation is unconfirmed. Ask IT to inspect the task from an elevated PowerShell prompt.".into(),
+            }),
+            Some(SystemTask::Missing) => usable.then(|| on(None)),
+            Some(SystemTask::User) => Some(on(None)),
+            Some(SystemTask::Ours { current: true, .. }) => None,
+            Some(SystemTask::Ours { profile, .. }) => Some(on(profile.as_deref())),
+            Some(SystemTask::NotOurs { action }) => {
+                let mut text = format!(
+                    "A SYSTEM task {} for this home runs {action}, not the machine client at {}. open-pact does not change it.\nRemove it from an elevated PowerShell prompt:\n{}",
+                    system.task_id,
+                    machine.display(),
+                    crate::machine::removal_block(home, &system.task_id, usable.then_some(machine.as_path()))
+                );
+                if let Some(fix) = self.machine_fix() {
+                    text.push_str(&format!("\nThen:\n{fix}"));
+                }
+                text.push_str(&format!("\nThen run:\n{}", on(None)));
+                Some(text)
+            }
+        }
+    }
 }
 
 /// The executable that the recorded OS job runs. `None` when no job is recorded.
@@ -2615,11 +2931,9 @@ pub(crate) fn inspect_job(
     home: &Home,
     config: &DeviceConfig,
     executable: &Path,
-) -> Result<JobStatus> {
+) -> Result<JobInspection> {
     if config.auto_send && config.run_as == RunAs::System {
-        return Ok(system_job_status(
-            read_protected_binary(executable).as_ref(),
-        ));
+        return inspect_system_job(home);
     }
     let desired = config.auto_send.then(|| Applied {
         run_as: config.run_as,
@@ -2636,8 +2950,104 @@ pub(crate) fn inspect_job(
             Change::Install => JobStatus::Missing,
             Change::Update => JobStatus::Outdated,
             Change::Remove => JobStatus::Leftover,
-        },
+        }
+        .into(),
     )
+}
+
+/// The SYSTEM job: the machine client and the task, each on its own. A standard user cannot read
+/// the task, so the answer stays unconfirmed; an elevated process reads it.
+fn inspect_system_job(home: &Home) -> Result<JobInspection> {
+    if crate::current_os()? != open_pact_core::Os::Windows {
+        return Ok(JobStatus::SystemUnconfirmed.into());
+    }
+    let machine_client = crate::machine::read_machine_client();
+    let machine_state =
+        crate::machine::machine_state(&machine_client, &crate::machine::running_version());
+    let machine = crate::machine::machine_path();
+    let home = Home(schedule_home(&home.0, true)?);
+    let task_id = task_id(&home.0)?;
+    let (job, task) = if crate::DeviceKey::process_is_elevated() {
+        let observed = observe(&home, None, false, &machine)?;
+        let task = observed.system_task(&machine, &home.0, crate::user_profile().as_deref());
+        let job = match &task {
+            SystemTask::Missing => JobStatus::Missing,
+            SystemTask::User | SystemTask::Ours { current: false, .. } => JobStatus::Outdated,
+            SystemTask::NotOurs { .. } => JobStatus::NotOurs,
+            SystemTask::Ours { current: true, .. } => JobStatus::Current,
+        };
+        (job, Some(task))
+    } else {
+        (JobStatus::SystemUnconfirmed, None)
+    };
+    let receipt = read_applied(&home)
+        .ok()
+        .flatten()
+        .map(|applied| applied.executable);
+    Ok(JobInspection {
+        job,
+        system: Some(SystemInspection {
+            machine: machine_client,
+            machine_state,
+            task,
+            receipt,
+            task_id,
+        }),
+    })
+}
+
+/// The text that tells the owner how to stop a SYSTEM job: the removal block when the task is not
+/// the machine client's, else the machine client's `schedule off` when it is usable, else the
+/// removal block. Never the caller's own path.
+pub(crate) fn system_stop_text(home: &Path) -> String {
+    let machine_client = crate::machine::read_machine_client();
+    let state = crate::machine::machine_state(&machine_client, &crate::machine::running_version());
+    let machine = crate::machine::machine_path();
+    let not_ours = crate::DeviceKey::process_is_elevated()
+        && schedule_home(home, true)
+            .map(Home)
+            .and_then(|home| observe(&home, None, false, &machine))
+            .is_ok_and(|observed| {
+                matches!(
+                    observed.system_task(&machine, home, None),
+                    SystemTask::NotOurs { .. }
+                )
+            });
+    stop_text_for(home, state, not_ours)
+}
+
+fn stop_text_for(home: &Path, state: MachineState, not_ours: bool) -> String {
+    let machine = crate::machine::machine_path();
+    let usable = matches!(state, MachineState::Current | MachineState::Outdated);
+    if usable && !not_ours {
+        crate::machine::machine_command(home, "schedule off", &machine, None)
+    } else {
+        task_id(home).map_or_else(
+            |error| format!("{error:#}"),
+            |id| crate::machine::removal_block(home, &id, usable.then_some(machine.as_path())),
+        )
+    }
+}
+
+/// The text that tells the owner how to turn a SYSTEM job on: the machine client's command when
+/// it is usable, else the install block and then that command.
+pub(crate) fn system_on_text(home: &Path) -> String {
+    let machine_client = crate::machine::read_machine_client();
+    let running = crate::machine::running_version();
+    let state = crate::machine::machine_state(&machine_client, &running);
+    let machine = crate::machine::machine_path();
+    let command = crate::machine::machine_command(
+        home,
+        "schedule on --system",
+        &machine,
+        crate::user_profile().as_deref(),
+    );
+    match crate::machine::machine_fix(&machine_client, state, &machine, &running) {
+        Some(fix) if !matches!(machine_client, MachineClient::Present { .. }) => {
+            format!("{fix}\nThen run:\n{command}")
+        }
+        _ => command,
+    }
 }
 
 /// The job is current except that it runs another copy of the client (the desktop app's CLI copy
@@ -2667,22 +3077,9 @@ fn runs_another_current_copy(
         })
 }
 
-/// The one line `check` prints when the job runs an older definition than this client would
-/// install, with the exact command that fixes it.
-fn outdated_job_line(job: JobStatus, system: bool, command: &str) -> Option<String> {
-    (job == JobStatus::Outdated).then(|| {
-        if system {
-            format!(
-                "The scheduled job is out of date. Run `{command} schedule on --system` from an elevated prompt."
-            )
-        } else {
-            format!("The scheduled job is out of date. Run `{command} schedule on`.")
-        }
-    })
-}
-
-/// The notice for `check`. It says nothing while automatic sending is off or when the OS cannot
-/// be inspected: `status` reports those.
+/// The lines `check` prints when the job needs attention: the machine client when it is not
+/// current, and the task when it is outdated or not ours. It says nothing while automatic sending
+/// is off or when the OS cannot be inspected: `status` reports those.
 pub(crate) fn outdated_job_notice(
     home: &Home,
     config: &DeviceConfig,
@@ -2691,18 +3088,18 @@ pub(crate) fn outdated_job_notice(
     if !config.auto_send {
         return None;
     }
-    let job = inspect_job(home, config, executable).ok()?;
-    if job == JobStatus::Outdated
+    let inspection = inspect_job(home, config, executable).ok()?;
+    if inspection.job == JobStatus::Outdated
         && config.run_as == RunAs::User
         && is_current_in_another_copy(home, executable)
     {
         return None;
     }
-    outdated_job_line(
-        job,
-        config.run_as == RunAs::System,
-        &crate::client_command(&home.0),
-    )
+    let task = matches!(inspection.job, JobStatus::Outdated | JobStatus::NotOurs)
+        .then(|| inspection.job_fix(&home.0))
+        .flatten();
+    let lines: Vec<String> = inspection.machine_fix().into_iter().chain(task).collect();
+    (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
 /// `schedule status`: the owner's choice, the company's policy and the state of the job.
@@ -2740,18 +3137,34 @@ async fn status(home: &Home, executable: &Path) -> Result<()> {
             }
         }
     };
+    if config.system_job_pending {
+        println!("Automatic sending waits for the SYSTEM job.");
+    }
     if desired
         .as_ref()
         .is_some_and(|desired| desired.run_as == RunAs::System)
     {
         println!(
-            "The job runs as SYSTEM. Run `schedule on --system` from an elevated prompt to change it."
+            "The job runs as SYSTEM, through the machine client at {}. Run `schedule on --system` from an elevated prompt to change it.",
+            crate::machine::machine_path().display()
         );
-        if system_job_status(read_protected_binary(executable).as_ref()) == JobStatus::Outdated {
-            println!(
-                "The job is out of date: the client it runs in Program Files is not this client. Run `{} schedule on --system` from an elevated prompt.",
-                crate::client_command(&home.0)
-            );
+        match inspect_system_job(home) {
+            Ok(inspection) => {
+                if let Some(fix) = inspection.machine_fix() {
+                    println!("{fix}");
+                }
+                match inspection.job {
+                    JobStatus::Current => println!("The job is installed and current."),
+                    JobStatus::Missing => println!("The job is not installed."),
+                    JobStatus::Outdated => println!("The job is out of date."),
+                    JobStatus::NotOurs => println!("The job is not the machine client's."),
+                    _ => {}
+                }
+                if let Some(fix) = inspection.job_fix(&home.0) {
+                    println!("{fix}");
+                }
+            }
+            Err(error) => println!("The SYSTEM job could not be inspected: {error:#}"),
         }
         print_next_due();
         return Ok(());
@@ -2794,13 +3207,14 @@ pub(crate) async fn run(home: &Home, command: Command, executable: &Path) -> Res
             system,
             user,
             dry_run,
+            user_home,
         } => {
             let run_as = if system {
                 Some(RunAs::System)
             } else {
                 user.then_some(RunAs::User)
             };
-            turn_on(home, run_as, dry_run, executable).await
+            turn_on(home, run_as, dry_run, executable, user_home.as_deref()).await
         }
         Command::Off { dry_run } => turn_off(home, dry_run, executable).await,
         Command::Status => status(home, executable).await,
@@ -2810,6 +3224,7 @@ pub(crate) async fn run(home: &Home, command: Command, executable: &Path) -> Res
                 Operation::Run { system, user_home },
                 false,
                 executable,
+                &crate::machine::machine_path(),
             )
             .await
         }
@@ -2831,13 +3246,9 @@ async fn run_tick(
         };
         let config = DeviceConfig::load_or_migrate(home, user_home, true)?;
         let command = crate::client_command(&home.0);
-        if let Some(notice) = device_config::legacy_notice(
-            home,
-            device_config::Surface::Job,
-            &command,
-            &config,
-            executable,
-        ) {
+        if let Some(notice) =
+            device_config::legacy_notice(home, device_config::Surface::Job, &command, &config)
+        {
             job_log(home, &notice);
         }
         if !config.auto_send {
@@ -2854,6 +3265,7 @@ async fn run_tick(
             self_removal: true,
         }
     };
+    note_client_version(home, state_home);
     tick(
         home,
         state_home,
@@ -2865,10 +3277,30 @@ async fn run_tick(
     .await
 }
 
+/// Writes one job-log line when the client version that runs the job changes, so an upgrade of
+/// the machine client shows in the log of the next wake.
+fn note_client_version(home: &Home, state_home: &Home) {
+    let version = env!("CARGO_PKG_VERSION");
+    let mut state: State = state_home
+        .read_json(STATE)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    if state.client_version.as_deref() == Some(version) {
+        return;
+    }
+    job_log(home, &format!("This job now runs client {version}."));
+    state.client_version = Some(version.to_owned());
+    if let Err(error) = save(state_home, STATE, &state) {
+        job_log(home, &format!("error: {error:#}"));
+    }
+}
+
 /// A client update leaves the OS job on the definition the old client wrote. The wake run
 /// compares the job with the definition this client would install, as `schedule on` does, and
 /// rewrites it when they differ. It only follows the owner's choice: nothing happens while
-/// automatic sending is off, for a SYSTEM job, without a signed schedule, or when the job is gone.
+/// automatic sending is off, for a SYSTEM job, without a signed schedule, or when the job is gone. A
+/// task that runs as SYSTEM is left as it is.
 /// The check runs once for each client version and path, so a wake costs no extra process start.
 /// `true` when it rewrote the job.
 fn refresh_job(home: &Home, executable: &Path) -> Result<bool> {
@@ -2920,8 +3352,10 @@ fn refresh_job_with(
             return Err(error);
         }
     };
-    let stale =
-        observed.exists && reconcile(Some(&desired), applied.as_ref(), &observed) == Change::Update;
+    // A SYSTEM task is the machine client's to keep: a user job never rewrites it.
+    let stale = observed.exists
+        && !observed.system
+        && reconcile(Some(&desired), applied.as_ref(), &observed) == Change::Update;
     // A failed rewrite is not retried every minute: `status` and `check` keep reporting the job.
     save(home, JOB_REFRESH, &known)?;
     if !stale {
@@ -2981,11 +3415,14 @@ fn macos_rewrite(
     std::fs::write(path, job.plist()).with_context(|| format!("write {}", path.display()))
 }
 
+/// §machine§ is the machine client: the only image that a SYSTEM job runs and the only one that
+/// a SYSTEM task may name.
 async fn operate(
     home: &Home,
     command: Operation,
     home_locked: bool,
     executable: &Path,
+    machine: &Path,
 ) -> Result<()> {
     let os = crate::current_os()?;
     if let Operation::Install { system, .. } = &command
@@ -3001,6 +3438,23 @@ async fn operate(
     let absolute = schedule_home(&home.0, uninstall)?;
     if system_run {
         require_home_without_link(&home.0, &absolute)?;
+        let image = std::env::current_exe().context("find the running image")?;
+        if !same_windows_path(&image, machine) {
+            let home = Home(absolute);
+            job_log(
+                &home,
+                &format!(
+                    "error: a SYSTEM job runs only the machine client at {}, not {}",
+                    machine.display(),
+                    image.display()
+                ),
+            );
+            bail!(
+                "a SYSTEM job runs only the machine client at {}, not {}",
+                machine.display(),
+                image.display()
+            );
+        }
     }
     let home = Home(absolute);
     let system_install = matches!(&command, Operation::Install { system: true, .. });
@@ -3025,13 +3479,13 @@ async fn operate(
         windows_require_elevation()?;
     }
     let protected_paths = if os == open_pact_core::Os::Windows && (system_run || system_install) {
-        Some(windows_protected_paths(&home, system_install, executable)?)
+        Some(windows_protected_paths(&home, machine)?)
     } else {
         None
     };
     let state_home = protected_paths
         .as_ref()
-        .map(|(_, state)| Home(state.clone()))
+        .map(|state| Home(state.clone()))
         .unwrap_or_else(|| Home(home.0.clone()));
     let home_exists = home.0.exists();
     let _home_lock = if system_install && !home_locked {
@@ -3095,17 +3549,21 @@ async fn operate(
             }
             result?;
         }
-        Operation::Install { system, user_home } => {
+        Operation::Install {
+            system,
+            user_home,
+            keep_state,
+        } => {
             home.enrolment()?;
             crate::DeviceKey::load(&home.0)?;
             if os == open_pact_core::Os::Windows {
                 validate_windows_home(&home.0)?;
             }
             let (executable, install_state) = if system {
-                let (binary, state) = protected_paths
+                let state = protected_paths
                     .as_ref()
                     .context("SYSTEM install paths were not prepared")?;
-                (binary.clone(), Home(state.clone()))
+                (machine.to_path_buf(), Home(state.clone()))
             } else {
                 (executable.to_path_buf(), Home(home.0.clone()))
             };
@@ -3121,7 +3579,16 @@ async fn operate(
                 )?;
                 job.log = text(&install_state.file(JOB_LOG))?.into();
             }
-            save(&install_state, STATE, &State::default())?;
+            // A SYSTEM update keeps the state of the running job. A new install, or a state that
+            // does not read, starts empty.
+            let keep = keep_state
+                && system
+                && install_state
+                    .read_json::<State>(STATE)
+                    .is_ok_and(|state| state.is_some());
+            if !keep {
+                save(&install_state, STATE, &State::default())?;
+            }
             let run_as = if system {
                 TaskRunAs::System
             } else {
@@ -3213,17 +3680,15 @@ mod tests {
     fn every_built_powershell_script_defines_its_called_helpers() {
         let job = Job::new(Path::new("client.exe"), Path::new("fixture-home")).unwrap();
         let scripts = [
-            windows_protected_paths_script("fixture-hash", "'source.exe'", true),
+            windows_protected_paths_script("fixture-hash", "'machine.exe'"),
             windows_task_query_script(&job),
             windows_uninstall_script(&job, false),
             windows_existing_system_state_script("fixture-hash"),
-            windows_cleanup_binary_script(&job, false),
-            windows_cleanup_binary_script(&job, true),
-            windows_orphaned_binary_script(&job),
-            windows_system_executable_script(),
-            windows_protected_binary_script(Path::new("client.exe")).unwrap(),
-            windows_observation_script(&job, Path::new("source.exe")).unwrap(),
+            windows_observation_script(&job),
             windows_require_elevation_script().to_owned(),
+            crate::machine::machine_probe_script(Path::new("machine.exe")).unwrap(),
+            crate::machine::install_block(&crate::machine::running_version()),
+            crate::machine::removal_block(Path::new("fixture-home"), "task", None),
         ];
         let helpers = scripts
             .iter()
@@ -4240,6 +4705,26 @@ esac
         );
     }
 
+    const MACHINE: &str = r"C:\Program Files\open-pact-client\open-pact-client.exe";
+
+    /// The task state of a task that wakes every minute and runs `actions`.
+    fn task_state(actions: &[(&str, &str)]) -> WindowsTaskState {
+        WindowsTaskState {
+            enabled: true,
+            triggers: 1,
+            trigger_enabled: true,
+            trigger_type: Some(1),
+            repetition: Some(WAKE_ISO.into()),
+            actions: actions
+                .iter()
+                .map(|(path, args)| ObservedAction {
+                    path: (*path).into(),
+                    args: (*args).into(),
+                })
+                .collect(),
+        }
+    }
+
     #[test]
     fn windows_reconcile_repairs_disabled_or_wrong_triggers() {
         let settings = Applied {
@@ -4248,34 +4733,25 @@ esac
             user_home: None,
         };
         let applied = Some(&settings);
-        let disabled = Observed {
+        let observed = |task: WindowsTaskState| Observed {
             exists: true,
             matches: true,
-            windows_task: Some(WindowsTaskState {
-                trigger_enabled: false,
-                trigger_type: Some(1),
-                repetition: Some(WAKE_ISO.into()),
-                protected_binary: None,
-            }),
+            windows_task: Some(task),
             ..Observed::default()
         };
-        assert_eq!(
-            reconcile(Some(&settings), applied, &disabled),
-            Change::Update
-        );
-        let wrong_type = Observed {
-            windows_task: Some(WindowsTaskState {
-                trigger_enabled: true,
-                trigger_type: Some(7),
-                repetition: Some(WAKE_ISO.into()),
-                protected_binary: None,
-            }),
-            ..disabled
+        let disabled = |change: fn(&mut WindowsTaskState)| {
+            let mut task = task_state(&[]);
+            change(&mut task);
+            reconcile(Some(&settings), applied, &observed(task))
         };
         assert_eq!(
-            reconcile(Some(&settings), applied, &wrong_type),
+            disabled(|task| task.trigger_enabled = false),
             Change::Update
         );
+        assert_eq!(disabled(|task| task.trigger_type = Some(7)), Change::Update);
+        assert_eq!(disabled(|task| task.enabled = false), Change::Update);
+        assert_eq!(disabled(|task| task.triggers = 2), Change::Update);
+        assert_eq!(disabled(|_| {}), Change::None);
     }
 
     #[test]
@@ -4289,10 +4765,8 @@ esac
             exists: true,
             matches: true,
             windows_task: Some(WindowsTaskState {
-                trigger_enabled: true,
-                trigger_type: Some(1),
                 repetition: repetition.map(str::to_owned),
-                protected_binary: None,
+                ..task_state(&[])
             }),
             ..Observed::default()
         };
@@ -4309,21 +4783,298 @@ esac
         );
     }
 
+    /// What the observation script prints for a task, as a string.
+    fn observation(principal: &str, task: &WindowsTaskState) -> String {
+        let mut lines = vec![
+            principal.to_owned(),
+            format!("task_enabled={}", i32::from(task.enabled)),
+            format!("trigger_count={}", task.triggers),
+        ];
+        if task.triggers == 1 {
+            lines.push(format!(
+                "trigger_enabled={}",
+                i32::from(task.trigger_enabled)
+            ));
+            lines.push(format!("trigger_type={}", task.trigger_type.unwrap_or(0)));
+            lines.push(format!(
+                "repetition={}",
+                task.repetition.clone().unwrap_or_default()
+            ));
+        }
+        for action in &task.actions {
+            lines.push(format!("action_path={}", action.path));
+            lines.push(format!("action_args={}", action.args));
+        }
+        lines.join("\r\n")
+    }
+
+    fn observed_task(principal: &str, task: &WindowsTaskState) -> Observed {
+        let parsed = parse_windows_task(&observation(principal, task));
+        Observed {
+            exists: parsed.exists,
+            system: parsed.system,
+            windows_task: parsed.task,
+            ..Observed::default()
+        }
+    }
+
     #[test]
-    fn a_system_job_with_another_protected_client_is_outdated() {
-        let probe = |exists: i32, matches: i32| {
-            protected_binary(&format!(
-                "protected_exists={exists}\nprotected_matches={matches}"
-            ))
-        };
-        assert_eq!(system_job_status(probe(1, 0).as_ref()), JobStatus::Outdated);
-        for unconfirmed in [probe(1, 1), probe(0, 0), None] {
+    fn the_observation_output_reads_back_into_the_task_state() {
+        let task = task_state(&[(MACHINE, "\"--home\" \"x\""), ("\"C:\\a b\\c.exe\"", "")]);
+        let parsed = parse_windows_task(&observation("system", &task));
+        assert!(parsed.exists && parsed.system && !parsed.script_matches);
+        assert_eq!(parsed.task, Some(task));
+        let user = parse_windows_task("user\r\ntask_enabled=0\r\ntrigger_count=0");
+        assert!(user.exists && !user.system);
+        assert_eq!(
+            user.task.map(|task| (task.enabled, task.triggers)),
+            Some((false, 0))
+        );
+        let missing = parse_windows_task("missing");
+        assert!(!missing.exists && missing.task.is_none());
+        assert!(parse_windows_task("user\nmatches").script_matches);
+    }
+
+    #[test]
+    fn command_lines_split_like_command_line_to_argv() {
+        for value in [
+            "plain",
+            "C:\\Users\\a b\\pact",
+            "C:\\Users\\trailing\\",
+            "quote\"inside",
+            "back\\\\slash\\\"quote",
+            "",
+        ] {
+            let line = [
+                windows_arg("--home"),
+                windows_arg(value),
+                windows_arg("x y"),
+            ]
+            .join(" ");
             assert_eq!(
-                system_job_status(unconfirmed.as_ref()),
-                JobStatus::SystemUnconfirmed,
-                "{unconfirmed:?}"
+                split_windows_args(&line),
+                ["--home", value, "x y"],
+                "{value}"
             );
         }
+        assert_eq!(split_windows_args("  a   b\tc "), ["a", "b", "c"]);
+        assert_eq!(split_windows_args(""), Vec::<String>::new());
+        assert_eq!(
+            task_user_home(&format!(
+                "{} {} {}",
+                windows_arg("--system"),
+                windows_arg("--user-home"),
+                windows_arg("C:\\Users\\a b")
+            )),
+            Some("C:\\Users\\a b".to_owned())
+        );
+        assert_eq!(task_user_home("\"--system\""), None);
+    }
+
+    /// The arguments of the task that the machine client registers for `home` and `profile`.
+    fn machine_args(home: &Path, profile: &Path) -> String {
+        system_arguments(Path::new(MACHINE), home, profile).unwrap()
+    }
+
+    #[test]
+    fn a_task_is_classified_by_its_principal_and_its_actions() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("profile");
+        std::fs::create_dir(&profile).unwrap();
+        let home = dir.path().join("pact");
+        let args = machine_args(&home, &profile);
+        let classify = |principal: &str, task: &WindowsTaskState| {
+            observed_task(principal, task).system_task(Path::new(MACHINE), &home, Some(&profile))
+        };
+        let ours = task_state(&[(MACHINE, &args)]);
+
+        assert_eq!(
+            Observed::default().system_task(Path::new(MACHINE), &home, None),
+            SystemTask::Missing
+        );
+        assert_eq!(
+            classify("system", &ours),
+            SystemTask::Ours {
+                profile: Some(profile.clone()),
+                current: true
+            }
+        );
+        // The program comes back quoted, in any case, or with the extended-path prefix.
+        for path in [
+            format!("\"{MACHINE}\""),
+            MACHINE.to_uppercase(),
+            format!(r"\\?\{MACHINE}"),
+        ] {
+            assert!(
+                matches!(
+                    classify("system", &task_state(&[(&path, &args)])),
+                    SystemTask::Ours { current: true, .. }
+                ),
+                "{path}"
+            );
+        }
+        // No action, two actions and another program are not ours.
+        for actions in [
+            vec![],
+            vec![(MACHINE, args.as_str()), (MACHINE, args.as_str())],
+            vec![(r"C:\Windows\System32\cmd.exe", args.as_str())],
+        ] {
+            assert!(
+                matches!(
+                    classify("system", &task_state(&actions)),
+                    SystemTask::NotOurs { .. }
+                ),
+                "{actions:?}"
+            );
+        }
+        let SystemTask::NotOurs { action } = classify(
+            "system",
+            &task_state(&[(r"C:\Windows\System32\cmd.exe", "")]),
+        ) else {
+            panic!("not ours");
+        };
+        assert_eq!(action, r"C:\Windows\System32\cmd.exe");
+        // Other arguments, a disabled task and a disabled trigger are ours and out of date.
+        let other = machine_args(&home, &dir.path().join("elsewhere"));
+        for task in [
+            task_state(&[(MACHINE, &other)]),
+            WindowsTaskState {
+                enabled: false,
+                ..ours.clone()
+            },
+            WindowsTaskState {
+                trigger_enabled: false,
+                ..ours.clone()
+            },
+            WindowsTaskState {
+                repetition: Some("PT5M".into()),
+                ..ours.clone()
+            },
+        ] {
+            assert!(
+                matches!(
+                    classify("system", &task),
+                    SystemTask::Ours { current: false, .. }
+                ),
+                "{task:?}"
+            );
+        }
+        // A task that runs as a user is a user job, whatever it runs and carries: its profile is
+        // never read.
+        let decoy = task_state(&[(MACHINE, &machine_args(&home, Path::new(r"C:\decoy")))]);
+        assert_eq!(classify("user", &decoy), SystemTask::User);
+        assert_eq!(
+            classify("user", &task_state(&[(r"C:\Windows\System32\cmd.exe", "")])),
+            SystemTask::User
+        );
+    }
+
+    #[test]
+    fn only_a_valid_task_profile_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("pact");
+        let missing = dir.path().join("missing");
+        let classify = |args: String| {
+            observed_task("system", &task_state(&[(MACHINE, &args)])).system_task(
+                Path::new(MACHINE),
+                &home,
+                None,
+            )
+        };
+        assert_eq!(
+            classify(machine_args(&home, &missing)),
+            SystemTask::Ours {
+                profile: None,
+                current: false
+            }
+        );
+        assert_eq!(
+            classify(machine_args(&home, Path::new("relative"))),
+            SystemTask::Ours {
+                profile: None,
+                current: false
+            }
+        );
+        assert_eq!(
+            classify(machine_args(&home, dir.path())),
+            SystemTask::Ours {
+                profile: Some(dir.path().to_path_buf()),
+                current: true
+            }
+        );
+    }
+
+    #[test]
+    fn the_profile_comes_from_the_argument_then_the_task_then_userprofile() {
+        let dir = tempfile::tempdir().unwrap();
+        let (argument, task, own) = (
+            dir.path().join("argument"),
+            dir.path().join("task"),
+            dir.path().join("own"),
+        );
+        for folder in [&argument, &task, &own] {
+            std::fs::create_dir(folder).unwrap();
+        }
+        let choose = |argument: Option<&Path>, task: Option<&Path>, own: Option<&Path>| {
+            choose_profile(argument, task, own.map(Path::to_path_buf))
+        };
+        assert_eq!(
+            choose(Some(&argument), Some(&task), Some(&own)).unwrap(),
+            argument
+        );
+        assert_eq!(choose(None, Some(&task), Some(&own)).unwrap(), task);
+        assert_eq!(choose(None, None, Some(&own)).unwrap(), own);
+        // An invalid argument refuses, and so does an invalid or missing USERPROFILE.
+        assert!(choose(Some(&dir.path().join("nope")), Some(&task), Some(&own)).is_err());
+        assert!(choose(Some(Path::new("relative")), None, Some(&own)).is_err());
+        assert!(choose(None, None, Some(&dir.path().join("nope"))).is_err());
+        assert!(choose(None, None, None).is_err());
+    }
+
+    #[test]
+    fn a_receipt_that_names_an_old_path_is_the_same_intent_for_a_system_job() {
+        let system = |executable: &str| Applied {
+            run_as: RunAs::System,
+            executable: PathBuf::from(executable),
+            user_home: Some(PathBuf::from("/profile")),
+        };
+        assert!(system("old").same_intent(&system(MACHINE)));
+        assert!(!system(MACHINE).same_intent(&Applied {
+            user_home: Some(PathBuf::from("/other")),
+            ..system(MACHINE)
+        }));
+        let user = |executable: &str| Applied {
+            run_as: RunAs::User,
+            executable: PathBuf::from(executable),
+            user_home: None,
+        };
+        assert!(!user("a").same_intent(&user("b")));
+        assert!(user("a").same_intent(&user("a")));
+        assert!(!user("a").same_intent(&system("a")));
+        // The observed task, not the receipt, decides what changes.
+        let observed = Observed {
+            exists: true,
+            matches: true,
+            system: true,
+            windows_task: Some(task_state(&[])),
+            ..Observed::default()
+        };
+        let desired = system(MACHINE);
+        assert_eq!(
+            reconcile(Some(&desired), Some(&system("old")), &observed),
+            Change::None
+        );
+        assert_eq!(
+            reconcile(
+                Some(&desired),
+                Some(&Applied {
+                    user_home: None,
+                    ..system(MACHINE)
+                }),
+                &observed
+            ),
+            Change::Update
+        );
     }
 
     const OLD_WAKE: &str = "<integer>300</integer>";
@@ -4555,17 +5306,15 @@ esac
     }
 
     #[test]
-    fn check_names_the_command_that_fixes_an_outdated_job() {
-        let user = outdated_job_line(JobStatus::Outdated, false, "open-pact-client").unwrap();
+    fn check_names_the_command_that_fixes_an_outdated_user_job() {
+        let home = Path::new("fixture-home");
+        let outdated = JobInspection::from(JobStatus::Outdated);
+        let line = outdated.job_fix(home).unwrap();
         assert!(
-            user.ends_with("Run `open-pact-client schedule on`."),
-            "{user}"
+            line.starts_with("The scheduled job is out of date. Run `open-pact-client"),
+            "{line}"
         );
-        let system = outdated_job_line(JobStatus::Outdated, true, "open-pact-client").unwrap();
-        assert!(
-            system.contains("`open-pact-client schedule on --system` from an elevated prompt"),
-            "{system}"
-        );
+        assert!(line.ends_with("schedule on`."), "{line}");
         for quiet in [
             JobStatus::Current,
             JobStatus::Missing,
@@ -4573,38 +5322,266 @@ esac
             JobStatus::Leftover,
             JobStatus::SystemUnconfirmed,
         ] {
-            assert_eq!(outdated_job_line(quiet, false, "open-pact-client"), None);
+            assert_eq!(JobInspection::from(quiet).job_fix(home), None);
+        }
+    }
+
+    fn system_inspection(
+        job: JobStatus,
+        machine: MachineClient,
+        task: Option<SystemTask>,
+        receipt: Option<&str>,
+    ) -> JobInspection {
+        let machine_state =
+            crate::machine::machine_state(&machine, &crate::machine::running_version());
+        JobInspection {
+            job,
+            system: Some(SystemInspection {
+                machine,
+                machine_state,
+                task,
+                receipt: receipt.map(PathBuf::from),
+                task_id: "org.open-pact.report.0123456789abcdef".into(),
+            }),
+        }
+    }
+
+    fn present(version: &str) -> MachineClient {
+        MachineClient::Present {
+            version: semver::Version::parse(version).unwrap(),
         }
     }
 
     #[test]
-    fn an_incomplete_protected_client_answer_proves_nothing() {
-        assert!(protected_binary("").is_none());
-        assert!(protected_binary("protected_exists=1").is_none());
-        assert!(protected_binary("protected_exists=1\nprotected_matches=").is_none());
-        let both =
-            protected_binary("system\nprotected_exists=1\nprotected_matches=1\nmatches").unwrap();
-        assert!(both.exists && both.matches_source);
+    fn the_package_and_the_task_each_have_their_own_fix() {
+        let home = Path::new("fixture-home");
+        let current = env!("CARGO_PKG_VERSION");
+        let ours = |current| {
+            Some(SystemTask::Ours {
+                profile: None,
+                current,
+            })
+        };
+        // A current machine client and a task that runs it need nothing.
+        let fine = system_inspection(JobStatus::Current, present(current), ours(true), None);
+        assert_eq!((fine.machine_fix(), fine.job_fix(home)), (None, None));
+        // An outdated machine client gets the upgrade block and the restart sentence, and the task
+        // still reports on its own.
+        let outdated = system_inspection(JobStatus::Outdated, present("0.0.1"), ours(false), None);
+        let machine = outdated.machine_fix().unwrap();
+        assert!(machine.contains("Upgrade it from an elevated PowerShell prompt"));
+        assert!(machine.contains("restart Windows"));
+        assert!(
+            outdated
+                .job_fix(home)
+                .unwrap()
+                .contains("schedule on --system")
+        );
+        // A missing machine client gets the install block; a missing task then has no command of
+        // its own, because the package line covers it.
+        let missing = system_inspection(
+            JobStatus::Missing,
+            MachineClient::Missing,
+            Some(SystemTask::Missing),
+            None,
+        );
+        assert!(missing.machine_fix().unwrap().contains("msiexec.exe"));
+        assert_eq!(missing.job_fix(home), None);
+        let usable = system_inspection(
+            JobStatus::Missing,
+            present(current),
+            Some(SystemTask::Missing),
+            None,
+        );
+        assert!(
+            usable
+                .job_fix(home)
+                .unwrap()
+                .contains("schedule on --system")
+        );
+        // An unreadable machine client says so and gives no block.
+        let unknown = system_inspection(
+            JobStatus::Current,
+            MachineClient::Unknown {
+                reason: "probe failed".into(),
+            },
+            ours(true),
+            None,
+        );
+        assert_eq!(
+            unknown.machine_fix().unwrap(),
+            "Cannot read the machine client: probe failed."
+        );
+        // An unprotected one never says to reinstall alone.
+        let unprotected = system_inspection(
+            JobStatus::Current,
+            MachineClient::Unprotected {
+                reason: "grants write".into(),
+            },
+            ours(true),
+            None,
+        );
+        let text = unprotected.machine_fix().unwrap();
+        assert!(text.contains("Ask IT, or uninstall the machine client and install it again"));
+        // A task that is not ours gets the removal block, then the install block when needed, then
+        // the machine client's command. The caller's own path never appears.
+        let not_ours = system_inspection(
+            JobStatus::NotOurs,
+            MachineClient::Missing,
+            Some(SystemTask::NotOurs {
+                action: r"C:\Windows\System32\cmd.exe".into(),
+            }),
+            None,
+        );
+        let text = not_ours.job_fix(home).unwrap();
+        let removal = text.find("schtasks.exe").unwrap();
+        let install = text.find("Then:\n").unwrap();
+        let command = text.find("Then run:").unwrap();
+        assert!(removal < install && install < command, "{text}");
+        assert!(text.contains("open-pact does not change it"));
+        assert!(!text.contains("Remove-Item"));
+        assert!(!text.contains(std::env::current_exe().unwrap().to_str().unwrap()));
     }
 
     #[test]
-    fn the_unelevated_protected_client_probe_defines_its_helper_and_reads_one_file() {
-        let probe = windows_protected_binary_probe("'client.exe'");
-        assert!(probe.contains("protected_exists=") && probe.contains("protected_matches="));
-        assert!(probe.contains("Get-FileHash -LiteralPath 'client.exe'"));
-        assert!(probe.contains("ProgramFilesPath"));
+    fn a_standard_user_cannot_confirm_the_task_and_the_receipt_is_a_hint() {
+        let home = Path::new("fixture-home");
+        let machine = crate::machine::machine_path();
+        let unconfirmed = |receipt: Option<&str>| {
+            system_inspection(
+                JobStatus::SystemUnconfirmed,
+                present(env!("CARGO_PKG_VERSION")),
+                None,
+                receipt,
+            )
+            .job_fix(home)
+            .unwrap()
+        };
+        let limitation = "SYSTEM job installation is unconfirmed. Ask IT to inspect the task from an elevated PowerShell prompt.";
+        assert_eq!(unconfirmed(None), limitation);
+        assert_eq!(unconfirmed(machine.to_str()), limitation);
+        let other = unconfirmed(Some(r"C:\Program Files\open-pact\open-pact-client.exe"));
+        assert!(other.contains("which is not the machine package"));
+        assert!(other.contains("not confirmed"));
+    }
+
+    #[test]
+    fn the_stop_text_never_names_the_caller_and_chooses_by_package_and_task() {
+        let home = Path::new("fixture-home");
+        let caller = std::env::current_exe().unwrap();
+        let caller = caller.to_str().unwrap();
+        for (state, not_ours) in [
+            (MachineState::Current, false),
+            (MachineState::Outdated, false),
+            (MachineState::Missing, false),
+            (MachineState::Unprotected, false),
+            (MachineState::Unknown, false),
+            (MachineState::Current, true),
+        ] {
+            let text = stop_text_for(home, state, not_ours);
+            assert!(!text.contains(caller), "{state:?} {not_ours}: {text}");
+            let command_only = !text.contains("schtasks.exe");
+            assert_eq!(
+                command_only,
+                matches!(state, MachineState::Current | MachineState::Outdated) && !not_ours,
+                "{state:?} {not_ours}: {text}"
+            );
+            assert!(command_only || !text.contains("Remove-Item"), "{text}");
+        }
+    }
+
+    #[test]
+    fn every_elevation_text_names_the_machine_client_or_the_install_block() {
+        let home = Path::new("fixture-home");
+        let caller = std::env::current_exe().unwrap();
+        let caller = caller.to_str().unwrap();
+        let machine = crate::machine::machine_path();
+        let machine = machine.to_str().unwrap().to_owned();
+        let current = present(env!("CARGO_PKG_VERSION"));
+        for wanted in [
+            Wanted::On(RunAs::System),
+            Wanted::On(RunAs::User),
+            Wanted::Off,
+        ] {
+            for client in [
+                current.clone(),
+                MachineClient::Missing,
+                MachineClient::Unprotected { reason: "x".into() },
+            ] {
+                let text = system_retry_text(home, wanted, &client, None);
+                assert!(!text.contains(caller), "{wanted:?} {client:?}: {text}");
+                let usable = matches!(client, MachineClient::Present { .. });
+                match (wanted, usable) {
+                    (Wanted::On(RunAs::System), true) => {
+                        assert!(text.contains("schedule on --system"), "{text}");
+                    }
+                    (Wanted::On(RunAs::System), false) => {
+                        assert!(text.contains("msiexec.exe"), "{text}");
+                        assert!(text.contains("Then run:"), "{text}");
+                    }
+                    (_, true) => assert!(text.contains("schedule off"), "{text}"),
+                    (_, false) => assert!(text.contains("schtasks.exe"), "{text}"),
+                }
+                if usable {
+                    assert!(text.contains(&machine) || machine.is_empty(), "{text}");
+                }
+            }
+        }
+        let with_profile = system_retry_text(
+            home,
+            Wanted::On(RunAs::System),
+            &current,
+            Some(Path::new("/owner's profile")),
+        );
+        assert!(
+            with_profile.ends_with("--user-home '/owner''s profile'"),
+            "{with_profile}"
+        );
+        let refusal = not_ours_text(home, Wanted::On(RunAs::System), "cmd.exe", &current);
+        assert!(refusal.contains("runs cmd.exe, not the machine client"));
+        assert!(refusal.contains("schtasks.exe") && refusal.contains("Then run:"));
+        let off = not_ours_text(home, Wanted::Off, "cmd.exe", &current);
+        assert!(off.contains("schtasks.exe") && !off.contains("Then run:"));
+    }
+
+    #[test]
+    fn a_system_task_that_is_not_ours_stops_every_change() {
+        let home = Path::new("fixture-home");
+        let not_ours = SystemTask::NotOurs {
+            action: "cmd.exe".into(),
+        };
+        for wanted in [
+            Wanted::On(RunAs::System),
+            Wanted::On(RunAs::User),
+            Wanted::Off,
+        ] {
+            assert!(refuse_not_ours(home, wanted, &not_ours).is_err());
+        }
+        for task in [
+            SystemTask::Missing,
+            SystemTask::User,
+            SystemTask::Ours {
+                profile: None,
+                current: false,
+            },
+        ] {
+            assert!(refuse_not_ours(home, Wanted::Off, &task).is_ok());
+        }
     }
 
     #[test]
     fn the_windows_observation_asks_for_the_one_minute_repeat() {
         let job = Job::new(Path::new("client.exe"), Path::new("fixture-home")).unwrap();
-        let script = windows_observation_script(&job, Path::new("client.exe")).unwrap();
+        let script = windows_observation_script(&job);
         assert!(
             script.contains("Repetition.Interval -eq 'PT1M'"),
             "{script}"
         );
         assert!(!script.contains("PT5M"));
         assert!(script.contains("repetition="));
+        // Every action is listed, so a task with two or none reads as not ours.
+        assert!(script.contains("foreach ($item in $action)"));
+        assert!(script.contains("task_enabled=") && script.contains("trigger_count="));
     }
 
     #[test]
@@ -4649,43 +5626,6 @@ esac
             &expected
         ));
         assert!(!windows_action_matches("user\n", exe, &expected));
-    }
-
-    #[test]
-    fn windows_reconcile_repairs_missing_or_stale_system_binary() {
-        let settings = Applied {
-            run_as: RunAs::System,
-            executable: PathBuf::from("C:\\example\\open-pact-client.exe"),
-            user_home: Some(PathBuf::from("C:\\Users\\example")),
-        };
-        let applied = Some(&settings);
-        for protected_binary in [
-            ProtectedBinaryState {
-                exists: false,
-                matches_source: false,
-            },
-            ProtectedBinaryState {
-                exists: true,
-                matches_source: false,
-            },
-        ] {
-            let observed = Observed {
-                exists: true,
-                matches: true,
-                system: true,
-                windows_task: Some(WindowsTaskState {
-                    trigger_enabled: true,
-                    trigger_type: Some(1),
-                    repetition: Some(WAKE_ISO.into()),
-                    protected_binary: Some(protected_binary),
-                }),
-                ..Observed::default()
-            };
-            assert_eq!(
-                reconcile(Some(&settings), applied, &observed),
-                Change::Update
-            );
-        }
     }
 
     #[test]
@@ -4921,63 +5861,26 @@ Write-Output 'limited_uninstall_removed_task_without_protected_access'
     }
 
     #[test]
-    fn only_the_install_directory_script_lets_standard_users_read() {
-        let job = Job::new(Path::new("client.exe"), Path::new("fixture-home")).unwrap();
-        let install = windows_protected_paths_script("fixture-hash", "'source.exe'", true);
-        assert!(install.contains("S-1-5-32-545"));
-        assert!(
-            install.contains("'ReadAndExecute','ContainerInherit,ObjectInherit','None','Allow'")
-        );
-        // The rule is added to the install directory only, after the elevation check.
-        assert_eq!(install.matches("AllowUsersRead $").count(), 1);
-        assert!(install.contains("AllowUsersRead $install"));
-        assert!(install.find("exit 5").unwrap() < install.find("AllowUsersRead $install").unwrap());
-        assert!(
-            install.find("AllowUsersRead $install").unwrap() < install.find("Copy-Item").unwrap()
-        );
-        // The state directory helpers and the other scripts never name the Users group.
-        assert!(!PROTECTED_DIRECTORY.contains("S-1-5-32-545"));
+    fn no_script_gives_standard_users_a_right_on_a_protected_folder() {
+        let install = windows_protected_paths_script("fixture-hash", "'machine.exe'");
+        // The machine client's folder inherits Program Files. Nothing here adds a rule for it.
         for script in [
-            windows_existing_system_state_script("fixture-hash"),
-            windows_cleanup_binary_script(&job, false),
-            windows_orphaned_binary_script(&job),
-            windows_system_executable_script(),
+            install.as_str(),
+            ASSERT_PROTECTED,
+            PROTECTED_DIRECTORY,
+            windows_existing_system_state_script("fixture-hash").as_str(),
         ] {
             assert!(!script.contains("S-1-5-32-545"));
             assert!(!script.contains("AllowUsersRead"));
+            assert!(!script.contains("Copy-Item"));
         }
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn standard_users_read_the_install_directory_and_still_cannot_write() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = powershell_literal(dir.path().join("install").to_str().unwrap());
-        let script = format!(
-            r#"{PROTECTED_DIRECTORY}{USERS_READ_DIRECTORY}
-ProtectedDirectory {path}
-AllowUsersRead {path}
-AllowUsersRead {path}
-AssertProtected {path}
-$acl = [IO.Directory]::GetAccessControl({path})
-$users = @($acl.GetAccessRules($true,$false,[Security.Principal.SecurityIdentifier]) | Where-Object {{ $_.IdentityReference.Value -eq 'S-1-5-32-545' }})
-if ($users.Count -ne 1) {{ throw "expected one Users rule, found $($users.Count)" }}
-$readExecute = [int][Security.AccessControl.FileSystemRights]::ReadAndExecute
-# .NET adds Synchronize to an Allow rule, so the rights read back as ReadAndExecute plus Synchronize.
-if (([int]$users[0].FileSystemRights -band $readExecute) -ne $readExecute) {{ throw 'Users rule is not ReadAndExecute' }}
-if ([int]$users[0].FileSystemRights -band 0xD0156) {{ throw 'Users rule grants write rights' }}
-if ([int]$users[0].InheritanceFlags -ne 3 -or [int]$users[0].PropagationFlags -ne 0) {{ throw 'Users rule does not inherit to children' }}
-$sids = @($acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]) | ForEach-Object {{ $_.IdentityReference.Value }} | Sort-Object -Unique)
-if (($sids -join ',') -ne 'S-1-5-18,S-1-5-32-544,S-1-5-32-545') {{ throw "unexpected install ACL principals: $($sids -join ',')" }}
-$acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier('S-1-5-32-545')),'Write','Allow')))
-[IO.Directory]::SetAccessControl({path},$acl)
-try {{ AssertProtected {path}; throw 'Users write accepted' }} catch {{
-    if ($_.Exception.Message -notlike '*non-admin principal*') {{ throw }}
-}}
-Write-Output 'users_read_only'
-"#
-        );
-        assert_eq!(windows_powershell(&script).unwrap(), "users_read_only");
+        // The install checks Program Files, the folder and the file before the state folders.
+        let program = install
+            .find("AssertProtected (Split-Path -Parent $folder)")
+            .unwrap();
+        let file = install.find("AssertProtected $machine").unwrap();
+        assert!(program < file && file < install.find("ProtectedDirectory $data").unwrap());
+        assert!(install.contains("$machine = 'machine.exe'"));
     }
 
     /// The tests that set the console interrupt flag take this lock, so they never overlap.
@@ -5136,62 +6039,11 @@ Write-Output 'state_acl_reset_to_system_and_administrators'
 
     #[cfg(windows)]
     #[test]
-    fn a_running_client_image_can_be_renamed() {
-        const READY: &str = "OPEN_PACT_RENAME_READY";
-        const STOP: &str = "OPEN_PACT_RENAME_STOP";
-        if let (Ok(ready), Ok(stop)) = (std::env::var(READY), std::env::var(STOP)) {
-            std::fs::write(ready, "ready").unwrap();
-            while !Path::new(&stop).exists() {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            return;
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let image = dir.path().join("open-pact-client.exe");
-        let renamed = dir.path().join("open-pact-client.exe.delete-fictional");
-        std::fs::copy(std::env::current_exe().unwrap(), &image).unwrap();
-        let ready = dir.path().join("ready");
-        let stop = dir.path().join("stop");
-        let mut child = std::process::Command::new(&image)
-            .args([
-                "--exact",
-                "schedule::tests::a_running_client_image_can_be_renamed",
-                "--nocapture",
-            ])
-            .env(READY, &ready)
-            .env(STOP, &stop)
-            .spawn()
-            .unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(15);
-        while !ready.exists() && std::time::Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        if !ready.exists() {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("child test process did not start");
-        }
-        if let Err(error) = std::fs::rename(&image, &renamed) {
-            let _ = std::fs::write(&stop, "stop");
-            let _ = child.wait();
-            panic!("rename running client image: {error}");
-        }
-        let old_image_exists = image.exists();
-        let renamed_image_exists = renamed.exists();
-        std::fs::write(&stop, "stop").unwrap();
-        let child_succeeded = child.wait().unwrap().success();
-        assert!(!old_image_exists);
-        assert!(renamed_image_exists);
-        assert!(child_succeeded);
-    }
-
-    #[cfg(windows)]
-    #[test]
     fn system_storage_refuses_non_admin_writers() {
         let dir = tempfile::tempdir().unwrap();
         let path = powershell_literal(dir.path().join("protected").to_str().unwrap());
         let script = format!(
-            r#"{PROTECTED_DIRECTORY}
+            r#"{ASSERT_PROTECTED}{PROTECTED_DIRECTORY}
 ProtectedDirectory {path}
 AssertProtected {path}
 $acl = [IO.Directory]::GetAccessControl({path})
@@ -5760,7 +6612,7 @@ Write-Output 'refused'
     #[test]
     fn the_job_runs_the_executable_the_caller_names() {
         let executable = Path::new("/opt/example/open-pact-client");
-        let desired = desired_job(Wanted::On(RunAs::User), executable)
+        let desired = desired_job(Wanted::On(RunAs::User), executable, None)
             .unwrap()
             .unwrap();
         assert_eq!(desired.executable, executable);
@@ -5777,8 +6629,30 @@ Write-Output 'refused'
             !job.plist()
                 .contains(&*std::env::current_exe().unwrap().to_string_lossy())
         );
-        assert!(desired_job(Wanted::Off, executable).unwrap().is_none());
-        assert!(desired_job(Wanted::On(RunAs::User), Path::new("")).is_err());
+        assert!(
+            desired_job(Wanted::Off, executable, None)
+                .unwrap()
+                .is_none()
+        );
+        assert!(desired_job(Wanted::On(RunAs::User), Path::new(""), None).is_err());
+        // A SYSTEM job runs the machine client and reads the chosen profile.
+        let system = desired_job(
+            Wanted::On(RunAs::System),
+            Path::new(MACHINE),
+            Some(PathBuf::from("/profile")),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(system.executable, Path::new(MACHINE));
+        assert_eq!(system.user_home, Some(PathBuf::from("/profile")));
+        let user = desired_job(
+            Wanted::On(RunAs::User),
+            executable,
+            Some(PathBuf::from("/profile")),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(user.user_home, None);
     }
 
     #[test]
@@ -6196,7 +7070,7 @@ Write-Output 'refused'
         let dir = tempfile::tempdir().unwrap();
         let home = enrolled_home_with_schedule(dir.path(), Some(""));
         assert!(home.signed_manifest().unwrap().body().schedule.is_none());
-        let error = turn_on(&home, None, false, &std::env::current_exe().unwrap())
+        let error = turn_on(&home, None, false, &std::env::current_exe().unwrap(), None)
             .await
             .unwrap_err();
         assert!(
@@ -6367,7 +7241,7 @@ Write-Output 'refused'
     }
 
     #[test]
-    fn the_system_removal_ends_the_task_and_waits_for_the_binary_before_queueing_it() {
+    fn the_system_removal_ends_the_task_before_it_waits_for_the_state_lock() {
         let job = Job::new(Path::new("client.exe"), Path::new("fixture-home")).unwrap();
         let end = windows_end_task_script(&job, false);
         assert!(end.contains("IsSystemTask $task"));
@@ -6375,36 +7249,6 @@ Write-Output 'refused'
         assert!(!windows_end_task_script(&job, true).contains("$task.Stop"));
         assert!(end.find("'disabled'").unwrap() < end.find("$task.Enabled = $false").unwrap());
         assert!(!windows_end_task_script(&job, true).contains("'disabled'"));
-        let cleanup = windows_cleanup_binary_script(&job, false);
-        let remove = cleanup.find("Remove-Item -LiteralPath $binary").unwrap();
-        let queue = cleanup.find("QueueBinaryRemoval $binary").unwrap();
-        assert!(remove < queue);
-        assert!(
-            cleanup.contains("AddSeconds(30)") && cleanup.contains("Start-Sleep -Milliseconds 250")
-        );
-    }
-
-    #[test]
-    fn the_binary_cleanup_skips_the_wait_for_the_running_image() {
-        let job = Job::new(Path::new("client.exe"), Path::new("fixture-home")).unwrap();
-        let cleanup = windows_cleanup_binary_script(&job, true);
-        assert!(!cleanup.contains("Remove-Item -LiteralPath $binary"));
-        assert!(!cleanup.contains("Start-Sleep"));
-        assert!(cleanup.contains("QueueBinaryRemoval $binary"));
-        assert!(cleanup.contains("$removed = $false"));
-    }
-
-    #[test]
-    fn the_running_image_matches_the_protected_path_in_any_case_and_prefix() {
-        let protected = Path::new(r"C:\Program Files\open-pact\open-pact-client.exe");
-        assert!(same_windows_path(
-            Path::new(r"\\?\c:\program files\Open-Pact\open-pact-client.exe"),
-            protected
-        ));
-        assert!(!same_windows_path(
-            Path::new(r"C:\Users\a\open-pact-client.exe"),
-            protected
-        ));
     }
 
     #[test]
@@ -6756,6 +7600,7 @@ Write-Output 'refused'
             Wanted::Off,
             false,
             Path::new("open-pact-client.exe"),
+            None,
         )
         .await
         .unwrap_err();
