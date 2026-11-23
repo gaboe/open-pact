@@ -17,7 +17,7 @@ use reqwest::StatusCode;
 use sqlx::{PgConnection, PgPool};
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 
-use crate::diag::Diag;
+use crate::diag;
 use crate::hooks::Hooks;
 use crate::metrics::{Observation, Push};
 use crate::{Enforced, Tree};
@@ -214,8 +214,6 @@ struct Shared {
     observe: Option<Arc<Observation>>,
     events: Mutex<Option<mpsc::UnboundedSender<WitnessEvent>>>,
     hooks: Arc<Hooks>,
-    /// The request paths' diagnostic lines; they never write to stderr themselves.
-    diag: Diag,
 }
 
 impl Shared {
@@ -225,14 +223,16 @@ impl Shared {
                 url,
                 witness,
                 pushed,
-            } => eprintln!(
+            } => diag::line(format!(
                 "witness {url} holds size {witness}, this push had {pushed}; the next push starts from {witness}"
-            ),
+            )),
             WitnessEvent::Refused { url, reason } => {
-                eprintln!("witness {url} refused the consistency proof: {reason}");
+                diag::line(format!(
+                    "witness {url} refused the consistency proof: {reason}"
+                ));
             }
             WitnessEvent::Failed { url, error } => {
-                eprintln!("witness {url} did not cosign: {error}");
+                diag::line(format!("witness {url} did not cosign: {error}"));
             }
         }
         if let Some(events) = self.events.lock().expect("witness events").as_ref() {
@@ -270,7 +270,6 @@ impl Owners {
             changed: watch::channel(0).0,
             http: reqwest::Client::builder().timeout(PUSH_TIMEOUT).build()?,
             db,
-            diag: Diag::start(observe.clone()),
             observe,
             events: Mutex::default(),
             hooks: Arc::default(),
@@ -305,16 +304,6 @@ impl Owners {
 
     pub fn hooks(&self) -> Arc<Hooks> {
         self.shared.hooks.clone()
-    }
-
-    /// Queues a diagnostic line from a request path. It never waits and never writes stderr.
-    pub fn log(&self, line: String) {
-        self.shared.diag.line(line);
-    }
-
-    #[cfg(test)]
-    pub fn diag(&self) -> &Diag {
-        &self.shared.diag
     }
 
     /// Adds the witness keys of a manifest this process starts to enforce.
@@ -471,6 +460,10 @@ struct Owner {
     refresh: bool,
     recheck: Option<Instant>,
     announced: HashSet<u64>,
+    /// A renewal tree step that a Push interrupted, with the revision of the snapshot it reads. It
+    /// keeps running while the owner serves the Push; the next renewal waits on it instead of
+    /// starting another behind the same `grow`.
+    step: Option<(u64, tokio::task::JoinHandle<anyhow::Result<Tree>>)>,
 }
 
 impl Owner {
@@ -499,6 +492,7 @@ impl Owner {
             refresh: false,
             recheck: None,
             announced: HashSet::new(),
+            step: None,
         }
     }
 
@@ -671,23 +665,32 @@ impl Owner {
             .expect("manifest snapshot")
             .clone();
         self.publish(false);
-        let mut step = crate::tree_step(
-            self.shared.db.clone(),
-            snap.clone(),
-            crate::TreeSql::Step,
-            self.shared.hooks.clone(),
-        );
+        // A step of the same snapshot that a Push interrupted is still the step to wait for. One
+        // of an older snapshot reads a log nobody asks about now; it runs on detached.
+        let mut step = match self.step.take() {
+            Some((revision, step)) if revision == snap.revision => step,
+            _ => crate::tree_step(
+                self.shared.db.clone(),
+                snap.clone(),
+                crate::TreeSql::Step,
+                self.shared.hooks.clone(),
+            ),
+        };
         // The tree can wait for `grow` behind a read with no deadline. A Push carries its own
-        // tree, so it never waits for this one: the step runs on without the owner.
+        // tree, so it never waits for this one: the step stays pending beside the owner.
         let tree = loop {
             tokio::select! {
                 done = &mut step => break done,
                 job = self.jobs.recv() => {
-                    let Some(job) = job else { return false };
+                    let Some(job) = job else {
+                        self.step = Some((snap.revision, step));
+                        return false;
+                    };
                     let push = matches!(job, Job::Push(_));
                     self.accept(job);
                     self.answer_joins();
                     if push {
+                        self.step = Some((snap.revision, step));
                         self.publish(false);
                         return true;
                     }
@@ -702,7 +705,10 @@ impl Owner {
                     Err(error) => anyhow::Error::from(error),
                     Ok(Ok(_)) => unreachable!("handled above"),
                 };
-                eprintln!("witness {}: the tree read failed: {error:#}", self.url);
+                diag::line(format!(
+                    "witness {}: the tree read failed: {error:#}",
+                    self.url
+                ));
                 let done = Instant::now();
                 if self.shared.revision() == snap.revision {
                     self.failures += 1;
@@ -811,7 +817,10 @@ impl Owner {
             keys.clone(),
         ));
         let attempt = task.await.unwrap_or_else(|error| {
-            eprintln!("witness {}: the push task failed: {error}", self.url);
+            diag::line(format!(
+                "witness {}: the push task failed: {error}",
+                self.url
+            ));
             Attempt {
                 ahead: None,
                 staged: Staged::Failed,
@@ -932,14 +941,17 @@ impl Owner {
         match stored {
             Ok(Ok(())) => true,
             Ok(Err(error)) => {
-                eprintln!(
+                diag::line(format!(
                     "witness {}: storing the cosignature failed: {error:#}",
                     self.url
-                );
+                ));
                 false
             }
             Err(error) => {
-                eprintln!("witness {}: the store task failed: {error}", self.url);
+                diag::line(format!(
+                    "witness {}: the store task failed: {error}",
+                    self.url
+                ));
                 false
             }
         }

@@ -434,7 +434,7 @@ struct RangeQuery {
 }
 
 fn internal(e: impl Display) -> Reply {
-    eprintln!("internal error: {e}");
+    diag::line(format!("internal error: {e}"));
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(json!({"status": "error"})),
@@ -761,8 +761,8 @@ async fn log_key_text(Extension(app): Extension<App>) -> impl IntoResponse {
 }
 
 /// The 503 of both read routes. The client retries it once, after the delay it names.
-fn unavailable(app: &App, why: served::Why) -> axum::response::Response {
-    app.owners.log(format!("checkpoint not served: {why:?}"));
+fn unavailable(why: served::Why) -> axum::response::Response {
+    diag::line(format!("checkpoint not served: {why:?}"));
     let headers = [(header::RETRY_AFTER, "5")];
     (
         StatusCode::SERVICE_UNAVAILABLE,
@@ -800,7 +800,7 @@ async fn log_checkpoint(
                 (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
                 (header::RETRY_AFTER, "5"),
             ];
-            app.owners.log(format!("checkpoint not served: {why:?}"));
+            diag::line(format!("checkpoint not served: {why:?}"));
             Ok((
                 StatusCode::SERVICE_UNAVAILABLE,
                 headers,
@@ -1201,6 +1201,19 @@ async fn accept_manifest(
     ))
 }
 
+/// The device's enrolment under the current manifest, when it is approved; otherwise the 403.
+async fn approved_enrolment(
+    app: &App,
+    conn: &mut sqlx::PgConnection,
+    pseudonym: &Pseudonym,
+) -> Result<devices::Enrolment, Reply> {
+    devices::bound(conn, pseudonym, app.manifest.hash().as_str())
+        .await
+        .map_err(internal)?
+        .filter(|e| e.state == DeviceState::Approved)
+        .ok_or_else(device_denied)
+}
+
 async fn log_mine(
     Extension(app): Extension<App>,
     RawQuery(query): RawQuery,
@@ -1213,21 +1226,17 @@ async fn log_mine(
     let has_witnesses = policy.is_some_and(|p| !p.witnesses.is_empty());
     // A pending or revoked device gets the base 403 whether or not a checkpoint is ready. The
     // connection goes back to the pool before any wait for a witness.
-    let enrolment = {
+    {
         let mut conn = app.conn().await?;
-        devices::bound(&mut conn, &request.pseudonym, app.manifest.hash().as_str())
-            .await
-            .map_err(internal)?
-            .filter(|e| e.state == DeviceState::Approved)
-            .ok_or_else(device_denied)?
-    };
+        approved_enrolment(&app, &mut conn, &request.pseudonym).await?;
+    }
     app.owners.hooks().hit("served_entered").await;
     let deadline = Instant::now() + app.wait;
     let (note, tree) = match app.served(policy, deadline).await {
         served::Answer::Witnessed { note, tree } => (note, tree),
         served::Answer::Unavailable(why) => {
             app.count_served(metrics::Caller::Mine, metrics::Served::NotYet);
-            return Ok(unavailable(&app, why));
+            return Ok(unavailable(why));
         }
     };
     let served = if has_witnesses {
@@ -1236,12 +1245,16 @@ async fn log_mine(
         metrics::Served::LogSigned
     };
     let cp = Checkpoint::parse(&note.text).map_err(internal)?;
-    let mut conn = app.conn().await?;
+    // The wait above can last seconds, so the approval is read again on the connection that reads
+    // the entries: a device revoked during the wait gets the 403, not its entries.
+    let mut tx = app.begin(metrics::Site::OtherTx).await?;
+    let enrolment = approved_enrolment(&app, &mut tx, &request.pseudonym).await?;
     let commitment =
         devices::commitment(&enrolment.salt, request.pseudonym.as_str()).map_err(internal)?;
-    let entries = translog::mine(&mut conn, cp.size, &enrolment.manifest, &commitment)
+    let entries = translog::mine(&mut tx, cp.size, &enrolment.manifest, &commitment)
         .await
         .map_err(internal)?;
+    tx.commit().await.map_err(internal)?;
     let with_proof = |entry: Entry| -> Result<EntryWithProof, Reply> {
         let proof = inclusion_proof(tree.prefix(cp.size), entry.index).map_err(internal)?;
         Ok(EntryWithProof { entry, proof })
@@ -2133,12 +2146,15 @@ async fn serve(db: PgPool) -> anyhow::Result<()> {
     tokio::spawn(refresh_cosignatures(app.clone()));
     let app = router(app);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(
+    let served = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(shutdown_signal())
-    .await?;
+    .await;
+    // The queued diagnostic lines are written before the process exits, for at most two seconds.
+    let _ = tokio::task::spawn_blocking(|| diag::shutdown(diag::SHUTDOWN_WAIT)).await;
+    served?;
     Ok(())
 }
 
@@ -2300,8 +2316,8 @@ async fn shutdown_signal() {
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .expect("install SIGTERM handler");
     tokio::select! {
-        _ = term.recv() => eprintln!("SIGTERM: finishing open requests"),
-        _ = tokio::signal::ctrl_c() => eprintln!("SIGINT: finishing open requests"),
+        _ = term.recv() => diag::line("SIGTERM: finishing open requests".into()),
+        _ = tokio::signal::ctrl_c() => diag::line("SIGINT: finishing open requests".into()),
     }
 }
 

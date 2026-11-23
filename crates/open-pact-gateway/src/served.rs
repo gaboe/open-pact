@@ -16,6 +16,7 @@ use open_pact_core::{
 use serde_json::json;
 use sqlx::Row as _;
 
+use crate::diag;
 use crate::hooks::Hooks;
 use crate::translog::RowBatch;
 use crate::witness::db_step;
@@ -23,6 +24,12 @@ use crate::{App, Reply, Tree, TreeSql, tree_step};
 
 /// The longest `?policy=` value the gateway decodes: the client sends at most this many bytes.
 const MAX_POLICY_QUERY: usize = 4096;
+
+#[cfg(test)]
+thread_local! {
+    /// Test only: how often this thread decoded a policy value.
+    static DECODED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// A gateway note counts only while it keeps this much of the age the client allows: 60 s for a
 /// client clock ahead of the gateway and 240 s from the gateway's choice to the client's check.
@@ -72,6 +79,8 @@ pub fn request_policy(query: Option<&str>) -> Result<Option<LogPolicy>, Reply> {
     if value.len() > MAX_POLICY_QUERY {
         return Err(invalid_policy());
     }
+    #[cfg(test)]
+    DECODED.with(|n| n.set(n.get() + 1));
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(value)
         .map_err(|_| invalid_policy())?;
@@ -219,8 +228,7 @@ impl App {
                 Some(tree)
             }
             Ok(Ok(Err(error))) => {
-                self.owners
-                    .log(format!("checkpoint read: the tree step failed: {error:#}"));
+                diag::line(format!("checkpoint read: the tree step failed: {error:#}"));
                 None
             }
             _ => None,
@@ -402,7 +410,7 @@ impl App {
             let top = match tokio::time::timeout_at(Self::timeout_at(deadline), step).await {
                 Ok(Ok(Ok(top))) => top,
                 Ok(Ok(Err(error))) => {
-                    self.owners.log(format!(
+                    diag::line(format!(
                         "checkpoint read: the uncached size query failed: {error:#}"
                     ));
                     return Err(Stop::Database);
@@ -470,8 +478,7 @@ impl App {
         match tokio::time::timeout_at(Self::timeout_at(deadline), step).await {
             Ok(Ok(Ok(batch))) => Ok(Rows { batch, known }),
             Ok(Ok(Err(error))) => {
-                self.owners
-                    .log(format!("checkpoint read: the row query failed: {error:#}"));
+                diag::line(format!("checkpoint read: the row query failed: {error:#}"));
                 Err(Stop::Database)
             }
             Ok(Err(_)) => Err(Stop::Database),
@@ -528,7 +535,7 @@ mod tests {
     use axum::http::StatusCode;
     use base64::Engine;
 
-    use super::{MAX_POLICY_QUERY, request_policy};
+    use super::request_policy;
 
     /// A policy with no witness, as JSON padded with spaces so that its base64url text has this
     /// many bytes (a multiple of four, so no remainder).
@@ -544,16 +551,25 @@ mod tests {
 
     #[test]
     fn a_policy_longer_than_4_kib_is_a_400_before_it_is_decoded() {
-        let at_limit = padded(MAX_POLICY_QUERY);
-        assert_eq!(at_limit.len(), "policy=".len() + MAX_POLICY_QUERY);
+        let decoded = || super::DECODED.with(std::cell::Cell::get);
+        // The client sends at most 4096 characters after `policy=`. The numbers are the wire
+        // limit itself, so changing the constant breaks this test.
+        let at_limit = padded(4096);
+        assert_eq!(at_limit.len(), 7 + 4096);
         assert!(
             request_policy(Some(&at_limit)).unwrap().is_some(),
-            "the client's largest query is accepted"
+            "4096 characters are accepted"
         );
-        // The same valid policy with one more block of four characters.
-        let over = padded(MAX_POLICY_QUERY + 4);
-        let (status, body) = request_policy(Some(&over)).unwrap_err();
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(body.0["reason"], "invalid policy");
+        assert_eq!(decoded(), 1);
+        // 4097 characters, and a valid policy of 4100 characters, are refused without a decode.
+        let one_over = format!("policy={}", "A".repeat(4097));
+        let valid_over = padded(4100);
+        assert_eq!(valid_over.len(), 7 + 4100);
+        for over in [one_over, valid_over] {
+            let (status, body) = request_policy(Some(&over)).unwrap_err();
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(body.0["reason"], "invalid policy");
+            assert_eq!(decoded(), 1, "an oversized value was decoded");
+        }
     }
 }

@@ -35,6 +35,8 @@ struct Fixture {
     log: LogKey,
     policy: LogPolicy,
     query: String,
+    /// The registry, when the options turn observation on.
+    metrics: Option<Arc<metrics::Metrics>>,
     events: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<witness::WitnessEvent>>,
 }
 
@@ -56,6 +58,8 @@ struct Options {
     /// Seeds of the witness keys (default: one per index) and whether all share one name.
     seeds: Option<Vec<[u8; 32]>>,
     same_name: bool,
+    /// Turns the metrics and the slow-request log on, logging requests slower than this.
+    slow_ms: Option<u64>,
 }
 
 impl Options {
@@ -72,6 +76,7 @@ impl Options {
             relay: false,
             seeds: None,
             same_name: false,
+            slow_ms: None,
         }
     }
 }
@@ -194,12 +199,14 @@ impl Fixture {
                 .collect();
         }
         let urls = witness::normalize_urls(urls);
+        let metrics = options.slow_ms.map(|_| Arc::new(metrics::Metrics::new()));
+        let observe = metrics::Observation::new(metrics.clone(), options.slow_ms);
         let owners = Owners::start(
             urls,
             enforced.log.witnesses.keys().to_vec(),
             current.clone(),
             db.clone(),
-            None,
+            observe.clone(),
         )
         .unwrap();
         let app = App {
@@ -216,7 +223,7 @@ impl Fixture {
             )),
             max_nonces: 10_000,
             kek: Arc::new(kek),
-            observe: None,
+            observe,
             owners: Arc::new(owners),
             wait: Duration::from_millis(options.wait_ms),
         };
@@ -234,6 +241,7 @@ impl Fixture {
             log,
             policy,
             query,
+            metrics,
         }
     }
 
