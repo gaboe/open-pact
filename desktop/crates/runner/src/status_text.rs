@@ -3,6 +3,8 @@
 use crate::text::{Headline, Tone, humanize, readable_local};
 use crate::zone;
 use open_pact_client::ControlReport;
+use open_pact_client::JobStatus;
+use open_pact_client::machine::MachineState;
 use open_pact_client::status::{ClaimEvidence, Issue, Report, Verdict};
 use open_pact_core::timestamp::{parse_rfc3339, seconds};
 use open_pact_core::{ControlValue, DeviceStatus};
@@ -362,12 +364,86 @@ pub fn resume_join(status: &Report) -> Option<bool> {
     open.then(|| status.schedule.owner_consented == Some(true))
 }
 
+/// True when the "Install job" button shows. A SYSTEM job runs the machine client, so the button
+/// needs a usable machine client (current or outdated) and a job that is missing, out of date or
+/// not confirmed. A user job keeps the rule of its job text.
+pub fn install_button_shown(
+    system_job: bool,
+    job: Option<JobStatus>,
+    machine: Option<MachineState>,
+    job_text: &str,
+) -> bool {
+    if system_job {
+        matches!(
+            machine,
+            Some(MachineState::Current | MachineState::Outdated)
+        ) && matches!(
+            job,
+            Some(JobStatus::Missing | JobStatus::Outdated | JobStatus::SystemUnconfirmed)
+        )
+    } else {
+        crate::text::job_needs_install(job_text)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::samples::{self, report};
     use open_pact_client::status::Urgency;
     use time::UtcOffset;
+
+    #[test]
+    fn a_system_job_offers_install_only_with_a_usable_machine_client() {
+        assert!(install_button_shown(
+            true,
+            Some(JobStatus::Missing),
+            Some(MachineState::Current),
+            ""
+        ));
+        assert!(install_button_shown(
+            true,
+            Some(JobStatus::SystemUnconfirmed),
+            Some(MachineState::Outdated),
+            ""
+        ));
+        assert!(!install_button_shown(
+            true,
+            Some(JobStatus::NotOurs),
+            Some(MachineState::Current),
+            ""
+        ));
+        assert!(!install_button_shown(
+            true,
+            Some(JobStatus::Missing),
+            Some(MachineState::Missing),
+            ""
+        ));
+        assert!(!install_button_shown(
+            true,
+            Some(JobStatus::Missing),
+            Some(MachineState::Unprotected),
+            ""
+        ));
+        assert!(!install_button_shown(
+            true,
+            Some(JobStatus::Current),
+            Some(MachineState::Current),
+            ""
+        ));
+        assert!(install_button_shown(
+            false,
+            None,
+            None,
+            "missing; OS checked now"
+        ));
+        assert!(!install_button_shown(
+            false,
+            None,
+            None,
+            "installed and current; OS checked now"
+        ));
+    }
 
     #[test]
     fn headlines_keep_uncertainty_in_plain_words() {
