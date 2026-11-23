@@ -7,6 +7,7 @@
 //! method names, five status classes. No path, address, pseudonym, nonce or hash reaches a label or
 //! the slow-request log.
 
+use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
@@ -456,58 +457,76 @@ impl<'a> StageClock<'a> {
     }
 }
 
-/// At most one slow-request line a second; the next line says how many were left out.
+/// At most one slow-request line a window (one second by default); the next line says how many
+/// were left out.
 pub struct SlowLog {
     threshold: Duration,
+    window: Duration,
     state: Mutex<SlowState>,
 }
 
-#[derive(Default)]
 struct SlowState {
+    /// When the last line finished writing.
     last: Option<Instant>,
     suppressed: u64,
+    out: Box<dyn Write + Send>,
 }
 
 impl SlowLog {
     fn new(threshold_ms: u64) -> SlowLog {
+        SlowLog::with_output(
+            Duration::from_millis(threshold_ms),
+            Duration::from_secs(1),
+            Box::new(std::io::stderr()),
+        )
+    }
+
+    fn with_output(threshold: Duration, window: Duration, out: Box<dyn Write + Send>) -> SlowLog {
         SlowLog {
-            threshold: Duration::from_millis(threshold_ms),
-            state: Mutex::default(),
+            threshold,
+            window,
+            state: Mutex::new(SlowState {
+                last: None,
+                suppressed: 0,
+                out,
+            }),
         }
     }
 
-    /// Writes the line for a request when one is due: the request was slow and no line went out a
-    /// moment ago. The lock stays held while the line is written, so lines leave in the order their
-    /// rate decisions were made.
-    fn emit(
-        &self,
-        now: Instant,
-        route: &str,
-        method: &str,
-        status: &str,
-        elapsed: Duration,
-    ) -> Option<String> {
+    /// Writes the line for a request when one is due: the request was slow and no line finished
+    /// writing less than a window ago. The clock is read under the lock, so a request that waited
+    /// for a slow write compares against the end of that write. The lock stays held while the line
+    /// is written, so lines leave in the order their decisions were made.
+    fn emit(&self, route: &str, method: &str, status: &str, elapsed: Duration) -> Option<String> {
         if elapsed < self.threshold {
             return None;
         }
         let mut state = self.state.lock().expect("slow log state");
         if state
             .last
-            .is_some_and(|last| now.duration_since(last) < Duration::from_secs(1))
+            .is_some_and(|last| Instant::now().saturating_duration_since(last) < self.window)
         {
             state.suppressed += 1;
             return None;
         }
-        state.last = Some(now);
         let mut line = format!(
             "slow_request route={route} method={method} status={status} ms={}",
             elapsed.as_millis()
         );
         if state.suppressed > 0 {
             line.push_str(&format!(" suppressed={}", state.suppressed));
-            state.suppressed = 0;
         }
-        eprintln!("{line}");
+        let written = format!("{line}\n");
+        if state
+            .out
+            .write_all(written.as_bytes())
+            .and_then(|()| state.out.flush())
+            .is_err()
+        {
+            return None;
+        }
+        state.last = Some(Instant::now());
+        state.suppressed = 0;
         Some(line)
     }
 }
@@ -604,7 +623,7 @@ async fn observe(
         metrics.request(&route, method, status, elapsed.as_secs_f64());
     }
     if let Some(slow) = &observation.slow {
-        slow.emit(now(), &route, method, status, elapsed);
+        slow.emit(&route, method, status, elapsed);
     }
     response
 }
@@ -1290,35 +1309,83 @@ mod tests {
         );
     }
 
+    /// A writer that takes `pause` for every write, as a blocked stderr would.
+    struct Pausing {
+        sink: Arc<Mutex<Vec<u8>>>,
+        pause: Duration,
+    }
+
+    impl Write for Pausing {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            std::thread::sleep(self.pause);
+            self.sink.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn captured(pause: Duration, window: Duration) -> (SlowLog, Arc<Mutex<Vec<u8>>>) {
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let out = Pausing {
+            sink: sink.clone(),
+            pause,
+        };
+        let slow = SlowLog::with_output(Duration::from_millis(1000), window, Box::new(out));
+        (slow, sink)
+    }
+
     #[test]
-    fn the_slow_log_writes_one_line_a_second_and_counts_what_it_left_out() {
-        let slow = SlowLog::new(1000);
-        let t = Instant::now();
+    fn the_slow_log_writes_one_line_a_window_and_counts_what_it_left_out() {
+        let window = Duration::from_millis(300);
+        let (slow, sink) = captured(Duration::ZERO, window);
         let ms = Duration::from_millis;
-        assert_eq!(slow.emit(t, "/v1/claim", "POST", "2xx", ms(999)), None);
+        assert_eq!(slow.emit("/v1/claim", "POST", "2xx", ms(999)), None);
         assert_eq!(
-            slow.emit(t, "/v1/claim", "POST", "2xx", ms(1234))
-                .as_deref(),
+            slow.emit("/v1/claim", "POST", "2xx", ms(1234)).as_deref(),
             Some("slow_request route=/v1/claim method=POST status=2xx ms=1234")
         );
+        // Each check comes well inside the window, so the margins hold on a loaded machine.
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(slow.emit("/v1/nonce", "POST", "5xx", ms(2000)), None);
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(slow.emit("/v1/nonce", "POST", "5xx", ms(2000)), None);
+        std::thread::sleep(window);
         assert_eq!(
-            slow.emit(t + ms(500), "/v1/nonce", "POST", "5xx", ms(2000)),
-            None
-        );
-        assert_eq!(
-            slow.emit(t + ms(900), "/v1/nonce", "POST", "5xx", ms(2000)),
-            None
-        );
-        assert_eq!(
-            slow.emit(t + ms(1100), "/v1/nonce", "POST", "5xx", ms(2000))
-                .as_deref(),
+            slow.emit("/v1/nonce", "POST", "5xx", ms(2000)).as_deref(),
             Some("slow_request route=/v1/nonce method=POST status=5xx ms=2000 suppressed=2")
         );
+        std::thread::sleep(window);
         assert_eq!(
-            slow.emit(t + ms(2200), "/", "GET", "2xx", ms(1000))
-                .as_deref(),
+            slow.emit("/", "GET", "2xx", ms(1000)).as_deref(),
             Some("slow_request route=/ method=GET status=2xx ms=1000")
         );
+        let written = String::from_utf8(sink.lock().unwrap().clone()).unwrap();
+        assert_eq!(written.lines().count(), 3, "{written}");
+    }
+
+    #[test]
+    fn a_request_that_waited_for_a_slow_write_keeps_the_window() {
+        let window = Duration::from_millis(100);
+        let (slow, sink) = captured(Duration::from_millis(300), window);
+        let slow = Arc::new(slow);
+        let first = {
+            let slow = slow.clone();
+            std::thread::spawn(move || {
+                slow.emit("/v1/claim", "POST", "2xx", Duration::from_secs(2))
+            })
+        };
+        // The first line now holds the lock for its 300 ms write. The second request arrives during
+        // that write, 150 ms after the first started, which is more than one window after the first
+        // started but less than one window after the first line finished.
+        std::thread::sleep(Duration::from_millis(150));
+        let second = slow.emit("/v1/nonce", "POST", "5xx", Duration::from_secs(2));
+        assert!(first.join().unwrap().is_some());
+        assert_eq!(second, None);
+        let written = String::from_utf8(sink.lock().unwrap().clone()).unwrap();
+        assert_eq!(written.lines().count(), 1, "{written}");
     }
 
     #[tokio::test]
