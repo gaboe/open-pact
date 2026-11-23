@@ -473,8 +473,10 @@ impl SlowLog {
         }
     }
 
-    /// The line to write for a request, or None when it was fast or a line went out a moment ago.
-    fn line(
+    /// Writes the line for a request when one is due: the request was slow and no line went out a
+    /// moment ago. The lock stays held while the line is written, so lines leave in the order their
+    /// rate decisions were made.
+    fn emit(
         &self,
         now: Instant,
         route: &str,
@@ -502,6 +504,7 @@ impl SlowLog {
             line.push_str(&format!(" suppressed={}", state.suppressed));
             state.suppressed = 0;
         }
+        eprintln!("{line}");
         Some(line)
     }
 }
@@ -583,7 +586,7 @@ async fn observe(
         .map_or("unmatched", MatchedPath::as_str)
         .to_owned();
     let method = method_label(request.method());
-    let start = Instant::now();
+    let start = now();
     let mut guard = InFlight {
         observation: &observation,
         route: &route,
@@ -597,10 +600,8 @@ async fn observe(
     if let Some(metrics) = observation.metrics() {
         metrics.request(&route, method, status, elapsed.as_secs_f64());
     }
-    if let Some(slow) = &observation.slow
-        && let Some(line) = slow.line(Instant::now(), &route, method, status, elapsed)
-    {
-        eprintln!("{line}");
+    if let Some(slow) = &observation.slow {
+        slow.emit(now(), &route, method, status, elapsed);
     }
     response
 }
@@ -1294,27 +1295,27 @@ mod tests {
         let slow = SlowLog::new(1000);
         let t = Instant::now();
         let ms = Duration::from_millis;
-        assert_eq!(slow.line(t, "/v1/claim", "POST", "2xx", ms(999)), None);
+        assert_eq!(slow.emit(t, "/v1/claim", "POST", "2xx", ms(999)), None);
         assert_eq!(
-            slow.line(t, "/v1/claim", "POST", "2xx", ms(1234))
+            slow.emit(t, "/v1/claim", "POST", "2xx", ms(1234))
                 .as_deref(),
             Some("slow_request route=/v1/claim method=POST status=2xx ms=1234")
         );
         assert_eq!(
-            slow.line(t + ms(500), "/v1/nonce", "POST", "5xx", ms(2000)),
+            slow.emit(t + ms(500), "/v1/nonce", "POST", "5xx", ms(2000)),
             None
         );
         assert_eq!(
-            slow.line(t + ms(900), "/v1/nonce", "POST", "5xx", ms(2000)),
+            slow.emit(t + ms(900), "/v1/nonce", "POST", "5xx", ms(2000)),
             None
         );
         assert_eq!(
-            slow.line(t + ms(1100), "/v1/nonce", "POST", "5xx", ms(2000))
+            slow.emit(t + ms(1100), "/v1/nonce", "POST", "5xx", ms(2000))
                 .as_deref(),
             Some("slow_request route=/v1/nonce method=POST status=5xx ms=2000 suppressed=2")
         );
         assert_eq!(
-            slow.line(t + ms(2200), "/", "GET", "2xx", ms(1000))
+            slow.emit(t + ms(2200), "/", "GET", "2xx", ms(1000))
                 .as_deref(),
             Some("slow_request route=/ method=GET status=2xx ms=1000")
         );
