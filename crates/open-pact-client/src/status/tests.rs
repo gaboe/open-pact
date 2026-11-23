@@ -1,7 +1,13 @@
 use super::*;
 use std::path::Path;
 
-use crate::fake_gateway::{Company, DEMO_MANIFEST, FakeGateway, Witness, not_found, snapshot};
+use crate::fake_gateway::{
+    Company, DEMO_MANIFEST, FakeGateway, Reply, Witness, not_found, snapshot,
+};
+
+/// What the checkpoint route answers instead of the stored checkpoint: the request number and
+/// the stored text in, the reply out.
+type CheckpointOverride = std::sync::Arc<dyn Fn(usize, &str) -> Reply + Send + Sync>;
 use open_pact_core::{Claim, ControlValue, Os, Pseudonym, TrustLevel};
 use serde_json::json;
 
@@ -67,6 +73,10 @@ interval = "55m"
 
 impl Fixture {
     async fn new(state: &str) -> Self {
+        Self::new_with(state, None).await
+    }
+
+    async fn new_with(state: &str, over: Option<CheckpointOverride>) -> Self {
         let now = open_pact_core::timestamp::parse_rfc3339("2026-11-16T10:00:00Z")
             .unwrap()
             .to_offset(time::UtcOffset::UTC);
@@ -140,14 +150,23 @@ impl Fixture {
             "revoked" => "revoked",
             _ => "approved",
         };
-        let gateway = FakeGateway::start(move |line, _| match line {
-            "GET /v1/manifest" => (200, published.clone()),
-            "GET /v1/log/key" => (200, log.clone()),
-            "GET /v1/log/checkpoint" => (200, checkpoint.clone()),
-            "POST /v1/nonce" => (200, json!({"nonce":"status-nonce"}).to_string()),
-            "POST /v1/device/status" => (200, json!({"state":approval}).to_string()),
-            "GET /v1/log/proof/consistency?from=1&to=2" => (503, "try later".into()),
-            _ => not_found(),
+        let stored_text = stored_checkpoint.clone();
+        let gateway = FakeGateway::start_with(move |line, nth| {
+            if line == "GET /v1/log/checkpoint"
+                && let Some(over) = &over
+            {
+                return over(nth, &stored_text);
+            }
+            let (status, body) = match line {
+                "GET /v1/manifest" => (200, published.clone()),
+                "GET /v1/log/key" => (200, log.clone()),
+                "GET /v1/log/checkpoint" => (200, checkpoint.clone()),
+                "POST /v1/nonce" => (200, json!({"nonce":"status-nonce"}).to_string()),
+                "POST /v1/device/status" => (200, json!({"state":approval}).to_string()),
+                "GET /v1/log/proof/consistency?from=1&to=2" => (503, "try later".into()),
+                _ => not_found(),
+            };
+            Reply::new(status, body)
         })
         .await;
         let dir = tempfile::tempdir().unwrap();
@@ -1140,4 +1159,67 @@ async fn status_of_a_system_job_never_shows_the_log_in_the_home() {
     assert!(report.render().contains(&note));
     let json = serde_json::to_value(&report).unwrap();
     assert_eq!(json["schedule"]["last_job_log_note"], note);
+}
+
+#[tokio::test]
+async fn a_late_gateway_503_is_retried_and_status_verifies_the_checkpoint() {
+    // The first answer comes after the old 3 s limit, then 503 with Retry-After: 1; the retry is 200.
+    let over: CheckpointOverride = std::sync::Arc::new(|nth, stored| {
+        if nth == 0 {
+            Reply::new(503, "try later")
+                .header("Retry-After", "1")
+                .delayed(std::time::Duration::from_millis(3500))
+        } else {
+            Reply::new(200, stored)
+        }
+    });
+    let fixture = Fixture::new_with("approved_ok", Some(over)).await;
+    let started = std::time::Instant::now();
+    let report = fixture.report(true).await;
+    assert!(started.elapsed() < std::time::Duration::from_secs(20));
+    assert_eq!(report.exit_code, 0, "{}", report.render());
+    assert!(
+        report.log.contains("checkpoint verified now"),
+        "{}",
+        report.log
+    );
+    let checkpoints = fixture
+        .gateway
+        .requests()
+        .iter()
+        .filter(|line| *line == "GET /v1/log/checkpoint")
+        .count();
+    assert_eq!(checkpoints, 2);
+    assert!(
+        fixture.gateway.policies().len() >= 2,
+        "both tries carry the saved manifest's policy"
+    );
+}
+
+#[tokio::test]
+async fn two_gateway_503s_are_a_refresh_failure_and_never_a_log_alarm() {
+    let over: CheckpointOverride =
+        std::sync::Arc::new(|_, _| Reply::new(503, "try later").header("Retry-After", "1"));
+    let fixture = Fixture::new_with("approved_ok", Some(over)).await;
+    let report = fixture.report(true).await;
+    assert_eq!(report.exit_code, 1);
+    assert!(
+        report
+            .limitations
+            .iter()
+            .any(|text| text.starts_with("Gateway refresh failed:")),
+        "{:?}",
+        report.limitations
+    );
+    assert!(report.issues.iter().any(|issue| {
+        issue
+            .message
+            .contains("Live approval and manifest agreement could not be confirmed.")
+    }));
+    let rendered = report.render();
+    assert!(!rendered.contains("ALARM"), "{rendered}");
+    assert!(
+        !rendered.contains("consistency proof unavailable"),
+        "{rendered}"
+    );
 }
