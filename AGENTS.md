@@ -13,4 +13,5 @@ One annotated tag publishes the CLI, the gateway image, and both desktop apps fr
    3. Check that every hash in the formula and the manifests matches `SHA256SUMS`.
    4. Commit `open-pact.rb` as `Formula/open-pact.rb` in [gaboe/homebrew-tap](https://github.com/gaboe/homebrew-tap) and push.
    5. Commit `open-pact.json` as `bucket/open-pact.json` and `open-pact-desktop.json` as `bucket/open-pact-desktop.json` in [gaboe/scoop-bucket](https://github.com/gaboe/scoop-bucket) and push.
+   6. For a stable tag only, after the rc tests pass, submit the winget manifests to [microsoft/winget-pkgs](https://github.com/microsoft/winget-pkgs) by hand. Download `gaboe.open-pact.yaml`, `gaboe.open-pact.installer.yaml`, and `gaboe.open-pact.locale.en-US.yaml` from the release. Check that `InstallerSha256` equals the `open-pact-client-x86_64-pc-windows-msvc.msi` line of `SHA256SUMS`. Open the pull request with the three files in `manifests/g/gaboe/open-pact/<version>/`.
 5. A prerelease tag, such as `v0.3.2-rc.1`, publishes assets only. Skip step 4 for it. Set the prerelease version in both `Cargo.toml` files before you tag.
