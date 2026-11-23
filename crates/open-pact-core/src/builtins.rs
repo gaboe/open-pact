@@ -69,10 +69,12 @@ const BUILTIN_ABOUT: &[(&str, u32, &str)] = &[
         "antimalware_active_threats",
         2,
         "A threat that the antimalware program found and did not remove is still \
-            a risk. On macOS the client reads the XProtect Remediator events of the \
-            last 7 days in the unified log. It reports 0 when every event is a clean \
-            result, and unknown when an event is not clean or the log has no event. \
-            On Windows and Linux the result is the same as version 1.",
+            a risk. On Windows the client counts the Microsoft Defender threats \
+            marked active. On macOS it reads the XProtect Remediator events of the \
+            last 7 days in the unified log. It reports 0 when there is at least one \
+            event and every event is a clean result, and unknown when an event is \
+            not clean, the log has no event, or any part of the read cannot be \
+            classified. On Linux the result is the same as version 1.",
     ),
     (
         "work_account",
@@ -219,11 +221,14 @@ const BUILTIN_ABOUT: &[(&str, u32, &str)] = &[
     (
         "antimalware_full_scan_age_days",
         2,
-        "A full scan can find malware that real-time protection missed. On macOS \
-            the client reports the whole days since the last XProtect Remediator \
-            scan in the unified log that was not canceled. That scan is not a \
-            full-device scan. The log keeps these events for a short time, so an old \
-            scan reads unknown. On Windows and Linux the result is the same as version 1.",
+        "A full scan can find malware that real-time protection missed. On \
+            Windows the client reads the Windows Defender full scan time, \
+            FullScanEndTime. On macOS it reports the whole days since the last \
+            XProtect Remediator scan in the unified log; canceled runs do not count \
+            and that scan is not a full-device scan. The log keeps these events for \
+            a short time, so an old scan reads unknown, as does a read with any \
+            part that cannot be classified. On Linux the result is the same as \
+            version 1.",
     ),
     (
         "web_protection",
