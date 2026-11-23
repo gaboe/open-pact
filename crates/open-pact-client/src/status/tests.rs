@@ -1212,6 +1212,75 @@ async fn a_pending_system_job_is_one_issue_with_the_machine_clients_command() {
     assert_eq!(report.exit_code, 1);
 }
 
+async fn pending_report(inspection: JobInspection) -> Report {
+    let fixture = Fixture::new("auto_off").await;
+    let mut config = DeviceConfig::load(&fixture.home).unwrap();
+    config.system_job_pending = true;
+    config.save(&fixture.home).unwrap();
+    collect_with_pending(
+        &fixture.home,
+        true,
+        false,
+        &std::env::current_exe().unwrap(),
+        fixture.now,
+        |_, _| Ok(JobStatus::Absent.into()),
+        |_| Ok(inspection),
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn an_online_pending_system_job_reports_the_machine_client_and_the_task() {
+    for (client, task, state, status) in [
+        (
+            package(env!("CARGO_PKG_VERSION")),
+            "missing",
+            MachineState::Current,
+            JobStatus::Missing,
+        ),
+        (
+            package("0.0.1"),
+            "missing",
+            MachineState::Outdated,
+            JobStatus::Missing,
+        ),
+        (
+            crate::machine::MachineClient::Missing,
+            "missing",
+            MachineState::Missing,
+            JobStatus::Missing,
+        ),
+        (
+            package(env!("CARGO_PKG_VERSION")),
+            "not_ours",
+            MachineState::Current,
+            JobStatus::NotOurs,
+        ),
+    ] {
+        let report = pending_report(JobInspection::system_fixture(client, task)).await;
+        assert!(report.schedule.system_job_pending);
+        assert_eq!(report.schedule.machine_client, Some(state));
+        assert_eq!(report.schedule.pending_job_status, Some(status));
+        // The job that runs now is the user job, which stays until the switch succeeds.
+        assert_eq!(report.schedule.job_status, Some(JobStatus::Absent));
+        let pending: Vec<_> = report
+            .issues
+            .iter()
+            .filter(|issue| issue.message == "Automatic sending waits for the SYSTEM job.")
+            .collect();
+        assert_eq!(pending.len(), 1, "{:?}", report.issues);
+        let fix = pending[0].fix.as_deref().unwrap();
+        match (state, status) {
+            (_, JobStatus::NotOurs) => assert!(fix.contains("schtasks.exe"), "{fix}"),
+            (MachineState::Missing, _) => assert!(fix.contains("msiexec.exe"), "{fix}"),
+            _ => assert!(fix.contains("schedule on --system"), "{fix}"),
+        }
+        // The fix is in the issue once: the report holds no second copy.
+        assert_eq!(report.schedule.machine_fix, None);
+    }
+}
+
 #[tokio::test]
 async fn a_local_report_of_a_revoked_system_job_starts_no_machine_probe_and_an_online_one_does() {
     for online in [false, true] {
