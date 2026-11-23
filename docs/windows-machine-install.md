@@ -158,7 +158,7 @@ if ($LASTEXITCODE -ne 0) { throw 'schedule off failed. Do not uninstall the pack
    A task whose Actions line is not 1 is not a task of the client. `schedule off` refuses such a task. Open it in Task Scheduler and read every action. When you know each action, remove the task in Task Scheduler.
 
 3. A task whose program is the old copy, `open-pact\open-pact-client.exe`, and whose Actions line is 1, needs the removal block. The list can show the program with a `\\?\` prefix. It is the same file. Replace two samples in the block:
-   - The task name `org.open-pact.report.0123abcd`, in every place where it appears.
+   - The task name `org.open-pact.report.0123456789abcdef`, in every place where it appears.
    - The home line `C:\Users\example\pact`, between `@'` and `'@`. Use the `--home` value of the task. Do not add quotes.
 
    The block deletes the task. It then checks that the machine client exists and runs `schedule off`. When the file is missing or `schedule off` fails, the block throws. Do not uninstall the package then. Fix the error and run the block again.
@@ -171,7 +171,7 @@ if ($LASTEXITCODE -ne 0) { throw 'schedule off failed. Do not uninstall the pack
     $service = New-Object -ComObject Schedule.Service
     $service.Connect()
     try {
-      [void]$service.GetFolder('\').GetTask('\org.open-pact.report.0123abcd')
+      [void]$service.GetFolder('\').GetTask('\org.open-pact.report.0123456789abcdef')
       return $true
     } catch {
       $e = $_.Exception
@@ -183,11 +183,11 @@ if ($LASTEXITCODE -ne 0) { throw 'schedule off failed. Do not uninstall the pack
   function End-TaskQuietly {
     # /End fails for a task that is not running. That does not matter here: /Delete decides.
     $ErrorActionPreference = 'Continue'
-    & $schtasks /End /TN 'org.open-pact.report.0123abcd' 2>$null | Out-Null
+    & $schtasks /End /TN 'org.open-pact.report.0123456789abcdef' 2>$null | Out-Null
   }
   if (Test-TaskRegistered) {
     End-TaskQuietly
-    & $schtasks /Delete /TN 'org.open-pact.report.0123abcd' /F
+    & $schtasks /Delete /TN 'org.open-pact.report.0123456789abcdef' /F
     if ($LASTEXITCODE -ne 0) { throw 'The task was not removed. Run this block again from an elevated prompt.' }
   }
   if (Test-TaskRegistered) { throw 'The task is still registered. Run this block again.' }
@@ -213,7 +213,7 @@ Use this section when the machine client is not installed, or when a task has mo
 
 1. Open the task in Task Scheduler.
 2. Read every action of the task.
-3. Replace the task name `org.open-pact.report.0123abcd` in every place where it appears in the block below.
+3. Replace the task name `org.open-pact.report.0123456789abcdef` in every place where it appears in the block below.
 4. Run the block below in an elevated Windows PowerShell 5.1 prompt, only when you know each action.
 
 The block deletes the task name that you give it. It does not check the program. It has no home line, because the machine client does not run.
@@ -226,7 +226,7 @@ The block deletes the task name that you give it. It does not check the program.
     $service = New-Object -ComObject Schedule.Service
     $service.Connect()
     try {
-      [void]$service.GetFolder('\').GetTask('\org.open-pact.report.0123abcd')
+      [void]$service.GetFolder('\').GetTask('\org.open-pact.report.0123456789abcdef')
       return $true
     } catch {
       $e = $_.Exception
@@ -238,11 +238,11 @@ The block deletes the task name that you give it. It does not check the program.
   function End-TaskQuietly {
     # /End fails for a task that is not running. That does not matter here: /Delete decides.
     $ErrorActionPreference = 'Continue'
-    & $schtasks /End /TN 'org.open-pact.report.0123abcd' 2>$null | Out-Null
+    & $schtasks /End /TN 'org.open-pact.report.0123456789abcdef' 2>$null | Out-Null
   }
   if (Test-TaskRegistered) {
     End-TaskQuietly
-    & $schtasks /Delete /TN 'org.open-pact.report.0123abcd' /F
+    & $schtasks /Delete /TN 'org.open-pact.report.0123456789abcdef' /F
     if ($LASTEXITCODE -ne 0) { throw 'The task was not removed. Run this block again from an elevated prompt.' }
   }
   if (Test-TaskRegistered) { throw 'The task is still registered. Run this block again.' }

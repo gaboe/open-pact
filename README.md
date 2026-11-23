@@ -502,7 +502,7 @@ open-pact-client folders add ~/projects
 open-pact-client folders remove ~/projects
 ```
 
-These commands suit a job that runs as you. A Windows SYSTEM job needs an elevated prompt and the full-path commands in [Use Windows SYSTEM checks](docs/client.md#use-windows-system-checks).
+These commands suit a job that runs as you. The `folders` commands run with your own token for either job mode, so they need no elevation. Start and stop a Windows SYSTEM job only from an elevated prompt, with the full-path commands in [Use Windows SYSTEM checks](docs/client.md#use-windows-system-checks).
 
 An `open-pact.toml` from an earlier client is ignored. The first time the client reads a home that has no `device.json`, it carries over what your earlier choices were: the folders of `[managed_repos]` go into `device.json` (they were your own choice, so `folders list` shows them and the wizard still asks step 5), and on Windows an installed SYSTEM job keeps `run_as` SYSTEM. `check` and the job print once that the file is ignored and where each value went. For a SYSTEM job the notice prints the exact command to run from an elevated PowerShell prompt, `schedule on --system` with the full path of the client. The client never deletes the file. The commands `apply`, `finish` and `config example` no longer exist. `~` expands to your user home, folder paths stay on the device, and the folders feed the managed repository checks.
 
@@ -581,14 +581,14 @@ not receive explicit access. Hosted Windows CI did not verify signing under a st
 or SYSTEM task token, so scheduler use under those tokens remains unverified.
 Creation requires an elevated administrator prompt. If the provider is unavailable,
 the client warns and uses a software key. `--software-key` forces software on a new home.
-Existing software keys stay in use. Before rotation, remove the old schedule. For a Windows SYSTEM job, remove the task of that home only, as [Stop the scheduled claims](docs/client.md#stop-the-scheduled-claims-and-remove-the-client) describes, and do not uninstall the package. Then run
+Existing software keys stay in use. Before rotation, remove the old schedule. For a Windows SYSTEM job, remove the task of that home only, as [Stop the scheduled claims](docs/client.md#stop-the-scheduled-claims-and-remove-the-client) describes. Do not uninstall the package. Then run
 `open-pact-client --home <old-home> delete-device-key`. To rotate to TPM, use a new `--home`, join again,
 and replace the old enrolment and scheduler registration.
 The home stores only the TPM key name in `device-tpm.key`. Keep this marker with the home.
 TPM claims request `L1`, like Secure Enclave claims. The gateway verifies them as `L0`
 until hardware attestation is supported. Real TPM signing is unverified on hosted CI.
 See [platform support](docs/platform-support.md#key-protection) for the test limits.
-For full uninstall, keep this order. First remove the schedule. For a Windows SYSTEM job, remove the task of each home only, as [Stop the scheduled claims](docs/client.md#stop-the-scheduled-claims-and-remove-the-client) describes, and do not uninstall the package yet. Then run `open-pact-client --home <home> delete-device-key` for each home. On Windows, run it with the machine client's full path, from the account that joined the device. Uninstall the package and delete the home only after that.
+For full uninstall, keep this order. First remove the schedule. For a Windows SYSTEM job, remove the task of each home only, as [Stop the scheduled claims](docs/client.md#stop-the-scheduled-claims-and-remove-the-client) describes. Skip its last step, the package uninstall. Then run `open-pact-client --home <home> delete-device-key` for each home. On Windows, run it with the machine client's full path, from the account that joined the device. Uninstall the package and delete the home only after that.
 Schedule removal keeps the device key. Key deletion removes the persisted CNG key, its marker, and any software device key file.
 On Windows, run key deletion as the user who created the key or as SYSTEM. A different administrator has no explicit key access.
 Windows CI checks creator deletion after removal of administrator membership, SYSTEM deletion, and refusal for a different administrator through the software CNG provider.

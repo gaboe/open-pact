@@ -1225,7 +1225,7 @@ mod doc_blocks {
     const WINDOWS_REMOVE: &str = "## Remove the package";
     const WINDOWS_NO_PACKAGE: &str = "## Remove a task without the package";
     const HOME: &str = r"C:\Users\example\pact";
-    const TASK: &str = "org.open-pact.report.0123abcd";
+    const TASK: &str = "org.open-pact.report.0123456789abcdef";
     const MACHINE: &str = r"C:\Program Files\open-pact-client\open-pact-client.exe";
     /// The commands that start the SYSTEM job, or, with `dry_run`, check its profile first. The reader
     /// writes each value into a here-string, so an apostrophe in a path needs no escape. The commands
@@ -1320,32 +1320,47 @@ elseif ($repair.ExitCode -ne 0) { throw ('The repair failed. Exit code: ' + $rep
         ])
     }
 
+    /// The fence marker of a line: its character (` or ~), its width, and the text after the marker.
+    /// A fence opens with three or more of one character at the start of the line.
+    fn fence_mark(line: &str) -> Option<(char, usize, &str)> {
+        let trimmed = line.trim_end();
+        let marker = trimmed.chars().next().filter(|c| *c == '`' || *c == '~')?;
+        let width = trimmed.chars().take_while(|c| *c == marker).count();
+        (width >= 3).then(|| (marker, width, trimmed[width..].trim()))
+    }
+
     /// Each code fence of doc with its info string and its body, in order. A fence opens with three
-    /// or more backticks and closes with a line of at least as many backticks, as Markdown does. A
-    /// fence inside an HTML comment is not an instruction, so it does not count.
+    /// or more backticks or tildes and closes with a line of the same character, at least as long,
+    /// as Markdown does. A fence inside an HTML comment or an HTML `pre` block is not an instruction,
+    /// and neither is a fence inside another fence, so none of them counts.
     fn code_fences(doc: &str) -> Vec<(String, String)> {
         let mut found = Vec::new();
-        let mut open: Option<(usize, String)> = None;
+        let mut open: Option<(char, usize, String)> = None;
         let mut body: Vec<&str> = Vec::new();
         let mut comment = false;
+        let mut pre = false;
         for line in doc.lines() {
-            let trimmed = line.trim_end();
-            let text = trimmed.trim_start_matches('`');
-            let ticks = trimmed.len() - text.len();
-            if let Some((width, info)) = open.take() {
-                if ticks >= width && text.is_empty() {
-                    found.push((info, body.join("\n")));
-                    body.clear();
-                } else {
-                    open = Some((width, info));
-                    body.push(line);
+            if let Some((marker, width, info)) = open.take() {
+                match fence_mark(line) {
+                    Some((m, w, rest)) if m == marker && w >= width && rest.is_empty() => {
+                        found.push((info, body.join("\n")));
+                        body.clear();
+                    }
+                    _ => {
+                        open = Some((marker, width, info));
+                        body.push(line);
+                    }
                 }
             } else if comment {
                 comment = !line.contains("-->");
-            } else if ticks >= 3 {
-                open = Some((ticks, text.trim().to_owned()));
+            } else if pre {
+                pre = !line.contains("</pre>");
+            } else if let Some((marker, width, info)) = fence_mark(line) {
+                open = Some((marker, width, info.to_owned()));
             } else if line.contains("<!--") && !line.contains("-->") {
                 comment = true;
+            } else if line.contains("<pre") && !line.contains("</pre>") {
+                pre = true;
             }
         }
         found
@@ -1366,27 +1381,31 @@ elseif ($repair.ExitCode -ne 0) { throw ('The repair failed. Exit code: ' + $rep
     }
 
     /// The lines of doc from the line heading to the next heading of the same or a higher level.
-    /// A line inside a fence or an HTML comment is never a heading.
+    /// A line inside a fence, an HTML comment or an HTML `pre` block is never a heading.
     fn section(doc: &str, heading: &str) -> String {
         let depth = heading.chars().take_while(|c| *c == '#').count();
         let mut found = false;
-        let mut fence: Option<usize> = None;
+        let mut fence: Option<(char, usize)> = None;
         let mut comment = false;
+        let mut pre = false;
         let mut lines = Vec::new();
         for line in doc.lines() {
-            let trimmed = line.trim_end();
-            let text = trimmed.trim_start_matches('`');
-            let ticks = trimmed.len() - text.len();
-            if let Some(width) = fence {
-                if ticks >= width && text.is_empty() {
+            if let Some((marker, width)) = fence {
+                if fence_mark(line)
+                    .is_some_and(|(m, w, rest)| m == marker && w >= width && rest.is_empty())
+                {
                     fence = None;
                 }
             } else if comment {
                 comment = !line.contains("-->");
-            } else if ticks >= 3 {
-                fence = Some(ticks);
+            } else if pre {
+                pre = !line.contains("</pre>");
+            } else if let Some((marker, width, _)) = fence_mark(line) {
+                fence = Some((marker, width));
             } else if line.contains("<!--") && !line.contains("-->") {
                 comment = true;
+            } else if line.contains("<pre") && !line.contains("</pre>") {
+                pre = true;
             } else if line.starts_with('#') {
                 let level = line.chars().take_while(|c| *c == '#').count();
                 if found && level <= depth {
@@ -1412,6 +1431,12 @@ elseif ($repair.ExitCode -ne 0) { throw ('The repair failed. Exit code: ' + $rep
             .filter(|fence| *fence == script)
             .count()
             == 1
+    }
+
+    #[test]
+    fn a_fence_inside_a_tilde_fence_or_a_pre_block_is_not_a_rendered_block() {
+        let doc = "~~~~text\n```powershell\n& {}\n```\n~~~~\n\n<pre>\n```powershell\nGet-Date\n```\n</pre>\n\n```powershell\n& {}\n```\n";
+        assert_eq!(powershell_fences(doc), vec!["& {}".to_owned()]);
     }
 
     fn install_text() -> String {
