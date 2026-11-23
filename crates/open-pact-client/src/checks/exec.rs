@@ -77,6 +77,7 @@ pub struct CapturedOutput {
     /// The child did not exit before the deadline. A child that exits after it counts too.
     pub timed_out: bool,
     /// The child printed more than the stdout limit. `stdout` holds only the bytes before it.
+    #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
     pub stdout_overflowed: bool,
     #[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
     pub elapsed: Duration,
