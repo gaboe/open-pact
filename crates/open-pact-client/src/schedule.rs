@@ -2737,16 +2737,21 @@ fn os_job_id(home: &Path) -> Result<String> {
 /// What to tell the owner when the OS job could not be queried: the query error and the platform's
 /// own step to look at the job. The state of the job is unknown, so the text never says to stop or
 /// remove it, never names the program that was started (a copy that a user can write), and never
-/// shows a command of another platform. On Windows the step runs the machine client when it
-/// passed its protection check, else it is the package fix first.
+/// shows a command of another platform. On Windows a SYSTEM install runs the machine client when
+/// it passed its protection check, else the step is the package fix first. Any other change reads
+/// the job through a read-only Task Scheduler query and needs no package.
 fn inspect_failure_text(
     home: &Path,
     os: open_pact_core::Os,
     machine_client: &MachineClient,
+    system_install: bool,
     error: &anyhow::Error,
 ) -> String {
     let id = os_job_id(home).unwrap_or_default();
     let step = match os {
+        open_pact_core::Os::Windows if !system_install => format!(
+            "Look at the job from PowerShell:\nGet-ScheduledTask -TaskName '{id}' | Get-ScheduledTaskInfo"
+        ),
         open_pact_core::Os::Windows => {
             let machine = crate::machine::machine_path();
             let running = crate::machine::running_version();
@@ -2872,11 +2877,15 @@ pub(crate) async fn change_job(
         let Ok(os) = crate::current_os() else {
             return error;
         };
-        let machine_client = machine_client.clone().unwrap_or_else(|| match os {
-            open_pact_core::Os::Windows => crate::machine::read_machine_client(),
-            _ => MachineClient::Missing,
-        });
-        anyhow::anyhow!(inspect_failure_text(&home.0, os, &machine_client, &error))
+        // Only a SYSTEM install reads the package, so a user job or a removal starts no probe.
+        let machine_client = machine_client.clone().unwrap_or(MachineClient::Missing);
+        anyhow::anyhow!(inspect_failure_text(
+            &home.0,
+            os,
+            &machine_client,
+            requested_system,
+            &error
+        ))
     })?;
     let task = observed.system_task(&machine, &home.0, None);
     refuse_not_ours(&home.0, wanted, &task, explicit_profile.as_deref())?;
@@ -3149,6 +3158,18 @@ impl JobInspection {
         )
     }
 
+    /// What the owner does to put the SYSTEM job that a pending choice waits for in place: the
+    /// removal block when a task that is not ours is in the way, else the machine client's command
+    /// with the install block first. `None` for a job that is not a SYSTEM inspection.
+    pub(crate) fn pending_fix(&self, home: &Path) -> Option<String> {
+        let system = self.system.as_ref()?;
+        if matches!(system.task, Some(SystemTask::NotOurs { .. })) {
+            self.job_fix(home)
+        } else {
+            Some(system_on_text_for(home, &system.machine))
+        }
+    }
+
     /// The fix for the task. For a SYSTEM job it is the machine client's command, or the removal
     /// block for a task that is not ours, or what a standard user cannot confirm. For a user job it
     /// is the line `check` prints for an outdated job.
@@ -3249,7 +3270,7 @@ pub(crate) fn inspect_job(
 
 /// The SYSTEM job: the machine client and the task, each on its own. A standard user cannot read
 /// the task, so the answer stays unconfirmed; an elevated process reads it.
-fn inspect_system_job(home: &Home) -> Result<JobInspection> {
+pub(crate) fn inspect_system_job(home: &Home) -> Result<JobInspection> {
     if crate::current_os()? != open_pact_core::Os::Windows {
         return Ok(JobStatus::SystemUnconfirmed.into());
     }
@@ -6185,13 +6206,14 @@ esac
             MachineClient::Unprotected { reason: "x".into() },
             MachineClient::Unknown { reason: "x".into() },
         ] {
-            for os in [
-                open_pact_core::Os::Windows,
-                open_pact_core::Os::Macos,
-                open_pact_core::Os::Linux,
+            for (os, system_install) in [
+                (open_pact_core::Os::Windows, true),
+                (open_pact_core::Os::Windows, false),
+                (open_pact_core::Os::Macos, true),
+                (open_pact_core::Os::Linux, true),
             ] {
                 let error = anyhow::anyhow!("access is denied");
-                let text = inspect_failure_text(home, os, &client, &error);
+                let text = inspect_failure_text(home, os, &client, system_install, &error);
                 assert!(
                     text.starts_with("Cannot inspect the scheduled job: access is denied"),
                     "{text}"
@@ -6217,6 +6239,15 @@ esac
                     open_pact_core::Os::Linux => {
                         assert!(step("systemctl --user status org.open-pact.report."));
                         assert!(!step("PowerShell") && !step("launchctl"), "{text}");
+                    }
+                    open_pact_core::Os::Windows if !system_install => {
+                        // A user job or a removal reads the task without the MSI, whatever the
+                        // package state is.
+                        assert!(step("Get-ScheduledTask -TaskName"), "{text}");
+                        assert!(
+                            !step("schedule status") && !step("msiexec") && !step("machine client"),
+                            "{client:?}: {text}"
+                        );
                     }
                     open_pact_core::Os::Windows => {
                         assert!(!step("launchctl") && !step("systemctl"), "{text}");
