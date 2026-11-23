@@ -147,6 +147,13 @@ fn known_folder(which: Known) -> Result<PathBuf> {
     bail!("the machine client exists only on Windows")
 }
 
+/// The `schtasks.exe` of the system folder. A bare name would let a copy in the current folder run first.
+pub(crate) fn system_schtasks() -> PathBuf {
+    known_folder(Known::System)
+        .unwrap_or_else(|_| PathBuf::from(r"C:\Windows\System32"))
+        .join("schtasks.exe")
+}
+
 /// The Windows PowerShell of the system folder. Every start of PowerShell uses this path, so a
 /// `powershell.exe` in the current folder or on `PATH` never runs.
 pub(crate) fn system_powershell() -> PathBuf {
@@ -549,14 +556,20 @@ pub(crate) fn removal_block(home: &Path, task_id: &str, machine: Option<&Path>) 
     let mut text = format!(
         r#"& {{
   $schtasks = Join-Path ([Environment]::SystemDirectory) 'schtasks.exe'
-  & $schtasks /Query /TN {id} 2>$null | Out-Null
-  if ($LASTEXITCODE -eq 0) {{
+  function Test-TaskRegistered {{
+    # Only this query runs with Continue. schtasks reports a missing task on stderr, which Stop turns into a throw.
+    $ErrorActionPreference = 'Continue'
+    $text = (& $schtasks /Query /TN {id} 2>&1 | Out-String).Trim()
+    if ($LASTEXITCODE -eq 0) {{ return $true }}
+    if ($text -match 'cannot find the file specified') {{ return $false }}
+    throw ('Could not query the task. ' + $text)
+  }}
+  if (Test-TaskRegistered) {{
     & $schtasks /End /TN {id} 2>$null | Out-Null
     & $schtasks /Delete /TN {id} /F
     if ($LASTEXITCODE -ne 0) {{ throw 'The task was not removed. Run this block again from an elevated prompt.' }}
   }}
-  & $schtasks /Query /TN {id} 2>$null | Out-Null
-  if ($LASTEXITCODE -eq 0) {{ throw 'The task is still registered. Run this block again.' }}{last}
+  if (Test-TaskRegistered) {{ throw 'The task is still registered. Run this block again.' }}{last}
 }}"#
     );
     if machine.is_none() {
@@ -992,6 +1005,29 @@ mod tests {
     }
 
     #[test]
+    fn the_removal_block_passes_only_a_missing_task_as_absent() {
+        let id = "org.open-pact.report.0123456789abcdef";
+        let block = removal_block(Path::new(r"C:\Users\pact"), id, None);
+        assert_eq!(block.matches("Test-TaskRegistered").count(), 3);
+        assert_eq!(block.matches("$ErrorActionPreference").count(), 1);
+        assert!(block.contains("$ErrorActionPreference = 'Continue'"));
+        assert!(block.contains("if ($LASTEXITCODE -eq 0) { return $true }"));
+        assert!(
+            block.contains("if ($text -match 'cannot find the file specified') { return $false }")
+        );
+        assert!(block.contains("throw ('Could not query the task. ' + $text)"));
+    }
+
+    #[test]
+    fn schtasks_starts_from_the_system_folder_by_its_full_path() {
+        let path = system_schtasks().to_string_lossy().into_owned();
+        assert!(
+            path.ends_with("System32\\schtasks.exe") || path.ends_with("System32/schtasks.exe"),
+            "{path}"
+        );
+    }
+
+    #[test]
     fn the_removal_block_uses_only_system32_task_tools_and_checks_each_step() {
         let home = Path::new(r"C:\Users\it's a\pact");
         let machine = Path::new(r"C:\Program Files\open-pact-client\open-pact-client.exe");
@@ -1010,14 +1046,10 @@ mod tests {
             .unwrap();
         // The delete runs only for a registered task, so a second run of the block ends the same
         // way; the last query still fails the block when the task survives.
-        let probe = block
-            .find("/Query /TN 'org.open-pact.report.0123456789abcdef'")
-            .unwrap();
-        let query = block
-            .rfind("/Query /TN 'org.open-pact.report.0123456789abcdef'")
-            .unwrap();
+        let probe = block.find("if (Test-TaskRegistered)").unwrap();
+        let query = block.rfind("if (Test-TaskRegistered)").unwrap();
         assert!(probe < end && end < delete && delete < check && check < query);
-        assert!(block.contains("-eq 0) { throw 'The task is still registered."));
+        assert!(block.contains("{ throw 'The task is still registered."));
         // With the machine client, the last line of the block removes the state through it.
         let last = block.find("schedule off").unwrap();
         assert!(query < last);
