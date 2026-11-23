@@ -17,6 +17,9 @@ pub enum Source {
     Scoop,
     /// A file that no package manager owns.
     Other,
+    /// The machine client in Program Files, installed for all users by an administrator. The app
+    /// never removes it.
+    MachineClient,
 }
 
 /// A command line tool on PATH that is not the installed copy.
@@ -125,9 +128,10 @@ pub fn shim_target(contents: &str) -> Option<PathBuf> {
 }
 
 /// The command that removes `copy`. A package manager removes its own package, so the app never
-/// deletes a file that a package manager owns.
-pub fn removal(copy: &OtherCopy, platform: Platform) -> Removal {
-    match copy.source {
+/// deletes a file that a package manager owns. The machine client has no removal: `None`.
+pub fn removal(copy: &OtherCopy, platform: Platform) -> Option<Removal> {
+    let removal = match copy.source {
+        Source::MachineClient => return None,
         Source::Homebrew => {
             let program = copy.brew.as_ref().map_or_else(
                 || "brew".to_owned(),
@@ -162,7 +166,8 @@ pub fn removal(copy: &OtherCopy, platform: Platform) -> Removal {
                 shown: line,
             }
         }
-    }
+    };
+    Some(removal)
 }
 
 /// Every `name` on `path_var` except the files in `own` (the installed copy and the copy
@@ -205,6 +210,15 @@ pub fn other_copies(
         });
     }
     found
+}
+
+/// Marks the copy at `machine` (the machine client) so the app shows it and never removes it.
+pub fn mark_machine_client(copies: &mut [OtherCopy], machine: &Path) {
+    for copy in copies {
+        if same_path(&copy.path, machine) {
+            copy.source = Source::MachineClient;
+        }
+    }
 }
 
 fn same_path(a: &Path, b: &Path) -> bool {
@@ -250,58 +264,44 @@ fn powershell_literal(text: &str) -> String {
     quoted
 }
 
-/// What the elevated PowerShell runs. A process that starts with the `runas` verb gets no
-/// environment from its parent, and a UAC prompt can run it as another administrator. So the
-/// script sets the scan profile itself, and the CLI gets the device home as `--home`. It ends
-/// with the CLI's exit code, and with 1 when the CLI did not run at all.
-fn elevated_script(installed: &Path, home: &Path, profile: &Path) -> String {
-    format!(
-        "$ErrorActionPreference = 'Stop'\n\
-         $env:USERPROFILE = {profile}\n\
-         try {{ & {exe} --home {home} schedule on --system }} catch {{ [Console]::Error.WriteLine($_.Exception.Message); exit 1 }}\n\
-         if ($null -eq $LASTEXITCODE) {{ exit 1 }}\n\
-         exit $LASTEXITCODE",
-        profile = powershell_literal(&profile.to_string_lossy()),
-        exe = powershell_literal(&installed.to_string_lossy()),
-        home = powershell_literal(&home.to_string_lossy()),
-    )
-}
-
-/// The text that `powershell -EncodedCommand` takes: base64 of the script as UTF-16 little endian.
-fn encoded_command(script: &str) -> String {
-    const DIGITS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
-    let mut encoded = String::new();
-    for chunk in bytes.chunks(3) {
-        let word = (u32::from(chunk[0]) << 16)
-            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
-            | u32::from(*chunk.get(2).unwrap_or(&0));
-        for place in 0..4 {
-            if place <= chunk.len() {
-                encoded.push(char::from(
-                    DIGITS[((word >> (18 - 6 * place)) & 63) as usize],
-                ));
-            } else {
-                encoded.push('=');
-            }
+/// One argument of a command line for `CommandLineToArgvW`: the value in double quotes, with each
+/// backslash before a quote, and the backslashes at its end, doubled, as Rust's own spawn does.
+fn windows_arg(raw: &str) -> String {
+    let mut out = String::from("\"");
+    let mut slashes = 0;
+    for c in raw.chars() {
+        if c == '\\' {
+            slashes += 1;
+            continue;
         }
+        out.push_str(&"\\".repeat(if c == '"' { slashes * 2 + 1 } else { slashes }));
+        out.push(c);
+        slashes = 0;
     }
-    encoded
+    out.push_str(&"\\".repeat(slashes * 2));
+    out.push('"');
+    out
 }
 
-/// `schedule on --system` in an elevated process, which the user's UAC prompt allows. A library
-/// call cannot elevate, so the app starts the installed copy through PowerShell's `runas` verb
-/// and waits for its exit code. `home` is the device home of the app's session and `profile`
-/// the profile whose repositories the job scans. A cancelled prompt, a launch that fails and a
-/// child without an exit code all end the wrapper with a nonzero exit code.
-pub fn elevated_system_schedule(installed: &Path, home: &Path, profile: &Path) -> Invocation {
-    let child = encoded_command(&elevated_script(installed, home, profile));
+/// `schedule on --system` in an elevated process, which the user's UAC prompt allows. The machine
+/// client at `machine` runs with the `runas` verb and the job's arguments: the device home, and the
+/// profile whose repositories the job scans. The client checks each argument and its own protection
+/// when it registers the job. The wrapper ends with the client's exit code. A cancelled prompt, a
+/// launch that fails and a child without an exit code all end it with a nonzero exit code.
+pub fn elevated_system_schedule(machine: &Path, home: &Path, profile: &Path) -> Invocation {
+    let arguments = format!(
+        "--home {} schedule on --system --user-home {}",
+        windows_arg(&home.to_string_lossy()),
+        windows_arg(&profile.to_string_lossy()),
+    );
     let line = format!(
         "$ErrorActionPreference = 'Stop'; \
-         try {{ $run = Start-Process -FilePath 'powershell.exe' -ArgumentList '-NoProfile','-NonInteractive','-EncodedCommand','{child}' -Verb RunAs -Wait -PassThru }} \
+         try {{ $run = Start-Process -FilePath {exe} -ArgumentList {arguments} -Verb RunAs -Wait -PassThru }} \
          catch {{ [Console]::Error.WriteLine('The administrator process did not start: ' + $_.Exception.Message); exit 1 }}; \
          if ($null -eq $run -or $null -eq $run.ExitCode) {{ [Console]::Error.WriteLine('The administrator process gave no exit code.'); exit 1 }}; \
-         exit $run.ExitCode"
+         exit $run.ExitCode",
+        exe = powershell_literal(&machine.to_string_lossy()),
+        arguments = powershell_literal(&arguments),
     );
     shell_invocation(Platform::Windows, &line)
 }
@@ -355,7 +355,8 @@ mod tests {
         let brew = removal(
             &copy("/opt/fictional/bin/open-pact-client", Source::Homebrew),
             Platform::Mac,
-        );
+        )
+        .unwrap();
         assert_eq!(brew.shown, "brew uninstall open-pact");
         assert_eq!(
             (brew.call.program.as_str(), brew.call.args.as_slice()),
@@ -371,7 +372,8 @@ mod tests {
                 Source::Scoop,
             ),
             Platform::Windows,
-        );
+        )
+        .unwrap();
         assert_eq!(scoop.shown, "scoop uninstall open-pact");
         assert_eq!(scoop.call.program, "powershell");
         assert_eq!(
@@ -382,7 +384,8 @@ mod tests {
         let file = removal(
             &copy("/home/fictional/my tools/open-pact-client", Source::Other),
             Platform::Mac,
-        );
+        )
+        .unwrap();
         assert_eq!(file.shown, "rm '/home/fictional/my tools/open-pact-client'");
         assert_eq!(
             file.call.args,
@@ -392,7 +395,8 @@ mod tests {
         let windows = removal(
             &copy(r"C:\Fictional's\open-pact-client.exe", Source::Other),
             Platform::Windows,
-        );
+        )
+        .unwrap();
         assert_eq!(
             windows.shown,
             r"Remove-Item -LiteralPath 'C:\Fictional''s\open-pact-client.exe'"
@@ -415,29 +419,30 @@ mod tests {
     const PROFILE: &str = r"C:\Users\Fictional";
 
     #[test]
-    fn the_elevated_child_gets_the_device_home_and_the_scan_profile() {
-        let script = elevated_script(
-            Path::new(r"C:\Users\O'Fictional\open-pact-client.exe"),
+    fn the_elevated_child_gets_the_device_home_and_the_profile_as_plain_arguments() {
+        let call = elevated_system_schedule(
+            Path::new(r"C:\Program Files\open-pact-client\open-pact-client.exe"),
             Path::new(HOME),
             Path::new(PROFILE),
         );
-        assert!(script.contains(r"$env:USERPROFILE = 'C:\Users\Fictional'"));
-        assert!(script.contains(
-            r"& 'C:\Users\O''Fictional\open-pact-client.exe' --home 'C:\Users\Fictional\.config\open-pact' schedule on --system"
+        let line = call.args.last().unwrap();
+        assert!(line.contains(
+            r"-FilePath 'C:\Program Files\open-pact-client\open-pact-client.exe' -ArgumentList '--home "
         ));
+        assert!(line.contains(&powershell_literal(&format!(
+            r#"--home "{HOME}" schedule on --system --user-home "{PROFILE}""#
+        ))));
         // A typographic quote in a path cannot end the literal early.
         assert_eq!(powershell_literal("a\u{2019}b"), "'a\u{2019}\u{2019}b'");
     }
 
     #[test]
-    fn the_child_script_ends_with_the_cli_exit_code_and_fails_without_one() {
-        let script = elevated_script(Path::new("a.exe"), Path::new(HOME), Path::new(PROFILE));
-        assert!(script.contains("$ErrorActionPreference = 'Stop'"));
-        assert!(
-            script.contains("catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }")
+    fn a_value_with_a_space_or_a_trailing_slash_stays_one_argument() {
+        assert_eq!(
+            windows_arg(r"C:\Users\Fictional Name\"),
+            r#""C:\Users\Fictional Name\\""#
         );
-        assert!(script.contains("if ($null -eq $LASTEXITCODE) { exit 1 }"));
-        assert!(script.ends_with("exit $LASTEXITCODE"));
+        assert_eq!(windows_arg(r#"a"b"#), r#""a\"b""#);
     }
 
     #[test]
@@ -448,15 +453,8 @@ mod tests {
             Path::new(PROFILE),
         );
         let line = call.args.last().unwrap();
-        let child = encoded_command(&elevated_script(
-            Path::new(r"C:\Users\Fictional\open-pact-client.exe"),
-            Path::new(HOME),
-            Path::new(PROFILE),
-        ));
         assert!(line.starts_with("$ErrorActionPreference = 'Stop'"));
-        assert!(line.contains(&format!(
-            "'-EncodedCommand','{child}' -Verb RunAs -Wait -PassThru"
-        )));
+        assert!(line.contains("-Verb RunAs -Wait -PassThru"));
         // A cancelled UAC prompt throws: the wrapper reports it and exits with 1, not 0.
         assert!(line.contains(
             "catch { [Console]::Error.WriteLine('The administrator process did not start: '"
@@ -465,7 +463,22 @@ mod tests {
         // No process or no exit code is a failure too, never a silent `exit $null`.
         assert!(line.contains("if ($null -eq $run -or $null -eq $run.ExitCode)"));
         assert!(line.ends_with("exit $run.ExitCode"));
-        assert!(!line.contains('"'));
+    }
+
+    #[test]
+    fn the_machine_client_has_no_removal_command_and_is_marked_by_its_path() {
+        let machine = r"C:\Program Files\open-pact-client\open-pact-client.exe";
+        assert_eq!(
+            removal(&copy(machine, Source::MachineClient), Platform::Windows),
+            None
+        );
+        let mut copies = vec![
+            copy(machine, Source::Other),
+            copy(r"C:\x\open-pact-client.exe", Source::Other),
+        ];
+        mark_machine_client(&mut copies, Path::new(machine));
+        assert_eq!(copies[0].source, Source::MachineClient);
+        assert_eq!(copies[1].source, Source::Other);
     }
 
     #[test]
@@ -480,14 +493,6 @@ mod tests {
             "exit 0",
         );
         assert_eq!(call.args.last().unwrap(), expected);
-    }
-
-    #[test]
-    fn the_encoded_command_is_base64_of_utf16() {
-        assert_eq!(encoded_command("dir"), "ZABpAHIA");
-        assert_eq!(encoded_command("Hi"), "SABpAA==");
-        assert_eq!(encoded_command("A"), "QQA=");
-        assert_eq!(encoded_command(""), "");
     }
 
     #[test]
@@ -520,7 +525,7 @@ mod tests {
         );
         copy.package = Some("open-pact-other".into());
         assert_eq!(
-            removal(&copy, Platform::Windows).shown,
+            removal(&copy, Platform::Windows).unwrap().shown,
             "scoop uninstall open-pact-other"
         );
     }
@@ -601,7 +606,7 @@ mod tests {
         assert_eq!(found.len(), 2);
         assert_eq!(found[0].brew, Some(root.join("brew-a/bin/brew")));
         assert_eq!(found[1].brew, Some(root.join("brew-b/bin/brew")));
-        let second = removal(&found[1], Platform::Mac);
+        let second = removal(&found[1], Platform::Mac).unwrap();
         assert_eq!(
             second.call.program,
             root.join("brew-b/bin/brew").to_string_lossy()

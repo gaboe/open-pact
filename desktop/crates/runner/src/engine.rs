@@ -250,17 +250,24 @@ pub fn find_other_copies(runner: &Runner, installed: &Path, bundled: &Path) -> V
             roots.push(std::fs::canonicalize(&prefix).unwrap_or(prefix));
         }
     }
-    ownership::other_copies(
+    let mut found = ownership::other_copies(
         tool_path(),
         client::cli_name(),
         &[installed.to_path_buf(), bundled.to_path_buf()],
         &roots,
-    )
+    );
+    if let Ok(machine) = open_pact_client::machine::machine_executable() {
+        ownership::mark_machine_client(&mut found, &machine);
+    }
+    found
 }
 
 /// Runs the removal command of `copy` and gives what it printed. Only the user's click calls it.
 pub fn remove_copy(runner: &Runner, copy: &OtherCopy) -> Result<String, String> {
-    let removal = ownership::removal(copy, crate::update::Platform::current());
+    let removal =
+        ownership::removal(copy, crate::update::Platform::current()).ok_or_else(|| {
+            "The machine client is managed by an administrator and is not removed here.".to_owned()
+        })?;
     let log = runner
         .with_timeout(Duration::from_secs(300))
         .with_env(&removal.call.env)
@@ -274,22 +281,20 @@ pub fn remove_copy(runner: &Runner, copy: &OtherCopy) -> Result<String, String> 
     })
 }
 
-/// Starts the installed copy elevated to install the SYSTEM job. The library cannot elevate, so
+/// Starts the machine client elevated to install the SYSTEM job. The library cannot elevate, so
 /// this is the one place where the app runs the command line tool as a process.
-pub fn install_system_job(
-    runner: &Runner,
-    log: &OperationLog,
-    installed: &Path,
-    home: &Path,
-) -> Result<(), String> {
+pub fn install_system_job(runner: &Runner, log: &OperationLog, home: &Path) -> Result<(), String> {
     let place = log.begin("Schedule on --system (administrator)");
-    let result = system_profile(std::env::var_os("USERPROFILE")).and_then(|profile| {
-        let call = ownership::elevated_system_schedule(installed, home, &profile);
-        runner
-            .with_timeout(Duration::from_secs(300))
-            .run(Path::new(&call.program), &call.args)
-            .map(|_| ())
-    });
+    let result = open_pact_client::machine::machine_executable()
+        .map_err(|error| format!("{error:#}"))
+        .and_then(|machine| {
+            let profile = system_profile(std::env::var_os("USERPROFILE"))?;
+            let call = ownership::elevated_system_schedule(&machine, home, &profile);
+            runner
+                .with_timeout(Duration::from_secs(300))
+                .run(Path::new(&call.program), &call.args)
+                .map(|_| ())
+        });
     log.finish(
         place,
         result.clone().map(|()| {
