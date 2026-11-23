@@ -79,6 +79,8 @@ spec:
               value: {{ .Values.nonces.windowSecs | quote }}
             - name: NONCE_MAX_OUTSTANDING
               value: {{ .Values.nonces.maxOutstanding | quote }}
+            - name: DATABASE_MAX_CONNECTIONS
+              value: {{ .Values.database.maxConnections | quote }}
             {{- if .Values.database.externalUrl }}
             - name: DATABASE_URL
               value: {{ .Values.database.externalUrl | quote }}

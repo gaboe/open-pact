@@ -241,6 +241,14 @@ helm upgrade --install pact deploy/helm/open-pact -f gateway-values.yaml
 
 The chart restarts the gateway when the manifest changes. Confirm that the gateway is ready. Check the transparency checkpoint and SIEM delivery logs.
 
+## Nonce durability and database connections
+
+The gateway issues a nonce with `synchronous_commit = off`, so issuers do not wait for a disk flush while they hold the issue lock. A database crash can lose an issued nonce that the client has not used yet, from about the last 0.6 s (three times PostgreSQL's `wal_writer_delay`). The client then gets "unknown or used nonce" and asks for a new nonce. The gateway consumes a nonce with `synchronous_commit = on` whatever the server default is, so a consumed nonce does not come back after a crash. The limit on outstanding nonces (`nonces.maxOutstanding`) stays exact, and a nonce works once.
+
+Replication changes this. A crash of the primary is covered as written. When you fail over to an asynchronous replica, the replica can be behind and can lose consumed nonces too. Replication durability depends on your synchronous standby configuration (`synchronous_standby_names`): use a synchronous standby for a highly available PostgreSQL when a replayed nonce matters to you.
+
+Each gateway pod keeps up to `database.maxConnections` connections to PostgreSQL (`DATABASE_MAX_CONNECTIONS`, default 10). Keep the sum over all pods below the server's `max_connections`. A request that needs a connection waits while all of them are busy.
+
 ## Read log entries
 
 Log entries are private. The public `/v1/log/entries` and `/v1/log/proof/inclusion` routes return 404. An approved device uses `POST /v1/log/mine` to get its signed manifest and its own device entries with inclusion proofs. The log key, signed checkpoint and consistency proofs remain public. Witnesses receive checkpoints and consistency proofs by push; they do not download entries.
