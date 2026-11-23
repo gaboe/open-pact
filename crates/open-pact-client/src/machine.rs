@@ -301,8 +301,9 @@ impl ProfileList {
             .map(|entry| entry.path.clone())
     }
 
-    /// The list from the lines that `profile_list_script` printed: `own <sid>` once, and
+    /// The list from the lines that `PROFILE_LIST_SCRIPT` printed: `own <sid>` once, and
     /// `entry <sid> <path>` for each account.
+    #[cfg(any(windows, test))]
     fn parse(output: &str) -> Self {
         let mut list = Self::default();
         for line in output.lines().map(str::trim) {
