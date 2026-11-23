@@ -24,6 +24,8 @@ pub enum Behaviour {
     StoreThenFail,
     /// Sleeps, then answers this status and stores nothing.
     DelayAnswer(Duration, u16),
+    /// Answers this status once and stores nothing, then behaves as Healthy.
+    AnswerOnce(u16),
 }
 
 #[derive(Clone, Debug)]
@@ -165,7 +167,11 @@ async fn add(State(w): State<Arc<Inner>>, body: String) -> (StatusCode, String) 
             at: Instant::now(),
         });
     };
-    let behaviour = w.behaviour.lock().unwrap().clone();
+    let mut behaviour = w.behaviour.lock().unwrap().clone();
+    if let Behaviour::AnswerOnce(code) = behaviour {
+        *w.behaviour.lock().unwrap() = Behaviour::Healthy;
+        behaviour = Behaviour::Answer(code);
+    }
     if let Behaviour::Answer(code) = behaviour {
         record(code);
         return (StatusCode::from_u16(code).unwrap(), "fake".into());

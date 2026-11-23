@@ -42,6 +42,10 @@ struct Options {
     pool: u32,
     /// Lists each witness URL twice, the second time with a trailing slash.
     duplicate_urls: bool,
+    /// Approves every enrolment and drops the manifest controls, so a real client claim is accepted.
+    real_client: bool,
+    /// No witness and `allow_split_views = true` (needs count 0).
+    split_views: bool,
 }
 
 impl Options {
@@ -52,6 +56,8 @@ impl Options {
             wait_ms: 3000,
             pool: 20,
             duplicate_urls: false,
+            real_client: false,
+            split_views: false,
         }
     }
 }
@@ -103,6 +109,27 @@ impl Fixture {
             options.quorum,
             &DEMO[end..]
         );
+        let toml = if options.split_views {
+            format!(
+                "{}witnesses = []\nwitness_quorum = 0\nallow_split_views = true{}",
+                &DEMO[..start],
+                &DEMO[end..]
+            )
+        } else {
+            toml
+        };
+        let toml = if options.real_client {
+            // One control that only reports a value, so every host passes it.
+            let from = toml.find("[[control]]").unwrap();
+            let keep = toml
+                .find("[[control]]\nid = \"managed_repos_total\"")
+                .unwrap();
+            let keep_end = keep + 1 + toml[keep + 1..].find("[[control]]").unwrap();
+            let to = toml.find("[log]").unwrap();
+            format!("{}{}{}", &toml[..from], &toml[keep..keep_end], &toml[to..])
+        } else {
+            toml
+        };
         let manifest = Manifest::parse(toml.as_bytes()).unwrap();
         let policy = manifest.body().log.clone().unwrap();
         let log_state = Log::new(keys.log.clone(), log.clone(), Witnesses::new(Some(&policy)));
@@ -137,7 +164,7 @@ impl Fixture {
             enforced,
             current,
             keys: Arc::new(keys),
-            auto_approve: false,
+            auto_approve: options.real_client,
             limiter: Arc::new(Limiter::new(100, Duration::from_secs(60), 100)),
             nonce_limiter: Arc::new(Limiter::new(100, Duration::from_secs(60), 100)),
             max_nonces: 10_000,
@@ -1091,3 +1118,5 @@ async fn a_stalled_store_releases_the_owner() {
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
     f.verifies(&reply.body, &f.policy);
 }
+
+mod real;

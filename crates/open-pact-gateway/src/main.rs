@@ -491,6 +491,10 @@ impl App {
     /// The committed log with base database limits, for the handlers that never waited on a
     /// witness. It shares the cache and the one-batch bound with every other tree step.
     async fn tree(&self) -> Result<Tree, Reply> {
+        #[cfg(test)]
+        if self.owners.hooks().fault_after_read() {
+            return Err(internal("a test fault in tree()"));
+        }
         let step = tree_step(
             self.db.clone(),
             self.enforced.clone(),
@@ -600,6 +604,10 @@ impl App {
         for reply in pending {
             outcomes.push(reply.await.unwrap_or(Outcome::Failed));
         }
+        #[cfg(test)]
+        if self.owners.hooks().fault_after_read() {
+            return Err(internal("a test fault in pushed()"));
+        }
         for outcome in &outcomes {
             let Outcome::Cosigned(lines) = outcome else {
                 continue;
@@ -638,6 +646,10 @@ impl App {
 
     async fn stored_lines(&self, checkpoint: &Checkpoint) -> Result<Vec<NoteSignature>, Reply> {
         self.owners.hooks().hit("stored_lines_read").await;
+        #[cfg(test)]
+        if self.owners.hooks().fault_in_read() {
+            return Err(internal("a test fault in the stored-line read"));
+        }
         let lines: Vec<String> = sqlx::query_scalar(
             "SELECT signature FROM log_cosignatures WHERE size = $1 AND root = $2 ORDER BY witness",
         )
@@ -1436,6 +1448,7 @@ async fn claim(
     }
     let policy = consented.body().log.as_ref();
     let (checkpoint, served) = app.checkpoint(Mode::Claim { policy }).await?;
+    app.owners.hooks().hit("claim_checkpointed").await;
     clock.mark(metrics::Stage::Checkpoint);
     app.count_served(metrics::Caller::Claim, served);
     Ok(Json(json!({
