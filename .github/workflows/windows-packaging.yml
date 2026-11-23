@@ -109,8 +109,16 @@ jobs:
           foreach ($key in $expected.Keys) {
               if (-not $installer.Contains("${key}: ""$($expected[$key])""")) { throw "The winget installer manifest does not name $key $($expected[$key])." }
           }
-          winget validate --manifest $winget
-          if ($LASTEXITCODE -ne 0) { throw "winget validate exits with $LASTEXITCODE." }
+          winget --version
+          $out = winget validate --manifest $winget 2>&1 | Out-String
+          $code = $LASTEXITCODE
+          Write-Host $out
+          if ($code -eq -1978335192) {
+              # Older winget on the runner warns on schema headers newer than its own; the schema fields still validate.
+              $warnings = @($out -split "\r?\n" | Where-Object { $_ -match '^Manifest Warning:' })
+              $other = @($warnings | Where-Object { $_ -notmatch 'The schema header URL does not match the expected pattern' })
+              if ($warnings.Count -eq 0 -or $other.Count -ne 0) { throw "winget validate warns: $($other -join '; ')" }
+          } elseif ($code -ne 0) { throw "winget validate exits with $code." }
       - name: Upload the fixtures
         uses: actions/upload-artifact@v4
         with:
