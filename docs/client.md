@@ -362,7 +362,9 @@ For a deployment with Intune or Group Policy, see [Windows machine install](wind
 
 ### Use Windows SYSTEM checks
 
-The wizard asks whether the job runs as SYSTEM. Later, choose it with `schedule on --system`, and go back with `schedule on --user`. Run `schedule on --system` from an elevated Windows PowerShell 5.1 prompt. Call the machine client by its full path, so that an older client on PATH never runs. Pass the profile of the user. The commands stop when the client file is missing or when the command fails.
+The wizard asks whether the job runs as SYSTEM. Later, choose SYSTEM with `schedule on --system`. Run it from an elevated Windows PowerShell 5.1 prompt. Call the machine client by its full path, so that an older client on PATH never runs. Pass the profile of the user. The commands stop when the client file is missing or when the command fails.
+
+To go back to a job that runs as you, do two steps. First, remove the SYSTEM task from an elevated prompt. Follow [Stop the scheduled claims and remove the client](#stop-the-scheduled-claims-and-remove-the-client). Second, run `open-pact-client schedule on --user` in your own prompt, not an elevated one.
 
 1. Replace the line `<the absolute client home>` with the absolute client home of the user.
 2. Replace the line `<the profile folder of the user>` with the profile folder of the user.
@@ -398,7 +400,7 @@ Run `stop` to print these instructions. For a SYSTEM job on Windows, `stop` prin
 
 On Windows, remove each SYSTEM task before you uninstall the package. Uninstalling the package does not remove SYSTEM tasks. Run every command in an elevated Windows PowerShell 5.1 prompt.
 
-First, list the SYSTEM tasks. The command selects tasks by their principal and by the program that they run, never by the name prefix alone. A task of a limited user is not listed. Write down the task name, the program and the `--home` value of each task:
+First, list the SYSTEM tasks. The command selects tasks by their principal and by the program that they run, never by the name prefix alone. A task of a limited user is not listed. Write down the task name, the number of actions, the program and the `--home` value of each task:
 
 ```powershell
 & {
@@ -412,6 +414,7 @@ First, list the SYSTEM tasks. The command selects tasks by their principal and b
     @($_.Actions | Where-Object { $_.Execute -and ($programs -contains ($_.Execute.Trim('"') -replace '^\\\\\?\\', '')) }).Count -gt 0
   } | ForEach-Object {
     'Task: ' + $_.TaskName
+    'Actions: ' + @($_.Actions).Count
     'Program: ' + (($_.Actions | ForEach-Object { $_.Execute }) -join ' ')
     'Arguments: ' + (($_.Actions | ForEach-Object { $_.Arguments }) -join ' ')
   }
@@ -434,9 +437,9 @@ $global:LASTEXITCODE = $null
 if ($LASTEXITCODE -ne 0) { throw 'schedule off failed. Do not uninstall the package. Fix the error, then run this command again.' }
 ```
 
-A task with more than one action is not a task of the client. The list shows every program of the task. `schedule off` refuses such a task. Open it in Task Scheduler and read every action. When you know each action, remove the task with the removal block below or in Task Scheduler.
+A task whose Actions line is not 1 is not a task of the client. `schedule off` refuses such a task. Open it in Task Scheduler and read every action. When you know each action, remove the task in Task Scheduler.
 
-A task whose program is the old copy, `open-pact\open-pact-client.exe`, needs the removal block. The list can show the program with a `\\?\` prefix. It is the same file. The block shows three samples.
+A task whose program is the old copy, `open-pact\open-pact-client.exe`, and whose Actions line is 1, needs the removal block. The list can show the program with a `\\?\` prefix. It is the same file. The block shows three samples.
 
 1. Replace the task name `org.open-pact.report.0123abcd` in every place where it appears.
 2. Replace the home line `C:\Users\example\pact`, between `@'` and `'@`, with the `--home` value of the task. Do not add quotes.
@@ -485,7 +488,7 @@ C:\Users\example\pact
 
 The block deletes the task. It then checks that the machine client exists and runs `schedule off` with it. `schedule off` waits for the state lock, then removes the job state. When the file is missing or `schedule off` fails, for example because a tick holds the lock, the block throws. Do not uninstall the package then. Fix the error and run the block again.
 
-Run the first command again. It must print nothing. Then uninstall the package. A SYSTEM task that runs another program can come from an older open-pact client. The client does not change it. To remove it without the package, open the task in Task Scheduler and read every action. Then use the block in step 1 of the [0.9.0 release notes](release-notes/v0.9.0.md#step-1-find-and-remove-the-old-system-task). That block uses Windows tools only. It deletes the task name that you give it and does not check the program.
+Run the first command again. It must print nothing. Then uninstall the package. A SYSTEM task that runs another program can come from an older open-pact client. The client does not change it. To remove it without the package, follow [Remove a task without the package](windows-machine-install.md#remove-a-task-without-the-package). That block uses Windows tools only. It deletes the task name that you give it and does not check the program.
 
 ## Read the output as JSON
 
@@ -617,7 +620,7 @@ The exit code tells a script what to do:
 | `join` refuses the gateway | Confirm the invitation URL, company key fingerprint, HTTPS certificate, and pinned log key with the gateway operator. |
 | `check` reports that the manifest changed | Run `open-pact-client accept`. Review the changes and sign the new manifest. You need no new invitation or approval. |
 | `check` says the device is pending | Give the device code to the gateway operator. Wait for approval. |
-| A check returns `unknown` on Windows | Run the task as an elevated administrator when the control needs machine-wide access. Run `schedule on --system` from an elevated PowerShell prompt. |
+| A check returns `unknown` on Windows | Run the task as an elevated administrator when the control needs machine-wide access. To start a SYSTEM job, follow [Use Windows SYSTEM checks](#use-windows-system-checks). Use its full-path commands in an elevated PowerShell 5.1 prompt. |
 | Windows event claims do not trigger | Check Event Log Readers access for the limited task user. Check that Defender history can be read. |
 | Linux `schedule on` cannot reach systemd | Start the user systemd manager. Run `schedule on` again. |
 | `schedule on` says the company did not define automatic sending | The signed manifest has no `[schedule]`. Send claims by hand with `check`, or ask the company to add the table. |
@@ -627,7 +630,7 @@ The exit code tells a script what to do:
 
 ## Remove the device key
 
-To rotate or remove the device key, run `open-pact-client schedule off` first. Then run `open-pact-client --home <home> delete-device-key` before you delete the home or binary. Schedule removal alone keeps the key.
+To rotate or remove the device key, remove the schedule first. For a job that runs as you, run `open-pact-client schedule off`. For a Windows SYSTEM job, follow [Stop the scheduled claims and remove the client](#stop-the-scheduled-claims-and-remove-the-client). Then run `open-pact-client --home <home> delete-device-key` before you delete the home or binary. Schedule removal alone keeps the key.
 
 On Windows, use the account that created the CNG key or SYSTEM. A different administrator has no explicit access to the key. Windows CI tests deletion with the software CNG provider. Hosted runners do not verify deletion from a real TPM.
 

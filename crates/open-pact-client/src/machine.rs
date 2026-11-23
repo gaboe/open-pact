@@ -601,7 +601,7 @@ pub(crate) fn removal_block(home: &Path, task_id: &str, machine: Option<&Path>) 
     );
     if machine.is_none() {
         text.push_str(&format!(
-            "\nThe state folder {} stays. The next `schedule on --system` resets it.",
+            "\nThe state folder {} stays. The next `schedule on --system` writes new job state in it and sets its permissions again.",
             system_state_folder(home).display()
         ));
     }
@@ -1115,7 +1115,7 @@ mod tests {
         let without = removal_block(home, id, None);
         assert!(!without.contains("schedule off"));
         assert!(without.contains("The state folder") && without.contains("stays."));
-        assert!(without.contains("resets it"));
+        assert!(without.contains("writes new job state in it and sets its permissions again"));
     }
 
     #[test]
@@ -1213,31 +1213,51 @@ mod doc_blocks {
     const WINDOWS_INSTALL: &str = include_str!("../../../docs/windows-machine-install.md");
     const RELEASE_NOTES: &str = include_str!("../../../docs/release-notes/v0.9.0.md");
     const README: &str = include_str!("../../../README.md");
-    const RELEASE_REMOVE: &str = "### Step 1: Find and remove the old SYSTEM task";
+    const RELEASE_LIST: &str = "### Step 1: Find the old SYSTEM task";
     const RELEASE_INSTALL: &str = "### Step 2: Install the 0.9.0 package";
-    const RELEASE_START: &str = "### Step 3: Start the SYSTEM job";
+    const RELEASE_CHECK: &str = "### Step 3: Check the profile of the task";
+    const RELEASE_REMOVE: &str = "### Step 4: Remove the old SYSTEM task";
+    const RELEASE_START: &str = "### Step 5: Start the SYSTEM job";
     const CLIENT_INSTALL: &str = "### Install the machine client for the SYSTEM job";
     const CLIENT_START: &str = "### Use Windows SYSTEM checks";
     const CLIENT_REMOVE: &str = "### Stop the scheduled claims and remove the client";
     const WINDOWS_INSTALL_HEADING: &str = "## Install with the block";
     const WINDOWS_START: &str = "## Start the SYSTEM job for each home";
     const WINDOWS_REMOVE: &str = "## Remove the package";
+    const WINDOWS_NO_PACKAGE: &str = "## Remove a task without the package";
     const HOME: &str = r"C:\Users\example\pact";
     const TASK: &str = "org.open-pact.report.0123abcd";
     const MACHINE: &str = r"C:\Program Files\open-pact-client\open-pact-client.exe";
-    /// The commands that start the SYSTEM job. The reader writes each value into a here-string, so an
-    /// apostrophe in a path needs no escape. The commands check the file and the exit code.
-    const START_COMMANDS: &str = r#"$q = Join-Path $env:ProgramW6432 'open-pact-client\open-pact-client.exe'
+    /// The commands that start the SYSTEM job, or, with `dry_run`, check its profile first. The reader
+    /// writes each value into a here-string, so an apostrophe in a path needs no escape. The commands
+    /// check the file and the exit code.
+    fn start_commands(dry_run: bool) -> String {
+        let (flag, failure) = if dry_run {
+            (
+                " --dry-run",
+                "The dry run failed. Do not remove the old task. Fix the error, then run this command again.",
+            )
+        } else {
+            (
+                "",
+                "schedule on failed. Fix the error, then run this command again.",
+            )
+        };
+        format!(
+            r#"$q = Join-Path $env:ProgramW6432 'open-pact-client\open-pact-client.exe'
 $clientHome = @'
 <the absolute client home>
 '@
 $userHome = @'
 <the profile folder of the user>
 '@
-if (-not (Test-Path -LiteralPath $q -PathType Leaf)) { throw 'The machine client is missing. Install the package, then run this command again.' }
+if (-not (Test-Path -LiteralPath $q -PathType Leaf)) {{ throw 'The machine client is missing. Install the package, then run this command again.' }}
 $global:LASTEXITCODE = $null
-& $q --home $clientHome schedule on --system --user-home $userHome
-if ($LASTEXITCODE -ne 0) { throw 'schedule on failed. Fix the error, then run this command again.' }"#;
+& $q --home $clientHome schedule on --system --user-home $userHome{flag}
+if ($LASTEXITCODE -ne 0) {{ throw '{failure}' }}"#
+        )
+    }
+
     /// The commands that remove a task that the machine client owns.
     const OFF_COMMANDS: &str = r#"$q = Join-Path $env:ProgramW6432 'open-pact-client\open-pact-client.exe'
 $clientHome = @'
@@ -1255,22 +1275,6 @@ $msiexec = Join-Path ([Environment]::SystemDirectory) 'msiexec.exe'
 $repair = Start-Process -FilePath $msiexec -ArgumentList ('/fa "' + $msi + '" /qn /norestart') -Wait -PassThru
 if ($repair.ExitCode -eq 3010) { Write-Output 'Restart Windows to finish the repair.' }
 elseif ($repair.ExitCode -ne 0) { throw ('The repair failed. Exit code: ' + $repair.ExitCode) }"#;
-
-    /// The commands that check the saved `--user-home` of an old task against the rule of 0.9.0, before
-    /// the task is removed. The reader writes the value into a here-string.
-    const PROFILE_CHECK: &str = r#"$userHome = @'
-<the --user-home value of the task>
-'@
-$list = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'
-$profiles = @(Get-ChildItem -LiteralPath $list | Where-Object { $_.PSChildName -like 'S-1-5-21-*' -or $_.PSChildName -like 'S-1-12-1-*' } | ForEach-Object { [Environment]::ExpandEnvironmentVariables([string]$_.GetValue('ProfileImagePath')) })
-$folder = Get-Item -LiteralPath $userHome -Force -ErrorAction SilentlyContinue
-$reason = $null
-if ($userHome.Contains('%')) { $reason = 'The folder name contains %.' }
-elseif (-not [IO.Path]::IsPathRooted($userHome)) { $reason = 'The folder is not an absolute path.' }
-elseif (-not $folder -or -not $folder.PSIsContainer) { $reason = 'The folder does not exist.' }
-elseif ($folder.Attributes -band [IO.FileAttributes]::ReparsePoint) { $reason = 'The folder is a link.' }
-elseif (-not ($profiles | Where-Object { $_.TrimEnd('\') -eq $userHome.TrimEnd('\') })) { $reason = 'Windows does not list the folder as the profile of a user account.' }
-if ($reason) { 'Not OK: ' + $reason; 'Profiles that Windows lists:'; $profiles } else { 'OK: version 0.9.0 accepts this profile.' }"#;
 
     /// The PowerShell script that lists the SYSTEM tasks that run one of `programs`. It selects by
     /// principal and by action, never by the name prefix alone, and it prints the arguments of
@@ -1297,6 +1301,7 @@ if ($reason) { 'Not OK: ' + $reason; 'Profiles that Windows lists:'; $profiles }
     @($_.Actions | Where-Object {{ $_.Execute -and ($programs -contains ($_.Execute.Trim('"') -replace '^\\\\\?\\', '')) }}).Count -gt 0
   }} | ForEach-Object {{
     'Task: ' + $_.TaskName
+    'Actions: ' + @($_.Actions).Count
     'Program: ' + (($_.Actions | ForEach-Object {{ $_.Execute }}) -join ' ')
     'Arguments: ' + (($_.Actions | ForEach-Object {{ $_.Arguments }}) -join ' ')
   }}
@@ -1434,6 +1439,11 @@ if ($reason) { 'Not OK: ' + $reason; 'Profiles that Windows lists:'; $profiles }
                 WINDOWS_INSTALL,
                 WINDOWS_REMOVE,
             ),
+            (
+                "docs/release-notes/v0.9.0.md",
+                RELEASE_NOTES,
+                RELEASE_REMOVE,
+            ),
         ] {
             assert!(
                 shows(doc, heading, &block),
@@ -1443,11 +1453,13 @@ if ($reason) { 'Not OK: ' + $reason; 'Profiles that Windows lists:'; $profiles }
     }
 
     #[test]
-    fn the_release_notes_show_the_removal_block_without_the_machine_client() {
+    fn the_guide_shows_the_removal_block_without_the_machine_client() {
         assert!(
-            shows(RELEASE_NOTES, RELEASE_REMOVE, &removal_text(None)),
-            "the release notes must show exactly the removal block without the machine client"
+            shows(WINDOWS_INSTALL, WINDOWS_NO_PACKAGE, &removal_text(None)),
+            "the IT guide must show exactly the removal block without the machine client"
         );
+        // The release notes remove the old task with the machine client, never with Windows tools alone.
+        assert!(!shows(RELEASE_NOTES, RELEASE_REMOVE, &removal_text(None)));
     }
 
     #[test]
@@ -1469,8 +1481,10 @@ if ($reason) { 'Not OK: ' + $reason; 'Profiles that Windows lists:'; $profiles }
             assert!(script.contains("$_.Execute"));
             assert!(script.contains("$env:ProgramW6432"));
             assert!(script.contains("$_.Arguments"));
+            // The reader counts the actions: the upgrade needs exactly one.
+            assert!(script.contains("'Actions: ' + @($_.Actions).Count"));
         }
-        assert!(shows(RELEASE_NOTES, RELEASE_REMOVE, &legacy_list()));
+        assert!(shows(RELEASE_NOTES, RELEASE_LIST, &legacy_list()));
         assert!(shows(WINDOWS_INSTALL, WINDOWS_REMOVE, &both_list()));
         assert!(shows(CLIENT, CLIENT_REMOVE, &both_list()));
     }
@@ -1483,33 +1497,50 @@ if ($reason) { 'Not OK: ' + $reason; 'Profiles that Windows lists:'; $profiles }
     }
 
     #[test]
-    fn the_release_notes_check_the_profile_before_they_remove_the_task() {
-        assert!(shows(RELEASE_NOTES, RELEASE_REMOVE, PROFILE_CHECK));
-        let step = section(RELEASE_NOTES, RELEASE_REMOVE);
-        let check = step.find("ProfileList").unwrap();
-        let removal = step.find("/Delete").unwrap();
+    fn the_release_notes_check_the_profile_with_a_dry_run_before_they_remove_the_task() {
+        let dry = start_commands(true);
+        assert!(dry.contains("schedule on --system --user-home $userHome --dry-run"));
+        assert!(shows(RELEASE_NOTES, RELEASE_CHECK, &dry));
+        // The dry run is not the start: the start has no `--dry-run`.
+        assert!(!start_commands(false).contains("--dry-run"));
+        assert!(!shows(RELEASE_NOTES, RELEASE_START, &dry));
+        assert!(!shows(RELEASE_NOTES, RELEASE_CHECK, &start_commands(false)));
+    }
+
+    #[test]
+    fn the_release_notes_order_their_blocks_by_the_position_of_each_fence() {
+        let all = fences(RELEASE_NOTES);
+        let position = |script: &str| {
+            let found: Vec<usize> = all
+                .iter()
+                .enumerate()
+                .filter(|(_, fence)| *fence == script)
+                .map(|(index, _)| index)
+                .collect();
+            assert_eq!(found.len(), 1, "the release notes show the block once");
+            found[0]
+        };
+        let order = [
+            position(&legacy_list()),
+            position(&install_text()),
+            position(&start_commands(true)),
+            position(&removal_with_machine()),
+            position(&start_commands(false)),
+        ];
         assert!(
-            check < removal,
-            "the profile check comes before the removal"
+            order.windows(2).all(|pair| pair[0] < pair[1]),
+            "list, install, dry run, removal, start: {order:?}"
         );
-        // The rule of 0.9.0: no %, an absolute folder that exists, not a link, listed as a profile.
-        for part in [
-            "Contains('%')",
-            "IsPathRooted",
-            "PSIsContainer",
-            "ReparsePoint",
-            "S-1-5-21-*",
-            "S-1-12-1-*",
-            "ProfileImagePath",
-            "'OK: ",
-            "'Not OK: ",
-        ] {
-            assert!(PROFILE_CHECK.contains(part), "the check lacks {part}");
-        }
-        assert!(PROFILE_LIST_SCRIPT.contains("ProfileList"));
-        assert!(PROFILE_LIST_SCRIPT.contains("S-1-5-21-*"));
-        assert!(PROFILE_LIST_SCRIPT.contains("S-1-12-1-*"));
-        assert!(PROFILE_LIST_SCRIPT.contains("ProfileImagePath"));
+        // The headings come in the same order, so each fence sits under its own step.
+        let headings = [
+            RELEASE_LIST,
+            RELEASE_INSTALL,
+            RELEASE_CHECK,
+            RELEASE_REMOVE,
+            RELEASE_START,
+        ]
+        .map(|heading| RELEASE_NOTES.find(heading).unwrap());
+        assert!(headings.windows(2).all(|pair| pair[0] < pair[1]));
     }
 
     #[test]
@@ -1528,14 +1559,18 @@ if ($reason) { 'Not OK: ' + $reason; 'Profiles that Windows lists:'; $profiles }
     #[test]
     fn the_install_and_start_blocks_stay_under_their_own_steps() {
         assert!(!shows(RELEASE_NOTES, RELEASE_START, &install_text()));
-        assert!(!shows(RELEASE_NOTES, RELEASE_INSTALL, START_COMMANDS));
+        assert!(!shows(
+            RELEASE_NOTES,
+            RELEASE_INSTALL,
+            &start_commands(false)
+        ));
         assert!(!shows(CLIENT, CLIENT_START, &install_text()));
-        assert!(!shows(CLIENT, CLIENT_INSTALL, START_COMMANDS));
+        assert!(!shows(CLIENT, CLIENT_INSTALL, &start_commands(false)));
         assert!(!shows(WINDOWS_INSTALL, WINDOWS_START, &install_text()));
         assert!(!shows(
             WINDOWS_INSTALL,
             WINDOWS_INSTALL_HEADING,
-            START_COMMANDS
+            &start_commands(false)
         ));
     }
 
@@ -1557,7 +1592,7 @@ if ($reason) { 'Not OK: ' + $reason; 'Profiles that Windows lists:'; $profiles }
             ),
         ] {
             assert!(
-                shows(doc, start, START_COMMANDS),
+                shows(doc, start, &start_commands(false)),
                 "{name} must show the start commands under `{start}`"
             );
             assert!(
@@ -1588,8 +1623,8 @@ if ($reason) { 'Not OK: ' + $reason; 'Profiles that Windows lists:'; $profiles }
             removal_text(None),
             legacy_list(),
             both_list(),
-            PROFILE_CHECK.to_owned(),
-            START_COMMANDS.to_owned(),
+            start_commands(true),
+            start_commands(false),
             OFF_COMMANDS.to_owned(),
             REPAIR_COMMANDS.to_owned(),
         ];
