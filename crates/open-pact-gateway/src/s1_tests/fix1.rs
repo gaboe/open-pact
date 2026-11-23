@@ -205,31 +205,41 @@ async fn slow_request_and_error_lines_reach_the_diagnostic_writer() {
     let lines = Arc::new(StdMutex::new(Vec::<String>::new()));
     let put = lines.clone();
     let _sink = diag::hold(move |line| put.lock().unwrap().push(line.to_string())).await;
+    let has = |start: &str| lines.lock().unwrap().iter().any(|l| l.starts_with(start));
     let reply = f.get(Some(&f.query)).await;
     expect_unavailable(
         &reply,
         Duration::from_millis(300 + ONE_CANDIDATE_BOUND_MS + 700),
     );
-    let manifest = f.app.manifest.hash().as_str().to_string();
-    let request = mine_request(&f.router, &f.db, &manifest).await;
-    sqlx::query("ALTER TABLE devices RENAME COLUMN salt TO salt_gone")
-        .execute(&f.db)
-        .await
-        .unwrap();
-    let (status, _, _) = post_mine(&f.router, &request).await;
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-    let has = |start: &str| lines.lock().unwrap().iter().any(|l| l.starts_with(start));
-    // A line that went to stderr directly never reaches this sink.
+    until("the checkpoint's 503 line", Duration::from_secs(5), || {
+        has("checkpoint not served: ")
+    })
+    .await;
     until("the slow-request line", Duration::from_secs(5), || {
         has("slow_request route=/v1/log/checkpoint method=GET status=5xx")
     })
     .await;
-    until("the internal error line", Duration::from_secs(5), || {
-        has("internal error: ")
+    // The mine 503 is checked on a sink that holds only lines written after its own request.
+    lines.lock().unwrap().clear();
+    let manifest = f.app.manifest.hash().as_str().to_string();
+    let answered = mine_request(&f.router, &f.db, &manifest).await;
+    let failing = mine_request(&f.router, &f.db, &manifest).await;
+    let (status, retry, _) = post_mine(&f.router, &answered).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(retry.as_deref(), Some("5"));
+    until("the mine 503 line", Duration::from_secs(5), || {
+        has("checkpoint not served: ")
     })
     .await;
-    until("the 503 line", Duration::from_secs(5), || {
-        has("checkpoint not served: ")
+    sqlx::query("ALTER TABLE devices RENAME COLUMN salt TO salt_gone")
+        .execute(&f.db)
+        .await
+        .unwrap();
+    let (status, _, _) = post_mine(&f.router, &failing).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    // Only the injected missing column names "salt" in an internal error line.
+    until("the internal error line", Duration::from_secs(5), || {
+        has("internal error: ") && lines.lock().unwrap().iter().any(|l| l.contains("\"salt\""))
     })
     .await;
 }

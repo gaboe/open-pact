@@ -138,6 +138,20 @@ pub async fn lock(conn: &mut PgConnection) -> sqlx::Result<()> {
         .map(drop)
 }
 
+/// Begins the transaction that reads one device's proof entries. Its first statement sets REPEATABLE
+/// READ, so the first read in it (the approval read) takes the snapshot that the entry read also
+/// uses: a revocation committed after that snapshot cannot pass, and one committed before it stops
+/// the proof at the approval read.
+pub async fn begin_proof(
+    db: &sqlx::PgPool,
+) -> anyhow::Result<sqlx::Transaction<'static, sqlx::Postgres>> {
+    let mut tx = db.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *tx)
+        .await?;
+    Ok(tx)
+}
+
 /// The partial indexes `log_entries_manifest` and `log_entries_commitment` (migration 0013) serve
 /// this query. Each `kind` list here must equal the `kind` predicate of its index in that migration.
 pub async fn mine(
