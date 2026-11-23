@@ -41,6 +41,7 @@ release_assets=$(gh release view "$tag" --repo "$repo" --json assets --jq '.asse
 while IFS= read -r asset; do
   case "$asset" in
     open-pact-client_*.deb|open-pact-client-*.rpm) assets+=("$asset") ;;
+    open-pact-client-x86_64-pc-windows-msvc.msi) assets+=("$asset") ;;
     open-pact-desktop-*-macos.zip|open-pact-desktop-*-windows-x64.zip) assets+=("$asset") ;;
   esac
 done <<< "$release_assets"

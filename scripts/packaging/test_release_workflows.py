@@ -8,10 +8,12 @@ publishes the release. image.yml only adds its notes to that release.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -208,6 +210,135 @@ class NotesScriptTest(unittest.TestCase):
         self.assertIn("client-release.yml", result.stderr)
         self.assertEqual(len(calls), 4)
         self.assertFalse([c for c in calls if " edit " in f" {c} " or " create " in f" {c} "])
+
+
+VERIFY_SCRIPT = ROOT / "scripts" / "verify-client-release.sh"
+MSI = "open-pact-client-x86_64-pc-windows-msvc.msi"
+CORE_ASSETS = [
+    "open-pact-client-aarch64-apple-darwin",
+    "open-pact-client-x86_64-apple-darwin",
+    "open-pact-client-x86_64-unknown-linux-musl",
+    "open-pact-client-x86_64-pc-windows-msvc.exe",
+    "NOTICE",
+]
+STUB_GH = f"""#!{sys.executable}
+import os
+import shutil
+import sys
+
+args = sys.argv[1:]
+if args[:2] == ["release", "view"] and "--jq" in args:
+    print(os.environ["MOCK_RELEASE_ASSETS"])
+elif args[:2] == ["release", "download"]:
+    target = args[args.index("--dir") + 1]
+    for index, arg in enumerate(args):
+        if arg == "--pattern":
+            name = args[index + 1]
+            source = os.path.join(os.environ["MOCK_FIXTURES"], name)
+            if not os.path.exists(source):
+                sys.exit(1)
+            shutil.copy(source, os.path.join(target, name))
+else:
+    sys.exit(99)
+"""
+STUB_COSIGN = f"""#!{sys.executable}
+import os
+import sys
+
+with open(os.environ["MOCK_COSIGN_LOG"], "a") as log:
+    log.write(sys.argv[-1] + "\\n")
+"""
+
+
+class ClientReleaseMsiTest(unittest.TestCase):
+    def setUp(self):
+        self.client = jobs("client-release.yml")
+        self.text = (WORKFLOWS / "client-release.yml").read_text()
+
+    def test_the_msi_job_builds_from_the_release_client_and_holds_no_identity_token(self):
+        msi = self.client["msi"]
+        self.assertIn("client-x86_64-pc-windows-msvc", msi)
+        self.assertIn("./scripts/packaging/install-wix.ps1", msi)
+        self.assertIn("./scripts/packaging/build-msi.ps1", msi)
+        self.assertIn("name: client-msi", msi)
+        self.assertEqual(needs(msi), ["build"])
+        self.assertNotIn("id-token", msi)
+        self.assertNotIn("cosign", msi)
+
+    def test_the_package_job_waits_for_the_msi(self):
+        self.assertIn("msi", needs(self.client["package"]))
+
+    def test_the_release_checks_the_exact_msi_names_before_it_uploads(self):
+        release = self.client["release"]
+        self.assertIn(MSI + ".sigstore.json", release)
+        self.assertLess(release.index(MSI), release.index("gh release upload"))
+
+    def test_only_the_sign_job_still_runs_cosign(self):
+        self.assertEqual(self.text.count("cosign sign-blob"), 2)
+        self.assertNotIn("cosign", self.client["msi"])
+
+
+class MachinePackageWorkflowTest(unittest.TestCase):
+    def test_the_pr_job_runs_the_install_sequence_and_keeps_its_fixtures(self):
+        job = jobs("windows-packaging.yml")["machine-package"]
+        self.assertIn("runs-on: windows-latest", job)
+        self.assertIn("./scripts/packaging/install-wix.ps1", job)
+        self.assertIn("./packaging/windows/tests/machine-package.ps1", job)
+        self.assertIn("name: machine-package-fixtures", job)
+
+
+class WixInstallerPinTest(unittest.TestCase):
+    def test_the_wix_package_is_pinned_by_hash_and_read_from_an_isolated_feed(self):
+        text = (HERE / "install-wix.ps1").read_text()
+        self.assertRegex(text, r"\$sha256 = '[0-9a-f]{64}'")
+        self.assertIn("$version = '5.0.2'", text)
+        self.assertIn("<clear />", text)
+
+
+class VerifyClientReleaseTest(unittest.TestCase):
+    def run_verify(self, shipped, listed):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            fixtures = tmp_path / "fixtures"
+            bin_dir = tmp_path / "bin"
+            fixtures.mkdir()
+            bin_dir.mkdir()
+            for name in shipped:
+                (fixtures / name).write_bytes(name.encode())
+            sums = "".join(f"{hashlib.sha256((fixtures / name).read_bytes()).hexdigest()}  {name}\n" for name in shipped)
+            (fixtures / "SHA256SUMS").write_text(sums)
+            for name in [*shipped, "SHA256SUMS"]:
+                (fixtures / f"{name}.sigstore.json").write_text("{}")
+            for tool, body in (("gh", STUB_GH), ("cosign", STUB_COSIGN)):
+                path = bin_dir / tool
+                path.write_text(body)
+                path.chmod(0o755)
+            log = tmp_path / "cosign.log"
+            env = {
+                "PATH": f"{bin_dir}:{os.environ['PATH']}",
+                "TMPDIR": str(tmp_path),
+                "MOCK_RELEASE_ASSETS": "\n".join([*listed, "SHA256SUMS"]),
+                "MOCK_FIXTURES": str(fixtures),
+                "MOCK_COSIGN_LOG": str(log),
+            }
+            result = subprocess.run(["bash", str(VERIFY_SCRIPT), "v0.9.0"], env=env, capture_output=True, text=True)
+            verified = log.read_text().splitlines() if log.exists() else []
+            return result, verified
+
+    def test_a_release_with_the_machine_package_verifies_the_msi_too(self):
+        shipped = [*CORE_ASSETS, MSI]
+        result, verified = self.run_verify(shipped, shipped)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(MSI, verified)
+
+    def test_an_older_release_without_the_msi_still_verifies(self):
+        result, verified = self.run_verify(CORE_ASSETS, CORE_ASSETS)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn(MSI, verified)
+
+    def test_a_listed_msi_that_was_not_downloaded_fails(self):
+        result, _ = self.run_verify(CORE_ASSETS, [*CORE_ASSETS, MSI])
+        self.assertNotEqual(result.returncode, 0)
 
 
 if __name__ == "__main__":

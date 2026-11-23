@@ -63,3 +63,37 @@ jobs:
           } finally {
             Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
           }
+
+  machine-package:
+    name: Machine package fixtures and install sequence
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.100.0
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: actions/setup-dotnet@2016bd2012dba4e32de620c46fe006a3ac9f0602 # v5.0.1
+        with:
+          dotnet-version: 8.0.x
+      - name: Install WiX
+        shell: pwsh
+        run: ./scripts/packaging/install-wix.ps1
+      - name: Build the fixtures and run the install sequence
+        shell: pwsh
+        run: ./packaging/windows/tests/machine-package.ps1 -Work "$env:RUNNER_TEMP/machine-package"
+      - name: Upload the fixtures
+        uses: actions/upload-artifact@v4
+        with:
+          name: machine-package-fixtures
+          path: ${{ runner.temp }}/machine-package/fixtures
+          if-no-files-found: error
+      - name: Upload the logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: machine-package-logs
+          path: ${{ runner.temp }}/machine-package/logs
+          if-no-files-found: warn

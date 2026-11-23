@@ -148,9 +148,41 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  msi:
+    name: Build the Windows machine package
+    needs: build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-dotnet@2016bd2012dba4e32de620c46fe006a3ac9f0602 # v5.0.1
+        with:
+          dotnet-version: 8.0.x
+      - uses: actions/download-artifact@v4
+        with:
+          name: client-x86_64-pc-windows-msvc
+          path: ${{ runner.temp }}/client
+      - name: Install WiX
+        shell: pwsh
+        run: ./scripts/packaging/install-wix.ps1
+      - name: Build the MSI from the release client
+        shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          $out = Join-Path $env:GITHUB_WORKSPACE 'msi' 'open-pact-client-x86_64-pc-windows-msvc.msi'
+          New-Item -ItemType Directory -Force -Path (Split-Path -Parent $out) | Out-Null
+          $exe = Join-Path $env:RUNNER_TEMP 'client' 'open-pact-client-x86_64-pc-windows-msvc.exe'
+          ./scripts/packaging/build-msi.ps1 -Exe $exe -Version ($env:TAG).Substring(1) -Out $out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: client-msi
+          path: msi/open-pact-client-x86_64-pc-windows-msvc.msi
+          if-no-files-found: error
+          retention-days: 1
+
   package:
     name: Package and checksum
-    needs: [build, desktop-macos, desktop-windows]
+    needs: [build, msi, desktop-macos, desktop-windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -255,6 +287,12 @@ jobs:
         run: |
           python3 scripts/packaging/generate-release-metadata.py "${GITHUB_REF_NAME#v}" dist/SHA256SUMS \
             --homebrew-dir dist/Formula --scoop-dir dist/bucket --desktop
+      - name: Check the machine package is in the release set
+        run: |
+          # The MSI is named exactly, so a missing one stops the release before it publishes.
+          for name in open-pact-client-x86_64-pc-windows-msvc.msi open-pact-client-x86_64-pc-windows-msvc.msi.sigstore.json; do
+            [ -f "dist/$name" ] || { echo "release asset is missing from dist: $name" >&2; exit 1; }
+          done
       - name: Attach assets to the GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
