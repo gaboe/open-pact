@@ -249,43 +249,106 @@ Migration 0013 adds two partial indexes on `log_entries`. The gateway runs it wh
 
 A plain Helm upgrade is supported when the log has about 200,000 entries or fewer and no long transaction holds a lock on `log_entries`. The gate in [`scripts/log-lookup-migration-gate.ts`](../scripts/log-lookup-migration-gate.ts) tests that size with appends running. It fails when the migration transaction takes 2 seconds or more, or when startup takes more than 5 seconds. The chart's liveness probe starts 10 seconds after the container starts. With the Kubernetes default period and failure threshold, the kubelet restarts a container that still does not answer about 30 seconds after it starts. A restart stops the build and rolls it back, so the next start builds again from the beginning.
 
-For a larger log, or a database that writers keep busy, run the migration before the probes apply. Check that the one-off command exits 0 before you roll out:
+For a larger log, or a database that writers keep busy, run the migration before the probes apply. A one-off Job runs the new image with the `status` command. Its environment and Secret references match the gateway container in the chart, so it reaches the same database. Save this manifest as `migrate-job.yaml`. Replace each `<...>` value with the value from the Deployment (`kubectl get deployment pact-gateway -o yaml`):
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: <release>-migrate
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: migrate
+          image: registry.example.com/open-pact-gateway:<new-tag>
+          args: ["status", "--json"]
+          env:
+            - name: GATEWAY_KEK
+              valueFrom:
+                secretKeyRef:
+                  name: <kek-secret>
+                  key: <kek-key>
+            - name: LISTEN_ADDR
+              value: "0.0.0.0:8080"
+            - name: LOG_ORIGIN
+              value: "<log.origin>"
+            - name: PUBLIC_URL
+              value: "<public URL>"
+            - name: AUTO_APPROVE
+              value: "<autoApprove>"
+            - name: WITNESS_URLS
+              value: "<witness URLs, comma separated>"
+            - name: NONCE_MAX_PER_WINDOW
+              value: "<nonces.maxPerWindow>"
+            - name: NONCE_WINDOW_SECS
+              value: "<nonces.windowSecs>"
+            - name: NONCE_MAX_OUTSTANDING
+              value: "<nonces.maxOutstanding>"
+            # Only with the chart PostgreSQL. Omit this entry and use the external URL when database.externalUrl is set.
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: <database-secret>
+                  key: <postgres-secret-key>
+            - name: DATABASE_URL
+              value: "<database URL, as the Deployment sets it>"
+            # Add the SIEM entries and MANIFEST_PATH, with their volumes, when the release sets them.
+```
+
+Then run these commands. The Job reaches `Complete` only when its container exits 0:
 
 ```sh
 kubectl scale deployment/pact-gateway --replicas=0
 kubectl wait --for=delete pod -l app=pact-gateway --timeout=10m
-# One-off pod with the Deployment's environment (DATABASE_URL and the KEK Secret).
-# Copy that environment from: kubectl get deployment pact-gateway -o yaml
-kubectl run pact-migrate --rm -i --restart=Never --image=registry.example.com/open-pact-gateway:<new-tag> -- open-pact-gateway status --json
-helm upgrade --install pact deploy/helm/open-pact -f gateway-values.yaml --set image.tag=<new-tag>
+kubectl apply -f migrate-job.yaml
+kubectl wait --for=condition=complete job/<release>-migrate --timeout=10m
+kubectl logs job/<release>-migrate
+helm upgrade --install <release> deploy/helm/open-pact -f gateway-values.yaml --set image.tag=<new-tag>
 ```
 
-To go back to the gateway from before 0013, stop every gateway and every command that migrates first. Then run the rollback block, then start the earlier image.
+With `backoffLimit: 0`, a failed Job does not retry, and it never reaches `Complete`, so the wait times out. Read the logs, and do not run `helm upgrade`. Run `kubectl delete job/<release>-migrate` before you run this block again, because `kubectl apply` cannot replace a Job that exists.
 
-```sh
-kubectl scale deployment/pact-gateway --replicas=0
-kubectl wait --for=delete pod -l app=pact-gateway --timeout=10m
-```
+To go back to the gateway from before 0013, run these steps in order. Each new-image CLI command, such as `status`, `devices list` or `log entries`, and the migration Job migrate the database when they run. A step out of order lets one of them apply 0013 again after the rollback.
 
-Pause anything that can recreate a pod or run a new-image gateway command, such as a CI deploy, a GitOps sync or a CronJob. Each new-image CLI command, such as `status`, `devices list` or `log entries`, migrates the database when it runs. It applies 0013 again after the rollback.
+1. Pause the GitOps sync, each CI deploy, and each CronJob that can recreate a gateway pod or run a new-image gateway command. Keep them paused until step 6.
+2. Scale the gateway to zero and wait for its pod to stop:
 
-Run this block against the gateway database with `psql`. It runs in one transaction, so a failure changes nothing:
+   ```sh
+   kubectl scale deployment/pact-gateway --replicas=0
+   kubectl wait --for=delete pod -l app=pact-gateway --timeout=10m
+   ```
 
-```sql
-BEGIN;
-DROP INDEX log_entries_commitment;
-DROP INDEX log_entries_manifest;
-DELETE FROM _sqlx_migrations WHERE version = 13;
-COMMIT;
-```
+3. Check that no gateway pod and no active migration Job remain:
 
-Then deploy the earlier image and keep it selected. The chart's default tag is `latest`, so set the tag in the values file:
+   ```sh
+   kubectl get pods -l app=pact-gateway
+   kubectl get jobs
+   ```
 
-```sh
-helm upgrade --install pact deploy/helm/open-pact -f gateway-values.yaml --set image.tag=<earlier-tag>
-```
+   The first command prints no pod. The second prints no `<release>-migrate` Job that is still active.
 
-The earlier gateway refuses a database that has version 13 applied, so run it only after the block. Keep `<earlier-tag>` in the values file until a planned upgrade. An upgrade that picks up the new image applies 0013 again.
+4. Run this block against the gateway database with `psql`. It runs in one transaction, so a failure changes nothing:
+
+   ```sql
+   BEGIN;
+   DROP INDEX log_entries_commitment;
+   DROP INDEX log_entries_manifest;
+   DELETE FROM _sqlx_migrations WHERE version = 13;
+   COMMIT;
+   ```
+
+5. Deploy the earlier image and keep it selected. The chart default tag is `latest`, so set the tag in the values file:
+
+   ```sh
+   helm upgrade --install <release> deploy/helm/open-pact -f gateway-values.yaml --set image.tag=<earlier-tag>
+   ```
+
+   The earlier gateway refuses a database that has version 13 applied, so run step 5 only after step 4. Keep `<earlier-tag>` in the values file until a planned upgrade. An upgrade that picks up the new image applies 0013 again.
+
+6. Keep the GitOps sync paused until its desired state selects `<earlier-tag>`. Then resume it.
 
 ## Nonce durability and database connections
 
