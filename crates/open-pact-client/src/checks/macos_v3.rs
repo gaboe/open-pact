@@ -1,7 +1,9 @@
 use std::fs;
+use std::time::Duration;
 
 use open_pact_core::ControlValue;
 use serde::Deserialize;
+use serde_json::Value;
 use time::OffsetDateTime;
 
 use super::common::{bounded_age, parse_groups};
@@ -348,6 +350,136 @@ fn parse_signature_age(
     )
 }
 
+/// The unified log keeps XProtect Remediator events for a few days, fewer on a busy Mac. Each
+/// Remediator plugin writes one event per run. The predicate selects only those events.
+const XPROTECT_LOG_PREDICATE: &str =
+    r#"subsystem == "com.apple.XProtectFramework.PluginAPI" AND category == "XPEvent.structured""#;
+const REMEDIATOR_PREFIX: &str =
+    "/Library/Apple/System/Library/CoreServices/XProtect.app/Contents/MacOS/XProtectRemediator";
+const LOG: &str = "/usr/bin/log";
+const LOG_TIMEOUT: Duration = Duration::from_secs(10);
+
+struct RemediatorEvent {
+    /// None when the timestamp does not parse.
+    time: Option<OffsetDateTime>,
+    /// None when the event message is not JSON with a string `status_message`.
+    status: Option<String>,
+}
+
+/// The Remediator events of the last 7 days. None when `log show` fails, times out, or ends early.
+fn remediator_events() -> Option<Vec<RemediatorEvent>> {
+    let ran = super::exec::run_status_with_timeout(
+        LOG,
+        &[
+            "show",
+            "--style",
+            "ndjson",
+            "--last",
+            "7d",
+            "--predicate",
+            XPROTECT_LOG_PREDICATE,
+        ],
+        LOG_TIMEOUT,
+    )?;
+    if !ran.success {
+        return None;
+    }
+    parse_remediator_events(&ran.text)
+}
+
+/// Parses `log show --style ndjson` output. None without the `{"count":N,"finished":1}` trailer,
+/// because only a complete read shows that no event is missing.
+fn parse_remediator_events(text: &str) -> Option<Vec<RemediatorEvent>> {
+    let mut finished = false;
+    let mut events = Vec::new();
+    for line in text.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if value.get("finished").and_then(Value::as_i64) == Some(1) {
+            finished = true;
+            continue;
+        }
+        let from_remediator = value
+            .get("processImagePath")
+            .and_then(Value::as_str)
+            .is_some_and(|path| path.starts_with(REMEDIATOR_PREFIX));
+        if !from_remediator {
+            continue;
+        }
+        let status = value
+            .get("eventMessage")
+            .and_then(Value::as_str)
+            .and_then(|message| serde_json::from_str::<Value>(message).ok())
+            .and_then(|message| message.get("status_message")?.as_str().map(str::to_owned));
+        let time = value
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(parse_log_time);
+        events.push(RemediatorEvent { time, status });
+    }
+    finished.then_some(events)
+}
+
+/// Reads `2026-11-22 19:43:04.306145+0100`, the local time with its offset, as RFC 3339.
+fn parse_log_time(text: &str) -> Option<OffsetDateTime> {
+    let split = text.len().checked_sub(5)?;
+    let (head, offset) = (text.get(..split)?, text.get(split..)?);
+    let (sign, digits) = (offset.get(..1)?, offset.get(1..)?);
+    if !matches!(sign, "+" | "-") || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let (date, clock) = head.split_once(' ')?;
+    let iso = format!("{date}T{clock}{sign}{}:{}", &digits[..2], &digits[2..]);
+    open_pact_core::timestamp::parse_rfc3339(&iso)
+}
+
+/// 0 when there is at least one event and every event is clean. A canceled run is clean, because it
+/// found nothing. Any other status, and an empty log, read unknown.
+fn threats_value(events: &[RemediatorEvent]) -> ControlValue {
+    let clean = |status: Option<&str>| {
+        matches!(
+            status,
+            Some("Success" | "NoThreatDetected" | "PluginCanceled")
+        )
+    };
+    if !events.is_empty() && events.iter().all(|event| clean(event.status.as_deref())) {
+        0.into()
+    } else {
+        "unknown".into()
+    }
+}
+
+/// Whole days since the newest Remediator run that was not canceled. Any such run without a
+/// readable time, a future time, or no such run reads unknown.
+fn scan_age_value(events: &[RemediatorEvent], now: OffsetDateTime) -> ControlValue {
+    let mut newest = None;
+    for event in events
+        .iter()
+        .filter(|event| event.status.as_deref() != Some("PluginCanceled"))
+    {
+        let Some(time) = event.time else {
+            return "unknown".into();
+        };
+        newest = newest.max(Some(time));
+    }
+    match newest {
+        Some(time) if time <= now => bounded_age((now - time).whole_days(), 3650),
+        _ => "unknown".into(),
+    }
+}
+
+pub fn antimalware_active_threats() -> ControlValue {
+    remediator_events().map_or_else(|| "unknown".into(), |events| threats_value(&events))
+}
+
+pub fn antimalware_full_scan_age_days() -> ControlValue {
+    remediator_events().map_or_else(
+        || "unknown".into(),
+        |events| scan_age_value(&events, OffsetDateTime::now_utc()),
+    )
+}
+
 pub fn web_protection() -> ControlValue {
     super::browsers::macos().into()
 }
@@ -613,5 +745,125 @@ mod timestamp_pins {
             ControlValue::Integer(0)
         );
         assert_eq!(signature_age("2026-10-19 23:59:00 UTC"), "unknown");
+    }
+}
+
+#[cfg(test)]
+mod xprotect_log {
+    use super::*;
+
+    const SNOW: &str = "/Library/Apple/System/Library/CoreServices/XProtect.app/Contents/MacOS/XProtectRemediatorSnowBeagle";
+    const TRAILER: &str = r#"{"count":3,"finished":1}"#;
+
+    fn event(time: &str, status: &str, process: &str) -> String {
+        format!(
+            r#"{{"processImagePath":"{process}","timestamp":"{time}","eventMessage":"{{\"status_message\":\"{status}\",\"status_code\":20,\"execution_duration\":8.3e-05,\"caused_by\":[]}}"}}"#
+        )
+    }
+
+    fn lines(events: &[String]) -> String {
+        let mut all = events.to_vec();
+        all.push(TRAILER.to_owned());
+        all.join("\n")
+    }
+
+    fn now() -> OffsetDateTime {
+        open_pact_core::timestamp::parse_rfc3339("2026-11-23T14:00:00+01:00").unwrap()
+    }
+
+    #[test]
+    fn clean_runs_read_zero_threats_and_a_fresh_scan() {
+        let text = lines(&[
+            event("2026-11-22 19:43:04.306145+0100", "NoThreatDetected", SNOW),
+            event("2026-11-23 02:21:43.239896+0100", "Success", SNOW),
+            event("2026-11-23 02:21:44.000001+0100", "PluginCanceled", SNOW),
+        ]);
+        let events = parse_remediator_events(&text).unwrap();
+        assert_eq!(threats_value(&events), ControlValue::Integer(0));
+        assert_eq!(scan_age_value(&events, now()), ControlValue::Integer(0));
+    }
+
+    #[test]
+    fn only_canceled_runs_are_clean_but_have_no_scan() {
+        let text = lines(&[event(
+            "2026-11-23 02:21:43.239896+0100",
+            "PluginCanceled",
+            SNOW,
+        )]);
+        let events = parse_remediator_events(&text).unwrap();
+        assert_eq!(threats_value(&events), ControlValue::Integer(0));
+        assert_eq!(scan_age_value(&events, now()), "unknown");
+    }
+
+    #[test]
+    fn a_status_that_is_not_clean_reads_unknown() {
+        let text = lines(&[
+            event("2026-11-23 02:21:43.239896+0100", "NoThreatDetected", SNOW),
+            event("2026-11-23 02:22:43.239896+0100", "ThreatDetected", SNOW),
+        ]);
+        let events = parse_remediator_events(&text).unwrap();
+        assert_eq!(threats_value(&events), "unknown");
+    }
+
+    #[test]
+    fn other_processes_are_ignored() {
+        let text = lines(&[
+            event("2026-11-23 02:21:43.239896+0100", "NoThreatDetected", SNOW),
+            event(
+                "2026-11-23 02:22:43.239896+0100",
+                "ThreatDetected",
+                "/usr/libexec/other",
+            ),
+        ]);
+        let events = parse_remediator_events(&text).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(threats_value(&events), ControlValue::Integer(0));
+    }
+
+    #[test]
+    fn an_empty_log_reads_unknown() {
+        let events = parse_remediator_events(TRAILER).unwrap();
+        assert_eq!(threats_value(&events), "unknown");
+        assert_eq!(scan_age_value(&events, now()), "unknown");
+    }
+
+    #[test]
+    fn a_read_without_the_trailer_is_incomplete() {
+        let text = event("2026-11-23 02:21:43.239896+0100", "NoThreatDetected", SNOW);
+        assert!(parse_remediator_events(&text).is_none());
+        assert!(parse_remediator_events("").is_none());
+    }
+
+    #[test]
+    fn scan_age_counts_whole_days_from_the_newest_run() {
+        let text = lines(&[event(
+            "2026-11-20 13:00:00.000000+0100",
+            "NoThreatDetected",
+            SNOW,
+        )]);
+        let events = parse_remediator_events(&text).unwrap();
+        // Three days and one hour before now.
+        assert_eq!(scan_age_value(&events, now()), ControlValue::Integer(3));
+    }
+
+    #[test]
+    fn a_future_run_reads_unknown() {
+        let text = lines(&[event(
+            "2026-11-24 13:00:00.000000+0100",
+            "NoThreatDetected",
+            SNOW,
+        )]);
+        let events = parse_remediator_events(&text).unwrap();
+        assert_eq!(scan_age_value(&events, now()), "unknown");
+    }
+
+    #[test]
+    fn log_times_keep_their_fraction_and_offset() {
+        assert_eq!(
+            parse_log_time("2026-11-22 19:43:04.306145+0100"),
+            open_pact_core::timestamp::parse_rfc3339("2026-11-22T19:43:04.306145+01:00")
+        );
+        assert_eq!(parse_log_time("not a time"), None);
+        assert_eq!(parse_log_time("2026-11-22 19:43:04.306145+01xx"), None);
     }
 }

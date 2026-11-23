@@ -61,9 +61,10 @@ pub(crate) fn event_markers() -> EventMarkerReads {
     }
 }
 
-/// `screen_lock@2` reports whole minutes. `screen_lock@1` keeps its buckets.
-fn screen_lock_version(input: &CheckInput<'_>) -> u32 {
-    if input.control.check == "builtin:screen_lock@2" {
+/// The version that the control asks for: 2 for `builtin:<id>@2`, else 1. `screen_lock@2` reports
+/// whole minutes, and `screen_lock@1` keeps its buckets.
+fn check_version(input: &CheckInput<'_>, id: &str) -> u32 {
+    if input.control.check == format!("builtin:{id}@2") {
         2
     } else {
         1
@@ -123,10 +124,12 @@ const MACOS: Registry = &[
         "antimalware_realtime",
         ignore_input!(macos_v3::antimalware_realtime),
     ),
-    (
-        "antimalware_active_threats",
-        ignore_input!(common::not_applicable),
-    ),
+    ("antimalware_active_threats", |input| {
+        match check_version(input, "antimalware_active_threats") {
+            2 => macos_v3::antimalware_active_threats(),
+            _ => common::not_applicable(),
+        }
+    }),
     ("work_account", ignore_input!(macos_v3::work_account)),
     ("uptime_days", ignore_input!(macos_v3::uptime_days)),
     (
@@ -134,9 +137,11 @@ const MACOS: Registry = &[
         ignore_input!(|| macos::disk_encryption().into()),
     ),
     ("firewall", ignore_input!(|| macos::firewall().into())),
-    ("screen_lock", |input| match screen_lock_version(input) {
-        2 => macos::screen_lock_minutes(),
-        _ => macos::screen_lock().into(),
+    ("screen_lock", |input| {
+        match check_version(input, "screen_lock") {
+            2 => macos::screen_lock_minutes(),
+            _ => macos::screen_lock().into(),
+        }
     }),
     (
         "os_supported",
@@ -157,7 +162,10 @@ const MACOS: Registry = &[
     ),
     (
         "antimalware_full_scan_age_days",
-        ignore_input!(common::not_applicable),
+        |input| match check_version(input, "antimalware_full_scan_age_days") {
+            2 => macos_v3::antimalware_full_scan_age_days(),
+            _ => common::not_applicable(),
+        },
     ),
     ("web_protection", ignore_input!(macos_v3::web_protection)),
     (
@@ -195,9 +203,11 @@ const LINUX: Registry = &[
         ignore_input!(|| linux::disk_encryption().into()),
     ),
     ("firewall", ignore_input!(|| linux::firewall().into())),
-    ("screen_lock", |input| match screen_lock_version(input) {
-        2 => linux::screen_lock_minutes(),
-        _ => linux::screen_lock().into(),
+    ("screen_lock", |input| {
+        match check_version(input, "screen_lock") {
+            2 => linux::screen_lock_minutes(),
+            _ => linux::screen_lock().into(),
+        }
     }),
     (
         "os_supported",
@@ -256,9 +266,11 @@ const WINDOWS: Registry = &[
     ("uptime_days", ignore_input!(windows::uptime_days)),
     ("disk_encryption", ignore_input!(windows::disk_encryption)),
     ("firewall", ignore_input!(windows::firewall)),
-    ("screen_lock", |input| match screen_lock_version(input) {
-        2 => windows::screen_lock_minutes(),
-        _ => windows::screen_lock(),
+    ("screen_lock", |input| {
+        match check_version(input, "screen_lock") {
+            2 => windows::screen_lock_minutes(),
+            _ => windows::screen_lock(),
+        }
     }),
     ("os_supported", ignore_input!(windows::os_supported)),
     (
@@ -600,13 +612,43 @@ mod tests {
             assert!(value.contains_key("screen_lock"), "{os}");
         }
         assert_eq!(
-            screen_lock_version(&CheckInput {
-                control,
-                device_config: None,
-                repo_scan: None
-            }),
+            check_version(
+                &CheckInput {
+                    control,
+                    device_config: None,
+                    repo_scan: None
+                },
+                "screen_lock"
+            ),
             2
         );
+    }
+
+    #[test]
+    fn antimalware_later_versions_read_on_macos_and_keep_version_one() {
+        let manifest =
+            Manifest::parse(include_bytes!("../../../../examples/manifest.toml")).unwrap();
+        for id in [
+            "antimalware_active_threats",
+            "antimalware_full_scan_age_days",
+        ] {
+            let mut later = manifest.body().control(id).unwrap().clone();
+            later.check = format!("builtin:{id}@2");
+            let first = manifest.body().control(id).unwrap().clone();
+            // Version 1 stays not applicable on macOS, and version 2 reads the Remediator log.
+            let v1 = run(Os::Macos, std::slice::from_ref(&first), None, None);
+            assert_eq!(v1[id], "n/a", "{id}");
+            let v2 = run(Os::Macos, std::slice::from_ref(&later), None, None);
+            assert_ne!(v2[id], "n/a", "{id}");
+            // Off macOS both versions run the same check.
+            for os in [Os::Linux, Os::Windows] {
+                assert_eq!(
+                    run(os, std::slice::from_ref(&first), None, None),
+                    run(os, std::slice::from_ref(&later), None, None),
+                    "{id} {os}"
+                );
+            }
+        }
     }
 
     #[test]

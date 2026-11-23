@@ -746,7 +746,7 @@ const INTEGER_MAX: &str = "{ integer = { min = 0, max = 2147483647 } }";
 /// minutes that fits an i32.
 const LOCK_MINUTES: &str = r#"{ integer = { min = 0, max = 2147483647 }, values = ["none"] }"#;
 
-pub const BUILTINS: [Builtin; 27] = [
+pub const BUILTINS: [Builtin; 29] = [
     Builtin {
         id: "disk_encryption",
         version: 1,
@@ -869,12 +869,34 @@ pub const BUILTINS: [Builtin; 27] = [
         group: Group::MalwareAndNetwork,
     },
     Builtin {
+        id: "antimalware_full_scan_age_days",
+        version: 2,
+        name: "Full scan age",
+        line: "How long ago the last full scan ran",
+        scope: "macOS and Windows",
+        output: INTEGER_3650,
+        max: true,
+        noun: "last full scan",
+        group: Group::MalwareAndNetwork,
+    },
+    Builtin {
         id: "antimalware_active_threats",
         version: 1,
         name: "Active threats",
         line: "Threats the antimalware program has not cleaned",
         scope: "Windows",
         output: r#"{ integer = { min = 0, max = 2147483647 }, values = ["n/a"] }"#,
+        max: true,
+        noun: "active threats",
+        group: Group::MalwareAndNetwork,
+    },
+    Builtin {
+        id: "antimalware_active_threats",
+        version: 2,
+        name: "Active threats",
+        line: "Threats the antimalware program has not cleaned",
+        scope: "macOS and Windows",
+        output: INTEGER_MAX,
         max: true,
         noun: "active threats",
         group: Group::MalwareAndNetwork,

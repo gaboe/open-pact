@@ -66,6 +66,15 @@ const BUILTIN_ABOUT: &[(&str, u32, &str)] = &[
             reports unknown, because the client has no threat list to read there.",
     ),
     (
+        "antimalware_active_threats",
+        2,
+        "A threat that the antimalware program found and did not remove is still \
+            a risk. On macOS the client reads the XProtect Remediator events of the \
+            last 7 days in the unified log. It reports 0 when every event is a clean \
+            result, and unknown when an event is not clean or the log has no event. \
+            On Windows and Linux the result is the same as version 1.",
+    ),
+    (
         "work_account",
         1,
         "A work account with administrator rights lets malware change the system. \
@@ -208,6 +217,15 @@ const BUILTIN_ABOUT: &[(&str, u32, &str)] = &[
             has no scan history to read there.",
     ),
     (
+        "antimalware_full_scan_age_days",
+        2,
+        "A full scan can find malware that real-time protection missed. On macOS \
+            the client reports the whole days since the newest XProtect Remediator \
+            run in the unified log that was not only canceled. That run is not a \
+            full-device scan. The log keeps these events for a short time, so an old \
+            run reads unknown. On Windows and Linux the result is the same as version 1.",
+    ),
+    (
         "web_protection",
         1,
         "A browser that does not block known bad sites lets phishing and malware \
@@ -304,7 +322,11 @@ pub fn builtin_about(check: &str) -> Option<&'static str> {
 
 /// Later versions of a builtin. The registry runs one check per id and picks the version from the
 /// control's `check`.
-pub const LATER_VERSIONS: &[(&str, u32)] = &[("screen_lock", 2)];
+pub const LATER_VERSIONS: &[(&str, u32)] = &[
+    ("screen_lock", 2),
+    ("antimalware_active_threats", 2),
+    ("antimalware_full_scan_age_days", 2),
+];
 
 fn implements(control: &Control) -> bool {
     BUILTINS
