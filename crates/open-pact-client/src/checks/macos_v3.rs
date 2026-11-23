@@ -360,15 +360,37 @@ const LOG: &str = "/usr/bin/log";
 const LOG_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct RemediatorEvent {
-    /// None when the timestamp does not parse.
-    time: Option<OffsetDateTime>,
-    /// None when the event message is not JSON with a string `status_message`.
-    status: Option<String>,
+    time: OffsetDateTime,
+    status: String,
 }
 
-/// The Remediator events of the last 7 days. None when `log show` fails, times out, or ends early.
+/// The most stdout that one `log show` read may produce. A seven day read is about 40 KB, so a
+/// larger stream is not the Remediator log that this check expects.
+const LOG_MAX_STDOUT: usize = 16 << 20;
+
+#[cfg(test)]
+thread_local! {
+    /// The stdout that stands in for `log show` in a test that runs the registered check.
+    static LOG_FIXTURE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `check` with `text` as the stdout of `log show`, in place of the real command.
+#[cfg(test)]
+pub(super) fn with_log_fixture<T>(text: &str, check: impl FnOnce() -> T) -> T {
+    LOG_FIXTURE.with(|fixture| *fixture.borrow_mut() = Some(text.to_owned()));
+    let value = check();
+    LOG_FIXTURE.with(|fixture| *fixture.borrow_mut() = None);
+    value
+}
+
+/// The Remediator events of the last 7 days. None when `log show` fails, times out, prints too
+/// much, or does not end with a complete stream.
 fn remediator_events() -> Option<Vec<RemediatorEvent>> {
-    let ran = super::exec::run_status_with_timeout(
+    #[cfg(test)]
+    if let Some(text) = LOG_FIXTURE.with(|fixture| fixture.borrow().clone()) {
+        return parse_remediator_events(&text);
+    }
+    let ran = super::exec::run_stdout_with_limit(
         LOG,
         &[
             "show",
@@ -380,6 +402,7 @@ fn remediator_events() -> Option<Vec<RemediatorEvent>> {
             XPROTECT_LOG_PREDICATE,
         ],
         LOG_TIMEOUT,
+        LOG_MAX_STDOUT,
     )?;
     if !ran.success {
         return None;
@@ -387,38 +410,42 @@ fn remediator_events() -> Option<Vec<RemediatorEvent>> {
     parse_remediator_events(&ran.text)
 }
 
-/// Parses `log show --style ndjson` output. None without the `{"count":N,"finished":1}` trailer,
-/// because only a complete read shows that no event is missing.
+/// Parses the stdout of `log show --style ndjson`: one record per line, then the trailer
+/// `{"count":N,"finished":1}`, where N is the number of records. None unless the last line is that
+/// trailer with the right count, because only a complete stream shows that no record is missing.
+/// None when any record cannot be read: a line that is not JSON, a record without a string
+/// `processImagePath`, or a Remediator event whose status or time does not parse. A record of
+/// another process with a string path is skipped.
 fn parse_remediator_events(text: &str) -> Option<Vec<RemediatorEvent>> {
-    let mut finished = false;
+    let mut lines = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    let trailer = serde_json::from_str::<Value>(lines.pop()?).ok()?;
+    if trailer.get("finished").and_then(Value::as_i64) != Some(1)
+        || trailer.get("count").and_then(Value::as_u64) != Some(lines.len() as u64)
+    {
+        return None;
+    }
     let mut events = Vec::new();
-    for line in text.lines() {
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        if value.get("finished").and_then(Value::as_i64) == Some(1) {
-            finished = true;
-            continue;
-        }
-        let from_remediator = value
-            .get("processImagePath")
-            .and_then(Value::as_str)
-            .is_some_and(|path| path.starts_with(REMEDIATOR_PREFIX));
-        if !from_remediator {
+    for line in lines {
+        let value = serde_json::from_str::<Value>(line).ok()?;
+        let path = value.get("processImagePath")?.as_str()?;
+        if !path.starts_with(REMEDIATOR_PREFIX) {
             continue;
         }
         let status = value
-            .get("eventMessage")
-            .and_then(Value::as_str)
-            .and_then(|message| serde_json::from_str::<Value>(message).ok())
-            .and_then(|message| message.get("status_message")?.as_str().map(str::to_owned));
-        let time = value
-            .get("timestamp")
-            .and_then(Value::as_str)
-            .and_then(parse_log_time);
+            .get("eventMessage")?
+            .as_str()
+            .and_then(|message| serde_json::from_str::<Value>(message).ok())?
+            .get("status_message")?
+            .as_str()?
+            .to_owned();
+        let time = parse_log_time(value.get("timestamp")?.as_str()?)?;
         events.push(RemediatorEvent { time, status });
     }
-    finished.then_some(events)
+    Some(events)
 }
 
 /// Reads `2026-11-22 19:43:04.306145+0100`, the local time with its offset, as RFC 3339.
@@ -437,31 +464,26 @@ fn parse_log_time(text: &str) -> Option<OffsetDateTime> {
 /// 0 when there is at least one event and every event is clean. A canceled run is clean, because it
 /// found nothing. Any other status, and an empty log, read unknown.
 fn threats_value(events: &[RemediatorEvent]) -> ControlValue {
-    let clean = |status: Option<&str>| {
-        matches!(
-            status,
-            Some("Success" | "NoThreatDetected" | "PluginCanceled")
-        )
-    };
-    if !events.is_empty() && events.iter().all(|event| clean(event.status.as_deref())) {
+    let clean = |status: &str| matches!(status, "Success" | "NoThreatDetected" | "PluginCanceled");
+    if !events.is_empty() && events.iter().all(|event| clean(&event.status)) {
         0.into()
     } else {
         "unknown".into()
     }
 }
 
-/// Whole days since the newest Remediator run that was not canceled. Any such run without a
-/// readable time, a future time, or no such run reads unknown.
+/// Whole days since the newest Remediator run that was not canceled. A status that is not known
+/// to be a finished run, a future time, or no such run reads unknown.
 fn scan_age_value(events: &[RemediatorEvent], now: OffsetDateTime) -> ControlValue {
     let mut newest = None;
-    for event in events
-        .iter()
-        .filter(|event| event.status.as_deref() != Some("PluginCanceled"))
-    {
-        let Some(time) = event.time else {
-            return "unknown".into();
-        };
-        newest = newest.max(Some(time));
+    for event in events {
+        match event.status.as_str() {
+            "PluginCanceled" => {}
+            "Success" | "NoThreatDetected" | "ThreatDetected" => {
+                newest = newest.max(Some(event.time));
+            }
+            _ => return "unknown".into(),
+        }
     }
     match newest {
         Some(time) if time <= now => bounded_age((now - time).whole_days(), 3650),
@@ -753,22 +775,44 @@ mod xprotect_log {
     use super::*;
 
     const SNOW: &str = "/Library/Apple/System/Library/CoreServices/XProtect.app/Contents/MacOS/XProtectRemediatorSnowBeagle";
-    const TRAILER: &str = r#"{"count":3,"finished":1}"#;
+    const TIME: &str = "2026-11-23 02:21:43.239896+0100";
 
     fn event(time: &str, status: &str, process: &str) -> String {
-        format!(
-            r#"{{"processImagePath":"{process}","timestamp":"{time}","eventMessage":"{{\"status_message\":\"{status}\",\"status_code\":20,\"execution_duration\":8.3e-05,\"caused_by\":[]}}"}}"#
+        message_event(
+            time,
+            &format!(
+                r#"{{\"status_message\":\"{status}\",\"status_code\":20,\"execution_duration\":8.3e-05,\"caused_by\":[]}}"#
+            ),
+            process,
         )
     }
 
-    fn lines(events: &[String]) -> String {
-        let mut all = events.to_vec();
-        all.push(TRAILER.to_owned());
+    fn message_event(time: &str, message: &str, process: &str) -> String {
+        format!(
+            r#"{{"processImagePath":"{process}","timestamp":"{time}","eventMessage":"{message}"}}"#
+        )
+    }
+
+    /// The lines of a complete read: the records, then the trailer that counts them.
+    fn lines(records: &[String]) -> String {
+        let mut all = records.to_vec();
+        all.push(format!(r#"{{"count":{},"finished":1}}"#, records.len()));
         all.join("\n")
     }
 
     fn now() -> OffsetDateTime {
         open_pact_core::timestamp::parse_rfc3339("2026-11-23T14:00:00+01:00").unwrap()
+    }
+
+    fn both(text: &str) -> (ControlValue, ControlValue) {
+        match parse_remediator_events(text) {
+            Some(events) => (threats_value(&events), scan_age_value(&events, now())),
+            None => ("unknown".into(), "unknown".into()),
+        }
+    }
+
+    fn assert_both_unknown(text: &str) {
+        assert_eq!(both(text), ("unknown".into(), "unknown".into()), "{text}");
     }
 
     #[test]
@@ -785,11 +829,7 @@ mod xprotect_log {
 
     #[test]
     fn only_canceled_runs_are_clean_but_have_no_scan() {
-        let text = lines(&[event(
-            "2026-11-23 02:21:43.239896+0100",
-            "PluginCanceled",
-            SNOW,
-        )]);
+        let text = lines(&[event(TIME, "PluginCanceled", SNOW)]);
         let events = parse_remediator_events(&text).unwrap();
         assert_eq!(threats_value(&events), ControlValue::Integer(0));
         assert_eq!(scan_age_value(&events, now()), "unknown");
@@ -798,7 +838,7 @@ mod xprotect_log {
     #[test]
     fn a_status_that_is_not_clean_reads_unknown() {
         let text = lines(&[
-            event("2026-11-23 02:21:43.239896+0100", "NoThreatDetected", SNOW),
+            event(TIME, "NoThreatDetected", SNOW),
             event("2026-11-23 02:22:43.239896+0100", "ThreatDetected", SNOW),
         ]);
         let events = parse_remediator_events(&text).unwrap();
@@ -806,9 +846,9 @@ mod xprotect_log {
     }
 
     #[test]
-    fn other_processes_are_ignored() {
+    fn a_string_path_of_another_process_is_ignored() {
         let text = lines(&[
-            event("2026-11-23 02:21:43.239896+0100", "NoThreatDetected", SNOW),
+            event(TIME, "NoThreatDetected", SNOW),
             event(
                 "2026-11-23 02:22:43.239896+0100",
                 "ThreatDetected",
@@ -821,17 +861,103 @@ mod xprotect_log {
     }
 
     #[test]
+    fn a_record_of_another_process_with_no_readable_message_is_ignored() {
+        let text = lines(&[
+            event(TIME, "NoThreatDetected", SNOW),
+            message_event("not a time", "<private>", "/usr/libexec/other"),
+        ]);
+        assert_eq!(both(&text).0, ControlValue::Integer(0));
+    }
+
+    #[test]
     fn an_empty_log_reads_unknown() {
-        let events = parse_remediator_events(TRAILER).unwrap();
+        let events = parse_remediator_events(&lines(&[])).unwrap();
+        assert!(events.is_empty());
         assert_eq!(threats_value(&events), "unknown");
         assert_eq!(scan_age_value(&events, now()), "unknown");
     }
 
     #[test]
-    fn a_read_without_the_trailer_is_incomplete() {
-        let text = event("2026-11-23 02:21:43.239896+0100", "NoThreatDetected", SNOW);
-        assert!(parse_remediator_events(&text).is_none());
+    fn a_malformed_line_makes_both_unknown() {
+        let clean = event(TIME, "NoThreatDetected", SNOW);
+        let truncated = &clean[..clean.len() / 2];
+        assert_both_unknown(&format!(
+            "{clean}\n{truncated}\n{{\"count\":2,\"finished\":1}}"
+        ));
+        assert_both_unknown(&format!(
+            "{clean}\nnot json\n{{\"count\":2,\"finished\":1}}"
+        ));
+    }
+
+    #[test]
+    fn a_record_without_a_string_path_makes_both_unknown() {
+        let clean = event(TIME, "NoThreatDetected", SNOW);
+        for other in [
+            r#"{"processImagePath":null,"timestamp":"2026-11-23 02:21:43.239896+0100"}"#,
+            r#"{"processImagePath":7,"timestamp":"2026-11-23 02:21:43.239896+0100"}"#,
+            r#"{"timestamp":"2026-11-23 02:21:43.239896+0100"}"#,
+            "[]",
+        ] {
+            assert_both_unknown(&format!("{clean}\n{other}\n{{\"count\":2,\"finished\":1}}"));
+        }
+    }
+
+    #[test]
+    fn a_remediator_event_with_an_unparsed_status_makes_both_unknown() {
+        for message in [
+            "<private>",
+            r#"{\"status_message\":\"UnrecognizedStatus\"}"#,
+            r#"{\"status_message\":7}"#,
+            r#"{\"status_code\":20}"#,
+        ] {
+            assert_both_unknown(&lines(&[message_event(TIME, message, SNOW)]));
+        }
+        let no_message = format!(r#"{{"processImagePath":"{SNOW}","timestamp":"{TIME}"}}"#);
+        assert_both_unknown(&lines(&[no_message]));
+    }
+
+    #[test]
+    fn a_remediator_event_with_an_unparsed_time_makes_both_unknown() {
+        for time in ["bad", "2026-11-23 02:21:43.239896"] {
+            assert_both_unknown(&lines(&[event(time, "NoThreatDetected", SNOW)]));
+        }
+        let no_time = format!(
+            r#"{{"processImagePath":"{SNOW}","eventMessage":"{{\"status_message\":\"NoThreatDetected\"}}"}}"#
+        );
+        assert_both_unknown(&lines(&[no_time]));
+    }
+
+    #[test]
+    fn a_read_without_the_final_trailer_is_incomplete() {
+        let clean = event(TIME, "NoThreatDetected", SNOW);
+        assert!(parse_remediator_events(&clean).is_none());
         assert!(parse_remediator_events("").is_none());
+        assert!(parse_remediator_events("\n\n").is_none());
+        // A trailer that is not the last line does not complete the read.
+        assert_both_unknown(&format!("{{\"count\":1,\"finished\":1}}\n{clean}"));
+        assert_both_unknown(&format!("{clean}\n{{\"count\":1,\"finished\":1}}\n{clean}"));
+        // A trailer that says the read is not finished does not complete it.
+        assert_both_unknown(&format!("{clean}\n{{\"count\":1,\"finished\":0}}"));
+    }
+
+    #[test]
+    fn the_trailer_count_must_equal_the_records() {
+        let clean = event(TIME, "NoThreatDetected", SNOW);
+        for trailer in [
+            r#"{"count":2,"finished":1}"#,
+            r#"{"count":0,"finished":1}"#,
+            r#"{"finished":1}"#,
+            r#"{"count":"1","finished":1}"#,
+        ] {
+            assert_both_unknown(&format!("{clean}\n{trailer}"));
+        }
+        let ok = parse_remediator_events(&format!("{clean}\n{{\"count\":1,\"finished\":1}}\n\n"));
+        assert_eq!(both_of(ok).0, ControlValue::Integer(0));
+    }
+
+    fn both_of(events: Option<Vec<RemediatorEvent>>) -> (ControlValue, ControlValue) {
+        let events = events.unwrap();
+        (threats_value(&events), scan_age_value(&events, now()))
     }
 
     #[test]
