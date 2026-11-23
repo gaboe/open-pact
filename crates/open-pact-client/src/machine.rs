@@ -372,7 +372,7 @@ fn validate_user_home_in(path: &Path, profiles: Option<&ProfileList>) -> Result<
 /// The profile that a SYSTEM job reads when no `--user-home` names one: the `ProfileImagePath` of
 /// the SID of the token of this process. `USERPROFILE` is the caller's own word, and a standard
 /// user can point it at the profile of another account, so it is never the source on Windows.
-pub(crate) fn default_user_home() -> Option<PathBuf> {
+pub fn default_user_home() -> Option<PathBuf> {
     match registered_profiles() {
         Ok(Some(list)) => list.own_profile(),
         Ok(None) => crate::user_profile(),

@@ -250,16 +250,14 @@ pub fn find_other_copies(runner: &Runner, installed: &Path, bundled: &Path) -> V
             roots.push(std::fs::canonicalize(&prefix).unwrap_or(prefix));
         }
     }
-    let mut found = ownership::other_copies(
+    let machine = open_pact_client::machine::machine_executable().ok();
+    ownership::other_copies(
         tool_path(),
         client::cli_name(),
         &[installed.to_path_buf(), bundled.to_path_buf()],
         &roots,
-    );
-    if let Ok(machine) = open_pact_client::machine::machine_executable() {
-        ownership::mark_machine_client(&mut found, &machine);
-    }
-    found
+        machine.as_deref(),
+    )
 }
 
 /// Runs the removal command of `copy` and gives what it printed. Only the user's click calls it.
@@ -288,7 +286,7 @@ pub fn install_system_job(runner: &Runner, log: &OperationLog, home: &Path) -> R
     let result = open_pact_client::machine::machine_executable()
         .map_err(|error| format!("{error:#}"))
         .and_then(|machine| {
-            let profile = system_profile(std::env::var_os("USERPROFILE"))?;
+            let profile = system_profile(open_pact_client::machine::default_user_home())?;
             let call = ownership::elevated_system_schedule(&machine, home, &profile);
             runner
                 .with_timeout(Duration::from_secs(300))
@@ -318,15 +316,14 @@ pub fn restart_elevated(runner: &Runner, exe: &Path) -> Result<(), String> {
         })
 }
 
-/// The profile whose repositories the SYSTEM job scans: the one of the user who runs the app.
-fn system_profile(variable: Option<std::ffi::OsString>) -> Result<PathBuf, String> {
-    variable
-        .filter(|profile| !profile.is_empty())
-        .map(PathBuf::from)
-        .ok_or_else(|| {
-            "USERPROFILE is not set, so the SYSTEM job cannot know whose repositories it scans."
-                .to_owned()
-        })
+/// The profile whose repositories the SYSTEM job scans: the one of the user who runs the app, from
+/// the profile of the token's user in Windows, never from `USERPROFILE`, which a user can point at
+/// another account.
+fn system_profile(profile: Option<PathBuf>) -> Result<PathBuf, String> {
+    profile.filter(|profile| !profile.as_os_str().is_empty()).ok_or_else(|| {
+        "The profile of the user who runs this app was not found, so the SYSTEM job cannot know whose repositories it scans."
+            .to_owned()
+    })
 }
 
 /// The status of a device, and the two things the app does for the device it owns: it moves the
@@ -528,11 +525,11 @@ mod tests {
     #[test]
     fn the_system_profile_is_the_profile_of_the_app_user_and_never_a_guess() {
         assert_eq!(
-            system_profile(Some(r"C:\Users\Fictional".into())),
+            system_profile(Some(PathBuf::from(r"C:\Users\Fictional"))),
             Ok(PathBuf::from(r"C:\Users\Fictional"))
         );
         assert!(system_profile(None).is_err());
-        assert!(system_profile(Some("".into())).is_err());
+        assert!(system_profile(Some(PathBuf::new())).is_err());
     }
 
     /// An install of the command line tool continues the join of a device that is still open,
