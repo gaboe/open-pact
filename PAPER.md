@@ -420,7 +420,7 @@ check = "builtin:antimalware_active@1"   # Windows: Security Center; macOS: XPro
 # os_auto_updates, antimalware_realtime, antimalware_active_threats,
 # work_account, uptime_days, antimalware_full_scan_age_days, web_protection, log_oldest_record_days,
 # process_audit, remote_wipe, powershell_logging, log_cleared. See README for sources.
-# macOS reports n/a for active threat counts and full-scan age.
+# On macOS, @1 reports n/a for active threat counts and full-scan age; @2 reads XProtect Remediator events.
 output = ["yes", "no", "unknown"]
 required = { macos = "yes", windows = "yes" }   # omitted on Linux
 grace = "3d"
