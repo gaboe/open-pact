@@ -243,7 +243,7 @@ Set SIEM retention at least as short as `claim_retention`. `GATEWAY_SIEM_RETENTI
 
 Two switches show what the gateway does. Both are off in the binary. The Helm chart turns the slow-request log on at 1000 ms and leaves metrics off.
 
-**Slow-request log.** Set `SLOW_REQUEST_MS` (Helm `gateway.slowRequestMs`) to a number of milliseconds. A request that takes longer writes one line to stderr, for example `slow_request route=/v1/claim method=POST status=2xx ms=1234`. At most one line goes out a second. The next line ends with `suppressed=N`, the count of slow requests left out. `0` or unset turns the log off. It needs no metrics listener.
+**Slow-request log.** Set `SLOW_REQUEST_MS` (Helm `gateway.slowRequestMs`) to a number of milliseconds. A request that takes longer queues one line for the diagnostic writer, which writes it to stderr, for example `slow_request route=/v1/claim method=POST status=2xx ms=1234`. At most one line goes out a second. A stalled stderr never delays a response: the queue holds 256 lines, and a line that finds it full is dropped and counted. The next line ends with `suppressed=N`, the count of slow requests left out. `0` or unset turns the log off. It needs no metrics listener.
 
 **Metrics.** Set `METRICS_ADDR` to start a listener. Without it there is no listener and no registry. The timing layer runs when `METRICS_ADDR` or the slow-request log is set, and with neither no request is timed. The listener serves only `GET /metrics` in the Prometheus text format, on its own port. The public router has no `/metrics` route. These settings are required with `METRICS_ADDR`, and the gateway refuses to start without them:
 
@@ -271,7 +271,7 @@ What a scraper learns: request counts and latency per route, the pool size, and 
 | `openpact_witness_push_seconds{result}` | One add-checkpoint call: `cosigned` (its signature verifies), `conflict`, `refused`, `invalid` (a 200 without a cosignature from a manifest witness key), `error` or `timeout` |
 | `openpact_checkpoint_served_total{caller,result}` | Answers that held a checkpoint, by `checkpoint`, `mine`, `enroll` and `claim`; `not_yet` means fewer witness cosignatures than the manifest's quorum, `log_signed` means the manifest asks for none. A failed request is not counted |
 | `openpact_log_size` | Entries in the log at the last read; `NaN` until the first read |
-| `openpact_log_lines_dropped_total` | Diagnostic lines of the read and mine routes that were dropped because 256 lines already waited for the log writer. A request never waits for stderr |
+| `openpact_log_lines_dropped_total` | Diagnostic lines (slow requests, internal errors, the read routes and the witness owners) that were dropped because 256 lines already waited for the log writer. A request never waits for stderr. A graceful shutdown writes the queued lines first, for at most two seconds |
 
 To compare gateway counts with another source, such as a proxy in front of the gateway, count the same thing. A handler completion is not a delivered response: a client that left, a timeout or a reset can lose the answer after the handler finished. Use `openpact_http_request_duration_seconds_count` by status class for the answers the gateway produced, `openpact_http_requests_aborted_total` for the handlers that never answered, and the proxy's upstream responses, read after traffic has drained, for what arrived. Accepted claims (`2xx` on `/v1/claim`) can exceed the claims a client verified and installed, because the client checks the answer after the gateway sent it.
 

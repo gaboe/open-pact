@@ -7,7 +7,6 @@
 //! method names, five status classes. No path, address, pseudonym, nonce or hash reaches a label or
 //! the slow-request log.
 
-use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
@@ -208,7 +207,6 @@ pub struct Metrics {
     claim_stage: Family<StageLabel, Histogram>,
     witness_push: Family<ResultLabel, Histogram>,
     checkpoint_served: Family<ServedLabels, Counter>,
-    log_lines_dropped: Counter,
     /// NaN until the first read of the log.
     log_size: Gauge<f64, AtomicU64>,
 }
@@ -285,11 +283,11 @@ impl Metrics {
             "Checkpoints handed out, by caller and by whether the witness quorum was met",
             checkpoint_served.clone(),
         );
-        let log_lines_dropped = Counter::default();
+        // The counter lives in the diagnostic queue; the registry shows the same counter.
         registry.register(
             "openpact_log_lines_dropped",
             "Diagnostic lines a request path dropped because 256 lines already waited for the log writer",
-            log_lines_dropped.clone(),
+            crate::diag::dropped(),
         );
         let log_size = Gauge::<f64, AtomicU64>::default();
         log_size.set(f64::NAN);
@@ -310,7 +308,6 @@ impl Metrics {
             claim_stage,
             witness_push,
             checkpoint_served,
-            log_lines_dropped,
             log_size,
         }
     }
@@ -386,10 +383,6 @@ impl Metrics {
         self.checkpoint_served
             .get_or_create(&ServedLabels { caller, result })
             .inc();
-    }
-
-    pub fn log_line_dropped(&self) {
-        self.log_lines_dropped.inc();
     }
 
     pub fn log_size(&self, size: u64) {
@@ -478,13 +471,14 @@ pub struct SlowLog {
     threshold: Duration,
     window: Duration,
     state: Mutex<SlowState>,
+    /// Takes a line. Production queues it for the diagnostic writer; it never writes stderr.
+    out: Box<dyn Fn(String) + Send + Sync>,
 }
 
 struct SlowState {
-    /// When the last line finished writing.
+    /// When the last line was queued.
     last: Option<Instant>,
     suppressed: u64,
-    out: Box<dyn Write + Send>,
 }
 
 impl SlowLog {
@@ -492,56 +486,54 @@ impl SlowLog {
         SlowLog::with_output(
             Duration::from_millis(threshold_ms),
             Duration::from_secs(1),
-            Box::new(std::io::stderr()),
+            Box::new(crate::diag::line),
         )
     }
 
-    fn with_output(threshold: Duration, window: Duration, out: Box<dyn Write + Send>) -> SlowLog {
+    fn with_output(
+        threshold: Duration,
+        window: Duration,
+        out: Box<dyn Fn(String) + Send + Sync>,
+    ) -> SlowLog {
         SlowLog {
             threshold,
             window,
             state: Mutex::new(SlowState {
                 last: None,
                 suppressed: 0,
-                out,
             }),
+            out,
         }
     }
 
-    /// Writes the line for a request when one is due: the request was slow and no line finished
-    /// writing less than a window ago. The clock is read under the lock, so a request that waited
-    /// for a slow write compares against the end of that write. The lock stays held while the line
-    /// is written, so lines leave in the order their decisions were made.
+    /// Hands out the line for a request when one is due: the request was slow and no line was
+    /// queued less than a window ago. The lock covers the decision only. The line leaves after the
+    /// lock is released, so a slow output never holds another request here.
     fn emit(&self, route: &str, method: &str, status: &str, elapsed: Duration) -> Option<String> {
         if elapsed < self.threshold {
             return None;
         }
-        let mut state = self.state.lock().expect("slow log state");
-        if state
-            .last
-            .is_some_and(|last| Instant::now().saturating_duration_since(last) < self.window)
-        {
-            state.suppressed += 1;
-            return None;
-        }
-        let mut line = format!(
-            "slow_request route={route} method={method} status={status} ms={}",
-            elapsed.as_millis()
-        );
-        if state.suppressed > 0 {
-            line.push_str(&format!(" suppressed={}", state.suppressed));
-        }
-        let written = format!("{line}\n");
-        if state
-            .out
-            .write_all(written.as_bytes())
-            .and_then(|()| state.out.flush())
-            .is_err()
-        {
-            return None;
-        }
-        state.last = Some(Instant::now());
-        state.suppressed = 0;
+        let line = {
+            let mut state = self.state.lock().expect("slow log state");
+            if state
+                .last
+                .is_some_and(|last| Instant::now().saturating_duration_since(last) < self.window)
+            {
+                state.suppressed += 1;
+                return None;
+            }
+            let mut line = format!(
+                "slow_request route={route} method={method} status={status} ms={}",
+                elapsed.as_millis()
+            );
+            if state.suppressed > 0 {
+                line.push_str(&format!(" suppressed={}", state.suppressed));
+            }
+            state.last = Some(Instant::now());
+            state.suppressed = 0;
+            line
+        };
+        (self.out)(line.clone());
         Some(line)
     }
 }
@@ -1365,38 +1357,21 @@ mod tests {
         );
     }
 
-    /// A writer that takes `pause` for every write, as a blocked stderr would.
-    struct Pausing {
-        sink: Arc<Mutex<Vec<u8>>>,
-        pause: Duration,
-    }
-
-    impl Write for Pausing {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            std::thread::sleep(self.pause);
-            self.sink.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    fn captured(pause: Duration, window: Duration) -> (SlowLog, Arc<Mutex<Vec<u8>>>) {
+    fn captured(window: Duration) -> (SlowLog, Arc<Mutex<Vec<String>>>) {
         let sink = Arc::new(Mutex::new(Vec::new()));
-        let out = Pausing {
-            sink: sink.clone(),
-            pause,
-        };
-        let slow = SlowLog::with_output(Duration::from_millis(1000), window, Box::new(out));
+        let out = sink.clone();
+        let slow = SlowLog::with_output(
+            Duration::from_millis(1000),
+            window,
+            Box::new(move |line| out.lock().unwrap().push(line)),
+        );
         (slow, sink)
     }
 
     #[test]
     fn the_slow_log_writes_one_line_a_window_and_counts_what_it_left_out() {
         let window = Duration::from_millis(300);
-        let (slow, sink) = captured(Duration::ZERO, window);
+        let (slow, sink) = captured(window);
         let ms = Duration::from_millis;
         assert_eq!(slow.emit("/v1/claim", "POST", "2xx", ms(999)), None);
         assert_eq!(
@@ -1418,30 +1393,47 @@ mod tests {
             slow.emit("/", "GET", "2xx", ms(1000)).as_deref(),
             Some("slow_request route=/ method=GET status=2xx ms=1000")
         );
-        let written = String::from_utf8(sink.lock().unwrap().clone()).unwrap();
-        assert_eq!(written.lines().count(), 3, "{written}");
+        let written = sink.lock().unwrap().clone();
+        assert_eq!(written.len(), 3, "{written:?}");
     }
 
     #[test]
-    fn a_request_that_waited_for_a_slow_write_keeps_the_window() {
-        let window = Duration::from_millis(100);
-        let (slow, sink) = captured(Duration::from_millis(300), window);
-        let slow = Arc::new(slow);
+    fn a_slow_output_never_holds_the_decision_lock() {
+        let (entered_tx, entered) = std::sync::mpsc::channel::<()>();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let entered_tx = Mutex::new(entered_tx);
+        let held = Mutex::new(held);
+        let slow = Arc::new(SlowLog::with_output(
+            Duration::from_millis(1000),
+            Duration::from_millis(100),
+            Box::new(move |_| {
+                let _ = entered_tx.lock().unwrap().send(());
+                let _ = held.lock().unwrap().recv_timeout(Duration::from_secs(10));
+            }),
+        ));
         let first = {
             let slow = slow.clone();
             std::thread::spawn(move || {
                 slow.emit("/v1/claim", "POST", "2xx", Duration::from_secs(2))
             })
         };
-        // The first line now holds the lock for its 300 ms write. The second request arrives during
-        // that write, 150 ms after the first started, which is more than one window after the first
-        // started but less than one window after the first line finished.
-        std::thread::sleep(Duration::from_millis(150));
-        let second = slow.emit("/v1/nonce", "POST", "5xx", Duration::from_secs(2));
+        // The first line is out and its output is stuck. A second request must still decide.
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (decided, decision) = std::sync::mpsc::channel();
+        {
+            let slow = slow.clone();
+            std::thread::spawn(move || {
+                let _ = decided.send(slow.emit("/v1/nonce", "POST", "5xx", Duration::from_secs(2)));
+            });
+        }
+        let second = decision.recv_timeout(Duration::from_secs(2));
+        drop(release);
+        assert_eq!(
+            second,
+            Ok(None),
+            "a request waited for another request's output"
+        );
         assert!(first.join().unwrap().is_some());
-        assert_eq!(second, None);
-        let written = String::from_utf8(sink.lock().unwrap().clone()).unwrap();
-        assert_eq!(written.lines().count(), 1, "{written}");
     }
 
     #[tokio::test]
