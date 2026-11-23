@@ -2706,6 +2706,19 @@ fn not_ours_text(
     text
 }
 
+/// The dry run of `schedule on --system` over a SYSTEM task that the machine client does not own.
+/// The real run refuses at that task before it reads the profile, so a dry run that refused too
+/// could never say whether the profile is usable. This one checks the profile with the rule of the
+/// real run, `choose_profile`, and then says that the task blocks the install. It changes nothing.
+fn preview_blocked_install(user_home: Option<&Path>) -> Result<()> {
+    let profile = choose_profile(user_home, None, crate::machine::default_user_home())?;
+    println!("The job scans {}.", profile.display());
+    println!(
+        "schedule: blocked. A SYSTEM task that is not the machine client's exists. Remove it first."
+    );
+    Ok(())
+}
+
 /// Refuses a change to a SYSTEM task that the machine client does not own.
 fn refuse_not_ours(
     home: &Path,
@@ -2888,6 +2901,9 @@ pub(crate) async fn change_job(
         ))
     })?;
     let task = observed.system_task(&machine, &home.0, None);
+    if dry_run && requested_system && matches!(task, SystemTask::NotOurs { .. }) {
+        return preview_blocked_install(user_home);
+    }
     refuse_not_ours(&home.0, wanted, &task, explicit_profile.as_deref())?;
     let system = needs_system_cleanup(requested_system, wanted == Wanted::Off, &observed);
     if system && !elevated {
@@ -5515,6 +5531,24 @@ esac
         assert!(choose(Some(Path::new("relative")), None, Some(&own)).is_err());
         assert!(choose(None, None, Some(&dir.path().join("nope"))).is_err());
         assert!(choose(None, None, None).is_err());
+    }
+
+    #[test]
+    fn the_dry_run_over_a_task_that_is_not_ours_checks_the_profile_like_the_real_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let listed = dir.path().join("listed");
+        let unlisted = dir.path().join("unlisted");
+        for folder in [&listed, &unlisted] {
+            std::fs::create_dir(folder).unwrap();
+        }
+        let _listed = crate::machine::list_profiles(&[&listed]);
+        preview_blocked_install(Some(&listed)).unwrap();
+        let error = preview_blocked_install(Some(&unlisted)).unwrap_err();
+        assert!(format!("{error:#}").contains("--user-home is not usable"));
+        // Without the argument the profile of the process decides, as in the real run.
+        preview_blocked_install(None).unwrap();
+        let _none = crate::machine::list_profiles(&[]);
+        assert!(preview_blocked_install(None).is_err());
     }
 
     #[test]
