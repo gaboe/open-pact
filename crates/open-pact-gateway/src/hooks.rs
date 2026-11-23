@@ -3,7 +3,7 @@
 #[cfg(test)]
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicU8, AtomicUsize, Ordering},
 };
 
 #[derive(Default)]
@@ -17,7 +17,8 @@ pub struct Hooks {
 #[cfg(test)]
 #[derive(Default)]
 pub struct Point {
-    armed: AtomicBool,
+    /// 0 off, 1 pause the next hit only, 2 pause every hit.
+    armed: AtomicU8,
     hits: AtomicUsize,
     reached: tokio::sync::Notify,
     release: tokio::sync::Notify,
@@ -38,14 +39,24 @@ impl Point {
     }
 
     pub fn disarm(&self) {
-        self.armed.store(false, Ordering::SeqCst);
-        self.release.notify_one();
+        self.armed.store(0, Ordering::SeqCst);
+        self.release.notify_waiters();
     }
 }
 
 #[cfg(test)]
 impl Hooks {
+    /// Pauses the next path that reaches `name`; later ones pass.
     pub fn arm(&self, name: &'static str) -> Arc<Point> {
+        self.set(name, 1)
+    }
+
+    /// Pauses every path that reaches `name` until `disarm`.
+    pub fn arm_always(&self, name: &'static str) -> Arc<Point> {
+        self.set(name, 2)
+    }
+
+    fn set(&self, name: &'static str, mode: u8) -> Arc<Point> {
         let point = self
             .points
             .lock()
@@ -53,15 +64,23 @@ impl Hooks {
             .entry(name)
             .or_default()
             .clone();
-        point.armed.store(true, Ordering::SeqCst);
+        point.armed.store(mode, Ordering::SeqCst);
         point
     }
 
     pub async fn hit(&self, name: &'static str) {
         let point = self.points.lock().expect("hooks").get(name).cloned();
-        if let Some(point) = point
-            && point.armed.load(Ordering::SeqCst)
-        {
+        if let Some(point) = point {
+            let mode = point.armed.load(Ordering::SeqCst);
+            if mode == 0
+                || (mode == 1
+                    && point
+                        .armed
+                        .compare_exchange(1, 0, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_err())
+            {
+                return;
+            }
             point.hits.fetch_add(1, Ordering::SeqCst);
             point.reached.notify_one();
             point.release.notified().await;
