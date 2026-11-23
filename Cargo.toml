@@ -11,6 +11,7 @@ license = "MIT"
 
 [workspace.dependencies]
 open-pact-core = { path = "crates/open-pact-core", version = "0.8.5" }
+open-pact-client = { path = "crates/open-pact-client", version = "0.8.5" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "signal"] }
