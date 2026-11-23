@@ -67,29 +67,64 @@ elseif ($install.ExitCode -ne 0) { throw ('The install failed. See ' + $log) }
 }
 ```
 
-The block installs, upgrades and reinstalls the package. It checks the Cosign signature and the SHA-256 hash of the package before it installs. It keeps its folder, because Windows Installer repairs from it. Each failed check stops the block. Exit code 3010 means that Windows needs a restart to finish the install.
+The block installs exactly version 0.9.0. It upgrades an older package. It does not change a newer package. It checks the Cosign signature and the SHA-256 hash of the package before it installs. It keeps its folder, because Windows Installer repairs from it. Each failed check stops the block. Exit code 3010 means that Windows needs a restart to finish the install. Then do the next section.
+
+To repair a package of the same version, run `msiexec.exe /fa "<msi>" /qn /norestart` with the verified MSI that the block leaves in its folder under `%ProgramData%`.
 
 ## Choose a deployment method
 
 - **Intune line-of-business app.** Upload the MSI and assign it to devices. Follow Microsoft's line-of-business page for updates. This method is not verified on an enrolled device yet.
 - **Intune Win32 app.** Detect the install by the ProductCode of the MSI. Treat exit code 3010 as a soft reboot.
 - **Group Policy.** Assign the MSI to the computer, not to a user.
-- **winget.** A release names winget only after the package is published there. Winget runs in a user session download the package into that user's temp folder first. Use the install block in a user session. Use winget as SYSTEM only through Intune, Group Policy or another SYSTEM tool.
+- **winget.** Do not use the `winget` command-line tool as SYSTEM. Microsoft does not support it there, even when Intune or Group Policy starts it. Deploy the verified MSI with one of the methods above.
 - **Rollback.** Keep Windows Installer rollback on. The package removes the old version inside the new install, so a failed upgrade returns to the old version. A policy that disables rollback removes this protection.
 
 ## Start the SYSTEM job for each home
 
-After the package is installed, run this command once for each user home. Run it in an elevated prompt:
+After the package is installed, run these commands once for each user home. Run them in an elevated Windows PowerShell 5.1 prompt. They resolve the client by its full path, so an older client on PATH never runs:
 
 ```powershell
-& 'C:\Program Files\open-pact-client\open-pact-client.exe' --home '<home>' schedule on --system
+$q = Join-Path $env:ProgramW6432 'open-pact-client\open-pact-client.exe'
+& $q --home '<home>' schedule on --system --user-home '<profile>'
 ```
 
-Replace `<home>` with the absolute home path of the user. The command reads the profile of that user from the device.
+Replace `<home>` with the absolute client home of the user. Replace `<profile>` with the profile folder of the user, for example `C:\Users\example`. The SYSTEM job reads the repositories below that profile. Without `--user-home`, the client uses the profile of the account that runs the elevated prompt. It fails when that account has no registered profile.
+
+For a device that ran a SYSTEM job before 0.9.0, take both values from the old task. The [release notes](release-notes/v0.9.0.md) show how.
 
 ## Remove the package
 
-1. For each SYSTEM task, run the removal block in an elevated Windows PowerShell 5.1 prompt. Find the task names with `schtasks.exe /Query /FO CSV /NH`. Lines that start with `"\org.open-pact.report.` name the tasks. Change the task name in the block to each name that you found.
+Run every command in an elevated Windows PowerShell 5.1 prompt. Uninstalling the package does not remove SYSTEM tasks. Remove each task first.
+
+1. List the SYSTEM tasks. The command selects tasks by their principal and by the program that they run. It never selects a limited user task by the name prefix alone. Write down the task name, the program and the `--home` value of each task:
+
+```powershell
+& {
+  $legacy = Join-Path $env:ProgramW6432 'open-pact\open-pact-client.exe'
+  $machine = Join-Path $env:ProgramW6432 'open-pact-client\open-pact-client.exe'
+  $system = @('SYSTEM', 'NT AUTHORITY\SYSTEM', 'S-1-5-18')
+  $programs = @($legacy, $machine)
+  Get-ScheduledTask -TaskPath '\' | Where-Object {
+    $_.TaskName -like 'org.open-pact.report.*' -and
+    ($system -contains $_.Principal.UserId) -and
+    @($_.Actions | Where-Object { $_.Execute -and ($programs -contains $_.Execute.Trim('"')) }).Count -gt 0
+  } | ForEach-Object {
+    'Task: ' + $_.TaskName
+    'Program: ' + (($_.Actions | ForEach-Object { $_.Execute }) -join ' ')
+    'Arguments: ' + (($_.Actions | ForEach-Object { $_.Arguments }) -join ' ')
+  }
+}
+```
+
+2. A task whose program is the machine client, `open-pact-client\open-pact-client.exe`, needs one command. It removes the task, the job state and the record of the owner's choice. Replace `<home>` with the `--home` value of the task:
+
+```powershell
+$q = Join-Path $env:ProgramW6432 'open-pact-client\open-pact-client.exe'
+& $q --home '<home>' schedule off
+if ($LASTEXITCODE -ne 0) { throw 'schedule off failed. Do not uninstall the package. Fix the error, then run this command again.' }
+```
+
+3. A task whose program is the old copy, `open-pact\open-pact-client.exe`, needs the removal block. Replace three samples in the block: the task name `org.open-pact.report.0123abcd` (in every place where it appears), the home `C:\Users\example\pact`, and the folder `C:\Program Files`. Use the `--home` value of the task for the home. Use the output of `$env:ProgramW6432` for the folder. The block deletes the task and then runs `schedule off`. When `schedule off` fails, the block throws. Do not uninstall the package then. Fix the error and run the block again.
 
 ```powershell
 & {
@@ -120,11 +155,11 @@ Replace `<home>` with the absolute home path of the user. The command reads the 
   }
   if (Test-TaskRegistered) { throw 'The task is still registered. Run this block again.' }
   & 'C:\Program Files\open-pact-client\open-pact-client.exe' --home 'C:\Users\example\pact' schedule off
+  if ($LASTEXITCODE -ne 0) { throw 'schedule off failed. Do not uninstall the package. Fix the error, then run this block again.' }
 }
 ```
 
-2. Uninstall the open-pact client package. Use Settings, Apps, or your deployment tool.
+4. Run the command of step 1 again. It must print nothing.
+5. Uninstall the open-pact client package. Use Settings, Apps, or your deployment tool.
 
-Uninstalling the package does not remove the SYSTEM tasks. Run step 1 before step 2.
-
-A task that runs another program was not made by the client. The client does not change it. The removal block deletes any task with the name that you give it. Check the action of the task in Task Scheduler before you run the block for it.
+The command of step 1 lists only tasks that run as SYSTEM and run the old copy or the machine client. A SYSTEM task that runs another program can come from an older open-pact client. The removal block can remove it without the package, but the client does not change it. The block deletes the task name that you give it. Check the action of the task in Task Scheduler before you run the block for it.
