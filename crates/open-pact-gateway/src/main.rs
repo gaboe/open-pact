@@ -328,23 +328,10 @@ impl App {
         (checkpoint, note, true)
     }
 
-    /// The current checkpoint signed by the log key, with the witness cosignatures stored for it.
-    /// A new checkpoint goes to the witnesses before any client sees it.
-    async fn checkpoint(&self, caller: metrics::Caller) -> Result<Note, Reply> {
-        let served = self.serve_checkpoint().await;
-        if let Some(metrics) = self.metrics() {
-            metrics.checkpoint_served(
-                caller,
-                match &served {
-                    Ok((_, served)) => *served,
-                    Err(_) => metrics::Served::Database,
-                },
-            );
-        }
-        served.map(|(note, _)| note)
-    }
-
-    async fn serve_checkpoint(&self) -> Result<(Note, metrics::Served), Reply> {
+    /// The current checkpoint signed by the log key, with the witness cosignatures stored for it,
+    /// and what the witnesses gave. A new checkpoint goes to the witnesses before any client sees
+    /// it. The handler counts the result with `count_served` once its answer holds the checkpoint.
+    async fn checkpoint(&self) -> Result<(Note, metrics::Served), Reply> {
         let tree = self.tree().await?;
         let (checkpoint, mut note, fresh) = self.signed(&tree);
         let mut cosignatures = self.cosignatures(&checkpoint).await?;
@@ -366,6 +353,13 @@ impl App {
         };
         note.signatures.extend(cosignatures);
         Ok((note, served))
+    }
+
+    /// Counts a checkpoint that an answer went out with.
+    fn count_served(&self, caller: metrics::Caller, served: metrics::Served) {
+        if let Some(metrics) = self.metrics() {
+            metrics.checkpoint_served(caller, served);
+        }
     }
 
     async fn cosignatures(&self, checkpoint: &Checkpoint) -> Result<Vec<NoteSignature>, Reply> {
@@ -479,7 +473,8 @@ async fn log_key_text(Extension(app): Extension<App>) -> impl IntoResponse {
 }
 
 async fn log_checkpoint(Extension(app): Extension<App>) -> Result<impl IntoResponse, Reply> {
-    let note = app.checkpoint(metrics::Caller::Checkpoint).await?;
+    let (note, served) = app.checkpoint().await?;
+    app.count_served(metrics::Caller::Checkpoint, served);
     Ok((
         [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
         note.to_string(),
@@ -749,7 +744,8 @@ async fn try_enroll(
     .fetch_one(&app.db)
     .await
     .map_err(internal)?;
-    let checkpoint = app.checkpoint(metrics::Caller::Enroll).await?;
+    let (checkpoint, served) = app.checkpoint().await?;
+    app.count_served(metrics::Caller::Enroll, served);
     Ok(Json(json!({
         "status": "enrolled",
         "device": device,
@@ -881,7 +877,7 @@ async fn log_mine(
 ) -> Result<Json<MyEntries>, Reply> {
     let Json(request) = body.map_err(|_| device_denied())?;
     authenticate_device(&app, &request, DeviceAuthPurpose::LogMine).await?;
-    let checkpoint = app.checkpoint(metrics::Caller::Mine).await?;
+    let (checkpoint, served) = app.checkpoint().await?;
     let cp = Checkpoint::parse(&checkpoint.text).map_err(internal)?;
     let tree = app.tree().await?;
     let mut conn = app.conn().await?;
@@ -908,6 +904,7 @@ async fn log_mine(
             device.push(with_proof(entry)?);
         }
     }
+    app.count_served(metrics::Caller::Mine, served);
     Ok(Json(MyEntries {
         checkpoint: checkpoint.to_string(),
         manifest: manifest.ok_or_else(|| internal("manifest log entry missing"))?,
@@ -1109,11 +1106,13 @@ async fn claim(
             &controls,
         ));
     }
+    clock.mark(metrics::Stage::Siem);
     if !reasons.is_empty() {
         return Err(denied(reasons));
     }
-    let checkpoint = app.checkpoint(metrics::Caller::Claim).await?;
+    let (checkpoint, served) = app.checkpoint().await?;
     clock.mark(metrics::Stage::Checkpoint);
+    app.count_served(metrics::Caller::Claim, served);
     Ok(Json(json!({
         "status": "accepted",
         "warnings": warnings,
@@ -2134,7 +2133,7 @@ mod tests {
         let metrics = Arc::new(metrics::Metrics::new());
         let observation = metrics::Observation::new(Some(metrics.clone()), None);
         let (app, server) = app_with_broken_witnesses(observation).await;
-        app.checkpoint(metrics::Caller::Checkpoint).await.unwrap();
+        app.checkpoint().await.unwrap();
         server.abort();
         let text = metrics.scrape(&app.db);
         for result in ["error", "refused", "conflict", "invalid"] {
@@ -2150,7 +2149,7 @@ mod tests {
     async fn witness_pushes_read_no_clock_when_observation_is_off() {
         let (app, server) = app_with_broken_witnesses(None).await;
         let before = metrics::clock_reads();
-        app.checkpoint(metrics::Caller::Checkpoint).await.unwrap();
+        app.checkpoint().await.unwrap();
         server.abort();
         assert_eq!(metrics::clock_reads(), before);
     }
@@ -2647,6 +2646,7 @@ mod tests {
             "lock",
             "evaluate",
             "commit",
+            "siem",
             "checkpoint",
         ] {
             assert!(
