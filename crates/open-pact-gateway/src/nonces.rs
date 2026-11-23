@@ -71,7 +71,7 @@ async fn consume_in(tx: &mut PgConnection, nonce: &str) -> sqlx::Result<Option<b
     .execute(&mut *tx)
     .await?;
     sqlx::query_scalar(
-        "DELETE FROM nonces WHERE nonce = $1 RETURNING expires_at > now()",
+        "DELETE FROM nonces WHERE nonce = $1 RETURNING expires_at > statement_timestamp()",
     )
     .bind(nonce)
     .fetch_optional(&mut *tx)
