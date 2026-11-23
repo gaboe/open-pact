@@ -550,6 +550,12 @@ fn winget_line() -> Option<&'static str> {
 /// itself.
 pub(crate) fn removal_block(home: &Path, task_id: &str, machine: Option<&Path>) -> String {
     let id = powershell_literal(task_id);
+    let task_path = if task_id.starts_with('\\') {
+        task_id.to_owned()
+    } else {
+        format!("\\{task_id}")
+    };
+    let path = powershell_literal(&task_path);
     let last = machine
         .map(|machine| format!("\n  {}", apply_command(home, "schedule off", machine)))
         .unwrap_or_default();
@@ -557,12 +563,18 @@ pub(crate) fn removal_block(home: &Path, task_id: &str, machine: Option<&Path>) 
         r#"& {{
   $schtasks = Join-Path ([Environment]::SystemDirectory) 'schtasks.exe'
   function Test-TaskRegistered {{
-    # Only this query runs with Continue. schtasks reports a missing task on stderr, which Stop turns into a throw.
-    $ErrorActionPreference = 'Continue'
-    $text = (& $schtasks /Query /TN {id} 2>&1 | Out-String).Trim()
-    if ($LASTEXITCODE -eq 0) {{ return $true }}
-    if ($text -match 'cannot find the file specified') {{ return $false }}
-    throw ('Could not query the task. ' + $text)
+    # The Task Scheduler COM API reports a missing task as HRESULT 0x80070002, in every display language.
+    $service = New-Object -ComObject Schedule.Service
+    $service.Connect()
+    try {{
+      [void]$service.GetFolder('\').GetTask({path})
+      return $true
+    }} catch {{
+      $e = $_.Exception
+      while ($e.InnerException) {{ $e = $e.InnerException }}
+      if ($e.HResult -eq -2147024894) {{ return $false }}
+      throw ('Could not query the task. ' + $_)
+    }}
   }}
   if (Test-TaskRegistered) {{
     & $schtasks /End /TN {id} 2>$null | Out-Null
@@ -1009,13 +1021,15 @@ mod tests {
         let id = "org.open-pact.report.0123456789abcdef";
         let block = removal_block(Path::new(r"C:\Users\pact"), id, None);
         assert_eq!(block.matches("Test-TaskRegistered").count(), 3);
-        assert_eq!(block.matches("$ErrorActionPreference").count(), 1);
-        assert!(block.contains("$ErrorActionPreference = 'Continue'"));
-        assert!(block.contains("if ($LASTEXITCODE -eq 0) { return $true }"));
-        assert!(
-            block.contains("if ($text -match 'cannot find the file specified') { return $false }")
-        );
-        assert!(block.contains("throw ('Could not query the task. ' + $text)"));
+        // The check asks the Task Scheduler COM API, not schtasks text, so it works in every language.
+        assert!(block.contains("New-Object -ComObject Schedule.Service"));
+        assert!(block.contains(r"GetFolder('\').GetTask('\org.open-pact.report.0123456789abcdef')"));
+        assert!(block.contains("if ($e.HResult -eq -2147024894) { return $false }"));
+        // Only HRESULT 0x80070002 (file not found) means absent; any other error still throws.
+        assert!(block.contains("throw ('Could not query the task. ' + $_)"));
+        assert!(!block.contains("cannot find the file specified"));
+        assert!(!block.contains("$text -match"));
+        assert!(!block.contains("$LASTEXITCODE -eq 0) { return $true"));
     }
 
     #[test]
