@@ -274,17 +274,67 @@ pub(crate) fn read_machine_client() -> MachineClient {
     })
 }
 
+/// One entry of `HKLM\...\ProfileList`: the SID of an account and its `ProfileImagePath`, with the
+/// environment variables expanded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProfileEntry {
+    pub(crate) sid: String,
+    pub(crate) path: PathBuf,
+}
+
+/// What Windows says about profiles: the SID of the token of the running process and the entries of
+/// the user accounts. Only a local, domain or Entra account is an entry, not SYSTEM or a service
+/// account.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ProfileList {
+    pub(crate) own_sid: Option<String>,
+    pub(crate) entries: Vec<ProfileEntry>,
+}
+
+impl ProfileList {
+    /// The profile folder of the account that owns the token of the running process.
+    fn own_profile(&self) -> Option<PathBuf> {
+        let own = self.own_sid.as_deref()?;
+        self.entries
+            .iter()
+            .find(|entry| entry.sid.eq_ignore_ascii_case(own))
+            .map(|entry| entry.path.clone())
+    }
+
+    /// The list from the lines that `profile_list_script` printed: `own <sid>` once, and
+    /// `entry <sid> <path>` for each account.
+    fn parse(output: &str) -> Self {
+        let mut list = Self::default();
+        for line in output.lines().map(str::trim) {
+            if let Some(sid) = line.strip_prefix("own ") {
+                list.own_sid = Some(sid.trim().to_owned());
+            } else if let Some(rest) = line.strip_prefix("entry ")
+                && let Some((sid, path)) = rest.split_once(' ')
+                && !path.trim().is_empty()
+            {
+                list.entries.push(ProfileEntry {
+                    sid: sid.to_owned(),
+                    path: PathBuf::from(path.trim()),
+                });
+            }
+        }
+        list
+    }
+}
+
 /// The owner's profile that a SYSTEM job reads: an absolute path to a folder that exists, with no
 /// `%` and no control character, that is not a link, and that Windows lists as the profile of a
 /// user account. A user chooses `USERPROFILE` and the arguments of a task, so neither is a source.
+///
+/// Only a path that needs a SYSTEM profile comes here, because on Windows the list costs a start of
+/// PowerShell.
 pub(crate) fn validate_user_home(path: &Path) -> Result<PathBuf> {
-    validate_user_home_in(path, registered_profiles)
+    validate_user_home_in(path, registered_profiles()?.as_ref())
 }
 
-fn validate_user_home_in(
-    path: &Path,
-    profiles: impl FnOnce() -> Result<Option<Vec<PathBuf>>>,
-) -> Result<PathBuf> {
+/// `validate_user_home` against the `profiles` that were read, or against none on a system
+/// without the list.
+fn validate_user_home_in(path: &Path, profiles: Option<&ProfileList>) -> Result<PathBuf> {
     let text = path_text(path)?;
     if text.contains('%') {
         bail!("the user home must not contain %");
@@ -300,14 +350,26 @@ fn validate_user_home_in(
     if !metadata.is_dir() {
         bail!("the user home is not a folder that exists");
     }
-    if let Some(profiles) = profiles()?
+    if let Some(profiles) = profiles
         && !profiles
+            .entries
             .iter()
-            .any(|profile| same_windows_path(profile, path))
+            .any(|entry| same_windows_path(&entry.path, path))
     {
         bail!("the user home is not the profile of a user account");
     }
     Ok(path.to_path_buf())
+}
+
+/// The profile that a SYSTEM job reads when no `--user-home` names one: the `ProfileImagePath` of
+/// the SID of the token of this process. `USERPROFILE` is the caller's own word, and a standard
+/// user can point it at the profile of another account, so it is never the source on Windows.
+pub(crate) fn default_user_home() -> Option<PathBuf> {
+    match registered_profiles() {
+        Ok(Some(list)) => list.own_profile(),
+        Ok(None) => crate::user_profile(),
+        Err(_) => None,
+    }
 }
 
 #[cfg(windows)]
@@ -321,28 +383,84 @@ fn is_reparse_point(_metadata: &std::fs::Metadata) -> bool {
     false
 }
 
-/// The profile folders of the user accounts, from `HKLM\...\ProfileList`. Only a local, domain or
-/// Entra account counts, not SYSTEM or a service account. `None` where Windows keeps no such list.
-#[cfg(windows)]
-fn registered_profiles() -> Result<Option<Vec<PathBuf>>> {
-    let output = crate::schedule::windows_powershell(
-        r#"$ErrorActionPreference = 'Stop'
+/// The PowerShell that prints the token SID of the process and the profile folders of the user
+/// accounts of `ProfileList`.
+#[cfg(any(windows, test))]
+const PROFILE_LIST_SCRIPT: &str = r#"$ErrorActionPreference = 'Stop'
+Write-Output ('own ' + [Security.Principal.WindowsIdentity]::GetCurrent().User.Value)
 Get-ChildItem -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList' |
     Where-Object { $_.PSChildName -like 'S-1-5-21-*' -or $_.PSChildName -like 'S-1-12-1-*' } |
-    ForEach-Object { $path = [string]$_.GetValue('ProfileImagePath'); if ($path) { Write-Output ([Environment]::ExpandEnvironmentVariables($path)) } }"#,
-    )?;
-    Ok(Some(
-        output
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(PathBuf::from)
+    ForEach-Object { $path = [string]$_.GetValue('ProfileImagePath'); if ($path) { Write-Output ('entry ' + $_.PSChildName + ' ' + [Environment]::ExpandEnvironmentVariables($path)) } }"#;
+
+// The profile list of this thread's tests. Without a list, nothing is a profile, as on a Windows
+// runner whose temporary folders are no account's profile.
+#[cfg(test)]
+thread_local! {
+    static TEST_PROFILES: std::cell::RefCell<ProfileList> =
+        std::cell::RefCell::new(ProfileList::default());
+}
+
+/// Puts `paths` in the profile list of this thread until the guard drops. The first path is the
+/// profile of the token of the process.
+#[cfg(test)]
+pub(crate) fn list_profiles(paths: &[&Path]) -> ProfileGuard {
+    let list = ProfileList {
+        own_sid: paths.first().map(|_| "S-1-5-21-1-1-1-1000".to_owned()),
+        entries: paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| ProfileEntry {
+                sid: format!("S-1-5-21-1-1-1-{}", 1000 + index),
+                path: path.to_path_buf(),
+            })
             .collect(),
+    };
+    ProfileGuard(TEST_PROFILES.with(|profiles| profiles.replace(list)))
+}
+
+#[cfg(test)]
+pub(crate) struct ProfileGuard(ProfileList);
+
+#[cfg(test)]
+impl Drop for ProfileGuard {
+    fn drop(&mut self) {
+        TEST_PROFILES.with(|profiles| profiles.replace(std::mem::take(&mut self.0)));
+    }
+}
+
+/// How many times this thread read the profile list, for the tests that show a command that needs
+/// no SYSTEM profile reads none.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PROFILE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn registered_profiles() -> Result<Option<ProfileList>> {
+    PROFILE_READS.with(|reads| reads.set(reads.get() + 1));
+    Ok(Some(
+        TEST_PROFILES.with(|profiles| profiles.borrow().clone()),
     ))
 }
 
-#[cfg(not(windows))]
-fn registered_profiles() -> Result<Option<Vec<PathBuf>>> {
+/// The profiles of this machine, from `HKLM\...\ProfileList`, read once per process. `None` where
+/// Windows keeps no such list.
+#[cfg(all(windows, not(test)))]
+fn registered_profiles() -> Result<Option<ProfileList>> {
+    static LIST: std::sync::OnceLock<std::result::Result<ProfileList, String>> =
+        std::sync::OnceLock::new();
+    LIST.get_or_init(|| {
+        crate::schedule::windows_powershell(PROFILE_LIST_SCRIPT)
+            .map(|output| ProfileList::parse(&output))
+            .map_err(|error| format!("{error:#}"))
+    })
+    .clone()
+    .map(Some)
+    .map_err(|error| anyhow::anyhow!(error))
+}
+
+#[cfg(all(not(windows), not(test)))]
+fn registered_profiles() -> Result<Option<ProfileList>> {
     Ok(None)
 }
 
@@ -682,14 +800,15 @@ mod tests {
     #[test]
     fn a_profile_must_be_an_absolute_existing_folder_without_percent_or_control_characters() {
         let dir = tempfile::tempdir().unwrap();
+        let percent = dir.path().join("%TEMP%");
+        std::fs::create_dir(&percent).unwrap();
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"x").unwrap();
+        let _listed = list_profiles(&[dir.path(), &percent, &file]);
         assert_eq!(validate_user_home(dir.path()).unwrap(), dir.path());
         assert!(validate_user_home(&dir.path().join("missing")).is_err());
         assert!(validate_user_home(Path::new("relative")).is_err());
-        let file = dir.path().join("file");
-        std::fs::write(&file, b"x").unwrap();
         assert!(validate_user_home(&file).is_err());
-        let percent = dir.path().join("%TEMP%");
-        std::fs::create_dir(&percent).unwrap();
         assert!(validate_user_home(&percent).is_err());
         assert!(validate_user_home(Path::new("/tmp/a\nb")).is_err());
     }
@@ -699,33 +818,88 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let profile = dir.path().join("user");
         std::fs::create_dir(&profile).unwrap();
-        let listed = |paths: Vec<PathBuf>| move || Ok(Some(paths));
+        let listed = |paths: &[&Path]| {
+            let entries = paths
+                .iter()
+                .map(|path| ProfileEntry {
+                    sid: "S-1-5-21-1-1-1-1000".into(),
+                    path: path.to_path_buf(),
+                })
+                .collect();
+            ProfileList {
+                own_sid: None,
+                entries,
+            }
+        };
         assert_eq!(
-            validate_user_home_in(&profile, listed(vec![profile.clone()])).unwrap(),
+            validate_user_home_in(&profile, Some(&listed(&[&profile]))).unwrap(),
             profile
         );
         // Windows compares the paths without case.
         let loud = PathBuf::from(profile.to_string_lossy().to_uppercase());
-        assert!(validate_user_home_in(&profile, listed(vec![loud])).is_ok());
+        assert!(validate_user_home_in(&profile, Some(&listed(&[&loud]))).is_ok());
         // USERPROFILE and a task argument are the caller's words: a folder that is no listed
-        // profile is refused, and so is a registry that cannot be read.
-        let error =
-            validate_user_home_in(&profile, listed(vec![dir.path().join("other")])).unwrap_err();
+        // profile is refused, and so is an empty list.
+        let other = dir.path().join("other");
+        let error = validate_user_home_in(&profile, Some(&listed(&[&other]))).unwrap_err();
         assert!(
             error
                 .to_string()
                 .contains("not the profile of a user account")
         );
-        assert!(validate_user_home_in(&profile, || bail!("registry")).is_err());
+        assert!(validate_user_home_in(&profile, Some(&ProfileList::default())).is_err());
         // A system without the list (not Windows) has no second source.
-        assert!(validate_user_home_in(&profile, || Ok(None)).is_ok());
+        assert!(validate_user_home_in(&profile, None).is_ok());
         #[cfg(unix)]
         {
             let link = dir.path().join("link");
             std::os::unix::fs::symlink(&profile, &link).unwrap();
-            let error = validate_user_home_in(&link, || Ok(None)).unwrap_err();
+            let error = validate_user_home_in(&link, None).unwrap_err();
             assert!(error.to_string().contains("must not be a link"), "{error}");
         }
+    }
+
+    #[test]
+    fn the_default_profile_is_the_one_of_the_token_sid_and_never_userprofile() {
+        let output = "own S-1-5-21-1-2-3-1001\r\n\
+            entry S-1-5-21-1-2-3-1000 C:\\Users\\other\r\n\
+            entry S-1-5-21-1-2-3-1001 C:\\Users\\my account\r\n\
+            entry S-1-12-1-9 C:\\Users\\cloud\r\n\
+            garbage\r\n\
+            entry S-1-5-21-1-2-3-1002 \r\n";
+        let list = ProfileList::parse(output);
+        assert_eq!(list.own_sid.as_deref(), Some("S-1-5-21-1-2-3-1001"));
+        assert_eq!(list.entries.len(), 3);
+        // A standard user who sets USERPROFILE to the profile of another account changes nothing:
+        // the answer comes from the SID.
+        assert_eq!(
+            list.own_profile(),
+            Some(PathBuf::from(r"C:\Users\my account"))
+        );
+        assert_eq!(ProfileList::default().own_profile(), None);
+        let unknown = ProfileList {
+            own_sid: Some("S-1-5-21-9".into()),
+            ..list
+        };
+        assert_eq!(unknown.own_profile(), None);
+        // The one script reads both: the token SID and the list of user accounts.
+        assert!(PROFILE_LIST_SCRIPT.contains("WindowsIdentity]::GetCurrent().User.Value"));
+        assert!(
+            PROFILE_LIST_SCRIPT.contains("S-1-5-21-*")
+                && PROFILE_LIST_SCRIPT.contains("S-1-12-1-*")
+        );
+        assert!(!PROFILE_LIST_SCRIPT.contains("USERPROFILE"));
+    }
+
+    #[test]
+    fn the_default_profile_in_a_test_comes_from_the_listed_profile_of_the_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = dir.path().join("other");
+        {
+            let _listed = list_profiles(&[dir.path(), &other]);
+            assert_eq!(default_user_home(), Some(dir.path().to_path_buf()));
+        }
+        assert_eq!(default_user_home(), None);
     }
 
     #[test]
