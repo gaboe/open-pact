@@ -286,7 +286,7 @@ jobs:
         if: ${{ !contains(github.ref_name, '-') }}
         run: |
           python3 scripts/packaging/generate-release-metadata.py "${GITHUB_REF_NAME#v}" dist/SHA256SUMS \
-            --homebrew-dir dist/Formula --scoop-dir dist/bucket --desktop
+            --homebrew-dir dist/Formula --scoop-dir dist/bucket --desktop --winget-dir dist/winget
       - name: Check the machine package is in the release set
         run: |
           # The MSI is named exactly, so a missing one stops the release before it publishes.
@@ -309,6 +309,7 @@ jobs:
           assets=(dist/open-pact-client* dist/open-pact-desktop-*.zip dist/open-pact-desktop-*.zip.sigstore.json dist/NOTICE dist/NOTICE.sigstore.json dist/SHA256SUMS dist/SHA256SUMS.sigstore.json)
           if [[ ! "$TAG" =~ - ]]; then
             assets+=(dist/Formula/open-pact.rb dist/bucket/open-pact.json dist/bucket/open-pact-desktop.json)
+            assets+=(dist/winget/gaboe.open-pact.yaml dist/winget/gaboe.open-pact.installer.yaml dist/winget/gaboe.open-pact.locale.en-US.yaml)
           fi
           gh release upload "$TAG" "${assets[@]}" --clobber
           release_assets=$(gh release view "$TAG" --json assets --jq '.assets[].name')
