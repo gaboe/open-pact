@@ -69,7 +69,7 @@ On Windows, `vpn/current` is a text pointer, not a directory. A pair reader read
 
 Windows replaces the flat copies sequentially, so they can briefly differ. The selected pair stays complete because readers use `vpn/current` and `vpn/<generation>/`. If a program holds a flat copy open, replacement can fail. The client keeps the new generation selected, marks the flat copies stale, and reports the locked file. Close the program that holds it and run `check` again. Every later start retries the flat-copy refresh. Startup recovery tries the VPN lock without waiting. If another process holds it, recovery warns and continues. `schedule` and `log` never wait for the VPN lock. `install` and `check` take the lock. New Windows files and directories inherit the home ACL. The client does not preserve an explicit ACL from a replaced file.
 
-No scheduled job runs until the signed manifest defines `[schedule]` and you run `open-pact-client schedule on` or answer yes in the join wizard. Before you delete the binary or client home, run `open-pact-client schedule off`. To remove the device key, run `open-pact-client --home <home> delete-device-key` before you delete the home.
+No scheduled job runs until the signed manifest defines `[schedule]` and you run `open-pact-client schedule on` or answer yes in the join wizard. Before you delete the binary or client home, remove the schedule. For a job that runs as you, run `open-pact-client schedule off`. For a Windows SYSTEM job, follow [Stop the scheduled claims](docs/client.md#stop-the-scheduled-claims-and-remove-the-client). To remove the device key, run `open-pact-client --home <home> delete-device-key` before you delete the home.
 
 ## Install the client
 
@@ -513,6 +513,8 @@ open-pact-client folders add ~/projects
 open-pact-client folders remove ~/projects
 ```
 
+These commands suit a job that runs as you. A Windows SYSTEM job needs an elevated prompt and the full-path commands in [Use Windows SYSTEM checks](docs/client.md#use-windows-system-checks).
+
 An `open-pact.toml` from an earlier client is ignored. The first time the client reads a home that has no `device.json`, it carries over what your earlier choices were: the folders of `[managed_repos]` go into `device.json` (they were your own choice, so `folders list` shows them and the wizard still asks step 5), and on Windows an installed SYSTEM job keeps `run_as` SYSTEM. `check` and the job print once that the file is ignored and where each value went. For a SYSTEM job the notice prints the exact command to run from an elevated PowerShell prompt, `schedule on --system` with the full path of the client. The client never deletes the file. The commands `apply`, `finish` and `config example` no longer exist. `~` expands to your user home, folder paths stay on the device, and the folders feed the managed repository checks.
 
 `check` prints each manifest control, its requirement for this OS, the device setting that feeds it, and the result.
@@ -532,9 +534,9 @@ The command runs the same local checks and prints the claim as JSON. It adds `ma
 The scheduled job runs the claim pipeline of `check` on its own. The company chooses the policy in `[schedule]` of the signed manifest: `[schedule.vpn]` works only while the device is on the company VPN, and `[schedule.always]` works on any network. You choose whether the job runs. These commands are examples for a job that runs as your user. A Windows SYSTEM job needs the full-path commands in [Use Windows SYSTEM checks](docs/client.md#use-windows-system-checks):
 
 ```sh
-open-pact-client schedule on --dry-run
-open-pact-client schedule on
-open-pact-client schedule on
+open-pact-client schedule on --user --dry-run
+open-pact-client schedule on --user
+open-pact-client schedule on --user
 ```
 
 `schedule on` refuses when the manifest has no `[schedule]`. It prints the policy line. The first run prints `schedule: install`. The second prints `no changes`. A changed executable path prints `schedule: update`, and so does a job that client 0.7 installed: it wakes every five minutes, and `schedule on` rewrites it to wake every minute. `schedule status` prints the consent line, your choice, the state of the job, the last answered claim, the last check, and when the next check and claim fall due. Dry run prints the planned change and writes nothing. Keep the binary at its installed path. macOS uses a launchd LaunchAgent. Linux uses a systemd user timer and needs a running user manager. Windows uses Task Scheduler. No separate client daemon is needed.
@@ -571,7 +573,7 @@ The job cannot ask you anything. When only you can fix a problem, it writes one 
 
 The client home holds `device.json` with your choices, an applied-settings receipt in `schedule-applied.json`, `report-schedule.lock`, `claim.lock`, and `schedule.log`. `manifest-to-sign.toml` exists only while `join` or `accept` waits for your answer. Limited jobs keep `report-state.json` there. Windows SYSTEM jobs keep their state and their `schedule.log` in the protected SYSTEM directory and use a sibling `<home hash>.lock` file. For a SYSTEM job, `status` reads that log, never a `schedule.log` in the home, and prints one line with the log path and the words "needs an elevated prompt" when your prompt cannot read it (`last_job_log_note` in `--json`). A SYSTEM job refuses a home file or folder that is a link (a junction, a symbolic link, or a second hard link): it neither reads nor changes it, and the run stops with an error in that log. State records connectivity, answered claims, compliance, and pending events. A lock prevents overlapping commands. Each client home has its own job name. An update of a SYSTEM job keeps the job state that it can read. An update of a job that runs as your user writes default state. An upgrade from 0.8.5 or earlier starts with fresh state.
 
-On Windows, remove each SYSTEM task before you uninstall the package. Follow [Stop the scheduled claims](docs/client.md#stop-the-scheduled-claims-and-remove-the-client) from an elevated prompt. For a task of the machine client, the guide gives one command that calls the client by its full path. Removal uses the existing SYSTEM cleanup path when a SYSTEM task or protected state remains. It requires elevation.
+To upgrade a Windows SYSTEM job from 0.8.5 or earlier, follow the [0.9.0 release notes](docs/release-notes/v0.9.0.md). To remove each SYSTEM task before you uninstall the package, follow [Stop the scheduled claims](docs/client.md#stop-the-scheduled-claims-and-remove-the-client) from an elevated prompt. For a task of the machine client, the guide gives one command that calls the client by its full path. Removal uses the existing SYSTEM cleanup path when a SYSTEM task or protected state remains. It requires elevation.
 
 A held state lock stops removal before the task changes and asks you to retry. Incomplete cleanup returns an error and lists the remaining files. Lock files remain. Retry with the same full-path command after the client stops or Windows restarts.
 
@@ -590,14 +592,14 @@ not receive explicit access. Hosted Windows CI did not verify signing under a st
 or SYSTEM task token, so scheduler use under those tokens remains unverified.
 Creation requires an elevated administrator prompt. If the provider is unavailable,
 the client warns and uses a software key. `--software-key` forces software on a new home.
-Existing software keys stay in use. Before rotation, remove the old schedule and run
+Existing software keys stay in use. Before rotation, remove the old schedule (for a Windows SYSTEM job, follow [Stop the scheduled claims](docs/client.md#stop-the-scheduled-claims-and-remove-the-client)) and run
 `open-pact-client --home <old-home> delete-device-key`. To rotate to TPM, use a new `--home`, join again,
 and replace the old enrolment and scheduler registration.
 The home stores only the TPM key name in `device-tpm.key`. Keep this marker with the home.
 TPM claims request `L1`, like Secure Enclave claims. The gateway verifies them as `L0`
 until hardware attestation is supported. Real TPM signing is unverified on hosted CI.
 See [platform support](docs/platform-support.md#key-protection) for the test limits.
-For full uninstall, remove the schedule first. Run `open-pact-client --home <home> delete-device-key` before deleting the home or binary.
+For full uninstall, remove the schedule first (for a Windows SYSTEM job, follow [Stop the scheduled claims](docs/client.md#stop-the-scheduled-claims-and-remove-the-client)). Run `open-pact-client --home <home> delete-device-key` before deleting the home or binary.
 Schedule removal keeps the device key. Key deletion removes the persisted CNG key, its marker, and any software device key file.
 On Windows, run key deletion as the user who created the key or as SYSTEM. A different administrator has no explicit key access.
 Windows CI checks creator deletion after removal of administrator membership, SYSTEM deletion, and refusal for a different administrator through the software CNG provider.
