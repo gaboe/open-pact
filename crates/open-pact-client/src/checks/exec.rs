@@ -33,7 +33,11 @@ pub fn run_with_timeout(program: &str, args: &[&str], timeout: Duration) -> Opti
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
-fn run_status_with_timeout(program: &str, args: &[&str], timeout: Duration) -> Option<Ran> {
+pub(super) fn run_status_with_timeout(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> Option<Ran> {
     let output = capture(program, args, timeout).ok()?;
     if output.timed_out {
         return None;
