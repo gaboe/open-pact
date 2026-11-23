@@ -354,8 +354,9 @@ fn tree_step(
         }
         let taken = std::mem::take(&mut *frontier);
         let published = snap.clone();
+        let blocking_hooks = hooks.clone();
         let built = tokio::task::spawn_blocking(move || {
-            catch_up(&published.log, &view, taken, from, batch)
+            catch_up(&published.log, &view, taken, from, batch, &blocking_hooks)
         })
         .await?;
         let (grown, view) = built;
@@ -377,11 +378,13 @@ fn catch_up(
     mut frontier: Frontier,
     from: u64,
     batch: RowBatch,
+    hooks: &hooks::Hooks,
 ) -> (Frontier, anyhow::Result<Arc<LogView>>) {
     let (rows, freed) = batch.into_parts();
     let entries = translog::decode(&rows, from);
     drop(rows);
     drop(freed);
+    hooks.block("cache_catch_up");
     let entries = match entries {
         Ok(entries) => entries,
         Err(error) => return (frontier, Err(error)),
