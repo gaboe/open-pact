@@ -429,8 +429,8 @@ impl Drop for ProfileGuard {
     }
 }
 
-/// How many times this thread read the profile list, for the tests that show a command that needs
-/// no SYSTEM profile reads none.
+// How many times this thread read the profile list, for the tests that show a command that needs
+// no SYSTEM profile reads none.
 #[cfg(test)]
 thread_local! {
     pub(crate) static PROFILE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
