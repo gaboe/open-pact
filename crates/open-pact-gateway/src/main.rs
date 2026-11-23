@@ -13,6 +13,8 @@ mod metrics;
 mod nonces;
 mod ratelimit;
 mod results;
+#[cfg(test)]
+mod s1_tests;
 mod seal;
 mod served;
 mod siem;

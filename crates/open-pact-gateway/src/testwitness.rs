@@ -2,7 +2,7 @@
 //! "latest" map and a real witness key, so its 200, 409 and 422 answers are the real witness's.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -22,6 +22,8 @@ pub enum Behaviour {
     Delay(Duration),
     /// Decides and stores, then drops the answer (a 500).
     StoreThenFail,
+    /// Sleeps, then answers this status and stores nothing.
+    DelayAnswer(Duration, u16),
 }
 
 #[derive(Clone, Debug)]
@@ -29,6 +31,8 @@ pub struct Received {
     pub size: u64,
     pub old_size: u64,
     pub status: u16,
+    /// When the push arrived, and when the witness answered.
+    pub arrived: Instant,
     pub at: Instant,
 }
 
@@ -39,7 +43,7 @@ pub struct Inner {
     latest: Mutex<BTreeMap<String, Checkpoint>>,
     behaviour: Mutex<Behaviour>,
     received: Mutex<Vec<Received>>,
-    offset: AtomicI64,
+    arrivals: std::sync::atomic::AtomicUsize,
     /// A decision gate: while set, a push waits for a permit before it decides.
     gate: Mutex<Option<Arc<Notify>>>,
 }
@@ -75,7 +79,7 @@ impl FakeWitness {
             latest: Mutex::default(),
             behaviour: Mutex::new(Behaviour::Healthy),
             received: Mutex::default(),
-            offset: AtomicI64::new(0),
+            arrivals: std::sync::atomic::AtomicUsize::new(0),
             gate: Mutex::default(),
         });
         let router = Router::new()
@@ -100,8 +104,22 @@ impl FakeWitness {
         gate
     }
 
-    pub fn ungate(&self) {
-        *self.inner.gate.lock().unwrap() = None;
+    /// Removes the gate and lets every push that waits at it decide.
+    pub fn open_gate(&self) {
+        let gate = self.inner.gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.notify_waiters();
+        }
+    }
+
+    /// How many pushes arrived, decided or not.
+    pub fn arrivals(&self) -> usize {
+        self.inner.arrivals.load(Ordering::SeqCst)
+    }
+
+    /// A line of this witness for `cp` made at `at`, as if it had cosigned then.
+    pub fn cosign(&self, cp: &Checkpoint, at: u64) -> open_pact_core::NoteSignature {
+        self.inner.key.cosign(&self.inner.signer, cp, at)
     }
 
     pub fn received(&self) -> Vec<Received> {
@@ -129,10 +147,6 @@ impl FakeWitness {
             .unwrap()
             .insert(cp.origin.clone(), cp);
     }
-
-    pub fn clock_offset(&self, secs: i64) {
-        self.inner.offset.store(secs, Ordering::SeqCst);
-    }
 }
 
 async fn add(State(w): State<Arc<Inner>>, body: String) -> (StatusCode, String) {
@@ -140,16 +154,24 @@ async fn add(State(w): State<Arc<Inner>>, body: String) -> (StatusCode, String) 
         return (StatusCode::BAD_REQUEST, "bad body".into());
     };
     let size = Checkpoint::parse(&req.note.text).map_or(0, |c| c.size);
+    let arrived = Instant::now();
+    w.arrivals.fetch_add(1, Ordering::SeqCst);
     let record = |status: u16| {
         w.received.lock().unwrap().push(Received {
             size,
             old_size: req.old_size,
             status,
+            arrived,
             at: Instant::now(),
         });
     };
     let behaviour = w.behaviour.lock().unwrap().clone();
     if let Behaviour::Answer(code) = behaviour {
+        record(code);
+        return (StatusCode::from_u16(code).unwrap(), "fake".into());
+    }
+    if let Behaviour::DelayAnswer(delay, code) = behaviour {
+        tokio::time::sleep(delay).await;
         record(code);
         return (StatusCode::from_u16(code).unwrap(), "fake".into());
     }
@@ -168,9 +190,7 @@ async fn add(State(w): State<Arc<Inner>>, body: String) -> (StatusCode, String) 
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs();
-            let at = u64::try_from(i64::try_from(now).unwrap() + w.offset.load(Ordering::SeqCst))
-                .unwrap_or(0);
-            let line = w.key.cosign(&w.signer, &cp, at);
+            let line = w.key.cosign(&w.signer, &cp, now);
             latest.insert(cp.origin.clone(), cp);
             if matches!(behaviour, Behaviour::StoreThenFail) {
                 record(500);

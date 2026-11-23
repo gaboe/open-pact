@@ -231,6 +231,9 @@ impl Shared {
 pub struct Owners {
     shared: Arc<Shared>,
     owners: Vec<OwnerHandle>,
+    /// Test only: how many Push fan-outs ran.
+    #[cfg(test)]
+    pub fanouts: std::sync::atomic::AtomicUsize,
 }
 
 impl Owners {
@@ -270,7 +273,12 @@ impl Owners {
                 OwnerHandle { jobs, wake, view }
             })
             .collect();
-        Ok(Owners { shared, owners })
+        Ok(Owners {
+            shared,
+            owners,
+            #[cfg(test)]
+            fanouts: std::sync::atomic::AtomicUsize::new(0),
+        })
     }
 
     pub fn is_empty(&self) -> bool {
@@ -279,11 +287,6 @@ impl Owners {
 
     pub fn hooks(&self) -> Arc<Hooks> {
         self.shared.hooks.clone()
-    }
-
-    #[cfg(test)]
-    pub fn keys(&self) -> Vec<WitnessKey> {
-        self.shared.keys.lock().expect("owner keys").clone()
     }
 
     /// Adds the witness keys of a manifest this process starts to enforce.
@@ -322,11 +325,6 @@ impl Owners {
         }
     }
 
-    #[cfg(test)]
-    pub fn wanted(&self) -> u64 {
-        self.shared.wanted.load(Ordering::SeqCst)
-    }
-
     /// Queues a Push of `cp` at every owner, in one order, and returns the replies.
     pub fn push_all(
         &self,
@@ -336,6 +334,8 @@ impl Owners {
         keys: &Arc<[WitnessKey]>,
     ) -> Vec<oneshot::Receiver<Outcome>> {
         let _order = self.shared.ingress.lock().expect("owner ingress");
+        #[cfg(test)]
+        self.fanouts.fetch_add(1, Ordering::SeqCst);
         self.owners
             .iter()
             .map(|owner| {
