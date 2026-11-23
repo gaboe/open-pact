@@ -53,7 +53,7 @@ enum Operation {
     Accept,
     Schedule(bool),
     UpdateCli(String),
-    RemoveCopy(OtherCopy, Option<PathBuf>),
+    RemoveCopy(OtherCopy),
 }
 
 enum Outcome {
@@ -62,6 +62,8 @@ enum Outcome {
     Installed(Opened),
     Preview(JoinPreview),
     Status(Report),
+    /// A schedule change: the status, and the executable that the user job records now.
+    Scheduled(Report, Option<PathBuf>),
     Joined(Report, Option<ClaimReport>),
     /// The join stopped before it sent anything: it needs an elevated process.
     NeedsElevation,
@@ -94,7 +96,9 @@ impl Outcome {
                     "does not match"
                 }
             ),
-            Self::Status(status) | Self::Joined(status, _) => verdict_word(status.verdict).into(),
+            Self::Status(status) | Self::Scheduled(status, _) | Self::Joined(status, _) => {
+                verdict_word(status.verdict).into()
+            }
             Self::NeedsElevation => "needs an administrator; nothing was sent".into(),
             Self::Restarted => "the administrator copy of the app started".into(),
             Self::Check(check, _) if check.accepted => "accepted".into(),
@@ -315,7 +319,12 @@ impl AppView {
                             .await
                             .map_err(|e| format!("{e:#}"))?;
                     }
-                    status_of(&session).await.map(Outcome::Status)
+                    // The job changed: the executable it records is read again, never kept.
+                    let status = status_of(&session).await?;
+                    Ok(Outcome::Scheduled(
+                        status,
+                        session.job_executable().ok().flatten(),
+                    ))
                 },
             ),
             Operation::UpdateCli(line) => engine.call(
@@ -330,11 +339,12 @@ impl AppView {
                         .map(Outcome::Status)
                 },
             ),
-            Operation::RemoveCopy(copy, active) => {
+            Operation::RemoveCopy(copy) => {
                 engine.call("Remove another copy", Outcome::summary, async move {
-                    let (run, target) = (runner.clone(), copy);
+                    let (run, target, home) = (runner.clone(), copy, installed.clone());
+                    // The live receipt decides what the job runs now, not what the window saw at open.
                     let output = engine::blocking(move || {
-                        engine::remove_copy(&run, &target, active.as_deref())
+                        engine::remove_copy(&run, &target, || engine::live_active(&home))
                     })
                     .await?;
                     let others = engine::blocking(move || {
@@ -430,6 +440,10 @@ impl AppView {
                 self.screen = Screen::Review(Arc::new(preview));
             }
             Ok(Outcome::Status(status)) => self.show_status(status),
+            Ok(Outcome::Scheduled(status, active)) => {
+                self.active = active;
+                self.show_status(status);
+            }
             Ok(Outcome::Joined(status, claim)) => {
                 // A denied first claim is a result, not a failure: show which checks failed.
                 if let Some(claim) = claim {
@@ -500,7 +514,6 @@ impl AppView {
             ownership::first_removable(&self.others, Platform::current(), self.active.as_deref())
         {
             let copy = copy.clone();
-            let active = self.active.clone();
             let runs_only = if self.system_job {
                 "the machine client for all users".to_owned()
             } else {
@@ -533,7 +546,7 @@ impl AppView {
                                 .disabled(self.busy)
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.run(
-                                        Operation::RemoveCopy(copy.clone(), active.clone()),
+                                        Operation::RemoveCopy(copy.clone()),
                                         cx,
                                     )
                                 })),
@@ -1149,6 +1162,49 @@ fn snapshots(output: PathBuf) {
 mod tests {
     // Named imports: a glob would bring in the `#[gpui::test]` macro in place of `#[test]`.
     use super::{Outcome, join_failure};
+    #[cfg(feature = "snapshot")]
+    use runner::{ownership, samples};
+    #[cfg(feature = "snapshot")]
+    use std::path::{Path, PathBuf};
+
+    #[cfg(feature = "snapshot")]
+    /// What the app protects after `outcome`, given what it protected before.
+    fn protected_after(outcome: Outcome, before: Option<PathBuf>) -> Option<PathBuf> {
+        match outcome {
+            Outcome::Scheduled(_, active) => active,
+            _ => before,
+        }
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[test]
+    fn a_schedule_change_replaces_the_protected_path() {
+        let old = PathBuf::from("/opt/fictional/bin/open-pact-client");
+        let copy = ownership::OtherCopy::new(old.clone(), ownership::Source::Other);
+        let protected = |active: &Option<PathBuf>| ownership::is_active(&copy, active.as_deref());
+        let before = Some(old.clone());
+        assert!(protected(&before));
+        // The SYSTEM job replaced the user job, or `schedule off` removed it: nothing is kept.
+        let gone = protected_after(
+            Outcome::Scheduled(samples::report_good(), None),
+            before.clone(),
+        );
+        assert!(!protected(&gone));
+        // A rewrite to the installed copy protects that copy only.
+        let installed = PathBuf::from("/home/fictional/.local/bin/open-pact-client");
+        let moved = protected_after(
+            Outcome::Scheduled(samples::report_good(), Some(installed.clone())),
+            before.clone(),
+        );
+        assert_eq!(moved.as_deref(), Some(installed.as_path()));
+        assert!(!protected(&moved));
+        // An operation that does not touch the job keeps what was read.
+        let kept = protected_after(Outcome::Status(samples::report_good()), before.clone());
+        assert_eq!(
+            kept.as_deref(),
+            Some(Path::new("/opt/fictional/bin/open-pact-client"))
+        );
+    }
 
     #[test]
     fn a_refusal_for_lack_of_elevation_maps_to_the_administrator_step() {
