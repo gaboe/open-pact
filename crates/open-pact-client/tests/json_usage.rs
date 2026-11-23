@@ -112,8 +112,7 @@ async fn a_json_join_survives_a_closed_stderr_pipe() {
                 published.clone()
             } else if request.starts_with("GET /v1/log/key ") {
                 log.vkey().to_string()
-            } else if (request.starts_with("GET /v1/log/checkpoint ")
-                || request.starts_with("GET /v1/log/checkpoint?")) {
+            } else if request.starts_with("GET /v1/log/checkpoint") {
                 // Some hosts suppress SIGPIPE from pipe writes. Deliver the same signal at
                 // the warning boundary so this also checks real main's signal disposition.
                 let pid = client_pid.load(std::sync::atomic::Ordering::Relaxed);

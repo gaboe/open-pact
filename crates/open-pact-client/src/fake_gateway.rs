@@ -13,15 +13,11 @@ use tokio::net::TcpListener;
 
 pub const DEMO_MANIFEST: &str = include_str!("../../../examples/manifest.toml");
 
-/// Answers a request line such as `GET /v1/manifest`; `nth` counts earlier requests with the same line.
-pub type Respond = dyn Fn(&str, usize) -> (u16, String) + Send + Sync;
-
-/// A full scripted answer: status, body, extra headers and a delay before it is sent.
+/// A full scripted answer: status, body and extra headers.
 pub struct Reply {
     pub status: u16,
     pub body: String,
     pub headers: Vec<(String, String)>,
-    pub delay: std::time::Duration,
 }
 
 impl Reply {
@@ -30,7 +26,6 @@ impl Reply {
             status,
             body: body.into(),
             headers: Vec::new(),
-            delay: std::time::Duration::ZERO,
         }
     }
 
@@ -38,12 +33,10 @@ impl Reply {
         self.headers.push((name.into(), value.into()));
         self
     }
-
-    pub fn after(mut self, delay: std::time::Duration) -> Self {
-        self.delay = delay;
-        self
-    }
 }
+
+/// A raw request target and its `policy` parameter.
+type Target = (String, Option<String>);
 
 type RespondFull = dyn Fn(&str, usize) -> Reply + Send + Sync;
 
@@ -52,7 +45,7 @@ pub struct FakeGateway {
     requests: Arc<Mutex<Vec<String>>>,
     bodies: Arc<Mutex<Vec<(String, String)>>>,
     /// The raw request target of every request, and its `policy` parameter if it had one.
-    targets: Arc<Mutex<Vec<(String, Option<String>)>>>,
+    targets: Arc<Mutex<Vec<Target>>>,
 }
 
 impl FakeGateway {
@@ -66,7 +59,7 @@ impl FakeGateway {
         .await
     }
 
-    /// Like `start`, with headers and a delay. The `policy` query parameter is cut from the
+    /// Like `start`, with headers. The `policy` query parameter is cut from the
     /// request line the closure sees; `policies` and `targets` keep it.
     pub async fn start_with(
         respond: impl Fn(&str, usize) -> Reply + Send + Sync + 'static,
@@ -104,11 +97,7 @@ impl FakeGateway {
                         status,
                         body,
                         headers,
-                        delay,
                     } = respond(&line, nth);
-                    if !delay.is_zero() {
-                        tokio::time::sleep(delay).await;
-                    }
                     if status == 0 {
                         return;
                     }
