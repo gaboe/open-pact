@@ -178,7 +178,7 @@ In Helm, set `siem.enabled=true`, `siem.syslogUrl`, `siem.caSecret.name`, and `s
 
 Claim handling queues events without network or file writes. The delivery thread retries failures after 1, 2, 4, 8, 16, and 32 seconds, then every 60 seconds. Connect, socket read, and socket write timeouts are 5 seconds. DNS resolution runs only in the delivery thread.
 
-The queue holds at most 1024 events, including the event being sent. Overflow drops the oldest event and increments `siem_dropped_total`. A separate reporter logs the drop count delta once per minute when it changes. It reports drops even if delivery is blocked. No metrics endpoint exists.
+The queue holds at most 1024 events, including the event being sent. Overflow drops the oldest event and increments `siem_dropped_total`. A separate reporter logs the drop count delta once per minute when it changes. It reports drops even if delivery is blocked. The optional metrics endpoint ([Observe the gateway](docs/gateway.md#observe-the-gateway)) does not expose the drop count.
 
 An event already being sent can still arrive after the queue drops it. A retry cannot remove a newer event. The queue is in memory, so a restart or shutdown loses queued events. TLS write success does not prove manager ingestion. Retries can produce duplicates. This export does not guarantee audit delivery.
 
