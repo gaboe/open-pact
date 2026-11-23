@@ -37,7 +37,7 @@ impl Notice {
                     machine_upgrade(&exe, &crate::machine::machine_path(), &self.latest)
                 }) {
                     line.push_str(&format!(
-                        "\nUpgrade the machine client from an elevated PowerShell prompt:\n{block}"
+                        "\nUpgrade the machine client from an elevated Windows PowerShell 5.1 prompt (powershell.exe, not pwsh):\n{block}"
                     ));
                 }
                 line
