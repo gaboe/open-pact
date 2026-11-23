@@ -250,6 +250,11 @@ jobs:
         with:
           name: release-signatures
           path: dist
+      - uses: dtolnay/rust-toolchain@1.100.0
+      - name: Verify that the release workflow signed SHA256SUMS
+        env:
+          TAG: ${{ github.ref_name }}
+        run: cargo run --locked --release -p open-pact-client --example verify_release -- "$TAG" "$GITHUB_REPOSITORY" dist/SHA256SUMS dist/SHA256SUMS.sigstore.json
       - name: Generate package manager metadata
         if: ${{ !contains(github.ref_name, '-') }}
         run: |
