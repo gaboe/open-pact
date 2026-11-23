@@ -140,6 +140,20 @@ pub fn add_checkpoint(
     }
 }
 
+/// Whether a cosignature made at `t` counts at `now` (Unix seconds): not further in the future than
+/// the clock skew and no older than `checkpoint_max_age` less `age_margin`. A time test only; the
+/// caller has checked the signature. The client calls it with no margin. The gateway keeps a margin so
+/// a note it chose stays usable while the client checks it.
+pub fn cosign_time_usable(policy: &LogPolicy, t: u64, now: u64, age_margin: u64) -> bool {
+    let max_age = policy
+        .checkpoint_max_age
+        .min_duration()
+        .and_then(|d| u64::try_from(d.whole_seconds()).ok())
+        .unwrap_or(u64::MAX);
+    t <= now.saturating_add(CLOCK_SKEW_SECS)
+        && now.saturating_sub(t) <= max_age.saturating_sub(age_margin)
+}
+
 /// Checks the manifest's witness policy: at least `witness_quorum` of the listed witnesses
 /// cosigned `checkpoint`, each no longer than `checkpoint_max_age` ago. Returns the names that
 /// count. `now` is Unix seconds.
@@ -152,11 +166,6 @@ pub fn verify_cosignatures<'p>(
     let Some(policy) = policy else {
         return Ok(vec![]);
     };
-    let max_age = policy
-        .checkpoint_max_age
-        .min_duration()
-        .and_then(|d| u64::try_from(d.whole_seconds()).ok())
-        .unwrap_or(u64::MAX);
     let mut counted = vec![];
     let mut problems = vec![];
     for w in &policy.witnesses {
@@ -165,9 +174,10 @@ pub fn verify_cosignatures<'p>(
             .iter()
             .filter_map(|s| w.key.verify(checkpoint, s))
             .collect();
-        let fresh = times.iter().filter_map(|t| t.as_ref().ok()).find(|&&t| {
-            t <= now.saturating_add(CLOCK_SKEW_SECS) && now.saturating_sub(t) <= max_age
-        });
+        let fresh = times
+            .iter()
+            .filter_map(|t| t.as_ref().ok())
+            .find(|&&t| cosign_time_usable(policy, t, now, 0));
         match (fresh, times.as_slice()) {
             (Some(_), _) => counted.push(w.name.as_str()),
             (None, []) => problems.push(format!("{}: no cosignature", w.name)),
@@ -445,6 +455,33 @@ mod tests {
         };
         let err = verify_cosignatures(Some(&policy(1, &[&w1])), &other, &note, NOW).unwrap_err();
         assert!(err.to_string().contains("does not verify"), "{err}");
+    }
+
+    #[test]
+    fn usable_quorum_edges() {
+        let (_, w1) = witness(1);
+        let p = policy(1, &[&w1]);
+        // The gateway's margin of 300 s: 3300 s old is usable, 3301 s is not.
+        assert!(cosign_time_usable(&p, NOW - 3300, NOW, 300));
+        assert!(!cosign_time_usable(&p, NOW - 3301, NOW, 300));
+        // The client accepts the 3300 s line 300 s later, at age 3600.
+        let f = Fixture::new();
+        let cp = f.checkpoint(5);
+        let (s1, _) = witness(1);
+        let mut note = f.key.sign(&f.signer, &cp);
+        note.signatures.push(w1.key.cosign(&s1, &cp, NOW - 3300));
+        assert!(verify_cosignatures(Some(&p), &cp, &note, NOW + 300).is_ok());
+        assert!(verify_cosignatures(Some(&p), &cp, &note, NOW + 301).is_err());
+        // The future edge has no margin for either function.
+        for margin in [0, 300] {
+            assert!(cosign_time_usable(&p, NOW + CLOCK_SKEW_SECS, NOW, margin));
+            assert!(!cosign_time_usable(
+                &p,
+                NOW + CLOCK_SKEW_SECS + 1,
+                NOW,
+                margin
+            ));
+        }
     }
 
     #[test]

@@ -52,12 +52,11 @@ pub async fn active(db: &PgPool) -> anyhow::Result<Option<Version>> {
 
 pub fn enforced(toml: &str, keys: &Keys, version: Option<i64>) -> anyhow::Result<Enforced> {
     let manifest = Manifest::parse(toml.as_bytes())?;
-    let log = Log {
-        key: log_key(keys)?,
-        signer: keys.log.clone(),
-        witnesses: Witnesses::new(witness_urls(), manifest.body().log.as_ref())?,
-        cache: Mutex::default(),
-    };
+    let log = Log::new(
+        keys.log.clone(),
+        log_key(keys)?,
+        Witnesses::new(manifest.body().log.as_ref()),
+    );
     Ok(Enforced {
         siem: None,
         company: Endorsement::sign(&keys.manifest, manifest.hash()),
@@ -65,6 +64,7 @@ pub fn enforced(toml: &str, keys: &Keys, version: Option<i64>) -> anyhow::Result
         toml: toml.into(),
         log: Arc::new(log),
         version,
+        revision: 0,
     })
 }
 
@@ -99,7 +99,10 @@ async fn change(
         }
     };
     let enforced = enforced(&toml, keys, version)?;
-    witness_refresh(&enforced.manifest, &enforced.log.witnesses)?;
+    witness_refresh(
+        &enforced.manifest,
+        !witness::normalize_urls(witness_urls()).is_empty(),
+    )?;
     let hash = enforced.manifest.hash().to_string();
     sqlx::query("UPDATE manifest_versions SET active = false WHERE active")
         .execute(&mut *tx)
