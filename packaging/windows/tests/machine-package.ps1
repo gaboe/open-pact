@@ -31,6 +31,11 @@ function Set-WorkspaceVersion {
     $regex = [regex]::new('(?ms)(^\[workspace\.package\]\r?\n(?:(?!^\[).*?\r?\n)*?version = )"[^"]*"')
     if (-not $regex.IsMatch($text)) { throw 'Cargo.toml has no [workspace.package] version.' }
     $updated = $regex.Replace($text, { param($match) $match.Groups[1].Value + '"' + $Version + '"' }, 1)
+    # The workspace pins open-pact-core to the workspace version, so the fixture
+    # build must move that requirement with it.
+    $core = [regex]::new('(?m)(^open-pact-core = \{[^}\r\n]*version = )"[^"]*"')
+    if (-not $core.IsMatch($updated)) { throw 'Cargo.toml has no open-pact-core version requirement.' }
+    $updated = $core.Replace($updated, { param($match) $match.Groups[1].Value + '"' + $Version + '"' }, 1)
     Set-Content -LiteralPath $cargoToml -Value $updated -NoNewline
 }
 
