@@ -40,6 +40,8 @@ probe() {
     --ignored --nocapture 2>&1)"; then
     tail -20 <<< "$out"; echo "FAIL: phase $1"; exit 1
   fi
+  # A filter that matches nothing still exits 0: require at least one passed test.
+  grep -qE '[1-9][0-9]* passed' <<< "$out" || { tail -20 <<< "$out"; echo "FAIL: phase $1 ran no tests"; exit 1; }
   grep -E 'wal_sync|READY|after the crash' <<< "$out" || true
 }
 ready
