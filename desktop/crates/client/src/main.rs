@@ -79,7 +79,7 @@ impl Outcome {
             format!(
                 "{}, other copies of the command line tool: {}",
                 verdict_word(opened.status.verdict),
-                opened.others.len()
+                ownership::other_count(&opened.others)
             )
         };
         match self {
@@ -133,6 +133,12 @@ struct AppView {
     removal_output: Option<String>,
     /// The device runs its scheduled job as SYSTEM. Only an elevated process can install it.
     system_job: bool,
+    /// Turning automatic sending on goes through the machine client and the administrator prompt:
+    /// a SYSTEM job, or a SYSTEM choice that is still pending.
+    system_route: bool,
+    /// The pending SYSTEM choice waits for a step that the status names, so the switch must not
+    /// install a user job in its place.
+    enable_blocked: bool,
     /// Fixtures set this RFC 3339 time. The app uses the real clock.
     clock: Option<String>,
     update: UpdateState,
@@ -168,6 +174,8 @@ impl AppView {
             others: Vec::new(),
             removal_output: None,
             system_job: false,
+            system_route: false,
+            enable_blocked: false,
             clock: None,
             update: UpdateState::None,
         }
@@ -185,7 +193,7 @@ impl AppView {
             let steps = steps.clone();
             move |step: JoinStep| steps.lock().unwrap_or_else(|e| e.into_inner()).push(step)
         };
-        let system_job = self.system_job;
+        let system_route = self.system_route;
         match operation {
             Operation::Open => engine.call("Open", Outcome::summary, async move {
                 engine::open(runner, log, bundled, installed)
@@ -291,7 +299,7 @@ impl AppView {
                 Outcome::summary,
                 async move {
                     let session = engine::session(&installed)?;
-                    if enabled && cfg!(windows) && system_job {
+                    if enabled && cfg!(windows) && system_route {
                         let home = session.home().to_path_buf();
                         engine::blocking(move || engine::install_system_job(&runner, &log, &home))
                             .await?;
@@ -333,6 +341,14 @@ impl AppView {
 
     fn run(&mut self, operation: Operation, cx: &mut Context<Self>) {
         if self.busy {
+            return;
+        }
+        if matches!(operation, Operation::Schedule(true)) && self.enable_blocked {
+            self.error = Some(
+                "Automatic sending waits for the SYSTEM job. Install the machine client, or remove the other task, as the notice on this screen says. Then press Install job."
+                    .into(),
+            );
+            cx.notify();
             return;
         }
         self.busy = true;
@@ -443,6 +459,8 @@ impl AppView {
 
     fn show_status(&mut self, status: Report) {
         self.system_job = status.schedule.system_job;
+        self.system_route = job_install(&status.schedule) == JobInstall::System;
+        self.enable_blocked = enable_blocked(&status.schedule);
         self.screen = if status.approval.state.is_none() && status.manifest.is_none() {
             Screen::Invitation
         } else {
@@ -456,14 +474,21 @@ impl AppView {
             return None;
         }
         let mut view = column().gap_2();
-        if let Some(copy) = self.others.first().cloned() {
-            if let Some(removal) = ownership::removal(&copy, Platform::current()) {
-                view = view
+        // The machine client can come first on PATH. It never hides a copy that the app can remove.
+        if let Some((copy, removal)) = ownership::first_removable(&self.others, Platform::current())
+        {
+            let copy = copy.clone();
+            let runs_only = if self.system_job {
+                "the machine client for all users".to_owned()
+            } else {
+                self.installed.display().to_string()
+            };
+            view = view
                 .child(banner(
                     format!(
-                        "Another open-pact command line tool is on this computer: {}. The scheduled job runs only the copy this app installed, {}. Remove the other copy so that it cannot run by itself.",
+                        "Another open-pact command line tool is on this computer: {}. The scheduled job runs only {}. Remove the other copy so that it cannot run by itself.",
                         copy.path.display(),
-                        self.installed.display()
+                        runs_only
                     ),
                     BLUE_INK,
                     BLUE_WASH,
@@ -484,11 +509,12 @@ impl AppView {
                                 })),
                         ),
                 );
-            } else {
-                view = view.child(note(
-                    "Machine client for all users, managed by an administrator",
-                ));
-            }
+        }
+        if let Some(machine) = ownership::machine_copy(&self.others) {
+            view = view.child(note(format!(
+                "Machine client for all users, managed by an administrator: {}",
+                machine.path.display()
+            )));
         }
         if let Some(output) = &self.removal_output {
             view = view
@@ -543,11 +569,15 @@ impl AppView {
                 };
                 column()
                     .child(title("Set up open-pact on this computer"))
-                    .child(div().text_color(rgb(INK_2)).child("The scheduled check runs a small command line tool that comes with this app. The app puts it in a fixed place so the check keeps working when you move or update the app, and keeps it up to date. No other copy runs the check."))
+                    .child(div().text_color(rgb(INK_2)).child("The app puts the small command line tool that comes with it in a fixed place, so the check keeps working when you move or update the app, and keeps it up to date. A scheduled check that runs as you runs this copy and no other."))
                     .child(table()
                         .child(row("Command line tool", div().font_family(mono()).text_size(px(13.)).child(location)))
                         .child(row("Version", version)))
-                    .when(self.system_job, |column| column.child(note("Machine client for all users: %ProgramFiles%\\open-pact-client\\open-pact-client.exe, installed by an administrator, IT or the release MSI.")))
+                    .when(cfg!(windows), |column| column.child(note(if self.system_job {
+                        "This computer runs its scheduled check as SYSTEM, with the machine client for all users: %ProgramFiles%\\open-pact-client\\open-pact-client.exe. This copy does not run it."
+                    } else {
+                        "A scheduled check that runs as SYSTEM uses the machine client for all users instead: %ProgramFiles%\\open-pact-client\\open-pact-client.exe, installed by an administrator, IT or the release MSI."
+                    })))
                     .child(column().gap_1()
                         .child(Checkbox::new("also-terminal").label("Also use it in Terminal").checked(self.also_terminal).disabled(self.busy)
                             .on_click(cx.listener(|this, checked: &bool, _, cx| { this.also_terminal = *checked; cx.notify(); })))
@@ -670,11 +700,10 @@ impl AppView {
                         .child(row("Scheduled job", {
                             let raw = status.schedule.job.clone();
                             div().flex().items_center().gap_3().child(job_text(&raw))
-                                .when(install_button_shown(self.system_job, status.schedule.job_status, status.schedule.machine_client, &raw), |value| value.child(Button::new("install-job").label(if self.system_job { "Install job (administrator)" } else { "Install job" }).small().disabled(self.busy)
+                                .when(install_button_shown(&status.schedule, &raw), |value| value.child(Button::new("install-job").label(if self.system_route { "Install job (administrator)" } else { "Install job" }).small().disabled(self.busy)
                                     .on_click(cx.listener(|this, _, _, cx| this.run(Operation::Schedule(true), cx)))))
                         }))
-                        .when_some(status.schedule.job_fix.clone(), |table, text| table.child(row("Job check", text)))
-                        .when_some(status.schedule.machine_fix.clone(), |table, text| table.child(row("Machine client", text)))
+                        .children(schedule_fix_rows(&status.schedule, &status.issues).into_iter().map(|(label, text)| row(label, text.to_owned())))
                         .child(row("What is checked", div().flex().flex_col().items_end().gap_1()
                             .child(div().flex().items_center().gap_2().child("Signed by you").when_some(signed, |line, hash| line.child(hash_chip(&hash))))
                             .when_some(agreement, |col, text| col.child(note(text))))));

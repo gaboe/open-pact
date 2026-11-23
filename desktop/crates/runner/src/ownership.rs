@@ -173,11 +173,15 @@ pub fn removal(copy: &OtherCopy, platform: Platform) -> Option<Removal> {
 /// Every `name` on `path_var` except the files in `own` (the installed copy and the copy
 /// bundled with the app). A file that two PATH entries reach counts once. A Scoop shim counts as
 /// the file it names, so the shim of the bundled copy is not another copy.
+///
+/// A file that is `machine`, the machine client, or a Scoop shim that names it, is the one entry
+/// of source `MachineClient`, at the machine client's own path. The app shows it and never removes it.
 pub fn other_copies(
     path_var: &OsStr,
     name: &str,
     own: &[PathBuf],
     brew_roots: &[PathBuf],
+    machine: Option<&Path>,
 ) -> Vec<OtherCopy> {
     let resolve = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let is_own = |path: &Path| own.iter().any(|own| same_path(own, path));
@@ -197,6 +201,12 @@ pub fn other_copies(
             continue;
         }
         seen.push(resolved.clone());
+        if let Some(machine) =
+            machine.filter(|machine| same_path(machine, &path) || same_path(machine, &target))
+        {
+            found.push(OtherCopy::new(machine.to_path_buf(), Source::MachineClient));
+            continue;
+        }
         let source = classify(&path, &resolved, brew_roots);
         found.push(OtherCopy {
             brew: (source == Source::Homebrew)
@@ -212,13 +222,27 @@ pub fn other_copies(
     found
 }
 
-/// Marks the copy at `machine` (the machine client) so the app shows it and never removes it.
-pub fn mark_machine_client(copies: &mut [OtherCopy], machine: &Path) {
-    for copy in copies {
-        if same_path(&copy.path, machine) {
-            copy.source = Source::MachineClient;
-        }
-    }
+/// The copy that the app offers to remove: the first one with a removal command, in PATH order.
+/// The machine client can come first, and it never hides a copy behind it.
+pub fn first_removable(copies: &[OtherCopy], platform: Platform) -> Option<(&OtherCopy, Removal)> {
+    copies
+        .iter()
+        .find_map(|copy| removal(copy, platform).map(|removal| (copy, removal)))
+}
+
+/// The machine client among the copies, which the app names but never removes.
+pub fn machine_copy(copies: &[OtherCopy]) -> Option<&OtherCopy> {
+    copies
+        .iter()
+        .find(|copy| copy.source == Source::MachineClient)
+}
+
+/// How many other copies the owner can act on. The machine client is no other copy.
+pub fn other_count(copies: &[OtherCopy]) -> usize {
+    copies
+        .iter()
+        .filter(|copy| copy.source != Source::MachineClient)
+        .count()
 }
 
 fn same_path(a: &Path, b: &Path) -> bool {
@@ -466,19 +490,80 @@ mod tests {
     }
 
     #[test]
-    fn the_machine_client_has_no_removal_command_and_is_marked_by_its_path() {
+    fn the_machine_client_has_no_removal_command_and_never_hides_another_copy() {
         let machine = r"C:\Program Files\open-pact-client\open-pact-client.exe";
+        let scoop = r"C:\Users\Fictional\scoop\shims\open-pact-client.exe";
         assert_eq!(
             removal(&copy(machine, Source::MachineClient), Platform::Windows),
             None
         );
-        let mut copies = vec![
-            copy(machine, Source::Other),
-            copy(r"C:\x\open-pact-client.exe", Source::Other),
+        // The machine client's directory comes first on PATH, as the MSI puts it there.
+        let copies = vec![
+            copy(machine, Source::MachineClient),
+            copy(scoop, Source::Scoop),
         ];
-        mark_machine_client(&mut copies, Path::new(machine));
-        assert_eq!(copies[0].source, Source::MachineClient);
-        assert_eq!(copies[1].source, Source::Other);
+        let (first, removal) = first_removable(&copies, Platform::Windows).unwrap();
+        assert_eq!(first.path, Path::new(scoop));
+        assert_eq!(removal.shown, "scoop uninstall open-pact");
+        assert_eq!(machine_copy(&copies).unwrap().path, Path::new(machine));
+        // The machine client is no other copy in the count.
+        assert_eq!(other_count(&copies), 1);
+        assert!(first_removable(&copies[..1], Platform::Windows).is_none());
+        assert_eq!(other_count(&copies[..1]), 0);
+    }
+
+    #[test]
+    fn the_machine_client_is_marked_by_its_path_or_by_a_shim_that_names_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let make = |relative: &str, text: &str| {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, text).unwrap();
+            path
+        };
+        let machine = make(
+            "Program Files/open-pact-client/open-pact-client",
+            "fictional",
+        );
+        let loose = make("tools/open-pact-client", "fictional");
+        let installed = make("home/open-pact-client", "fictional");
+        let own = [installed];
+        // PATH order: the machine client, then another copy.
+        let path = std::env::join_paths([
+            root.join("Program Files/open-pact-client"),
+            root.join("tools"),
+        ])
+        .unwrap();
+        let found = other_copies(&path, "open-pact-client", &own, &[], Some(&machine));
+        assert_eq!(
+            found,
+            vec![
+                OtherCopy::new(machine.clone(), Source::MachineClient),
+                OtherCopy::new(loose.clone(), Source::Other),
+            ]
+        );
+        assert_eq!(
+            first_removable(&found, Platform::Mac).unwrap().0.path,
+            loose
+        );
+        // A shim that names the machine client comes first, then its own folder: one entry, and
+        // it is the machine client.
+        make("scoop/shims/open-pact-client", "shim program");
+        make(
+            "scoop/shims/open-pact-client.shim",
+            &format!("path = \"{}\"\n", machine.display()),
+        );
+        let path = std::env::join_paths([
+            root.join("scoop/shims"),
+            root.join("Program Files/open-pact-client"),
+        ])
+        .unwrap();
+        let found = other_copies(&path, "open-pact-client", &own, &[], Some(&machine));
+        assert_eq!(
+            found,
+            vec![OtherCopy::new(machine.clone(), Source::MachineClient)]
+        );
     }
 
     #[test]
@@ -555,7 +640,8 @@ mod tests {
                 &path,
                 "open-pact-client",
                 std::slice::from_ref(&bundled),
-                &[]
+                &[],
+                None
             ),
             vec![]
         );
@@ -566,7 +652,7 @@ mod tests {
             "scoop/shims/open-pact-client.shim",
             &format!("path = \"{}\"\n", standalone.display()),
         );
-        let found = other_copies(&path, "open-pact-client", &[bundled], &[]);
+        let found = other_copies(&path, "open-pact-client", &[bundled], &[], None);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].source, Source::Scoop);
         assert_eq!(found[0].package.as_deref(), Some("open-pact"));
@@ -602,6 +688,7 @@ mod tests {
             "open-pact-client",
             std::slice::from_ref(&installed),
             &roots,
+            None,
         );
         assert_eq!(found.len(), 2);
         assert_eq!(found[0].brew, Some(root.join("brew-a/bin/brew")));
@@ -619,7 +706,7 @@ mod tests {
         );
         // After prefix A lost its package, the rescan reports B, and the command names B's brew.
         std::fs::remove_file(root.join("brew-a/bin/open-pact-client")).unwrap();
-        let rescan = other_copies(&path, "open-pact-client", &[installed], &[]);
+        let rescan = other_copies(&path, "open-pact-client", &[installed], &[], None);
         assert_eq!(rescan.len(), 1);
         assert_eq!(rescan[0].brew, Some(root.join("brew-b/bin/brew")));
     }
@@ -649,7 +736,7 @@ mod tests {
             root.join("missing"),
         ])
         .unwrap();
-        let found = other_copies(&path, "open-pact-client", &[installed], &[]);
+        let found = other_copies(&path, "open-pact-client", &[installed], &[], None);
         assert_eq!(
             found,
             vec![

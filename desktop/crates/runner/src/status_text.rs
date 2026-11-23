@@ -5,7 +5,7 @@ use crate::zone;
 use open_pact_client::ControlReport;
 use open_pact_client::JobStatus;
 use open_pact_client::machine::MachineState;
-use open_pact_client::status::{ClaimEvidence, Issue, Report, Verdict};
+use open_pact_client::status::{ClaimEvidence, Issue, Report, ScheduleEvidence, Verdict};
 use open_pact_core::timestamp::{parse_rfc3339, seconds};
 use open_pact_core::{ControlValue, DeviceStatus};
 use time::macros::format_description;
@@ -365,26 +365,86 @@ pub fn resume_join(status: &Report) -> Option<bool> {
     open.then(|| status.schedule.owner_consented == Some(true))
 }
 
-/// True when the "Install job" button shows. A SYSTEM job runs the machine client, so the button
-/// needs a usable machine client (current or outdated) and a job that is missing, out of date or
-/// not confirmed. A user job keeps the rule of its job text.
-pub fn install_button_shown(
-    system_job: bool,
-    job: Option<JobStatus>,
-    machine: Option<MachineState>,
-    job_text: &str,
-) -> bool {
-    if system_job {
-        matches!(
-            machine,
-            Some(MachineState::Current | MachineState::Outdated)
-        ) && matches!(
-            job,
-            Some(JobStatus::Missing | JobStatus::Outdated | JobStatus::SystemUnconfirmed)
-        )
-    } else {
-        crate::text::job_needs_install(job_text)
+/// How the app turns on automatic sending, from the owner's choice that the report holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobInstall {
+    /// The owner wants a user job. The library installs it.
+    User,
+    /// The owner wants a SYSTEM job, or chose it and it is not installed yet. Only the machine
+    /// client installs it, through the administrator prompt.
+    System,
+    /// The owner chose a SYSTEM job and it cannot be installed from here now: the machine client is
+    /// missing or unusable, or a task that is not ours is in the way. A user job must not
+    /// take its place.
+    Blocked,
+}
+
+/// What `Schedule on` does for this report. A pending SYSTEM choice counts as the choice: the
+/// wizard saved it, and a user job would drop it.
+pub fn job_install(schedule: &ScheduleEvidence) -> JobInstall {
+    let pending = schedule.system_job_pending;
+    if !schedule.system_job && !pending {
+        return JobInstall::User;
     }
+    let task = if pending {
+        schedule.pending_job_status
+    } else {
+        schedule.job_status
+    };
+    let usable = matches!(
+        schedule.machine_client,
+        Some(MachineState::Current | MachineState::Outdated)
+    );
+    if usable && task != Some(JobStatus::NotOurs) {
+        JobInstall::System
+    } else {
+        JobInstall::Blocked
+    }
+}
+
+/// True when the switch for automatic sending cannot turn it on from here: the pending SYSTEM
+/// choice waits for an administrator step that the status screen names.
+pub fn enable_blocked(schedule: &ScheduleEvidence) -> bool {
+    schedule.system_job_pending && job_install(schedule) == JobInstall::Blocked
+}
+
+/// True when the "Install job" button shows. A SYSTEM job runs the machine client, so the button
+/// needs a usable machine client (current or outdated), no task of another owner, and either a
+/// pending choice or a job that is missing, out of date or not confirmed. A user job keeps the
+/// rule of its job text.
+pub fn install_button_shown(schedule: &ScheduleEvidence, job_text: &str) -> bool {
+    match job_install(schedule) {
+        JobInstall::User => crate::text::job_needs_install(job_text),
+        JobInstall::Blocked => false,
+        JobInstall::System => {
+            schedule.system_job_pending
+                || matches!(
+                    schedule.job_status,
+                    Some(JobStatus::Missing | JobStatus::Outdated | JobStatus::SystemUnconfirmed)
+                )
+        }
+    }
+}
+
+/// The fixes of the schedule that no issue shows already, as (label, text). The client puts the
+/// same block in an issue and in the schedule, and the screen shows each block once.
+pub fn schedule_fix_rows<'a>(
+    schedule: &'a ScheduleEvidence,
+    issues: &[Issue],
+) -> Vec<(&'static str, &'a str)> {
+    let shown = |text: &str| {
+        issues
+            .iter()
+            .any(|issue| issue.fix.as_deref() == Some(text))
+    };
+    [
+        ("Job check", schedule.job_fix.as_deref()),
+        ("Machine client", schedule.machine_fix.as_deref()),
+    ]
+    .into_iter()
+    .filter_map(|(label, text)| text.map(|text| (label, text)))
+    .filter(|(_, text)| !shown(text))
+    .collect()
 }
 
 #[cfg(test)]
@@ -394,56 +454,101 @@ mod tests {
     use open_pact_client::status::Urgency;
     use time::UtcOffset;
 
+    fn system_schedule(
+        pending: bool,
+        machine: Option<MachineState>,
+        task: Option<JobStatus>,
+    ) -> ScheduleEvidence {
+        let mut schedule = crate::samples::report_good().schedule;
+        schedule.system_job = !pending;
+        schedule.system_job_pending = pending;
+        schedule.machine_client = machine;
+        if pending {
+            schedule.pending_job_status = task;
+            // The user job runs until the switch succeeds.
+            schedule.job_status = Some(JobStatus::Current);
+        } else {
+            schedule.job_status = task;
+        }
+        schedule
+    }
+
+    #[test]
+    fn a_pending_system_choice_installs_through_the_machine_client_not_a_user_job() {
+        use JobInstall::*;
+        use MachineState::*;
+        for machine in [Current, Outdated] {
+            let schedule = system_schedule(true, Some(machine), Some(JobStatus::Missing));
+            assert_eq!(job_install(&schedule), System, "{machine:?}");
+            assert!(install_button_shown(&schedule, "installed and current"));
+            assert!(!enable_blocked(&schedule));
+        }
+        // With the machine client missing the status shows its fix and no Install, and the switch
+        // does not fall back to a user job, which would drop the choice.
+        for machine in [Some(Missing), Some(Unprotected), Some(Unknown), None] {
+            let schedule = system_schedule(true, machine, Some(JobStatus::Missing));
+            assert_eq!(job_install(&schedule), Blocked, "{machine:?}");
+            assert!(!install_button_shown(&schedule, "missing; OS checked now"));
+            assert!(enable_blocked(&schedule));
+        }
+        // A known task of another owner blocks the action, whatever the machine client is.
+        let schedule = system_schedule(true, Some(Current), Some(JobStatus::NotOurs));
+        assert_eq!(job_install(&schedule), Blocked);
+        assert!(!install_button_shown(&schedule, ""));
+        assert!(enable_blocked(&schedule));
+    }
+
     #[test]
     fn a_system_job_offers_install_only_with_a_usable_machine_client() {
-        assert!(install_button_shown(
-            true,
-            Some(JobStatus::Missing),
-            Some(MachineState::Current),
-            ""
-        ));
-        assert!(install_button_shown(
-            true,
-            Some(JobStatus::SystemUnconfirmed),
-            Some(MachineState::Outdated),
-            ""
-        ));
+        use MachineState::*;
+        let shown = |machine, task| {
+            install_button_shown(&system_schedule(false, Some(machine), Some(task)), "")
+        };
+        assert!(shown(Current, JobStatus::Missing));
+        assert!(shown(Outdated, JobStatus::SystemUnconfirmed));
+        assert!(shown(Current, JobStatus::Outdated));
+        assert!(!shown(Current, JobStatus::NotOurs));
+        assert!(!shown(Missing, JobStatus::Missing));
+        assert!(!shown(Unprotected, JobStatus::Missing));
+        assert!(!shown(Current, JobStatus::Current));
+        let mut user = system_schedule(false, None, None);
+        user.system_job = false;
+        assert_eq!(job_install(&user), JobInstall::User);
+        assert!(install_button_shown(&user, "missing; OS checked now"));
         assert!(!install_button_shown(
-            true,
-            Some(JobStatus::NotOurs),
-            Some(MachineState::Current),
-            ""
-        ));
-        assert!(!install_button_shown(
-            true,
-            Some(JobStatus::Missing),
-            Some(MachineState::Missing),
-            ""
-        ));
-        assert!(!install_button_shown(
-            true,
-            Some(JobStatus::Missing),
-            Some(MachineState::Unprotected),
-            ""
-        ));
-        assert!(!install_button_shown(
-            true,
-            Some(JobStatus::Current),
-            Some(MachineState::Current),
-            ""
-        ));
-        assert!(install_button_shown(
-            false,
-            None,
-            None,
-            "missing; OS checked now"
-        ));
-        assert!(!install_button_shown(
-            false,
-            None,
-            None,
+            &user,
             "installed and current; OS checked now"
         ));
+        assert!(!enable_blocked(&user));
+    }
+
+    #[test]
+    fn a_fix_that_an_issue_shows_is_not_shown_again_in_the_schedule() {
+        let mut schedule = system_schedule(false, Some(MachineState::Missing), None);
+        schedule.machine_fix = Some("Install block".into());
+        schedule.job_fix = Some("Task fix".into());
+        let issue = |fix: &str| Issue {
+            urgency: open_pact_client::status::Urgency::Action,
+            message: "m".into(),
+            fix: Some(fix.into()),
+            command: None,
+            stop_job_command: None,
+            deadline: "d".into(),
+        };
+        assert_eq!(
+            schedule_fix_rows(&schedule, &[]),
+            [
+                ("Job check", "Task fix"),
+                ("Machine client", "Install block")
+            ]
+        );
+        assert_eq!(
+            schedule_fix_rows(&schedule, &[issue("Install block")]),
+            [("Job check", "Task fix")]
+        );
+        assert!(
+            schedule_fix_rows(&schedule, &[issue("Install block"), issue("Task fix")]).is_empty()
+        );
     }
 
     #[test]
