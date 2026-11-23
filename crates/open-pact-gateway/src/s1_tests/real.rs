@@ -685,8 +685,8 @@ async fn a_base_tree_read_keeps_base_limits() {
     open_pact_core::verify_consistency(
         before - 1,
         before,
-        &open_pact_core::root(tree.prefix(before - 1)),
-        &open_pact_core::root(tree.prefix(before)),
+        &tree.root_at(before - 1),
+        &tree.root_at(before),
         &hashes,
     )
     .unwrap();

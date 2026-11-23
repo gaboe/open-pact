@@ -11,7 +11,7 @@ use base64::Engine;
 use futures_util::TryStreamExt;
 use open_pact_core::{
     CLOCK_SKEW_SECS, Checkpoint, LogHash, LogKey, LogPolicy, Note, NoteSignature,
-    cosign_time_usable, root,
+    cosign_time_usable,
 };
 use serde_json::json;
 use sqlx::Row as _;
@@ -423,7 +423,7 @@ impl App {
                 } else {
                     if uncached.is_none() && !past() {
                         hooks.bump("uncached_root");
-                        *uncached = Some((size, root(tree.prefix(size))));
+                        *uncached = Some((size, tree.root_at(size)));
                     }
                     if let Some((u, hash)) = uncached.as_ref().filter(|(u, _)| *u == size) {
                         known.insert(*u, *hash);

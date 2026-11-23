@@ -31,8 +31,8 @@ pub use evaluate::{
 pub use invitation::{InvalidInvitation, Invitation, InvitationCode, InvitationHash};
 pub use lease::vpn_lease;
 pub use log::{
-    Entry, EntryKind, Frontier, LogHash, consistency_proof, inclusion_proof, leaf_hash, root,
-    verify_consistency, verify_inclusion,
+    Entry, EntryKind, Frontier, LogHash, MerkleCache, consistency_proof, inclusion_proof,
+    leaf_hash, root, verify_consistency, verify_inclusion,
 };
 pub use manifest::{
     Accepted, AcceptedValues, CheckPeriod, Control, ControlValue, IntegerOutput, IntegerRange,
