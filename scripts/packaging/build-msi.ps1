@@ -47,8 +47,9 @@ foreach ($name in $expected.Keys) {
 }
 
 $admin = Join-Path ([IO.Path]::GetTempPath()) ('open-pact-admin-' + [guid]::NewGuid().ToString('N'))
-& $msiexec /a $Out "TARGETDIR=$admin" /qn
-if ($LASTEXITCODE -ne 0) { throw "msiexec /a exits with $LASTEXITCODE." }
+# msiexec is a GUI program, so the call operator does not wait for it.
+$adminRun = Start-Process -FilePath $msiexec -ArgumentList @('/a', "`"$Out`"", "TARGETDIR=`"$admin`"", '/qn') -Wait -PassThru
+if ($adminRun.ExitCode -ne 0) { throw "msiexec /a exits with $($adminRun.ExitCode)." }
 $extracted = @(Get-ChildItem -LiteralPath $admin -Recurse -File -Filter 'open-pact-client.exe')
 if ($extracted.Count -ne 1) { throw "The administrative image has $($extracted.Count) client executables, expected 1." }
 if ((Get-FileHash -LiteralPath $extracted[0].FullName -Algorithm SHA256).Hash -ne (Get-FileHash -LiteralPath $Exe -Algorithm SHA256).Hash) {
