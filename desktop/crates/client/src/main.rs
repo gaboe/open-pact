@@ -292,12 +292,9 @@ impl AppView {
                 async move {
                     let session = engine::session(&installed)?;
                     if enabled && cfg!(windows) && system_job {
-                        let (runner, log, installed) = (runner, log, installed.clone());
                         let home = session.home().to_path_buf();
-                        engine::blocking(move || {
-                            engine::install_system_job(&runner, &log, &installed, &home)
-                        })
-                        .await?;
+                        engine::blocking(move || engine::install_system_job(&runner, &log, &home))
+                            .await?;
                     } else {
                         session
                             .schedule(enabled)
@@ -460,8 +457,8 @@ impl AppView {
         }
         let mut view = column().gap_2();
         if let Some(copy) = self.others.first().cloned() {
-            let removal = ownership::removal(&copy, Platform::current());
-            view = view
+            if let Some(removal) = ownership::removal(&copy, Platform::current()) {
+                view = view
                 .child(banner(
                     format!(
                         "Another open-pact command line tool is on this computer: {}. The scheduled job runs only the copy this app installed, {}. Remove the other copy so that it cannot run by itself.",
@@ -487,6 +484,11 @@ impl AppView {
                                 })),
                         ),
                 );
+            } else {
+                view = view.child(note(
+                    "Machine client for all users, managed by an administrator",
+                ));
+            }
         }
         if let Some(output) = &self.removal_output {
             view = view
@@ -545,6 +547,7 @@ impl AppView {
                     .child(table()
                         .child(row("Command line tool", div().font_family(mono()).text_size(px(13.)).child(location)))
                         .child(row("Version", version)))
+                    .when(self.system_job, |column| column.child(note("Machine client for all users: %ProgramFiles%\\open-pact-client\\open-pact-client.exe, installed by an administrator, IT or the release MSI.")))
                     .child(column().gap_1()
                         .child(Checkbox::new("also-terminal").label("Also use it in Terminal").checked(self.also_terminal).disabled(self.busy)
                             .on_click(cx.listener(|this, checked: &bool, _, cx| { this.also_terminal = *checked; cx.notify(); })))
@@ -667,9 +670,11 @@ impl AppView {
                         .child(row("Scheduled job", {
                             let raw = status.schedule.job.clone();
                             div().flex().items_center().gap_3().child(job_text(&raw))
-                                .when(job_needs_install(&raw) || (cfg!(windows) && self.system_job), |value| value.child(Button::new("install-job").label(if self.system_job { "Install job (administrator)" } else { "Install job" }).small().disabled(self.busy)
+                                .when(install_button_shown(self.system_job, status.schedule.job_status, status.schedule.machine_client, &raw), |value| value.child(Button::new("install-job").label(if self.system_job { "Install job (administrator)" } else { "Install job" }).small().disabled(self.busy)
                                     .on_click(cx.listener(|this, _, _, cx| this.run(Operation::Schedule(true), cx)))))
                         }))
+                        .when_some(status.schedule.job_fix.clone(), |table, text| table.child(row("Job check", text)))
+                        .when_some(status.schedule.machine_fix.clone(), |table, text| table.child(row("Machine client", text)))
                         .child(row("What is checked", div().flex().flex_col().items_end().gap_1()
                             .child(div().flex().items_center().gap_2().child("Signed by you").when_some(signed, |line, hash| line.child(hash_chip(&hash))))
                             .when_some(agreement, |col, text| col.child(note(text))))));
