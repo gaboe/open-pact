@@ -170,6 +170,13 @@ class WingetTest(unittest.TestCase):
         version = (winget / "gaboe.open-pact.yaml").read_text()
         self.assertIn('PackageIdentifier: gaboe.open-pact\n', version)
         self.assertIn(f'PackageVersion: "{VERSION}"', version)
+        self.assertIn("winget-manifest.version.1.28.0.schema.json", version)
+        self.assertIn("ManifestVersion: 1.28.0", version)
+        self.assertIn("winget-manifest.installer.1.28.0.schema.json", installer)
+        self.assertIn("ManifestVersion: 1.28.0", installer)
+        locale = (winget / "gaboe.open-pact.locale.en-US.yaml").read_text()
+        self.assertIn("winget-manifest.defaultLocale.1.28.0.schema.json", locale)
+        self.assertIn("ManifestVersion: 1.28.0", locale)
 
     def test_stable_winget_needs_the_msi_checksum(self):
         sums = write_sums(self.dir, {"open-pact-client-x86_64-pc-windows-msvc.exe": "d" * 64})
