@@ -632,7 +632,6 @@ async fn a_base_tree_read_keeps_base_limits() {
         .execute(&mut *lock)
         .await
         .unwrap();
-    let locked_at = Instant::now();
     entered.release();
     let blocked = || async {
         sqlx::query_scalar::<_, i64>(
@@ -652,6 +651,8 @@ async fn a_base_tree_read_keeps_base_limits() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    // The lock is released 3 s after the first SELECT was seen waiting, inside the client's limit.
+    let locked_at = Instant::now();
     committed.release();
     let router = f.router.clone();
     let proof = tokio::spawn(async move {
@@ -669,7 +670,6 @@ async fn a_base_tree_read_keeps_base_limits() {
             .unwrap()
     });
     let reader = f.get(Some(&f.query)).await;
-    // The lock is released 3 s after it was taken, inside the client's request limit.
     tokio::time::sleep(Duration::from_secs(3).saturating_sub(locked_at.elapsed())).await;
     lock.rollback().await.unwrap();
     expect_unavailable(&reader, Duration::from_millis(1000 + 500 + 50));
@@ -794,4 +794,47 @@ async fn checkpoints_during_a_join_burst_are_witnessed() {
     }
     f.sizes_are_non_decreasing();
     f.assert_no_fork_line().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs TEST_DATABASE_URL and LOG_ORIGIN"]
+async fn a_claim_push_ignores_the_cooldown() {
+    let f = Fixture::real().await;
+    let live = f.live().await;
+    let devices = f.enrolled(&live, 1).await;
+    let hooks = f.app.owners.hooks();
+    // The preflight runs at a witnessed size; the claim is held after it.
+    let committed = hooks.arm("claim_committed");
+    let claim = spawn_claim(&devices[0]);
+    committed.reached().await;
+    // A failed renewal at that size puts the owner into its cooldown.
+    f.witnesses[0].set(Behaviour::Answer(500));
+    f.app.owners.refresh_all();
+    until("the renewal failed", Duration::from_secs(5), || {
+        f.app.owners.views().iter().all(|v| v.cooling)
+    })
+    .await;
+    f.witnesses[0].set(Behaviour::Healthy);
+    f.append(1).await;
+    let size = f.size().await;
+    committed.release();
+    claim.await.unwrap();
+    let failed_at = f.witnesses[0]
+        .received()
+        .iter()
+        .find(|r| r.status == 500)
+        .map(|r| r.at)
+        .expect("the renewal reached the witness");
+    let claim_push = f.witnesses[0]
+        .received()
+        .into_iter()
+        .find(|r| r.size == size)
+        .expect("the claim's push reached the witness");
+    assert!(
+        claim_push.arrived.duration_since(failed_at) < Duration::from_millis(1000),
+        "the claim waited for the cooldown: {:?}",
+        claim_push.arrived.duration_since(failed_at)
+    );
+    assert_eq!(claim_push.status, 200);
+    assert!(devices[0].installed());
 }

@@ -1101,6 +1101,59 @@ async fn a_stalled_store_releases_the_owner() {
     f.verifies(&reply.body, &f.policy);
 }
 
+#[tokio::test]
+#[ignore = "needs TEST_DATABASE_URL and LOG_ORIGIN"]
+async fn a_held_row_released_in_time_lets_the_store_commit() {
+    let f = Fixture::new(1, 1).await;
+    let size = f.size().await;
+    let tree = f.app.tree().await.unwrap();
+    let cp = Checkpoint {
+        origin: f.log.origin().to_string(),
+        size,
+        root: tree.root(),
+    };
+    let line = f.witnesses[0].cosign(&cp, now_secs());
+    let mut held = f.db.begin().await.unwrap();
+    sqlx::query(witness::UPSERT)
+        .bind(i64::try_from(size).unwrap())
+        .bind(cp.root.to_string())
+        .bind(f.policy.witnesses[0].key.vkey())
+        .bind(line.to_string().trim_end())
+        .execute(&mut *held)
+        .await
+        .unwrap();
+    let (router, query) = (f.router.clone(), f.query.clone());
+    let reader = tokio::spawn(async move { Fixture::get_with(router, Some(query)).await });
+    // Release the row as soon as the owner's upsert waits on it: it can still commit in its 2 s step.
+    let started = Instant::now();
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' \
+             AND query ILIKE '%log_cosignatures%'",
+        )
+        .fetch_one(&f.db)
+        .await
+        .unwrap();
+        if waiting > 0 {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the upsert never waited"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    held.rollback().await.unwrap();
+    let reply = reader.await.unwrap();
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    assert!(
+        reply.elapsed <= Duration::from_millis(3500),
+        "{:?}",
+        reply.elapsed
+    );
+    f.verifies(&reply.body, &f.policy);
+}
+
 mod real;
 
 mod blocking;
