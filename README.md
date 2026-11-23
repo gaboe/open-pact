@@ -592,7 +592,7 @@ not receive explicit access. Hosted Windows CI did not verify signing under a st
 or SYSTEM task token, so scheduler use under those tokens remains unverified.
 Creation requires an elevated administrator prompt. If the provider is unavailable,
 the client warns and uses a software key. `--software-key` forces software on a new home.
-Existing software keys stay in use. Before rotation, remove the old schedule (for a Windows SYSTEM job, follow [Stop the scheduled claims](docs/client.md#stop-the-scheduled-claims-and-remove-the-client)) and run
+Existing software keys stay in use. Before rotation, remove the old schedule. For a Windows SYSTEM job, remove the task of that home only, as [Stop the scheduled claims](docs/client.md#stop-the-scheduled-claims-and-remove-the-client) describes, and do not uninstall the package. Then run
 `open-pact-client --home <old-home> delete-device-key`. To rotate to TPM, use a new `--home`, join again,
 and replace the old enrolment and scheduler registration.
 The home stores only the TPM key name in `device-tpm.key`. Keep this marker with the home.

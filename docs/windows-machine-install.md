@@ -111,7 +111,7 @@ $global:LASTEXITCODE = $null
 if ($LASTEXITCODE -ne 0) { throw 'schedule on failed. Fix the error, then run this command again.' }
 ```
 
-The SYSTEM job reads the repositories below that profile. Without `--user-home`, the client uses the profile that the existing SYSTEM task of this home names. When that task names none, it uses the registered profile of the account that runs the elevated prompt. It fails when it finds neither.
+The SYSTEM job reads the repositories below that profile. Without `--user-home`, the client uses the profile that the existing SYSTEM task of this home names. It uses that profile only when the machine client owns the task and the profile is valid. When the machine client owns the task but the profile is not valid, it uses the registered profile of the account that runs the elevated prompt. A task that another program owns blocks the install. The client fails when it finds no profile.
 
 For a device that ran a SYSTEM job before 0.9.0, take both values from the old task. The [release notes](release-notes/v0.9.0.md) show how.
 
@@ -157,10 +157,9 @@ if ($LASTEXITCODE -ne 0) { throw 'schedule off failed. Do not uninstall the pack
 
    A task whose Actions line is not 1 is not a task of the client. `schedule off` refuses such a task. Open it in Task Scheduler and read every action. When you know each action, remove the task in Task Scheduler.
 
-3. A task whose program is the old copy, `open-pact\open-pact-client.exe`, and whose Actions line is 1, needs the removal block. The list can show the program with a `\\?\` prefix. It is the same file. Replace three samples in the block:
+3. A task whose program is the old copy, `open-pact\open-pact-client.exe`, and whose Actions line is 1, needs the removal block. The list can show the program with a `\\?\` prefix. It is the same file. Replace two samples in the block:
    - The task name `org.open-pact.report.0123abcd`, in every place where it appears.
    - The home line `C:\Users\example\pact`, between `@'` and `'@`. Use the `--home` value of the task. Do not add quotes.
-   - The folder `C:\Program Files`. Use the output of `$env:ProgramW6432`.
 
    The block deletes the task. It then checks that the machine client exists and runs `schedule off`. When the file is missing or `schedule off` fails, the block throws. Do not uninstall the package then. Fix the error and run the block again.
 
@@ -192,7 +191,7 @@ if ($LASTEXITCODE -ne 0) { throw 'schedule off failed. Do not uninstall the pack
     if ($LASTEXITCODE -ne 0) { throw 'The task was not removed. Run this block again from an elevated prompt.' }
   }
   if (Test-TaskRegistered) { throw 'The task is still registered. Run this block again.' }
-  $q = 'C:\Program Files\open-pact-client\open-pact-client.exe'
+  $q = Join-Path $env:ProgramW6432 'open-pact-client\open-pact-client.exe'
   if (-not (Test-Path -LiteralPath $q -PathType Leaf)) { throw 'The machine client is missing. Install the package, then run this block again.' }
   $clientHome = @'
 C:\Users\example\pact
@@ -214,11 +213,10 @@ Use this section when the machine client is not installed, or when a task has mo
 
 1. Open the task in Task Scheduler.
 2. Read every action of the task.
-3. Run the block below in an elevated Windows PowerShell 5.1 prompt, only when you know each action.
-4. Replace the task name `org.open-pact.report.0123abcd` in every place where it appears.
-5. Replace the home line `C:\Users\example\pact`, between `@'` and `'@`, with the `--home` value of the task. Do not add quotes.
+3. Replace the task name `org.open-pact.report.0123abcd` in every place where it appears in the block below.
+4. Run the block below in an elevated Windows PowerShell 5.1 prompt, only when you know each action.
 
-The block deletes the task name that you give it. It does not check the program.
+The block deletes the task name that you give it. It does not check the program. It has no home line, because the machine client does not run.
 
 ```powershell
 & {
