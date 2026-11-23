@@ -39,7 +39,13 @@ Run the verification script with a release tag:
 scripts/verify-client-release.sh v0.8.5
 ```
 
-The script checks every checksum and Sigstore bundle. For a release that has them, it also checks the desktop app zips (`open-pact-desktop-<version>-macos.zip` and `open-pact-desktop-<version>-windows-x64.zip`). The desktop installers, `desktop/scripts/install-desktop.sh` and `install-desktop.ps1`, check the zip against its line in `SHA256SUMS` but do not verify the Cosign signature. It keeps the verified files in a private temporary directory when verification succeeds. It removes the directory if verification fails. It prints the directory path on the last line. Copy that path for the install command. A release can also include the Windows package `open-pact-client-x86_64-pc-windows-msvc.msi`. Install it with the block in [Install the machine client](#install-the-machine-client-for-the-system-job).
+The script checks every checksum and Sigstore bundle. For a release that has them, it also checks the desktop app zips (`open-pact-desktop-<version>-macos.zip` and `open-pact-desktop-<version>-windows-x64.zip`).
+
+The desktop installers, `desktop/scripts/install-desktop.sh` and `install-desktop.ps1`, check the zip against its line in `SHA256SUMS`. They do not verify the Cosign signature.
+
+The script keeps the verified files in a private temporary directory when verification succeeds. It removes the directory if verification fails. It prints the directory path on the last line. Copy that path for the install command.
+
+A release can also include the Windows package `open-pact-client-x86_64-pc-windows-msvc.msi`. Install it with the block in [Install the machine client](#install-the-machine-client-for-the-system-job).
 
 Set `verified_dir` to the printed path:
 
@@ -338,7 +344,9 @@ elseif ($install.ExitCode -ne 0) { throw ('The install failed. See ' + $log) }
 }
 ```
 
-Exit code 3010 means that Windows needs a restart to finish the install. To repair a package of the same version, run these commands in the same prompt. Write the full path of the verified MSI between `@'` and `'@`. The block leaves that MSI in its folder under `%ProgramData%`. The commands wait for `msiexec` and stop when it fails.
+Exit code 3010 means that Windows needs a restart to finish the install.
+
+To repair a package of the same version, run the next commands in the same prompt. Write the full path of the verified MSI between `@'` and `'@`. The install block leaves that MSI in its folder under `%ProgramData%`. The commands wait for `msiexec`. They stop when it fails.
 
 ```powershell
 $msi = @'
@@ -374,7 +382,7 @@ $global:LASTEXITCODE = $null
 if ($LASTEXITCODE -ne 0) { throw 'schedule on failed. Fix the error, then run this command again.' }
 ```
 
-Without elevation, the command prints the exact elevated command and changes nothing. When the package is missing, it prints the install block before it checks for elevation. Other operating systems reject `--system`. The package installs the machine client at `%ProgramFiles%\open-pact-client\open-pact-client.exe`, in a folder that non-administrators cannot write. The SYSTEM job runs only that file, and nothing is copied.
+Without elevation, `schedule on --system` prints the exact elevated command and changes nothing. When the package is missing, a client that can run prints the install block before it checks for elevation. The start commands above stop with a short message in that case. Other operating systems reject `--system`. The package installs the machine client at `%ProgramFiles%\open-pact-client\open-pact-client.exe`, in a folder that non-administrators cannot write. The SYSTEM job runs only that file, and nothing is copied.
 
 The SYSTEM job runs with `--system --user-home <profile>`. It reads the selected absolute client home. It uses the repository folders from `device.json`. It keeps its state under protected `%ProgramData%`. Choose a home path without `%`. `--user-home` must be the profile folder of a user account that Windows lists in its profile registry, and not a link. The client ignores `USERPROFILE` and the arguments of a task that a user can write. The install block that the client prints runs in an elevated Windows PowerShell 5.1 prompt (`powershell.exe`), not in `pwsh`. The task reads Windows settings and does not change them. See [platform support](platform-support.md) for checks that need SYSTEM access.
 
@@ -382,7 +390,11 @@ A SYSTEM job reads repositories only below the user profile. A worktree whose re
 
 ### Stop the scheduled claims and remove the client
 
-For a job that you run as your user, run `open-pact-client schedule off` with the same absolute `--home` before deleting the binary or client home. For a SYSTEM job on Windows, follow the steps below instead. It removes the job, the applied-settings receipt, and the job state, and it records your no in `device.json`. Run `stop` to print these instructions. On Windows it prints the full path of the client and says that a SYSTEM job needs an elevated PowerShell prompt.
+For a job that you run as your user, run `open-pact-client schedule off` with the same absolute `--home` before deleting the binary or client home. For a SYSTEM job on Windows, follow the steps below instead.
+
+`schedule off` removes the job, the applied-settings receipt, and the job state. It saves automatic sending as off in an existing client home.
+
+Run `stop` to print these instructions. For a SYSTEM job on Windows, `stop` prints the full path of the client when the machine client can run. When it cannot, `stop` prints a block that uses Windows tools only and has no client path. Either way, a SYSTEM job needs an elevated PowerShell prompt.
 
 On Windows, remove each SYSTEM task before you uninstall the package. Uninstalling the package does not remove SYSTEM tasks. Run every command in an elevated Windows PowerShell 5.1 prompt.
 
@@ -397,7 +409,7 @@ First, list the SYSTEM tasks. The command selects tasks by their principal and b
   Get-ScheduledTask -TaskPath '\' | Where-Object {
     $_.TaskName -like 'org.open-pact.report.*' -and
     ($system -contains $_.Principal.UserId) -and
-    @($_.Actions | Where-Object { $_.Execute -and ($programs -contains $_.Execute.Trim('"')) }).Count -gt 0
+    @($_.Actions | Where-Object { $_.Execute -and ($programs -contains ($_.Execute.Trim('"') -replace '^\\\\\?\\', '')) }).Count -gt 0
   } | ForEach-Object {
     'Task: ' + $_.TaskName
     'Program: ' + (($_.Actions | ForEach-Object { $_.Execute }) -join ' ')
@@ -406,7 +418,7 @@ First, list the SYSTEM tasks. The command selects tasks by their principal and b
 }
 ```
 
-A task whose program is the machine client needs one command. It removes the task, the job state and the record of your choice. The command stops when the client file is missing or when `schedule off` fails.
+A task whose program is the machine client needs one command. It removes the task, the job state, and the applied-settings receipt. It saves automatic sending as off in an existing client home. It clears a pending SYSTEM choice. The command stops when the client file is missing or when `schedule off` fails.
 
 1. Replace the line `<the absolute client home>` with the `--home` value of the task.
 2. Keep the value on its own line, between `@'` and `'@`. Do not add quotes.
@@ -422,9 +434,9 @@ $global:LASTEXITCODE = $null
 if ($LASTEXITCODE -ne 0) { throw 'schedule off failed. Do not uninstall the package. Fix the error, then run this command again.' }
 ```
 
-A task with more than one action is not a task of the client. The list shows every program of the task. `schedule off` refuses such a task. Check it in Task Scheduler. Then use the removal block below for it.
+A task with more than one action is not a task of the client. The list shows every program of the task. `schedule off` refuses such a task. Open it in Task Scheduler and read every action. When you know each action, remove the task with the removal block below or in Task Scheduler.
 
-A task whose program is the old copy, `open-pact\open-pact-client.exe`, needs the removal block. The block shows three samples.
+A task whose program is the old copy, `open-pact\open-pact-client.exe`, needs the removal block. The list can show the program with a `\\?\` prefix. It is the same file. The block shows three samples.
 
 1. Replace the task name `org.open-pact.report.0123abcd` in every place where it appears.
 2. Replace the home line `C:\Users\example\pact`, between `@'` and `'@`, with the `--home` value of the task. Do not add quotes.
@@ -473,7 +485,7 @@ C:\Users\example\pact
 
 The block deletes the task. It then checks that the machine client exists and runs `schedule off` with it. `schedule off` waits for the state lock, then removes the job state. When the file is missing or `schedule off` fails, for example because a tick holds the lock, the block throws. Do not uninstall the package then. Fix the error and run the block again.
 
-Run the first command again. It must print nothing. Then uninstall the package. A SYSTEM task that runs another program can come from an older open-pact client. The client does not change it. To remove it without the package, use the block in step 1 of the [0.9.0 release notes](release-notes/v0.9.0.md#step-1-find-and-remove-the-old-system-task). That block uses Windows tools only. The removal block above deletes the task name that you give it. Check the task in Task Scheduler first.
+Run the first command again. It must print nothing. Then uninstall the package. A SYSTEM task that runs another program can come from an older open-pact client. The client does not change it. To remove it without the package, open the task in Task Scheduler and read every action. Then use the block in step 1 of the [0.9.0 release notes](release-notes/v0.9.0.md#step-1-find-and-remove-the-old-system-task). That block uses Windows tools only. It deletes the task name that you give it and does not check the program.
 
 ## Read the output as JSON
 
