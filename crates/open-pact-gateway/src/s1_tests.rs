@@ -28,6 +28,9 @@ struct Fixture {
     app: App,
     router: Router,
     db: PgPool,
+    /// A pool that skips the relay (the same pool when there is none).
+    direct: PgPool,
+    relay: Option<relay::Relay>,
     witnesses: Vec<FakeWitness>,
     log: LogKey,
     policy: LogPolicy,
@@ -48,6 +51,11 @@ struct Options {
     split_views: bool,
     /// The witnesses the manifest lists, by index (default: all).
     listed: Option<Vec<usize>>,
+    /// The database pool reaches Postgres through a relay the test controls.
+    relay: bool,
+    /// Seeds of the witness keys (default: one per index) and whether all share one name.
+    seeds: Option<Vec<[u8; 32]>>,
+    same_name: bool,
 }
 
 impl Options {
@@ -61,6 +69,9 @@ impl Options {
             real_client: false,
             split_views: false,
             listed: None,
+            relay: false,
+            seeds: None,
+            same_name: false,
         }
     }
 }
@@ -121,14 +132,34 @@ impl Fixture {
     }
 
     async fn build(options: Options) -> Fixture {
-        let db = testdb::fresh_with_max_connections(options.pool).await;
+        let direct = testdb::fresh_with_max_connections(options.pool).await;
+        let (db, relay) = if options.relay {
+            let relay = relay::Relay::start(direct.connect_options().as_ref()).await;
+            let through = relay.options(direct.connect_options().as_ref());
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(options.pool)
+                .connect_with(through)
+                .await
+                .unwrap();
+            (pool, Some(relay))
+        } else {
+            (direct.clone(), None)
+        };
         let kek = SealingKey::new(&KEK);
         let keys = Keys::load_or_create(&db, &kek).await.unwrap();
         let log = log_key(&keys).unwrap();
         let mut witnesses = vec![];
         for index in 0..options.count {
-            let name = format!("witness.example.org/w{index}");
-            witnesses.push(FakeWitness::with_seed(&name, witness_seed(index), &log).await);
+            let name = if options.same_name {
+                "witness.example.org/w0".to_string()
+            } else {
+                format!("witness.example.org/w{index}")
+            };
+            let seed = options
+                .seeds
+                .as_ref()
+                .map_or_else(|| witness_seed(index), |s| s[index]);
+            witnesses.push(FakeWitness::with_seed(&name, seed, &log).await);
         }
         let listed: Vec<String> = witnesses
             .iter()
@@ -197,6 +228,8 @@ impl Fixture {
             router: router(app.clone()),
             app,
             db,
+            direct,
+            relay,
             witnesses,
             log,
             policy,
@@ -289,6 +322,30 @@ impl Fixture {
                 "a fork line: {event:?}"
             );
         }
+    }
+
+    /// Stores one line per (size, witness) with one statement: `(size, root, witness, line)`.
+    async fn seed(&self, rows: Vec<(u64, LogHash, String, String)>) {
+        sqlx::query(
+            "INSERT INTO log_cosignatures (size, root, witness, signature) \
+             SELECT * FROM unnest($1::bigint[], $2::text[], $3::text[], $4::text[]) \
+             ON CONFLICT (size, root, witness) DO NOTHING",
+        )
+        .bind(
+            rows.iter()
+                .map(|r| i64::try_from(r.0).unwrap())
+                .collect::<Vec<_>>(),
+        )
+        .bind(rows.iter().map(|r| r.1.to_string()).collect::<Vec<_>>())
+        .bind(rows.iter().map(|r| r.2.clone()).collect::<Vec<_>>())
+        .bind(
+            rows.iter()
+                .map(|r| r.3.trim_end().to_string())
+                .collect::<Vec<_>>(),
+        )
+        .execute(&self.direct)
+        .await
+        .unwrap();
     }
 
     fn sizes_are_non_decreasing(&self) {
@@ -971,6 +1028,7 @@ fn assemble_prefers_a_timely_line() {
         note.clone(),
         &[future.clone(), timely.clone()],
         now,
+        &hooks::Hooks::default(),
     );
     assert_eq!(count, 1);
     assert_eq!(reply.signatures.len(), 2);
@@ -978,7 +1036,15 @@ fn assemble_prefers_a_timely_line() {
     verify_cosignatures(Some(&policy), &cp, &reply, now).unwrap();
     // Both timely: the newer line wins, and one key counts once.
     let older = key.cosign(&signer, &cp, now - 20);
-    let (_, count, kept) = served::assemble(&log, Some(&policy), &cp, note, &[older, timely], now);
+    let (_, count, kept) = served::assemble(
+        &log,
+        Some(&policy),
+        &cp,
+        note,
+        &[older, timely],
+        now,
+        &hooks::Hooks::default(),
+    );
     assert_eq!((count, kept[0].time), (1, now - 10));
 }
 
@@ -1157,6 +1223,12 @@ async fn a_held_row_released_in_time_lets_the_store_commit() {
 mod real;
 
 mod blocking;
+
+mod bounds;
+
+mod order;
+
+mod relay;
 
 /// A device that is approved in the database, and a mine request it signs with a fresh nonce.
 async fn mine_request(router: &Router, db: &PgPool, manifest: &str) -> Value {

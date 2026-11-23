@@ -14,6 +14,7 @@ struct Raw {
     status: u16,
     retry_after: Option<String>,
     elapsed: Duration,
+    body: String,
 }
 
 /// A GET sent from its own OS thread over a plain socket, so a stopped async worker cannot stop
@@ -37,10 +38,14 @@ fn raw_get(addr: SocketAddr, query: String) -> Receiver<Option<Raw>> {
                 .lines()
                 .find_map(|l| l.strip_prefix("retry-after: "))
                 .map(|v| v.trim().to_string());
+            let body = text
+                .split_once("\r\n\r\n")
+                .map_or(String::new(), |(_, b)| b.to_string());
             Some(Raw {
                 status,
                 retry_after,
                 elapsed: started.elapsed(),
+                body,
             })
         })();
         let _ = tx.send(answer);
@@ -66,7 +71,7 @@ async fn answer(rx: &Receiver<Option<Raw>>) -> Raw {
 
 impl Fixture {
     /// `count` entries in one statement, as a log that already holds them.
-    async fn append_bulk(&self, count: i64) {
+    pub(super) async fn append_bulk(&self, count: i64) {
         let start = i64::try_from(self.size().await).unwrap();
         sqlx::query(
             "INSERT INTO log_entries (idx, kind, data) \
@@ -80,7 +85,7 @@ impl Fixture {
         .unwrap();
     }
 
-    async fn blocking_fixture() -> Fixture {
+    pub(super) async fn blocking_fixture() -> Fixture {
         let mut options = Options::new(1, 1);
         options.wait_ms = 1000;
         options.pool = 64;
@@ -221,4 +226,128 @@ async fn a_witness_proof_does_not_hold_a_reader() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     f.assert_no_fork_line().await;
+}
+
+const DROP_WAIT_MS: u64 = 2000;
+
+async fn drop_fixture(wait_ms: u64) -> Fixture {
+    let mut options = Options::new(5, 3);
+    options.wait_ms = wait_ms;
+    options.pool = 64;
+    let f = Fixture::build(options).await;
+    // No owner stores a line, so only the rows the test seeds exist.
+    f.app.owners.hooks().set_hold_retries(true);
+    f
+}
+
+/// Valid full-key rows of the first three witnesses (the quorum) at every size from `from`.
+async fn seed_quorum(f: &Fixture, tree: &Tree, from: u64) -> usize {
+    let now = now_secs();
+    let mut rows = vec![];
+    for size in from..=tree.size() {
+        let cp = Checkpoint {
+            origin: f.log.origin().to_string(),
+            size,
+            root: open_pact_core::root(tree.prefix(size)),
+        };
+        for i in 0..3 {
+            rows.push((
+                size,
+                cp.root,
+                f.policy.witnesses[i].key.vkey(),
+                f.witnesses[i].cosign(&cp, now).to_string(),
+            ));
+        }
+    }
+    let count = rows.len();
+    f.seed(rows).await;
+    count
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[ignore = "needs TEST_DATABASE_URL and LOG_ORIGIN"]
+async fn a_row_batch_is_dropped_off_the_worker() {
+    let bound = Duration::from_millis(DROP_WAIT_MS + 500 + 50);
+    // Case 1: a found candidate leaves a tail of 199 groups, and its drop holds.
+    let f = drop_fixture(DROP_WAIT_MS).await;
+    let live = f.live().await;
+    let hooks = f.app.owners.hooks();
+    let start = f.app.tree().await.unwrap().size();
+    let first = raw_get(addr_of(&live), f.query.clone());
+    until("A waits", Duration::from_secs(5), || {
+        hooks.count("reader_waiting") >= 1
+    })
+    .await;
+    f.append(199).await;
+    let tree = f.app.tree().await.unwrap();
+    assert_eq!(tree.size(), start + 199);
+    let groups = hooks.count("row_groups");
+    let freed = hooks.count("freed_rows");
+    let seeded = seed_quorum(&f, &tree, start).await;
+    let hold = hooks.arm_block("row_batch_drop");
+    f.app.owners.notify_changed();
+    hold.reached().await;
+    // The batch of 200 groups is being freed on the blocking pool; A and B answer meanwhile.
+    let a = answer(&first).await;
+    assert_eq!(
+        (a.status, a.elapsed <= bound),
+        (200, true),
+        "{} {:?}",
+        a.body,
+        a.elapsed
+    );
+    assert_eq!(f.verifies(&a.body, &f.policy).size, tree.size());
+    assert_eq!(
+        hooks.count("row_groups") - groups,
+        200,
+        "the SQL returned 200 groups"
+    );
+    assert_eq!(hold.hits(), 1);
+    let second = raw_get(addr_of(&live), f.query.clone());
+    let b = answer(&second).await;
+    assert_eq!(b.status, 200, "{}", b.body);
+    assert!(b.elapsed <= bound, "B answered after {:?}", b.elapsed);
+    assert!(hold.holding(), "B answered only after the hold");
+    hold.release();
+    until("the batch is freed", Duration::from_secs(5), || {
+        hooks.count("freed_rows") - freed >= seeded + 3
+    })
+    .await;
+    // A's whole batch (the 200 groups) and B's (the 3 rows of size N).
+    assert_eq!(
+        hooks.count("freed_rows") - freed,
+        seeded + 3,
+        "every row was freed"
+    );
+    drop(live);
+    // Case 2: a step that completes with no waiter frees its batch off the worker too.
+    let f = drop_fixture(1000).await;
+    let live = f.live().await;
+    let hooks = f.app.owners.hooks();
+    let tree = f.app.tree().await.unwrap();
+    let seeded = seed_quorum(&f, &tree, tree.size()).await;
+    let step = hooks.arm("row_step_returned");
+    let hold = hooks.arm_block("row_batch_drop");
+    let abandoned = raw_get(addr_of(&live), f.query.clone());
+    step.reached().await;
+    let a = answer(&abandoned).await;
+    assert_eq!((a.status, a.retry_after.as_deref()), (503, Some("5")));
+    // A has answered; the step now completes with nobody waiting for it.
+    step.release();
+    hold.reached().await;
+    assert_eq!(hold.hits(), 1);
+    let second = raw_get(addr_of(&live), f.query.clone());
+    let b = answer(&second).await;
+    assert_eq!(b.status, 200, "{}", b.body);
+    assert!(
+        b.elapsed <= Duration::from_millis(1000 + 500 + 50),
+        "{:?}",
+        b.elapsed
+    );
+    assert!(hold.holding(), "B answered only after the hold");
+    hold.release();
+    until("the batch is freed", Duration::from_secs(5), || {
+        hooks.count("freed_rows") >= seeded
+    })
+    .await;
 }

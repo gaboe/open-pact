@@ -20,3 +20,8 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time",
 # the debug build the Linux container tests run.
 [profile.dev.package.sha2]
 opt-level = 3
+
+# The gateway bounds one checkpoint candidate at 100 ms for 1,000,000 leaves (docs/gateway.md); its
+# O(size) Merkle root lives in this crate, and the test profile must meet the same bound.
+[profile.dev.package.open-pact-core]
+opt-level = 3

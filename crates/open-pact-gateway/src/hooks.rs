@@ -19,6 +19,15 @@ pub struct Hooks {
     /// Database steps of a claim fail once this many stored-line reads happened (usize::MAX: never).
     #[cfg(test)]
     fault_after_reads: Threshold,
+    /// The fault above spares the claim's `tree()` reads (it then reaches the cp2 write).
+    #[cfg(test)]
+    fault_spares_tree: AtomicBool,
+    /// Rule 2 of every owner is ineligible: no tree read and no send for demand or renewal.
+    #[cfg(test)]
+    hold_retries: AtomicBool,
+    /// How long after its deadline the next path that reaches the named point continues.
+    #[cfg(test)]
+    past_deadline: Mutex<std::collections::HashMap<&'static str, std::time::Duration>>,
 }
 
 /// A stored-line read count; the default is never reached.
@@ -178,15 +187,62 @@ impl Hooks {
             .unwrap_or(0)
     }
 
+    /// Adds `n` to the counter `name` from a path that cannot await.
+    pub fn add(&self, name: &'static str, n: usize) {
+        *self.counts.lock().expect("hooks").entry(name).or_default() += n;
+    }
+
     /// From now on every claim database step fails once `reads` more stored-line reads ran.
     pub fn fail_after_reads(&self, reads: usize) {
+        self.fault_spares_tree.store(false, Ordering::SeqCst);
         self.fault_after_reads
             .0
             .store(self.count("stored_lines_read") + reads, Ordering::SeqCst);
     }
 
+    /// The same, but the claim's `tree()` reads pass: the first failing step is the cp2 write.
+    pub fn fail_writes_after_reads(&self, reads: usize) {
+        self.fail_after_reads(reads);
+        self.fault_spares_tree.store(true, Ordering::SeqCst);
+    }
+
     pub fn clear_fault(&self) {
         self.fault_after_reads.0.store(usize::MAX, Ordering::SeqCst);
+        self.fault_spares_tree.store(false, Ordering::SeqCst);
+    }
+
+    /// True when a `tree()` read that follows the latest stored-line read must fail.
+    pub fn fault_in_tree(&self) -> bool {
+        !self.fault_spares_tree.load(Ordering::SeqCst) && self.fault_after_read()
+    }
+
+    /// Rule 2 of every owner stays ineligible while this is set (Push jobs are not affected).
+    pub fn set_hold_retries(&self, hold: bool) {
+        self.hold_retries.store(hold, Ordering::SeqCst);
+    }
+
+    pub fn holding_retries(&self) -> bool {
+        self.hold_retries.load(Ordering::SeqCst)
+    }
+
+    /// The next path that reaches `name` through `hold_until_after` continues `slack` after its
+    /// deadline, so its work lies wholly past it.
+    pub fn arm_past_deadline(&self, name: &'static str, slack: std::time::Duration) {
+        self.past_deadline
+            .lock()
+            .expect("hooks")
+            .insert(name, slack);
+    }
+
+    /// A std wait for code that cannot await: counts the pass and, when armed, sleeps until
+    /// `deadline` plus the armed slack.
+    pub fn hold_until_after(&self, name: &'static str, deadline: std::time::Instant) {
+        self.bump(name);
+        let slack = self.past_deadline.lock().expect("hooks").remove(name);
+        if let Some(slack) = slack {
+            let until = deadline + slack;
+            std::thread::sleep(until.saturating_duration_since(std::time::Instant::now()));
+        }
     }
 
     /// True when a database step that follows the latest stored-line read must fail.
@@ -243,6 +299,17 @@ impl Hooks {
 
     #[inline]
     pub fn bump(&self, _name: &'static str) {}
+
+    #[inline]
+    pub fn add(&self, _name: &'static str, _n: usize) {}
+
+    #[inline]
+    pub fn hold_until_after(&self, _name: &'static str, _deadline: std::time::Instant) {}
+
+    #[inline]
+    pub fn holding_retries(&self) -> bool {
+        false
+    }
 
     #[inline]
     pub async fn hit(&self, _name: &'static str) {}

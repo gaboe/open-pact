@@ -1,9 +1,13 @@
+use std::sync::Arc;
+
 use anyhow::Context;
 use futures_util::TryStreamExt;
 use open_pact_core::{Entry, EntryKind};
 use serde_json::Value;
 use sqlx::postgres::PgRow;
 use sqlx::{PgConnection, Row as _};
+
+use crate::hooks::Hooks;
 
 type Row = (i64, String, Value);
 
@@ -13,13 +17,15 @@ pub struct RowBatch {
     rows: Vec<PgRow>,
     /// Closed after the rows are freed, so a waiter knows the memory is gone.
     freed: Option<tokio::sync::oneshot::Sender<()>>,
+    hooks: Arc<Hooks>,
 }
 
 impl RowBatch {
-    pub fn new(freed: Option<tokio::sync::oneshot::Sender<()>>) -> RowBatch {
+    pub fn new(freed: Option<tokio::sync::oneshot::Sender<()>>, hooks: Arc<Hooks>) -> RowBatch {
         RowBatch {
             rows: Vec::new(),
             freed,
+            hooks,
         }
     }
 
@@ -48,9 +54,12 @@ impl Drop for RowBatch {
         if rows.is_empty() {
             return;
         }
+        let hooks = self.hooks.clone();
         match tokio::runtime::Handle::try_current() {
             Ok(runtime) => {
                 runtime.spawn_blocking(move || {
+                    hooks.block("row_batch_drop");
+                    hooks.add("freed_rows", rows.len());
                     drop(rows);
                     drop(freed);
                 });
