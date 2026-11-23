@@ -171,7 +171,15 @@ impl FakeWitness {
     }
 }
 
+/// The decision runs in its own task: a client that gave up does not cancel it, so a late
+/// decision is applied as a real witness applies one.
 async fn add(State(w): State<Arc<Inner>>, body: String) -> (StatusCode, String) {
+    tokio::spawn(decide(w, body))
+        .await
+        .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "decision failed".into()))
+}
+
+async fn decide(w: Arc<Inner>, body: String) -> (StatusCode, String) {
     let Ok(req) = AddCheckpoint::parse(&body) else {
         return (StatusCode::BAD_REQUEST, "bad body".into());
     };
