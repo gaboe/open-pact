@@ -130,7 +130,7 @@ Run every command in an elevated Windows PowerShell 5.1 prompt. Uninstalling the
   Get-ScheduledTask -TaskPath '\' | Where-Object {
     $_.TaskName -like 'org.open-pact.report.*' -and
     ($system -contains $_.Principal.UserId) -and
-    @($_.Actions | Where-Object { $_.Execute -and ($programs -contains $_.Execute.Trim('"')) }).Count -gt 0
+    @($_.Actions | Where-Object { $_.Execute -and ($programs -contains ($_.Execute.Trim('"') -replace '^\\\\\?\\', '')) }).Count -gt 0
   } | ForEach-Object {
     'Task: ' + $_.TaskName
     'Program: ' + (($_.Actions | ForEach-Object { $_.Execute }) -join ' ')
@@ -139,7 +139,7 @@ Run every command in an elevated Windows PowerShell 5.1 prompt. Uninstalling the
 }
 ```
 
-2. A task whose program is the machine client, `open-pact-client\open-pact-client.exe`, needs one command. It removes the task, the job state and the record of the owner's choice. The command stops when the client file is missing or when `schedule off` fails.
+2. A task whose program is the machine client, `open-pact-client\open-pact-client.exe`, needs one command. It removes the task, the job state, and the applied-settings receipt. It saves automatic sending as off in an existing client home. It clears a pending SYSTEM choice. The command stops when the client file is missing or when `schedule off` fails.
    - Replace the line `<the absolute client home>` with the `--home` value of the task.
    - Keep the value on its own line, between `@'` and `'@`. Do not add quotes.
 
@@ -154,9 +154,9 @@ $global:LASTEXITCODE = $null
 if ($LASTEXITCODE -ne 0) { throw 'schedule off failed. Do not uninstall the package. Fix the error, then run this command again.' }
 ```
 
-   A task with more than one action is not a task of the client. The list shows every program of the task. `schedule off` refuses such a task. Check it in Task Scheduler. Then use the block of step 3 for it.
+   A task with more than one action is not a task of the client. The list shows every program of the task. `schedule off` refuses such a task. Open it in Task Scheduler and read every action. When you know each action, remove the task with the block of step 3 or in Task Scheduler.
 
-3. A task whose program is the old copy, `open-pact\open-pact-client.exe`, needs the removal block. Replace three samples in the block:
+3. A task whose program is the old copy, `open-pact\open-pact-client.exe`, needs the removal block. The list can show the program with a `\\?\` prefix. It is the same file. Replace three samples in the block:
    - The task name `org.open-pact.report.0123abcd`, in every place where it appears.
    - The home line `C:\Users\example\pact`, between `@'` and `'@`. Use the `--home` value of the task. Do not add quotes.
    - The folder `C:\Program Files`. Use the output of `$env:ProgramW6432`.
@@ -205,4 +205,4 @@ C:\Users\example\pact
 4. Run the command of step 1 again. It must print nothing.
 5. Uninstall the open-pact client package. Use Settings, Apps, or your deployment tool.
 
-The command of step 1 lists only tasks that run as SYSTEM and run the old copy or the machine client. A SYSTEM task that runs another program can come from an older open-pact client. The client does not change it. To remove it without the package, use the block in step 1 of the [0.9.0 release notes](release-notes/v0.9.0.md#step-1-find-and-remove-the-old-system-task). That block uses Windows tools only. The block of step 3 deletes the task name that you give it. Check the action of the task in Task Scheduler before you run the block for it.
+The command of step 1 lists only tasks that run as SYSTEM and run the old copy or the machine client. A SYSTEM task that runs another program can come from an older open-pact client. The client does not change it. To remove it without the package, open the task in Task Scheduler and read every action. Then use the block in step 1 of the [0.9.0 release notes](release-notes/v0.9.0.md#step-1-find-and-remove-the-old-system-task). That block uses Windows tools only. The block of step 3 and that block delete the task name that you give them and do not check the program.
