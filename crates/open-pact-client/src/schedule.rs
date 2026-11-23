@@ -2522,12 +2522,13 @@ impl Wanted {
 }
 
 /// The profile that a SYSTEM job reads. The `--user-home` argument wins and must be valid. Else
-/// the valid value of the machine client's own task for this home. Else `USERPROFILE` of this
-/// process, which must be valid too. The receipt is no source: a user can write it.
+/// the valid value of the machine client's own task for this home. Else the profile of the account
+/// that owns this process (`own`, from its token SID), which must be valid too. The receipt is no
+/// source: a user can write it, and so is `USERPROFILE`.
 fn choose_profile(
     argument: Option<&Path>,
     task: Option<&Path>,
-    userprofile: Option<PathBuf>,
+    own: Option<PathBuf>,
 ) -> Result<PathBuf> {
     if let Some(argument) = argument {
         return crate::machine::validate_user_home(argument).context("--user-home is not usable");
@@ -2535,11 +2536,11 @@ fn choose_profile(
     if let Some(task) = task {
         return Ok(task.to_path_buf());
     }
-    let profile = userprofile.context(
-        "USERPROFILE is not set; a SYSTEM job needs the profile whose repositories it scans. Pass --user-home",
+    let profile = own.context(
+        "Windows lists no profile for this account; a SYSTEM job needs the profile whose repositories it scans. Pass --user-home",
     )?;
     crate::machine::validate_user_home(&profile)
-        .context("USERPROFILE is not a usable profile. Pass --user-home")
+        .context("the profile of this account is not usable. Pass --user-home")
 }
 
 /// What the job should be when `wanted` is on: it runs `executable`, the installed client, and
@@ -2681,6 +2682,25 @@ fn inspect_failure_text(
     )
 }
 
+/// The validated `--user-home`, and the validated profile that a printed command carries: that one
+/// or else the profile of this account. Only a SYSTEM install needs either, and the profile list
+/// costs a start of PowerShell on Windows, so every other change gets none and reads no list.
+fn printable_profiles(
+    requested_system: bool,
+    user_home: Option<&Path>,
+) -> (Option<PathBuf>, Option<PathBuf>) {
+    if !requested_system {
+        return (None, None);
+    }
+    let valid = |path: &Path| crate::machine::validate_user_home(path).ok();
+    let explicit = user_home.and_then(valid);
+    let caller = user_home
+        .map(Path::to_path_buf)
+        .or_else(crate::machine::default_user_home)
+        .and_then(|path| valid(&path));
+    (explicit, caller)
+}
+
 /// Installs, updates or removes the OS job so it matches `wanted`. A SYSTEM job runs the machine
 /// client and nothing else: `schedule on --system` refuses when it is missing or unprotected, and
 /// no change touches a SYSTEM task that is not the machine client's. `user_home` is the profile a
@@ -2720,12 +2740,9 @@ pub(crate) async fn change_job(
         // check runs here, before any file of the home is locked, read or written.
         require_home_without_link(&given, &home.0)?;
     }
-    // USERPROFILE is the caller's own word, so only a validated profile reaches a printed command.
-    let caller_profile = user_home
-        .map(Path::to_path_buf)
-        .or_else(crate::user_profile)
-        .and_then(|path| crate::machine::validate_user_home(&path).ok());
-    let explicit_profile = user_home.and_then(|path| crate::machine::validate_user_home(path).ok());
+    // Only a SYSTEM install needs a profile, and the profile list costs a start of PowerShell on
+    // Windows, so every other command skips it. Only a validated profile reaches a printed command.
+    let (explicit_profile, caller_profile) = printable_profiles(requested_system, user_home);
     if let Some(machine_client) = &machine_client
         && !elevated
     {
@@ -2743,16 +2760,12 @@ pub(crate) async fn change_job(
         } else {
             executable
         },
-        requested_system
-            .then(|| {
-                user_home
-                    .and_then(|path| crate::machine::validate_user_home(path).ok())
-                    .or_else(|| {
-                        crate::user_profile()
-                            .and_then(|path| crate::machine::validate_user_home(&path).ok())
-                    })
-            })
-            .flatten(),
+        explicit_profile.clone().or_else(|| {
+            requested_system
+                .then(crate::machine::default_user_home)
+                .flatten()
+                .and_then(|path| crate::machine::validate_user_home(&path).ok())
+        }),
     )?;
     let observed = observe(&home, provisional.as_ref(), elevated, executable).map_err(|error| {
         let machine_client = machine_client
@@ -2784,7 +2797,11 @@ pub(crate) async fn change_job(
             SystemTask::Ours { profile, .. } => profile.as_deref(),
             _ => None,
         };
-        Some(choose_profile(user_home, from_task, crate::user_profile())?)
+        Some(choose_profile(
+            user_home,
+            from_task,
+            crate::machine::default_user_home(),
+        )?)
     } else {
         None
     };
@@ -3138,12 +3155,16 @@ fn inspect_system_job(home: &Home) -> Result<JobInspection> {
     let machine_client = crate::machine::read_machine_client();
     let machine = crate::machine::machine_path();
     let home = Home(schedule_home(&home.0, true)?);
+    let elevated = crate::DeviceKey::process_is_elevated();
+    // The profile list costs a start of PowerShell, so a standard user, who cannot read the task,
+    // does not read it.
+    let fallback = elevated.then(crate::machine::default_user_home).flatten();
     system_job_from(
         &home,
         machine_client,
-        crate::DeviceKey::process_is_elevated(),
+        elevated,
         &machine,
-        crate::user_profile().as_deref(),
+        fallback.as_deref(),
         |home| observe(home, None, false, &machine),
     )
 }
@@ -3246,10 +3267,14 @@ fn stop_text_for(home: &Path, state: MachineState, not_ours: bool) -> String {
 /// The text that tells the owner how to turn a SYSTEM job on: the machine client's command when
 /// it is usable, else the install block and then that command.
 pub(crate) fn system_on_text(home: &Path) -> String {
-    let machine_client = crate::machine::read_machine_client();
-    let profile =
-        crate::user_profile().and_then(|profile| crate::machine::validate_user_home(&profile).ok());
-    on_text_for(home, &machine_client, profile.as_deref())
+    system_on_text_for(home, &crate::machine::read_machine_client())
+}
+
+/// `system_on_text` for a machine client that was read already.
+pub(crate) fn system_on_text_for(home: &Path, machine_client: &MachineClient) -> String {
+    let profile = crate::machine::default_user_home()
+        .and_then(|profile| crate::machine::validate_user_home(&profile).ok());
+    on_text_for(home, machine_client, profile.as_deref())
 }
 
 fn on_text_for(home: &Path, machine_client: &MachineClient, profile: Option<&Path>) -> String {
@@ -5095,6 +5120,7 @@ esac
         let dir = tempfile::tempdir().unwrap();
         let profile = dir.path().join("profile");
         std::fs::create_dir(&profile).unwrap();
+        let _listed = crate::machine::list_profiles(&[&profile]);
         let home = dir.path().join("pact");
         let args = machine_args(&home, &profile);
         let classify = |machine: &str, action: (&str, &str)| {
@@ -5176,6 +5202,7 @@ esac
         let dir = tempfile::tempdir().unwrap();
         let profile = dir.path().join("profile");
         std::fs::create_dir(&profile).unwrap();
+        let _listed = crate::machine::list_profiles(&[&profile]);
         let home = dir.path().join("pact");
         let args = machine_args(&home, &profile);
         let classify = |principal: &str, task: &WindowsTaskState| {
@@ -5267,6 +5294,7 @@ esac
     #[test]
     fn only_a_valid_task_profile_counts() {
         let dir = tempfile::tempdir().unwrap();
+        let _listed = crate::machine::list_profiles(&[dir.path()]);
         let home = dir.path().join("pact");
         let missing = dir.path().join("missing");
         let classify = |args: String| {
@@ -5300,6 +5328,28 @@ esac
     }
 
     #[test]
+    fn only_a_system_install_reads_the_profile_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let _listed = crate::machine::list_profiles(&[dir.path()]);
+        let reads = || crate::machine::PROFILE_READS.with(std::cell::Cell::get);
+        let before = reads();
+        // Plain user-mode and removal commands start no PowerShell for a profile.
+        assert_eq!(printable_profiles(false, None), (None, None));
+        assert_eq!(printable_profiles(false, Some(dir.path())), (None, None));
+        assert_eq!(reads(), before);
+        let (explicit, caller) = printable_profiles(true, Some(dir.path()));
+        assert_eq!(explicit.as_deref(), Some(dir.path()));
+        assert_eq!(caller.as_deref(), Some(dir.path()));
+        assert!(reads() > before);
+        // Without `--user-home`, the profile of this account is the caller's, and `USERPROFILE`
+        // is never read.
+        assert_eq!(
+            printable_profiles(true, None),
+            (None, Some(dir.path().to_path_buf()))
+        );
+    }
+
+    #[test]
     fn the_profile_comes_from_the_argument_then_the_task_then_userprofile() {
         let dir = tempfile::tempdir().unwrap();
         let (argument, task, own) = (
@@ -5310,6 +5360,8 @@ esac
         for folder in [&argument, &task, &own] {
             std::fs::create_dir(folder).unwrap();
         }
+        // Windows lists the three folders as profiles. A folder that it does not list is refused.
+        let _listed = crate::machine::list_profiles(&[&own, &argument, &task]);
         let choose = |argument: Option<&Path>, task: Option<&Path>, own: Option<&Path>| {
             choose_profile(argument, task, own.map(Path::to_path_buf))
         };

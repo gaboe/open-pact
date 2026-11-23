@@ -183,6 +183,24 @@ pub(crate) fn legacy_notice(
     command: &str,
     config: &DeviceConfig,
 ) -> Option<String> {
+    legacy_notice_with(
+        home,
+        surface,
+        command,
+        config,
+        crate::machine::read_machine_client,
+    )
+}
+
+/// `legacy_notice` with the machine client that the SYSTEM line names, read only when a line needs
+/// it. A test passes the state that it wants instead of the one of the machine that runs it.
+fn legacy_notice_with(
+    home: &Home,
+    surface: Surface,
+    command: &str,
+    config: &DeviceConfig,
+    machine_client: impl FnOnce() -> crate::machine::MachineClient,
+) -> Option<String> {
     let value = legacy_value(home)?;
     let mut given: LegacyNoticeGiven = home
         .read_json(NOTICE_FILE)
@@ -230,7 +248,7 @@ pub(crate) fn legacy_notice(
     if config.run_as == RunAs::System {
         lines.push(format!(
             "  An installed SYSTEM job was found. A SYSTEM job runs the machine client only, and this client does not change an older task. From an elevated PowerShell prompt run:\n    {}",
-            crate::schedule::system_on_text(&home.0)
+            crate::schedule::system_on_text_for(&home.0, &machine_client())
         ));
     }
     if value.get("report").is_some() {
@@ -606,9 +624,13 @@ mod tests {
             run_as: RunAs::System,
             ..DeviceConfig::default()
         };
-        let notice = legacy_notice(&home, Surface::Job, "client", &config).unwrap();
-        // This machine has no machine client to read, so the notice offers the package fix
-        // alone. `schedule::tests` covers the line that a usable machine client gets.
+        let unreadable = || crate::machine::MachineClient::Unknown {
+            reason: "the check printed no answer".into(),
+        };
+        let notice =
+            legacy_notice_with(&home, Surface::Job, "client", &config, unreadable).unwrap();
+        // A machine client that cannot be read gets the package fix alone, whatever machine runs
+        // this test. `schedule::tests` covers the line that a usable machine client gets.
         assert!(
             notice.contains("elevated PowerShell prompt run")
                 && notice.contains("Cannot read the machine client")
