@@ -326,6 +326,21 @@ fn system_profile(profile: Option<PathBuf>) -> Result<PathBuf, String> {
     })
 }
 
+/// Whether the open of the app moves the OS job to the installed copy. A pending SYSTEM choice
+/// counts as a SYSTEM job: the rewrite is a user install, and it would clear the choice.
+fn rewrite_wanted(
+    job: Option<&Path>,
+    installed: &Path,
+    schedule: &open_pact_client::status::ScheduleEvidence,
+) -> bool {
+    ownership::job_needs_rewrite(
+        job,
+        installed,
+        schedule.owner_consented == Some(true),
+        schedule.system_job || schedule.system_job_pending,
+    )
+}
+
 /// The status of a device, and the two things the app does for the device it owns: it moves the
 /// OS job to the installed copy, and it looks for other copies. `installed` is what the library
 /// gets as the job executable.
@@ -339,9 +354,7 @@ pub async fn inspect(
     let mut warning = None;
     let mut status = session.status(true).await.map_err(|e| format!("{e:#}"))?;
     let job = session.job_executable().ok().flatten();
-    let consented = status.schedule.owner_consented == Some(true);
-    let system = status.schedule.system_job;
-    if ownership::job_needs_rewrite(job.as_deref(), &installed, consented, system) {
+    if rewrite_wanted(job.as_deref(), &installed, &status.schedule) {
         let was = job
             .as_deref()
             .map(|job| job.display().to_string())
@@ -520,6 +533,24 @@ mod tests {
         assert!(!owns_progress(2, 1, true));
         assert!(owns_progress(2, 2, true));
         assert!(!owns_progress(2, 2, false));
+    }
+
+    #[test]
+    fn a_pending_system_choice_keeps_its_user_job_at_open() {
+        let installed = Path::new("/home/fictional/.local/bin/open-pact-client");
+        let other = Path::new("/opt/fictional/bin/open-pact-client");
+        let mut schedule = crate::samples::report_good().schedule;
+        schedule.owner_consented = Some(true);
+        schedule.system_job = false;
+        schedule.system_job_pending = false;
+        assert!(rewrite_wanted(Some(other), installed, &schedule));
+        // The wizard saved a SYSTEM choice that is not installed yet: a rewrite would install a
+        // user job and clear the choice.
+        schedule.system_job_pending = true;
+        assert!(!rewrite_wanted(Some(other), installed, &schedule));
+        schedule.system_job_pending = false;
+        schedule.system_job = true;
+        assert!(!rewrite_wanted(Some(other), installed, &schedule));
     }
 
     #[test]

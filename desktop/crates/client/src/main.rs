@@ -653,7 +653,7 @@ impl AppView {
                 if !status.issues.is_empty() {
                     view = view.child(div().flex().flex_col().children(status.issues.iter().enumerate().map(|(i, issue)| {
                         let shown = issue_view_local(issue, self.clock.as_deref());
-                        let button = shown.action.map(|action| {
+                        let button = issue_action_shown(&status.schedule, shown.action).map(|action| {
                             Button::new(("issue-action", i)).label(action.label()).small().disabled(self.busy)
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     let operation = match action {
