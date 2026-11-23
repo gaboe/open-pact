@@ -794,9 +794,10 @@ fn authorized(expected: &[u8; 32], headers: &HeaderMap) -> bool {
     digest.ct_eq(expected).into()
 }
 
-/// A HEAD request gets no scrape. Axum would otherwise run the GET handler and drop the body.
-async fn head_refused() -> StatusCode {
-    StatusCode::METHOD_NOT_ALLOWED
+/// Only GET scrapes. A HEAD request gets no scrape, because Axum would run the GET handler and drop
+/// the body. Any other method gets the same 405, with the one method the listener allows.
+async fn method_refused() -> Response {
+    (StatusCode::METHOD_NOT_ALLOWED, [(header::ALLOW, "GET")]).into_response()
 }
 
 async fn scrape(State(state): State<Scrape>, headers: HeaderMap) -> Response {
@@ -827,7 +828,9 @@ pub async fn start(
     let router = Router::new()
         .route(
             "/metrics",
-            on(MethodFilter::GET, scrape).on(MethodFilter::HEAD, head_refused),
+            on(MethodFilter::GET, scrape)
+                .on(MethodFilter::HEAD, method_refused)
+                .fallback(method_refused),
         )
         .with_state(Scrape {
             metrics,
@@ -1068,8 +1071,10 @@ mod tests {
         assert_eq!(other_path.status(), 404);
         let post = client.post(&url).bearer_auth(TOKEN).send().await.unwrap();
         assert_eq!(post.status(), 405);
+        assert_eq!(post.headers().get(header::ALLOW).unwrap(), "GET");
         let head = client.head(&url).bearer_auth(TOKEN).send().await.unwrap();
         assert_eq!(head.status(), 405);
+        assert_eq!(head.headers().get(header::ALLOW).unwrap(), "GET");
         // The scheme name is case-insensitive.
         let lowercase = client
             .get(&url)
