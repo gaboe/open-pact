@@ -183,11 +183,16 @@ jobs:
           $admin = ([Security.Principal.WindowsPrincipal]::new($identity)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
           Write-Output "runner_is_administrator=$admin"
 
-      - name: Verify native uninstall modes under administrator and standard-user tokens
-        timeout-minutes: 8
+      - name: Install WiX
+        shell: powershell
+        run: ./scripts/packaging/install-wix.ps1
+
+      - name: Verify the machine client, native uninstall modes, a task that is not ours and a planted user task
+        timeout-minutes: 15
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
+          $env:PATH += ";$env:USERPROFILE\.dotnet\tools"
           cargo build -p open-pact-client
           if ($LASTEXITCODE -ne 0) { throw 'build failed' }
           $root = Join-Path $env:PUBLIC ('open-pact-fictional-' + [Guid]::NewGuid().ToString('N'))
@@ -196,20 +201,43 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'fixture preparation failed' }
           $client = Join-Path $root 'client.exe'
           Copy-Item target/debug/open-pact-client.exe $client
+          # The machine client Q is the package build of this same client, at its own version.
+          $version = ((& $client --version) -split '\s+')[-1]
+          $msi = Join-Path $root 'open-pact-client.msi'
+          & ./scripts/packaging/build-msi.ps1 -Exe (Resolve-Path target/debug/open-pact-client.exe).Path -Version $version -Out $msi
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $msi)) { throw 'the machine package was not built' }
+          $Q = Join-Path $env:ProgramFiles 'open-pact-client\open-pact-client.exe'
           $user = 'op_fixture_' + [Guid]::NewGuid().ToString('N').Substring(0,8)
           $password = 'Op!7' + [Guid]::NewGuid().ToString('N')
           $secure = ConvertTo-SecureString $password -AsPlainText -Force
           New-LocalUser -Name $user -Password $secure -AccountNeverExpires | Out-Null
           $sid = (Get-LocalUser $user).SID.Value
-          & icacls.exe $root /grant "*${sid}:(OI)(CI)M" /T | Out-Null
+          & icacls.exe $root /grant "*$($sid):(OI)(CI)M" /T | Out-Null
           if ($LASTEXITCODE -ne 0) { throw 'fixture ACL setup failed' }
+          $installed = $false
+          $qHash = $null
+          function Invoke-Msi($mode, $name) {
+            $log = Join-Path $root "msi-$name.log"
+            $msiexec = Join-Path ([Environment]::SystemDirectory) 'msiexec.exe'
+            $process = Start-Process $msiexec -ArgumentList @($mode, "`"$msi`"", '/qn', '/norestart', '/l*v', "`"$log`"") -Wait -PassThru
+            if ($process.ExitCode -ne 0 -and $process.ExitCode -ne 3010) {
+              Get-Content $log -Tail 80 -ErrorAction SilentlyContinue
+              throw "msiexec $mode failed: $($process.ExitCode)"
+            }
+          }
           function Invoke-Client($homePath, $arguments) {
             & $client --home $homePath @arguments
             return $LASTEXITCODE
           }
+          function Invoke-Capture($homePath, $arguments) {
+            $ErrorActionPreference = 'Continue'
+            $lines = & $client --home $homePath @arguments 2>&1 | ForEach-Object { "$_" }
+            return [pscustomobject]@{ Code = $LASTEXITCODE; Text = ($lines -join "`n") }
+          }
           function Install-System($homePath) {
             $result = Invoke-Client $homePath @('schedule', 'on', '--system')
             if ($result[-1] -ne 0) { throw "SYSTEM install failed: $result" }
+            Assert-Action $homePath
           }
           function State-Path($homePath) {
             $bytes = [Text.Encoding]::UTF8.GetBytes(('\\?\' + $homePath))
@@ -220,10 +248,23 @@ jobs:
             $hash = Split-Path (State-Path $homePath) -Leaf
             return 'org.open-pact.report.' + $hash.Substring(0,16)
           }
+          function Assert-Action($homePath) {
+            $task = Get-ScheduledTask -TaskName (Task-Name $homePath)
+            $actions = @($task.Actions)
+            if ($actions.Count -ne 1) { throw 'the SYSTEM task does not have exactly one action' }
+            if ($actions[0].Execute.Trim('"') -ine $Q) { throw "the SYSTEM task runs $($actions[0].Execute), not the machine client" }
+            if ($task.Principal.UserId -ne 'SYSTEM') { throw 'the task does not run as SYSTEM' }
+          }
+          function Assert-Q {
+            if (-not $qHash) { return }
+            if (-not (Test-Path $Q)) { throw 'the machine client is gone' }
+            if ((Get-FileHash $Q).Hash -ne $qHash) { throw 'a schedule command changed the machine client' }
+          }
           function Assert-Clean($homePath) {
             if (Get-ScheduledTask -TaskName (Task-Name $homePath) -ErrorAction SilentlyContinue) { throw 'task remains' }
             if (Test-Path (State-Path $homePath)) { throw 'SYSTEM state remains' }
-            if (Get-ChildItem "$env:ProgramFiles/open-pact/open-pact-client.exe*" -Force -ErrorAction SilentlyContinue) { throw 'binary leftovers remain' }
+            if (Test-Path "$env:ProgramFiles/open-pact") { throw 'a client wrote the legacy folder' }
+            Assert-Q
           }
           function Remove-System($homePath) {
             $result = Invoke-Client $homePath @('schedule', 'off')
@@ -234,13 +275,39 @@ jobs:
             if ($result[-1] -ne 0) { throw "SYSTEM retry failed: $result" }
             Assert-Clean $homePath
           }
+          function Get-Status($homePath) {
+            $lines = & $client --home $homePath status --json
+            return ($lines -join "`n") | ConvertFrom-Json
+          }
+          function Get-Block($text) {
+            $lines = $text -split "`r?`n"
+            $start = [array]::IndexOf($lines, '& {')
+            if ($start -lt 0) { throw "no removal block in: $text" }
+            $end = $start + 1
+            while ($end -lt $lines.Count -and $lines[$end].TrimEnd() -ne '}') { $end++ }
+            if ($end -ge $lines.Count) { throw 'the removal block has no end' }
+            return ($lines[$start..$end] -join "`n")
+          }
+          function Assert-Refused($homePath, $arguments, $label) {
+            $result = Invoke-Capture $homePath $arguments
+            if ($result.Code -eq 0) { throw "$label was accepted" }
+            return $result
+          }
           try {
             $limited = (Resolve-Path (Join-Path $root 'limited')).Path
+            # Without the machine client, a SYSTEM install fails and leaves nothing behind.
+            $refused = Assert-Refused $limited @('schedule', 'on', '--system') 'a SYSTEM install without the machine client'
+            if ($refused.Text -notmatch 'machine client is not installed') { throw "the refusal does not name the package: $($refused.Text)" }
+            Assert-Clean $limited
+            if (Test-Path (Join-Path $limited 'schedule-applied.json')) { throw 'a refused install wrote a receipt' }
+            if (Test-Path $Q) { throw 'the machine client exists before the package is installed' }
+            Invoke-Msi '/i' 'install'
+            $installed = $true
+            if (-not (Test-Path $Q)) { throw 'the package did not install the machine client' }
+            $qHash = (Get-FileHash $Q).Hash
             Install-System $limited
             Unregister-ScheduledTask -TaskName (Task-Name $limited) -Confirm:$false
             $state = State-Path $limited
-            $binary = "$env:ProgramFiles/open-pact/open-pact-client.exe"
-            $before = (Get-FileHash $binary).Hash
             $worker = Join-Path $root 'standard-user.ps1'
             @'
           param($client,$homePath,$receipt,$taskName)
@@ -253,7 +320,7 @@ jobs:
             if (-not (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue)) { throw 'limited task was not installed' }
             foreach ($attempt in 1..2) {
               & $client --home $homePath schedule off
-              if ($LASTEXITCODE -ne 0) { throw 'limited uninstall failed with protected leftovers' }
+              if ($LASTEXITCODE -ne 0) { throw 'limited uninstall failed' }
               if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) { throw 'limited task remains' }
             }
             if (Test-Path "$homePath/report-schedule.json") { throw 'limited configuration remains' }
@@ -272,11 +339,12 @@ jobs:
             Get-Content $receipt
             if ($process.ExitCode -ne 0) { throw 'standard-user fixture failed' }
             if (-not (Test-Path $state)) { throw 'limited uninstall removed protected state' }
-            if ((Get-FileHash $binary).Hash -ne $before) { throw 'limited uninstall changed protected binary' }
+            Assert-Q
             Remove-System $limited
             $process = Start-Process powershell.exe -Credential $credential -LoadUserProfile -ArgumentList $arguments -Wait -PassThru
             Get-Content $receipt
             if ($process.ExitCode -ne 0) { throw 'standard-user uninstall without protected leftovers failed' }
+            Assert-Q
             foreach ($name in @('system','missing','retry')) {
               $homePath = (Resolve-Path (Join-Path $root $name)).Path
               Install-System $homePath
@@ -289,7 +357,7 @@ jobs:
                   $result = Invoke-Client $homePath @('schedule', 'off')
                   if ($result[-1] -eq 0) { throw 'held state lock reported success' }
                   if (-not (Get-ScheduledTask -TaskName (Task-Name $homePath) -ErrorAction SilentlyContinue)) { throw 'held state lock did not preserve task' }
-                  if (-not (Test-Path "$env:ProgramFiles/open-pact/open-pact-client.exe")) { throw 'held state lock did not preserve binary' }
+                  Assert-Q
                 } finally { $guard.Dispose() }
                 $held = [IO.File]::Open((Join-Path $state 'held-fixture'),[IO.FileMode]::Create,[IO.FileAccess]::ReadWrite,[IO.FileShare]::Read)
                 try {
@@ -303,13 +371,60 @@ jobs:
               Remove-System $homePath
               if ($name -eq 'missing' -and (Test-Path $homePath)) { throw 'uninstall created missing home' }
             }
-            $pending = "$env:ProgramFiles/open-pact/open-pact-client.exe.delete-fictional"
-            Set-Content $pending 'fictional leftover'
-            [IO.File]::SetAttributes($pending,[IO.FileAttributes]::Hidden)
+            # A SYSTEM task with the home's id that runs another program is not ours: every change refuses
+            # and leaves it, and status says so. The printed removal block removes it with Windows tools.
+            Install-System $limited
+            $id = Task-Name $limited
+            Unregister-ScheduledTask -TaskName $id -Confirm:$false
+            $other = Join-Path ([Environment]::SystemDirectory) 'cmd.exe'
+            $foreign = New-ScheduledTaskAction -Execute $other -Argument '/c exit 0'
+            $at = New-ScheduledTaskTrigger -Once -At (Get-Date).AddYears(1)
+            $system = New-ScheduledTaskPrincipal -UserId SYSTEM -LogonType ServiceAccount -RunLevel Highest
+            Register-ScheduledTask -TaskName $id -Action $foreign -Trigger $at -Principal $system | Out-Null
+            $refusals = @()
+            foreach ($change in @(@('schedule','on','--system'), @('schedule','on','--user'), @('schedule','off'))) {
+              $refusals += Assert-Refused $limited $change ($change -join ' ')
+              $now = @((Get-ScheduledTask -TaskName $id).Actions)
+              if ($now.Count -ne 1 -or $now[0].Execute -ine $other) { throw "$($change -join ' ') changed the foreign task" }
+            }
+            Assert-Q
+            $status = Get-Status $limited
+            if ($status.schedule.job_status -ne 'not_ours') { throw "elevated status says $($status.schedule.job_status), not not_ours" }
+            $block = Get-Block $refusals[2].Text
+            foreach ($attempt in 1..2) {
+              & ([scriptblock]::Create($block))
+              if (Get-ScheduledTask -TaskName $id -ErrorAction SilentlyContinue) { throw 'the removal block left the task' }
+              if (Test-Path (State-Path $limited)) { throw 'the removal block left the state' }
+              Assert-Q
+            }
+            Assert-Clean $limited
+            # A task with the home's id that runs as a user is a user job. It is never not-ours and never
+            # the source of the profile: the replacement reads the elevated profile, not the planted one.
+            Install-System $limited
+            Unregister-ScheduledTask -TaskName $id -Confirm:$false
+            $planted = Join-Path $root 'planted-user-task.ps1'
+            @'
+          param($q,$homePath,$taskName)
+          $ErrorActionPreference = 'Stop'
+          $action = New-ScheduledTaskAction -Execute $q -Argument "--home `"$homePath`" schedule run --system --user-home C:\decoy"
+          $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddYears(1) -RepetitionInterval (New-TimeSpan -Minutes 1)
+          Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger | Out-Null
+          '@ | Set-Content $planted
+            $plantedArguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$planted`" -q `"$Q`" -homePath `"$limited`" -taskName `"$id`""
+            $process = Start-Process powershell.exe -Credential $credential -LoadUserProfile -ArgumentList $plantedArguments -Wait -PassThru
+            if ($process.ExitCode -ne 0) { throw 'the standard user could not register the planted task' }
+            $status = Get-Status $limited
+            if ($status.schedule.job_status -ne 'outdated') { throw "a user task with the home's id reports $($status.schedule.job_status), not outdated" }
+            Install-System $limited
+            $replaced = @((Get-ScheduledTask -TaskName $id).Actions)
+            if ($replaced[0].Arguments -match 'decoy') { throw 'the replacement kept the planted profile' }
+            if ($replaced[0].Arguments -notlike "*--user-home*$env:USERPROFILE*") { throw "the replacement does not read the elevated profile: $($replaced[0].Arguments)" }
+            Assert-Q
             Remove-System $limited
-            Write-Output 'native_system_uninstall_retry_replacement_task_and_missing_home_passed'
+            Write-Output 'native_system_uninstall_retry_replacement_task_not_ours_planted_and_missing_home_passed'
           } finally {
             Get-ScheduledTask -TaskName 'org.open-pact.report.*' -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false
+            if ($installed) { Invoke-Msi '/x' 'uninstall' }
             Remove-LocalUser -Name $user -ErrorAction SilentlyContinue
             Remove-Item $root -Recurse -Force -ErrorAction SilentlyContinue
           }
