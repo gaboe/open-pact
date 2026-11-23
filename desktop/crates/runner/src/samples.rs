@@ -174,6 +174,18 @@ fn vpn_issue() -> Issue {
     )
 }
 
+/// A SYSTEM job that runs another task than the machine client. The app shows no button for it.
+pub fn report_system_job_not_ours() -> Report {
+    let mut report = online();
+    report.schedule.system_job = true;
+    report.schedule.job = "a SYSTEM task that is not the machine client's; OS checked now".into();
+    report.schedule.job_status = Some(JobStatus::NotOurs);
+    report.schedule.machine_client = Some(open_pact_client::machine::MachineState::Current);
+    report.schedule.job_fix =
+        Some("Not changed by open-pact. Remove or fix that task in Task Scheduler.".into());
+    report
+}
+
 /// Four items with buttons: an out of date job, a failed VPN probe, and two gateway findings.
 pub fn report_needs_action() -> Report {
     let mut report = online();
