@@ -244,7 +244,9 @@ open-pact-client schedule status
 open-pact-client schedule off
 ```
 
-`schedule on` prints the policy line, then `schedule: install`, then `Your choice: automatic sending is on.` A second run prints `no changes` and the same choice line, and a changed executable path prints `schedule: update`. A job that client 0.7 installed wakes every five minutes: `schedule on` prints `schedule: update` and rewrites it to wake every minute on macOS, Linux and Windows. After a client update, a job that you run as your own user rewrites itself to the new definition on its first wake, once for each client version, and only while automatic sending is on and the signed manifest defines `[schedule]`; on macOS a short helper job reloads the LaunchAgent after the run ends. A SYSTEM job on Windows runs the machine client in Program Files. To upgrade it, run the install block in [Install the machine client](#install-the-machine-client-for-the-system-job). When the machine client is older than the client you run, `status`, `schedule status` and `check` say so. A newer machine client counts as current. So does one of the same version in another file. Dry run prints the planned change and writes nothing. `schedule status` shows the consent line, your choice, the state of the job, the last claim that the gateway answered, the last check, and when the next check and the next claim fall due. For a SYSTEM job on Windows it reads that job's protected state: run it from an elevated prompt. When the state cannot be read, `schedule status` and `accept` say that the times are unknown and why. It derives the due times from the same rules as the job, and it assumes that the device stays where the last run found it (on the VPN or not). Keep the client binary at its installed path. Use the same absolute `--home` for each command. If the entire client home is already missing, `schedule off` removes the remaining job without recreating that home. The job reads the policy from the manifest you signed. A manifest change that keeps or narrows the schedule needs no new `schedule on`. After `accept` signs a manifest that widens it, run `schedule on` again. A change that only checks more often counts as widening.
+`schedule on` prints the policy line, then `schedule: install`, then `Your choice: automatic sending is on.` A second run prints `no changes` and the same choice line, and a changed executable path prints `schedule: update`. A job that client 0.7 installed wakes every five minutes: `schedule on` prints `schedule: update` and rewrites it to wake every minute on macOS, Linux and Windows. After a client update, a job that you run as your own user rewrites itself to the new definition on its first wake, once for each client version, and only while automatic sending is on and the signed manifest defines `[schedule]`; on macOS a short helper job reloads the LaunchAgent after the run ends. Dry run prints the planned change and writes nothing. `schedule status` shows the consent line, your choice, the state of the job, the last claim that the gateway answered, the last check, and when the next check and the next claim fall due. For a SYSTEM job on Windows it reads that job's protected state: run it from an elevated prompt. When the state cannot be read, `schedule status` and `accept` say that the times are unknown and why. It derives the due times from the same rules as the job, and it assumes that the device stays where the last run found it (on the VPN or not). Keep the client binary at its installed path. Use the same absolute `--home` for each command. If the entire client home is already missing, `schedule off` removes the remaining job without recreating that home. The job reads the policy from the manifest you signed. A manifest change that keeps or narrows the schedule needs no new `schedule on`. After `accept` signs a manifest that widens it, run `schedule on` again. A change that only checks more often counts as widening.
+
+A SYSTEM job on Windows runs the machine client in Program Files. To upgrade it, run the install block in [Install the machine client](#install-the-machine-client-for-the-system-job). When the machine client is older than the client you run, `status`, `schedule status` and `check` say so. A newer machine client counts as current. So does one of the same version in another file.
 
 ### What one wake does
 
@@ -277,7 +279,7 @@ A `[report]` table in an old `open-pact.toml` has no effect. The client sends no
 
 ### Install the machine client for the SYSTEM job
 
-The SYSTEM job runs the machine client, which the package installs at `C:\Program Files\open-pact-client\open-pact-client.exe`. Install the package before you run `schedule on --system`. Run this block in an elevated Windows PowerShell 5.1 prompt (`powershell.exe`, not `pwsh`). The block installs exactly version 0.9.0. It upgrades an older package. It does not change a newer package:
+The SYSTEM job runs the machine client, which the package installs in the 64-bit Program Files folder. By default this is `C:\Program Files\open-pact-client\open-pact-client.exe`. Install the package before you run `schedule on --system`. Run this block in an elevated Windows PowerShell 5.1 prompt (`powershell.exe`, not `pwsh`). The block installs exactly version 0.9.0. It upgrades an older package. It does not change a newer package:
 
 ```powershell
 & {
@@ -336,15 +338,40 @@ elseif ($install.ExitCode -ne 0) { throw ('The install failed. See ' + $log) }
 }
 ```
 
-Exit code 3010 means that Windows needs a restart to finish the install. To repair a package of the same version, run `msiexec.exe /fa "<msi>" /qn /norestart` with the verified MSI that the block leaves in its folder under `%ProgramData%`. For a deployment with Intune or Group Policy, see [Windows machine install](windows-machine-install.md).
+Exit code 3010 means that Windows needs a restart to finish the install. To repair a package of the same version, run these commands in the same prompt. Write the full path of the verified MSI between `@'` and `'@`. The block leaves that MSI in its folder under `%ProgramData%`. The commands wait for `msiexec` and stop when it fails.
+
+```powershell
+$msi = @'
+<the full path of the verified MSI>
+'@
+$msiexec = Join-Path ([Environment]::SystemDirectory) 'msiexec.exe'
+$repair = Start-Process -FilePath $msiexec -ArgumentList ('/fa "' + $msi + '" /qn /norestart') -Wait -PassThru
+if ($repair.ExitCode -eq 3010) { Write-Output 'Restart Windows to finish the repair.' }
+elseif ($repair.ExitCode -ne 0) { throw ('The repair failed. Exit code: ' + $repair.ExitCode) }
+```
+
+For a deployment with Intune or Group Policy, see [Windows machine install](windows-machine-install.md).
 
 ### Use Windows SYSTEM checks
 
-The wizard asks whether the job runs as SYSTEM. Later, choose it with `schedule on --system`, and go back with `schedule on --user`. Run `schedule on --system` from an elevated Windows PowerShell 5.1 prompt. Call the machine client by its full path, so that an older client on PATH never runs. Pass the profile of the user:
+The wizard asks whether the job runs as SYSTEM. Later, choose it with `schedule on --system`, and go back with `schedule on --user`. Run `schedule on --system` from an elevated Windows PowerShell 5.1 prompt. Call the machine client by its full path, so that an older client on PATH never runs. Pass the profile of the user. The commands stop when the client file is missing or when the command fails.
+
+1. Replace the line `<the absolute client home>` with the absolute client home of the user.
+2. Replace the line `<the profile folder of the user>` with the profile folder of the user.
+3. Keep each value on its own line, between `@'` and `'@`. Do not add quotes. A path with an apostrophe then needs no escape.
 
 ```powershell
 $q = Join-Path $env:ProgramW6432 'open-pact-client\open-pact-client.exe'
-& $q --home 'C:\Example User\pact' schedule on --system --user-home 'C:\Users\Example User'
+$clientHome = @'
+<the absolute client home>
+'@
+$userHome = @'
+<the profile folder of the user>
+'@
+if (-not (Test-Path -LiteralPath $q -PathType Leaf)) { throw 'The machine client is missing. Install the package, then run this command again.' }
+$global:LASTEXITCODE = $null
+& $q --home $clientHome schedule on --system --user-home $userHome
+if ($LASTEXITCODE -ne 0) { throw 'schedule on failed. Fix the error, then run this command again.' }
 ```
 
 Without elevation, the command prints the exact elevated command and changes nothing. When the package is missing, it prints the install block before it checks for elevation. Other operating systems reject `--system`. The package installs the machine client at `%ProgramFiles%\open-pact-client\open-pact-client.exe`, in a folder that non-administrators cannot write. The SYSTEM job runs only that file, and nothing is copied.
@@ -355,7 +382,7 @@ A SYSTEM job reads repositories only below the user profile. A worktree whose re
 
 ### Stop the scheduled claims and remove the client
 
-Run `open-pact-client schedule off` with the same absolute `--home` before deleting the binary or client home. It removes the job, the applied-settings receipt, and the job state, and it records your no in `device.json`. Run `stop` to print these instructions. On Windows it prints the full path of the client and says that a SYSTEM job needs an elevated PowerShell prompt.
+For a job that you run as your user, run `open-pact-client schedule off` with the same absolute `--home` before deleting the binary or client home. For a SYSTEM job on Windows, follow the steps below instead. It removes the job, the applied-settings receipt, and the job state, and it records your no in `device.json`. Run `stop` to print these instructions. On Windows it prints the full path of the client and says that a SYSTEM job needs an elevated PowerShell prompt.
 
 On Windows, remove each SYSTEM task before you uninstall the package. Uninstalling the package does not remove SYSTEM tasks. Run every command in an elevated Windows PowerShell 5.1 prompt.
 
@@ -379,15 +406,31 @@ First, list the SYSTEM tasks. The command selects tasks by their principal and b
 }
 ```
 
-A task whose program is the machine client needs one command. It removes the task, the job state and the record of your choice. Replace `<home>` with the `--home` value of the task:
+A task whose program is the machine client needs one command. It removes the task, the job state and the record of your choice. The command stops when the client file is missing or when `schedule off` fails.
+
+1. Replace the line `<the absolute client home>` with the `--home` value of the task.
+2. Keep the value on its own line, between `@'` and `'@`. Do not add quotes.
 
 ```powershell
 $q = Join-Path $env:ProgramW6432 'open-pact-client\open-pact-client.exe'
-& $q --home '<home>' schedule off
+$clientHome = @'
+<the absolute client home>
+'@
+if (-not (Test-Path -LiteralPath $q -PathType Leaf)) { throw 'The machine client is missing. Install the package, then run this command again.' }
+$global:LASTEXITCODE = $null
+& $q --home $clientHome schedule off
 if ($LASTEXITCODE -ne 0) { throw 'schedule off failed. Do not uninstall the package. Fix the error, then run this command again.' }
 ```
 
-A task whose program is the old copy, `open-pact\open-pact-client.exe`, needs the removal block. The block shows three samples. Replace the task name `org.open-pact.report.0123abcd` in every place where it appears. Replace the home `C:\Users\example\pact` with the `--home` value of the task. Replace the folder `C:\Program Files` with the output of `$env:ProgramW6432`. The client prints this block with the values of your device when it refuses to change an old task.
+A task with more than one action is not a task of the client. The list shows every program of the task. `schedule off` refuses such a task. Check it in Task Scheduler. Then use the removal block below for it.
+
+A task whose program is the old copy, `open-pact\open-pact-client.exe`, needs the removal block. The block shows three samples.
+
+1. Replace the task name `org.open-pact.report.0123abcd` in every place where it appears.
+2. Replace the home line `C:\Users\example\pact`, between `@'` and `'@`, with the `--home` value of the task. Do not add quotes.
+3. Replace the folder `C:\Program Files` with the output of `$env:ProgramW6432`.
+
+ The client prints this block with the values of your device when it refuses to change an old task.
 
 ```powershell
 & {
@@ -417,14 +460,20 @@ A task whose program is the old copy, `open-pact\open-pact-client.exe`, needs th
     if ($LASTEXITCODE -ne 0) { throw 'The task was not removed. Run this block again from an elevated prompt.' }
   }
   if (Test-TaskRegistered) { throw 'The task is still registered. Run this block again.' }
-  & 'C:\Program Files\open-pact-client\open-pact-client.exe' --home 'C:\Users\example\pact' schedule off
+  $q = 'C:\Program Files\open-pact-client\open-pact-client.exe'
+  if (-not (Test-Path -LiteralPath $q -PathType Leaf)) { throw 'The machine client is missing. Install the package, then run this block again.' }
+  $clientHome = @'
+C:\Users\example\pact
+'@
+  $global:LASTEXITCODE = $null
+  & $q --home $clientHome schedule off
   if ($LASTEXITCODE -ne 0) { throw 'schedule off failed. Do not uninstall the package. Fix the error, then run this block again.' }
 }
 ```
 
-The block deletes the task and then runs `schedule off` with the machine client. `schedule off` waits for the state lock, then removes the job state. When it fails, for example because a tick holds the lock, the block throws. Do not uninstall the package then. Fix the error and run the block again.
+The block deletes the task. It then checks that the machine client exists and runs `schedule off` with it. `schedule off` waits for the state lock, then removes the job state. When the file is missing or `schedule off` fails, for example because a tick holds the lock, the block throws. Do not uninstall the package then. Fix the error and run the block again.
 
-Run the first command again. It must print nothing. Then uninstall the package. A SYSTEM task that runs another program can come from an older open-pact client. The block can remove it without the package, but the client does not change it. The block deletes the task name that you give it. Check the task in Task Scheduler first.
+Run the first command again. It must print nothing. Then uninstall the package. A SYSTEM task that runs another program can come from an older open-pact client. The client does not change it. To remove it without the package, use the block in step 1 of the [0.9.0 release notes](release-notes/v0.9.0.md#step-1-find-and-remove-the-old-system-task). That block uses Windows tools only. The removal block above deletes the task name that you give it. Check the task in Task Scheduler first.
 
 ## Read the output as JSON
 
