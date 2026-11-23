@@ -1131,6 +1131,39 @@ async fn a_missing_package_still_shows_the_task_and_a_current_package_shows_only
 }
 
 #[tokio::test]
+async fn a_package_problem_and_a_foreign_task_show_the_package_fix_once() {
+    let fixture = Fixture::new("auto_on").await;
+    let report = system_report(
+        &fixture,
+        JobInspection::system_fixture(package("0.0.1"), "not_ours"),
+    )
+    .await;
+    let machine = report
+        .schedule
+        .machine_fix
+        .clone()
+        .expect("the package fix");
+    let shown = report
+        .issues
+        .iter()
+        .filter(|issue| {
+            issue
+                .fix
+                .as_deref()
+                .is_some_and(|fix| fix.contains(&machine))
+        })
+        .count();
+    assert_eq!(shown, 1, "{:?}", report.issues);
+    let task = report
+        .issues
+        .iter()
+        .find(|issue| issue.message.contains("is not the machine client's"))
+        .expect("the not-ours issue");
+    assert!(task.fix.as_deref().unwrap().contains("schtasks.exe"));
+    assert_eq!(report.schedule.job_fix.as_deref(), task.fix.as_deref());
+}
+
+#[tokio::test]
 async fn a_task_that_is_not_ours_lists_the_removal_block() {
     let fixture = Fixture::new("auto_on").await;
     let report = system_report(
