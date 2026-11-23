@@ -116,7 +116,7 @@ jobs:
           if ($code -eq -1978335192) {
               # Older winget on the runner warns on schema headers newer than its own; the schema fields still validate.
               $warnings = @($out -split "\r?\n" | Where-Object { $_ -match '^Manifest Warning:' })
-              $other = @($warnings | Where-Object { $_ -notmatch 'The schema header URL does not match the expected pattern' })
+              $other = @($warnings | Where-Object { $_ -notmatch '^Manifest Warning: The schema header URL does not match the expected pattern\. Value: ' })
               if ($warnings.Count -eq 0 -or $other.Count -ne 0) { throw "winget validate warns: $($other -join '; ')" }
               $global:LASTEXITCODE = 0
           } elseif ($code -ne 0) { throw "winget validate exits with $code." }
