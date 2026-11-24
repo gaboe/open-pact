@@ -21,6 +21,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      - name: Check the workflow path filters
+        run: |
+          python3 -m venv "$RUNNER_TEMP/filters-venv" && "$RUNNER_TEMP/filters-venv/bin/pip" install --quiet pyyaml && "$RUNNER_TEMP/filters-venv/bin/python" -m unittest scripts/packaging/check_path_filters.py
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.100.0
