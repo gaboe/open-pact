@@ -81,12 +81,15 @@ if ($repair.ExitCode -eq 3010) { Write-Output 'Restart Windows to finish the rep
 elseif ($repair.ExitCode -ne 0) { throw ('The repair failed. Exit code: ' + $repair.ExitCode) }
 ```
 
+Repair only from a folder that only administrators can change, such as the folder of the install block. Windows Installer repairs from the folder of the last install. When a standard user can write to that folder, the user can put another MSI with the same package code there, and an elevated repair then installs the files of that MSI. Do not install or repair the package from a share or a folder that standard users can change.
+
 ## Choose a deployment method
 
 - **Intune line-of-business app.** Upload the MSI and assign it to devices. Follow Microsoft's line-of-business page for updates. This method is not verified on an enrolled device yet.
 - **Intune Win32 app.** Detect the install by the ProductCode of the MSI. Treat exit code 3010 as a soft reboot.
 - **Group Policy.** Assign the MSI to the computer, not to a user.
 - **winget.** Do not use the `winget` command-line tool as SYSTEM. Microsoft does not support it there, even when Intune or Group Policy starts it. Deploy the verified MSI with one of the methods above.
+- **Upgrade while the client runs.** When a process runs from the machine client, such as a SYSTEM job run or a `join` that waits for input, `msiexec` refuses the upgrade with exit code 1601. The old version stays installed and the SYSTEM job keeps running it. Install the upgrade again when the process has stopped. Set your deployment tool to retry a failed install.
 - **Rollback.** Keep Windows Installer rollback on. The package removes the old version inside the new install, so a failed upgrade returns to the old version. A policy that disables rollback removes this protection.
 
 ## Start the SYSTEM job for each home
