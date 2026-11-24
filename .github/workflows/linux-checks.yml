@@ -25,9 +25,20 @@ jobs:
         with:
           toolchain: 1.100.0
           components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+
+  # The scenarios build the client inside Docker and need no host toolchain, so they run beside
+  # the cargo job instead of after it.
+  containers:
+    name: Ubuntu container scenarios
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
       - name: Ubuntu container scenarios
         env:
           DISTROS: ubuntu
