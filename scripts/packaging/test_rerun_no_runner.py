@@ -31,6 +31,31 @@ def step(conclusion, status="completed"):
 SUCCESS = job(900, "success", [step("success")], name="linux")
 
 
+RUN = {"id": 7, "run_attempt": 1, "status": "completed", "workflow_id": 3, "event": "push"}
+
+
+class CurrentTest(unittest.TestCase):
+    def test_the_inspected_completed_attempt_is_current(self):
+        self.assertTrue(rerun.current(RUN, 1))
+
+    def test_a_moved_attempt_is_not_current(self):
+        self.assertFalse(rerun.current(dict(RUN, run_attempt=2), 1))
+
+    def test_a_run_still_in_progress_is_not_current(self):
+        self.assertFalse(rerun.current(dict(RUN, status="in_progress"), 1))
+
+
+class NewestTest(unittest.TestCase):
+    def test_the_run_listed_first_is_newest(self):
+        self.assertTrue(rerun.newest(RUN, [{"id": 7}, {"id": 6}]))
+
+    def test_a_newer_run_listed_first_is_not_newest(self):
+        self.assertFalse(rerun.newest(RUN, [{"id": 8}, {"id": 7}]))
+
+    def test_an_empty_list_is_not_newest(self):
+        self.assertFalse(rerun.newest(RUN, []))
+
+
 class DecideTest(unittest.TestCase):
     def test_a_no_runner_job_alone_among_successes_reruns(self):
         jobs = [job(1, "failure", name="macos-arm64"), SUCCESS]

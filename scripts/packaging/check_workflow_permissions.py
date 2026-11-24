@@ -3,6 +3,7 @@
     uv run --with pyyaml python -m unittest scripts/packaging/check_workflow_permissions.py
 
 It is not named test_*.py: the plain `unittest discover` run in the release workflow has no PyYAML.
+It also pins the permissions of rerun-no-runner.yml to its one job.
 Policy: the sign job of client-release.yml mints the release signature. The jobs that call
 authenticode.yml and its own sign job also hold id-token: write, but their token names
 authenticode.yml, which the release verification rejects.
@@ -32,6 +33,25 @@ def token(job: dict) -> bool:
 def third_party(job: dict) -> list[str]:
     uses = [step["uses"] for step in job.get("steps", []) if "uses" in step]
     return [use for use in uses if not use.startswith("./")]
+
+
+RERUN_PERMISSIONS = {"actions": "write", "checks": "read", "contents": "read"}
+
+
+class RerunWorkflowTest(unittest.TestCase):
+    def setUp(self):
+        self.workflow = load("rerun-no-runner.yml")
+        self.jobs = self.workflow["jobs"]
+
+    def test_no_workflow_level_permissions(self):
+        self.assertEqual(self.workflow.get("permissions"), {})
+
+    def test_one_job_with_exactly_the_rerun_permissions(self):
+        self.assertEqual(list(self.jobs), ["rerun"])
+        self.assertEqual(self.jobs["rerun"].get("permissions"), RERUN_PERMISSIONS)
+
+    def test_it_holds_no_identity_token(self):
+        self.assertFalse(token(self.jobs["rerun"]))
 
 
 class ReleaseTokenTest(unittest.TestCase):
