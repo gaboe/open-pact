@@ -10,6 +10,15 @@ on:
       - 'Cargo.toml'
       - 'rust-toolchain.toml'
       - '.github/workflows/desktop.yml'
+      # The core and the client compile these files in with include_str! and include_bytes!.
+      # scripts/packaging/check_path_filters.py checks the list.
+      - 'examples/**'
+      - 'PAPER.md'
+      - 'README.md'
+      - 'docs/client.md'
+      - 'docs/controls.md'
+      - 'docs/windows-machine-install.md'
+      - 'docs/release-notes/**'
   pull_request:
     paths:
       - 'desktop/**'
@@ -18,6 +27,15 @@ on:
       - 'Cargo.toml'
       - 'rust-toolchain.toml'
       - '.github/workflows/desktop.yml'
+      # The core and the client compile these files in with include_str! and include_bytes!.
+      # scripts/packaging/check_path_filters.py checks the list.
+      - 'examples/**'
+      - 'PAPER.md'
+      - 'README.md'
+      - 'docs/client.md'
+      - 'docs/controls.md'
+      - 'docs/windows-machine-install.md'
+      - 'docs/release-notes/**'
 
 permissions:
   contents: read

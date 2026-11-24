@@ -3,9 +3,39 @@ name: windows-checks
 on:
   push:
     branches: [main]
-    paths-ignore: ['desktop/**']
+    # Runs unless the change touches only the desktop, the gateway, the witness, deploy/ or docs that no client code reads. scripts/packaging/check_path_filters.py checks the list.
+    # The last six lines re-include the docs that client code reads.
+    paths:
+      - '**'
+      - '!desktop/**'
+      - '!crates/open-pact-gateway/**'
+      - '!crates/open-pact-witness/**'
+      - '!deploy/**'
+      - '!docs/**'
+      - '!*.md'
+      - 'docs/client.md'
+      - 'docs/controls.md'
+      - 'docs/windows-machine-install.md'
+      - 'docs/release-notes/**'
+      - 'README.md'
+      - 'PAPER.md'
   pull_request:
-    paths-ignore: ['desktop/**']
+    # Runs unless the change touches only the desktop, the gateway, the witness, deploy/ or docs that no client code reads. scripts/packaging/check_path_filters.py checks the list.
+    # The last six lines re-include the docs that client code reads.
+    paths:
+      - '**'
+      - '!desktop/**'
+      - '!crates/open-pact-gateway/**'
+      - '!crates/open-pact-witness/**'
+      - '!deploy/**'
+      - '!docs/**'
+      - '!*.md'
+      - 'docs/client.md'
+      - 'docs/controls.md'
+      - 'docs/windows-machine-install.md'
+      - 'docs/release-notes/**'
+      - 'README.md'
+      - 'PAPER.md'
   workflow_dispatch:
 
 permissions:
