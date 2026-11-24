@@ -373,9 +373,10 @@ mod tests {
             "0.8.1",
         )
         .unwrap();
+        let script = |name: &str| format!("{REPOSITORY}/v0.8.1/desktop/scripts/{name}");
         assert_eq!(mac.program, "sh");
         assert_eq!(mac.args[0], "-c");
-        assert!(mac.args[1].contains("/open-pact/v0.8.1/desktop/scripts/install-desktop.sh"));
+        assert!(mac.args[1].contains(&script("install-desktop.sh")));
         assert!(!mac.args[1].contains("/main/"));
         let scoop = update_invocation(Platform::Windows, SCOOP, "0.8.1").unwrap();
         assert_eq!(scoop.program, "powershell");
@@ -396,16 +397,14 @@ mod tests {
             "0.8.1",
         )
         .unwrap();
-        assert!(plain.args[2].contains("/open-pact/v0.8.1/desktop/scripts/install-desktop.ps1"));
+        assert!(plain.args[2].contains(&script("install-desktop.ps1")));
         let other_package = update_invocation(
             Platform::Windows,
             r"C:\scoop\apps\another\current\open-pact.exe",
             "0.8.1",
         )
         .unwrap();
-        assert!(
-            other_package.args[2].contains("/open-pact/v0.8.1/desktop/scripts/install-desktop.ps1")
-        );
+        assert!(other_package.args[2].contains(&script("install-desktop.ps1")));
         assert_eq!(
             update_invocation(Platform::Other, "/usr/bin/open-pact", "0.8.1"),
             None
