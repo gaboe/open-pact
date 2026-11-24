@@ -11670,3 +11670,11 @@ grace = "1d"
         assert!(session.folders().unwrap().is_empty());
     }
 }
+
+#[cfg(test)]
+mod ci_canary {
+    #[test]
+    fn planted_failure_for_the_ci_check() {
+        assert_eq!(1 + 1, 3, "planted failure: this branch must go red");
+    }
+}
