@@ -4,11 +4,17 @@ on:
   pull_request:
     paths-ignore: ['desktop/**']
   push:
+    branches: [main]
     paths-ignore: ['desktop/**']
   workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  # A newer push to the same pull request replaces its run. Runs on main always finish.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   scoop-local-manifest:
