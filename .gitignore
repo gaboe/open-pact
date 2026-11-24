@@ -4,3 +4,4 @@ internal/
 skills-lock.json
 target/
 DECISIONS.md
+__pycache__/

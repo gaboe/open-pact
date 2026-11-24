@@ -55,6 +55,18 @@ class NewestTest(unittest.TestCase):
     def test_an_empty_list_is_not_newest(self):
         self.assertFalse(rerun.newest(RUN, []))
 
+    def test_a_newer_run_from_another_fork_does_not_count(self):
+        run = dict(RUN, head_repository={"full_name": "gaboe/open-pact"})
+        fork = {"id": 9, "head_repository": {"full_name": "someone/open-pact"}}
+        mine = {"id": 7, "head_repository": {"full_name": "gaboe/open-pact"}}
+        self.assertTrue(rerun.newest(run, [fork, mine]))
+
+    def test_a_newer_run_from_the_same_repository_counts(self):
+        run = dict(RUN, head_repository={"full_name": "gaboe/open-pact"})
+        newer = {"id": 9, "head_repository": {"full_name": "gaboe/open-pact"}}
+        mine = {"id": 7, "head_repository": {"full_name": "gaboe/open-pact"}}
+        self.assertFalse(rerun.newest(run, [newer, mine]))
+
 
 class DecideTest(unittest.TestCase):
     def test_a_no_runner_job_alone_among_successes_reruns(self):

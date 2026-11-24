@@ -7,7 +7,8 @@ a failed or cancelled run and reruns that run's failed jobs with `gh run rerun -
 It reruns only when every failed or cancelled job of the attempt ran no step and has that
 annotation. A real failure, or a job cancelled by a newer push, gives False. It stops at attempt 3.
 Right before the request it also checks that the run is still the attempt it inspected, and that
-it is the newest run of its workflow on its branch and event.
+it is the newest run of its workflow on its branch and event. The rerun API takes no attempt
+precondition, so a run that changes in the seconds between that read and the request is not caught.
 """
 
 from __future__ import annotations
@@ -53,9 +54,18 @@ def current(run, attempt):
     return run.get("run_attempt") == attempt and run.get("status") == "completed"
 
 
+def head_repo(run):
+    return (run.get("head_repository") or {}).get("full_name")
+
+
 def newest(run, recent_runs):
-    """True when the run is first in its workflow's recent runs, which GitHub lists newest first."""
-    return bool(recent_runs) and recent_runs[0].get("id") == run.get("id")
+    """True when no newer run of the same head repository and branch exists.
+
+    GitHub lists runs newest first. A branch filter also matches fork PRs that use the same branch
+    name, and those runs cannot supersede this one, so only runs from the same head repository count.
+    """
+    same = [r for r in recent_runs if head_repo(r) == head_repo(run)]
+    return bool(same) and same[0].get("id") == run.get("id")
 
 
 def gh_api(*args):
@@ -106,7 +116,7 @@ def main():
     recent = gh_json(
         f"repos/{repo}/actions/workflows/{run['workflow_id']}/runs"
         f"?branch={quote(run.get('head_branch') or '', safe='')}"
-        f"&event={quote(run['event'], safe='')}&per_page=5"
+        f"&event={quote(run['event'], safe='')}&per_page=50"
     )["workflow_runs"]
     if not newest(run, recent):
         print("rerun=no reason=newer run exists")
