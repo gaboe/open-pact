@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import os
 import re
 from pathlib import Path
 
@@ -20,7 +21,10 @@ MSI_FILE = "open-pact-client-x86_64-pc-windows-msvc.msi"
 WINGET_ID = "gaboe.open-pact"
 WINGET_TEST_ID = "gaboe.open-pact.test"
 ROOT = Path(__file__).resolve().parents[2]
-RELEASE_URL = "https://github.com/gaboe/open-pact/releases/download"
+# The release workflow of a fork sets GITHUB_REPOSITORY, so its metadata names the fork.
+REPOSITORY = os.environ.get("GITHUB_REPOSITORY") or "gaboe/open-pact"
+REPO_URL = f"https://github.com/{REPOSITORY}"
+RELEASE_URL = f"{REPO_URL}/releases/download"
 
 
 def _load_version_gate():
@@ -71,18 +75,18 @@ def formula(version: str, hashes: dict[str, str], placeholder: bool) -> str:
 # Open Pact client formula.
 class OpenPact < Formula
   desc "Verifiable security checks for personally owned devices"
-  homepage "https://github.com/gaboe/open-pact"
+  homepage "{REPO_URL}"
   license "MIT"
   depends_on :macos
 
   on_macos do
     on_arm do
-      url "https://github.com/gaboe/open-pact/releases/download/v{version}/{RELEASE_FILES['mac_arm64']}"
+      url "{RELEASE_URL}/v{version}/{RELEASE_FILES['mac_arm64']}"
       sha256 "{arm_hash}"
     end
 
     on_intel do
-      url "https://github.com/gaboe/open-pact/releases/download/v{version}/{RELEASE_FILES['mac_x86_64']}"
+      url "{RELEASE_URL}/v{version}/{RELEASE_FILES['mac_x86_64']}"
       sha256 "{intel_hash}"
     end
   end
@@ -110,13 +114,13 @@ def scoop_manifest(version: str, digest: str, placeholder: bool, url: str | None
         else "Open Pact client."
     )
     download_url = url or (
-        f"https://github.com/gaboe/open-pact/releases/download/v{version}/"
+        f"{RELEASE_URL}/v{version}/"
         f"{RELEASE_FILES['windows_x86_64']}"
     )
     return f'''{{
   "version": "{version}",
   "description": "{note}",
-  "homepage": "https://github.com/gaboe/open-pact",
+  "homepage": "{REPO_URL}",
   "license": "MIT",
   "architecture": {{
     "64bit": {{
@@ -126,16 +130,16 @@ def scoop_manifest(version: str, digest: str, placeholder: bool, url: str | None
   }},
   "bin": [["{RELEASE_FILES['windows_x86_64']}", "open-pact-client"]],
   "checkver": {{
-    "github": "https://github.com/gaboe/open-pact"
+    "github": "{REPO_URL}"
   }},
   "autoupdate": {{
     "architecture": {{
       "64bit": {{
-        "url": "https://github.com/gaboe/open-pact/releases/download/v$version/{RELEASE_FILES['windows_x86_64']}"
+        "url": "{RELEASE_URL}/v$version/{RELEASE_FILES['windows_x86_64']}"
       }}
     }},
     "hash": {{
-      "url": "https://github.com/gaboe/open-pact/releases/download/v$version/SHA256SUMS",
+      "url": "{RELEASE_URL}/v$version/SHA256SUMS",
       "regex": "(?m)^(?<sha256>[0-9a-f]{{64}})  {RELEASE_FILES['windows_x86_64'].replace('.', '[.]')}$"
     }}
   }}
@@ -149,7 +153,7 @@ def desktop_scoop_manifest(version: str, digest: str) -> str:
     It has no "bin" entry: the app installs and owns its copy of the client, so a second
     open-pact-client shim would collide with the shim of the open-pact package.
     """
-    repo = "https://github.com/gaboe/open-pact"
+    repo = REPO_URL
     manifest = {
         "version": version,
         "description": "Desktop apps for open-pact: join a company and check this device, and edit deployment manifests",
@@ -223,7 +227,7 @@ ManifestVersion: 1.28.0
 Publisher: gaboe
 PublisherUrl: https://github.com/gaboe
 PackageName: open-pact client
-PackageUrl: https://github.com/gaboe/open-pact
+PackageUrl: {REPO_URL}
 License: MIT
 ShortDescription: "Verifiable security checks for personally owned devices"
 ManifestType: defaultLocale

@@ -9,6 +9,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 import re
 import subprocess
 import sys
@@ -27,7 +28,20 @@ def load(name: str, file: str):
     return module
 
 
-generator = load("generate_release_metadata", "generate-release-metadata.py")
+def load_generator(repository: str | None):
+    """The generator as it reads GITHUB_REPOSITORY at import: unset gives this repository."""
+    saved = os.environ.pop("GITHUB_REPOSITORY", None)
+    if repository is not None:
+        os.environ["GITHUB_REPOSITORY"] = repository
+    try:
+        return load("generate_release_metadata", "generate-release-metadata.py")
+    finally:
+        os.environ.pop("GITHUB_REPOSITORY", None)
+        if saved is not None:
+            os.environ["GITHUB_REPOSITORY"] = saved
+
+
+generator = load_generator(None)
 gate = load("check_release_version", "check-release-version.py")
 
 VERSION = "1.2.3"
@@ -127,6 +141,44 @@ class GeneratorTest(unittest.TestCase):
         bucket = self.generate(SUMS)
         self.assertTrue((bucket / "open-pact.json").exists())
         self.assertTrue((self.dir / "Formula" / "open-pact.rb").exists())
+
+
+class ForkRepositoryTest(unittest.TestCase):
+    """A fork's release workflow sets GITHUB_REPOSITORY, so every URL names the fork."""
+
+    def generate(self, module, directory: Path) -> str:
+        sums = write_sums(directory, SUMS)
+        out = directory / "out"
+        argv = sys.argv
+        sys.argv = [
+            "generate-release-metadata.py",
+            VERSION,
+            str(sums),
+            "--homebrew-dir",
+            str(out / "Formula"),
+            "--scoop-dir",
+            str(out / "bucket"),
+            "--desktop",
+        ]
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                module.main()
+        finally:
+            sys.argv = argv
+        return "".join(path.read_text() for path in sorted(out.rglob("*")) if path.is_file())
+
+    def test_a_fork_value_replaces_the_repository_in_every_url(self):
+        fork = load_generator("contoso/open-pact")
+        with tempfile.TemporaryDirectory() as tmp:
+            text = self.generate(fork, Path(tmp))
+        self.assertIn("https://github.com/contoso/open-pact/releases/download/v1.2.3/", text)
+        self.assertNotIn("gaboe/open-pact", text)
+
+    def test_without_the_variable_the_repository_is_this_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            text = self.generate(load_generator(None), Path(tmp))
+        self.assertIn("https://github.com/gaboe/open-pact/releases/download/v1.2.3/", text)
+        self.assertNotIn("contoso", text)
 
 
 class WingetTest(unittest.TestCase):

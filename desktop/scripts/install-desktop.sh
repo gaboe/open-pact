@@ -20,7 +20,7 @@ set -eu
 # stop the update halfway.
 trap '' PIPE
 
-repo=gaboe/open-pact
+repo=${OPEN_PACT_REPOSITORY:-gaboe/open-pact}
 dir=${OPEN_PACT_INSTALL_DIR:-$HOME/Applications}
 apps="open-pact open-pact-admin"
 

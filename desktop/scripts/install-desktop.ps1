@@ -19,7 +19,7 @@ $ProgressPreference = 'SilentlyContinue'
 
 function Fail($message) { throw "open-pact: $message" }
 
-$repo = 'gaboe/open-pact'
+$repo = if ($env:OPEN_PACT_REPOSITORY) { $env:OPEN_PACT_REPOSITORY } else { 'gaboe/open-pact' }
 $dir = if ($env:OPEN_PACT_INSTALL_DIR) { $env:OPEN_PACT_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA 'open-pact-desktop' }
 $apps = @('open-pact', 'open-pact-admin')
 

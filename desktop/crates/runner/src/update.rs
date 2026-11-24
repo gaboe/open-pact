@@ -5,11 +5,16 @@ use crate::{Runner, args, client::version_key};
 use serde_json::Value;
 use std::time::Duration;
 
-pub const REPOSITORY: &str = "gaboe/open-pact";
+/// The repository that releases this app. The release workflow sets `OPEN_PACT_REPOSITORY` when it
+/// builds, so a fork's build updates from the fork.
+pub const REPOSITORY: &str = match option_env!("OPEN_PACT_REPOSITORY") {
+    Some(repository) => repository,
+    None => DEFAULT_REPOSITORY,
+};
+const DEFAULT_REPOSITORY: &str = "gaboe/open-pact";
 pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
 pub const CHECK_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
 const SCOOP_PACKAGE: &str = "open-pact-desktop";
-const RAW: &str = "https://raw.githubusercontent.com/gaboe/open-pact";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Platform {
@@ -126,14 +131,19 @@ fn last_segment(path: &str) -> &str {
 }
 
 fn install_dir_env(platform: Platform, exe: &str) -> Vec<(String, String)> {
-    install_folder(platform, exe)
+    let mut env: Vec<(String, String)> = install_folder(platform, exe)
         .map(|folder| vec![("OPEN_PACT_INSTALL_DIR".to_owned(), folder.to_owned())])
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // A fork's build tells the install script which repository to read. The default needs none.
+    if REPOSITORY != DEFAULT_REPOSITORY {
+        env.push(("OPEN_PACT_REPOSITORY".to_owned(), REPOSITORY.to_owned()));
+    }
+    env
 }
 
 /// The folder of the install scripts in the source of the release `version`, not of `main`.
 fn scripts_url(version: &str) -> String {
-    format!("{RAW}/v{version}/desktop/scripts")
+    format!("https://raw.githubusercontent.com/{REPOSITORY}/v{version}/desktop/scripts")
 }
 
 /// Downloads the installer to a temporary file and runs it. A failed download fails the command.
@@ -303,6 +313,16 @@ mod tests {
         assert!(checks_enabled(Some("")));
         assert!(checks_enabled(Some("0")));
         assert!(!checks_enabled(Some("1")));
+    }
+
+    /// CI builds without `OPEN_PACT_REPOSITORY`, so the default repository is the one asked.
+    #[test]
+    fn the_default_build_updates_from_this_repository() {
+        assert_eq!(REPOSITORY, "gaboe/open-pact");
+        assert_eq!(
+            scripts_url("0.8.1"),
+            "https://raw.githubusercontent.com/gaboe/open-pact/v0.8.1/desktop/scripts"
+        );
     }
 
     #[test]

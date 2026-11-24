@@ -12,8 +12,12 @@ use serde::Serialize;
 
 use crate::schedule::{ASSERT_PROTECTED, apply_command, powershell_literal};
 
-/// The repository whose release workflow signs the package. A constant, never an environment value.
-const REPOSITORY: &str = "gaboe/open-pact";
+/// The repository whose release workflow signs the package. The release workflow sets
+/// `OPEN_PACT_REPOSITORY` when it builds, so a fork's build trusts the fork. Never a run-time value.
+pub(crate) const REPOSITORY: &str = match option_env!("OPEN_PACT_REPOSITORY") {
+    Some(repository) => repository,
+    None => "gaboe/open-pact",
+};
 const COSIGN_URL: &str =
     "https://github.com/sigstore/cosign/releases/download/v3.0.6/cosign-windows-amd64.exe";
 /// SHA-256 of `cosign-windows-amd64.exe` of Cosign v3.0.6, as its release checksums list it.

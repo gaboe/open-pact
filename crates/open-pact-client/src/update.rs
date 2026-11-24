@@ -7,7 +7,6 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-const LATEST_RELEASE: &str = "https://api.github.com/repos/gaboe/open-pact/releases/latest";
 const CHECK_LIMIT: Duration = Duration::from_secs(3);
 const OPT_OUT: &str = "OPEN_PACT_NO_UPDATE_CHECK";
 
@@ -57,13 +56,21 @@ fn machine_upgrade(exe: &Path, machine: &Path, latest: &str) -> Option<String> {
     ))
 }
 
+fn latest_release_url() -> String {
+    format!(
+        "https://api.github.com/repos/{}/releases/latest",
+        crate::machine::REPOSITORY
+    )
+}
+
 pub(crate) fn latest_notice() -> Option<Notice> {
     let switch = std::env::var(OPT_OUT).ok();
     let exe = std::env::current_exe().ok();
+    let url = latest_release_url();
     bounded(CHECK_LIMIT, move || async move {
         check(
             switch.as_deref(),
-            LATEST_RELEASE,
+            &url,
             CHECK_LIMIT,
             env!("CARGO_PKG_VERSION"),
             exe.as_deref(),
@@ -163,6 +170,16 @@ mod tests {
     use tokio::net::TcpListener;
 
     const BREW: &str = "/opt/homebrew/Cellar/open-pact-client/0.6.0/bin/open-pact-client";
+
+    /// CI builds without `OPEN_PACT_REPOSITORY`, so the default repository is the one asked.
+    #[test]
+    fn the_update_check_asks_this_repository_by_default() {
+        assert_eq!(crate::machine::REPOSITORY, "gaboe/open-pact");
+        assert_eq!(
+            latest_release_url(),
+            "https://api.github.com/repos/gaboe/open-pact/releases/latest"
+        );
+    }
 
     struct Mock {
         url: String,
