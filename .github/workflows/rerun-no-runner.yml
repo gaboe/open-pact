@@ -1,0 +1,31 @@
+name: rerun-no-runner
+
+# Reruns the failed jobs of a run when a macOS job was never acquired by a hosted runner.
+# The rule is in scripts/packaging/rerun_no_runner.py.
+on:
+  workflow_run:
+    workflows: ["desktop", "control-contracts", "client-release"]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  rerun:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: github.event.workflow_run.conclusion == 'failure' || github.event.workflow_run.conclusion == 'cancelled'
+    permissions:
+      actions: write
+      checks: read
+      contents: read
+    steps:
+      # The default branch, never the workflow_run head: that run can come from a fork pull request.
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Rerun jobs that no runner acquired
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+        run: python3 scripts/packaging/rerun_no_runner.py
