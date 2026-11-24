@@ -96,13 +96,48 @@ sudo dnf install "$verified_dir/open-pact-client-0.8.5-1.x86_64.rpm"
 
 ## Run the Windows client under app control
 
-The Windows binaries in a release are not Authenticode-signed. Windows checks them in three ways:
+The Windows binaries in a release of this repository are not Authenticode-signed, unless the repository sets the Artifact Signing variables. A release that an organization builds with its own signing, as in the next section, is signed. Windows checks a Windows binary in three ways:
 
 - **SmartScreen.** A downloaded file can show "Windows protected your PC". Select **More info**, then **Run anyway**.
 - **Smart App Control.** When it is on, Windows blocks an unsigned file and gives no way to run it. It runs a file that is signed with a certificate from a certificate authority in the Microsoft Trusted Root Program.
 - **App Control for Business.** A managed device runs only what the organization's policy allows.
 
-An organization that uses Smart App Control or App Control for Business signs the release itself:
+### Sign releases with Azure Artifact Signing
+
+An organization can run the release workflow in its own fork and get Authenticode-signed Windows files. The workflow signs the three executables, the machine package `.msi`, and so the desktop zip, with [Azure Artifact Signing](https://learn.microsoft.com/azure/artifact-signing/overview). Signing is off until the repository sets the variables below. Without them, the release stays unsigned, with the same assets as before.
+
+You need:
+
+- An Artifact Signing account with a Public Trust certificate profile. Public Trust needs identity validation of the organization.
+- An app registration in Microsoft Entra ID for the workflow. Give it the role "Artifact Signing Certificate Profile Signer" on the certificate profile.
+- A federated credential on the app registration. The issuer is `https://token.actions.githubusercontent.com` and the audience is `api://AzureADTokenExchange`. The subject of a release run is `repo:<owner>/<repo>:ref:refs/tags/vX.Y.Z`. A plain federated credential matches the subject exactly and allows no wildcard, so add one credential for each tag. To cover every tag with one credential, use a flexible federated credential (preview) with the expression `claims['sub'] matches 'repo:<owner>/<repo>:ref:refs/tags/v*' and claims['repository_id'] eq '<repository id>'`.
+
+Set these repository variables (Settings, Secrets and variables, Actions, Variables). They are identifiers, not secrets, and the login needs no secret:
+
+| Variable | Value |
+| --- | --- |
+| `AZURE_CLIENT_ID` | Application (client) ID of the app registration |
+| `AZURE_TENANT_ID` | Directory (tenant) ID |
+| `AZURE_SUBSCRIPTION_ID` | Subscription ID of the signing account |
+| `ARTIFACT_SIGNING_ENDPOINT` | Endpoint of the account, for example `https://eus.codesigning.azure.net` |
+| `ARTIFACT_SIGNING_ACCOUNT` | Name of the signing account. The workflow signs only when this is set. |
+| `ARTIFACT_SIGNING_PROFILE` | Name of the certificate profile |
+
+Then push a version tag, as in the release steps of `CLAUDE.md`. The workflow signs in this order: the executables, then the MSI built from the signed client, then the desktop zip built from the signed executables. It checks that every file has a valid signature and a timestamp, and stops the release when one does not. It then makes `SHA256SUMS` and the Cosign signature over the signed files. The Cosign signature is still made by the `sign` job of `client-release.yml` only. The signing job is a separate workflow, `authenticode.yml`, so its identity token cannot stand in for the release signature.
+
+Verify a fork's release with the repository name of the fork:
+
+```sh
+GH_REPO=<owner>/<repo> scripts/verify-client-release.sh vX.Y.Z
+```
+
+The release workflow builds the client and the desktop apps with `OPEN_PACT_REPOSITORY` set to its own repository. The update check, the machine install block, and the desktop updater of that build then read releases of the fork. A build without this variable reads `gaboe/open-pact`. The package manager files that the release generates name the fork too.
+
+A new certificate gets SmartScreen reputation only over time. A signed file can still show the SmartScreen prompt for a while.
+
+### Sign a downloaded release yourself
+
+An organization that uses Smart App Control or App Control for Business and does not run the release workflow signs the release itself:
 
 1. Verify the release with `scripts/verify-client-release.sh`, as in [Verify a release](#verify-a-release).
 2. Sign each Windows executable with the organization's code-signing certificate. Use the timestamp URL of the certificate authority:

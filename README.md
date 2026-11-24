@@ -123,7 +123,7 @@ irm https://raw.githubusercontent.com/gaboe/open-pact/v0.8.5/desktop/scripts/ins
 
 "Latest" skips prereleases. To install a prerelease or one fixed version, set `OPEN_PACT_DESKTOP_VERSION` first, for example `OPEN_PACT_DESKTOP_VERSION=0.8.5` on macOS or `$env:OPEN_PACT_DESKTOP_VERSION = '0.8.5'` on Windows. The Scoop manifest exists only for stable releases. Run the same command again to update.
 
-Both installers check the zip against its line in `SHA256SUMS` before they replace anything. The macOS installer also checks each app's signature. The apps are not notarized by Apple and not Authenticode-signed, so a browser download can be blocked: install with the commands above instead. On Windows, SmartScreen may warn the first time. For Smart App Control and App Control for Business, see [Run the Windows client under app control](docs/client.md#run-the-windows-client-under-app-control). To also check the Cosign signature of `SHA256SUMS`, run `scripts/verify-client-release.sh` first; it checks the desktop zips too.
+Both installers check the zip against its line in `SHA256SUMS` before they replace anything. The macOS installer also checks each app's signature. The apps are not notarized by Apple, and the Windows files of this repository are not Authenticode-signed unless its owner sets up signing, so a browser download can be blocked: install with the commands above instead. On Windows, SmartScreen may warn the first time. For Smart App Control and App Control for Business, see [Run the Windows client under app control](docs/client.md#run-the-windows-client-under-app-control). To also check the Cosign signature of `SHA256SUMS`, run `scripts/verify-client-release.sh` first; it checks the desktop zips too.
 
 ## Verify a release
 
