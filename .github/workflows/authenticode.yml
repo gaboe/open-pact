@@ -1,0 +1,100 @@
+name: authenticode
+
+# Signs Windows files in a stored artifact with Azure Artifact Signing and stores
+# them again under the same name.
+#
+# This is a separate workflow on purpose. Fulcio names a GitHub certificate by
+# job_workflow_ref. An identity token minted in this called workflow gets the
+# identity .../authenticode.yml@refs/tags/<tag>. release_verify (WORKFLOW =
+# client-release.yml) and the Cosign identity checks reject that identity, so it
+# can never stand in for the release signature. The rule "only the sign job of
+# client-release.yml can mint the release signature" still holds.
+#
+# The Azure values are repository variables, not secrets: they are identifiers,
+# and the OIDC login needs no secret.
+
+on:
+  workflow_call:
+    inputs:
+      artifact:
+        description: The artifact to sign in place.
+        type: string
+        required: true
+      files:
+        description: File names inside the artifact, one per line.
+        type: string
+        required: true
+
+jobs:
+  sign:
+    name: Authenticode
+    runs-on: windows-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ inputs.artifact }}
+          path: ${{ runner.temp }}\signing
+      - name: Resolve the absolute paths
+        id: paths
+        shell: pwsh
+        env:
+          FILES: ${{ inputs.files }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'signing'
+          $paths = @()
+          foreach ($name in ($env:FILES -split '\r?\n')) {
+            if ($name.Trim() -eq '') { continue }
+            $paths += (Resolve-Path -LiteralPath (Join-Path $root $name.Trim())).Path
+          }
+          if ($paths.Count -eq 0) { throw 'No file to sign.' }
+          "list<<END_OF_LIST" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          $paths | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "END_OF_LIST" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+      - uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          endpoint: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.ARTIFACT_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.ARTIFACT_SIGNING_PROFILE }}
+          files: ${{ steps.paths.outputs.list }}
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+          # Only the Azure CLI credential from azure/login stays on.
+          exclude-environment-credential: true
+          exclude-workload-identity-credential: true
+          exclude-managed-identity-credential: true
+          exclude-shared-token-cache-credential: true
+          exclude-visual-studio-credential: true
+          exclude-visual-studio-code-credential: true
+          exclude-azure-powershell-credential: true
+          exclude-azure-developer-cli-credential: true
+          exclude-interactive-browser-credential: true
+      - name: Check every signature and its timestamp
+        shell: pwsh
+        env:
+          FILES: ${{ steps.paths.outputs.list }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($path in ($env:FILES -split '\r?\n')) {
+            if ($path.Trim() -eq '') { continue }
+            $signature = Get-AuthenticodeSignature -LiteralPath $path.Trim()
+            if ($signature.Status -ne 'Valid') { throw "$path has signature status $($signature.Status)." }
+            if ($null -eq $signature.TimeStamperCertificate) { throw "$path has no timestamp." }
+            Write-Host "$path is signed by $($signature.SignerCertificate.Subject)."
+          }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ inputs.artifact }}
+          path: ${{ runner.temp }}\signing\*
+          overwrite: true
+          if-no-files-found: error
+          retention-days: 1

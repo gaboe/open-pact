@@ -31,6 +31,11 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - name: Check who may request an identity token
+        run: |
+          python3 -m venv "$RUNNER_TEMP/policy-venv"
+          "$RUNNER_TEMP/policy-venv/bin/pip" install --quiet pyyaml
+          "$RUNNER_TEMP/policy-venv/bin/python" -m unittest scripts/packaging/check_workflow_permissions.py
 
   # The scenarios build the client inside Docker and need no host toolchain, so they run beside
   # the cargo job instead of after it.

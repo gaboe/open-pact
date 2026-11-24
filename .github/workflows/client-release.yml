@@ -15,6 +15,11 @@ jobs:
       - uses: actions/checkout@v6
       - name: Test the packaging scripts
         run: python3 -m unittest discover -s scripts/packaging -p 'test_*.py'
+      - name: Check who may request an identity token
+        run: |
+          python3 -m venv "$RUNNER_TEMP/policy-venv"
+          "$RUNNER_TEMP/policy-venv/bin/pip" install --quiet pyyaml
+          "$RUNNER_TEMP/policy-venv/bin/python" -m unittest scripts/packaging/check_workflow_permissions.py
       - name: Check that the tag names both workspace versions
         run: python3 scripts/packaging/check-release-version.py "$GITHUB_REF_NAME"
 
@@ -28,15 +33,20 @@ jobs:
         include:
           - target: aarch64-apple-darwin
             os: macos-latest
+            artifact: client-aarch64-apple-darwin
             binary: open-pact-client-aarch64-apple-darwin
           - target: x86_64-apple-darwin
             os: macos-latest
+            artifact: client-x86_64-apple-darwin
             binary: open-pact-client-x86_64-apple-darwin
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
+            artifact: client-x86_64-unknown-linux-musl
             binary: open-pact-client-x86_64-unknown-linux-musl
           - target: x86_64-pc-windows-msvc
             os: windows-latest
+            # The msi job stores the final client under client-<target>, signed when signing is on.
+            artifact: windows-client-unsigned
             binary: open-pact-client-x86_64-pc-windows-msvc.exe
     steps:
       - uses: actions/checkout@v6
@@ -47,6 +57,8 @@ jobs:
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: sudo apt-get update && sudo apt-get install --yes musl-tools
       - name: Build client
+        env:
+          OPEN_PACT_REPOSITORY: ${{ github.repository }}
         run: cargo build --locked --release --package open-pact-client --target ${{ matrix.target }}
       - name: Check the Windows client imports no Visual C++ runtime
         if: matrix.target == 'x86_64-pc-windows-msvc'
@@ -56,7 +68,7 @@ jobs:
         run: cp "target/${{ matrix.target }}/release/open-pact-client${{ matrix.target == 'x86_64-pc-windows-msvc' && '.exe' || '' }}" "${{ matrix.binary }}"
       - uses: actions/upload-artifact@v4
         with:
-          name: client-${{ matrix.target }}
+          name: ${{ matrix.artifact }}
           path: ${{ matrix.binary }}
           if-no-files-found: error
           retention-days: 1
@@ -74,6 +86,8 @@ jobs:
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
       - name: Build both apps for both Mac architectures
+        env:
+          OPEN_PACT_REPOSITORY: ${{ github.repository }}
         run: |
           for target in aarch64-apple-darwin x86_64-apple-darwin; do
             cargo build --release --locked --workspace --target "$target"
@@ -86,7 +100,7 @@ jobs:
           done
       - uses: actions/download-artifact@v4
         with:
-          pattern: client-*
+          pattern: client-*-apple-darwin
           merge-multiple: true
           path: ${{ github.workspace }}/cli
       - name: Join the command line tool of this run
@@ -126,31 +140,46 @@ jobs:
         with:
           version: '20.1'
       - name: Build both apps
+        env:
+          OPEN_PACT_REPOSITORY: ${{ github.repository }}
         run: cargo build --release --locked --workspace
       - uses: actions/download-artifact@v4
         with:
-          pattern: client-*
-          merge-multiple: true
+          name: windows-client-unsigned
           path: ${{ github.workspace }}/cli
-      - name: Zip the apps with the command line tool of this run
-        env:
-          TAG: ${{ github.ref_name }}
+      - name: Stage the three executables with the command line tool of this run
         run: |
-          mkdir stage "$GITHUB_WORKSPACE/out"
+          mkdir stage
           cp target/release/open-pact.exe target/release/open-pact-admin.exe stage/
           cp "$GITHUB_WORKSPACE/cli/open-pact-client-x86_64-pc-windows-msvc.exe" stage/open-pact-client.exe
-          name="open-pact-desktop-${TAG#v}-windows-x64.zip"
-          powershell -NoProfile -Command "Compress-Archive -Path stage/* -DestinationPath \"$GITHUB_WORKSPACE/out/$name\""
+      # The msi job zips them after the optional Authenticode job, so the zip holds the signed files.
       - uses: actions/upload-artifact@v4
         with:
-          name: desktop-windows
-          path: out/*
+          name: windows-exes
+          path: desktop/stage/*
           if-no-files-found: error
           retention-days: 1
 
+  authenticode-exes:
+    # Runs only when the repository sets the Artifact Signing variables.
+    name: Authenticode of the executables
+    needs: desktop-windows
+    if: ${{ vars.ARTIFACT_SIGNING_ACCOUNT != '' }}
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/authenticode.yml
+    with:
+      artifact: windows-exes
+      files: |
+        open-pact.exe
+        open-pact-admin.exe
+        open-pact-client.exe
+
   msi:
-    name: Build the Windows machine package
-    needs: build
+    name: Build the Windows machine package and the desktop zip
+    needs: [desktop-windows, authenticode-exes]
+    if: ${{ !cancelled() && !failure() }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
@@ -159,8 +188,8 @@ jobs:
           dotnet-version: 8.0.x
       - uses: actions/download-artifact@v4
         with:
-          name: client-x86_64-pc-windows-msvc
-          path: ${{ runner.temp }}/client
+          name: windows-exes
+          path: ${{ runner.temp }}/exes
       - name: Install WiX
         shell: pwsh
         run: ./scripts/packaging/install-wix.ps1
@@ -171,7 +200,7 @@ jobs:
         run: |
           $out = Join-Path $env:GITHUB_WORKSPACE 'msi' 'open-pact-client-x86_64-pc-windows-msvc.msi'
           New-Item -ItemType Directory -Force -Path (Split-Path -Parent $out) | Out-Null
-          $exe = Join-Path $env:RUNNER_TEMP 'client' 'open-pact-client-x86_64-pc-windows-msvc.exe'
+          $exe = Join-Path $env:RUNNER_TEMP 'exes' 'open-pact-client.exe'
           ./scripts/packaging/build-msi.ps1 -Exe $exe -Version ($env:TAG).Substring(1) -Out $out
       - uses: actions/upload-artifact@v4
         with:
@@ -179,10 +208,47 @@ jobs:
           path: msi/open-pact-client-x86_64-pc-windows-msvc.msi
           if-no-files-found: error
           retention-days: 1
+      - name: Zip the desktop apps and name the client
+        shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          $exes = Join-Path $env:RUNNER_TEMP 'exes'
+          $out = Join-Path $env:GITHUB_WORKSPACE 'out'
+          $client = Join-Path $env:GITHUB_WORKSPACE 'client'
+          New-Item -ItemType Directory -Force -Path $out, $client | Out-Null
+          Compress-Archive -Path (Join-Path $exes '*') -DestinationPath (Join-Path $out "open-pact-desktop-$($env:TAG.Substring(1))-windows-x64.zip")
+          Copy-Item (Join-Path $exes 'open-pact-client.exe') (Join-Path $client 'open-pact-client-x86_64-pc-windows-msvc.exe')
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-windows
+          path: out/*
+          if-no-files-found: error
+          retention-days: 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: client-x86_64-pc-windows-msvc
+          path: client/*
+          if-no-files-found: error
+          retention-days: 1
+
+  authenticode-msi:
+    # Runs only when the repository sets the Artifact Signing variables.
+    name: Authenticode of the machine package
+    needs: msi
+    if: ${{ vars.ARTIFACT_SIGNING_ACCOUNT != '' }}
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/authenticode.yml
+    with:
+      artifact: client-msi
+      files: open-pact-client-x86_64-pc-windows-msvc.msi
 
   package:
     name: Package and checksum
-    needs: [build, msi, desktop-macos, desktop-windows]
+    needs: [build, msi, authenticode-msi, desktop-macos]
+    if: ${{ !cancelled() && !failure() }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -233,9 +299,11 @@ jobs:
           retention-days: 1
 
   sign:
-    # The only job with the identity token. The updater trusts a release through
-    # the Cosign signature over SHA256SUMS, so only this job may mint it. It runs
-    # three actions, each pinned by commit SHA, and no build or release tool.
+    # The only job here with the identity token for the release signature. The updater
+    # trusts a release through the Cosign signature over SHA256SUMS, so only this job may
+    # mint it. It runs three actions, each pinned by commit SHA, and no build or release
+    # tool. The two authenticode-* jobs also hold the identity token permission, but their token names
+    # authenticode.yml, which release_verify and the Cosign identity checks reject.
     name: Sign the checksums
     needs: package
     runs-on: ubuntu-latest

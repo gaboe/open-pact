@@ -132,8 +132,9 @@ class SigningJobTest(unittest.TestCase):
         self.assertNotIn("write-all", top)
         for name, job in self.jobs.items():
             self.assertNotIn("write-all", job, name)
-            if name == "sign":
-                self.assertEqual(re.findall(r"id-token: (\w+)", job), ["write"])
+            if name == "sign" or "uses: ./.github/workflows/authenticode.yml" in job:
+                # The authenticode jobs mint a token that names authenticode.yml, not this workflow.
+                self.assertEqual(re.findall(r"id-token: (\w+)", job), ["write"], name)
             else:
                 self.assertNotIn("id-token", job, name)
 
@@ -299,7 +300,7 @@ class ClientReleaseMsiTest(unittest.TestCase):
         self.assertIn("./scripts/packaging/install-wix.ps1", msi)
         self.assertIn("./scripts/packaging/build-msi.ps1", msi)
         self.assertIn("name: client-msi", msi)
-        self.assertEqual(needs(msi), ["build"])
+        self.assertEqual(needs(msi), ["desktop-windows", "authenticode-exes"])
         self.assertNotIn("id-token", msi)
         self.assertNotIn("cosign", msi)
 
