@@ -5,7 +5,7 @@
 # vX.Y.Z is the tag of the release to install. The script of a tag installs the latest release, or
 # the release named in $env:OPEN_PACT_DESKTOP_VERSION.
 #
-# The apps are not code signed, so Windows SmartScreen may warn the first time. The zip is checked
+# The apps are unsigned unless the release was built with Azure Artifact Signing, so Windows SmartScreen may warn the first time. The zip is checked
 # against its line in the SHA256SUMS file of the same release before anything is replaced. The
 # release signs SHA256SUMS with Cosign (see docs/client.md, "Verify a release").
 #

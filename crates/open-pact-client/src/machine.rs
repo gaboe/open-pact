@@ -985,9 +985,9 @@ mod tests {
         // Cosign is pinned by hash, then it verifies the sums with the exact identity.
         assert!(block.contains(&format!("-ne '{COSIGN_SHA256}'")));
         assert!(block.find(COSIGN_SHA256).unwrap() < block.find("verify-blob").unwrap());
-        assert!(block.contains(
-            "--certificate-identity 'https://github.com/gaboe/open-pact/.github/workflows/client-release.yml@refs/tags/v0.9.0'"
-        ));
+        assert!(block.contains(&format!(
+            "--certificate-identity 'https://github.com/{REPOSITORY}/.github/workflows/client-release.yml@refs/tags/v0.9.0'"
+        )));
         assert!(
             block.contains(
                 "--certificate-oidc-issuer 'https://token.actions.githubusercontent.com'"

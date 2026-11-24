@@ -134,10 +134,9 @@ fn install_dir_env(platform: Platform, exe: &str) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = install_folder(platform, exe)
         .map(|folder| vec![("OPEN_PACT_INSTALL_DIR".to_owned(), folder.to_owned())])
         .unwrap_or_default();
-    // A fork's build tells the install script which repository to read. The default needs none.
-    if REPOSITORY != DEFAULT_REPOSITORY {
-        env.push(("OPEN_PACT_REPOSITORY".to_owned(), REPOSITORY.to_owned()));
-    }
+    // The install script reads this repository. Always pass the compiled one, so an inherited
+    // value cannot switch the repository between the update check and the install.
+    env.push(("OPEN_PACT_REPOSITORY".to_owned(), REPOSITORY.to_owned()));
     env
 }
 
@@ -315,29 +314,54 @@ mod tests {
         assert!(!checks_enabled(Some("1")));
     }
 
-    /// CI builds without `OPEN_PACT_REPOSITORY`, so the default repository is the one asked.
+    /// Only a build without `OPEN_PACT_REPOSITORY` is the upstream build, so only it must name
+    /// the upstream repository.
     #[test]
     fn the_default_build_updates_from_this_repository() {
-        assert_eq!(REPOSITORY, "gaboe/open-pact");
+        if option_env!("OPEN_PACT_REPOSITORY").is_none() {
+            assert_eq!(REPOSITORY, "gaboe/open-pact");
+        }
+    }
+
+    #[test]
+    fn the_scripts_come_from_the_compiled_repository() {
         assert_eq!(
             scripts_url("0.8.1"),
-            "https://raw.githubusercontent.com/gaboe/open-pact/v0.8.1/desktop/scripts"
+            format!("https://raw.githubusercontent.com/{REPOSITORY}/v0.8.1/desktop/scripts")
         );
+    }
+
+    /// The installer reads the repository from its environment, so a direct update always names
+    /// the repository that this build was compiled for, in a default build too.
+    #[test]
+    fn a_direct_update_always_names_the_compiled_repository() {
+        let mac = update_invocation(
+            Platform::Mac,
+            "/Applications/Open Pact.app/Contents/MacOS/open-pact-desktop",
+            "0.9.0",
+        )
+        .unwrap();
+        let windows = update_invocation(
+            Platform::Windows,
+            r"C:\Users\Contoso\AppData\Local\open-pact-desktop\open-pact-desktop.exe",
+            "0.9.0",
+        )
+        .unwrap();
+        for invocation in [mac, windows] {
+            assert!(
+                invocation
+                    .env
+                    .contains(&("OPEN_PACT_REPOSITORY".to_owned(), REPOSITORY.to_owned()))
+            );
+        }
     }
 
     #[test]
     fn the_check_uses_curl_with_a_five_second_limit() {
         let mac = check_invocation(Platform::Mac);
+        let url = format!("https://api.github.com/repos/{REPOSITORY}/releases/latest");
         assert_eq!(mac.program, "curl");
-        assert_eq!(
-            mac.args,
-            [
-                "-fsSL",
-                "-m",
-                "5",
-                "https://api.github.com/repos/gaboe/open-pact/releases/latest"
-            ]
-        );
+        assert_eq!(mac.args, ["-fsSL", "-m", "5", url.as_str()]);
         assert_eq!(check_invocation(Platform::Windows).program, "curl.exe");
     }
 
@@ -460,10 +484,13 @@ mod tests {
         .unwrap();
         assert_eq!(
             mac.env,
-            [(
-                "OPEN_PACT_INSTALL_DIR".to_owned(),
-                "/Users/fictional/Tools/op".to_owned()
-            )]
+            [
+                (
+                    "OPEN_PACT_INSTALL_DIR".to_owned(),
+                    "/Users/fictional/Tools/op".to_owned()
+                ),
+                ("OPEN_PACT_REPOSITORY".to_owned(), REPOSITORY.to_owned()),
+            ]
         );
         let plain = update_invocation(
             Platform::Windows,
@@ -473,10 +500,13 @@ mod tests {
         .unwrap();
         assert_eq!(
             plain.env,
-            [(
-                "OPEN_PACT_INSTALL_DIR".to_owned(),
-                r"C:\Users\fictional\AppData\Local\open-pact-desktop".to_owned()
-            )]
+            [
+                (
+                    "OPEN_PACT_INSTALL_DIR".to_owned(),
+                    r"C:\Users\fictional\AppData\Local\open-pact-desktop".to_owned()
+                ),
+                ("OPEN_PACT_REPOSITORY".to_owned(), REPOSITORY.to_owned()),
+            ]
         );
         assert!(
             update_invocation(Platform::Windows, SCOOP, "0.8.1")
@@ -486,7 +516,10 @@ mod tests {
         );
         let bare =
             update_invocation(Platform::Mac, "/Users/fictional/dev/open-pact", "0.8.1").unwrap();
-        assert!(bare.env.is_empty());
+        assert_eq!(
+            bare.env,
+            [("OPEN_PACT_REPOSITORY".to_owned(), REPOSITORY.to_owned())]
+        );
     }
 
     #[cfg(unix)]

@@ -171,14 +171,20 @@ mod tests {
 
     const BREW: &str = "/opt/homebrew/Cellar/open-pact-client/0.6.0/bin/open-pact-client";
 
-    /// CI builds without `OPEN_PACT_REPOSITORY`, so the default repository is the one asked.
+    /// The check asks the repository that this build was compiled for. Only a build without
+    /// `OPEN_PACT_REPOSITORY` must name the upstream repository.
     #[test]
-    fn the_update_check_asks_this_repository_by_default() {
-        assert_eq!(crate::machine::REPOSITORY, "gaboe/open-pact");
+    fn the_update_check_asks_the_compiled_repository() {
         assert_eq!(
             latest_release_url(),
-            "https://api.github.com/repos/gaboe/open-pact/releases/latest"
+            format!(
+                "https://api.github.com/repos/{}/releases/latest",
+                crate::machine::REPOSITORY
+            )
         );
+        if option_env!("OPEN_PACT_REPOSITORY").is_none() {
+            assert_eq!(crate::machine::REPOSITORY, "gaboe/open-pact");
+        }
     }
 
     struct Mock {
