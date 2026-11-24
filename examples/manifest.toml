@@ -215,3 +215,5 @@ mode = "vpn"
 vpn_probe = "10.0.0.1:443"
 vpn_probe_name = "vpn.example.org"
 interval = "55m"
+
+# proof: path filter
