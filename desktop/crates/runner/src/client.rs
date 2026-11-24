@@ -85,7 +85,7 @@ pub fn install(runner: &Runner, bundled: &Path, destination: &Path) -> Result<()
     let wanted = version(runner, bundled)?;
     let parent = destination.parent().ok_or("Invalid install destination")?;
     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    let temporary = destination.with_extension("installing");
+    let temporary = temporary_path(destination);
     std::fs::copy(bundled, &temporary).map_err(|e| e.to_string())?;
     if version(runner, &temporary)? != wanted {
         let _ = std::fs::remove_file(&temporary);
@@ -95,6 +95,12 @@ pub fn install(runner: &Runner, bundled: &Path, destination: &Path) -> Result<()
         std::fs::remove_file(destination).map_err(|e| e.to_string())?;
     }
     std::fs::rename(temporary, destination).map_err(|e| e.to_string())
+}
+
+/// The staging name for a copy that will replace `destination`. It must not contain "install":
+/// Windows Installer Detection treats such an unmanifested exe as a setup program and asks for elevation.
+fn temporary_path(destination: &Path) -> PathBuf {
+    destination.with_extension("new")
 }
 
 #[cfg(unix)]
@@ -210,5 +216,26 @@ fn broadcast_environment_change() {
             5000,
             &mut result,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn staging_name_has_no_install_word() {
+        for destination in [
+            Path::new(cli_name()),
+            Path::new("C:/Users/Ana/AppData/Local/open-pact/open-pact-client.exe"),
+            Path::new("/home/ana/.local/bin/open-pact-client"),
+        ] {
+            let staged = temporary_path(destination);
+            let name = staged.file_name().unwrap().to_string_lossy().to_lowercase();
+            assert!(
+                !name.contains("install"),
+                "staging name {name} contains install"
+            );
+        }
     }
 }
