@@ -1447,6 +1447,15 @@ elseif ($repair.ExitCode -ne 0) { throw ('The repair failed. Exit code: ' + $rep
         install_block(&Version::parse("0.9.0").unwrap())
     }
 
+    /// The docs name the upstream repository in their release URLs. A fork's build prints its own
+    /// `REPOSITORY`, so the docs are compared the way that build prints them.
+    fn as_built(doc: &str) -> String {
+        doc.replace(
+            "https://github.com/gaboe/open-pact/",
+            &format!("https://github.com/{REPOSITORY}/"),
+        )
+    }
+
     /// The removal block without the prose lines after it. Those lines name folders of this machine.
     fn removal_text(machine: Option<&Path>) -> String {
         removal_block(Path::new(HOME), TASK, machine)
@@ -1464,16 +1473,21 @@ elseif ($repair.ExitCode -ne 0) { throw ('The repair failed. Exit code: ' + $rep
     #[test]
     fn every_doc_shows_the_install_block_that_the_client_prints() {
         let block = install_text();
+        let (client, windows, notes) = (
+            as_built(CLIENT),
+            as_built(WINDOWS_INSTALL),
+            as_built(RELEASE_NOTES),
+        );
         for (name, doc, heading) in [
-            ("docs/client.md", CLIENT, CLIENT_INSTALL),
+            ("docs/client.md", client.as_str(), CLIENT_INSTALL),
             (
                 "docs/windows-machine-install.md",
-                WINDOWS_INSTALL,
+                windows.as_str(),
                 WINDOWS_INSTALL_HEADING,
             ),
             (
                 "docs/release-notes/v0.9.0.md",
-                RELEASE_NOTES,
+                notes.as_str(),
                 RELEASE_INSTALL,
             ),
         ] {
@@ -1564,7 +1578,8 @@ elseif ($repair.ExitCode -ne 0) { throw ('The repair failed. Exit code: ' + $rep
 
     #[test]
     fn the_release_notes_order_their_blocks_by_the_position_of_each_fence() {
-        let all = fences(RELEASE_NOTES);
+        let notes = as_built(RELEASE_NOTES);
+        let all = fences(&notes);
         let position = |script: &str| {
             let found: Vec<usize> = all
                 .iter()
@@ -1594,7 +1609,7 @@ elseif ($repair.ExitCode -ne 0) { throw ('The repair failed. Exit code: ' + $rep
             RELEASE_REMOVE,
             RELEASE_START,
         ]
-        .map(|heading| RELEASE_NOTES.find(heading).unwrap());
+        .map(|heading| notes.find(heading).unwrap());
         assert!(headings.windows(2).all(|pair| pair[0] < pair[1]));
     }
 
@@ -1684,12 +1699,12 @@ elseif ($repair.ExitCode -ne 0) { throw ('The repair failed. Exit code: ' + $rep
             REPAIR_COMMANDS.to_owned(),
         ];
         for (name, doc) in [
-            ("README.md", README),
-            ("docs/client.md", CLIENT),
-            ("docs/windows-machine-install.md", WINDOWS_INSTALL),
-            ("docs/release-notes/v0.9.0.md", RELEASE_NOTES),
+            ("README.md", as_built(README)),
+            ("docs/client.md", as_built(CLIENT)),
+            ("docs/windows-machine-install.md", as_built(WINDOWS_INSTALL)),
+            ("docs/release-notes/v0.9.0.md", as_built(RELEASE_NOTES)),
         ] {
-            for fence in powershell_fences(doc) {
+            for fence in powershell_fences(&doc) {
                 // A value that the reader writes goes in a here-string, never between quotes.
                 assert!(
                     !fence.contains("'<"),
