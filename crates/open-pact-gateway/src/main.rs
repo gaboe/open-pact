@@ -169,6 +169,8 @@ type Reply = (StatusCode, Json<Value>);
 #[derive(Clone)]
 struct App {
     db: PgPool,
+    /// The pool of the read routes and of every tree step. Writes never use it.
+    read_db: PgPool,
     enforced: Arc<Enforced>,
     current: Arc<RwLock<Arc<Enforced>>>,
     keys: Arc<Keys>,
@@ -510,7 +512,7 @@ impl App {
             return Err(internal("a test fault in tree()"));
         }
         let step = tree_step(
-            self.db.clone(),
+            self.read_db.clone(),
             self.enforced.clone(),
             TreeSql::Base,
             self.owners.hooks(),
@@ -1659,6 +1661,24 @@ async fn publish_manifest_in(
     Ok(())
 }
 
+/// Connections of the read pool: the read routes and every tree step use it, so a write path that
+/// stalls PostgreSQL leaves them a connection.
+const DEFAULT_READ_POOL: u32 = 4;
+
+fn read_pool_connections() -> anyhow::Result<u32> {
+    let connections: u32 = env_number("READ_POOL_CONNECTIONS", DEFAULT_READ_POOL)?;
+    anyhow::ensure!(connections > 0, "READ_POOL_CONNECTIONS must be at least 1");
+    Ok(connections)
+}
+
+/// A pool of up to `connections` connections with the options of `db`. It opens no connection
+/// until a read needs one.
+fn read_pool(db: &PgPool, connections: u32) -> PgPool {
+    PgPoolOptions::new()
+        .max_connections(connections)
+        .connect_lazy_with(db.connect_options().as_ref().clone())
+}
+
 async fn connect(url: &str) -> anyhow::Result<PgPool> {
     let max_connections: u32 = env_number("DATABASE_MAX_CONNECTIONS", 10)?;
     anyhow::ensure!(
@@ -2036,7 +2056,8 @@ async fn poll_manifest(app: App) {
     }
 }
 
-async fn serve(db: PgPool) -> anyhow::Result<()> {
+async fn serve(db: PgPool, read_connections: u32) -> anyhow::Result<()> {
+    let read_db = read_pool(&db, read_connections);
     let addr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
     // Checked first: a bad token or certificate refuses startup before any other work.
     let observation = metrics::Settings::from_env()?;
@@ -2048,7 +2069,7 @@ async fn serve(db: PgPool) -> anyhow::Result<()> {
         .then(|| Arc::new(metrics::Metrics::new()));
     let observe = metrics::Observation::new(registry.clone(), observation.slow_ms);
     if let (Some(listener), Some(registry)) = (observation.listener, registry) {
-        let bound = metrics::start(listener, registry, db.clone()).await?;
+        let bound = metrics::start(listener, registry, db.clone(), read_db.clone()).await?;
         eprintln!("metrics on {bound}");
     }
     if let Some(ms) = observation.slow_ms {
@@ -2149,6 +2170,7 @@ async fn serve(db: PgPool) -> anyhow::Result<()> {
         enforced.log.witnesses.keys().to_vec(),
         current.clone(),
         db.clone(),
+        read_db.clone(),
         observe.clone(),
     )?;
     let app = App {
@@ -2157,6 +2179,7 @@ async fn serve(db: PgPool) -> anyhow::Result<()> {
         owners: Arc::new(owners),
         wait: Duration::from_millis(wait_ms),
         db,
+        read_db,
         keys: Arc::new(keys),
         auto_approve,
         limiter: Arc::new(limiter),
@@ -2270,15 +2293,19 @@ fn usage_error_line(args: &[std::ffi::OsString], error: &clap::Error) -> Option<
 }
 
 async fn run(cli: Cli) -> anyhow::Result<()> {
-    let db = connect(&std::env::var("DATABASE_URL")?).await?;
     let command = cli.command.unwrap_or(Command::Serve);
+    // A bad pool size refuses startup before any connection is made.
+    let read_connections = matches!(command, Command::Serve)
+        .then(read_pool_connections)
+        .transpose()?;
+    let db = connect(&std::env::var("DATABASE_URL")?).await?;
     if matches!(command, Command::Claims { .. }) {
         check_schema_current(&db).await?;
     } else {
         sqlx::migrate!("./migrations").run(&db).await?;
     }
     match command {
-        Command::Serve => serve(db).await,
+        Command::Serve => serve(db, read_connections.unwrap_or(DEFAULT_READ_POOL)).await,
         Command::Invite {
             json,
             ttl,
@@ -2360,11 +2387,22 @@ mod tests {
     fn owners_for(
         current: &Arc<RwLock<Arc<Enforced>>>,
         db: &PgPool,
+        read_db: &PgPool,
         urls: Vec<String>,
         observe: Option<Arc<metrics::Observation>>,
     ) -> Arc<Owners> {
         let keys = current.read().unwrap().log.witnesses.keys().to_vec();
-        Arc::new(Owners::start(urls, keys, current.clone(), db.clone(), observe).unwrap())
+        Arc::new(
+            Owners::start(
+                urls,
+                keys,
+                current.clone(),
+                db.clone(),
+                read_db.clone(),
+                observe,
+            )
+            .unwrap(),
+        )
     }
 
     fn tree_of(leaves: Vec<LogHash>) -> Tree {
@@ -2384,10 +2422,12 @@ mod tests {
         let keys = Keys::load_or_create(&db, &kek).await.unwrap();
         let enforced = Arc::new(manifests::enforced(toml, &keys, None).unwrap());
         let current = Arc::new(RwLock::new(enforced.clone()));
+        let read_db = testdb::read_pool(&db, 2);
         App {
-            owners: owners_for(&current, &db, vec![], None),
+            owners: owners_for(&current, &db, &read_db, vec![], None),
             wait: Duration::from_secs(3),
             db,
+            read_db,
             enforced,
             current,
             keys: Arc::new(keys),
@@ -2506,7 +2546,7 @@ mod tests {
         let url = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, witness).await.unwrap() });
         let mut app = manifest_app(DEMO).await;
-        app.owners = owners_for(&app.current, &app.db, vec![url], None);
+        app.owners = owners_for(&app.current, &app.db, &app.read_db, vec![url], None);
         let refresh = tokio::spawn(refresh_cosignatures(app));
         let result = tokio::time::timeout(Duration::from_secs(4), async {
             while pushes.load(std::sync::atomic::Ordering::Relaxed) < 2 {
@@ -2549,7 +2589,7 @@ mod tests {
         let mut app = manifest_app(DEMO).await;
         app.observe = observe.clone();
         let urls = ["failing", "refusing", "ahead", "empty"].map(|name| format!("{base}/{name}"));
-        app.owners = owners_for(&app.current, &app.db, urls.to_vec(), observe);
+        app.owners = owners_for(&app.current, &app.db, &app.read_db, urls.to_vec(), observe);
         (app, server)
     }
 
@@ -2562,7 +2602,7 @@ mod tests {
         let (app, server) = app_with_broken_witnesses(observation).await;
         app.checkpoint(Mode::Enroll).await.unwrap();
         server.abort();
-        let text = metrics.scrape(&app.db);
+        let text = metrics.scrape(&app.db, &app.read_db);
         for result in ["error", "refused", "conflict", "invalid"] {
             let line = format!("openpact_witness_push_seconds_count{{result=\"{result}\"}} 1");
             assert!(text.contains(&line), "{result} missing: {text}");
@@ -2808,10 +2848,12 @@ mod tests {
         let old = manifest_a();
         let enforced = Arc::new(manifests::enforced(&old, &keys, None).unwrap());
         let current = Arc::new(RwLock::new(enforced.clone()));
+        let read_db = testdb::read_pool(&db, 2);
         let app = App {
-            owners: owners_for(&current, &db, vec![], None),
+            owners: owners_for(&current, &db, &read_db, vec![], None),
             wait: Duration::from_secs(3),
             db: db.clone(),
+            read_db,
             enforced,
             current,
             keys: Arc::new(keys),
@@ -3029,12 +3071,14 @@ mod tests {
             revision: 0,
         });
         let current = Arc::new(RwLock::new(enforced.clone()));
+        let read_db = testdb::read_pool(&db, max_connections.min(2));
         let app = router(App {
-            owners: owners_for(&current, &db, urls, observe.clone()),
+            owners: owners_for(&current, &db, &read_db, urls, observe.clone()),
             wait: Duration::from_secs(3),
             enforced,
             current,
             db: db.clone(),
+            read_db,
             keys: Arc::new(keys),
             auto_approve,
             limiter: Arc::new(Limiter::new(enrol_limit, minute, 100)),
@@ -3067,7 +3111,7 @@ mod tests {
         assert_eq!(first, StatusCode::OK, "{body}");
         let (second, _) = send_claim(&app, &key, &claim, None).await;
         assert_eq!(second, StatusCode::FORBIDDEN);
-        let text = metrics.scrape(&db);
+        let text = metrics.scrape(&db, &db);
         let count = |route: &str, status: &str| {
             format!(
                 "openpact_http_request_duration_seconds_count{{route=\"{route}\",method=\"POST\",status=\"{status}\"}}"
@@ -3142,7 +3186,7 @@ mod tests {
             post_json(&app, "/v1/nonce", &Value::Null).await.0,
             StatusCode::TOO_MANY_REQUESTS
         );
-        let text = metrics.scrape(&db);
+        let text = metrics.scrape(&db, &db);
         assert!(
             text.contains("openpact_nonce_issue_total{result=\"issued\"} 1"),
             "{text}"

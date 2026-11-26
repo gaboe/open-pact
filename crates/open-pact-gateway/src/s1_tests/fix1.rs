@@ -41,6 +41,7 @@ async fn waiting_on_log_entries(db: &PgPool) -> i64 {
 async fn a_queued_push_does_not_wait_for_a_renewal_tree_read() {
     let mut options = Options::new(1, 1);
     options.pool = 30;
+    options.read_pool = 30;
     let f = Fixture::build(options).await;
     let hooks = f.app.owners.hooks();
     // A fresh checkpoint holds its tree and has not queued its Push yet.
@@ -96,7 +97,11 @@ async fn a_queued_push_does_not_wait_for_a_renewal_tree_read() {
 
 /// The drop counter of the Prometheus scrape.
 fn dropped_lines(f: &Fixture) -> u64 {
-    let text = f.metrics.as_ref().expect("observation is on").scrape(&f.db);
+    let text = f
+        .metrics
+        .as_ref()
+        .expect("observation is on")
+        .scrape(&f.db, &f.app.read_db);
     text.lines()
         .find_map(|line| line.strip_prefix("openpact_log_lines_dropped_total "))
         .unwrap_or_else(|| panic!("no drop counter in {text}"))
@@ -278,6 +283,7 @@ async fn a_device_revoked_while_mine_waits_gets_the_403() {
 async fn several_pushes_during_one_stalled_read_start_one_renewal_tree_task() {
     let mut options = Options::new(1, 1);
     options.pool = 30;
+    options.read_pool = 30;
     let f = Fixture::build(options).await;
     let hooks = f.app.owners.hooks();
     // Three claims, each on a log one entry longer, read their tree and stop before they queue

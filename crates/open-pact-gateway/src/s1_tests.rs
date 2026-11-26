@@ -45,6 +45,8 @@ struct Options {
     quorum: usize,
     wait_ms: u64,
     pool: u32,
+    /// Connections of the read pool. Few, so the suite stays under the 100 connections of a default PostgreSQL.
+    read_pool: u32,
     /// Lists each witness URL twice, the second time with a trailing slash.
     duplicate_urls: bool,
     /// Approves every enrolment and drops the manifest controls, so a real client claim is accepted.
@@ -69,6 +71,7 @@ impl Options {
             quorum,
             wait_ms: 3000,
             pool: 20,
+            read_pool: 2,
             duplicate_urls: false,
             real_client: false,
             split_views: false,
@@ -201,16 +204,19 @@ impl Fixture {
         let urls = witness::normalize_urls(urls);
         let metrics = options.slow_ms.map(|_| Arc::new(metrics::Metrics::new()));
         let observe = metrics::Observation::new(metrics.clone(), options.slow_ms);
+        let read_db = testdb::read_pool(&db, options.read_pool);
         let owners = Owners::start(
             urls,
             enforced.log.witnesses.keys().to_vec(),
             current.clone(),
             db.clone(),
+            read_db.clone(),
             observe.clone(),
         )
         .unwrap();
         let app = App {
             db: db.clone(),
+            read_db,
             enforced,
             current,
             keys: Arc::new(keys),
@@ -576,7 +582,10 @@ async fn an_exhausted_pool_answers_503() {
     options.pool = 2;
     options.wait_ms = 1000;
     let f = Fixture::build(options).await;
-    let held = (f.db.acquire().await.unwrap(), f.db.acquire().await.unwrap());
+    let mut held = vec![];
+    for _ in 0..f.app.read_db.options().get_max_connections() {
+        held.push(f.app.read_db.acquire().await.unwrap());
+    }
     let reply = f.get(Some(&f.query)).await;
     expect_unavailable(&reply, Duration::from_millis(1500));
     drop(held);
@@ -978,7 +987,14 @@ async fn a_cold_burst_fetches_one_batch() {
     let hooks = f.app.owners.hooks();
     let barrier = hooks.arm_always("tree_start_captured");
     let steps: Vec<_> = (0..40)
-        .map(|_| tree_step(f.db.clone(), snap.clone(), TreeSql::Step, hooks.clone()))
+        .map(|_| {
+            tree_step(
+                f.app.read_db.clone(),
+                snap.clone(),
+                TreeSql::Step,
+                hooks.clone(),
+            )
+        })
         .collect();
     until(
         "every step captured its start",
@@ -1244,6 +1260,8 @@ mod fix1;
 mod order;
 
 mod relay;
+
+mod readpool;
 
 /// A device that is approved in the database, and a mine request it signs with a fresh nonce.
 async fn mine_request(router: &Router, db: &PgPool, manifest: &str) -> Value {

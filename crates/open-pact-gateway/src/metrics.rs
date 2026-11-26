@@ -203,6 +203,8 @@ pub struct Metrics {
     nonce_issue: Family<ResultLabel, Counter>,
     pool_connections: Family<StateLabel, Gauge>,
     pool_max: Gauge,
+    read_pool_connections: Family<StateLabel, Gauge>,
+    read_pool_max: Gauge,
     db_acquire: Family<SiteLabel, Histogram>,
     claim_stage: Family<StageLabel, Histogram>,
     witness_push: Family<ResultLabel, Histogram>,
@@ -256,6 +258,18 @@ impl Metrics {
             "Largest size of the database pool",
             pool_max.clone(),
         );
+        let read_pool_connections = Family::<StateLabel, Gauge>::default();
+        registry.register(
+            "openpact_db_read_pool_connections",
+            "Read pool connections at scrape time, used or idle",
+            read_pool_connections.clone(),
+        );
+        let read_pool_max = Gauge::default();
+        registry.register(
+            "openpact_db_read_pool_max",
+            "Largest size of the read pool",
+            read_pool_max.clone(),
+        );
         let db_acquire = Family::<SiteLabel, Histogram>::new_with_constructor(histogram);
         registry.register_with_unit(
             "openpact_db_acquire",
@@ -304,6 +318,8 @@ impl Metrics {
             nonce_issue,
             pool_connections,
             pool_max,
+            read_pool_connections,
+            read_pool_max,
             db_acquire,
             claim_stage,
             witness_push,
@@ -389,22 +405,26 @@ impl Metrics {
         self.log_size.set(size as f64);
     }
 
-    /// The text of a scrape. The pool gauges are read now.
-    pub fn scrape(&self, pool: &PgPool) -> String {
-        let size = i64::from(pool.size());
-        let idle = i64::try_from(pool.num_idle()).unwrap_or(i64::MAX);
-        self.pool_connections
-            .get_or_create(&StateLabel { state: "used" })
-            .set((size - idle).max(0));
-        self.pool_connections
-            .get_or_create(&StateLabel { state: "idle" })
-            .set(idle);
-        self.pool_max
-            .set(i64::from(pool.options().get_max_connections()));
+    /// The text of a scrape. The gauges of both pools are read now.
+    pub fn scrape(&self, pool: &PgPool, read_pool: &PgPool) -> String {
+        set_pool(&self.pool_connections, &self.pool_max, pool);
+        set_pool(&self.read_pool_connections, &self.read_pool_max, read_pool);
         let mut text = String::new();
         encode(&mut text, &self.registry).expect("encode into a String cannot fail");
         text
     }
+}
+
+fn set_pool(connections: &Family<StateLabel, Gauge>, max: &Gauge, pool: &PgPool) {
+    let size = i64::from(pool.size());
+    let idle = i64::try_from(pool.num_idle()).unwrap_or(i64::MAX);
+    connections
+        .get_or_create(&StateLabel { state: "used" })
+        .set((size - idle).max(0));
+    connections
+        .get_or_create(&StateLabel { state: "idle" })
+        .set(idle);
+    max.set(i64::from(pool.options().get_max_connections()));
 }
 
 /// The clock an observation point reads. Only points that run with observation on call it, so a
@@ -785,6 +805,7 @@ async fn serve_connection(
 struct Scrape {
     metrics: Arc<Metrics>,
     pool: PgPool,
+    read_pool: PgPool,
     /// SHA-256 of the token: the comparison then takes the same time for every guess.
     token: [u8; 32],
 }
@@ -826,7 +847,7 @@ async fn scrape(State(state): State<Scrape>, headers: HeaderMap) -> Response {
             header::CONTENT_TYPE,
             "application/openmetrics-text; version=1.0.0; charset=utf-8",
         )],
-        state.metrics.scrape(&state.pool),
+        state.metrics.scrape(&state.pool, &state.read_pool),
     )
         .into_response()
 }
@@ -837,6 +858,7 @@ pub async fn start(
     settings: ListenerSettings,
     metrics: Arc<Metrics>,
     pool: PgPool,
+    read_pool: PgPool,
 ) -> anyhow::Result<SocketAddr> {
     let router = Router::new()
         .route(
@@ -848,6 +870,7 @@ pub async fn start(
         .with_state(Scrape {
             metrics,
             pool,
+            read_pool,
             token: Sha256::digest(settings.token.as_bytes()).into(),
         });
     let tls = settings
@@ -896,6 +919,13 @@ mod tests {
     fn lazy_pool() -> PgPool {
         PgPoolOptions::new()
             .max_connections(7)
+            .connect_lazy("postgres://nobody@127.0.0.1:1/none")
+            .unwrap()
+    }
+
+    fn lazy_read_pool() -> PgPool {
+        PgPoolOptions::new()
+            .max_connections(3)
             .connect_lazy("postgres://nobody@127.0.0.1:1/none")
             .unwrap()
     }
@@ -1042,9 +1072,14 @@ mod tests {
     async fn the_tls_listener_serves_only_a_scraper_with_the_token() {
         let pki = Pki::new();
         // Not a loopback address: the scraper reaches it through 127.0.0.1 with a name.
-        let bound = start(pki.settings("0.0.0.0:0"), recorded(), lazy_pool())
-            .await
-            .unwrap();
+        let bound = start(
+            pki.settings("0.0.0.0:0"),
+            recorded(),
+            lazy_pool(),
+            lazy_read_pool(),
+        )
+        .await
+        .unwrap();
         let client = reqwest::Client::builder()
             .add_root_certificate(reqwest::Certificate::from_pem(pki.ca_pem.as_bytes()).unwrap())
             .resolve(
@@ -1064,6 +1099,11 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("openpact_db_pool_max 7"), "{text}");
+        assert!(text.contains("openpact_db_read_pool_max 3"), "{text}");
+        assert!(
+            text.contains("openpact_db_read_pool_connections{state=\"idle\"} 0"),
+            "{text}"
+        );
         assert!(text.ends_with("# EOF\n"));
 
         let anonymous = client.get(&url).send().await.unwrap();
@@ -1141,9 +1181,14 @@ mod tests {
     #[tokio::test]
     async fn a_client_that_never_finishes_its_handshake_blocks_no_one() {
         let pki = Pki::new();
-        let bound = start(pki.settings("127.0.0.1:0"), recorded(), lazy_pool())
-            .await
-            .unwrap();
+        let bound = start(
+            pki.settings("127.0.0.1:0"),
+            recorded(),
+            lazy_pool(),
+            lazy_pool(),
+        )
+        .await
+        .unwrap();
         let _stalled = tokio::net::TcpStream::connect(bound).await.unwrap();
         let client = reqwest::Client::builder()
             .add_root_certificate(reqwest::Certificate::from_pem(pki.ca_pem.as_bytes()).unwrap())
@@ -1164,7 +1209,9 @@ mod tests {
     async fn a_client_that_sends_no_request_is_closed_after_the_header_timeout() {
         let env = [("METRICS_ADDR", "127.0.0.1:0"), ("METRICS_TOKEN", TOKEN)];
         let listener = settings(&env).unwrap().listener.unwrap();
-        let bound = start(listener, recorded(), lazy_pool()).await.unwrap();
+        let bound = start(listener, recorded(), lazy_pool(), lazy_pool())
+            .await
+            .unwrap();
         let mut idle = tokio::net::TcpStream::connect(bound).await.unwrap();
         let closed =
             tokio::time::timeout(Duration::from_secs(10), idle.read_to_end(&mut Vec::new())).await;
@@ -1175,7 +1222,9 @@ mod tests {
     async fn a_scrape_waits_for_a_slot_behind_stalled_connections() {
         let env = [("METRICS_ADDR", "127.0.0.1:0"), ("METRICS_TOKEN", TOKEN)];
         let listener = settings(&env).unwrap().listener.unwrap();
-        let bound = start(listener, recorded(), lazy_pool()).await.unwrap();
+        let bound = start(listener, recorded(), lazy_pool(), lazy_pool())
+            .await
+            .unwrap();
         let mut stalled = Vec::new();
         for _ in 0..CONNECTIONS_AT_ONCE {
             stalled.push(tokio::net::TcpStream::connect(bound).await.unwrap());
@@ -1199,7 +1248,7 @@ mod tests {
         let pki = Pki::new();
         let mut missing_key = pki.settings("127.0.0.1:0");
         missing_key.tls.as_mut().unwrap().1 = pki.dir.join("none.key");
-        let error = start(missing_key, recorded(), lazy_pool())
+        let error = start(missing_key, recorded(), lazy_pool(), lazy_pool())
             .await
             .unwrap_err();
         assert!(
@@ -1210,7 +1259,7 @@ mod tests {
         std::fs::write(pki.dir.join("empty.crt"), "").unwrap();
         let mut no_certificate = pki.settings("127.0.0.1:0");
         no_certificate.tls.as_mut().unwrap().0 = pki.dir.join("empty.crt");
-        let error = start(no_certificate, recorded(), lazy_pool())
+        let error = start(no_certificate, recorded(), lazy_pool(), lazy_pool())
             .await
             .unwrap_err();
         assert!(
@@ -1221,14 +1270,20 @@ mod tests {
         let mut mismatched = pki.settings("127.0.0.1:0");
         let other = Pki::new();
         mismatched.tls.as_mut().unwrap().1 = other.dir.join("tls.key");
-        assert!(start(mismatched, recorded(), lazy_pool()).await.is_err());
+        assert!(
+            start(mismatched, recorded(), lazy_pool(), lazy_pool())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
     async fn loopback_serves_plain_http_with_the_token() {
         let env = [("METRICS_ADDR", "127.0.0.1:0"), ("METRICS_TOKEN", TOKEN)];
         let listener = settings(&env).unwrap().listener.unwrap();
-        let bound = start(listener, recorded(), lazy_pool()).await.unwrap();
+        let bound = start(listener, recorded(), lazy_pool(), lazy_pool())
+            .await
+            .unwrap();
         let client = reqwest::Client::new();
         let url = format!("http://{bound}/metrics");
         assert_eq!(client.get(&url).send().await.unwrap().status(), 401);
@@ -1287,7 +1342,7 @@ mod tests {
         );
         assert_eq!(send(&router, "GET", "/v1/device/9f2c4e/status").await, 404);
         assert_eq!(send(&router, "FOO", "/v1/manifest").await, 405);
-        let text = metrics.scrape(&lazy_pool());
+        let text = metrics.scrape(&lazy_pool(), &lazy_pool());
         assert!(
             text.contains("openpact_http_request_duration_seconds_count{route=\"/v1/manifest\",method=\"GET\",status=\"2xx\"} 1"),
             "{text}"
@@ -1317,7 +1372,7 @@ mod tests {
     async fn a_slow_handler_lands_in_the_bucket_that_holds_its_time() {
         let (router, metrics) = observed();
         assert_eq!(send(&router, "GET", "/slow").await, 200);
-        let text = metrics.scrape(&lazy_pool());
+        let text = metrics.scrape(&lazy_pool(), &lazy_pool());
         let bucket = |le: &str| -> u64 {
             let prefix = format!(
                 "openpact_http_request_duration_seconds_bucket{{le=\"{le}\",route=\"/slow\",method=\"GET\",status=\"2xx\"}} "
@@ -1344,12 +1399,12 @@ mod tests {
         pending.abort();
         let aborted = "openpact_http_requests_aborted_total{route=\"/hang\",method=\"GET\"} 1";
         for _ in 0..50 {
-            if metrics.scrape(&lazy_pool()).contains(aborted) {
+            if metrics.scrape(&lazy_pool(), &lazy_pool()).contains(aborted) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        let text = metrics.scrape(&lazy_pool());
+        let text = metrics.scrape(&lazy_pool(), &lazy_pool());
         assert!(text.contains(aborted), "{text}");
         assert!(
             !text.contains("route=\"/hang\",method=\"GET\",status"),
@@ -1461,9 +1516,15 @@ mod tests {
     async fn the_log_size_is_unknown_until_the_first_read() {
         let metrics = Metrics::new();
         let has = |text: &str, line: &str| text.lines().any(|l| l == line);
-        assert!(has(&metrics.scrape(&lazy_pool()), "openpact_log_size NaN"));
+        assert!(has(
+            &metrics.scrape(&lazy_pool(), &lazy_pool()),
+            "openpact_log_size NaN"
+        ));
         metrics.log_size(3);
-        assert!(has(&metrics.scrape(&lazy_pool()), "openpact_log_size 3.0"));
+        assert!(has(
+            &metrics.scrape(&lazy_pool(), &lazy_pool()),
+            "openpact_log_size 3.0"
+        ));
     }
 
     #[tokio::test]
@@ -1480,7 +1541,7 @@ mod tests {
         metrics.witness_push(Push::Conflict, 0.01);
         metrics.checkpoint_served(Caller::Claim, Served::NotYet);
         metrics.log_size(3);
-        let text = metrics.scrape(&lazy_pool());
+        let text = metrics.scrape(&lazy_pool(), &lazy_pool());
         for expected in [
             "openpact_db_acquire_seconds_count{site=\"conn\"} 1",
             "openpact_claim_stage_seconds_count{stage=\"verify\"} 1",

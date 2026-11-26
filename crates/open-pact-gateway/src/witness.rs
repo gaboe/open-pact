@@ -209,6 +209,7 @@ struct Shared {
     changed: watch::Sender<u64>,
     http: reqwest::Client,
     db: PgPool,
+    read_db: PgPool,
     observe: Option<Arc<Observation>>,
     events: Mutex<Option<mpsc::UnboundedSender<WitnessEvent>>>,
     hooks: Arc<Hooks>,
@@ -258,6 +259,7 @@ impl Owners {
         keys: Vec<WitnessKey>,
         current: Arc<RwLock<Arc<Enforced>>>,
         db: PgPool,
+        read_db: PgPool,
         observe: Option<Arc<Observation>>,
     ) -> anyhow::Result<Owners> {
         let shared = Arc::new(Shared {
@@ -268,6 +270,7 @@ impl Owners {
             changed: watch::channel(0).0,
             http: reqwest::Client::builder().timeout(PUSH_TIMEOUT).build()?,
             db,
+            read_db,
             observe,
             events: Mutex::default(),
             hooks: Arc::default(),
@@ -668,7 +671,7 @@ impl Owner {
         let mut step = match self.step.take() {
             Some((revision, step)) if revision == snap.revision => step,
             _ => crate::tree_step(
-                self.shared.db.clone(),
+                self.shared.read_db.clone(),
                 snap.clone(),
                 crate::TreeSql::Step,
                 self.shared.hooks.clone(),

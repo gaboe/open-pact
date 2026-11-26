@@ -265,7 +265,8 @@ What a scraper learns: request counts and latency per route, the pool size, and 
 | `openpact_http_request_duration_seconds{route,method,status}` | Time inside the gateway until the handler answered |
 | `openpact_http_requests_aborted_total{route,method}` | Requests whose handler stopped before it answered, for example when the client left |
 | `openpact_nonce_lock_wait_seconds`, `openpact_nonce_issue_total{result}` | Wait for the nonce advisory lock; nonce requests as `issued`, `rate_limited` or `cap_reached` |
-| `openpact_db_pool_connections{state}`, `openpact_db_pool_max` | Pool use at scrape time |
+| `openpact_db_pool_connections{state}`, `openpact_db_pool_max` | Main pool use at scrape time |
+| `openpact_db_read_pool_connections{state}`, `openpact_db_read_pool_max` | Read pool use at scrape time |
 | `openpact_db_acquire_seconds{site}` | Wait for a pool connection at `conn`, `claim_tx`, `nonce_tx` and `other_tx`. A transaction site also covers its `BEGIN`. Queries on the pool itself acquire without a timer |
 | `openpact_claim_stage_seconds{stage}` | Where a claim spends its time: `verify`, `nonce`, `tree`, `begin`, `lock`, `evaluate`, `certificate`, `store`, `commit`, `siem` (the SIEM submission), `checkpoint` (the checkpoint call alone) |
 | `openpact_witness_push_seconds{result}` | One add-checkpoint call: `cosigned` (its signature verifies), `conflict`, `refused`, `invalid` (a 200 without a cosignature from a manifest witness key), `error` or `timeout` |
@@ -409,6 +410,8 @@ The gateway consumes a nonce with `synchronous_commit` raised from `off` to `loc
 Replication changes this. A crash of such a primary is covered as written. When you fail over to an asynchronous replica, the replica can be behind and can lose consumed nonces too. Replication durability depends on your synchronous standby configuration (`synchronous_standby_names`): use a synchronous standby for a highly available PostgreSQL when a replayed nonce matters to you.
 
 Each gateway pod keeps up to `database.maxConnections` connections to PostgreSQL (`DATABASE_MAX_CONNECTIONS`, default 10). Keep the sum over all pods below the server's `max_connections`. A request that needs a connection waits while all of them are busy.
+
+A second pool keeps reads alive when a write path stalls PostgreSQL and fills the main pool. It serves the tree reads and the cosignature reads of `GET /v1/log/checkpoint` and `POST /v1/log/mine`, and the tree read of the other routes: the claim, the consistency proof, the device checkpoint write and the home page. Everything else stays on the main pool: storing a new witness cosignature, and the nonce, approval and proof work of `POST /v1/log/mine`. So `mine` can still answer 503 when the main pool is full. The pool is opened on demand and keeps up to `database.readPoolConnections` connections (`READ_POOL_CONNECTIONS`, default 4; the gateway refuses to start with 0). Each gateway pod opens up to `DATABASE_MAX_CONNECTIONS` plus `READ_POOL_CONNECTIONS` connections, 14 with the defaults. Keep the sum over all pods below the server's `max_connections`.
 
 ## Read log entries
 

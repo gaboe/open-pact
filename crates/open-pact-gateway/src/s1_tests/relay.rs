@@ -143,6 +143,7 @@ async fn relayed(pool: u32) -> Fixture {
     let mut options = Options::new(1, 1);
     options.relay = true;
     options.pool = pool;
+    options.read_pool = pool;
     Fixture::build(options).await
 }
 

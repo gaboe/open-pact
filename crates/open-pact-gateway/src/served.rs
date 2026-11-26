@@ -215,7 +215,7 @@ impl App {
     async fn tree_until(&self, deadline: Instant) -> Option<Tree> {
         self.owners.hooks().bump("served_tree_reads");
         let step = tree_step(
-            self.db.clone(),
+            self.read_db.clone(),
             self.enforced.clone(),
             TreeSql::Step,
             self.owners.hooks(),
@@ -393,7 +393,7 @@ impl App {
                 i64::try_from(hi).unwrap_or(i64::MAX),
                 cols.clone(),
             );
-            let step = db_step(self.db.clone(), move |conn| {
+            let step = db_step(self.read_db.clone(), move |conn| {
                 Box::pin(async move {
                     let top: Option<i64> = sqlx::query_scalar(
                         "SELECT max(size) FROM log_cosignatures \
@@ -452,7 +452,7 @@ impl App {
             return Err(Stop::NotYet);
         }
         let step_hooks = hooks.clone();
-        let step = db_step(self.db.clone(), move |conn| {
+        let step = db_step(self.read_db.clone(), move |conn| {
             Box::pin(async move {
                 let hooks = step_hooks;
                 let mut batch = RowBatch::new(None, hooks.clone());

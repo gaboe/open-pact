@@ -89,6 +89,7 @@ impl Fixture {
         let mut options = Options::new(1, 1);
         options.wait_ms = 1000;
         options.pool = 64;
+        options.read_pool = 64;
         Fixture::build(options).await
     }
 }
@@ -234,6 +235,7 @@ async fn drop_fixture(wait_ms: u64) -> Fixture {
     let mut options = Options::new(5, 3);
     options.wait_ms = wait_ms;
     options.pool = 64;
+    options.read_pool = 64;
     let f = Fixture::build(options).await;
     // No owner stores a line, so only the rows the test seeds exist.
     f.app.owners.hooks().set_hold_retries(true);

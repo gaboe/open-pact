@@ -321,6 +321,7 @@ async fn served_bounds_the_work_after_the_last_read() {
     let mut options = Options::new(5, 3);
     options.wait_ms = 2000;
     options.pool = 64;
+    options.read_pool = 64;
     let f = Fixture::build(options).await;
     let hooks = f.app.owners.hooks();
     // No owner reads, sends or stores during the fixture, so none adds a candidate.

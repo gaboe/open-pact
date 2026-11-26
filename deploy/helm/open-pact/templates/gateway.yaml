@@ -92,6 +92,10 @@ spec:
             - name: DATABASE_MAX_CONNECTIONS
               value: {{ .Values.database.maxConnections | quote }}
             {{- end }}
+            {{- if not (kindIs "invalid" .Values.database.readPoolConnections) }}
+            - name: READ_POOL_CONNECTIONS
+              value: {{ .Values.database.readPoolConnections | quote }}
+            {{- end }}
             - name: SLOW_REQUEST_MS
               value: {{ .Values.gateway.slowRequestMs | quote }}
             {{- if .Values.metrics.enabled }}

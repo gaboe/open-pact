@@ -106,6 +106,10 @@ database:
   # Connections the gateway keeps open to PostgreSQL, per pod. Keep the sum over all pods below the
   # server's max_connections.
   maxConnections: 10
+  # Connections of a second pool that the read routes and the log cache catch-up use, per pod, so a
+  # stalled write path leaves them a connection. Count it in the same sum: a pod opens
+  # maxConnections + readPoolConnections.
+  readPoolConnections: 4
 
 # URL the clients use, written into invitations. Defaults to https://<ingress.host>.
 publicUrl: ""

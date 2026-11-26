@@ -178,6 +178,7 @@ impl Fixture {
             enforced.log.witnesses.keys().to_vec(),
             current.clone(),
             self.db.clone(),
+            self.app.read_db.clone(),
             None,
         )
         .unwrap();

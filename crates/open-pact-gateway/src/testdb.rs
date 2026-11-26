@@ -41,6 +41,15 @@ async fn fresh_with(max_connections: u32, settings: &[(&str, &str)]) -> PgPool {
     db
 }
 
+/// A read pool for a test database: few connections, and idle ones close at once, so many tests
+/// in parallel stay under the 100 connections of a default PostgreSQL.
+pub fn read_pool(db: &PgPool, connections: u32) -> PgPool {
+    PgPoolOptions::new()
+        .max_connections(connections)
+        .idle_timeout(std::time::Duration::from_millis(300))
+        .connect_lazy_with(db.connect_options().as_ref().clone())
+}
+
 pub async fn enrolled_device(db: &PgPool, pseudonym: &str, manifest: &str) {
     device_in_state(db, pseudonym, manifest, "approved").await;
 }
