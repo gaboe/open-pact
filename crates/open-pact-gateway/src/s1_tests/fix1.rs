@@ -403,6 +403,10 @@ async fn no_row_step_starts_when_the_bind_arrays_end_past_the_deadline() {
     hooks.arm_past_deadline("row_step_prepare", Duration::from_millis(1));
     let reply = f.get(Some(&f.query)).await;
     expect_unavailable(&reply, Duration::from_millis(500 + 500));
+    assert_eq!(
+        reply.body,
+        "witness cosignatures are not available yet; retry\n"
+    );
     assert_eq!(hooks.count("row_step_prepare"), 1);
     // A step that was spawned would reach its first statement within moments.
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -444,4 +448,40 @@ async fn a_second_409_keeps_the_latest_witness_size() {
         "the next push starts from the latest size: {seen:?}"
     );
     f.assert_no_fork_line().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs TEST_DATABASE_URL and LOG_ORIGIN"]
+async fn the_mine_route_names_the_database_cause_in_its_json_reason() {
+    let mut options = Options::new(1, 1);
+    options.wait_ms = 500;
+    let f = Fixture::build(options).await;
+    f.append(1).await;
+    let manifest = f.app.manifest.hash().as_str().to_string();
+    let request = mine_request(&f.router, &f.db, &manifest).await;
+    sqlx::query("ALTER TABLE log_cosignatures RENAME TO log_cosignatures_gone")
+        .execute(&f.direct)
+        .await
+        .unwrap();
+    let mut request = Request::post("/v1/log/mine")
+        .header("content-type", "application/json")
+        .body(Body::from(request.to_string()))
+        .unwrap();
+    request
+        .extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([192, 0, 2, 7], 40000))));
+    let response = f.router.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::RETRY_AFTER)
+            .map(|v| v.to_str().unwrap()),
+        Some("5")
+    );
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["reason"], "the log could not be read in time; retry");
 }

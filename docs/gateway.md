@@ -209,7 +209,13 @@ Replace the verifier-key placeholder with the gateway key that you confirmed out
 
 ### What a reader gets
 
-`GET /v1/log/checkpoint` and `POST /v1/log/mine` never answer 200 with a note that the client's policy would reject. When the gateway cannot get enough cosignatures in time, it answers 503 with `Retry-After: 5` and the client asks once more. The client sends the policy it verifies with in `?policy=` (base64url JSON, at most 4 KiB). Without it the gateway uses the policy of the manifest it enforces. A policy that does not parse or validate gets 400.
+`GET /v1/log/checkpoint` and `POST /v1/log/mine` never answer 200 with a note that the client's policy would reject. When the gateway cannot get enough cosignatures in time, it answers 503 with `Retry-After: 5` and the client asks once more. The `reason` of that 503 (the JSON `reason` of `POST /v1/log/mine`, the text body of `GET /v1/log/checkpoint`) names one of three causes:
+
+- `witness cosignatures are not available yet; retry`: the read finished but fewer than the quorum of fresh cosignatures were found before the deadline.
+- `not enough fresh witness cosignatures for this checkpoint; retry`: every witness has stopped trying for this checkpoint, and the fresh cosignatures stored do not reach the quorum.
+- `the log could not be read in time; retry`: reading the log did not finish before the deadline, or failed. This covers a database step and building the tree from its rows, including waiting for another reader that is building it.
+
+The status and `Retry-After` are the same for all three. The client sends the policy it verifies with in `?policy=` (base64url JSON, at most 4 KiB). Without it the gateway uses the policy of the manifest it enforces. A policy that does not parse or validate gets 400.
 
 A witness cosignature counts only when its time is inside the client's window: not older than `checkpoint_max_age` and not more than the client's skew allowance in the future. The gateway applies the same test with a 300 s margin on the age. The promise holds while the client's clock, at the moment it verifies, is 0 to 300 s ahead of the gateway's clock at the moment the gateway chose the note. A client clock behind the gateway's can reject a note the gateway chose; a client clock more than 300 s ahead can find it too old. A gateway clock that is more than a few minutes off also causes 503. Keep the gateway, witness and client clocks within a minute of true time.
 

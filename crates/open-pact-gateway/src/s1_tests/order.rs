@@ -442,6 +442,10 @@ async fn a_failed_candidate_past_the_deadline_starts_no_read() {
         if case == 1 {
             // Exhausted exit: exactly one final read, and it does not wait for the deadline.
             assert_eq!((reads, trees, kicks), (2, 1, 1), "case 1 control");
+            assert_eq!(
+                control.body,
+                "not enough fresh witness cosignatures for this checkpoint; retry\n"
+            );
             assert!(
                 control.elapsed < Duration::from_millis(WAIT),
                 "{:?}",
@@ -449,6 +453,10 @@ async fn a_failed_candidate_past_the_deadline_starts_no_read() {
             );
         } else {
             // Not exhausted: the bump makes the reader reread the tree, and the wait ends at NotYet.
+            assert_eq!(
+                control.body,
+                "witness cosignatures are not available yet; retry\n"
+            );
             assert_eq!(trees, 2, "case 2 control rereads the tree after the bump");
             assert!(reads >= 3 && kicks >= 1, "{reads} {kicks}");
         }
@@ -599,4 +607,124 @@ async fn a_failed_claim_advance_answers_the_short_note_with_a_real_client() {
     // Case 3: the advance's tree read fails. Case 4: the advance's write fails.
     failed_advance(3).await;
     failed_advance(4).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs TEST_DATABASE_URL and LOG_ORIGIN"]
+async fn a_deadline_during_the_row_read_answers_the_database_text() {
+    let mut options = Options::new(1, 1);
+    options.wait_ms = 1000;
+    let f = Fixture::build(options).await;
+    let hooks = f.app.owners.hooks();
+    // The tree step returns; the row query then waits for a lock that the test holds past the deadline.
+    let tree_returned = hooks.arm("served_tree_returned");
+    let (router, query) = (f.router.clone(), f.query.clone());
+    let reader = tokio::spawn(async move { Fixture::get_with(router, Some(query)).await });
+    tree_returned.reached().await;
+    let mut lock = f.direct.begin().await.unwrap();
+    sqlx::query("LOCK TABLE log_cosignatures IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+    let row_starts = hooks.count("row_step_start");
+    tree_returned.release();
+    let reply = reader.await.unwrap();
+    lock.rollback().await.unwrap();
+    assert_eq!(
+        hooks.count("row_step_start"),
+        row_starts + 1,
+        "the row query started"
+    );
+    expect_unavailable(&reply, Duration::from_millis(1000 + 500));
+    assert_eq!(reply.body, "the log could not be read in time; retry\n");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs TEST_DATABASE_URL and LOG_ORIGIN"]
+async fn a_failed_final_read_answers_the_database_text() {
+    const WAIT: u64 = 2000;
+    let mut options = Options::new(2, 2);
+    options.wait_ms = WAIT;
+    let f = Fixture::build(options).await;
+    let hooks = f.app.owners.hooks();
+    let n = f.size().await;
+    // w2 holds a size above N, so its push of N is a 409 and every view ends up exhausted.
+    f.witnesses[1].hold(Checkpoint {
+        origin: f.log.origin().to_string(),
+        size: n + 5,
+        root: LogHash([3; 32]),
+    });
+    let first = f.get(Some(&f.query)).await;
+    assert_eq!(first.status, StatusCode::SERVICE_UNAVAILABLE);
+    owners_tried(&f, n).await;
+    hooks.set_hold_retries(true);
+    let row_starts = hooks.count("row_step_start");
+    // The first read returns its rows; the table is renamed before the final read runs.
+    let row_returned = hooks.arm("row_step_returned");
+    let (router, query) = (f.router.clone(), f.query.clone());
+    let reader = tokio::spawn(async move { Fixture::get_with(router, Some(query)).await });
+    row_returned.reached().await;
+    sqlx::query("ALTER TABLE log_cosignatures RENAME TO log_cosignatures_gone")
+        .execute(&f.direct)
+        .await
+        .unwrap();
+    row_returned.release();
+    let reply = reader.await.unwrap();
+    expect_unavailable(&reply, Duration::from_millis(WAIT + 500));
+    assert_eq!(
+        hooks.count("row_step_start"),
+        row_starts + 2,
+        "the first read and the final read each started a row step"
+    );
+    assert_eq!(reply.body, "the log could not be read in time; retry\n");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs TEST_DATABASE_URL and LOG_ORIGIN"]
+async fn the_mine_route_names_the_exhausted_cause_in_its_json_reason() {
+    const WAIT: u64 = 2000;
+    let mut options = Options::new(2, 2);
+    options.wait_ms = WAIT;
+    let f = Fixture::build(options).await;
+    let hooks = f.app.owners.hooks();
+    let n = f.size().await;
+    // The setup of case 1 above: w2 holds a size above N, so every view ends up exhausted.
+    f.witnesses[1].hold(Checkpoint {
+        origin: f.log.origin().to_string(),
+        size: n + 5,
+        root: LogHash([3; 32]),
+    });
+    let first = f.get(Some(&f.query)).await;
+    assert_eq!(first.status, StatusCode::SERVICE_UNAVAILABLE);
+    owners_tried(&f, n).await;
+    hooks.set_hold_retries(true);
+    let manifest = f.app.manifest.hash().as_str().to_string();
+    let signed = mine_request(&f.router, &f.db, &manifest).await;
+    let mut request = Request::post(format!("/v1/log/mine?{}", f.query))
+        .header("content-type", "application/json")
+        .body(Body::from(signed.to_string()))
+        .unwrap();
+    request
+        .extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([192, 0, 2, 7], 40000))));
+    let started = std::time::Instant::now();
+    let response = f.router.clone().oneshot(request).await.unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::RETRY_AFTER)
+            .map(|v| v.to_str().unwrap()),
+        Some("5")
+    );
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        body["reason"],
+        "not enough fresh witness cosignatures for this checkpoint; retry"
+    );
+    assert!(elapsed < Duration::from_millis(WAIT), "{elapsed:?}");
 }

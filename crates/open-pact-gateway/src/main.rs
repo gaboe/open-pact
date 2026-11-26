@@ -779,7 +779,7 @@ fn unavailable(why: served::Why) -> axum::response::Response {
     (
         StatusCode::SERVICE_UNAVAILABLE,
         headers,
-        Json(json!({"status": "error", "reason": served::UNAVAILABLE})),
+        Json(json!({"status": "error", "reason": served::reason(why)})),
     )
         .into_response()
 }
@@ -816,7 +816,7 @@ async fn log_checkpoint(
             Ok((
                 StatusCode::SERVICE_UNAVAILABLE,
                 headers,
-                format!("{}\n", served::UNAVAILABLE),
+                format!("{}\n", served::reason(why)),
             )
                 .into_response())
         }

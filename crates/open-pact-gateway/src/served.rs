@@ -35,7 +35,18 @@ thread_local! {
 /// client clock ahead of the gateway and 240 s from the gateway's choice to the client's check.
 pub const AGE_MARGIN_SECS: u64 = 300;
 
-pub const UNAVAILABLE: &str = "witness cosignatures are not available yet; retry";
+/// The `reason` of a 503 from the read routes, by cause. Each names the cause the operator can act on.
+pub const NOT_YET: &str = "witness cosignatures are not available yet; retry";
+pub const DATABASE: &str = "the log could not be read in time; retry";
+pub const EXHAUSTED: &str = "not enough fresh witness cosignatures for this checkpoint; retry";
+
+pub fn reason(why: Why) -> &'static str {
+    match why {
+        Why::NotYet => NOT_YET,
+        Why::Database => DATABASE,
+        Why::Exhausted => EXHAUSTED,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Why {
@@ -196,6 +207,9 @@ fn groups_in(batch: &RowBatch) -> usize {
     groups
 }
 
+/// Why a read did not finish. `NotYet`: the deadline passed with no database step running.
+/// `Database`: a database step was running or failed. A read that finished and found nothing is
+/// `Ok(None)`, never this.
 enum Stop {
     NotYet,
     Database,
@@ -275,8 +289,8 @@ impl App {
             {
                 Ok(Some(note)) => return Answer::Witnessed { note, tree },
                 Ok(None) => {}
-                Err(Stop::Database) => return Answer::Unavailable(Why::Database),
                 Err(Stop::NotYet) => return Answer::Unavailable(Why::NotYet),
+                Err(Stop::Database) => return Answer::Unavailable(Why::Database),
             }
             if past() {
                 return Answer::Unavailable(Why::NotYet);
@@ -295,8 +309,10 @@ impl App {
                     .final_read(policy, &tree, floor, deadline, &mut uncached)
                     .await
                 {
-                    Some(note) => Answer::Witnessed { note, tree },
-                    None => Answer::Unavailable(Why::Exhausted),
+                    Ok(Some(note)) => Answer::Witnessed { note, tree },
+                    Ok(None) => Answer::Unavailable(Why::Exhausted),
+                    Err(Stop::NotYet) => Answer::Unavailable(Why::NotYet),
+                    Err(Stop::Database) => Answer::Unavailable(Why::Database),
                 };
             }
             hooks.hit("reader_waiting").await;
@@ -315,8 +331,9 @@ impl App {
                 }
                 () = tokio::time::sleep_until(Self::timeout_at(final_at)) => {
                     return match self.final_read(policy, &tree, floor, deadline, &mut uncached).await {
-                        Some(note) => Answer::Witnessed { note, tree },
-                        None => Answer::Unavailable(Why::NotYet),
+                        Ok(Some(note)) => Answer::Witnessed { note, tree },
+                        Ok(None) | Err(Stop::NotYet) => Answer::Unavailable(Why::NotYet),
+                        Err(Stop::Database) => Answer::Unavailable(Why::Database),
                     };
                 }
             }
@@ -330,14 +347,12 @@ impl App {
         floor: u64,
         deadline: Instant,
         uncached: &mut Option<(u64, LogHash)>,
-    ) -> Option<Note> {
+    ) -> Result<Option<Note>, Stop> {
         if Instant::now() >= deadline {
-            return None;
+            return Err(Stop::NotYet);
         }
         self.read_once(policy, tree, floor, deadline, uncached)
             .await
-            .ok()
-            .flatten()
     }
 
     async fn read_once(
@@ -482,7 +497,7 @@ impl App {
                 Err(Stop::Database)
             }
             Ok(Err(_)) => Err(Stop::Database),
-            Err(_) => Err(Stop::NotYet),
+            Err(_) => Err(Stop::Database),
         }
     }
 
@@ -535,7 +550,7 @@ mod tests {
     use axum::http::StatusCode;
     use base64::Engine;
 
-    use super::request_policy;
+    use super::{Why, request_policy};
 
     /// A policy with no witness, as JSON padded with spaces so that its base64url text has this
     /// many bytes (a multiple of four, so no remainder).
@@ -547,6 +562,35 @@ mod tests {
             "policy={}",
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
         )
+    }
+
+    #[tokio::test]
+    async fn each_cause_has_its_own_503_text() {
+        for (why, text) in [
+            (
+                Why::NotYet,
+                "witness cosignatures are not available yet; retry",
+            ),
+            (
+                Why::Exhausted,
+                "not enough fresh witness cosignatures for this checkpoint; retry",
+            ),
+            (Why::Database, "the log could not be read in time; retry"),
+        ] {
+            let reply = crate::unavailable(why);
+            assert_eq!(reply.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                reply.headers()[axum::http::header::RETRY_AFTER]
+                    .to_str()
+                    .unwrap(),
+                "5"
+            );
+            let bytes = axum::body::to_bytes(reply.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["reason"], text);
+        }
     }
 
     #[test]

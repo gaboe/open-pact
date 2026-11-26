@@ -588,6 +588,7 @@ async fn an_exhausted_pool_answers_503() {
     }
     let reply = f.get(Some(&f.query)).await;
     expect_unavailable(&reply, Duration::from_millis(1500));
+    assert_eq!(reply.body, "the log could not be read in time; retry\n");
     drop(held);
     let reply = f.get(Some(&f.query)).await;
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
