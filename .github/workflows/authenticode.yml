@@ -1,7 +1,8 @@
 name: authenticode
 
 # Signs Windows files in a stored artifact with Azure Artifact Signing and stores
-# them again under the same name.
+# them under the name <artifact>-signed. The unsigned artifact stays as it was, so a rerun
+# of a failed job still finds its input.
 #
 # This is a separate workflow on purpose. Fulcio names a GitHub certificate by
 # job_workflow_ref. An identity token minted in this called workflow gets the
@@ -93,8 +94,7 @@ jobs:
           }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: ${{ inputs.artifact }}
+          name: ${{ inputs.artifact }}-signed
           path: ${{ runner.temp }}\signing\*
-          overwrite: true
           if-no-files-found: error
           retention-days: 1

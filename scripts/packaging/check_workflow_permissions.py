@@ -105,6 +105,18 @@ class AuthenticodeWorkflowTest(unittest.TestCase):
     def test_it_never_signs_a_release_with_cosign(self):
         self.assertNotIn("cosign", (WORKFLOWS / "authenticode.yml").read_text())
 
+    def test_it_uploads_only_under_the_signed_name(self):
+        # The unsigned input keeps its name, so a rerun of a failed job still finds it.
+        uploads = [
+            step for step in self.jobs["sign"]["steps"]
+            if str(step.get("uses", "")).startswith("actions/upload-artifact@")
+        ]
+        self.assertEqual(len(uploads), 1)
+        name = uploads[0]["with"]["name"]
+        self.assertEqual(name, "${{ inputs.artifact }}-signed")
+        self.assertNotEqual(name, "${{ inputs.artifact }}")
+        self.assertNotIn("overwrite", uploads[0]["with"])
+
 
 if __name__ == "__main__":
     unittest.main()

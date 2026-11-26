@@ -187,6 +187,12 @@ jobs:
         with:
           dotnet-version: 8.0.x
       - uses: actions/download-artifact@v4
+        if: ${{ vars.ARTIFACT_SIGNING_ACCOUNT != '' }}
+        with:
+          name: windows-exes-signed
+          path: ${{ runner.temp }}/exes
+      - uses: actions/download-artifact@v4
+        if: ${{ vars.ARTIFACT_SIGNING_ACCOUNT == '' }}
         with:
           name: windows-exes
           path: ${{ runner.temp }}/exes
@@ -252,10 +258,30 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      # client-msi and client-msi-signed both exist when signing runs, so the package never
+      # downloads the client-* pattern. Each MSI name is downloaded alone.
       - uses: actions/download-artifact@v4
         with:
-          pattern: client-*
+          pattern: client-*-apple-darwin
           merge-multiple: true
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: client-x86_64-unknown-linux-musl
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: client-x86_64-pc-windows-msvc
+          path: dist
+      - uses: actions/download-artifact@v4
+        if: ${{ vars.ARTIFACT_SIGNING_ACCOUNT != '' }}
+        with:
+          name: client-msi-signed
+          path: dist
+      - uses: actions/download-artifact@v4
+        if: ${{ vars.ARTIFACT_SIGNING_ACCOUNT == '' }}
+        with:
+          name: client-msi
           path: dist
       - uses: actions/download-artifact@v4
         with:

@@ -307,6 +307,21 @@ class ClientReleaseMsiTest(unittest.TestCase):
     def test_the_package_job_waits_for_the_msi(self):
         self.assertIn("msi", needs(self.client["package"]))
 
+    def test_the_package_job_takes_the_signed_msi_and_never_globs_the_unsigned_one(self):
+        package = self.client["package"]
+        self.assertNotIn("pattern: client-*\n", package)
+        self.assertIn("name: client-msi-signed", package)
+        self.assertIn("name: client-msi\n", package)
+        self.assertIn("vars.ARTIFACT_SIGNING_ACCOUNT != ''", package)
+        # Each MSI download step pairs the signed name with signing on and the plain name with it off.
+        steps = package.split("- uses: ")
+        signed = [s for s in steps if "name: client-msi-signed" in s]
+        plain = [s for s in steps if "name: client-msi\n" in s]
+        self.assertEqual(len(signed), 1)
+        self.assertEqual(len(plain), 1)
+        self.assertIn("vars.ARTIFACT_SIGNING_ACCOUNT != ''", signed[0])
+        self.assertIn("vars.ARTIFACT_SIGNING_ACCOUNT == ''", plain[0])
+
     def test_the_release_checks_the_exact_msi_names_before_it_uploads(self):
         release = self.client["release"]
         self.assertIn(MSI + ".sigstore.json", release)
