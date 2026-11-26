@@ -58,14 +58,56 @@ def head_repo(run):
     return (run.get("head_repository") or {}).get("full_name")
 
 
+PAGE_SIZE = 100
+MAX_PAGES = 3
+
+
+def same_repo(run, other):
+    """True when both runs come from the same head repository, and that repository is known."""
+    name = head_repo(run)
+    return name is not None and head_repo(other) == name
+
+
 def newest(run, recent_runs):
     """True when no newer run of the same head repository and branch exists.
 
     GitHub lists runs newest first. A branch filter also matches fork PRs that use the same branch
     name, and those runs cannot supersede this one, so only runs from the same head repository count.
+    A run without a head repository is skipped, and a row without one never counts.
     """
-    same = [r for r in recent_runs if head_repo(r) == head_repo(run)]
-    return bool(same) and same[0].get("id") == run.get("id")
+    if head_repo(run) is None:
+        print("rerun=no reason=unknown head repository")
+        return False
+    same = [r for r in recent_runs if same_repo(run, r)]
+    if not same:
+        print("rerun=no reason=run not listed")
+        return False
+    if same[0].get("id") != run.get("id") or any(r.get("id", 0) > run.get("id", 0) for r in same):
+        print("rerun=no reason=newer run exists")
+        return False
+    return True
+
+
+def recent_runs_of(run, fetch_page):
+    """The runs of the branch, newest first, read one page at a time up to MAX_PAGES.
+
+    Reading stops after the first page that holds a run of the same head repository. A busy branch
+    can list many fork runs above it, and those cannot supersede this run. fetch_page(page) returns
+    one page of workflow_runs rows.
+    """
+    if head_repo(run) is None:
+        return []
+    rows = []
+    for page in range(1, MAX_PAGES + 1):
+        batch = fetch_page(page)
+        rows.extend(batch)
+        if len(batch) < PAGE_SIZE or any(same_repo(run, r) for r in batch):
+            break
+    if page > 1:
+        # A run that started while the later pages were read lands on page 1: read it again.
+        seen = {r.get("id") for r in rows}
+        rows = [r for r in fetch_page(1) if r.get("id") not in seen] + rows
+    return rows
 
 
 def gh_api(*args):
@@ -113,13 +155,15 @@ def main():
         reason = "attempt moved" if run.get("run_attempt") != attempt else "run not completed"
         print(f"rerun=no reason={reason}")
         return 0
-    recent = gh_json(
-        f"repos/{repo}/actions/workflows/{run['workflow_id']}/runs"
-        f"?branch={quote(run.get('head_branch') or '', safe='')}"
-        f"&event={quote(run['event'], safe='')}&per_page=50"
-    )["workflow_runs"]
+    recent = recent_runs_of(
+        run,
+        lambda page: gh_json(
+            f"repos/{repo}/actions/workflows/{run['workflow_id']}/runs"
+            f"?branch={quote(run.get('head_branch') or '', safe='')}"
+            f"&event={quote(run['event'], safe='')}&per_page={PAGE_SIZE}&page={page}"
+        )["workflow_runs"],
+    )
     if not newest(run, recent):
-        print("rerun=no reason=newer run exists")
         return 0
     print("rerun=yes")
     subprocess.run(["gh", "run", "rerun", run_id, "--failed", "--repo", repo], check=True)

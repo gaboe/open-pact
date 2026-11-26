@@ -6,7 +6,9 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -31,7 +33,15 @@ def step(conclusion, status="completed"):
 SUCCESS = job(900, "success", [step("success")], name="linux")
 
 
-RUN = {"id": 7, "run_attempt": 1, "status": "completed", "workflow_id": 3, "event": "push"}
+REPO = {"full_name": "gaboe/open-pact"}
+RUN = {
+    "id": 7,
+    "run_attempt": 1,
+    "status": "completed",
+    "workflow_id": 3,
+    "event": "push",
+    "head_repository": REPO,
+}
 
 
 class CurrentTest(unittest.TestCase):
@@ -47,10 +57,10 @@ class CurrentTest(unittest.TestCase):
 
 class NewestTest(unittest.TestCase):
     def test_the_run_listed_first_is_newest(self):
-        self.assertTrue(rerun.newest(RUN, [{"id": 7}, {"id": 6}]))
+        self.assertTrue(rerun.newest(RUN, [{"id": 7, "head_repository": REPO}, {"id": 6, "head_repository": REPO}]))
 
     def test_a_newer_run_listed_first_is_not_newest(self):
-        self.assertFalse(rerun.newest(RUN, [{"id": 8}, {"id": 7}]))
+        self.assertFalse(rerun.newest(RUN, [{"id": 8, "head_repository": REPO}, {"id": 7, "head_repository": REPO}]))
 
     def test_an_empty_list_is_not_newest(self):
         self.assertFalse(rerun.newest(RUN, []))
@@ -66,6 +76,88 @@ class NewestTest(unittest.TestCase):
         newer = {"id": 9, "head_repository": {"full_name": "gaboe/open-pact"}}
         mine = {"id": 7, "head_repository": {"full_name": "gaboe/open-pact"}}
         self.assertFalse(rerun.newest(run, [newer, mine]))
+
+
+class UnknownHeadTest(unittest.TestCase):
+    def test_a_run_without_a_head_repository_is_skipped(self):
+        run = dict(RUN, head_repository=None)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertFalse(rerun.newest(run, [{"id": 7, "head_repository": None}]))
+        self.assertIn("unknown head repository", out.getvalue())
+
+    def test_a_row_without_a_head_repository_never_counts_as_newer(self):
+        run = dict(RUN, head_repository={"full_name": "gaboe/open-pact"})
+        unknown = {"id": 9, "head_repository": None}
+        mine = {"id": 7, "head_repository": {"full_name": "gaboe/open-pact"}}
+        self.assertTrue(rerun.newest(run, [unknown, mine]))
+
+    def test_no_page_is_read_for_a_run_without_a_head_repository(self):
+        calls = []
+        rows = rerun.recent_runs_of(dict(RUN, head_repository=None), lambda page: calls.append(page) or [])
+        self.assertEqual((rows, calls), ([], []))
+
+
+def fork_page(start, size=rerun.PAGE_SIZE):
+    return [{"id": start - i, "head_repository": {"full_name": "someone/open-pact"}} for i in range(size)]
+
+
+class RecentRunsTest(unittest.TestCase):
+    def setUp(self):
+        self.run = dict(RUN, head_repository={"full_name": "gaboe/open-pact"})
+        self.mine = {"id": 7, "head_repository": {"full_name": "gaboe/open-pact"}}
+
+    def reader(self, pages):
+        calls = []
+
+        def fetch(page):
+            calls.append(page)
+            return pages.get(page, [])
+
+        return fetch, calls
+
+    def test_reading_stops_at_the_page_with_the_first_same_repository_run(self):
+        fetch, calls = self.reader({
+            1: fork_page(1000),
+            2: [self.mine] + fork_page(900, rerun.PAGE_SIZE - 1),
+            3: fork_page(800),
+        })
+        rows = rerun.recent_runs_of(self.run, fetch)
+        self.assertEqual(calls, [1, 2, 1])
+        self.assertTrue(rerun.newest(self.run, rows))
+
+    def test_a_run_that_starts_while_later_pages_are_read_is_seen(self):
+        newer = {"id": 1001, "head_repository": {"full_name": "gaboe/open-pact"}}
+        reads = []
+
+        def fetch(page):
+            reads.append(page)
+            if page == 1:
+                # The first read of page 1 lists forks only; the second sees the new run on top.
+                return fork_page(1000) if reads.count(1) == 1 else [newer] + fork_page(1000, rerun.PAGE_SIZE - 1)
+            return [self.mine] + fork_page(900, rerun.PAGE_SIZE - 1)
+
+        rows = rerun.recent_runs_of(self.run, fetch)
+        with redirect_stdout(io.StringIO()):
+            self.assertFalse(rerun.newest(self.run, rows))
+
+    def test_a_flood_of_fork_runs_is_read_for_three_pages_at_most(self):
+        fetch, calls = self.reader({
+            1: fork_page(1000),
+            2: fork_page(900),
+            3: fork_page(800),
+            4: [self.mine],
+        })
+        rows = rerun.recent_runs_of(self.run, fetch)
+        self.assertEqual(calls, [1, 2, 3, 1])
+        self.assertEqual(len(rows), 3 * rerun.PAGE_SIZE)
+        with redirect_stdout(io.StringIO()):
+            self.assertFalse(rerun.newest(self.run, rows))
+
+    def test_a_short_page_ends_the_reading(self):
+        fetch, calls = self.reader({1: fork_page(1000, 5)})
+        rows = rerun.recent_runs_of(self.run, fetch)
+        self.assertEqual((len(rows), calls), (5, [1]))
 
 
 class DecideTest(unittest.TestCase):
