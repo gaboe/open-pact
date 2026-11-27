@@ -1,0 +1,45 @@
+{
+  "id": "gatekeeper",
+  "cases": [
+    {
+      "name": "macos-1",
+      "os": "macos",
+      "input": ["assessments enabled"],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "on",
+      "known_diff": null
+    },
+    {
+      "name": "macos-2",
+      "os": "macos",
+      "input": ["assessments disabled"],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "off",
+      "known_diff": null
+    },
+    {
+      "name": "macos-3",
+      "os": "macos",
+      "input": [""],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "unknown",
+      "known_diff": null
+    },
+    {
+      "name": "linux-4",
+      "os": "linux",
+      "input": [],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "n/a",
+      "known_diff": null
+    },
+    {
+      "name": "windows-5",
+      "os": "windows",
+      "input": [],
+      "now": "2026-10-26T12:00:00Z",
+      "expected": "n/a",
+      "known_diff": null
+    }
+  ]
+}

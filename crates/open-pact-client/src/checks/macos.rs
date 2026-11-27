@@ -3,6 +3,8 @@ use super::exec::{Ran, run, run_status};
 use time::Date;
 
 const SOCKETFILTERFW: &str = "/usr/libexec/ApplicationFirewall/socketfilterfw";
+const CSRUTIL: &str = "/usr/bin/csrutil";
+const SPCTL: &str = "/usr/sbin/spctl";
 const INSTALL_HISTORY: &str = "/Library/Receipts/InstallHistory.plist";
 /// The screen saver idle time the installed macOS uses when the user and a profile set none.
 const SAVER_ENGINE_DEFAULTS: &str =
@@ -15,6 +17,35 @@ pub fn disk_encryption() -> &'static str {
 
 pub fn firewall() -> &'static str {
     run(SOCKETFILTERFW, &["--getglobalstate"]).map_or("unknown", |t| parse_firewall(&t))
+}
+
+/// `sip_enabled@1`: System Integrity Protection, as `csrutil status` reports it.
+pub fn sip_enabled() -> &'static str {
+    run_status(CSRUTIL, &["status"]).map_or("unknown", |ran| sip_result(&ran))
+}
+
+/// A failed `csrutil status` gives unknown, whatever it printed.
+fn sip_result(ran: &Ran) -> &'static str {
+    if ran.success {
+        parse_sip_enabled(&ran.text)
+    } else {
+        "unknown"
+    }
+}
+
+/// `gatekeeper@1`: whether Gatekeeper assessments are enabled, as `spctl --status` reports it.
+pub fn gatekeeper() -> &'static str {
+    run_status(SPCTL, &["--status"]).map_or("unknown", |ran| gatekeeper_result(&ran))
+}
+
+/// `spctl --status` exits 1 when assessments are disabled, so only that text may come with a
+/// failed exit.
+fn gatekeeper_result(ran: &Ran) -> &'static str {
+    match parse_gatekeeper(&ran.text) {
+        "on" if ran.success => "on",
+        "off" => "off",
+        _ => "unknown",
+    }
 }
 
 /// `screen_lock@1`: the password delay only, as `sysadminctl -screenLock` reports it. It does not
@@ -101,6 +132,39 @@ pub fn parse_firewall(out: &str) -> &'static str {
         "off"
     } else {
         "unknown"
+    }
+}
+
+/// A protection that a custom configuration turns off, shown as `Name: disabled`, makes the
+/// result off even when the status line says enabled.
+pub fn parse_sip_enabled(out: &str) -> &'static str {
+    let mut lines = out.lines().filter(|line| !line.trim().is_empty());
+    let Some(status) = lines
+        .next()
+        .map(str::trim)
+        .and_then(|line| line.strip_prefix("System Integrity Protection status: "))
+    else {
+        return "unknown";
+    };
+    // Only the indented lines right after the "Configuration:" heading name protections. The
+    // first unindented line ends that block, so a later diagnostic line does not count.
+    let protection_off = lines
+        .skip_while(|line| line.trim() != "Configuration:")
+        .skip(1)
+        .take_while(|line| line.starts_with([' ', '\t']))
+        .any(|line| line.trim().ends_with(": disabled"));
+    match status {
+        "enabled." if !protection_off => "on",
+        "enabled." | "disabled." | "unknown (Custom Configuration)." => "off",
+        _ => "unknown",
+    }
+}
+
+pub fn parse_gatekeeper(out: &str) -> &'static str {
+    match out.trim() {
+        "assessments enabled" => "on",
+        "assessments disabled" => "off",
+        _ => "unknown",
     }
 }
 
@@ -277,6 +341,96 @@ mod tests {
         assert_eq!(parse_firewall("Firewall is enabled. (State = 1)"), "on");
         assert_eq!(parse_firewall("Firewall is disabled. (State = 0)"), "off");
         assert_eq!(parse_firewall(""), "unknown");
+    }
+
+    #[test]
+    fn sip_enabled() {
+        assert_eq!(
+            parse_sip_enabled("System Integrity Protection status: enabled.\n"),
+            "on"
+        );
+        assert_eq!(
+            parse_sip_enabled("System Integrity Protection status: disabled.\n"),
+            "off"
+        );
+        assert_eq!(
+            parse_sip_enabled(
+                "System Integrity Protection status: unknown (Custom Configuration).\n"
+            ),
+            "off"
+        );
+        assert_eq!(
+            parse_sip_enabled(
+                "System Integrity Protection status: enabled.\n\nConfiguration:\n\tKext Signing: disabled\n"
+            ),
+            "off"
+        );
+        assert_eq!(
+            parse_sip_enabled(
+                "System Integrity Protection status: enabled.\n\nConfiguration:\n\tKext Signing: enabled\n\ncsrutil: diagnostic logging: disabled\n"
+            ),
+            "on"
+        );
+        assert_eq!(parse_sip_enabled(""), "unknown");
+        assert_eq!(parse_sip_enabled("garbage"), "unknown");
+        assert_eq!(
+            parse_sip_enabled("csrutil: failed to read Custom Configuration\n"),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn sip_is_unknown_after_a_failed_exit() {
+        let ran = |success: bool| Ran {
+            success,
+            text: "System Integrity Protection status: enabled.\n".to_owned(),
+        };
+        assert_eq!(sip_result(&ran(true)), "on");
+        assert_eq!(sip_result(&ran(false)), "unknown");
+    }
+
+    #[test]
+    fn sip_reads_disabled_protections_only_under_configuration() {
+        assert_eq!(
+            parse_sip_enabled(
+                "System Integrity Protection status: enabled.\ncsrutil: diagnostic logging: disabled\n"
+            ),
+            "on"
+        );
+    }
+
+    #[test]
+    fn gatekeeper_trusts_only_disabled_text_on_a_failed_exit() {
+        let ran = |success: bool, text: &str| Ran {
+            success,
+            text: text.to_owned(),
+        };
+        assert_eq!(gatekeeper_result(&ran(true, "assessments enabled\n")), "on");
+        assert_eq!(
+            gatekeeper_result(&ran(false, "assessments enabled\n")),
+            "unknown"
+        );
+        assert_eq!(
+            gatekeeper_result(&ran(false, "assessments disabled\n")),
+            "off"
+        );
+        assert_eq!(
+            gatekeeper_result(&ran(true, "assessments disabled\n")),
+            "off"
+        );
+        assert_eq!(gatekeeper_result(&ran(false, "")), "unknown");
+    }
+
+    #[test]
+    fn gatekeeper() {
+        assert_eq!(parse_gatekeeper("assessments enabled\n"), "on");
+        assert_eq!(parse_gatekeeper("assessments disabled\n"), "off");
+        assert_eq!(parse_gatekeeper(""), "unknown");
+        assert_eq!(parse_gatekeeper("garbage"), "unknown");
+        assert_eq!(
+            parse_gatekeeper("spctl: unable to determine whether assessments enabled\n"),
+            "unknown"
+        );
     }
 
     #[test]

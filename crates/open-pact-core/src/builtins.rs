@@ -13,6 +13,8 @@ pub const BUILTINS: &[(&str, u32)] = &[
     ("uptime_days", 1),
     ("disk_encryption", 1),
     ("firewall", 1),
+    ("sip_enabled", 1),
+    ("gatekeeper", 1),
     ("screen_lock", 1),
     ("os_supported", 1),
     ("os_patch_age_days", 1),
@@ -113,6 +115,24 @@ const BUILTIN_ABOUT: &[(&str, u32, &str)] = &[
             Windows it reads the Domain, Private and Public profiles with \
             Get-NetFirewallProfile (all three must be on), and on Linux it asks \
             firewalld (firewall-cmd --state) and reads the UFW configuration.",
+    ),
+    (
+        "sip_enabled",
+        1,
+        "Without System Integrity Protection, software can change the protected parts of \
+            macOS. On macOS the client runs csrutil status and reads whether the \
+            protection is enabled. A custom configuration that turns off any \
+            protection counts as off. On Windows and Linux the control does not \
+            apply and reports n/a.",
+    ),
+    (
+        "gatekeeper",
+        1,
+        "Gatekeeper checks that an app from the internet is signed by a known \
+            developer and notarized by Apple before it first starts; the user can still allow \
+            one app with Open Anyway. On macOS the client runs spctl --status \
+            and reads whether assessments are enabled. On Windows and Linux the \
+            control does not apply and reports n/a.",
     ),
     (
         "screen_lock",

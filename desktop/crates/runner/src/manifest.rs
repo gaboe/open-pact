@@ -746,7 +746,7 @@ const INTEGER_MAX: &str = "{ integer = { min = 0, max = 2147483647 } }";
 /// minutes that fits an i32.
 const LOCK_MINUTES: &str = r#"{ integer = { min = 0, max = 2147483647 }, values = ["none"] }"#;
 
-pub const BUILTINS: [Builtin; 29] = [
+pub const BUILTINS: [Builtin; 31] = [
     Builtin {
         id: "disk_encryption",
         version: 1,
@@ -765,6 +765,28 @@ pub const BUILTINS: [Builtin; 29] = [
         line: "The firewall is on",
         scope: "",
         output: r#"["on", "off", "unknown"]"#,
+        max: true,
+        noun: "",
+        group: Group::MalwareAndNetwork,
+    },
+    Builtin {
+        id: "sip_enabled",
+        version: 1,
+        name: "System Integrity Protection",
+        line: "System Integrity Protection is on",
+        scope: "macOS",
+        output: r#"["on", "off", "n/a", "unknown"]"#,
+        max: true,
+        noun: "",
+        group: Group::MalwareAndNetwork,
+    },
+    Builtin {
+        id: "gatekeeper",
+        version: 1,
+        name: "Gatekeeper",
+        line: "Gatekeeper is on",
+        scope: "macOS",
+        output: r#"["on", "off", "n/a", "unknown"]"#,
         max: true,
         noun: "",
         group: Group::MalwareAndNetwork,

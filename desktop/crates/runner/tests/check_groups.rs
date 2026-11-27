@@ -45,6 +45,8 @@ fn the_groups_hold_the_checks_the_task_names() {
                 "antimalware_active_threats",
                 "web_protection",
                 "firewall",
+                "sip_enabled",
+                "gatekeeper",
             ],
         ),
         (

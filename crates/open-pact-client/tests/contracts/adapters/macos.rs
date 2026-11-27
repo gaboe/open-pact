@@ -7,6 +7,8 @@ pub(crate) fn run(id: &str, case: &Case) -> ControlValue {
     match id {
         "disk_encryption" => parse_fdesetup(text).into(),
         "firewall" => parse_firewall(text).into(),
+        "sip_enabled" => parse_sip_enabled(text).into(),
+        "gatekeeper" => parse_gatekeeper(text).into(),
         "screen_lock" => parse_screen_lock(text).into(),
         "os_supported" => parse_os_supported(text).into(),
         "auto_login" => parse_auto_login(text).into(),

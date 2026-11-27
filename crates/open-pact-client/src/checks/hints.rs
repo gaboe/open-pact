@@ -6,6 +6,8 @@ const COMPLIANT: &[(&str, &[&str])] = &[
     ("antimalware_active_threats", &["0", "n/a"]),
     ("disk_encryption", &["full"]),
     ("firewall", &["on"]),
+    ("sip_enabled", &["on", "n/a"]),
+    ("gatekeeper", &["on", "n/a"]),
     ("screen_lock", &["le_5min"]),
     ("os_supported", &["yes"]),
     ("os_patch_age_days", &[]),
@@ -76,6 +78,15 @@ pub fn fix_hint(check: &str, value: &str, os: Os) -> Option<&'static str> {
         ),
         ("firewall", Os::Macos) => {
             Some("Turn on the firewall: System Settings > Network > Firewall.")
+        }
+        ("sip_enabled", Os::Macos) => Some(
+            "Turn System Integrity Protection back on: start in Recovery, open Terminal and run 'csrutil enable', then restart.",
+        ),
+        ("gatekeeper", Os::Macos) => {
+            Some("Turn Gatekeeper back on: run 'sudo spctl --global-enable' in Terminal.")
+        }
+        ("sip_enabled" | "gatekeeper", _) => {
+            Some("This control applies only to macOS, so it needs no fix on this system.")
         }
         ("firewall", Os::Windows) => Some(
             "Turn on Windows Defender Firewall: Settings > Privacy & security > Windows Security > Firewall & network protection.",

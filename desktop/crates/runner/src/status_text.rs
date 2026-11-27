@@ -205,6 +205,8 @@ const CONTROL_NAMES: &[(&str, &str)] = &[
     ("antimalware_active_threats", "Active threats"),
     ("disk_encryption", "Disk encryption"),
     ("firewall", "Firewall"),
+    ("sip_enabled", "System Integrity Protection"),
+    ("gatekeeper", "Gatekeeper"),
     ("screen_lock", "Screen lock"),
     ("os_supported", "Operating system support"),
     ("os_patch_age_days", "System update age"),

@@ -277,6 +277,8 @@ fn a_check_is_added_as_reported_and_removed_again() {
     assert_eq!(
         ids,
         [
+            "sip_enabled",
+            "gatekeeper",
             "password_set",
             "web_protection",
             "process_audit",

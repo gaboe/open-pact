@@ -137,6 +137,8 @@ const MACOS: Registry = &[
         ignore_input!(|| macos::disk_encryption().into()),
     ),
     ("firewall", ignore_input!(|| macos::firewall().into())),
+    ("sip_enabled", ignore_input!(|| macos::sip_enabled().into())),
+    ("gatekeeper", ignore_input!(|| macos::gatekeeper().into())),
     ("screen_lock", |input| {
         match check_version(input, "screen_lock") {
             2 => macos::screen_lock_minutes(),
@@ -203,6 +205,8 @@ const LINUX: Registry = &[
         ignore_input!(|| linux::disk_encryption().into()),
     ),
     ("firewall", ignore_input!(|| linux::firewall().into())),
+    ("sip_enabled", ignore_input!(common::not_applicable)),
+    ("gatekeeper", ignore_input!(common::not_applicable)),
     ("screen_lock", |input| {
         match check_version(input, "screen_lock") {
             2 => linux::screen_lock_minutes(),
@@ -266,6 +270,8 @@ const WINDOWS: Registry = &[
     ("uptime_days", ignore_input!(windows::uptime_days)),
     ("disk_encryption", ignore_input!(windows::disk_encryption)),
     ("firewall", ignore_input!(windows::firewall)),
+    ("sip_enabled", ignore_input!(common::not_applicable)),
+    ("gatekeeper", ignore_input!(common::not_applicable)),
     ("screen_lock", |input| {
         match check_version(input, "screen_lock") {
             2 => windows::screen_lock_minutes(),
@@ -337,6 +343,8 @@ fn registry(os: Os) -> OsRegistry {
             checks: LINUX,
             #[cfg(test)]
             not_applicable: &[
+                "sip_enabled",
+                "gatekeeper",
                 "process_audit",
                 "remote_wipe",
                 "powershell_logging",
@@ -347,7 +355,7 @@ fn registry(os: Os) -> OsRegistry {
         Os::Windows => OsRegistry {
             checks: WINDOWS,
             #[cfg(test)]
-            not_applicable: &["remote_wipe"],
+            not_applicable: &["remote_wipe", "sip_enabled", "gatekeeper"],
         },
         // A release binary carries only its own OS checks; a foreign OS has none.
         #[cfg(not(test))]
@@ -372,6 +380,8 @@ fn legacy_registry(os: Os) -> LegacyRegistry {
         ("uptime_days", macos_v3::uptime_days),
         ("disk_encryption", || macos::disk_encryption().into()),
         ("firewall", || macos::firewall().into()),
+        ("sip_enabled", || macos::sip_enabled().into()),
+        ("gatekeeper", || macos::gatekeeper().into()),
         ("screen_lock", || macos::screen_lock().into()),
         ("os_supported", || macos::os_supported().into()),
         ("os_patch_age_days", macos::os_patch_age_days),
@@ -401,6 +411,8 @@ fn legacy_registry(os: Os) -> LegacyRegistry {
         ("uptime_days", linux_v3::uptime_days),
         ("disk_encryption", || linux::disk_encryption().into()),
         ("firewall", || linux::firewall().into()),
+        ("sip_enabled", common::not_applicable),
+        ("gatekeeper", common::not_applicable),
         ("screen_lock", || linux::screen_lock().into()),
         ("os_supported", || linux::os_supported().into()),
         ("os_patch_age_days", linux::os_patch_age_days),
@@ -433,6 +445,8 @@ fn legacy_registry(os: Os) -> LegacyRegistry {
         ("uptime_days", windows::uptime_days),
         ("disk_encryption", windows::disk_encryption),
         ("firewall", windows::firewall),
+        ("sip_enabled", common::not_applicable),
+        ("gatekeeper", common::not_applicable),
         ("screen_lock", windows::screen_lock),
         ("os_supported", windows::os_supported),
         ("os_patch_age_days", windows::os_patch_age_days),
@@ -533,13 +547,18 @@ mod tests {
             (
                 Os::Linux,
                 &[
+                    "sip_enabled",
+                    "gatekeeper",
                     "process_audit",
                     "remote_wipe",
                     "powershell_logging",
                     "log_cleared",
                 ][..],
             ),
-            (Os::Windows, &["remote_wipe"][..]),
+            (
+                Os::Windows,
+                &["remote_wipe", "sip_enabled", "gatekeeper"][..],
+            ),
         ] {
             for id in unavailable {
                 assert!(!can_check(os, id), "{id} should be unavailable on {os}");
@@ -695,9 +714,14 @@ mod tests {
         let all = run_all(Os::Windows);
         assert_eq!(all.len(), BUILTINS.len());
         assert_eq!(all["remote_wipe"], "n/a");
+        assert_eq!(all["sip_enabled"], "n/a");
+        assert_eq!(all["gatekeeper"], "n/a");
         assert!(
             all.iter()
-                .filter(|(id, _)| id.as_str() != "remote_wipe")
+                .filter(|(id, _)| !matches!(
+                    id.as_str(),
+                    "remote_wipe" | "sip_enabled" | "gatekeeper"
+                ))
                 .all(|(_, value)| value == "unknown")
         );
     }

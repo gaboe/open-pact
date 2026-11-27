@@ -6,6 +6,8 @@ This page lists the built-in controls. The catalog is in `crates/open-pact-core/
 | --- | --- | --- | --- | --- |
 | `disk_encryption` | `full`, `none`, or `unknown` from FileVault | `full`, `partial`, `none`, or `unknown` from BitLocker | `full`, `partial`, `none`, or `unknown` from mounted writable, persistent local disks and swap; excludes boot and removable media | Run as the device user. |
 | `firewall` | `on`, `off`, or `unknown` | `on`, `off`, or `unknown` | `on`, `off`, or `unknown` | Run as the device user. |
+| `sip_enabled` | `on`, `off`, or `unknown` | `n/a` | `n/a` | Run as the device user. |
+| `gatekeeper` | `on`, `off`, or `unknown` | `n/a` | `n/a` | Run as the device user. |
 | `screen_lock` | `@1`: `le_5min`, `le_15min`, `gt_15min`, `none`, or `unknown`. `@2`: whole minutes, `none`, or `unknown` | `@1`: `le_5min`, `le_15min`, `gt_15min`, `none`, or `unknown`. `@2`: whole minutes, `none`, or `unknown` | `@1`: `le_5min`, `le_15min`, `gt_15min`, `none`, or `unknown`. `@2`: whole minutes, `none`, or `unknown` | Windows SYSTEM reads interactive user profiles. Other checks use the device user. |
 | `os_supported` | `yes`, `no`, or `unknown` | `yes`, `no`, or `unknown` | `yes`, `no`, or `unknown` | Run as the device user. |
 | `os_patch_age_days` | Integer days or `unknown` | Integer days or `unknown` | Integer days or `unknown` | Windows needs administrator or SYSTEM access. macOS and Linux use the device user. |
