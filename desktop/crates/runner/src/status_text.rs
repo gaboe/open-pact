@@ -1,5 +1,6 @@
 //! Plain-words wording for the typed reports of the client library. No UI code lives here.
 
+use crate::rejection::time_left;
 use crate::text::{Headline, Tone, humanize, readable_local};
 use crate::zone;
 use open_pact_client::ControlReport;
@@ -138,29 +139,49 @@ pub struct IssueView {
     pub action: Option<IssueAction>,
 }
 
-/// A gateway answer such as `Gateway at <time>: <id> = <value>, <required> required, access ends in 19h`.
-struct Finding<'a> {
+/// A gateway answer such as `Gateway at <time>: <id> = <value>, <required> required, access ends in 19h`,
+/// cut into its time, its body and the span of its grace tail. Every body gets the tail cut, so
+/// a text that is not `id = value` still has its countdown.
+struct Answer<'a> {
     at: &'a str,
-    id: &'a str,
-    value: &'a str,
-    required: &'a str,
+    body: &'a str,
     span: Option<&'a str>,
 }
 
-fn parse_finding(message: &str) -> Option<Finding<'_>> {
-    let (at, body) = message.strip_prefix("Gateway at ")?.split_once(": ")?;
+fn split_answer(message: &str) -> Option<Answer<'_>> {
+    let (at, text) = message.strip_prefix("Gateway at ")?.split_once(": ")?;
+    Some(match text.rsplit_once(", access ends in ") {
+        Some((body, span)) => Answer {
+            at,
+            body,
+            span: Some(span),
+        },
+        None => Answer {
+            at,
+            body: text,
+            span: None,
+        },
+    })
+}
+
+/// The body `<id> = <value>, <required> required` of a gateway answer.
+struct Finding<'a> {
+    id: &'a str,
+    value: &'a str,
+    required: &'a str,
+}
+
+fn parse_finding(body: &str) -> Option<Finding<'_>> {
     let (id, rest) = body.split_once(" = ")?;
     if id.contains(' ') {
         return None;
     }
     let (value, rest) = rest.split_once(", ")?;
-    let (required, tail) = rest.split_once(" required")?;
+    let (required, _) = rest.split_once(" required")?;
     Some(Finding {
-        at,
         id,
         value,
         required,
-        span: tail.strip_prefix(", access ends in "),
     })
 }
 
@@ -180,6 +201,13 @@ pub(crate) fn span_delta(span: &str) -> Option<Duration> {
         parts += 1;
     }
     (1..=2).contains(&parts).then_some(total)
+}
+
+/// The earliest instant of "access ends in <span>": `at + span`. The gateway rounds the time left
+/// down, so the true end lies in `[at + span, at + span + one unit)`. The app shows the earliest
+/// end, so it never promises the user more access than the gateway allows.
+pub(crate) fn access_deadline(at: OffsetDateTime, span: &str) -> Option<OffsetDateTime> {
+    at.checked_add(span_delta(span)?)
 }
 
 const MEASURES: &[(&str, &str)] = &[
@@ -253,27 +281,16 @@ fn finding_title(finding: &Finding) -> String {
     format!("{name} is {}, it must be {required}", finding.value)
 }
 
-/// The words for one action item. The raw CLI text stays in the command log.
+/// The words for one action item. The raw CLI text stays in the command log. The message names
+/// the time the gateway answered; "access ends in <span>" counts from `sent_at`, the claim send
+/// time, so the end is never later than the real end. Without `sent_at` it counts from the answer.
 pub fn issue_view(
     issue: &Issue,
+    sent_at: Option<OffsetDateTime>,
     now: OffsetDateTime,
     zone: impl Fn(OffsetDateTime) -> OffsetDateTime,
 ) -> IssueView {
     let action = issue_action(issue);
-    let Some(finding) = parse_finding(&issue.message) else {
-        let message = issue.message.as_str();
-        let title = message
-            .strip_prefix("Gateway at ")
-            .and_then(|rest| rest.split_once(": "))
-            .map_or(message, |(_, text)| text);
-        return IssueView {
-            title: title.to_owned(),
-            fix: issue.fix.clone(),
-            note: deadline_text(issue),
-            action,
-        };
-    };
-    let at = parse_rfc3339(finding.at);
     let when = |time: OffsetDateTime| {
         zone(time)
             .format(format_description!(
@@ -281,23 +298,49 @@ pub fn issue_view(
             ))
             .unwrap_or_default()
     };
-    let note = match (finding.span, at) {
-        (Some(span), Some(at)) => {
-            span_delta(span)
-                .and_then(|left| at.checked_add(left))
-                .map(|deadline| {
-                    if deadline < now {
-                        format!("Access ended {}", when(deadline))
-                    } else {
-                        format!("Access ends {} unless fixed", when(deadline))
-                    }
-                })
+    let raw = || {
+        let message = issue.message.as_str();
+        let title = message
+            .strip_prefix("Gateway at ")
+            .and_then(|rest| rest.split_once(": "))
+            .map_or(message, |(_, text)| text);
+        IssueView {
+            title: title.to_owned(),
+            fix: issue.fix.clone(),
+            note: deadline_text(issue),
+            action,
         }
-        (None, Some(at)) => Some(format!("Refused by the gateway on {}", when(at))),
-        _ => None,
+    };
+    let Some(answer) = split_answer(&issue.message) else {
+        return raw();
+    };
+    let at = parse_rfc3339(answer.at);
+    let finding = parse_finding(answer.body);
+    let deadline = answer
+        .span
+        .zip(sent_at.or(at))
+        .and_then(|(span, from)| access_deadline(from, span));
+    let (title, note) = match (deadline, &finding) {
+        (Some(deadline), _) => (
+            finding
+                .as_ref()
+                .map_or_else(|| answer.body.to_owned(), finding_title),
+            Some(match time_left(deadline, now) {
+                Some(left) => format!("Access ends {left} ({}) unless fixed", when(deadline)),
+                None => format!("Access ended {}", when(deadline)),
+            }),
+        ),
+        (None, Some(finding)) => (
+            finding_title(finding),
+            match (answer.span, at) {
+                (None, Some(at)) => Some(format!("Refused by the gateway on {}", when(at))),
+                _ => None,
+            },
+        ),
+        (None, None) => return raw(),
     };
     IssueView {
-        title: finding_title(&finding),
+        title,
         fix: issue.fix.clone(),
         note,
         action,
@@ -306,11 +349,11 @@ pub fn issue_view(
 
 /// `issue_view` in the time zone of this computer. `now` is an RFC 3339 time that a fixture sets
 /// so that a picture does not change with the day; the app passes `None`.
-pub fn issue_view_local(issue: &Issue, now: Option<&str>) -> IssueView {
+pub fn issue_view_local(issue: &Issue, sent_at: Option<&str>, now: Option<&str>) -> IssueView {
     let now = now
         .and_then(parse_rfc3339)
         .unwrap_or_else(OffsetDateTime::now_utc);
-    issue_view(issue, now, zone::to_local)
+    issue_view(issue, sent_at.and_then(parse_rfc3339), now, zone::to_local)
 }
 
 /// The title, value and verdict of one control of a claim. A control the manifest does not require
@@ -705,6 +748,88 @@ mod tests {
     }
 
     #[test]
+    fn a_warning_shows_the_same_countdown_as_a_rejection() {
+        let view = issue_view(
+            &issue(
+                "Gateway at 2026-11-16T14:10:35Z: firewall = off, on required, access ends in 2d 5h",
+                None,
+            ),
+            None,
+            at("2026-11-16T15:00:00Z"),
+            prague(),
+        );
+        assert_eq!(
+            view.note.as_deref(),
+            Some("Access ends in 2 days (18 Nov, 20:10) unless fixed")
+        );
+    }
+
+    #[test]
+    fn a_new_manifest_warning_counts_down_from_the_time_it_was_sent() {
+        let message = "Gateway at 2026-11-16T10:00:00Z: password_min_length is required by a new manifest that waits for your acceptance; run `open-pact-client accept`, access ends in 24h";
+        let view = issue_view(
+            &issue(message, None),
+            None,
+            at("2026-11-16T11:00:00Z"),
+            prague(),
+        );
+        assert_eq!(
+            view.note.as_deref(),
+            Some("Access ends in 23 h (17 Nov, 11:00) unless fixed")
+        );
+        assert_eq!(
+            view.title,
+            "password_min_length is required by a new manifest that waits for your acceptance; run `open-pact-client accept`"
+        );
+    }
+
+    #[test]
+    fn a_response_that_arrives_late_does_not_move_the_end() {
+        // The message names the time the response arrived; the end counts from the claim time.
+        let view = issue_view(
+            &issue(
+                "Gateway at 2026-11-17T10:00:10Z: firewall = off, on required, access ends in 1m",
+                None,
+            ),
+            Some(at("2026-11-17T10:00:00Z")),
+            at("2026-11-17T10:01:05Z"),
+            prague(),
+        );
+        assert_eq!(view.note.as_deref(), Some("Access ended 17 Nov, 11:01"));
+    }
+
+    #[test]
+    fn a_denied_answer_names_the_response_time() {
+        let view = issue_view(
+            &issue(
+                "Gateway at 2026-11-16T09:51:00Z: firewall = off, on required",
+                None,
+            ),
+            Some(at("2026-11-16T09:50:00Z")),
+            at("2026-11-16T10:00:00Z"),
+            prague(),
+        );
+        assert_eq!(
+            view.note.as_deref(),
+            Some("Refused by the gateway on 16 Nov, 10:51")
+        );
+    }
+
+    #[test]
+    fn a_rounded_zero_minutes_warning_ends_at_the_earliest_instant() {
+        let view = issue_view(
+            &issue(
+                "Gateway at 2026-11-17T10:00:00Z: firewall = off, on required, access ends in 0m",
+                None,
+            ),
+            None,
+            at("2026-11-17T10:00:05Z"),
+            prague(),
+        );
+        assert_eq!(view.note.as_deref(), Some("Access ended 17 Nov, 11:00"));
+    }
+
+    #[test]
     fn gateway_findings_read_in_plain_words_with_local_dates() {
         let now = at("2026-11-16T15:00:00Z");
         let view = issue_view(
@@ -712,6 +837,7 @@ mod tests {
                 "Gateway at 2026-11-16T14:10:35Z: password_min_length = 4, >= 10 required, access ends in 19h",
                 Some("open-pact-client check"),
             ),
+            None,
             now,
             prague(),
         );
@@ -721,7 +847,7 @@ mod tests {
         );
         assert_eq!(
             view.note.as_deref(),
-            Some("Access ends 17 Nov, 10:10 unless fixed")
+            Some("Access ends in 18 h (17 Nov, 10:10) unless fixed")
         );
         assert_eq!(view.action, None);
         let view = issue_view(
@@ -729,6 +855,7 @@ mod tests {
                 "Gateway at 2026-11-16T14:10:35Z: antimalware_signature_age_days = 4, <= 3 required, access ends in 19h",
                 None,
             ),
+            None,
             now,
             prague(),
         );
@@ -741,6 +868,7 @@ mod tests {
                 "Gateway at 2026-11-16T09:00:00Z: firewall = off, on required, access ends in 2h",
                 None,
             ),
+            None,
             now,
             prague(),
         );
@@ -751,6 +879,7 @@ mod tests {
                 "Gateway at 2026-11-16T09:00:00Z: disk_encryption = unknown, full required",
                 None,
             ),
+            None,
             now,
             prague(),
         );
@@ -768,7 +897,7 @@ mod tests {
             "Automatic sending is on, but its job needs installation or update.",
             Some("open-pact-client schedule on"),
         );
-        let view = issue_view(&job, now, prague());
+        let view = issue_view(&job, None, now, prague());
         assert_eq!(view.title, job.message);
         assert_eq!(view.action, Some(IssueAction::InstallJob));
         assert_eq!(

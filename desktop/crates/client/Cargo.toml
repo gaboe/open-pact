@@ -18,6 +18,7 @@ winresource = "0.1"
 
 [dependencies]
 runner = { workspace = true, features = ["desktop", "client"] }
+time = "0.3"
 open-pact-client.workspace = true
 open-pact-core.workspace = true
 serde_json.workspace = true

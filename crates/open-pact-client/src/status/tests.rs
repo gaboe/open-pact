@@ -538,6 +538,7 @@ fn access_spans_cover_the_gateway_formats() {
         warning_deadline(
             "firewall = off",
             "2026-11-16T09:50:00Z",
+            "2026-11-16T09:50:00Z",
             time::OffsetDateTime::now_utc()
         )
         .starts_with("Exact deadline unknown")
@@ -990,6 +991,63 @@ async fn send_time_and_response_time_are_distinct_evidence() {
     let claim = report.last_claim.as_ref().unwrap();
     assert_eq!(claim.sent_at.as_deref(), Some("2026-11-16T09:50:00Z"));
     assert_eq!(claim.response_at, "2026-11-16T09:51:00Z");
+}
+
+#[tokio::test]
+async fn a_denied_answer_names_the_response_time() {
+    let fixture = Fixture::new("denied").await;
+    let mut records = locallog::read(&fixture.home.file("claims.jsonl")).unwrap();
+    records[0].time = "2026-11-16T09:51:00Z".into();
+    fixture
+        .home
+        .write(
+            "claims.jsonl",
+            (serde_json::to_string(&records[0]).unwrap() + "\n").as_bytes(),
+        )
+        .unwrap();
+    let report = fixture.report(false).await;
+    let claim = report.last_claim.as_ref().unwrap();
+    assert_eq!(claim.sent_at.as_deref(), Some("2026-11-16T09:50:00Z"));
+    assert!(
+        report.issues.iter().any(|issue| issue
+            .message
+            .starts_with("Gateway at 2026-11-16T09:51:00Z: ")),
+        "{:?}",
+        report.issues
+    );
+}
+
+#[tokio::test]
+async fn a_warning_counts_from_the_claim_time_not_from_the_response_time() {
+    let fixture = Fixture::new("grace_warning").await;
+    let mut records = locallog::read(&fixture.home.file("claims.jsonl")).unwrap();
+    records[0].time = "2026-11-16T09:50:10Z".into();
+    fixture
+        .home
+        .write(
+            "claims.jsonl",
+            (serde_json::to_string(&records[0]).unwrap() + "\n").as_bytes(),
+        )
+        .unwrap();
+    let report = fixture.report(false).await;
+    let issue = report
+        .issues
+        .iter()
+        .find(|issue| issue.message.contains("access ends in"))
+        .unwrap();
+    assert!(
+        issue
+            .message
+            .starts_with("Gateway at 2026-11-16T09:50:10Z: "),
+        "{}",
+        issue.message
+    );
+    assert!(
+        issue.deadline.contains("at 2026-11-16T09:50:10Z)")
+            && issue.deadline.contains("about 2026-11-17T08:50:00Z"),
+        "{}",
+        issue.deadline
+    );
 }
 
 #[tokio::test]

@@ -635,7 +635,7 @@ The summary shows:
 
 The local view is the default. It reads only the files in the client home and makes no network or OS query. It marks approval and manifest agreement as saved or unknown, and it prints the `status --online` command to refresh them. `--online` asks the gateway for the current approval, manifest, and log checkpoint, probes the VPN address from the signed schedule, and asks the OS about the job. It authenticates to the gateway only after the pinned keys and the checkpoint verify, and it stops with an alarm when they do not. It does not store the checkpoint.
 
-`status` cannot tell you that the device is compliant now. Only `check` runs the checks and gets a new answer. The gateway words its grace warning as a time left, for example `access ends in 23h`. The summary adds the absolute time, which is the time of the response plus that span. The gateway rounds the span down, so the time is approximate. Without such a span in the warning, the deadline is unknown.
+`status` cannot tell you that the device is compliant now. Only `check` runs the checks and gets a new answer. The gateway words its grace warning as a time left, for example `access ends in 23h`. The summary adds the absolute time, which is the time the claim was sent plus that span. When the stored claim cannot be verified, the end counts from the time the gateway answered. It also names when the gateway answered. The gateway rounds the span down, so the time is approximate. Without such a span in the warning, the deadline is unknown.
 
 The exit code tells a script what to do:
 

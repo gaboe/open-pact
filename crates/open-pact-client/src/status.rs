@@ -841,14 +841,22 @@ fn access_span(message: &str) -> Option<(&str, time::Duration)> {
     (1..=2).contains(&parts).then_some((span, total))
 }
 
-fn warning_deadline(message: &str, response_time: &str, now: OffsetDateTime) -> String {
+/// The end counts from `sent_at`, the claim send time, which is never later than the gateway's
+/// evaluation, so the shown end is never later than the real end. `response_time` only names when
+/// the gateway answered.
+fn warning_deadline(
+    message: &str,
+    sent_at: &str,
+    response_time: &str,
+    now: OffsetDateTime,
+) -> String {
     let Some((span, left)) = access_span(message) else {
         return "Exact deadline unknown; the gateway warning gives no time.".into();
     };
-    let Some(deadline) = open_pact_core::timestamp::parse_rfc3339(response_time)
+    let Some(deadline) = open_pact_core::timestamp::parse_rfc3339(sent_at)
         .and_then(|time| time.to_offset(time::UtcOffset::UTC).checked_add(left))
     else {
-        return "Exact deadline unknown; the response time is unreadable.".into();
+        return "Exact deadline unknown; the claim time is unreadable.".into();
     };
     let said = format!("(gateway said 'access ends in {span}' at {response_time})");
     if deadline < now {
@@ -942,6 +950,8 @@ impl Report {
             os: claim.map(|claim| claim.os),
             results: claim.map(|claim| claim.results.clone()).unwrap_or_default(),
         };
+        // The span counts from the send time; the labels name the response time.
+        let counted_from = evidence.sent_at.as_deref().unwrap_or(&record.time);
         for (urgency, messages) in [
             (Urgency::Action, &evidence.reasons),
             (Urgency::Warning, &evidence.warnings),
@@ -963,7 +973,7 @@ impl Report {
                     })
                     .unwrap_or("Fix the reported item. Tell IT if the cause is unclear.");
                 let deadline = if urgency == Urgency::Warning {
-                    warning_deadline(message, &record.time, now)
+                    warning_deadline(message, counted_from, &record.time, now)
                 } else {
                     "The gateway denied that claim at the recorded time.".into()
                 };
@@ -1386,24 +1396,38 @@ mod timestamp_pins {
     }
 
     #[test]
-    fn warning_deadlines_add_the_time_left_to_the_response_time() {
+    fn warning_deadlines_add_the_time_left_to_the_claim_time() {
         let now = at("2026-11-16T10:00:00Z");
         let message = "firewall = off, access ends in 23h";
         assert_eq!(
-            warning_deadline(message, "2026-11-16T09:50:00Z", now),
+            warning_deadline(message, "2026-11-16T09:50:00Z", "2026-11-16T09:50:00Z", now),
             "about 2026-11-17T08:50:00Z (gateway said 'access ends in 23h' at 2026-11-16T09:50:00Z)"
         );
         assert_eq!(
-            warning_deadline(message, "2026-11-16T11:50:00.9+02:00", now),
+            warning_deadline(
+                message,
+                "2026-11-16T11:50:00.9+02:00",
+                "2026-11-16T11:50:00.9+02:00",
+                now
+            ),
             "about 2026-11-17T08:50:00Z (gateway said 'access ends in 23h' at 2026-11-16T11:50:00.9+02:00)"
         );
         assert_eq!(
-            warning_deadline(message, "2026-11-16T09:50:00Z", at("2026-11-17T09:00:00Z")),
+            warning_deadline(
+                message,
+                "2026-11-16T09:50:00Z",
+                "2026-11-16T09:50:00Z",
+                at("2026-11-17T09:00:00Z")
+            ),
             "Deadline passed at about 2026-11-17T08:50:00Z (gateway said 'access ends in 23h' at 2026-11-16T09:50:00Z)"
         );
         assert_eq!(
-            warning_deadline(message, "yesterday", now),
-            "Exact deadline unknown; the response time is unreadable."
+            warning_deadline(message, "yesterday", "2026-11-16T09:50:00Z", now),
+            "Exact deadline unknown; the claim time is unreadable."
+        );
+        assert_eq!(
+            warning_deadline(message, "2026-11-16T09:50:00Z", "2026-11-16T09:50:10Z", now),
+            "about 2026-11-17T08:50:00Z (gateway said 'access ends in 23h' at 2026-11-16T09:50:10Z)"
         );
     }
 }

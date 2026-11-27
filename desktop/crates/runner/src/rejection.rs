@@ -2,26 +2,65 @@
 //! the gateway's text, written by the `Reason` Display of the core. No UI code lives here.
 
 use crate::manifest::{builtin, value_label};
-use crate::status_text::span_delta;
-use crate::text::humanize;
-use time::OffsetDateTime;
+use crate::status_text::access_deadline;
+use crate::text::{Tone, humanize};
 use time::macros::format_description;
+use time::{Duration, OffsetDateTime};
 
 /// Where a failing control stands against its grace period.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GraceState {
     Ended,
-    /// The local time when access ends, such as "17 Nov, 10:10".
-    EndsAt(String),
+    /// The end instant, and its local time such as "17 Nov, 11:10" for the label.
+    EndsAt {
+        when: String,
+        at: OffsetDateTime,
+    },
 }
 
 impl GraceState {
-    pub fn text(&self) -> String {
+    /// The grace text as of `now`: the time left, and the local end time in brackets.
+    pub fn text(&self, now: OffsetDateTime) -> String {
         match self {
             Self::Ended => "Grace ended".into(),
-            Self::EndsAt(when) => format!("Grace ends {when}"),
+            Self::EndsAt { when, at } => match time_left(*at, now) {
+                Some(left) => format!("Grace ends {left} ({when})"),
+                None => "Grace ended".into(),
+            },
         }
     }
+
+    /// The tone of the grace label as of `now`. It reads the same clock as `text`.
+    pub fn tone(&self, now: OffsetDateTime) -> Tone {
+        match self {
+            Self::Ended => Tone::Bad,
+            Self::EndsAt { at, .. } if now >= *at => Tone::Bad,
+            Self::EndsAt { .. } => Tone::Warn,
+        }
+    }
+}
+
+/// The time left until `end` as of `now`, in words such as "in 19 h". `None` from the end instant on.
+/// The warning rows of an accepted check use these same words.
+pub fn time_left(end: OffsetDateTime, now: OffsetDateTime) -> Option<String> {
+    let left = end - now;
+    if left <= Duration::ZERO {
+        return None;
+    }
+    let days = left.whole_days();
+    let hours = left.whole_hours();
+    Some(if days >= 2 {
+        format!("in {days} days")
+    } else if hours >= 24 {
+        match hours - 24 {
+            0 => "in 1 day".into(),
+            rest => format!("in 1 day {rest} h"),
+        }
+    } else if hours >= 1 {
+        format!("in {hours} h")
+    } else {
+        format!("in {} min", left.whole_minutes().max(1))
+    })
 }
 
 /// One reason. A reason this module cannot read keeps its text as `name` and has no `detail`.
@@ -58,7 +97,14 @@ pub fn reason_row(
             detail: Some(detail),
             grace,
         },
-        None => ReasonRow::raw(reason),
+        None => match grace {
+            Some(grace) => ReasonRow {
+                name: body.to_owned(),
+                detail: None,
+                grace: Some(grace),
+            },
+            None => ReasonRow::raw(reason),
+        },
     }
 }
 
@@ -69,13 +115,13 @@ fn split_grace(
     zone: impl Fn(OffsetDateTime) -> OffsetDateTime,
 ) -> Option<(&str, Option<GraceState>)> {
     if let Some((body, span)) = reason.rsplit_once(", access ends in ") {
-        let deadline = sent?.checked_add(span_delta(span)?)?;
+        let deadline = access_deadline(sent?, span)?;
         let when = zone(deadline)
             .format(format_description!(
                 "[day padding:none] [month repr:short], [hour]:[minute]"
             ))
             .ok()?;
-        return Some((body, Some(GraceState::EndsAt(when))));
+        return Some((body, Some(GraceState::EndsAt { when, at: deadline })));
     }
     if let Some(head) = reason.strip_suffix(" ended") {
         for marker in [", grace ", ", unknown_grace "] {
@@ -196,6 +242,20 @@ mod tests {
         reason_row(reason, parse_rfc3339("2026-11-16T14:10:35Z"), prague)
     }
 
+    fn ends_at() -> OffsetDateTime {
+        parse_rfc3339("2026-11-17T10:10:35Z").unwrap()
+    }
+
+    /// The grace text when `left` is still to run (negative: already past the end).
+    fn grace_left(left: Duration) -> String {
+        let at = ends_at();
+        GraceState::EndsAt {
+            when: "17 Nov, 11:10".into(),
+            at,
+        }
+        .text(at - left)
+    }
+
     fn read(name: &str, detail: &str, grace: Option<GraceState>) -> ReasonRow {
         ReasonRow {
             name: name.into(),
@@ -270,13 +330,114 @@ mod tests {
             read(
                 "Password policy",
                 "4 characters, at least 10 needed",
-                Some(GraceState::EndsAt("17 Nov, 10:10".into()))
+                Some(GraceState::EndsAt {
+                    when: "17 Nov, 10:10".into(),
+                    at: parse_rfc3339("2026-11-17T09:10:35Z").unwrap(),
+                })
             )
         );
         assert_eq!(
-            GraceState::EndsAt("17 Nov, 10:10".into()).text(),
-            "Grace ends 17 Nov, 10:10"
+            grace_left(Duration::hours(19)),
+            "Grace ends in 19 h (17 Nov, 11:10)"
         );
+    }
+
+    #[test]
+    fn the_grace_text_counts_down_in_days_hours_and_minutes() {
+        assert_eq!(
+            grace_left(Duration::days(3)),
+            "Grace ends in 3 days (17 Nov, 11:10)"
+        );
+        assert_eq!(
+            grace_left(Duration::days(2)),
+            "Grace ends in 2 days (17 Nov, 11:10)"
+        );
+        assert_eq!(
+            grace_left(Duration::seconds(2 * 86_400 - 1)),
+            "Grace ends in 1 day 23 h (17 Nov, 11:10)"
+        );
+        assert_eq!(
+            grace_left(Duration::days(1)),
+            "Grace ends in 1 day (17 Nov, 11:10)"
+        );
+        assert_eq!(
+            grace_left(Duration::hours(25)),
+            "Grace ends in 1 day 1 h (17 Nov, 11:10)"
+        );
+        assert_eq!(
+            grace_left(Duration::hours(23)),
+            "Grace ends in 23 h (17 Nov, 11:10)"
+        );
+        assert_eq!(
+            grace_left(Duration::hours(1)),
+            "Grace ends in 1 h (17 Nov, 11:10)"
+        );
+        assert_eq!(
+            grace_left(Duration::seconds(3599)),
+            "Grace ends in 59 min (17 Nov, 11:10)"
+        );
+        assert_eq!(
+            grace_left(Duration::seconds(59)),
+            "Grace ends in 1 min (17 Nov, 11:10)"
+        );
+    }
+
+    #[test]
+    fn the_grace_text_says_ended_from_the_end_instant_on() {
+        assert_eq!(grace_left(Duration::ZERO), "Grace ended");
+        assert_eq!(grace_left(Duration::seconds(-60)), "Grace ended");
+        assert_eq!(GraceState::Ended.text(ends_at()), "Grace ended");
+    }
+
+    #[test]
+    fn the_band_text_rounds_down_and_never_up() {
+        assert_eq!(
+            grace_left(Duration::seconds(2 * 86_400 + 23 * 3600)),
+            "Grace ends in 2 days (17 Nov, 11:10)"
+        );
+        assert_eq!(
+            grace_left(Duration::seconds(3600 + 59 * 60)),
+            "Grace ends in 1 h (17 Nov, 11:10)"
+        );
+    }
+
+    #[test]
+    fn a_rounded_zero_minutes_left_ends_at_the_earliest_instant() {
+        let sent = parse_rfc3339("2026-11-17T10:00:00Z");
+        let grace = reason_row(
+            "firewall = off, on required, access ends in 0m",
+            sent,
+            prague,
+        )
+        .grace
+        .unwrap();
+        let five_seconds_later = parse_rfc3339("2026-11-17T10:00:05Z").unwrap();
+        assert_eq!(grace.text(five_seconds_later), "Grace ended");
+        assert_eq!(grace.tone(five_seconds_later), Tone::Bad);
+    }
+
+    #[test]
+    fn the_tone_and_the_text_follow_the_same_clock() {
+        let grace = GraceState::EndsAt {
+            when: "17 Nov, 11:10".into(),
+            at: ends_at(),
+        };
+        let hour_before = ends_at() - Duration::hours(1);
+        assert_eq!(grace.text(hour_before), "Grace ends in 1 h (17 Nov, 11:10)");
+        assert_eq!(grace.tone(hour_before), Tone::Warn);
+        assert_eq!(grace.text(ends_at()), "Grace ended");
+        assert_eq!(grace.tone(ends_at()), Tone::Bad);
+    }
+
+    #[test]
+    fn a_reason_with_an_unknown_body_still_gets_its_countdown() {
+        let reason = "future_rule must hold, access ends in 24h";
+        let row = row(reason);
+        assert_eq!(row.name, "future_rule must hold");
+        assert_eq!(row.detail, None);
+        let grace = row.grace.unwrap();
+        let hour_later = parse_rfc3339("2026-11-16T15:10:35Z").unwrap();
+        assert_eq!(grace.text(hour_later), "Grace ends in 23 h (17 Nov, 15:10)");
     }
 
     #[test]

@@ -695,7 +695,7 @@ impl AppView {
                 }
                 if !status.issues.is_empty() {
                     view = view.child(div().flex().flex_col().children(status.issues.iter().enumerate().map(|(i, issue)| {
-                        let shown = issue_view_local(issue, self.clock.as_deref());
+                        let shown = issue_view_local(issue, status.last_claim.as_ref().and_then(|claim| claim.sent_at.as_deref()), self.clock.as_deref());
                         let button = issue_action_shown(&status.schedule, shown.action).map(|action| {
                             Button::new(("issue-action", i)).label(action.label()).small().disabled(self.busy)
                                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -838,11 +838,8 @@ fn rejection_panel(check: &ClaimReport) -> Div {
                     }),
             )
             .when_some(row.grace, |line, grace| {
-                let tone = match grace {
-                    runner::rejection::GraceState::Ended => Tone::Bad,
-                    runner::rejection::GraceState::EndsAt(_) => Tone::Warn,
-                };
-                line.child(pill(grace.text(), tone).flex_none())
+                let now = time::OffsetDateTime::now_utc();
+                line.child(pill(grace.text(now), grace.tone(now)).flex_none())
             })
     });
     div()
